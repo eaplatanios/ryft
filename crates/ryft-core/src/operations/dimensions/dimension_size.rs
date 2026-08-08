@@ -293,13 +293,21 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, Shape};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
+    };
     use crate::contexts::{Context, EagerContext};
+    use crate::operations::dimensions::dimension_add::DimensionAddOperation;
+    use crate::operations::manipulation::concatenation::ConcatenateOperation;
+    use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Effects, Operation, ProgramBuilder, RegionInterface, TypeIdentityRenaming};
+    use crate::programs::{
+        Effects, Operation, ProgramBuilder, RegionInterface, TypeIdentityPosition, TypeIdentityRenaming,
+    };
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -497,6 +505,14 @@ mod tests {
         assert!(second_instruction.regions().is_empty());
         assert!(matches!(first_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
         assert!(matches!(second_instruction.operation(), ArrayIrOperation::DimensionSize(_),));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[extent] .
+                let %1:dimension<extent ∈ [2, 8)> = dimension_size [axis=0] %0
+                    %2:dimension<extent ∈ [2, 8)> = dimension_size [axis=0] %0
+                in (%1, %2)"},
+        );
 
         let concrete = ArrayIrValue::Array(Array::vector(vec![0.0f32; 5]));
         let (first, second) = program.interpret(concrete.clone()).unwrap();
@@ -525,6 +541,87 @@ mod tests {
         assert_eq!(first.variable(), &variable);
         assert_eq!(second.variable(), &variable);
         assert_eq!(imported.instructions().len(), 2);
+        assert_eq!(imported.to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_shape_dependencies_are_operand_edges_or_dimension_size_reads() {
+        // One representative mixed program: a dynamically shaped operand is read with `dimension_size`, the extent is
+        // combined with ordinary dimension arithmetic, and the derived extent is then consumed by two shape-carrying
+        // operations as an explicit operand.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let size_operation = DimensionSizeOperation::new(&input_type, 0).unwrap();
+        let size_type = size_operation.result_type().clone();
+        let sum_operation = DimensionAddOperation::new(&size_type, &size_type).unwrap();
+        let sum_type = sum_operation.infer_output_types(&[size_type.clone(), size_type], &[]).unwrap().remove(0);
+        let one_value = DimensionValue::constant(1).unwrap();
+        let concatenate_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[input_type.clone().into(), input_type.clone().into(), sum_type.into()],
+        )
+        .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
+        let size = builder.add_instruction(size_operation, Vec::new(), vec![input]).unwrap()[0];
+        let sum = builder
+            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size])
+            .unwrap()[0];
+        let concatenated =
+            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum]).unwrap()[0];
+        let reshaped = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one])
+            .unwrap()[0];
+        let program = builder
+            .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![reshaped], Placeholder, Placeholder)
+            .unwrap();
+
+        // Every derived extent is visible in the rendered program: one `dimension_size` read plus explicit operand
+        // edges into the shape-carrying operations. No shape is recovered from ambient or type-level metadata.
+        let [size_instruction, sum_instruction, concatenate_instruction, reshape_instruction] = program.instructions()
+        else {
+            panic!("expected a dimension read, dimension arithmetic, a concatenate, and a reshape");
+        };
+        assert_eq!(size_instruction.inputs(), &[input]);
+        assert_eq!(sum_instruction.inputs(), &[size, size]);
+        assert_eq!(concatenate_instruction.inputs(), &[input, input, sum]);
+        assert_eq!(reshape_instruction.inputs(), &[concatenated, sum, one]);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows] .
+                let %1:dimension<1> = const
+                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
+                    %4:f32[rows + rows] = concatenate [axis=0] %0 %0 %3
+                    %5:f32[rows + rows, 1] = reshape %4 %3 %1
+                in (%5)"},
+        );
+
+        // Drift gate: an instruction result may only *reference* a dimension identity that one of its own operands
+        // carries. A rule that recovered geometry from stored metadata instead of an operand edge would produce a
+        // result type naming an identity that reaches the instruction through no rendered edge.
+        let atoms = program.atoms();
+        for instruction in program.instructions() {
+            let mut operand_identities = Vec::new();
+            for input in instruction.inputs() {
+                let r#type = atoms[input.index()].r#type();
+                operand_identities.extend(r#type.identities().map(|(_, identity)| identity.clone()));
+            }
+            for output in instruction.outputs() {
+                let r#type = atoms[output.index()].r#type();
+                for (position, identity) in r#type.identities() {
+                    assert!(
+                        position != TypeIdentityPosition::Reference || operand_identities.contains(identity),
+                        "instruction '{}' result type {} references identity {identity} that no operand carries",
+                        instruction.operation().name(),
+                        r#type.as_ref(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

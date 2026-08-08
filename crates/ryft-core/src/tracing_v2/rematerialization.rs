@@ -57,7 +57,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::{
     AddOperation, Broadcast, BroadcastOperation, DotOperation, TagOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, Zero,
+    TransposeOperation, Zero, ZeroLikeOperation,
 };
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -295,8 +295,8 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::
 /// replayed recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
-    for RematerializeOperation<C::Type>
+impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::Type>>> + Zero<C::Value>>
+    DifferentiableOperation<C> for RematerializeOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -330,10 +330,14 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
         // Replay the tangent region on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
         // output.
         let mut tangent_operands = forward_tail;
-        // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros.
+
+        // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros against
+        // their own primal, which is a live value of exactly the tangent's type and therefore supplies the runtime
+        // geometry a reference-bearing tangent type omits; static inputs keep the nullary zero.
         for input in inputs {
-            tangent_operands.push(input.tangent().clone().materialize(context)?);
+            tangent_operands.push(input.tangent().clone().materialize_like(context, input.primal())?);
         }
+
         let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 

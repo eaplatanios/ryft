@@ -238,20 +238,43 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
-        MAX_DIMENSION_EXTENT, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionError,
+        DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT, Shape,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::TransposableOperation;
     use crate::macros::check_operation_partial_evaluation;
+    use crate::operations::dimensions::dimension_requirement::{
+        DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DimensionRequirementOperation,
+    };
+    use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
+    use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Effects, EmptyRegionDriver, ProgramBuilder, RegionInterface};
+    use crate::programs::{Effects, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface};
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Returns the names of `program`'s ordered-assertion instructions, in program order.
+    fn assertion_operation_names(
+        program: &Program<
+            ArrayIrValue<Array>,
+            ArrayIrOperation<Array>,
+            Vec<ArrayIrValue<Array>>,
+            Vec<ArrayIrValue<Array>>,
+        >,
+    ) -> Vec<&'static str> {
+        program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().effects().contains(Effect::OrderedAssertion))
+            .map(|instruction| instruction.operation().name())
+            .collect()
+    }
 
     #[test]
     fn test_dimension_from_scalar() {
@@ -434,6 +457,13 @@ mod tests {
             .unwrap();
         drop(builder);
         assert_eq!(program.type_identity_signature().internal_identities(), std::slice::from_ref(&variable));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[] .
+                let %1:dimension<extent ∈ [0, 9)> = dimension_from_scalar [bounds=[0, 9)] %0
+                in (%1)"},
+        );
 
         let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let relocated_input = relocated_builder.add_input(ArrayType::scalar(DataType::I32).into());
@@ -449,6 +479,17 @@ mod tests {
         assert_ne!(relocated_operation.result_type().variable(), &variable);
         assert_eq!(relocated_operation.result_type().variable().name(), variable.name());
         assert_eq!(relocated_operation.result_type().bounds(), bounds);
+
+        // The relocated identity is nominally fresh but alpha-equivalent, so the relocated program renders exactly
+        // like its source.
+        let relocated = relocated_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                relocated_outputs,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
 
         let projected_context = TestContext::new();
         let projected_input = projected_context.input(ArrayType::scalar(DataType::I32).into());
@@ -481,5 +522,128 @@ mod tests {
             Err(crate::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dimension_from_scalar` is not transposable",
         ));
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_ordered_assertions_survive_differentiation() {
+        // A tier-3 composite program whose differentiable array body is shaped by a data-derived dimension. The
+        // gateway always carries an ordered assertion because its bounds check can only run against runtime data, and
+        // the requirement is inconclusive from the declared `[1, 9)` bounds alone, so it residualizes as a second
+        // ordered assertion. Their relative order defines which failure is observed first and must never change.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let extent = builder
+            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar])
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                DimensionOperation::Requirement(DimensionRequirementOperation::bounds(
+                    &DimensionType::new(rows),
+                    DimensionBounds::new(2, Some(8)).unwrap(),
+                )),
+                Vec::new(),
+                vec![extent],
+            )
+            .unwrap();
+        let broadcast = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, extent])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Sin(SinOperation::new())),
+                Vec::new(),
+                vec![broadcast],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(program.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(
+            assertion_operation_names(&program),
+            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+        );
+
+        // Forward differentiation stages both assertions once, in their original relative order: a dimension carries
+        // no tangent, so neither assertion may be duplicated into a tangent computation or reordered against the
+        // other by the interleaved dual program.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(
+            assertion_operation_names(&jvp),
+            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+        );
+
+        // Linearization splits the dual program by known-ness. Both assertions are nonlinear primal work, so they
+        // stay in the primal sub-program in their original order, and the compact linear tangent sub-program is left
+        // pure: it consumes the checked extent as an ordinary residual instead of re-asserting it.
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(
+            assertion_operation_names(linearization.primal()),
+            vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+        );
+        assert_eq!(linearization.tangent().effects(), Effects::PURE);
+        assert_eq!(assertion_operation_names(linearization.tangent()), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_extent_controls_multiple_bounded_outputs() {
+        // A data-dependent extent is an ordinary SSA value with one definition. Two sibling shape-carrying
+        // constructors consume that one gateway result as an explicit operand instead of each recovering an extent of
+        // its own, so both outputs are governed by a single identity and a single bounds assertion.
+        let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(9)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let first_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let second_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let extent = builder
+            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar])
+            .unwrap()[0];
+        let first = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent])
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![second_value, extent])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![first, second],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[], %1:f64[], %2:f64[] .
+                let %3:dimension<total ∈ [1, 9)> = dimension_from_scalar [bounds=[1, 9)] %0
+                    %4:f64[total] = broadcast [output_axes=[]] %1 %3
+                    %5:f64[total] = broadcast [output_axes=[]] %2 %3
+                in (%4, %5)"},
+        );
+        let output_types = program.output_types();
+        assert_eq!(output_types[0], output_types[1]);
+
+        // Both outputs follow the same runtime extent across every value the declared bounds admit.
+        for extent in [1_usize, 5, 8] {
+            assert_eq!(
+                program.interpret(vec![
+                    ArrayIrValue::Array(Array::scalar(i32::try_from(extent).unwrap())),
+                    ArrayIrValue::Array(Array::scalar(2.0_f64)),
+                    ArrayIrValue::Array(Array::scalar(3.0_f64)),
+                ]),
+                Ok(vec![
+                    ArrayIrValue::Array(Array::vector(vec![2.0_f64; extent])),
+                    ArrayIrValue::Array(Array::vector(vec![3.0_f64; extent])),
+                ]),
+            );
+        }
     }
 }

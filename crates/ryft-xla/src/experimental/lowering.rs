@@ -10971,7 +10971,8 @@ mod tests {
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
@@ -11033,7 +11034,8 @@ mod tests {
             let mut builder = CompositeXlaProgramBuilder::new();
             builder.0.add_input(extent_type.clone().into());
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(
@@ -13317,7 +13319,8 @@ mod tests {
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(

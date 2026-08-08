@@ -1,10 +1,11 @@
-//! Allocation regression tests for reference arrays and projecting array members out of [`ArrayIrValue`].
+//! Allocation regression tests for reference arrays and projecting members out of [`ArrayIrValue`].
 //!
 //! The reference [`Array`] backend shares its immutable physical byte storage, so cloning an array must not copy or
 //! allocate storage proportional to its payload. Direct typed kernels must allocate output storage without adding a
-//! payload-sized intermediate, and projecting an array member out of [`ArrayIrValue`] must add no allocation at all.
-//! These tests use a counting global allocator to pin those contracts. They live in a dedicated integration-test
-//! binary so its global allocator and serialized measurement state cannot affect unrelated tests.
+//! payload-sized intermediate, and projecting either member of [`ArrayIrValue`] — an array or a first-class runtime
+//! dimension — must add no allocation at all. These tests use a counting global allocator to pin those contracts.
+//! They live in a dedicated integration-test binary so its global allocator and serialized measurement state cannot
+//! affect unrelated tests.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -12,7 +13,9 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ryft_core::arrays::{Array, ArrayType, DataType, Dimension, Shape};
+use ryft_core::arrays::{
+    Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
+};
 use ryft_core::contexts::EagerContext;
 use ryft_core::operations::constants::{Fill, Iota};
 use ryft_core::operations::math::{Add, Sin};
@@ -106,6 +109,12 @@ fn measure_allocations<S, T>(setup: impl FnOnce() -> S, operation: impl FnOnce(S
 /// Constructs a large stored reference array outside the measured interval.
 fn stored_array() -> ArrayIrValue<Array> {
     ArrayIrValue::Array(Array::vector((0..4096).map(|value| value as f32).collect()))
+}
+
+/// Constructs a stored first-class runtime dimension outside the measured interval.
+fn stored_dimension() -> ArrayIrValue<Array> {
+    let variable = DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap());
+    ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(variable), 4).unwrap())
 }
 
 #[test]
@@ -219,4 +228,27 @@ fn test_consuming_array_ir_projection_does_not_allocate() {
         <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(stored).unwrap()
     });
     assert_eq!(statistics, AllocationStatistics::default());
+}
+
+#[test]
+fn test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate() {
+    // A borrowed dimension projection hands back a reference into the stored member, so repeating it many times must
+    // stay at exactly zero allocations rather than merely at a small constant.
+    let borrowed = measure_allocations(stored_dimension, |stored| {
+        for _ in 0..1_000 {
+            let projected =
+                <ArrayIrValue<Array> as ValueProjection<DimensionType>>::projected(black_box(&stored)).unwrap();
+            black_box(projected.extent());
+        }
+    });
+    assert_eq!(borrowed, AllocationStatistics::default());
+
+    // The consuming projection transfers ownership of the stored `DimensionValue`, whose declared type shares one
+    // reference-counted `DimensionVariable` payload, so no type metadata is copied either. Note that the *projected
+    // binding* path (`ProjectedContext::bind`) does clone type metadata by design; that clone is a refcount bump on
+    // the variable payload and is not measured here.
+    let consuming = measure_allocations(stored_dimension, |stored| {
+        <ArrayIrValue<Array> as ValueProjection<DimensionType>>::into_projected(stored).unwrap()
+    });
+    assert_eq!(consuming, AllocationStatistics::default());
 }

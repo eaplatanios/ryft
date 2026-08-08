@@ -428,6 +428,7 @@ macro_rules! impl_composite_operation_conversion {
 }
 
 impl_composite_operation_conversion!(
+    ZeroLikeOperation<ArrayIrType>,
     ZeroOperation<ArrayType>,
     OneOperation<ArrayType>,
     IotaOperation<ArrayType>,

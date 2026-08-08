@@ -1349,13 +1349,16 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       whenever an operand supplies geometry. The mixed `ArrayIrType` forward-mode rules for pad and concatenate now
       route through `materialize_array_tangent`, which uses the operand primal as the runtime-geometry exemplar for an
       identity-bearing structural zero and keeps the canonical nullary zero for identity-free types (2026-08-07; see
-      the log entry below). The remaining exemplar-available sites are the homogeneous `ArrayType` forward-mode rules
-      (`slicing.rs` update-slice and dynamic-update-slice, `scattering.rs`, `select.rs`, `complex.rs`,
-      `concatenation.rs`, `padding.rs`) plus the type-generic transform drivers (`custom_derivatives.rs`,
-      `rematerialization.rs`, `linear.rs`, `forward.rs`, `scan.rs`, `while.rs`, `condition.rs`, `reverse.rs`
-      auxiliary seeds, and `attention.rs` sequence-length cotangents). Each of those needs a
-      `From<ZeroLikeOperation<T>>` bound added to an existing generic operation-family bound, so they are one
-      separately reviewable slice rather than part of this delivery.
+      the log entry below). Every type-generic transform driver is now migrated too (2026-08-08; see the second log
+      entry below): `condition.rs`, `scan.rs`, `while.rs` (both the bounded and fused rules), `linear.rs`,
+      `custom_derivatives.rs` (custom JVP and custom VJP), `rematerialization.rs`, and `reverse.rs` auxiliary seeds
+      all stage `MaybeZero::materialize_like` over the operand's own primal, and `forward.rs`'s fused-JVP output
+      boundary uses the residual protocol it already carried a bound for. `attention.rs` sequence-length cotangents
+      are classified static-only and documented in place: the entry point is defined over a homogeneous
+      `Domain<Type = ArrayType>` that cannot observe an extent, and the cotangent retypes the element to the zero
+      space so the lengths value is not an exemplar for it. The remaining exemplar-available sites are the homogeneous
+      `ArrayType` forward-mode rules (`slicing.rs` update-slice and dynamic-update-slice, `scattering.rs`,
+      `select.rs`, `complex.rs`, `concatenation.rs`, `padding.rs`).
 - [ ] Phase 6 owner: migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types
       (condition, scan, while, gather, scatter, slice, pad, and differentiation rules) to `zero_like`, structural
       zeros, or explicit extent residuals, with dynamic-shape acceptance tests per consumer. The zero reference guard
@@ -1363,9 +1366,16 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       Gather, slice, dynamic-slice, dynamic-update-slice, and broadcast were already residual-aware from P6b and are
       confirmed so by the inventory below. Scatter has no `MemberDifferentiableOperation` rule at all, so a mixed
       scatter reaches the homogeneous rule through the unguarded `arrays/operations/mod.rs` catch-all; that remains a
-      real gap. The reverse-mode transpose cluster (`gathering.rs`, `slicing.rs` slice/dynamic-slice, `condition.rs`,
-      `scan.rs`, `linear.rs`) cannot use an exemplar at all because the geometry belongs to an `Unknown` linear
-      operand, so it needs the residual protocol rather than `zero_like`.
+      real gap. The reverse-mode transpose cluster was re-examined empirically on 2026-08-08 and split (see the second
+      log entry below). `gathering.rs`, `slicing.rs` slice, and `slicing.rs` dynamic-slice are **static-only by
+      construction** — their mixed `MemberDifferentiableOperation` rules route every dynamically shaped operand into a
+      residual-carrying `LinearCallOperation`, so the homogeneous transpose can only ever see a static operand — and
+      each now carries a code comment saying so. `condition.rs`, `scan.rs`, and `linear.rs` do **not** need a new
+      residual: the transposition boundary already carries the geometry, because the all-zero early return guarantees
+      a live peer cotangent and the known residual/operand run is live too, so `MaybeZero::materialize_like_any`
+      finds a value of exactly the required type. The one residue is a dead **stacked** scan output, whose
+      length-prefixed cotangent type no peer carries; it is marked with a `TODO(eaplatanios)` in
+      `transpose_primal_scan` and needs identity-directed geometry rather than exemplar matching.
 - [ ] Cross-phase invariant: keep `DimensionType` strictly identity plus bounds throughout all later phases. Concrete
       extents are runtime values and output-refinement observations, never part of `Typed::r#type`, structural
       equality, hashing, rendering, persistence, or cache identity.
@@ -1375,9 +1385,15 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
 - [x] Give each operation classified as mixed by the Phase 3 inventory one direct positional operand contract and
       migrate its inference, eager rule, transforms, and lowering to preserve those same SSA edges. Explicit later
       transform and production-XLA reachability gates remain assigned above.
-- [ ] Phase 4–6 cleanup gate: delete copied dimension operand identity, bounds, and ordering validation after
+- [x] Phase 4–6 cleanup gate: delete copied dimension operand identity, bounds, and ordering validation after
       inference derives result metadata directly from operand types. Centralize only genuinely repeated count/kind
-      projection.
+      projection. *(Executed 2026-08-08 — refer to the `Phase 4–6 cleanup and integration gates` log entry below. The
+      sweep over every dimension-operand-carrying operation in `crates/ryft-core/src/operations/` found exactly one
+      provably dead copy: `validate_concatenation_inputs`' `axis >= rank` bounds check, subsumed at both call sites by
+      `Axis::normalize(inputs[0].rank())`. It was deleted. The one genuinely repeated kind projection — the
+      `&[ArrayIrType] -> Vec<Dimension>` extent-operand run shared by mixed reshape, slice, pad, broadcast, and the
+      shape-changing collectives — is centralized as `ArrayIrType::extents`. Four rejected centralizations and one
+      deferred-to-owner candidate are recorded in the log entry.)*
 - [ ] Phase 6 owner: replace shape-metadata zero/one materialization inside transforms with structural zero or
       `zero_like`/`one_like` wherever semantics allow. The complete remaining inventory is five homogeneous
       `ArrayType` batching sites: `padding.rs` mask-input `one` (exemplar `operand.value()` available, blocked only on
@@ -1396,8 +1412,19 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       instantiation restricted to identity-free member types until Phase 6 deletes it.
 - [x] No operation consumer independently calls an ad hoc
       `runtime_dimension_variables` contract.
-- [ ] Phase 4–6 integration gate: every shape dependency in rendered IR is an operand edge or an explicit
-      `dimension_size` instruction.
+- [x] Phase 4–6 integration gate: every shape dependency in rendered IR is an operand edge or an explicit
+      `dimension_size` instruction. *(Verified 2026-08-08 — refer to the `Phase 4–6 cleanup and integration gates` log
+      entry below. The workspace-wide sweep for dimension-value constructions outside the sanctioned-reads ledger found
+      **zero violations**: every production site that reads a type's shape and turns it into a value performs the
+      static-axis exact-constant / dynamic-axis `dimension_size` split. Two compliant production `dimension_size`
+      stagers sit outside the eight-site transform-time ledger — `collective_input_extents` and
+      `dynamic_broadcast_leading` — and are covered by P3k's separate original-operation-boundary sanction rather than
+      being ledger drift; the ledger's scope is narrowed in place below. The gate was previously unpinned by any
+      fixture, so `test_shape_dependencies_are_operand_edges_or_dimension_size_reads` in
+      `operations::dimensions::dimension_size::tests` was added: it renders one mixed program
+      (`dimension_size` → `dimension_add` → `concatenate` → `reshape`), pins the exact rendering and every
+      instruction's operand edges, and asserts structurally that no instruction result type *references* a dimension
+      identity that none of its own operands carries.)*
 
 ### Phase 4: remove implicit-shape replay and the parallel array language
 
@@ -1523,9 +1550,13 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       with output axis 0, and the two-input mapped/replicated variant stages a homogeneous `broadcast` whose stored
       output type retains the dynamic extent (`f64[2, n]`) while the replicated input keeps its unbatched `f64[n]`
       type. That staged-broadcast payload is exactly the shape covered by the separate homogeneous-baseline replay
-      refinement item below, which is why the test pins staging rather than eager replay. The item is left unchecked
-      pending the owner's confirmation that fix (1) has landed on the branch.)*
-- [ ] Homogeneous-baseline replay refinement (opened 2026-08-07 by the consumer sweep): `Program::interpret_in_context`
+      refinement item below, which is why the test pins staging rather than eager replay. Confirmed landed on
+      2026-08-08: fix (1) is on the branch as the dynamic-output guard in `CustomCallOperation::infer_output_types`
+      (`crates/ryft-core/src/operations/custom_call.rs`) together with
+      `test_custom_call_rejects_dynamic_output_types_without_extent_operands`, which asserts the exact
+      `'custom_call' requires explicit result-extent operands for dynamic output type f32[rows, 3]` message, so all
+      four fixes are present and the item is checked.)*
+- [x] Homogeneous-baseline replay refinement (opened 2026-08-07 by the consumer sweep): `Program::interpret_in_context`
       refines only the input/output boundary, not instruction operation payloads, so a homogeneous
       `BroadcastOperation` with a dynamic stored `output_type` (admitted by broadcast inference for identity-equal
       dynamic dimensions, and required by `StaticArrayBatchingPolicy::broadcast_input`) fails eager replay with an
@@ -1534,6 +1565,17 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       documented diagnostic. Also add an XLA lowering test pinning `lower_broadcast_to_mlir` behavior for a dynamic
       result type. Do NOT add a dynamic-routing `From<BroadcastOperation> for ArrayIrOperation`: the conversion site
       has no context from which to synthesize extent operands, which would reintroduce ambient recovery.
+      *(First executed on 2026-08-08 as the exact replay-time rejection, then **withdrawn on review the same day**.
+      The rejection was a heuristic: it rewrote any `ProgramError::Type` raised at an instruction whose declared
+      outputs happened to name a refined identity, without ever establishing that the stale symbolic payload caused
+      the error or that the error even involved that identity, so an unrelated operation failure was misclassified and
+      the reported identity was arbitrary under several refinements. The item therefore resolves to the **accept the
+      limitation with a documented diagnostic** branch: replay refines only program and region boundaries, never
+      instruction operation payloads, so such a payload fails replay with its own inference diagnostic, and that is
+      pinned as an accepted limitation. Future path, should the specialized diagnostic ever be wanted: it must
+      originate from a structured operation error that causally identifies the failing payload constraint, not from
+      post-hoc inspection of a rendered error. The XLA `lower_broadcast_to_mlir` dynamic-result lowering test is
+      orthogonal and stands. Refer to the two dated log entries below.)*
 - [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
 - [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
@@ -1637,7 +1679,14 @@ rename only part of the problem while introducing another carrier.
       construction. Two follow-ups recorded below as separate items.)* **Ledger amendment (2026-08-08):** the first
       and fourth sites now reach `array_dimension` indirectly through `folded_array_dimension`, which reads only
       genuinely dynamic axes. The gate is unchanged in substance — five sanctioned reads, two of them behind that one
-      folding helper.
+      folding helper. **Scope clarification (2026-08-08, integration-gate sweep):** this ledger governs *transform-time*
+      reads (batching, padding, residual retention, and the two `capture_zero_residual*` readers), i.e. sites that
+      recover geometry from an already-transformed carrier. It does **not** govern the *original-operation-boundary*
+      derivations that P3k sanctioned separately, where a public composite capability builds its own explicit extent
+      operands from the operand it was handed: `collectives.rs` `collective_input_extents` and
+      `manipulation/broadcasting.rs` `dynamic_broadcast_leading`. Both perform the same static-constant / dynamic-read
+      split as `folded_array_dimension` and are compliant; they are named here so a future `DimensionSizeOperation`
+      call-site census does not mistake them for drift.
 - [x] Constant-fold static axes in `DynamicArrayBatchingPolicy::match_axis` and the composite `prepare_inputs`
       sharding normalization, matching the existing `DimensionSource::Static` arm and `collective_input_extents`:
       today those two paths read every axis `0..rank` through `dimension_size`, allocating fresh exact-bounded
@@ -1647,13 +1696,20 @@ rename only part of the problem while introducing another carrier.
       through the extracted `dimension_constant` helper for `Dimension::Static` axes and delegates only genuinely
       dynamic axes to `array_dimension`. `prepare_inputs` additionally stops staging a read for the mapped axis it
       immediately overwrites with the transform's extent. Details in the review section below.)*
-- [ ] Optional, risk-gated: replace the composite sharding-normalization broadcast in `prepare_inputs` with a
+- [x] Optional, risk-gated: replace the composite sharding-normalization broadcast in `prepare_inputs` with a
       projected `ReshardOperation` bind, deleting the rank-many `array_dimension` sweep staged purely to relabel one
       axis's placement and making the composite entrypoint symmetric with the homogeneous one. Gate: `Reshard` is a
       tracked transition dualized under transposition while the current broadcast has a different transpose rule —
       verify no AD/PE behavior change at the transform boundary first, and keep the broadcast if the adjoint differs.
       Also resolve the unused `From<ReshardOperation>` bound in `operations/manipulation/broadcasting.rs` in the
-      same pass (recorded 2026-08-07).
+      same pass (recorded 2026-08-07). *(Resolved negative 2026-08-08: the gate fails on its acceptance predicate, so
+      the broadcast stays. `ReshardOperation::infer_output_types` does not replace the output sharding wholesale — it
+      substitutes the **operand's** `varying_manual_axes` for the target's, and rejects any target referencing an
+      `Auto` mesh axis. `normalized_batch_axis_type` deliberately does both of the opposite things, so the swap is
+      not type-preserving. The `From<ReshardOperation>` bound is also **not** unused: `BroadcastOperation`'s transpose
+      reaches `BroadcastDerivativeAlignment::unalign_cotangent_along`, which reshards the contribution onto the
+      operand's placement; removing the bound fails to compile with E0599. Pinned by
+      `test_batch_axis_sharding_normalization_is_not_a_reshard`; analysis in the review section below.)*
 - [x] Verify nested `vmap`, mapped arrays with dynamic logical extents, replicated dimension residuals, control flow,
       and all mapped-authority rejection paths.
 - [x] P5d — immediately after P5c3: enforce one canonical batching algorithm per semantic contract. Member rules
@@ -2707,7 +2763,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       operations' type contracts have no slot for it, so promotion needs a contract extension rather than a `From`
       arm. Refer to the `Composite region batching and scatter differentiation fixes` log entry for the proof, the
       transpose-only `LinearCall` residue, and the follow-up item below.)*
-- [ ] Give `CustomJvp`, `CustomVjp`, and `Rematerialize` composite carriers with extent-threaded regions (opened
+- [x] Give `CustomJvp`, `CustomVjp`, and `Rematerialize` composite carriers with extent-threaded regions (opened
       2026-08-08 by the item above): these three region-carrying array payloads cannot be promoted today because
       `ArrayIrBatching` widens a structurally batched region's boundary to `[extent, inputs...] ↦ [extent, outputs...]`
       while each of their `Operation::infer_output_types` contracts requires the attached regions' boundaries to equal
@@ -2719,6 +2775,13 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       working-transform fixtures, and update the `ArrayIrOperation::Array` rustdoc residue list. A transpose-only
       `LinearCallOperation` additionally needs a cross-universe type lift for its stored member interface types (its
       `LinearCallInterface` is private, so `LinearCallOperation::new(residual_count)` covers only the executable form).
+      *(Executed 2026-08-08: each of the three gained a `nondifferentiated_count` extent slot — leading operands every
+      region receives positionally and none of the derivative interfaces pairs with a tangent or a cotangent — and all
+      three batching rules were generalized from `BatchableOperation<C, ArrayBatching<P>>` on `ArrayType` to
+      `BatchableOperation<C, P>` for `P: LinearCallBatchingPolicy<C>`, exactly matching `LinearCallOperation`'s
+      policy-generic rule. The `ArrayIrOperation::Array` residue list is now empty: `CustomJvp`, `CustomVjp`,
+      `Rematerialize`, and both `LinearCall` interface forms are composite carriers. Refer to the `Composite carriers
+      for CustomJvp/CustomVjp/Rematerialize` log entry for the design, the JAX-parity rationale, and the fixtures.)*
 - [x] Guard `LinearCallOperation`'s all-replicated batching fast path, found unsound by audit (ii) above (opened
       2026-08-08): transposed programs naturally contain named-axis collectives (`AllGather` transposes to
       `PSumScatter` and vice versa), and public constructors admit arbitrary regions (e.g., a bare `axis_index`), so
@@ -3123,9 +3186,18 @@ ambient environments, and the graph remains the complete source of data dependen
 - [ ] Verify gateway-defined variables need no boundary `TypeRefinements` entry: they are internal identities
       established by their producing instruction under the existing structural-closure rules. Cover closure, import,
       alpha-renaming, and repeated splicing.
-- [ ] Differentiation: dimensions remain nondifferentiable, and the linear-call residual contract must carry
+- [x] Differentiation: dimensions remain nondifferentiable, and the linear-call residual contract must carry
       gateway-defined dimensions through linearization, transposition, and nested JVP without modification. Add a
-      rendered-IR fixture in which a data-derived extent is a visible residual edge of a `linear_call`.
+      rendered-IR fixture in which a data-derived extent is a visible residual edge of a `linear_call`. *(Done
+      2026-08-08: `test_array_ir_reshape_differentiation_over_a_data_derived_extent` in
+      `arrays::operations::manipulation::tests` asserts the full rendered primal and tangent with `indoc!`. The
+      data-derived `total` is a residual output of the primal and a leading residual operand of
+      `linear_call [residual_count=2]`, and it is threaded verbatim through both attached regions — the `forward`
+      region reshapes with it and the `transpose` region rebuilds `f64[source, 4]` from the geometry-read `source`
+      and a constant `4`, so no dimension is reconstructed from output metadata. All three legs of the item are
+      executed: linearization (primal/tangent interpretation), transposition (`pullback()` interpretation), and
+      nested JVP (`linearization.tangent().jvp()`, which adds one array tangent input and no dimension tangent
+      input).)*
 - [ ] Batching: pin the existing tier-3 MVP policy with fixtures — a gateway whose scalar operand is replicated
       produces ordinary replicated dimension authority; a mapped operand keeps its exact typed rejection diagnostic,
       updated to name Phase 14 raggedness as the missing capability.
@@ -3246,8 +3318,11 @@ composes nested axes already, and the relaxed-while-predicate work established t
       capability on `Array` is a host-metadata accessor that binds no operation.)*
 - [x] Dimension-to-data conversion occurs only through explicit gateways. *(Audited 2026-08-08 by closed-family
       enumeration: only `DimensionToScalar` and the deliberately composite-level `Compare<ArrayIrType>` cross
-      dimension-to-array; everything else consumes dimensions as geometry. A dedicated exhaustive-match classifier
-      fixture is queued below to make this a compile-forced gate.)*
+      dimension-to-array; everything else consumes dimensions as geometry. Drift gate added 2026-08-08:
+      `test_array_ir_operation_member_kinds_are_a_closed_family` in `arrays::operations::tests` classifies all 23
+      `ArrayIrOperation` variants through a wildcard-free exhaustive `match` against a hand-maintained table, so a
+      new variant cannot compile until its member-kind signature is declared, and the table asserts exactly two
+      dimension-to-array gateways.)*
 - [x] Shape operations retain all explicit dimension operands through tracing, import, PE, batching, AD, and lowering.
       *(Audited 2026-08-08: `test_array_ir_concatenate` pins instruction-level operand edges through
       tracing/render/eager/AD; `test_array_ir_reshape_differentiation` pins linearization residual edges;
@@ -3258,7 +3333,15 @@ composes nested axes already, and the relaxed-while-predicate work established t
       2026-08-08: `LinearResiduals::retain_shape` stages explicit deduplicated reads; the gather transpose builds
       zeros from residual SSA. The sanctioned-reads drift gate is rewritten below to cover the operation rather
       than one helper.)*
-- [ ] Eager projection adds no heap allocation for concrete array/dimension values.
+- [x] Eager projection adds no heap allocation for concrete array/dimension values. *(Closed 2026-08-08 by
+      `test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate` in
+      `crates/ryft-core/tests/test_array_ir_projection_allocations.rs`, which joins the two existing array-projection
+      fixtures: the counting global allocator records exactly zero allocations for 1,000 borrowed
+      `ValueProjection<DimensionType>::projected` calls and for one consuming `into_projected`, because a borrowed
+      projection hands back a reference and a consuming one transfers the `DimensionValue` whose declared type shares
+      one reference-counted `DimensionVariable` payload. Recorded in the fixture: projected *binding*
+      (`ProjectedContext::bind`) does clone type metadata by design; that clone is a refcount bump and is outside this
+      contract.)*
 - [x] Eager projection neither deep-copies the reference `Array` payload nor relies on an undocumented cheap-clone
       assumption. *(Audited 2026-08-08: `test_large_array_clone_does_not_allocate_payload_storage` proves
       metadata-only clones sharing the exact payload pointer; the sharing contract is documented on the field and
@@ -3275,7 +3358,15 @@ composes nested axes already, and the relaxed-while-predicate work established t
 - [x] Required primal dimension values travel as ordinary differentiation residual SSA values.
 - [x] No primal operation payload contains `transpose_dimension_variables` or an equivalent residual manifest.
 - [x] Dynamic batching alignment consumes an explicit dimension value.
-- [ ] Requirement effects survive every transform and lower in deterministic order.
+- [x] Requirement effects survive every transform and lower in deterministic order. *(Closed 2026-08-08 by
+      `test_dimension_from_scalar_ordered_assertions_survive_differentiation` (AD leg) plus the already-pinned legs:
+      `test_dimension_requirement_effects_and_partial_evaluation` (program effects, DCE retention of two inconclusive
+      requirements while the provable one is erased, and residual PE), `test_array_ir_operation_forwards_payload_effects`
+      (payload classification reaching the composite family unchanged in both provable and inconclusive states), and the
+      composite lowering fixtures. The AD fixture builds a program whose differentiable array body is broadcast to a
+      data-derived extent and asserts `Effects::single(Effect::OrderedAssertion)` plus the exact ordered-assertion
+      instruction sequence `[dimension_from_scalar, dimension_require_bounds]` on the source program, on `jvp()`, and on
+      `linearize().primal()`.)*
 - [ ] Nested condition, while, scan, and linear-call regions carry dimensions correctly (audited 2026-08-08:
       SATISFIED with extensive fixtures); custom-derivative and rematerialization payloads have no composite
       carrier yet and are rejected by name with an exact diagnostic in interpretation, projected binding,
@@ -3288,21 +3379,55 @@ composes nested axes already, and the relaxed-while-predicate work established t
 - [x] Fresh internal dimensions have one producer and dominate every reference. *(Audited 2026-08-08: evaluation-
       order dominance and single-producer rejection in `Region::type_identity_signature`, pinned exhaustively with
       exact messages by `test_structural_identity_closure_rejects_invalid_dominance_and_ownership`.)*
-- [ ] Alpha-equivalent programs share cache identity; live permutations and different graphs do not.
+- [x] Alpha-equivalent programs share cache identity; live permutations and different graphs do not. *(Closed
+      2026-08-08 at both levels, with the row's wording corrected by what the retained-JIT fixture actually measured.
+      Region-interning level: `test_program_builder_type_identity_instantiation_cache_preserves_live_identities` — a
+      renaming-free instantiation (the callee's own formals) reuses the plain callee root, repeated exact
+      instantiations share, and both separately created identities and a permutation of the *same* two live
+      identities get their own imported roots. Retained-JIT level:
+      `test_array_ir_dynamic_zero_retained_jit_specializes_on_dimension_identity` — over a two-dimension dynamic-extent
+      input, two calls differing only in runtime extent share one specialization (1 dispatch hit), while an
+      alpha-equivalent pair of freshly created `DimensionVariable`s with identical names and bounds, and a permutation
+      of the original overlapping identities, each take their own specialization: 4 calls → 1 hit, 3 misses, 3 traces,
+      3 lowerings, 3 compilation requests, 3 retained specializations. NOTE the correction: `DimensionVariable`
+      identity is nominal (`Arc::ptr_eq`), so "alpha-equivalent" programs in the sense of independently created
+      same-named variables do NOT share a cache key at either level. The invariance this row actually guarantees is
+      invariance to the *runtime extent*, plus no-sharing for permutations and for different graphs.)*
 - [ ] Exact diagnostics match the baseline.
 - [x] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
 - [ ] Behavioral JAX parity and Ryft-exceeds-JAX cases remain intact.
 - [x] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
 - [x] (Tier 3) Data-to-dimension conversion occurs only through the checked `dimension_from_scalar` gateway.
       *(Audited 2026-08-08 by closed-family enumeration; the gateway's checks are pinned by
-      `test_dimension_from_scalar` across all eight integer element types with exact diagnostics. Shares the
-      queued exhaustive-match classifier fixture with the gateway row above.)*
-- [ ] (Tier 3) A data-derived dimension's runtime extent never enters structural type equality, hashing, or
+      `test_dimension_from_scalar` across all eight integer element types with exact diagnostics. Drift gate added
+      2026-08-08: the same wildcard-free exhaustive classifier as the gateway row above,
+      `test_array_ir_operation_member_kinds_are_a_closed_family`, whose table asserts exactly one array-to-dimension
+      gateway variant, `DimensionFromScalar`.)*
+- [x] (Tier 3) A data-derived dimension's runtime extent never enters structural type equality, hashing, or
       retained-compilation cache keys; only its declared identity and bounds do (reworded 2026-08-08 — the
       original wording was false by design since the gateway deliberately establishes a definition-position
-      structural identity). Machinery satisfied; needs the queued retained-JIT cache-identity fixture.
-- [ ] (Tier 3) Gateway bounds checks retain `OrderedAssertion` ordering through every transform and lowering.
-- [ ] (Tier 3) Data-derived extents ride the linear-call residual contract through differentiation unchanged.
+      structural identity). *(Closed 2026-08-08:
+      `test_array_ir_dynamic_zero_retained_jit_specializes_on_dimension_identity` shows two calls whose only
+      difference is the runtime extent sharing one retained trace, lowering, and compiled specialization, alongside
+      the existing `test_array_ir_dynamic_zero_retained_jit_reuses_one_specialization` and
+      `test_array_ir_dimension_values_share_one_abstract_type` (equal `r#type()`, equal `Display`, equal `Hash` across
+      differing extents).)*
+- [x] (Tier 3) Gateway bounds checks retain `OrderedAssertion` ordering through every transform and lowering.
+      *(Closed 2026-08-08 by `test_dimension_from_scalar_ordered_assertions_survive_differentiation`, which pins the
+      gateway's unconditional `Effects::single(Effect::OrderedAssertion)` and its position ahead of the residualized
+      `dimension_require_bounds` assertion in the source program, in `jvp()`, and in `linearize().primal()`; the
+      compact linear tangent sub-program is asserted `Effects::PURE`, i.e. the checked extent reaches it as an
+      ordinary residual and is never re-asserted. The PE, DCE, and lowering legs were already pinned by
+      `test_dimension_from_scalar` (residual PE case), `test_dimension_requirement_effects_and_partial_evaluation`
+      (DCE retention and ordering), and the composite lowering fixtures.)*
+- [x] (Tier 3) Data-derived extents ride the linear-call residual contract through differentiation unchanged.
+      *(Closed 2026-08-08 by `test_array_ir_reshape_differentiation_over_a_data_derived_extent` in
+      `arrays::operations::manipulation::tests`: a `f64[source, 4] -> f64[total]` reshape whose output extent comes
+      from `dimension_from_scalar` over an `i32[]` input. The rendered primal emits the gateway result as residual
+      output `%2` beside the geometry-read `%4 = dimension_size`, and the rendered tangent shows both as leading
+      residual operands of `linear_call [residual_count=2] %1 %2 %0`, with the gateway-defined `total` appearing
+      verbatim in both attached region boundaries. Executed legs: primal/tangent/pullback interpretation and a nested
+      `jvp()` of the linear program, which adds no dimension tangent input.)*
 - [ ] (Tier 3) Every operation without data-dependent lowering or ragged batching support fails with an exact
       diagnostic before execution; padding effects are unobservable on every supported path.
 
@@ -3311,7 +3436,12 @@ composes nested axes already, and the relaxed-while-predicate work established t
 The 2026-08-08 matrix re-audit ticked twelve rows with recorded evidence, reworded three, and left the following
 concrete residue:
 
-- [ ] Small-fixture batch closing four rows (~4 fixtures, about a day total):
+- [x] Small-fixture batch closing four rows (~4 fixtures, about a day total). *(Executed 2026-08-08 — all five
+      fixtures landed, closing seven matrix rows plus the Phase 12 differentiation item, and adding drift-gate
+      evidence to two already-ticked rows. One correction: the retained-JIT fixture measured that
+      alpha-equivalent-but-distinct `DimensionVariable` instantiations do **not** share a specialization, because
+      dimension identity is nominal (`Arc::ptr_eq`); the actual behavior is pinned and the cache-identity row's
+      wording was corrected accordingly. See the `Verification-matrix small-fixture batch (2026-08-08)` log entry.)*
   - `test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate` in the allocation-instrumented
     integration binary, mirroring the two array tests over `ArrayIrValue::Dimension` (closes the eager-projection
     allocation row; record that projected *binding* clones type metadata by design).
@@ -3329,10 +3459,38 @@ concrete residue:
   - Bonus, highest leverage: an exhaustive `match` over every `ArrayIrOperation` variant classifying its
     member-kind signature (array-to-array / dim-to-dim / dim-to-array gateway / geometry-consuming /
     region-forwarding), converting the two closed-family enumeration rows into a compile-forced gate (~50 lines).
-- [ ] Re-home or explicitly retire the nineteen absent P0 diagnostic golden fixtures named in
+- [x] Re-home or explicitly retire the nineteen absent P0 diagnostic golden fixtures named in
       `.tasks/dimensions_p0_evidence.md` (the message *templates* all survive with exact-match assertions in the
       current owners; several fixtures have near-equivalents to port assertions into; the genuinely unowned ones
       are requirement-order determinism and the three prover-probe tests). About 1-2 days.
+      *(Executed 2026-08-08 — six new fixtures added, five existing fixtures extended, two fixtures confirmed already
+      covered, two deferred to the concurrently owned batching files (both landed later the same day by the wave
+      mop-up; refer to the `Wave mop-up: deferred ports and concatenate transpose (2026-08-08)` log entry), four
+      retired with recorded drift. All five
+      frozen requirement diagnostic strings, including `elements % alignment == 0; observed elements=25,
+      alignment=8`, now have exact-match host-side assertions. See the `P0 diagnostic goldens re-homed (2026-08-08)`
+      log entry. Full disposition:*
+      | # | Archived fixture | Disposition |
+      |---:|---|---|
+      | 1 | `test_array_program_dynamic_reshape_with_explicit_dimension_operands` | covered-by `test_array_ir_explicit_shape_vertical_slice` and `test_array_ir_operation_tracing_has_only_explicit_dependencies` (`arrays/operations/mod.rs`), both exact-rendering; no change |
+      | 2 | `test_array_program_dimension_size_tracing_repeated_readers_and_import` | ported-to `test_dimension_size_program` (`operations/dimensions/dimension_size.rs`) |
+      | 3 | `test_dimension_program_tracing_rendering_and_import` | ported-to `test_dimension_add_program` (`operations/dimensions/dimension_add.rs`) |
+      | 4 | `test_array_program_data_dependent_extent_controls_multiple_bounded_outputs` | added `test_dimension_from_scalar_extent_controls_multiple_bounded_outputs` (`operations/dimensions/dimension_from_scalar.rs`); drift: the archived vector-element gateway is deleted |
+      | 5 | `test_array_program_dimension_data_gateways_tracing_and_import` | ported-to `test_dimension_from_scalar` and `test_dimension_to_scalar` |
+      | 6 | `test_array_program_condition_tracing_import_and_eager_execution` | added `test_composite_condition_tracing_rendering_and_eager_execution` (`arrays/operations/control_flow.rs`); drift: the archived branch-bounds-widening half is obsolete |
+      | 7 | `test_array_program_batching_stages_one_composite_graph` | added `test_array_ir_batching_stages_one_composite_graph` (`arrays/operations/mod.rs`, beside `test_array_ir_explicit_shape_vertical_slice`) by the wave mop-up |
+      | 8 | `test_array_program_batching_broadcast_preserves_explicit_dynamic_extent` | added `test_explicit_broadcast_batching_preserves_a_declared_dynamic_extent` (`operations/manipulation/broadcasting.rs`) by the wave mop-up; the untested rule is **correct** |
+      | 9 | `test_array_program_batching_dynamic_slice_varying_indices_uses_explicit_batch_extent` | retired: premise removed (`Program::batched` takes `axis_size: usize`; batch-varying indices use by-item expansion, not a gather with an extent operand) |
+      | 10 | `test_array_program_staged_dynamic_reshape_jvp_reuses_dimension_primals` | ported-to `test_array_ir_reshape_differentiation` (`arrays/operations/manipulation.rs`) |
+      | 11 | `test_array_program_dynamic_reshape_linearization_threads_dimension_residual_into_pullback` | covered-by `test_array_ir_reshape_differentiation` and `test_array_ir_reshape_differentiation_over_a_data_derived_extent`; no change |
+      | 12 | `test_array_program_concatenate_transpose_threads_dynamic_non_concatenated_extent` | first added as a rejection pin, then **resolved** by the wave mop-up: the composite transpose now slices the case directly and the fixture became `test_array_ir_concatenate_transpose_slices_a_dynamic_non_concatenated_extent`. The archived *residual* threading still does not exist and is not needed, because the geometry is live at the transpose boundary |
+      | 13 | `test_dimension_requirement_tracing_rendering_and_import` | added `test_dimension_requirement_program_rendering_and_relocation` (`operations/dimensions/dimension_requirement.rs`); drift: zero-result assertions are invisible in renderings |
+      | 14 | `test_array_program_dimension_requirement_static_failure_preserves_observed_actors` | added `test_dimension_requirement_failure_diagnostics`; drift: the type-time path drops observed values |
+      | 15 | `test_dimension_requirement_order_is_deterministic` | added under the archived name |
+      | 16 | `test_array_program_dimension_requirement_simplification_preserves_residual_diagnostics` | ported-to `test_dimension_requirement_effects_and_partial_evaluation` |
+      | 17 | `test_dimension_ssa_requirement_proof_probes_and_negative_controls` | retired: depends on the absent congruence-transfer prover layer; see the owner design call item immediately below |
+      | 18 | `test_dimension_ssa_congruence_transfer_handles_zero_factors_and_wide_residues` | retired: same pointer |
+      | 19 | `test_array_program_dimension_requirement_proof_inventory` | retired: same pointer |
 - [ ] Owner design call: the P0 baseline's congruence-transfer prover layer does not exist in the current
       `AbstractDimensionValue` (interval + exact + same-variable only), so e.g. `require_divisible_by(n*4, 2)`
       residualizes a runtime assertion the archive proved statically. Either reinstate congruence transfer in the
@@ -6474,3 +6632,963 @@ non-additive-combiner rejection and its message are preserved verbatim from the 
 **Gates.** `cargo check --workspace --all-targets` 0 errors / 0 warnings; `ryft-core --lib` 1,175 passed / 0 failed;
 `ryft-xla` 439 passed / 0 failed / 1 ignored; `cargo test -p ryft-macros-tests` passed; `rustfmt --edition 2024 --check`
 clean on all six touched files; `cargo doc -p ryft-core --no-deps` no new warnings.
+
+### Composite sharding-normalization Reshard swap rejected (2026-08-08)
+
+The optional, risk-gated item proposing to restage `ArrayIrBatching::prepare_inputs`'s batch-axis sharding
+normalization as a projected `ReshardOperation` bind was evaluated and **rejected**. No production code changed; the
+one added fixture converts the negative result into a drift gate.
+
+**Gate 1 — acceptance predicate: FAILS.** The item assumed `ReshardOperation` "replaces the output sharding
+wholesale". It does not. `ReshardOperation::infer_output_types` (`operations/sharding.rs`) takes the target's
+`dimensions`, `unreduced_axes`, and `reduced_axes`, but then *discards the target's `varying_manual_axes` and
+substitutes the operand's* — deliberately, because a reshard changes placement, and placement is orthogonal to which
+manual axes a value varies across. It additionally rejects any target whose sharded dimensions, unreduced axes, or
+reduced axes reference an `Auto` mesh axis. `normalized_batch_axis_type` (`arrays/batching.rs`) does the opposite on
+both counts, again deliberately:
+
+  - it *extends* `varying_manual_axes` with the manual axes introduced by the new batch-axis placement, so a mapped
+    input renormalized from `Replicated` onto `Sharded(["m"])` (manual `m`) becomes varying along `m`; and
+  - it carries every non-batch dimension and both reduction sets over verbatim, so an input with an unrelated
+    dimension placed on an `Auto` axis — a normal type, produced by `dot`/`gather` inference and by `shard_map`
+    projection, both of which call `Sharding::without_auto_axes` precisely because auto-axis placements are
+    representable — survives normalization untouched.
+
+Consequently the swap is not type-preserving in the first case and turns a placement relabel into a hard
+`TypeError` in the second. Both divergences are now pinned empirically by
+`arrays::batching::tests::test_batch_axis_sharding_normalization_is_not_a_reshard`, written before any swap was
+attempted; loosening either assertion is the signal that the swap has become viable.
+
+**Gate 2 — adjoint: reachable, and the broadcast is the safer dual.** The normalization is staged into
+`batching_context.parent()`, so under `vmap`-inside-`vjp` it lands in the differentiated program and is reached by
+transposition; the question is real. Tracing both duals:
+
+  - The current path stages a rank-preserving identity-axis `DynamicBroadcastOperation`. Its transpose
+    (`operations/manipulation/broadcasting.rs`) delegates to the projected homogeneous `BroadcastOperation`
+    transpose, which calls `BroadcastDerivativeAlignment::unalign_cotangent_along`
+    (`differentiation/elementwise.rs`). With no reduced or permuted axes that helper reduces nothing, then
+    **reshards the contribution onto the operand cotangent's placement**, then pins any residual metadata-only
+    difference with an axis-identity broadcast, and finally *verifies* the result equals the required input
+    cotangent type.
+  - A `ReshardOperation` would transpose to `cotangent.reshard(input_cotangent_sharding)` — the same declared target.
+
+So in the ordinary case the two adjoints agree; the current broadcast already dualizes through a reshard. Where they
+diverge is exactly the gate-1 configurations, and there the broadcast is strictly better: `Reshard`'s transpose has
+no metadata-pinning fallback for a *sharded* input (it broadcasts only when the input carries no sharding at all)
+and no final type check, so the staged reshard would inherit the incoming cotangent's `varying_manual_axes` and
+produce a mistyped input cotangent; and with auto-axis placements the reshard target is itself invalid, so the
+pullback would fail to build where it succeeds today. The gate's own instruction therefore applies: keep the
+broadcast.
+
+**Second half of the item — the "unused" bound is not unused.** The `+ From<ReshardOperation>` bound on
+`BroadcastOperation`'s transpose rule (`operations/manipulation/broadcasting.rs`) was recorded on 2026-08-07 as
+unused. It is required, and reached indirectly: the rule's cotangents are `Tracer<TracingContext<V, O>>` values, so
+`unalign_cotangent_along`'s blanket impl needs `Tracer<…>: Reshard`, which the blanket `Reshard` impl grants only
+when `O: From<ReshardOperation>`; the helper genuinely calls `.reshard(…)` on the redistribution step above.
+Verified by deletion: `cargo check -p ryft-core --lib` then fails with
+`E0599: the method 'unalign_cotangent_along' exists for reference '&Tracer<TracingContext<V, O>>', but its trait
+bounds were not satisfied`. The line was restored byte-identical.
+
+**Ledger.** Unchanged — the sanctioned-reads gate keeps all eight sites, including `prepare_inputs`'s sharding
+normalization (which reaches `array_dimension` only through `folded_array_dimension`, and so already stages reads
+for genuinely dynamic axes only, the residual cost the swap was meant to remove).
+
+**Test delta.** `ryft-core --lib` went from 1,179 to 1,180 tests: +1, the new drift-gate fixture, which passes. No
+existing test changed behavior, since no production code changed. `ryft-xla` unchanged at 439.
+
+**Gates.** `cargo check --workspace --all-targets` 0 errors / 0 warnings; `cargo check -p ryft-core --all-targets`
+0 errors / 0 warnings; `ryft-core --lib` 1,179 passed / 1 failed; `ryft-core` integration suites 6 + 6 passed and 53
+doctests passed / 16 ignored; `ryft-xla --lib --test-threads=1` 439 passed / 0 failed / 1 ignored;
+`cargo test -p ryft-macros-tests` 20 + 17 passed; `rustfmt --edition 2024 --check` clean on
+`crates/ryft-core/src/arrays/batching.rs`, the only file this item touched.
+
+The single lib failure is foreign and attributed: `arrays::operations::constants::tests::test_array_constants` at
+`arrays/operations/constants.rs:1420`, an in-flight error-message assertion in another agent's concurrent edit of that
+file (+111 uncommitted lines there). It is untouched by, and unreachable from, this item's one added test. The
+workspace check also transiently reported errors in `operations/control_flow/while.rs`, `differentiation/forward.rs`,
+and the `ryft-xla` differentiation surface during this item; all were concurrent-migration churn and all cleared on
+retry without any action here.
+
+### Verification-matrix small-fixture batch (2026-08-08)
+
+Executed the "Small-fixture batch" residue item of the 2026-08-08 matrix re-audit. Five fixtures landed; no production
+code changed.
+
+**Fixture 1 — eager dimension projection allocates nothing.**
+`test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate` in
+`crates/ryft-core/tests/test_array_ir_projection_allocations.rs`, beside the two existing array-projection fixtures and
+sharing their counting-global-allocator plus serializing-mutex harness. A new `stored_dimension()` setup helper builds
+the measured value outside the counted interval. Both legs assert `AllocationStatistics::default()`: 1,000 borrowed
+`ValueProjection<DimensionType>::projected` calls (repeated so the contract is exactly zero rather than a small
+constant) and one consuming `into_projected`. The module doc now covers both members. The fixture records that
+projected *binding* (`ProjectedContext::bind`) clones type metadata by design — a refcount bump on the shared
+`DimensionVariable` payload — and that this is outside the measured contract.
+
+**Fixture 2 — ordered assertions survive AD.**
+`test_dimension_from_scalar_ordered_assertions_survive_differentiation`, placed in
+`operations::dimensions::dimension_from_scalar::tests`. Placement rationale: the fixture is a *composite*
+`ArrayIrValue<Array>` / `ArrayIrOperation<Array>` program and the gateway is its subject, so it belongs beside the
+gateway's existing composite-domain AD coverage; `dimension_requirement::tests` is deliberately homogeneous over
+`DimensionValue` / `DimensionOperation` and would have had to import the whole array universe to host it. The program
+converts an `i32[]` input through the gateway, requires inconclusive `[2, 8)` bounds on the result, broadcasts an
+`f64[]` input to that extent, and applies `sin`. A local `assertion_operation_names` helper filters instructions by
+`Effect::OrderedAssertion`. Asserted on the source program, on `jvp()`, and on `linearize().primal()`:
+`Effects::single(Effect::OrderedAssertion)` and the exact sequence `[dimension_from_scalar,
+dimension_require_bounds]`. The compact linear tangent sub-program is asserted `Effects::PURE` — it consumes the
+already-checked extent as an ordinary residual and never re-asserts it. That last leg was left open ("pin whichever
+way it lands"); it landed pure, which is the correct contract and is stated as such in the fixture.
+
+**Fixture 3 — retained-JIT cache identity.**
+`test_array_ir_dynamic_zero_retained_jit_specializes_on_dimension_identity`, placed in
+`arrays::operations::constants::tests` beside `test_array_ir_dynamic_zero_retained_jit_reuses_one_specialization`,
+which owns the only `RetainedJitDomain` fixture (a composite `CompilationDomain` with no compilation cache, so every
+`compile` is counted). `compilation::function::tests` was rejected as a home: its `TestDomain` is `ArrayType`-only, has
+no dimension member, and caches compilations behind a `Debug`-formatted string key that would have collided across
+same-named variables. The function takes `Vec<ArrayIrType>` of two dimensions and stages a two-dimensional dynamic
+zero. Four calls: two differing only in runtime extent, one over freshly created alpha-equivalent variables (identical
+names and bounds), and one permuting the original two live identities.
+
+**Surprise, and the actual behavior pinned.** The residue item predicted that the alpha-equivalent pair would *share*
+a specialization. It does not, and the fixture pins the real behavior: `DimensionVariable` identity is nominal
+(`PartialEq`/`Hash` are `Arc::ptr_eq` / `Arc::as_ptr`), `DimensionType` is exactly that identity plus bounds, and the
+`JitCacheKey` is built from the runtime values' own `Typed::r#type`, so independently created same-named variables are
+different input types. Measured: 4 calls -> 1 dispatch hit, 3 dispatch misses, 3 traces, 3 lowerings, 3 compilation
+requests, 3 retained specializations, 3 backend compilations. This mirrors the region-interning level exactly, where
+`test_program_builder_type_identity_instantiation_cache_preserves_live_identities` also keeps separately created
+identities distinct (`assert_ne!(first, second)`) and shares only the renaming-free instantiation
+(`assert_eq!(plain, direct)`). The cache-identity matrix row's wording was corrected accordingly: the invariance this
+system guarantees is invariance to the *runtime extent*, not to the declared identity.
+
+**Fixture 4 — gateway-defined extents on the linear-call residual contract.**
+`test_array_ir_reshape_differentiation_over_a_data_derived_extent` in `arrays::operations::manipulation::tests`,
+cloning the structure of `test_array_ir_reshape_differentiation`'s dynamic leg. A first attempt over a *static*
+`f64[6]` source produced no `linear_call` at all — with a static source the inverse reshape is trivially expressible,
+so the linear rule stages a bare `reshape` and the residual edge, while still present, is not a linear-call operand.
+The landed fixture therefore reshapes `f64[source, 4] -> f64[total]`, where `total` comes from `dimension_from_scalar`
+over an `i32[]` input, so the transpose needs the geometry-read `source` and the forward needs the data-derived
+`total`. Both rendered programs are asserted in full with `indoc!`. The primal emits the gateway result as residual
+`%2` beside `%4 = dimension_size [axis=0] %0`; the tangent shows
+`linear_call [residual_count=2] %1 %2 %0` with both dimensions as leading residual operands and `total` appearing
+verbatim in both attached region boundaries. Executed legs: primal/tangent/pullback interpretation, plus a nested
+`linearization.tangent().jvp()` that adds one array tangent input and no dimension tangent input. This satisfies the
+full text of the Phase 12 differentiation item (linearization, transposition, and nested JVP), which is now ticked.
+
+**Fixture 5 — compile-forced closed-family gate.**
+`test_array_ir_operation_member_kinds_are_a_closed_family` in `arrays::operations::tests`, with a module-local
+`MemberKindSignature` enum and a wildcard-free `member_kind_signature` match over all 23 `ArrayIrOperation` variants.
+Adding a variant cannot compile until its member-kind signature is declared and recorded in the test's hand-maintained
+table of one constructed instance per variant, in declaration order. The taxonomy needed one category beyond the four
+named in the residue item: the residue's "dimension-to-array gateway" covers only one direction, so the enum
+distinguishes `DimensionToArrayGateway` (exactly two: `DimensionToScalar` and the composite-level
+`Compare<ArrayIrType>`) from `ArrayToDimensionGateway` (exactly one: `DimensionFromScalar`), with the remaining
+variants classified `ArrayToArray`, `DimensionToDimension`, `GeometryMixed`, or `RegionForwarding`. Both gateway counts
+are asserted explicitly. `DimensionSize` is `GeometryMixed`, not a gateway: it reads an array's type-level geometry
+rather than converting a value across member kinds.
+
+**Rows closed.** Eager-projection allocation; requirement effects through every transform; alpha-equivalence /
+cache identity (with the correction above); tier-3 runtime extent absent from type equality, hashing, and
+retained-compilation cache keys; tier-3 gateway `OrderedAssertion` ordering; tier-3 data-derived extents on the
+linear-call residual contract; plus the Phase 12 differentiation item. Drift-gate evidence was added to the two
+already-ticked closed-family enumeration rows.
+
+**Test delta.** +4 `ryft-core --lib` fixtures and +1 `ryft-core` integration fixture (allocation binary, 5 -> 6). No
+other counts changed.
+
+**Gates.** `cargo check --workspace --all-targets` 0 errors / 0 warnings; `cargo test -p ryft-xla --lib
+-- --test-threads=1` 439 passed / 0 failed / 1 ignored; `ryft-core` integration binaries 6 + 6 passed and 53 doctests
+passed / 16 ignored; `rustfmt --edition 2024 --check` clean on all five touched files; `cargo doc -p ryft-core
+--no-deps` adds no new warnings (the two warnings reported against `arrays/operations/mod.rs` are the pre-existing
+redundant-explicit-link targets on the `DimensionOperation` and `ArrayIrOperation` doc comments, untouched here).
+
+**Pre-existing failure, not from this item.** `arrays::operations::constants::tests::test_array_constants` fails on the
+`fill` diagnostic: the assertion expects `... expand it with 'dynamic_broadcast'` while
+`operations/constants/fill.rs` still emits `... expand it with 'dynamic_broadcast' instead`. Both sides are unchanged
+from `HEAD` (`3cd203bf0`), which committed the test-side wording without the production-side wording, so this is
+in-flight concurrent work on the diagnostics pass and was deliberately left alone. `ryft-core --lib` therefore reports
+1,181 passed / 1 failed out of 1,182 at handoff; that one failure is the only one, and all four new lib fixtures pass.
+The total drifted upward during this item (1,180 -> 1,182) from concurrent commits, so the delta is stated as +4/+1
+rather than as an absolute count.
+
+### Zero/one residue slices: transposition residuals and generic drivers (2026-08-08)
+
+Executed the two slices deferred by the Phase 6 zero/one hygiene entry below. Both were re-verified empirically
+before being changed, and the empirical results reclassified most of the "no exemplar possible" transposition
+cluster.
+
+Delivered mechanism: `MaybeZero::materialize_like_any` (and its single-candidate alias `MaybeZero::materialize_like`)
+in `programs/atoms.rs`. It is the type-generic sibling of `materialize_array_tangent`: given a structural zero, it
+consults candidate live values only when the zero's type carries a `TypeIdentityPosition::Reference` — exactly the
+condition under which the nullary `ZeroOperation` refuses to construct — and stages `ZeroLikeOperation` over the
+first candidate whose type equals the zero's type, otherwise keeping the canonical nullary zero. Gating on
+*reference*-position identities rather than on `identities().next().is_some()` is deliberate and strictly narrower:
+it is precisely `check_constructor_type_has_no_identity_references`'s predicate, so a definition-position identity
+(e.g., a first-class `DimensionType`) is never diverted onto an exemplar that would be nonsense for it. Type equality
+is a sufficient exemplar test because a repeated `TypeIdentity` denotes one runtime quantity, so two values of the
+same reference-bearing type necessarily have the same runtime extents. The doc comment records the semantic
+difference that forces the gate: `zero_like` takes an operand and therefore introduces a dependence edge keeping the
+exemplar alive, while the nullary zero has no operands at all.
+
+One conversion supports the bound: `From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A>` in
+`arrays/operations/constants.rs`, mapping to the homogeneous member constructor (a zero-like reads its complete
+output type from its exemplar, so the composite family needs no mixed encoding for it), plus the matching
+`ZeroLikeOperation<ArrayIrType>` entry in `ryft-xla`'s `impl_composite_operation_conversion!`. Adding a second
+`From<ZeroLikeOperation<_>>` impl to those two families made three bare `ZeroLikeOperation::new()` calls in
+`ryft-xla`'s lowering tests ambiguous; they were turbofished.
+
+**Slice A — transposition cluster.** The class as a whole was *not* the "needs a new residual" class the inventory
+assumed. Two probes settled it. First, a mixed condition whose third branch output is dead fails today with exactly
+`'zero' cannot construct type f64[extent] without operands because it references identity extent` when its pullback
+is built — a hard capability gap, not silent wrongness. Second, the geometry it needs is already at the boundary:
+the all-zero early return guarantees at least one *live* peer cotangent, and the known predicate/residual operands
+are live too, so a value of the required type is in scope without retaining anything new.
+
+| Site | Universe | Disposition |
+| --- | --- | --- |
+| `manipulation/gathering.rs` gather transpose | homogeneous `ArrayType` | **static-only, documented** — the mixed `MemberDifferentiableOperation` rule routes a dynamic operand into a residual-carrying `LinearCallOperation`, so this rule only ever sees a static operand |
+| `manipulation/slicing.rs` slice transpose | homogeneous `ArrayType` | **static-only, documented** — same mixed-rule guard |
+| `manipulation/slicing.rs` dynamic-slice transpose | homogeneous `ArrayType` | **static-only, documented** — same mixed-rule guard |
+| `control_flow/condition.rs` `transpose_primal_condition` | type-generic | **fixed by consuming existing geometry** — live peer cotangents chained with the known residuals |
+| `control_flow/scan.rs` `transpose_array_scan` captured form | type-generic | **fixed by consuming existing geometry** — live peer cotangents chained with the known operands |
+| `control_flow/scan.rs` `transpose_primal_scan` linear carries | type-generic | **fixed by consuming existing geometry** — same candidate set |
+| `control_flow/scan.rs` `transpose_primal_scan` stacked y-outputs | type-generic | **remaining, `TODO(eaplatanios)` in place** — a dead stacked output's cotangent type is length-prefixed, so no peer at this boundary carries it; closing it needs identity-directed geometry (e.g., a known dimension carry threaded by the scan JVP rule), which `ZeroLikeOperation` cannot express |
+| `differentiation/linear.rs` `LinearCallOperation::transpose` | type-generic | **fixed by consuming existing geometry** — live peer cotangents chained with the retained residuals |
+
+No site needed a new linear-call residual. The rules that *do* stage residual-carrying linear calls (reshape, pad,
+slice, gather, reduce, and the shape-changing collectives) were already residual-aware from P6b, which is exactly why
+their homogeneous transposes are unreachable with dynamic geometry.
+
+**Slice B — type-generic drivers.** Each driver has the operand's own primal in scope, and a primal is a live value
+of exactly the tangent type whenever the array family does not widen the element type, so `materialize_like` applies
+directly.
+
+| Site | Bound threading | Disposition |
+| --- | --- | --- |
+| `control_flow/condition.rs` fused JVP operand tangents | `+ From<ZeroLikeOperation<C::Type>>` on the `DifferentiableOperation` impl | **exemplar-staged** (`operand.primal()`) |
+| `control_flow/scan.rs` fused JVP carry and scanned tangents | same, on the `DifferentiableOperation` impl | **exemplar-staged** (`input.primal()`) |
+| `control_flow/while.rs` bounded-rule tangent scan operands | `jvp_while_bounded`, `jvp_array_backed_while`, and both `WhileJvp` impls (`ArrayType`, `ArrayIrType`) | **exemplar-staged** (`input.primal()`) |
+| `control_flow/while.rs` fused doubled-state loop operands | `jvp_while_fused` | **exemplar-staged** (`input.primal()`) |
+| `differentiation/linear.rs` higher-order linear-call JVP | `Operation: From<ZeroLikeOperation<C::Type>>` on the `DifferentiableOperation` impl | **exemplar-staged** (`input.primal()`) |
+| `tracing_v2/custom_derivatives.rs` custom-JVP region inputs | same, on the `CustomJvpOperation` impl | **exemplar-staged** (`input.primal()`) |
+| `tracing_v2/custom_derivatives.rs` custom-VJP carrier operands | same, on the `CustomVjpOperation` impl | **exemplar-staged** (`input.primal()`) |
+| `tracing_v2/rematerialization.rs` tangent-region operands | same, on the `RematerializeOperation` impl | **exemplar-staged** (`input.primal()`) |
+| `differentiation/reverse.rs` auxiliary cotangent seeds | `+ From<ZeroLikeOperation<Self::Type>>` on the four macro-generated `value_and_gradient_with_aux*` methods and their free-function counterparts | **exemplar-staged** (the auxiliary leaf itself) |
+| `differentiation/forward.rs` fused-JVP output tangent boundary | **none** — reuses the `ResidualZeroProvider<V::Type>` bound the impl already carries | **residual protocol** (`capture_and_validate_zero_residual_values` + `zero_operation_with_residuals` over the output's own primal) |
+| `operations/attention.rs` sequence-length cotangents | — | **static-only, documented** — homogeneous `Domain<Type = ArrayType>` entry point, and the cotangent retypes the element to the zero space so the lengths value is not an exemplar of the required type |
+
+`forward.rs` deliberately does not use the exemplar. Threading `From<ZeroLikeOperation<V::Type>>` through
+`RegionRef::jvp`/`linearize` cascades into `RecursiveDifferentiationDriver`, `Program::jvp`/`linearize`,
+`ForwardModeDifferentiate`, `ReverseModeDifferentiate`, and `ryft-xla`'s jit and shard-map paths — a very large blast
+radius for one boundary. The residual protocol is the mechanism the codebase already designates for this exact role
+and the impl block already requires it, so the site costs no new bound at all. For an identity-free type it declares
+zero residuals and reduces to the same nullary zero, so the staged shape is unchanged there.
+
+No `OneLikeOperation` bound was needed: the only production `One` materialization in the inventory is
+`reverse.rs`'s `gradient_seed`, which is class (a) and guarded by `is_scalar()`.
+
+Coverage (three new `ryft-core` tests, all in `arrays/operations/control_flow.rs`):
+`test_composite_condition_jvp_shapes_a_disconnected_dynamic_operand_tangent_from_its_primal` severs one dynamic
+operand's tangent with `stop_gradient` so the fused conditional has one live and one structurally zero dynamic
+tangent operand, asserts the JVP renders a `zero_like`, and interprets it end to end;
+`test_composite_condition_pullback_shapes_a_dead_dynamic_output_cotangent_from_a_live_peer` and
+`test_composite_scan_pullback_shapes_a_dead_dynamic_carry_cotangent_from_a_live_peer` pin the previously failing
+dynamic transpositions with exact rendered pullback IR (each shows `zero_like %0` feeding the transposed
+condition/reversed scan) plus an interpretation check.
+
+Verification: `cargo check --workspace --all-targets` is clean with zero errors and zero warnings. `ryft-core --lib`
+is 1,182 passed and 1 failed; the one failure is
+`arrays::operations::constants::tests::test_array_constants`, which is **pre-existing at `HEAD`** and unrelated —
+it asserts a `Fill` diagnostic without the trailing word `instead` while `operations/constants/fill.rs` emits it, and
+`git show HEAD:` confirms both sides are unmodified in this working tree. `ryft-core`'s two integration binaries pass
+6 + 6, `ryft-xla --lib` with `--test-threads=1` passes 439 with 1 ignored, and `ryft-macros-tests` passes 20 + 17.
+This change contributes exactly the three tests above. **Zero rendered fixtures for static programs changed**, and
+none needed regeneration: every migration is gated on a reference-position identity, which a statically shaped type
+never has, so a static program stages byte-identical instruction sequences. `cargo doc -p ryft-core --no-deps`
+introduces no new warnings; the eight `[`Type`](crate::Type)` links in `programs/atoms.rs` were shortened to
+`[`Type`]` because importing `Type` for the new gate brought it into scope and made the explicit targets redundant.
+Per-file `rustfmt --edition 2024 --check` is clean on every edited file.
+
+### Homogeneous-baseline replay refinement: exact rejection (2026-08-08)
+
+Closed the homogeneous-baseline replay refinement item by implementing the **exact replay-time rejection** rather than
+accepting the limitation with a documented diagnostic. The decision rationale, recorded on the item itself: the
+inference-level failure actively misleads (it describes an inference rule when the real situation is a boundary-refined
+identity that the payload still stores symbolically); the rejection preserves the no-ambient-recovery invariant with no
+new mechanism; its cost lands only on eager replay of dynamically typed homogeneous programs, a reference/testing path;
+and actually refining payloads would need an identity-to-extent substitution mechanism the type system deliberately
+does not have (extents reach an operation only as explicit dimension SSA operands, as in `DynamicBroadcastOperation`).
+
+**Rejection site.** `reject_unrefined_operation_payload` in `crates/ryft-core/src/interpretation.rs`, wired as a
+`map_err` on the `Context::bind` closure of both `Program::interpret_in_context` and `RegionRef::interpret_in_context`
+(the nested-region path has the identical limitation and reaches replay through the second entry point). Intercepting
+at the bind failure — rather than pre-scanning instructions — is what keeps the check narrow and free: it runs only
+after a bind has already failed, only for `ProgramError::Type` failures, and only over the failing instruction's
+declared output types, which are exactly the types a homogeneous payload contributes to the surrounding program. A
+non-type failure, an already-rewritten nested rejection, or an instruction whose declared outputs name no refined
+identity all propagate unchanged.
+
+**Diagnostic.** New `ProgramError::UnrefinedOperationPayload { operation, identity, refinement, message }` in
+`crates/ryft-core/src/programs/mod.rs`, rendering:
+
+```text
+cannot replay operation 'broadcast' whose declared output type names type identity n that the input boundary refined
+to 3, because replay refines only program and region boundaries and not instruction operation payloads; the payload
+rejected the refined inputs with: broadcasting input axis 0 has size 3 but the output has size n; a dynamic dimension
+only broadcasts to an identical dynamic dimension
+```
+
+The identity-to-extent lookup goes through a new `TypeRefinements::established_refinement(&self, identity)` hook in
+`crates/ryft-core/src/programs/types.rs`, overridden by `ArrayTypeRefinements` (binding lookup, extent rendered) and
+delegated by `ArrayIrTypeRefinements`.
+
+**Review of the refinement accessor (2026-08-08).** A design review objected that `established_refinement` is
+diagnostic-only and that widening the generic `TypeRefinements` contract with a required method serving one caller is
+unwarranted, and further proposed that the whole rejection surface is transitional and should carry a deletion TODO.
+Resolution:
+
+  - The deletion premise is **wrong**; the surface is end-state. The composite universe already has explicit dimension
+    SSA (`DynamicBroadcastOperation`), yet the homogeneous payload with symbolic stored geometry persists
+    deliberately: the 2026-08-07 removability audit concluded the homogeneous family is the permanent baseline,
+    `StaticArrayBatchingPolicy::broadcast_input` requires the dynamic stored output type, and the homogeneous universe
+    (`Context<Type = ArrayType>`, no `DimensionSize` variant) structurally cannot carry extent operands. The item
+    itself forbids the `From<BroadcastOperation> for ArrayIrOperation` escape hatch. The trigger condition "once
+    geometry is explicit SSA" therefore never fires for this path, and the diagnostic lives as long as eager replay of
+    dynamically typed homogeneous programs is supported. No deletion TODO was added.
+  - The contract-widening half **is** valid and was fixed: `established_refinement` is now a *defaulted* method whose
+    default body returns `None`, documented as an optional read-only diagnostic hook that never participates in
+    establishment or validation. The now-redundant override in `impl TypeRefinements<T> for ()` was deleted; only
+    families that record cross-value facts override it. The hook is an opt-in, not an obligation.
+  - The accessor is diagnostic-only *by design*: it is read-only and never substitutes a refinement back into a stored
+    payload, which is precisely why the rejection introduces no ambient recovery.
+
+**Tests.** `interpretation::tests::test_program_interpret_rejects_unrefined_operation_payload` builds the payload the
+plan item names — a homogeneous `broadcast [output_type=f64[2, n], output_axes=[1]]` over an `f64[n]` input, the same
+shape `test_program_batched_carries_dynamic_per_item_dimensions` stages from batching — pins the staged rendering,
+asserts the exact rejection for an `f64[3]` eager input (`identity: "n"`, `refinement: "3"`, and the verbatim payload
+message), and closes with a statically typed broadcast that replays normally, showing the ordinary path is untouched.
+`experimental::lowering::tests::test_plain_broadcast_with_dynamic_result_type_lowers_to_bounded_broadcast_in_dim` in
+`ryft-xla` pins `lower_broadcast_to_mlir` for a dynamic result type in both directions: a *bounded* dynamic extent
+lowers to `stablehlo.broadcast_in_dim` over `tensor<2x?xf32, #stablehlo.bounds<?, 4>>` with no extent operand
+(exact rendered module), while an *unbounded* dynamic extent produces a module that fails StableHLO verification and
+returns `LoweringError::MlirVerificationFailure`, because `stablehlo.broadcast_in_dim` requires a statically shaped or
+single-bounded-dimension result.
+
+Verification: `cargo check --workspace --all-targets` clean with zero warnings; `ryft-core --lib`, `ryft-core`
+integration binaries, `ryft-xla --lib` with `--test-threads=1`, and `ryft-macros-tests` all pass with the only failure
+being the pre-existing `arrays::operations::constants::tests::test_array_constants` (`Fill` diagnostic `instead`
+wording, red at `HEAD`). No rendered fixture changed. Per-file `rustfmt --edition 2024 --check` is clean on every
+edited file.
+
+### Composite carriers for CustomJvp/CustomVjp/Rematerialize (2026-08-08)
+
+The last three region-carrying array payloads without a composite carrier now have one, so the projected
+`ArrayIrOperation::Array` variant holds only region-free operations and its residue list is empty.
+
+**Decision rationale (owner-approved, JAX comparison).** JAX batches a `custom_jvp` / `custom_vjp` / `remat` wrapped
+jaxpr transparently: it has one type universe, the mapped extent is transform metadata rather than a value, and the
+primitive's params simply carry the rebatched jaxpr. Ryft's composite universe deliberately keeps a dynamic mapped
+extent as an ordinary first-class dimension SSA value, which is strictly more expressive but adds a boundary
+obligation JAX never has: `ArrayIrBatching` widens every structurally batched region to
+`[extent, inputs...] ↦ [extent, outputs...]`, and the leading *input* is load-bearing (it defines the
+`DimensionVariable` that every inserted dynamic batch dimension references, and a sealed program's types must be
+grounded in its own scope). The three wrappers' `Operation` contracts had no slot for it. Building the slot — rather
+than special-casing the composite policy or reintroducing a static extent — was chosen because, in the owner's words,
+it "feels like the most powerful option that doesn't really sacrifice anything": it costs one `usize` per payload,
+renders only when nonzero, and gives the wrappers the operand role JAX already has a name for.
+
+**Per-wrapper design.** Each of `CustomJvpOperation`, `CustomVjpOperation`, and `RematerializeOperation` gained a
+`nondifferentiated_count: usize` with `with_nondifferentiated_count` / `nondifferentiated_count` and a private
+`split_inputs`. It follows `LinearCallOperation::residual_count` exactly: a leading operand group that parameterizes
+the call, that every attached region receives positionally, and that no derivative interface pairs with a tangent or a
+cotangent. It is also the direct analogue of JAX's `nondiff_argnums`, whose rule-calling convention is the same split.
+Writing `L` for the leading group, `X` for the differentiated operands, `Y` for the outputs, and `R` for the forward
+residuals, the reconciled contracts are:
+
+  - `custom_jvp`: `primal: L ++ X ↦ Y`, `jvp: L ++ X ++ tangent(X) ↦ Y ++ tangent(Y)`. Only the tangent list changed;
+    the "primal inputs == wrapper inputs" clause the item quoted still holds verbatim, because the extent enters as an
+    ordinary wrapper operand.
+  - `custom_vjp`: `primal/forward: L ++ X ↦ Y (++ R)`, `backward: L ++ R ++ cotangent(Y) ↦ cotangent(X)`.
+  - `rematerialize`: `primal/forward: L ++ X ↦ Y (++ R)`, `backward: L ++ R ++ Y ↦ X`, `tangent: L ++ R ++ X ↦ Y`.
+
+`validated_custom_vjp_interfaces` and `validated_rematerialize_interfaces` became `validated_interfaces` methods on
+their payloads so they can consult the split. Each `jvp` rule feeds every dual primal but only the differentiated
+duals' tangents, and rejects a live tangent on a leading operand with an exact diagnostic instead of dropping it
+(dimension operands are always zero-space, so the guard never fires on batching-produced calls). `custom_vjp`'s
+transpose-only `LinearCallOperation` carrier now takes `L ++ R` as its residual group, which is exactly the backward
+region's own leading inputs. Rendering follows the `WhileOperation::iteration_bound` precedent: the bracketed
+`[nondifferentiated_count=N]` section appears only when `N > 0`, so no existing rendered fixture changed.
+
+**Policy-generic batching.** All three batching rules moved from `BatchableOperation<C, ArrayBatching<P>>` on
+`ArrayType` to `BatchableOperation<C, P>` for `T: DifferentiableType`, `C: Context<Type = T, Operation: From<Self>>`,
+`P: LinearCallBatchingPolicy<C>` — the same shape `LinearCallOperation` already had, which is why no new mechanism was
+needed. `BatchingContext::align_and_adapt_batched_program` was added beside `align_batched_program_outputs` (both now
+share a private `aligned_batched_program`): the extent-threading `Condition`/`While`/`Scan` consumers need the widened
+boundary, whereas a plain region must shed the relayed extent *output* through
+`BatchingPolicy::adapt_batched_program`. Each rule then prepends `BatchingPolicy::boundary_operands` to its operands
+and rebinds itself with `nondifferentiated_count + boundary_operands.len()`. Homogeneous array batching is unchanged
+byte for byte, because `ArrayBatching` returns no boundary operands and adapts boundary-preservingly.
+
+**Lift and cross-universe types.** `From<ArrayOperation<A>> for ArrayIrOperation<A>` promotes all three (carrying
+`nondifferentiated_count`, and `prevent_cse` for rematerialization) and now promotes *both* linear-call interface
+forms. The transpose-only form needed the cross-universe type lift the item called out: `LinearCallOperation` gained
+`transpose_only_interface() -> Option<(&[T], &[T])>`, the only view of the stored interface, and the lift maps each
+member type through `ArrayIrType::Array`. `XlaOperation` already had `CustomJvp`, `CustomVjp`, and `Rematerialize`
+variants, so `ryft-xla` needed only three `From<ArrayIrOperation<..>>` arms and three names in the
+"must be promoted to the XLA operation family before lowering" arm of `lower_array_ir_operation`.
+
+**Fixtures.** The three typed-rejection fixtures were replaced by working-transform fixtures in
+`arrays/operations/mod.rs`: `test_composite_lift_promotes_every_region_carrying_array_payload` (all five promotions
+plus the transpose-only interface lift), `test_composite_batching_of_a_{custom_jvp,custom_vjp,rematerialize}_payload`
+(each pins the exact rendered staged program, showing `custom_jvp [nondifferentiated_count=1] %0 %1` over a threaded
+`dimension<batch ∈ [1, 9)>` extent and every region rebuilt with boundary `[extent, inputs...] ↦ [outputs...]` — note
+the `jvp` region's `[extent, primal, tangent]` boundary, which is precisely the contract clause that previously had no
+slot), `test_composite_batching_of_a_linear_call_payload` (the preserved executable-linear-call case),
+`test_composite_differentiation_of_a_region_carrying_array_payload` (the rendered `jvp` program now proves the user
+rule's deliberately wrong tangent scale of three governed the result), and
+`test_composite_transposition_of_a_region_carrying_array_payload` (reverse mode through the composite carrier returns
+gradient `3` rather than the primal's true derivative `2`; a direct transpose of the raw un-linearized call is still
+rejected, but now by the payload's own `operation \`custom_jvp\` is not transposable` rule rather than by a projected
+adapter that never received its regions — that rejection is correct and matches JAX's treatment of
+`custom_jvp_call`).
+
+Nothing was resolved negatively. `test_array_ir_operation_member_kinds_are_a_closed_family` grew from 23 to 26
+variants, all `RegionForwarding`.
+
+Verification: `cargo check --workspace --all-targets` clean with zero warnings; `ryft-core --lib` 1194 passed / 1
+failed, `ryft-core` integration binaries (6 + 6) and doctests (53 passed / 16 ignored) green, `ryft-xla --lib`
+`--test-threads=1` 440 passed / 1 ignored, `ryft-macros-tests` 20 + 17. The only failure is the pre-existing
+`arrays::operations::constants::tests::test_array_constants` (`Fill` diagnostic `instead` wording, red at `HEAD`). The
+`ryft-core --lib` total rose from 1188 to 1195: this item contributes net +4 (one rejection fixture removed, two
+rewritten in place, five added), and the remaining +3 come from concurrent work by other owners. No pre-existing
+rendered fixture changed. Per-file `rustfmt --edition 2024 --check` is clean on every edited file.
+
+### P0 diagnostic goldens re-homed (2026-08-08)
+
+The nineteen P0 golden fixtures named in `.tasks/dimensions_p0_evidence.md` were absent from `crates/` (workspace-wide
+grep found zero occurrences of any of the nineteen names). Each was traced to its current behavioral owner and given
+one of five dispositions: already covered by an exact-match assertion, ported into a near-equivalent test, added as a
+new fixture, deferred to a concurrently owned file, or explicitly retired with the reason recorded. The full
+fixture-by-fixture table lives with the ticked item in the verification-matrix residue section above; this entry
+records what the work found and what it pinned.
+
+**New fixtures (six).**
+
+- `operations::dimensions::dimension_requirement::tests::test_dimension_requirement_program_rendering_and_relocation`
+  builds a two-requirement dimension program, pins its rendering, its ordered instruction sequence, and
+  `Effects::single(Effect::OrderedAssertion)`, then relocates it with `splice_program` and re-asserts all three plus
+  the first-failure diagnostic.
+- `..._failure_diagnostics` re-homes all five frozen requirement strings from the evidence document as exact
+  `assert_eq!` matches on `DimensionError::RequirementViolation` raised by eager `bind`:
+  `left == right; observed left=12, right=8`, `left <= right; observed left=12, right=8`,
+  `left % right == 0; observed left=12, right=5`, `right > 0 for divisibility; observed left=12, right=0`, and
+  `elements % alignment == 0; observed elements=25, alignment=8`. It also pins the bounds failure
+  (`BindingOutOfBounds { variable: "left", value: 3, bounds: [4, 16) }`) and both type-time wordings
+  (`high <= low is impossible from declared bounds`, `low in [5, 9) is impossible from declared bounds`).
+- `..._order_is_deterministic` builds the same requirement sequence twice and asserts byte-identical renderings and
+  identical instruction-name sequences, then proves that swapping two failing requirements swaps which diagnostic is
+  reported. This is the requirement-order determinism fixture the item called genuinely unowned.
+- `operations::dimensions::dimension_from_scalar::tests::test_dimension_from_scalar_extent_controls_multiple_bounded_outputs`
+  drives two sibling `broadcast` constructors from one gateway result, pins the rendering showing the single `%3`
+  extent edge feeding both, asserts both outputs share one type, and interprets at extents 1, 5, and 8.
+- `arrays::operations::control_flow::tests::test_composite_condition_tracing_rendering_and_eager_execution` pins the
+  rendered composite condition including both nested branch bodies, executes it under both predicate values, and
+  relocates it, re-asserting identical rendering and execution.
+- `arrays::operations::manipulation::tests::test_array_ir_concatenate_transpose_rejects_a_dynamic_non_concatenated_extent`
+  pins the *current* behavior described below.
+
+**Extended fixtures (five).** `test_dimension_size_program`, `test_dimension_add_program`, `test_dimension_from_scalar`,
+and `test_dimension_to_scalar` gained exact `indoc!` renderings plus a relocated-program rendering-equality assertion;
+`test_dimension_add_program` supplies the first rendered dimension-only program in the tree.
+`test_dimension_requirement_effects_and_partial_evaluation` gained the linking assertion the archived simplification
+fixture existed for: after `simplified()` erases the proven self-equality, interpreting the residual program still
+raises each surviving requirement's original variable-named diagnostic, earliest first.
+`test_array_ir_reshape_differentiation` gained the reuse assertion: the dual program stages exactly one primal
+`reshape`, one `dimension_mul`, and two `dimension_size`, and the staged `linear_call`'s first two residual operands
+are exactly the primal reshape's own dimension operands.
+
+**Recorded drift (four findings; no production wording or behavior was changed).**
+
+1. **Zero-result assertions are invisible in renderings.** `Program::render` walks *atoms*, so an instruction with no
+   outputs is never emitted. A requirement-only program renders as `lambda ... .\nin ()`. The archived
+   `test_dimension_requirement_tracing_rendering_and_import` asserted rendered requirement text that the current
+   renderer structurally cannot produce. The actual behavior is now pinned with a comment explaining it; assertion
+   presence and order remain observable through the instruction sequence, `Effects`, and the first reported failure.
+2. **`static_violation` drops the observed actors.** Requirements disproven from declared bounds at type-inference
+   time emit `"{requirement} is impossible from declared bounds"` with no observed values, because no concrete extent
+   exists yet. The archived fixture's name promises observed actors on the *static* path; only the runtime
+   `evaluate_*` path carries them. Both wordings are now pinned so either can only change deliberately.
+3. **Concatenate transposition rejects a dynamic non-concatenated axis, in the composite path too.** The comment in
+   `operations::manipulation::concatenation::tests::test_concatenate` claimed "Composite differentiation retains that
+   runtime extent as an explicit residual"; no test proved it, and it is false. The composite
+   `TransposableOperation for ConcatenateOperation<ArrayIrType>` delegates cotangent slicing to the homogeneous rule,
+   which requires a static size on every non-concatenated axis, so `transpose_with_respect_to` fails with
+   `'concatenate' transpose requires a static size on axis 1 but operand 0 has size columns` even though the extent is
+   available as first-class dimension SSA. Forward mode is unaffected. The stale comment was corrected to point at the
+   new pinning test, and the gap was filed as a separate follow-up. **Resolved 2026-08-08** by the wave mop-up: the
+   composite rule now stages the slicing itself for this case, and the rejection pin became a working-transposition
+   fixture. Refer to the `Wave mop-up: deferred ports and concatenate transpose (2026-08-08)` log entry.
+4. **Two archived premises no longer exist.** The vector-element dimension gateway
+   (`DimensionFromVectorElementOperation`, used by archived fixtures 4 and 5) is deleted; `dimension_from_scalar` is
+   the sole numerical-data-to-dimension boundary. `Program::batched` now takes `axis_size: usize` rather than a
+   first-class dimension, and batch-varying dynamic-slice indices go through `batch_by_item_expansion`
+   (`operations/manipulation/slicing.rs`) emitting per-item `slice`/`update_slice` rather than a gather with an
+   explicit batch-extent operand, so archived fixture 9 was retired rather than reconstructed.
+
+**Deferred to owners (two).** Archived fixtures 7 and 8 belong to files under concurrent edit by other owners. Fixture
+7 ("batching stages one composite graph") wants a program whose body mixes array operations with first-class
+`dimension_add`/`dimension_size` and an assertion that batching produces a single composite graph with an exact
+instruction-name sequence; the natural hosts are `test_array_ir_batching_policy` / `test_array_ir_batch_entrypoints`
+(`arrays/batching.rs`) or `test_array_ir_explicit_shape_vertical_slice` (`arrays/operations/mod.rs`). Fixture 8
+("batching broadcast preserves explicit dynamic extent") needs the first test anywhere that drives
+`DynamicBroadcastOperation::batch` on a *mapped* input and asserts the lifted operation forwards the declared
+`output_extents` rather than reconstructing them; the rule lives at `operations/manipulation/broadcasting.rs:192` and
+every `check_operation_batching!` block in that file currently targets the homogeneous `BroadcastOperation`.
+**Both landed 2026-08-08** in the wave mop-up; refer to the
+`Wave mop-up: deferred ports and concatenate transpose (2026-08-08)` log entry.
+
+**Retired with pointer (three).** `test_dimension_ssa_requirement_proof_probes_and_negative_controls`,
+`test_dimension_ssa_congruence_transfer_handles_zero_factors_and_wide_residues`, and
+`test_array_program_dimension_requirement_proof_inventory` all depend on the archived `DimensionSsaFacts` /
+`DimensionCongruence` graph-level prover, which has no successor: the current `AbstractDimensionValue`
+(`dimension_requirement.rs`) carries only a declared type, an interval, and an optional exact value, with no
+cross-instruction fact propagation and no modular reasoning anywhere in the workspace. They are retired here rather
+than reimplemented, and the open owner design call immediately following the ticked item decides reinstate-vs-amend.
+Congruence transfer was deliberately not implemented as part of this item. One consequence worth carrying into that
+decision: `prove_divisible_by`'s three proof arms, `prove_bounds`'s `contains_bounds` arm, and
+`prove_less_than_or_equal`'s interval arm remain the largest untested surface in the owner file, and the
+`% == 0` / `> 0 for divisibility` templates now have host-side exact assertions for the first time (previously their
+only assertion sites were CPU-plugin end-to-end tests in `ryft-xla`'s `domains.rs`).
+
+Verification: `cargo check --workspace --all-targets` clean with zero warnings; `ryft-core --lib` 1194 passed / 1 failed
+for 1195 total, up from 1185 when this item started. This item contributes exactly `+6` fixtures (the six new tests
+listed above; the five extended fixtures add assertions, not test cases). The remaining `+4` is concurrent work by
+other owners. The single failure is the pre-existing
+`arrays::operations::constants::tests::test_array_constants` `Fill` diagnostic `instead` wording, red at `HEAD`;
+`ryft-core` integration binaries 6 + 6 passed and 53 doc-tests passed; `ryft-xla --lib` with `--test-threads=1`
+440 passed / 1 ignored (the `+1` over the 439 baseline is concurrent work by another owner, not this item, which
+touched no `ryft-xla` file); `ryft-macros-tests` 17 passed. No existing rendered fixture was modified. Per-file
+`rustfmt --edition 2024 --check` is clean on every edited file.
+
+### Phase 4–6 cleanup and integration gates (2026-08-08)
+
+Closed the two remaining Phase 4–6 gates as one review unit: the cleanup gate (delete copied dimension-operand
+identity, bounds, and ordering validation) and the integration gate (every shape dependency in rendered IR is an
+operand edge or an explicit `dimension_size` instruction). Both were executed as behavior-preserving units: zero
+diagnostic-message changes and zero rendered-fixture changes.
+
+#### Cleanup gate: deletions
+
+Swept every dimension-operand-carrying operation under `crates/ryft-core/src/operations/` — `manipulation/`
+(concatenation, reshaping, slicing, padding, gathering, scattering, broadcasting), `dimensions/`, `constants/`,
+`control_flow/`, `collectives.rs`, `random.rs`, and `math/reduce.rs` — for validation that re-checks dimension operand
+identity, bounds, or ordering that `infer_output_types` already derives from the same operand types. Exactly one copy
+is provably dead:
+
+| Deleted site | Subsumed by | Proof that no behavior changes |
+| --- | --- | --- |
+| `manipulation/concatenation.rs` `validate_concatenation_inputs`: the leading `if axis >= rank { … axis {axis} is out of bounds for operands of rank {rank} }` guard | `Axis::normalize(rank)` at both call sites | The helper has exactly two callers. `infer_array_ir_concatenation` computes `rank = inputs[0].rank()` and calls `axis.normalize(rank)?` before it, so `axis < rank` on entry. `Concatenate for ArrayType` computes `rank = first.rank()` (`first == inputs[0]`) and takes `axis` from `ConcatenateOperation::new(axis, rank)?.axis()`, which normalizes against that same rank. In both cases the helper recomputes `rank` from `inputs[0]`, so the guard's condition is unsatisfiable and the branch is unreachable. No test can reach it: the three existing out-of-bounds assertions (`'concatenate' axis 1 is out of bounds for operands of rank 1`, `axis 2 … rank 2`, `axis -3 … rank 2`) all come from `ConcatenateOperation::new` or `infer_array_ir_concatenation`, which render the *un-normalized* `Axis` and are unaffected. A code comment now records the precondition in place of the dead check. |
+
+#### Cleanup gate: centralization made
+
+The one genuinely repeated count/kind projection is the trailing extent-operand run that every mixed shape-carrying
+inference rule projects: `&[ArrayIrType] -> Vec<Dimension>` via `<&DimensionType>::try_from(..).map(to_dimension)`.
+Six production sites repeated it verbatim. It is now `ArrayIrType::extents` (a `pub(crate)` associated function on the
+owning type in `crates/ryft-core/src/arrays/types/ir.rs`), which preserves the canonical member-kind diagnostic
+(`expected dimension type but got array type`) unchanged. Migrated: `manipulation/reshaping.rs`
+`DynamicReshapeOperation::infer_output_types`, `manipulation/slicing.rs`
+`DynamicShapeSliceOperation::infer_output_types`, `manipulation/padding.rs` `PadOperation<ArrayIrType>`, and
+`collectives.rs` `infer_explicit_shape_changing_collective_output_type`. The two remaining sites are in
+`manipulation/broadcasting.rs` (`DynamicBroadcastOperation::infer_output_types` and `dynamic_broadcast_leading`'s
+value-typed variant) were **deferred to that file's owner**, who was editing it concurrently; migrating them is a
+one-line change each with no behavioral surface. **Both migrated 2026-08-08** by the wave mop-up, so all six sites now
+share the one helper; refer to the `Wave mop-up: deferred ports and concatenate transpose (2026-08-08)` log entry.
+
+#### Cleanup gate: centralizations and deletions rejected, with reasons
+
+- **Extent-vs-bounds checks in `gathering.rs` (slice size), `slicing.rs` (slice limit, update-slice limit,
+  dynamic-slice size, dynamic-update-slice size).** Five sites share one *shape* — `Dimension::Static(e) if x > e` /
+  `Dimension::Dynamic(v) if x > v.bounds().lower()` — but each owns two distinct, user-visible diagnostics with
+  different vocabulary (`slice size … exceeds the operand extent`, `limit index … is out of bounds for axis …`,
+  `update axis … does not fit in input size …`, `size … is out of bounds for axis … with size …`). Centralizing would
+  mean threading two message templates per call site, which is message plumbing rather than count/kind projection and
+  is explicitly outside this gate's mandate. None is a *copy* of inference: each is the only place its condition is
+  checked.
+- **Duplicated runtime-length operand identity check in `control_flow/scan.rs`.** The block
+  `runtime_length_type.variable() != variable → '{SCAN_OPERATION_NAME}' runtime length operand has type … but scan
+  length requires …` appears verbatim in `ScanTypeSemantics::<ArrayIrType>::scan_body_input_types` and in
+  `infer_scan_output_types`. It is a real duplicate but **not** provably redundant: the two are distinct `Operation`
+  hooks (`infer_region_input_types` and `infer_output_types`) reachable independently, so deleting either changes
+  which diagnostic surfaces first for a directly invoked hook. Left in place.
+- **`ArithmeticDimensionOperation::infer_output_types` vs `DimensionRequirementOperation::validate_input_types`.**
+  These share a verbatim operand-refinement loop and diagnostic. Only two call sites, so extracting a helper is
+  explicitly outside the gate's centralization mandate.
+- **`DimensionSizeOperation::validate_input_type`'s `MAX_DIMENSION_EXTENT` re-check.** Looks like a copy of the same
+  check in `DimensionSizeOperation::new`, but is live: inference runs against a *refined* input type that the
+  constructor never saw, and `test_dimension_size_operation` pins the `ExtentExceedsBackendWidth` error raised from
+  `infer_output_types`.
+- **Eager extent-operand re-validation** in `concatenation.rs`, `padding.rs`, `collectives.rs`, and `random.rs`
+  `interpret` rules. These compare the explicit extent *value* against the observed runtime payload extent, which
+  type-level inference cannot do. Not copies.
+- **`padding.rs` `validate_pad_inputs`.** Genuinely shared between the homogeneous and mixed contracts, checking data
+  type, padding-value rank, memory space, and padding-vector arity — none of which the extent operands determine.
+
+#### Cleanup gate: deferred to owner
+
+- `manipulation/broadcasting.rs`: two `ArrayIrType::extents` migration sites (above). Sibling-owned during this slice;
+  migrated 2026-08-08 by the wave mop-up.
+- `arrays/operations/constants.rs`: the mixed `DynamicZero`/`DynamicOne`/`DynamicIota` constructors. Their
+  per-dynamic-axis identity validation is already centralized in `operations/constants/mod.rs`
+  `infer_dynamic_constructor_output_types`, so no copy remains; recorded here only because the file lies outside this
+  slice's ownership and was not edited.
+
+#### Integration gate: sweep classification
+
+Workspace-wide sweep (`ryft-core`, `ryft-xla`, `ryft-macros`, `ryft-pjrt`, `ryft-mlir`) for constructions of dimension
+values from types: `DimensionSizeOperation`, `dimension_size(`, `array_dimension`, `folded_array_dimension`,
+`dimension_constant`, `DimensionValue::new`/`::constant`, `ArrayIrValue::Dimension`, `DimensionOperation::Constant`,
+and every site building an extent from `.shape()` / `.dimension(` / `Dimension::Static(` and then binding it.
+
+**Result: zero violations.** Exactly four production code shapes read a type's shape and convert it to a value, and
+every one performs the static-axis exact-constant / dynamic-axis explicit-read split:
+
+1. `arrays/batching.rs` `folded_array_dimension` — static → `dimension_constant`, dynamic → `array_dimension`
+   (`dimension_size`). Backs sanctioned reads 1 and 4.
+2. `collectives.rs` `collective_input_extents` — static → `collective_extent_constant`, dynamic →
+   `value.dimension_size(axis)`. Original-operation-boundary derivation sanctioned by P3k; see the ledger scope
+   clarification above.
+3. `manipulation/broadcasting.rs` `dynamic_broadcast_leading` — same split, same P3k sanction.
+4. `arrays/differentiation.rs` `ExactShape::dimensions` — static → `DimensionOperation::Constant`, residual →
+   operand edge.
+
+Everything else classified as: **[SANCTIONED]** the eight ledger sites (`batching.rs` `match_axis`, `broadcast_input`
+`DimensionSource::Value`, `prepare_inputs` mapped-extent inference, `prepare_inputs` sharding normalization,
+`padding.rs` pad-mask construction, `arrays/differentiation.rs` `LinearResiduals::retain_shape` — note it lives in
+`arrays/differentiation.rs`, not `differentiation/linear.rs` — and `arrays/operations/constants.rs`
+`capture_zero_residuals` / `capture_zero_residual_values`); **[OPERAND-EDGE]** (e.g. `padding.rs` `batch`'s lifted
+output extents, `slicing.rs` `DynamicShapeSliceOperation::batch`'s `context.axis_extent()`); **[CONSTANT]**
+(transpose-rule seeds such as `constant(0)`/`constant(1)`, `collective_extent_constant`, XLA's re-materialization of
+an already-concrete operand in a one-shot program); **[HOST-METADATA]** (eager `dimension_size` /
+`dimension_from_scalar` accessors on `Array` and `XlaArray`, eager `interpret` validation that builds a concrete type
+from payload extents, `AbstractDimensionValue::from_type`/`from_partial` proof machinery — none of these bind an
+operation or appear in rendered IR); and **[TEST]**. `ryft-xla`'s StableHLO emitters
+(`lower_runtime_dimension_size_i64`, `lowering/composite.rs`) are backend lowering, out of this gate's scope, and
+perform the same split in spirit. `ryft-macros` and `ryft-pjrt` have zero hits.
+
+#### Integration gate: fixture
+
+The gate was **not** previously pinned. `test_array_ir_operation_member_kinds_are_a_closed_family` is a member-kind
+conversion gate that never builds or renders a program; `test_array_ir_concatenate`,
+`test_array_ir_reshape_differentiation`, and `test_array_ir_broadcast_to_first_class_dimensions` pin the *presence* of
+specific `dimension_size` lines in one operation each; `test_array_ir_operation_tracing_has_only_explicit_dependencies`
+is closest in intent but every program in it is statically shaped and contains no `dimension_size` at all.
+
+Added exactly one fixture (additive; no existing fixture modified):
+`operations::dimensions::dimension_size::tests::test_shape_dependencies_are_operand_edges_or_dimension_size_reads`,
+colocated with the module that owns the `dimension_size` instruction. It builds one mixed program —
+`dimension_size` → `dimension_add` → mixed `concatenate` (explicit result extent) → mixed `reshape` — over a
+dynamically shaped `f32[rows]` input, then asserts (a) each instruction's exact operand-edge list, (b) exactly one
+`dimension_size` occurrence and the exact rendered program, and (c) a structural drift invariant: no instruction's
+result type may *reference* a dimension identity that none of its own operands carries. A rule that recovered geometry
+from stored metadata instead of an operand edge would produce a result type naming an identity that reaches the
+instruction through no rendered edge, and (c) fails.
+
+Verification: `cargo check --workspace --all-targets` clean with zero warnings; `ryft-core --lib` 1194 passed / 1
+failed; `ryft-core` integration binaries (6 + 6) and doctests (53 passed / 16 ignored) green; `ryft-xla --lib`
+`--test-threads=1` 440 passed / 1 ignored; `ryft-macros-tests` 20 + 17. The only failure is the pre-existing
+`arrays::operations::constants::tests::test_array_constants` (`Fill` diagnostic `instead` wording, red at `HEAD`). The
+`ryft-core --lib` count is 1194 including this item's net +1 fixture; the rest of the delta relative to earlier runs in
+the same session is concurrent work by other owners. No rendered fixture changed. Per-file
+`rustfmt --edition 2024 --check` is clean on every edited file.
+
+### Wave mop-up: deferred ports and concatenate transpose (2026-08-08)
+
+Closed the four items the concurrent wave deferred to each other on file-ownership grounds: the two archived P0
+fixtures that belonged to sibling-owned files, the two `ArrayIrType::extents` migration sites left in
+`manipulation/broadcasting.rs`, and the concatenate-transposition gap the goldens agent filed. Net effect is `+2`
+`ryft-core --lib` tests, one renamed fixture, one production behavior extension, and two mechanical deletions.
+
+#### Archived fixture 7: batching stages one composite graph
+
+`arrays::operations::tests::test_array_ir_batching_stages_one_composite_graph`, hosted beside
+`test_array_ir_explicit_shape_vertical_slice` because that is the module where the mixed array/dimension vertical
+slices already live (`arrays/batching.rs`'s two entry-point tests own transform *entry points*, not stored program
+bodies). The fixture builds one stored composite program whose body interleaves both member kinds —
+`add` -> `dimension_size` -> `dimension_add` -> mixed `broadcast` (consuming both dimension results as explicit
+extent operands) -> `reduce_sum` — over a dynamically shaped `f32[rows]` input, pins its exact rendering, replays it
+through an `ArrayIrBatching` `BatchingContext` over a `TracingContext` parent, and then asserts on the staged result:
+the exact instruction-name sequence `["add", "dimension_size", "dimension_add", "broadcast", "reduce_sum"]`, every
+instruction's exact operand-edge list, that no instruction carries a region (one flat graph, not a nested one), the
+exact rendered batched program, and end-to-end interpretation. The dimension instructions stay replicated (the lifted
+`dimension_size` reads packed axis 1, not 0) while the array instructions gain the packed axis, all in one program.
+
+Two constraints the fixture had to respect, both recorded here because they are properties of the current design
+rather than accidents of this test:
+
+  - **The program's declared output type must not name an internally derived dimension identity.** `Program::interpret_in_context`
+    checks each boundary output with `declared.is_refined_by(actual)`, and `DimensionVariable` equality is nominal
+    (`Arc::ptr_eq`). Replaying a body under a *staging* parent re-derives `dimension_add`'s result as a *fresh*
+    variable, so a program whose output is `f32[rows + rows, ...]` fails that check with two identically rendered
+    types. Terminating the body with `reduce_sum` back to `f32[rows]` keeps the boundary in boundary-defined
+    identities. (This is not reachable through `Program::batched`, which is `ArrayType`-only and declares its own
+    boundary; it is specific to replaying a stored composite program through a batching context.)
+  - **The mapped axis must have a statically known size.** The batched `reduce` routes through the homogeneous
+    `ArrayBatch` machinery, which raises `BatchingError::DynamicBatchAxis` for a dynamic packed batch extent. The
+    fixture therefore uses an exact `dimension<2>` batch extent while keeping the *per-item* extent `rows` symbolic,
+    so the batched graph is still shape polymorphic where it matters.
+
+#### Archived fixture 8: mapped-input dynamic broadcast batching (rule verdict: correct)
+
+`operations::manipulation::broadcasting::tests::test_explicit_broadcast_batching_preserves_a_declared_dynamic_extent`
+is the first test anywhere to drive `DynamicBroadcastOperation::batch` on a *mapped* input; every
+`check_operation_batching!` block in that file targets the homogeneous `BroadcastOperation`. **The previously untested
+rule is correct**; no production change was needed. The fixture stages the rule over a `TracingContext`, with a mapped
+`f32[2, 1]` input and one *declared* `dimension<columns ∈ [1, 9)>` output extent that is an ordinary SSA input, then
+asserts that the lifted broadcast's operands are exactly `[input, batch_extent, columns]` by atom identity, that the
+whole rule stages exactly one instruction (a rule reconstructing geometry from the operand type would have had to add
+its own `dimension_size` read, which the instruction count would catch), the exact rendered program
+(`broadcast [output_axes=[0, 1]] %1 %2 %0`), the lifted output type `f32[2, columns]`, and end-to-end interpretation
+at `columns = 3`. A declared *dynamic* extent is what makes the forwarding observable at all: with exact extents the
+forwarded and reconstructed operands would be indistinguishable.
+
+#### `ArrayIrType::extents` migration
+
+Both deferred sites migrated, so all six production copies of the `&[ArrayIrType] -> Vec<Dimension>` extent-operand
+projection now share one helper. `DynamicBroadcastOperation::infer_output_types` calls it on its trailing operand-type
+run directly. The value-typed site in `DynamicBroadcast::dynamic_broadcast_with_output_sharding` first materializes
+the operand types (`dimension.r#type().into_owned()`), because the helper takes `&[ArrayIrType]` while `Typed::r#type`
+yields `Cow`; each cloned value is a small `DimensionType`. The `expected dimension type but got array type`
+diagnostic is preserved by construction and is still pinned by `test_explicit_broadcast`. `DimensionType` remains
+imported for other uses in the module.
+
+#### Concatenate transposition over a dynamic non-concatenated extent (gap closed)
+
+The rejection filed by the goldens agent is **fixed**, using the same treatment as the earlier transposition-cluster
+slice: consume geometry that is already live at the boundary rather than retaining a new residual.
+
+The reasoning is the one the cluster established. Concatenation preserves every non-concatenated axis, so the output
+cotangent carries the operands' own dimension identity on each of those axes, and a repeated `TypeIdentity` denotes
+one runtime quantity. The `MaybeZero::Zero` arm needs no geometry at all (it returns structural zeros), so in the only
+arm that needs extents there is a live value of exactly the right shape in scope. `TransposableOperation for
+ConcatenateOperation<ArrayIrType>` therefore now splits three ways instead of two:
+
+  - **Fully static operands** keep delegating to the homogeneous member rule through
+    `transpose_projected_operation`, byte-for-byte unchanged. This is why no existing rendered fixture moved.
+  - **A dynamic extent on a non-concatenated axis** is sliced directly in the composite universe. The rule stages one
+    shared `dimension<0>` start, one exact dimension constant per static non-concatenated axis, one `dimension_size`
+    read of the live cotangent per *dynamic* non-concatenated axis (shared across all operands), and then one
+    `dynamic_shape_slice` per operand whose concatenated-axis start and size are exact constants at the cumulative
+    offset. The homogeneous rule structurally cannot express this: its `SliceOperation` bounds are static payload
+    values, which is exactly why it emits `'concatenate' transpose requires a static size on axis {axis} …`.
+  - **A dynamic extent on the concatenated axis** keeps its existing rejection and its existing diagnostic, and still
+    routes through linearization. This is the genuinely different sub-case, not a `TODO`: the per-operand offsets are
+    then runtime *sums* of operand extents, and the output cotangent carries only their total, so no value at this
+    boundary determines where one operand's slice ends and the next begins. The `jvp` rule already retains those
+    extents as `LinearResiduals`, which is the mechanism designed for it.
+
+Bounds added to the impl's `O`: `From<DimensionOperation<DimensionValue>>`, `From<DimensionSizeOperation>`, and
+`From<DynamicShapeSliceOperation>` — the minimum the body needs. The derived `TransposableOperation` dispatcher on
+`ArrayIrOperation` needed no change, because its generated where-clause predicate
+`ConcatenateOperation<ArrayIrType>: TransposableOperation<_, Self>` resolves against the concrete family, which
+already has all three conversions.
+
+**Intentional rendered-fixture change (the only one in this item).**
+`arrays::operations::manipulation::tests::test_array_ir_concatenate_transpose_rejects_a_dynamic_non_concatenated_extent`
+was a pin of a *rejection* that this item removes, so it could not survive unchanged; leaving it would assert an error
+the code no longer raises. It is renamed to
+`..._transpose_slices_a_dynamic_non_concatenated_extent` and now pins the working pullback for the same program
+(`concatenate(f64[2, columns], f64[1, columns], axis=0)`): the exact rendered pullback
+
+```text
+lambda %0:f64[3, columns] .
+let %1:dimension<3> = const
+    %2:dimension<0> = constant [value=0]
+    %3:dimension<columns ∈ [1, 9)> = dimension_size [axis=1] %0
+    %4:dimension<2> = constant [value=2]
+    %5:f64[2, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %2 %2 %4 %3
+    %6:dimension<2> = constant [value=2]
+    %7:dimension<1> = constant [value=1]
+    %8:f64[1, columns] = dynamic_shape_slice [strides=[1, 1]] %0 %6 %2 %7 %3
+in (%5, %8)
+```
+
+plus interpretation at `columns = 2` splitting `[[1,2],[3,4],[5,6]]` into `[[1,2],[3,4]]` and `[[5,6]]`, and the
+retained forward-mode assertion. Exactly one `dimension_size` is spent for the shared `columns` extent, and no
+residual is retained. The stale comment in
+`operations::manipulation::concatenation::tests::test_concatenate` was updated again: the homogeneous rule still
+rejects the case (its own pin is unchanged), but the composite rule no longer inherits that rejection.
+
+Verification (all with `CARGO_INCREMENTAL=0`): `cargo check --workspace --all-targets` clean with zero warnings;
+`ryft-core --lib` 1196 passed / 1 failed for 1197 total, up from the 1195 baseline — the `+2` is exactly this item's
+two new fixtures (fixture 7 and fixture 8); the concatenate work renamed a fixture and added no test case. The single
+failure is the pre-existing `arrays::operations::constants::tests::test_array_constants` (`Fill` diagnostic `instead`
+wording, red at `HEAD`). `ryft-core` integration binaries 6 + 6 and doc-tests 53 passed / 16 ignored; `ryft-xla --lib`
+with `--test-threads=1` 440 passed / 1 ignored (unchanged; no `ryft-xla` file was touched); `ryft-macros-tests`
+20 + 17. One rendered fixture changed, justified above; no other rendered fixture moved. Per-file
+`rustfmt --edition 2024 --check` is clean on every edited file.
+
+### Final review pass and queued follow-ups (2026-08-08)
+
+Closing pass over the wave: a review of the mop-up's changed regions (the only unreviewed code) plus the five
+follow-ups the three area reviewers queued. Net effect is `+2` `ryft-core --lib` tests, one deleted subsumed
+assertion block, one extracted shared guard, and one local rename; no production behavior changed.
+
+#### Review of the mop-up's changed regions
+
+The three-way `TransposableOperation for ConcatenateOperation<ArrayIrType>` split is correct and minimal. The static
+arm is the previous body verbatim behind an `array_types.iter().all(|input_type| input_type.static_shape().is_some())`
+guard, so a fully static concatenation transposes exactly as before. The sliced arm spends **one** `dimension_size`
+per dynamic non-concatenated axis, not one per operand: the shared `zero` start and the per-axis `extents` vector are
+staged once above the operand loop, and only the per-operand `start`/`size` dimension constants are staged inside it.
+Reading those extents off the cotangent is sound because `validate_concatenation_inputs` requires *exact* dimension
+equality on every non-concatenated axis, so the cotangent type repeats each operand's dimension identity there. The
+rejection arm's diagnostic is byte-identical (the only edit inside the guard loop is hoisting `self.axis()` into a
+local). All three new `O` bounds are exercised: `From<DimensionOperation<DimensionValue>>` by the staged dimension
+constants, `From<DimensionSizeOperation>` by the live extent read, and `From<DynamicShapeSliceOperation>` by the
+slice. No debug output, dead code, or unused imports in any of the four mop-up files.
+
+Two findings, both addressed:
+
+  - One malformed sentence in the impl's doc comment ("the one case whose geometry this boundary genuinely does not
+    hold") was rewritten, and the surrounding paragraph reflowed with it.
+  - **The rejection arm was unpinned.** The static arm is pinned by `test_array_ir_concatenate_differentiation` and
+    the sliced arm by the mop-up's renamed fixture, but nothing asserted the dynamic-*concatenated*-axis rejection.
+    Added `arrays::operations::manipulation::tests::test_array_ir_concatenate_transpose_rejects_a_dynamic_concatenated_extent`,
+    which pins the exact `UnsupportedOperation` message for `concatenate(f64[rows], f64[1], axis=0)` under
+    `transpose_with_respect_to` and asserts that `linearize().pullback()` — the route the message names — succeeds.
+
+Observations recorded but deliberately not changed: the sliced arm stages a duplicate `dimension<2>` constant when an
+operand's extent along the concatenated axis equals the next operand's cumulative offset (visible as `%4`/`%6` in the
+pinned pullback), because the tracer performs no constant deduplication; and `test_array_ir_batching_stages_one_composite_graph`
+asserts the batched instruction-name vector, the per-instruction operand edges, *and* the full rendering, which
+overlaps but reads as three distinct contracts.
+
+#### Follow-up 1: `MaybeZero` owner-module test
+
+`programs::atoms::tests::test_maybe_zero_materialization` pins the three branches of
+`materialize_like_any`/`materialize_like` in the module that owns them. Over one `TracingContext` it stages: an
+identity-free `f32[2]` zero against a type-equal exemplar, which still takes the nullary form; a reference-bearing
+`f32[rows]` zero against the candidate run `[f32[2] exemplar, f32[rows] exemplar]`, which skips the type-unequal
+candidate rather than ending the search and stages `zero_like` over the second; and the no-matching-candidate case,
+which falls back to the nullary form and surfaces
+`'zero' cannot construct type f32[rows] without operands because it references identity rows`. The two staged forms
+are pinned together as one rendered program, so the "nullary keeps no operand alive / `zero_like` takes one" contrast
+is a single assertion. Placed after the `AtomId`/`Atom` tests as instructed; note that `MaybeZero` is declared *above*
+both in the file, so strict source order would put it first.
+
+#### Follow-up 2: subsumed eager-bind block deleted
+
+The trailing eager `context.bind` `less_than_or_equal` failure assertion in
+`operations::dimensions::dimension_requirement::tests::test_dimension_requirement_operation` (observed `7`/`3`) is
+fully subsumed by row two of the `test_dimension_requirement_failure_diagnostics` table, which pins the same eager
+`Context::bind` contract at `12`/`8`. Removed the block together with the `EagerContext`, `left`, and `right`
+bindings that existed only to feed it; everything above it is untouched.
+
+#### Follow-up 3: routing-invariant pin (strengthened, not duplicated)
+
+`test_array_ir_gather_differentiation` already drives a dynamically shaped gather operand and therefore already
+exercised the routing, but it only asserted `residual_count()` and a `.contains(...)` substring, neither of which
+distinguishes the mixed member rule from the homogeneous one. Strengthened it in place rather than adding a
+duplicate: it now pins the tangent program's exact input boundary
+`[f64[extent], i32[3, 1], dimension<extent ∈ [1, 6)>]`, and the trailing first-class dimension residual is precisely
+what the homogeneous rule cannot express — it reads operand geometry off its own static payload and retains only the
+indices. The comment states the invariant that keeps the `gathering`/`slicing` homogeneous transpose rules
+static-only. `test_array_ir_slice_differentiation` covers the same routing for `slice` and was left as is.
+
+#### Follow-up 4: triplicated nonzero-tangent guard extracted
+
+`check_nondifferentiated_tangents_are_zero(name, nondifferentiated_inputs)` now lives in `tracing_v2/custom_derivatives.rs`
+(the more fundamental of the two siblings — `rematerialization.rs` already depends on it, not the reverse; `tracing_v2/mod.rs`
+is a pure facade and was left as one). All three call sites pass `self.name()`, so the reported operation can no longer
+drift from the operation raising it, and the count comes from `nondifferentiated_inputs.len()`, which every
+`split_inputs` guarantees equals `self.nondifferentiated_count`. The rendered messages are byte-identical.
+
+#### Follow-up 5: `residual_count` widening made explicit
+
+In `CustomVjpOperation::jvp` the local feeding `LinearCallOperation::transpose_only` is renamed
+`residual_count` -> `leading_operand_count`, with a comment stating why the widening is sound: the nondifferentiated
+operands and the residuals are alike to the linear call, both forwarded to the backward region rather than transposed.
+The public `transpose_only` parameter name is unchanged.
+
+#### Cross-cutting sweep and verification
+
+A sweep of the entire uncommitted diff found no `println!`, `eprintln!`, `dbg!`, `PROBE`, `RENDER:`, or `if false`.
+The only `TODO` added to code is the scan stacked-y-output one in `control_flow/scan.rs`, which follows the
+`TODO(eaplatanios)` discipline; the remaining matches are prose in this plan.
+
+Verification (all with `CARGO_INCREMENTAL=0`): `cargo check --workspace --all-targets` clean with zero warnings;
+`ryft-core --lib` 1198 passed / 1 failed for 1199 total, up from the 1197 baseline — the `+2` is exactly
+`test_maybe_zero_materialization` and `test_array_ir_concatenate_transpose_rejects_a_dynamic_concatenated_extent`
+(follow-up 3 strengthened an existing test and follow-up 2 deleted an assertion block inside one, so neither moves the
+count). The single failure remains the pre-existing `arrays::operations::constants::tests::test_array_constants`
+(`Fill` diagnostic `instead` wording, red at `HEAD`). `ryft-core` integration binaries 6 + 6 and doc-tests 53 passed /
+16 ignored; `ryft-xla --lib` with `--test-threads=1` 440 passed / 1 ignored; `ryft-macros-tests` 20 + 17. No existing
+rendered fixture moved. Per-file `rustfmt --edition 2024 --check` is clean on every edited file.
+
+### Review fixes: replay rejection withdrawn, effectful rendering (2026-08-08)
+
+Two review findings, both fixed.
+
+**Item 1 — the replay rejection surface is deleted.** `reject_unrefined_operation_payload` was a heuristic, not a
+diagnosis: it rewrote *any* `ProgramError::Type` raised at an instruction whose declared outputs happened to mention a
+refined identity, without establishing that the stale symbolic payload caused the failure or that the failure even
+involved that identity, and with several refinements it reported whichever one it scanned first. That contradicted its
+own documented claim that unrelated failures propagate unchanged. Deleted: the function and its two `map_err` wirings
+(`Program::interpret_in_context` and `RegionRef::interpret_in_context`), `ProgramError::UnrefinedOperationPayload`, the
+defaulted `TypeRefinements::established_refinement` diagnostic hook, its `ArrayTypeRefinements` override, and the
+`ArrayIrTypeRefinements` delegation. A repo-wide search over `*.rs`/`*.md` for all three identifiers is empty.
+
+The limitation itself is real and stays pinned, now as an accepted limitation rather than a specialized diagnostic:
+`interpretation::tests::test_program_interpret_does_not_refine_operation_payloads` (renamed from
+`..._rejects_unrefined_operation_payload`) keeps the same homogeneous `broadcast` fixture, asserts the failure is a
+plain `ProgramError::Type`, and pins its exact inference-level message, with a comment stating the constraint: replay
+refines only program and region boundaries, never instruction operation payloads, so a homogeneous payload storing
+symbolic geometry fails replay with the payload's own inference diagnostic. Recorded future path if the specialized
+diagnostic is ever wanted: it must come from a structured operation error that causally identifies the failing payload
+constraint. The XLA `lower_broadcast_to_mlir` dynamic-result test is orthogonal and untouched.
+
+**Item 6 — zero-output effectful instructions now render.** `Program::render` walked atoms and keyed each instruction
+off its first output atom, so an instruction that binds no atom produced no line at all; two programs differing only in
+their ordered assertions rendered identically, and the requirement determinism test was comparing renderings that
+omitted the very instructions whose order it claimed to test. This is an intentional rendering-contract change.
+
+Design: the per-instruction body is factored out of the atom walk into a `render_instruction` helper, and the walk now
+carries an instruction cursor. Before rendering the instruction reached at an atom, every not-yet-rendered preceding
+instruction with no outputs is flushed, and the remainder is flushed after the walk, so the statement sequence always
+reflects instruction order. The atom walk still drives binding names and constants, so nothing else moves. Syntax: a
+region body is a statement sequence, and a statement is either the existing binding form `%2:t = operation ...operands`
+or, with no outputs, the resultless form `operation ...operands` with the `%N:t =` binder simply omitted. Resultless
+statements take part in the same `let`/blank gutter as bindings (`let` marks the first statement of the block, whatever
+kind it is), which keeps the gutter monotone. No program text is parsed anywhere in the workspace, so there is no
+round-trip to preserve.
+
+Fixture sweep: exactly two pinned renderings in the workspace contain zero-output instructions, both in
+`operations/dimensions/dimension_requirement.rs`, and both deltas are purely the addition of previously hidden lines.
+`test_dimension_requirement_program_rendering_and_relocation` now shows both requirements and asserts they survive
+relocation (the rendering equality against the spliced program is the relocation check and is now meaningful);
+`test_dimension_requirement_order_is_deterministic` now shows the requirement statements around the `dimension_add`
+binding, and gained a swapped-order program that binds byte-identical atoms yet renders differently, which is the
+direct demonstration that semantically different programs no longer render identically. No other fixture in `ryft-core`
+or `ryft-xla` moved; `ryft-xla` pins no program renderings at all.
+
+Verification (all with `CARGO_INCREMENTAL=0`): `cargo check --workspace --all-targets` clean with zero warnings;
+`ryft-core --lib` 1198 passed / 1 failed for 1199 total, unchanged from the previous entry's baseline (one test was
+renamed, none added or removed), and the single failure is still the pre-existing
+`arrays::operations::constants::tests::test_array_constants`; `ryft-core` integration binaries 6 + 6 and doc-tests
+53 passed / 16 ignored; `ryft-xla --lib` with `--test-threads=1` 440 passed / 1 ignored; `ryft-macros-tests` 20 + 17.
+Per-file `rustfmt --edition 2024 --check` is clean on every edited file. The verification matrix needed no rewording:
+no row states a rendering contract, and the "shape dependency in rendered IR is an operand edge" gate is unaffected
+because resultless instructions only add lines.
+
+### Review fixes: mechanical batch (2026-08-08)
+
+Review item 7 and the smaller review items, all mechanical. (1) `programs/statistics.rs` now stores operation and
+region-slot names as `&'static str` (including the `BTreeMap` keys of `operation_counts` and `total_operation_counts`),
+removing a per-instruction and per-attachment-edge allocation; the types derive only `Serialize`, so the serialized
+form is byte-identical and the pinned serialization test is unchanged. (2) The import block of
+`tests/test_array_ir_projection_allocations.rs` now imports the root re-exports through `ryft_core::{...}`, keeping
+only `operations::random` on its module facade. (3) `ArrayIrType::extents` takes
+`impl IntoIterator<Item: Borrow<Self>>`, so `dynamic_broadcast_with_output_sharding` projects `Typed::r#type` `Cow`s
+in place instead of collecting an intermediate `Vec<ArrayIrType>`; the five slice call sites are unchanged and the
+member-kind diagnostic is untouched. (4) A focused `ryft-xla` conversion test pins the promotion metadata of the
+custom-JVP, custom-VJP, and rematerialization arms (payload equality plus name and region slots). (5) The two
+`differentiation` re-exports in `arrays/mod.rs` are merged into one statement, which clears the pre-existing global
+nightly `rustfmt --check` failure.

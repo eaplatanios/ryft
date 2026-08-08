@@ -618,10 +618,13 @@ impl AbstractDimensionValue {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
+    use crate::operations::dimensions::dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
+    use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder};
@@ -678,23 +681,6 @@ mod tests {
         let bounds = DimensionRequirementOperation::bounds(&overlapping, required_bounds);
         assert_eq!(bounds.predicate(), DimensionRequirementPredicate::Bounds(required_bounds),);
         assert_eq!(bounds.to_string(), "dimension_require_bounds [bounds=[2, 8)]");
-
-        let context = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new();
-        let left = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(0, Some(10)).unwrap()));
-        let right = DimensionType::new(DimensionVariable::new("right", DimensionBounds::new(0, Some(10)).unwrap()));
-        let error = context
-            .bind(
-                DimensionRequirementOperation::less_than_or_equal(&left, &right),
-                Vec::new(),
-                &[DimensionValue::new(left, 7).unwrap(), DimensionValue::new(right, 3).unwrap()],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<DimensionError>(),
-            Some(&DimensionError::RequirementViolation {
-                message: "left <= right; observed left=7, right=3".to_string(),
-            }),
-        );
     }
 
     #[test]
@@ -736,6 +722,33 @@ mod tests {
             vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,],
         );
 
+        // Erasing the proven self-equality does not weaken the requirements that survive: each retained assertion
+        // still reports its original variable-named diagnostic, and the earliest surviving failure is the one raised.
+        let error = simplified
+            .interpret(vec![
+                DimensionValue::new(left.clone(), 7).unwrap(),
+                DimensionValue::new(right.clone(), 3).unwrap(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "left <= right; observed left=7, right=3".to_string(),
+            }),
+        );
+        let error = simplified
+            .interpret(vec![
+                DimensionValue::new(left.clone(), 3).unwrap(),
+                DimensionValue::new(right.clone(), 7).unwrap(),
+            ])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "left == right; observed left=3, right=7".to_string(),
+            }),
+        );
+
         let equality =
             requirement_program(DimensionRequirementOperation::equal(&left, &right), &[left.clone(), right.clone()]);
         let residual = equality
@@ -763,5 +776,303 @@ mod tests {
                 message: "left == right; observed left=4, right=5".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_dimension_requirement_program_rendering_and_relocation() {
+        let left = test_dimension_type("left", 0, 20);
+        let right = test_dimension_type("right", 0, 20);
+
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let left_atom = builder.add_input(left.clone());
+        let right_atom = builder.add_input(right.clone());
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                Vec::new(),
+                vec![left_atom, right_atom],
+            )
+            .unwrap();
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
+                Vec::new(),
+                vec![right_atom],
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(Vec::new(), vec![Placeholder, Placeholder], Vec::new())
+            .unwrap();
+
+        // Requirements bind no output atom, so they render in the resultless statement form and appear in instruction
+        // order. A program's rendering therefore records its complete ordered assertion sequence.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 20)>, %1:dimension<right ∈ [0, 20)> .
+                let dimension_require_less_than_or_equal %0 %1
+                    dimension_require_bounds [bounds=[2, 8)] %1
+                in ()"},
+        );
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+        );
+        assert_eq!(program.effects(), Effects::single(Effect::OrderedAssertion));
+
+        // Relocating the program into a fresh region preserves the assertion order and every requirement diagnostic.
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let inputs = vec![builder.add_input(left.clone()), builder.add_input(right.clone())];
+        let outputs = builder.splice_program(&program, &inputs).unwrap();
+        let imported = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(outputs, vec![Placeholder, Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(imported.to_string(), program.to_string());
+        assert_eq!(
+            imported.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
+        );
+        assert_eq!(imported.effects(), Effects::single(Effect::OrderedAssertion));
+        let error = imported
+            .interpret(vec![DimensionValue::new(left, 7).unwrap(), DimensionValue::new(right, 3).unwrap()])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "left <= right; observed left=7, right=3".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_dimension_requirement_failure_diagnostics() {
+        let context = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let left = test_dimension_type("left", 0, 20);
+        let right = test_dimension_type("right", 0, 20);
+        let elements = test_dimension_type("elements", 1, 33);
+        let alignment = test_dimension_type("alignment", 1, 17);
+
+        // Every runtime failure names the requirement and both observed actors with their concrete extents.
+        let failures = [
+            (
+                DimensionRequirementOperation::equal(&left, &right),
+                vec![DimensionValue::new(left.clone(), 12).unwrap(), DimensionValue::new(right.clone(), 8).unwrap()],
+                "left == right; observed left=12, right=8",
+            ),
+            (
+                DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                vec![DimensionValue::new(left.clone(), 12).unwrap(), DimensionValue::new(right.clone(), 8).unwrap()],
+                "left <= right; observed left=12, right=8",
+            ),
+            (
+                DimensionRequirementOperation::divisible_by(&left, &right),
+                vec![DimensionValue::new(left.clone(), 12).unwrap(), DimensionValue::new(right.clone(), 5).unwrap()],
+                "left % right == 0; observed left=12, right=5",
+            ),
+            (
+                DimensionRequirementOperation::divisible_by(&left, &right),
+                vec![DimensionValue::new(left.clone(), 12).unwrap(), DimensionValue::new(right.clone(), 0).unwrap()],
+                "right > 0 for divisibility; observed left=12, right=0",
+            ),
+            (
+                DimensionRequirementOperation::divisible_by(&elements, &alignment),
+                vec![DimensionValue::new(elements, 25).unwrap(), DimensionValue::new(alignment, 8).unwrap()],
+                "elements % alignment == 0; observed elements=25, alignment=8",
+            ),
+        ];
+        for (operation, inputs, expected) in failures {
+            let error = context.bind(operation, Vec::new(), &inputs).unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<DimensionError>(),
+                Some(&DimensionError::RequirementViolation { message: expected.to_string() }),
+            );
+        }
+
+        // A bounds failure retains the actor name, the observed extent, and the required interval.
+        let required_bounds = DimensionBounds::new(4, Some(16)).unwrap();
+        let error = context
+            .bind(
+                DimensionRequirementOperation::bounds(&left, required_bounds),
+                Vec::new(),
+                &[DimensionValue::new(left.clone(), 3).unwrap()],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::BindingOutOfBounds {
+                variable: "left".to_string(),
+                value: 3,
+                bounds: required_bounds,
+            }),
+        );
+
+        // Failures proven from declared bounds alone are raised during type inference, where no concrete extent has
+        // been observed yet, so they cite the requirement and its provenance instead of observed actor values.
+        let low = test_dimension_type("low", 0, 4);
+        let high = test_dimension_type("high", 5, 9);
+        let error = DimensionRequirementOperation::less_than_or_equal(&high, &low)
+            .infer_output_types(&[high.clone(), low.clone()], &[])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "high <= low is impossible from declared bounds".to_string(),
+            }),
+        );
+        let error = DimensionRequirementOperation::bounds(&low, DimensionBounds::new(5, Some(9)).unwrap())
+            .infer_output_types(&[low], &[])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::RequirementViolation {
+                message: "low in [5, 9) is impossible from declared bounds".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_dimension_requirement_order_is_deterministic() {
+        let left = test_dimension_type("left", 0, 10);
+        let right = test_dimension_type("right", 0, 10);
+
+        // Building the same requirement sequence twice yields byte-identical programs, so assertion placement never
+        // depends on iteration order over a hashed collection.
+        let programs = [(); 2].map(|()| {
+            let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+            let left_atom = builder.add_input(left.clone());
+            let right_atom = builder.add_input(right.clone());
+            builder
+                .add_instruction(
+                    DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                    Vec::new(),
+                    vec![left_atom, right_atom],
+                )
+                .unwrap();
+            let sum = builder
+                .add_instruction(
+                    DimensionAddOperation::new(&left, &right).unwrap(),
+                    Vec::new(),
+                    vec![left_atom, right_atom],
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(
+                    DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
+                    Vec::new(),
+                    vec![right_atom],
+                )
+                .unwrap();
+            builder
+                .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                    vec![sum],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        });
+        assert_eq!(programs[0].to_string(), programs[1].to_string());
+        assert_eq!(
+            programs[0].to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
+                let dimension_require_less_than_or_equal %0 %1
+                    %2:dimension<left + right ∈ [0, 19)> = dimension_add %0 %1
+                    dimension_require_bounds [bounds=[2, 8)] %1
+                in (%2)"},
+        );
+        for program in &programs {
+            assert_eq!(
+                program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+                vec![
+                    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME,
+                    DIMENSION_ADD_OPERATION_NAME,
+                    DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
+                ],
+            );
+        }
+
+        // Requirements are ordered assertions, so a program that states them in a different order is a different
+        // program. Both orderings bind exactly the same atoms, and the rendering distinguishes them purely by where
+        // the resultless statements fall in the statement sequence.
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let left_atom = builder.add_input(left.clone());
+        let right_atom = builder.add_input(right.clone());
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
+                Vec::new(),
+                vec![right_atom],
+            )
+            .unwrap();
+        let sum = builder
+            .add_instruction(
+                DimensionAddOperation::new(&left, &right).unwrap(),
+                Vec::new(),
+                vec![left_atom, right_atom],
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                Vec::new(),
+                vec![left_atom, right_atom],
+            )
+            .unwrap();
+        let swapped = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                vec![sum],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(swapped.atoms(), programs[0].atoms());
+        assert_eq!(
+            swapped.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [0, 10)>, %1:dimension<right ∈ [0, 10)> .
+                let dimension_require_bounds [bounds=[2, 8)] %1
+                    %2:dimension<left + right ∈ [0, 19)> = dimension_add %0 %1
+                    dimension_require_less_than_or_equal %0 %1
+                in (%2)"},
+        );
+        assert_ne!(swapped.to_string(), programs[0].to_string());
+
+        // Two requirements that both fail report the earlier one, so swapping their order swaps the diagnostic.
+        let orderings = [
+            (
+                DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                DimensionRequirementOperation::equal(&left, &right),
+                "left <= right; observed left=7, right=3",
+            ),
+            (
+                DimensionRequirementOperation::equal(&left, &right),
+                DimensionRequirementOperation::less_than_or_equal(&left, &right),
+                "left == right; observed left=7, right=3",
+            ),
+        ];
+        for (first, second, expected) in orderings {
+            let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+            let left_atom = builder.add_input(left.clone());
+            let right_atom = builder.add_input(right.clone());
+            builder.add_instruction(first, Vec::new(), vec![left_atom, right_atom]).unwrap();
+            builder.add_instruction(second, Vec::new(), vec![left_atom, right_atom]).unwrap();
+            let program = builder
+                .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                    Vec::new(),
+                    vec![Placeholder, Placeholder],
+                    Vec::new(),
+                )
+                .unwrap();
+            let error = program
+                .interpret(vec![
+                    DimensionValue::new(left.clone(), 7).unwrap(),
+                    DimensionValue::new(right.clone(), 3).unwrap(),
+                ])
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_custom::<DimensionError>(),
+                Some(&DimensionError::RequirementViolation { message: expected.to_string() }),
+            );
+        }
     }
 }

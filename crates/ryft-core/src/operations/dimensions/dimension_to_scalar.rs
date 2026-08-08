@@ -170,6 +170,7 @@ impl_non_transposable_operation!(DimensionToScalarOperation);
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -280,6 +281,13 @@ mod tests {
             )
             .unwrap();
         drop(builder);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<extent ∈ [0, 9)> .
+                let %1:i64[] = dimension_to_scalar %0
+                in (%1)"},
+        );
 
         let mut relocated_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let relocated_input = relocated_builder.add_input(ArrayIrType::Dimension(dimension_type.clone()));
@@ -294,6 +302,14 @@ mod tests {
             relocated_instruction.operation(),
             ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
         ));
+        let relocated = relocated_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                relocated_outputs,
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
 
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_ids().len(), 1);

@@ -47,6 +47,7 @@ fn infer_bounds(left: &DimensionType, right: &DimensionType) -> Result<(Dimensio
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{DimensionBounds, DimensionOperation, DimensionValue};
@@ -91,6 +92,30 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
+
+        // A dimension-only program renders with the same `lambda ... let ... in (...)` grammar as an array program;
+        // each dimension type shows its diagnostic name beside the bounds inferred for it.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<left ∈ [1, 9)>, %1:dimension<right ∈ [1, 5)> .
+                let %2:dimension<left + right ∈ [2, 13)> = dimension_add %0 %1
+                in (%2)"},
+        );
+
+        // Relocating the program into a fresh region renames the internal result identity but renders identically.
+        let mut relocated_builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let relocated_inputs =
+            vec![relocated_builder.add_input(left_type.clone()), relocated_builder.add_input(right_type.clone())];
+        let relocated_outputs = relocated_builder.splice_program(&program, &relocated_inputs).unwrap();
+        let relocated = relocated_builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
+                relocated_outputs,
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(relocated.to_string(), program.to_string());
 
         let result_type = program.output_types().remove(0);
         assert_ne!(result_type.variable(), left_type.variable());

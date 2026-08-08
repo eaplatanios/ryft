@@ -13,7 +13,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
-use crate::operations::{Broadcast, BroadcastOperation, Transpose, TransposeOperation, Zero};
+use crate::operations::{Broadcast, BroadcastOperation, Transpose, TransposeOperation, Zero, ZeroLikeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value};
@@ -256,7 +256,9 @@ where
 /// partial-evaluation split discovers the residual operand edges structurally — so the rule is a leaf needing no
 /// nested differentiation or linearization request, and reverse mode transposes the replayed bilinear operations
 /// exactly as it does for any other straight-line tangent program.
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Type> {
+impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::Type>>> + Zero<C::Value>>
+    DifferentiableOperation<C> for CustomJvpOperation<C::Type>
+{
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
         context: &C,
@@ -268,13 +270,18 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
         let jvp_region = driver.region(1)?;
         let output_count = jvp_region.output_types().len() / 2;
         check_count!("input", inputs, jvp_region.input_types().len() / 2, ProgramError);
+
         // The JVP region consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
         // tangents.
         let mut jvp_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        // The user's JVP region takes every input tangent as a real region input, so materialize structural zeros.
+
+        // The user's JVP region takes every input tangent as a real region input, so materialize structural zeros
+        // against their own primal, which is a live value of exactly the tangent's type and therefore supplies the
+        // runtime geometry a reference-bearing tangent type omits; static inputs keep the nullary zero.
         for input in inputs {
-            jvp_inputs.push(input.tangent().clone().materialize(context)?);
+            jvp_inputs.push(input.tangent().clone().materialize_like(context, input.primal())?);
         }
+
         let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
@@ -730,7 +737,7 @@ where
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
 where
     C::Type: DifferentiableType,
-    C::Operation: From<LinearCallOperation<C::Type>>,
+    C::Operation: From<ZeroLikeOperation<C::Type>> + From<LinearCallOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -766,12 +773,13 @@ where
         // Stage one opaque carrier over `[residuals..., input_tangents...]`, producing the output tangents. The
         // carrier rejects forward interpretation and transposes by replaying the user's backward region.
         // The transpose-only carrier takes its residuals first, followed by every input tangent as a real operand,
-        // so materialize structural zeros.
+        // so materialize structural zeros against their own primal, which is a live value of exactly the tangent's
+        // type and therefore supplies the runtime geometry a reference-bearing tangent type omits.
         let mut carrier_operands = residuals;
         carrier_operands.extend(
             inputs
                 .iter()
-                .map(|input| input.tangent().clone().materialize(context))
+                .map(|input| input.tangent().clone().materialize_like(context, input.primal()))
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let carrier = LinearCallOperation::transpose_only(residual_count, input_tangent_types, output_tangent_types);
