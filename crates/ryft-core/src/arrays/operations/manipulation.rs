@@ -686,8 +686,8 @@ mod tests {
         CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionMulOperation,
         DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
         DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers,
-        GatherOperation, IotaOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
-        SliceOperation, UpdateSliceOperation,
+        GatherOperation, IotaOperation, OneOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
@@ -1277,7 +1277,7 @@ in (%4)
                 ArrayIrValue::Array(Array::scalar(1.0_f64)),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 0.0, 0.0, -1.0])),
+                ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 0.0, 1.0, -1.0])),
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 1.0])),
             ]),
         );
@@ -1327,7 +1327,7 @@ in (%4)
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64])),
             ]),
             Ok(vec![
-                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 30.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 30.0])),
                 ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 1.0])),
             ]),
         );
@@ -1527,6 +1527,72 @@ in (%4)
             Ok(vec![
                 ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0])),
                 ArrayIrValue::Array(Array::vector(vec![20.0_f64, 40.0])),
+            ]),
+        );
+    }
+
+    /// Mixed scatter applies the same operand-exemplar rule as pad and concatenation: a structurally zero operand
+    /// tangent whose type names its extent by identity is materialized from that operand's primal rather than from the
+    /// type, which carries no runtime extent.
+    #[test]
+    fn test_array_ir_dynamic_scatter_disconnected_operand_tangent_uses_a_primal_exemplar() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(7)).unwrap());
+        let extent_type = DimensionType::new(extent);
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let padded_extent = builder.add_input(extent_type.clone().into());
+        let indices = builder.add_input(indices_type.clone().into());
+        let updates = builder.add_input(updates_type.into());
+
+        // The reshaped operand is a static nullary one constant, so its tangent is a structural zero of a static type
+        // that no rule needs to materialize. Mixed reshape then carries that zero tangent into a structural zero of its
+        // own identity-bearing output type, which is exactly the disconnected dynamic operand tangent the scattered
+        // operand receives. Its primal is a non-zero exemplar and the update tangent stays live, so the rule must hand
+        // a concrete operand tangent to the staged tangent scatter from that exemplar rather than from the type, which
+        // carries no runtime extent.
+        let ones = builder
+            .add_instruction(
+                ArrayOperation::One(OneOperation::new(ArrayType::new(
+                    DataType::F64,
+                    Shape::new(vec![Dimension::Static(4)]),
+                ))),
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()[0];
+        let operand = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![ones, padded_extent])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Scatter(ScatterOperation::new(
+                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                ))),
+                Vec::new(),
+                vec![operand, indices, updates],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(extent_type, 4).unwrap()),
+                ArrayIrValue::Array(Array::from_f64s(indices_type, vec![1.0, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0])),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 11.0, 1.0, 21.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 0.0, 2.0])),
             ]),
         );
     }

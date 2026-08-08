@@ -462,7 +462,11 @@ impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> f
             .iter()
             .map(|dimension| {
                 dimension.value().ok_or_else(|| {
-                    TypeError::invalid(format!("cannot materialize an iota of dynamically sized type {type}"))
+                    TypeError::invalid(format!(
+                        "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
+                         over 'ArrayIrOperation', whose 'DynamicIota' constructor consumes one dimension operand per \
+                         dynamic axis",
+                    ))
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1284,7 +1288,11 @@ mod tests {
             context.fill(&array_type(DataType::U4, &[2]), 2.5f64).unwrap().elements::<u4>(),
             Ok(vec![u4::new(2).unwrap(); 2]),
         );
-        // Kernels that materialize a payload from a type reject dynamically sized types.
+
+        // Kernels that materialize a payload from a type reject dynamically sized types, and each diagnostic names
+        // the canonical array-program route that does admit dynamic extents. `zero` and `one` share the storage-level
+        // rejection raised by `ArrayAddressing::new`, while `fill` and `iota` carry their own constructor-specific
+        // guards and therefore name their exact replacements.
         let dynamic_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![
@@ -1292,7 +1300,8 @@ mod tests {
                 Dimension::Static(3),
             ]),
         );
-        let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]";
+        let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]; dynamically \
+                                shaped values exist only in array programs over 'ArrayIrOperation'";
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
@@ -1301,7 +1310,16 @@ mod tests {
             context.one(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
         ));
-        assert_eq!(context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(), expected_message);
+        assert_eq!(
+            context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(),
+            "cannot materialize a value of dynamically sized type f64[dynamic, 3]; stage a rank-zero fill in an array \
+             program over 'ArrayIrOperation' and expand it with 'dynamic_broadcast'",
+        );
+        assert_eq!(
+            context.iota(&dynamic_type, 1).unwrap_err().to_string(),
+            "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
+             'ArrayIrOperation', whose 'DynamicIota' constructor consumes one dimension operand per dynamic axis",
+        );
     }
 
     #[test]

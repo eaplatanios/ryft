@@ -210,8 +210,18 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
-    /// Region-free homogeneous array operation. Member control-flow operations are promoted to their direct
-    /// composite carriers when an array-only operation is lifted into the array IR.
+    /// Homogeneous array operation whose complete boundary is projected into the array member family. Every transform
+    /// reaches the member rule through that projection, which carries no region access: an operation's attached
+    /// regions are programs in the *composite* universe, and no projected view can present them in the member
+    /// universe. This variant therefore holds only region-free array operations, and the array-operation lift promotes
+    /// every region-carrying member payload that has a composite carrier — [`Condition`](Self::Condition),
+    /// [`While`](Self::While), [`Scan`](Self::Scan), and the executable form of [`LinearCall`](Self::LinearCall) — to
+    /// that carrier instead.
+    ///
+    /// The remaining region-carrying array payloads ([`CustomJvpOperation`], [`CustomVjpOperation`],
+    /// [`RematerializeOperation`], and the transpose-only [`LinearCallOperation`] form) have no composite carrier yet,
+    /// so they still reach this variant. They are not silently mis-transformed: each transform rejects a region-
+    /// carrying projected payload with an exact diagnostic naming the operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 
@@ -307,6 +317,13 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 let captures = operation.captures().iter().cloned().map(ArrayIrValue::Array).collect();
                 Self::Scan(operation.with_captures(captures))
             }
+            // The executable linear-call form is fully described by its residual count and therefore promotes to the
+            // composite carrier, which owns the extent-threaded region rule. The transpose-only form additionally
+            // stores its unavailable forward map's member types, which have no composite counterpart here, so it stays
+            // in the projected variant and is rejected by name if a transform ever reaches its regions.
+            ArrayOperation::LinearCall(operation) if !operation.is_transpose_only() => {
+                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
+            }
             operation => Self::Array(operation),
         }
     }
@@ -369,6 +386,7 @@ where
             Self::DynamicSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::DynamicUpdateSlice(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::Gather(operation) => operation.jvp_in_parent(context, driver, inputs)?,
+            Self::Scatter(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::Reduce(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             operation => jvp_projected_operation(context, operation, inputs)?,
         };
@@ -432,7 +450,7 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::arrays::types::memories::Memory;
-    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::interpretation::InterpretableOperation;
@@ -446,8 +464,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, OperationProjection, ProgramBuilder, ProgramError, RegionInterface, Type,
-        TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        Effect, Effects, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder, ProgramError,
+        RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1266,6 +1284,163 @@ mod tests {
                 in (%3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_batching_of_a_region_carrying_array_payload() {
+        type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
+
+        let array_type = ArrayType::scalar(DataType::F64);
+
+        // `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a custom JVP
+        // boundary that survived a transform would be detectable.
+        let scaling_program = |primal_scale: f64, tangent_scale: Option<f64>| -> TestProgram {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(array_type.clone().into());
+            let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(primal_scale)));
+            let mut outputs = builder
+                .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale])
+                .unwrap()
+                .to_vec();
+            let mut input_count = 1;
+            if let Some(tangent_scale) = tangent_scale {
+                let tangent_input = builder.add_input(array_type.clone().into());
+                let tangent_scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(tangent_scale)));
+                outputs.extend(
+                    builder
+                        .add_instruction(
+                            ArrayOperation::Mul(MulOperation::new()),
+                            Vec::new(),
+                            vec![tangent_input, tangent_scale],
+                        )
+                        .unwrap(),
+                );
+                input_count = 2;
+            }
+            let output_count = outputs.len();
+            builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
+        };
+
+        // A region-carrying payload with no composite carrier still reaches the projected `Array` variant. Batching it
+        // names the operation and the remedy instead of reporting an out-of-range region index from a driver the
+        // projection had already discarded.
+        let lifted = TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new()));
+        assert!(matches!(lifted, ArrayIrOperation::Array(ArrayOperation::CustomJvp(_))));
+        let error = batch(
+            |input: BatchingTracer<_, ArrayIrBatching>| {
+                let context = input.context().clone();
+                Ok(context
+                    .bind(
+                        ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+                        vec![scaling_program(2.0, None), scaling_program(2.0, Some(3.0))],
+                        &[input],
+                    )?
+                    .remove(0))
+            },
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            BatchingError::UnsupportedOperation {
+                message: "projected operation `custom_jvp` carries regions and cannot be batched through its member \
+                          family; batch it through a composite carrier for that operation instead"
+                    .to_string(),
+            },
+        );
+
+        // The executable linear call does have a composite carrier, so the lift promotes it and its extent-threading
+        // composite rule batches the attached regions.
+        let identity_program = || -> TestProgram {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            builder.add_input(array_type.clone().into());
+            let linear = builder.add_input(array_type.clone().into());
+            builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+        };
+        let promoted = TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::new(1)));
+        assert!(matches!(promoted, ArrayIrOperation::LinearCall(operation) if operation.residual_count() == 1));
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
+        let output: TestValue = batch(
+            |(residual, linear): (BatchingTracer<_, ArrayIrBatching>, BatchingTracer<_, ArrayIrBatching>)| {
+                let context = residual.context().clone();
+                Ok(context
+                    .bind(
+                        ArrayOperation::LinearCall(LinearCallOperation::new(1)),
+                        vec![identity_program(), identity_program()],
+                        &[residual, linear],
+                    )?
+                    .remove(0))
+            },
+            (ArrayIrValue::Array(Array::scalar(3.0_f64)), linear.clone()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, linear);
+    }
+
+    /// Builds a composite program holding one region-carrying array payload with identity `primal` and `jvp` regions,
+    /// which is the projected-variant residue that has no composite carrier.
+    fn composite_custom_jvp_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let array_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let primal = {
+            let mut region = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = region.add_input(array_type.clone().into());
+            region
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let jvp = {
+            let mut region = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = region.add_input(array_type.clone().into());
+            let tangent = region.add_input(array_type.clone().into());
+            region
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![input, tangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let regions = [primal, jvp].map(|region| builder.import_region(region.entry_region_ref())).to_vec();
+        let input = builder.add_input(array_type.into());
+        let output = builder
+            .add_instruction(ArrayOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input])
+            .unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    #[test]
+    fn test_composite_differentiation_of_a_region_carrying_array_payload() {
+        // Forward mode reaches the projected member rule with no region access, so it names the operation and the
+        // remedy instead of reporting an out-of-range region index.
+        assert_eq!(
+            composite_custom_jvp_program().jvp().unwrap_err(),
+            DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "projected operation `custom_jvp` carries regions and cannot be differentiated through its \
+                          member family; differentiate it through a composite carrier for that operation instead"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_composite_transposition_of_a_region_carrying_array_payload() {
+        // Transposition records member rules in a member-typed trace and therefore also reaches the payload without
+        // its regions. The diagnostic precedes the payload's own non-transposable rejection.
+        assert_eq!(
+            composite_custom_jvp_program().transpose_with_respect_to(&[0]).unwrap_err(),
+            DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "projected operation `custom_jvp` carries regions and cannot be transposed through its \
+                          member family; transpose it through a composite carrier for that operation instead"
+                    .to_string(),
+            }),
         );
     }
 

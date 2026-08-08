@@ -1346,11 +1346,26 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       checkbox remains open for group-aware production reachability, Phase 7 bounded-dynamic execution, and the final
       current-JAX behavioral/StableHLO comparisons.
 - [ ] Phase 6 owner: route transform-generated zero/one values through structural zero or `zero_like`/`one_like`
-      whenever an operand supplies geometry.
+      whenever an operand supplies geometry. The mixed `ArrayIrType` forward-mode rules for pad and concatenate now
+      route through `materialize_array_tangent`, which uses the operand primal as the runtime-geometry exemplar for an
+      identity-bearing structural zero and keeps the canonical nullary zero for identity-free types (2026-08-07; see
+      the log entry below). The remaining exemplar-available sites are the homogeneous `ArrayType` forward-mode rules
+      (`slicing.rs` update-slice and dynamic-update-slice, `scattering.rs`, `select.rs`, `complex.rs`,
+      `concatenation.rs`, `padding.rs`) plus the type-generic transform drivers (`custom_derivatives.rs`,
+      `rematerialization.rs`, `linear.rs`, `forward.rs`, `scan.rs`, `while.rs`, `condition.rs`, `reverse.rs`
+      auxiliary seeds, and `attention.rs` sequence-length cotangents). Each of those needs a
+      `From<ZeroLikeOperation<T>>` bound added to an existing generic operation-family bound, so they are one
+      separately reviewable slice rather than part of this delivery.
 - [ ] Phase 6 owner: migrate transform consumers that stage `ZeroOperation<ArrayType>` with possibly-dynamic types
       (condition, scan, while, gather, scatter, slice, pad, and differentiation rules) to `zero_like`, structural
       zeros, or explicit extent residuals, with dynamic-shape acceptance tests per consumer. The zero reference guard
-      is not complete until this lands.
+      is not complete until this lands. Pad and concatenate are migrated with dynamic acceptance tests (2026-08-07).
+      Gather, slice, dynamic-slice, dynamic-update-slice, and broadcast were already residual-aware from P6b and are
+      confirmed so by the inventory below. Scatter has no `MemberDifferentiableOperation` rule at all, so a mixed
+      scatter reaches the homogeneous rule through the unguarded `arrays/operations/mod.rs` catch-all; that remains a
+      real gap. The reverse-mode transpose cluster (`gathering.rs`, `slicing.rs` slice/dynamic-slice, `condition.rs`,
+      `scan.rs`, `linear.rs`) cannot use an exemplar at all because the geometry belongs to an `Unknown` linear
+      operand, so it needs the residual protocol rather than `zero_like`.
 - [ ] Cross-phase invariant: keep `DimensionType` strictly identity plus bounds throughout all later phases. Concrete
       extents are runtime values and output-refinement observations, never part of `Typed::r#type`, structural
       equality, hashing, rendering, persistence, or cache identity.
@@ -1364,7 +1379,13 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
       inference derives result metadata directly from operand types. Centralize only genuinely repeated count/kind
       projection.
 - [ ] Phase 6 owner: replace shape-metadata zero/one materialization inside transforms with structural zero or
-      `zero_like`/`one_like` wherever semantics allow.
+      `zero_like`/`one_like` wherever semantics allow. The complete remaining inventory is five homogeneous
+      `ArrayType` batching sites: `padding.rs` mask-input `one` (exemplar `operand.value()` available, blocked only on
+      the Boolean element retype), `slicing.rs` `batch_by_item_expansion` empty-batch zero and `scan.rs` zero-length
+      and accumulator stack zeros (no exemplar exists by construction — the value being allocated is the first of its
+      kind), and `padding.rs` transpose mask-input zero. All five live in `Context<Type = ArrayType>`, whose operation
+      family has no `DimensionSize` variant and therefore no way to observe a runtime extent, so they are the
+      permanent homogeneous baseline unless their owning rules move to the mixed family (2026-08-07).
 - [x] Static and dynamic reshape/broadcast invocations bind the same canonical payload with exact constants or dynamic
       dimension SSA operands. Constructors intentionally use static homogeneous encoding versus the variant-owned
       dynamic stored-type contract described above.
@@ -1455,7 +1476,7 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [x] Ambient dimension and source-array context-view fields no longer exist.
 - [x] Delete temporary homogeneous program construction used only to replay shape-carrying rules.
 - [x] Narrow the homogeneous operation family to array-only primitives.
-- [ ] Phase 5/6 owner: migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical
+- [x] Phase 5/6 owner: migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical
       array-program domain where they need dynamic shape, mixed control-flow, or composite transform functionality.
       Retain the homogeneous reference backend and focused transform fixtures until their composite replacements land;
       they are comparison baselines, not unfinished production-XLA migration. *(Scope narrowed 2026-08-07 by the
@@ -1475,7 +1496,35 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       diagnostics; (3) document `Array`'s always-static invariant on the struct doc with its enforcement point;
       (4) document `RegionRef::batched`'s contract (mapped axis always inserted static; per-item dynamic dimensions
       pass through to `DimensionSource` resolution) plus one test batching a program with a dynamic per-item input
-      type. Deferred pending the concurrent zero/one hygiene agent's completion in the same files.)*
+      type. Deferred pending the concurrent zero/one hygiene agent's completion in the same files. Fix (1) was
+      executed on 2026-08-07 alongside the foreign-call batching D0/D1 work, which already owned that file: after
+      alias validation, `CustomCallOperation<ArrayType>::infer_output_types` rejects any declared output whose
+      `static_shape()` is `None` with `'custom_call' requires explicit result-extent operands for dynamic output
+      type {t}`, covered by
+      `test_custom_call_rejects_dynamic_output_types_without_extent_operands`. Fixes (2)–(4) were executed on
+      2026-08-07. (2) The eager constructor rejection test in `arrays/operations/constants.rs` now also covers `iota`,
+      and each constructor diagnostic names its canonical replacement: `iota` points at the array program over
+      `ArrayIrOperation` whose `DynamicIota` constructor consumes one dimension operand per dynamic axis, and `fill`
+      points at a rank-zero fill expanded with `dynamic_broadcast`. The shared `ArrayAddressing::new` rejection was
+      also extended, with the route-neutral clause `dynamically shaped values exist only in array programs over
+      ArrayIrOperation`, because that message is raised from four storage entry points (`ArrayAddressing::new`,
+      `Array::materialized_element_count`, the `encode_elements` codec behind `Array::from_elements`, and the eager
+      broadcast kernel), several of which have no constructor-specific replacement; the ripple was three exact-match
+      assertions (`addressing.rs`, `arrays.rs`, and the zero/one arms in `constants.rs`), well under the review
+      threshold. The eager broadcast guard in `arrays/operations/manipulation.rs` was deliberately left on the plain
+      shared text since it is a kernel-level, not constructor-level, rejection. (3) `Array`'s struct doc now records
+      the always-static invariant, its enforcement point in `ArrayAddressing::new`, the reference-kernel consequence,
+      and the single `#[cfg(test)]`-gated `with_unchecked_type` bypass. (4) `RegionRef::batched`'s doc now states that
+      the mapped axis is always freshly inserted as `Dimension::Static(axis_size)`, so program batching never reads a
+      batch extent off an input type and never raises `BatchingError::DynamicBatchAxis` the way value-level
+      `Batch::batch` does, while per-item dynamic dimensions cross the boundary unchanged and are resolved through
+      `DimensionSource`. `test_program_batched_carries_dynamic_per_item_dimensions` pins the empirical result: batching
+      a `f64[n] -> f64[n]` add program at axis 0 with size 2 succeeds and yields `f64[2, n]` input and output types
+      with output axis 0, and the two-input mapped/replicated variant stages a homogeneous `broadcast` whose stored
+      output type retains the dynamic extent (`f64[2, n]`) while the replicated input keeps its unbatched `f64[n]`
+      type. That staged-broadcast payload is exactly the shape covered by the separate homogeneous-baseline replay
+      refinement item below, which is why the test pins staging rather than eager replay. The item is left unchecked
+      pending the owner's confirmation that fix (1) has landed on the branch.)*
 - [ ] Homogeneous-baseline replay refinement (opened 2026-08-07 by the consumer sweep): `Program::interpret_in_context`
       refines only the input/output boundary, not instruction operation payloads, so a homogeneous
       `BroadcastOperation` with a dynamic stored `output_type` (admitted by broadcast inference for identity-equal
@@ -1585,12 +1634,19 @@ rename only part of the problem while introducing another carrier.
       Sanctioned-reads ledger (drift gate — `array_dimension` shall have exactly these five production call sites):
       `arrays/batching.rs` replicated `match_axis`, `broadcast_input` `DimensionSource::Value`, `prepare_inputs`
       mapped-extent inference, `prepare_inputs` sharding normalization, and `manipulation/padding.rs` pad-mask
-      construction. Two follow-ups recorded below as separate items.)*
-- [ ] Constant-fold static axes in `DynamicArrayBatchingPolicy::match_axis` and the composite `prepare_inputs`
+      construction. Two follow-ups recorded below as separate items.)* **Ledger amendment (2026-08-08):** the first
+      and fourth sites now reach `array_dimension` indirectly through `folded_array_dimension`, which reads only
+      genuinely dynamic axes. The gate is unchanged in substance — five sanctioned reads, two of them behind that one
+      folding helper.
+- [x] Constant-fold static axes in `DynamicArrayBatchingPolicy::match_axis` and the composite `prepare_inputs`
       sharding normalization, matching the existing `DimensionSource::Static` arm and `collective_input_extents`:
       today those two paths read every axis `0..rank` through `dimension_size`, allocating fresh exact-bounded
       `size(axis=N)` identities for statically known axes — IR noise and identity churn, not a correctness bug
-      (recorded 2026-08-07; small, behaviorally inert, some golden-IR test churn).
+      (recorded 2026-08-07; small, behaviorally inert, some golden-IR test churn). *(Executed 2026-08-08: both paths
+      now go through the new `folded_array_dimension` helper, which stages an exact `DimensionOperation::Constant`
+      through the extracted `dimension_constant` helper for `Dimension::Static` axes and delegates only genuinely
+      dynamic axes to `array_dimension`. `prepare_inputs` additionally stops staging a read for the mapped axis it
+      immediately overwrites with the transform's extent. Details in the review section below.)*
 - [ ] Optional, risk-gated: replace the composite sharding-normalization broadcast in `prepare_inputs` with a
       projected `ReshardOperation` bind, deleting the rank-many `array_dimension` sweep staged purely to relabel one
       axis's placement and making the composite entrypoint symmetric with the homogeneous one. Gate: `Reshard` is a
@@ -2567,7 +2623,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       Two premise corrections recorded: JAX 0.6.1's `vmap_method` is live and non-deprecated (only its implicit
       `sequential` default is deprecated toward `NotImplementedError`), and JAX's own `sequential_vmap` is a canned
       rule atop `custom_vmap`, not a separate mechanism. The actionable residue is the two items below.)*
-  - [ ] Foreign-call batching D0 — all-replicated pass-through and diagnostic audit: the current blanket
+  - [x] Foreign-call batching D0 — all-replicated pass-through and diagnostic audit: the current blanket
         `BatchableOperation` rejection for `CustomCallOperation` errors even when every operand is replicated, a
         JAX-parity defect (JAX only invokes a batching rule when an operand is mapped). The shortcut is sound for
         custom call specifically because it is region-free by construction (a foreign kernel cannot observe the
@@ -2575,8 +2631,18 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `plan_custom_derivative_batching_axis_parity.md` so the shortcut is never generalized. Also: name the mapped
         operand index/axis and the remedies in the rejection message; fix the rustdoc that implies wrapping in
         `custom_jvp`/`custom_vjp` provides a batching rule (it does not — both structurally batch their primal
-        region and hit the same rejection); remove the module-review TODOs.
-  - [ ] Foreign-call batching D1 — enumerated `CustomCallBatching` payload field (`Rejected` default \|
+        region and hit the same rejection); remove the module-review TODOs. *(Executed 2026-08-07: the blanket
+        rejection now binds an all-replicated call unchanged through `context.parent()` and reports replicated
+        outputs; a mapped operand reports `custom call '<target>' has no batching rule for operand <i> mapped at
+        batch axis <a>; invoke a kernel that understands the batch axis, or select an explicit batching behavior
+        with \`CustomCallOperation::with_batching\``. The impl rustdoc justifies the shortcut by custom call being
+        region-free by construction — `infer_output_types` rejects every attached region, so the kernel is a leaf
+        and cannot observe the transform's named axis — and cites `plan_custom_derivative_batching_axis_parity.md`'s
+        JAX fixture (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still yields `[0, 1, 2]`)
+        as the counterexample that forbids generalizing it to region-carrying operations. The payload rustdoc now
+        states that `custom_jvp`/`custom_vjp` supply only the missing derivative and structurally batch their own
+        primal region, so a mapped operand meets this same contract. Both module-review TODOs removed.)*
+  - [x] Foreign-call batching D1 — enumerated `CustomCallBatching` payload field (`Rejected` default \|
         `Sequential { unroll: Option<usize> }` \| `BroadcastAll`), read inside the operation's own
         `BatchableOperation` impls (no new policy trait, no second batching path): a policy-generic homogeneous rule
         mirroring `RngBitGeneratorOperation`'s scan-based sequential shape (which also serves the composite
@@ -2586,19 +2652,99 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         axis while its aliased output gains size b) and `legacy_vectorized` is REJECTED (an XLA-legacy mode JAX
         already removed). Required test coverage includes alias-under-batching rejection, layout shifting on batched
         types, side-effect count semantics (batched-once vs sequential-N — both conventions already exist in-repo:
-        `Print` vs `RngBitGenerator`), nested vmap, and one CPU execution fixture.
+        `Print` vs `RngBitGenerator`), nested vmap, and one CPU execution fixture. *(Executed 2026-08-07; refer to the
+        `Foreign-call batching D0/D1` log entry for the delivered design, the one recorded refinement to the mixed
+        rule's delegation condition, and the verification results.)*
   - Note (2026-08-07, corrected by the owner): `tracing_v2` is NOT being deleted — its functionality
         (`custom_derivatives.rs`, `rematerialization.rs`, feature-gated benchmarking) stays, and the owner plans to
         refactor the module later on their own schedule. This is deliberately NOT a Phase 9 exit-criterion item and
         gates nothing; recorded only so the module's transitional name is not mistaken for unrecorded residue again.
         Until that owner-driven refactor, `crate::tracing_v2::*` rustdoc links (e.g., in `custom_call.rs`) remain
         valid and should not be "cleaned up".
-  - [ ] Five-minute audits flagged by the review (adjacent, possibly separate defects): (i) whether
+  - [x] Five-minute audits flagged by the review (adjacent, possibly separate defects): (i) whether
         `ArrayIrOperation::Array(ArrayOperation::CustomJvp(..))` — a region-carrying payload reached through a
         variant documented region-free — can actually reach `batch_projected_operation`, which requires region-free
         operations; (ii) whether `LinearCallOperation`'s all-replicated batching fast path is sound against the
         all-replicated-shortcut-invalid fixture (likely yes because differentiation-generated linear regions cannot
-        contain named-axis collectives, but unverified).
+        contain named-axis collectives, but unverified). *(Both audited 2026-08-07 during D0/D1; both are real
+        defects and neither was fixed here because both are outside the foreign-call scope.*
+
+        *(i) CONFIRMED REACHABLE. `From<ArrayOperation<A>> for ArrayIrOperation<A>` promotes only `Zero`,
+        `Condition`, `While`, and `Scan` to composite carriers and routes everything else — including the
+        region-carrying `CustomJvp`, `CustomVjp`, `Rematerialize`, and `LinearCall` payloads — into
+        `ArrayIrOperation::Array`, whose own rustdoc claims "region-free homogeneous array operation". Such an
+        instruction also type-checks with regions attached, because `infer_projected_operation_output_types`
+        projects the whole boundary including every `RegionInterface`. The derived batching dispatcher's projected
+        arm then calls `batch_projected_operation`, which discards the instruction's driver and passes
+        `EmptyRegionDriver`, so `CustomJvpOperation::batch`'s `driver.region(0)?` fails with
+        `MalformedProgram("region index 0 is out of range")`. So it is a confusing-diagnostic and lost-capability
+        defect rather than a silent miscompute: region-carrying array payloads simply cannot be batched inside a
+        composite program. The fix belongs with the composite family: either promote these payloads to composite
+        carriers in the `From` conversion, or give the projected arm a region-aware path.*
+
+        *(ii) PREMISE FALSE; fast path is unsound in general. Two independent routes. First, the stated premise —
+        that differentiation-generated linear regions cannot contain named-axis collectives — is false:
+        `AllGatherOperation::transpose` stages a `PSumScatterOperation` and vice versa, so a transposed program
+        naturally contains named-axis collectives, and a `linear_call` whose region names the very axis an enclosing
+        named `vmap` introduces is exactly the counterexample fixture (all wrapper operands replicated, region value
+        per batch item). Second, `LinearCallOperation::new` is public and both `ArrayOperation::LinearCall` and
+        `ArrayIrOperation::LinearCall` are public variants, so arbitrary user-supplied regions — including a bare
+        `axis_index` — reach the same fast path. The safe rule is the one the custom-derivative wrappers already
+        follow: batch the regions structurally and let their natural output axes decide, keeping the fast path only
+        when the regions provably contain no named-axis operation.)*
+- [x] Fix the region-carrying composite batching defect confirmed by audit (i) above (opened 2026-08-08): the
+      `From<ArrayOperation<A>>` lift routes `CustomJvp`/`CustomVjp`/`Rematerialize`/`LinearCall` into the
+      region-free-documented `ArrayIrOperation::Array` variant, whose projected batching arm passes
+      `EmptyRegionDriver` and fails with `MalformedProgram("region index 0 is out of range")`. Either promote these
+      region-carrying payloads to composite carriers in the `From` conversion (matching `Condition`/`While`/`Scan`)
+      or give the projected dispatch arm a region-aware path; add the reproducing fixture first, and fix the
+      `Array` variant's rustdoc claim either way. *(Executed 2026-08-08: promotion for the executable `LinearCall`
+      form, which already has a composite carrier and a fully policy-generic region rule, plus exact typed
+      diagnostics naming the operation and the remedy in all three projected member adapters
+      (`batch_projected_operation`, `jvp_projected_operation`, `transpose_projected_operation`) for the payloads that
+      have no carrier. Promoting `CustomJvp`/`CustomVjp`/`Rematerialize` was proven out of scope during execution:
+      the composite policy widens every batched region boundary with a leading extent input, and those three
+      operations' type contracts have no slot for it, so promotion needs a contract extension rather than a `From`
+      arm. Refer to the `Composite region batching and scatter differentiation fixes` log entry for the proof, the
+      transpose-only `LinearCall` residue, and the follow-up item below.)*
+- [ ] Give `CustomJvp`, `CustomVjp`, and `Rematerialize` composite carriers with extent-threaded regions (opened
+      2026-08-08 by the item above): these three region-carrying array payloads cannot be promoted today because
+      `ArrayIrBatching` widens a structurally batched region's boundary to `[extent, inputs...] ↦ [extent, outputs...]`
+      while each of their `Operation::infer_output_types` contracts requires the attached regions' boundaries to equal
+      the wrapper's own (`custom_jvp` primal inputs == wrapper inputs, and so on). `LinearCallOperation` threads that
+      extent as one more leading residual and `Condition`/`While`/`Scan` thread it as loop state, so those four already
+      have carriers. Give each of the three an equivalent extent slot (the residual-count shape is the closest
+      precedent), then promote them in the `From<ArrayOperation<A>>` lift, replace the projected-adapter diagnostics
+      asserted by `test_composite_{batching,differentiation,transposition}_of_a_region_carrying_array_payload` with
+      working-transform fixtures, and update the `ArrayIrOperation::Array` rustdoc residue list. A transpose-only
+      `LinearCallOperation` additionally needs a cross-universe type lift for its stored member interface types (its
+      `LinearCallInterface` is private, so `LinearCallOperation::new(residual_count)` covers only the executable form).
+- [x] Guard `LinearCallOperation`'s all-replicated batching fast path, found unsound by audit (ii) above (opened
+      2026-08-08): transposed programs naturally contain named-axis collectives (`AllGather` transposes to
+      `PSumScatter` and vice versa), and public constructors admit arbitrary regions (e.g., a bare `axis_index`), so
+      an all-replicated linear call whose regions name the enclosing `vmap`'s axis is mis-batched today. Add the
+      counterexample fixture, then keep the fast path only when the regions provably contain no named-axis
+      operation, falling back to structural region batching otherwise (the custom-derivative wrappers' rule).
+      *(Executed 2026-08-08: the guard is `input_axes.iter().all(BatchAxis::is_replicated) &&
+      context.axis_name().is_none()`. The item's "regions provably contain no named-axis operation" property is proven
+      from the *level* instead of by scanning the regions, which is both sound and cheaper: a region value can vary per
+      batch item with no mapped operand only by addressing the level **by name**, and every named-axis operation
+      resolves its level by comparing its own axis name against `BatchingContext::axis_name`, so an unnamed level is
+      provably invisible to all of them — including operations of families `ryft-core` does not know about, which a
+      recursive operation-name denylist would silently fail open on (and which the `Effects` doc explicitly warns
+      against: transforms consult classifications "instead of hardcoding operation lists"). No new `Operation` hook was
+      needed. Named levels now always batch structurally, which is also what lets their regions' named-axis operations
+      resolve; the transpose-only rejection message was reworded because it is now also reachable with all-replicated
+      operands. Refer to the log entry below.)*
+- [x] Give scatter a mixed differentiation rule (opened 2026-08-08 by the Phase 6 zero/one inventory): a mixed
+      scatter reaches the homogeneous `ScatterOperation` JVP through the unguarded projected catch-all in
+      `arrays/operations/mod.rs`, whose zero materialization is metadata-only; scatter needs its own
+      `MemberDifferentiableOperation` rule (or an exemplar-aware bound) mirroring the slice/gather rules. *(Executed
+      2026-08-08: `MemberDifferentiableOperation<C> for ScatterOperation` in `manipulation/scattering.rs` plus the
+      `Self::Scatter(..)` dispatcher arm. The rule materializes each missing scatter-add tangent from its own primal
+      exemplar through `materialize_array_tangent` and needs no residual-parameterized linear call, because
+      scatter-add's transpose reads only the known indices. Refer to the `Composite region batching and scatter
+      differentiation fixes` log entry for the reproducing path and the delegation condition.)*
 - [x] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
 - [ ] Phase 9 exit criterion (added 2026-08-07, owner decision): Phase 9 concludes only after every unchecked residual
@@ -3074,39 +3220,134 @@ composes nested axes already, and the relaxed-while-predicate work established t
 
 ## Verification matrix
 
-- [ ] Static array-only primitives never inspect the heterogeneous storage sum.
-- [ ] Dimension-only primitives never inspect array variants.
-- [ ] Mixed inference covers fixed, repeated, optional, and segmented operands.
-- [ ] Each mixed operation defines its explicit dimension operands once through its inference signature, with no
-      parallel payload metadata or schema.
-- [ ] `dimension_size` has exactly one result kind.
-- [ ] Dimension-to-data conversion occurs only through explicit gateways.
-- [ ] Shape operations retain all explicit dimension operands through tracing, import, PE, batching, AD, and lowering.
-- [ ] No transform reconstructs a dimension operand from output metadata or an ambient source array.
+- [x] Static array-only primitives never inspect the heterogeneous storage sum. *(Audited 2026-08-08: source gate
+      clean — no `ArrayIr*` in any array-only owner under `operations/**`; the apparent hits are the
+      policy-generic `impl_nullary_batchable_operation!(@member ...)` branch and the sanctioned
+      `MemberDifferentiableOperation` mixed seams; `CompareOperation<T>`'s phantom parameter gives the two
+      universes disjoint `Operation` impls, closing the last dual-contract carve-out.)*
+- [x] Dimension-only primitives never inspect array variants. *(Audited 2026-08-08: zero array-type identifiers
+      across all eleven `operations/dimensions/*.rs` files; the two gateways live in
+      `arrays/operations/dimensions.rs` as intended.)*
+- [x] Every mixed operation validates its own operand signature in one `infer_output_types` (or one
+      `MemberOperation<ArrayIrType>::infer_parent_output_types`), and the fixed, repeated (possibly-empty), and
+      multi-output segmented operand shapes each have at least one tested owner; no shared operand-pattern
+      vocabulary was needed. *(Reworded and audited 2026-08-08 — the original row presumed the typed mixed
+      projection vocabulary that was deliberately not built. Owners verified: gateways + composite compare
+      (fixed); dynamic constructors, dynamic reshape/broadcast, pad, collectives (repeated); custom call and RNG
+      accept zero-length trailing groups (optional); dynamic-shape slice, multi-output custom call, RNG state+bits
+      (segmented).)*
+- [x] Each mixed operation defines its explicit dimension operands once through its inference signature, with no
+      parallel payload metadata or schema. *(Audited 2026-08-08: retired-identifier gate clean repo-wide;
+      per-payload field audit found no parallel operand schema — `ConcatenateOperation`'s
+      `requires_runtime_assertion` is the sanctioned effect-precision bit, and the nullary constructors derive
+      operand positions from their stored type through the one shared helper.)*
+- [x] `dimension_size` has exactly one result kind. *(Audited 2026-08-08: one `Operation` impl with
+      `Type = ArrayIrType` returning the stored dimension result type unconditionally; the `DimensionSize<usize>`
+      capability on `Array` is a host-metadata accessor that binds no operation.)*
+- [x] Dimension-to-data conversion occurs only through explicit gateways. *(Audited 2026-08-08 by closed-family
+      enumeration: only `DimensionToScalar` and the deliberately composite-level `Compare<ArrayIrType>` cross
+      dimension-to-array; everything else consumes dimensions as geometry. A dedicated exhaustive-match classifier
+      fixture is queued below to make this a compile-forced gate.)*
+- [x] Shape operations retain all explicit dimension operands through tracing, import, PE, batching, AD, and lowering.
+      *(Audited 2026-08-08: `test_array_ir_concatenate` pins instruction-level operand edges through
+      tracing/render/eager/AD; `test_array_ir_reshape_differentiation` pins linearization residual edges;
+      composite lowering packs explicit scalar dimension operands into the shape tensors with CPU-executed
+      fixtures; import pinned by the builder interning tests; batching covered inside `test_array_ir_batching`
+      and `test_composite_scan_batching`.)*
+- [x] No transform reconstructs a dimension operand from output metadata or an ambient source array. *(Audited
+      2026-08-08: `LinearResiduals::retain_shape` stages explicit deduplicated reads; the gather transpose builds
+      zeros from residual SSA. The sanctioned-reads drift gate is rewritten below to cover the operation rather
+      than one helper.)*
 - [ ] Eager projection adds no heap allocation for concrete array/dimension values.
-- [ ] Eager projection neither deep-copies the reference `Array` payload nor relies on an undocumented cheap-clone
-      assumption.
-- [ ] Staged projection preserves SSA atom identity.
-- [ ] Mapped dimension authority and sharded dimension authority remain rejected.
+- [x] Eager projection neither deep-copies the reference `Array` payload nor relies on an undocumented cheap-clone
+      assumption. *(Audited 2026-08-08: `test_large_array_clone_does_not_allocate_payload_storage` proves
+      metadata-only clones sharing the exact payload pointer; the sharing contract is documented on the field and
+      on `new_unchecked`; `ProjectedContext::bind` documents its metadata clone.)*
+- [x] Staged projection preserves SSA atom identity. *(Audited 2026-08-08:
+      `test_projected_context_stages_without_implicit_dependencies` (generic; original atom consumed, one
+      instruction, zero-state adapter) plus `test_array_ir_tracer_projection_preserves_ssa_identity`
+      (production).)*
+- [x] Mapped dimension authority and sharded dimension authority remain rejected. *(Audited 2026-08-08:
+      `test_array_ir_batching` asserts exact `MappedDimension` errors across four dimension-consuming rules;
+      sharded authority is unrepresentable by construction and rejected at the shard-map boundary by
+      `test_shard_map_composite_boundary_is_array_only` for operands, body inputs, and body outputs.)*
 - [x] Dimension tangents/cotangents remain absent or structural zero.
 - [x] Required primal dimension values travel as ordinary differentiation residual SSA values.
 - [x] No primal operation payload contains `transpose_dimension_variables` or an equivalent residual manifest.
 - [x] Dynamic batching alignment consumes an explicit dimension value.
 - [ ] Requirement effects survive every transform and lower in deterministic order.
-- [ ] Nested condition, while, scan, custom derivative, and rematerialization regions carry dimensions correctly.
-- [ ] Repeated boundary readers do not become duplicate producers.
-- [ ] Fresh internal dimensions have one producer and dominate every reference.
+- [ ] Nested condition, while, scan, and linear-call regions carry dimensions correctly (audited 2026-08-08:
+      SATISFIED with extensive fixtures); custom-derivative and rematerialization payloads have no composite
+      carrier yet and are rejected by name with an exact diagnostic in interpretation, projected binding,
+      batching, JVP, and transposition — resolved by the region-carrying composite batching defect item above
+      (either carriers or documented rejection closes this row).
+- [x] Repeated boundary readers do not become duplicate producers. *(Audited 2026-08-08: forwarded-definition
+      classification in `Region::type_identity_signature`, pinned by
+      `test_structural_identity_closure_classifies_forwarded_and_fresh_definitions`; production corroboration in
+      the double `dimension_size` readers of `test_array_ir_reshape_differentiation`'s rendered primal.)*
+- [x] Fresh internal dimensions have one producer and dominate every reference. *(Audited 2026-08-08: evaluation-
+      order dominance and single-producer rejection in `Region::type_identity_signature`, pinned exhaustively with
+      exact messages by `test_structural_identity_closure_rejects_invalid_dominance_and_ownership`.)*
 - [ ] Alpha-equivalent programs share cache identity; live permutations and different graphs do not.
 - [ ] Exact diagnostics match the baseline.
 - [x] Bounded dynamic ABI, CPU, and CUDA behavior match the baseline.
 - [ ] Behavioral JAX parity and Ryft-exceeds-JAX cases remain intact.
 - [x] Toy third-kind tests demonstrate that generic program/context/projection machinery is closed to modification.
-- [ ] (Tier 3) Data-to-dimension conversion occurs only through the checked `dimension_from_scalar` gateway.
-- [ ] (Tier 3) Data-derived dimensions never enter structural type identity or retained-compilation cache keys.
+- [x] (Tier 3) Data-to-dimension conversion occurs only through the checked `dimension_from_scalar` gateway.
+      *(Audited 2026-08-08 by closed-family enumeration; the gateway's checks are pinned by
+      `test_dimension_from_scalar` across all eight integer element types with exact diagnostics. Shares the
+      queued exhaustive-match classifier fixture with the gateway row above.)*
+- [ ] (Tier 3) A data-derived dimension's runtime extent never enters structural type equality, hashing, or
+      retained-compilation cache keys; only its declared identity and bounds do (reworded 2026-08-08 — the
+      original wording was false by design since the gateway deliberately establishes a definition-position
+      structural identity). Machinery satisfied; needs the queued retained-JIT cache-identity fixture.
 - [ ] (Tier 3) Gateway bounds checks retain `OrderedAssertion` ordering through every transform and lowering.
 - [ ] (Tier 3) Data-derived extents ride the linear-call residual contract through differentiation unchanged.
 - [ ] (Tier 3) Every operation without data-dependent lowering or ragged batching support fails with an exact
       diagnostic before execution; padding effects are unobservable on every supported path.
+
+### Verification-matrix re-audit residue (2026-08-08)
+
+The 2026-08-08 matrix re-audit ticked twelve rows with recorded evidence, reworded three, and left the following
+concrete residue:
+
+- [ ] Small-fixture batch closing four rows (~4 fixtures, about a day total):
+  - `test_borrowed_and_consuming_dimension_ir_projection_does_not_allocate` in the allocation-instrumented
+    integration binary, mirroring the two array tests over `ArrayIrValue::Dimension` (closes the eager-projection
+    allocation row; record that projected *binding* clones type metadata by design).
+  - One shared fixture for the two `OrderedAssertion`-through-AD rows: a program with `dimension_from_scalar`, a
+    `DimensionRequirement`, and a differentiable body, run through `jvp()`/`linearize()`, asserting
+    `Effects::single(Effect::OrderedAssertion)` on the primal and original relative assertion order (PE/DCE/
+    lowering legs are already pinned).
+  - A retained-JIT alpha-invariance fixture: one `JittedFunction` over a dynamic-extent input called with two
+    alpha-equivalent-but-distinct `DimensionVariable` instantiations plus one permuted pair, asserting
+    `JitCacheStatistics` trace/lowering/dispatch counts (region-interning level already pinned by the builder
+    tests; closes the cache-identity row together with them).
+  - A gateway-residual rendering fixture: clone `test_array_ir_reshape_differentiation` with the extent sourced
+    from `dimension_from_scalar`, asserting the rendered `linear_call` shows the gateway result as a visible
+    residual edge (closes the tier-3 linear-call residual row).
+  - Bonus, highest leverage: an exhaustive `match` over every `ArrayIrOperation` variant classifying its
+    member-kind signature (array-to-array / dim-to-dim / dim-to-array gateway / geometry-consuming /
+    region-forwarding), converting the two closed-family enumeration rows into a compile-forced gate (~50 lines).
+- [ ] Re-home or explicitly retire the nineteen absent P0 diagnostic golden fixtures named in
+      `.tasks/dimensions_p0_evidence.md` (the message *templates* all survive with exact-match assertions in the
+      current owners; several fixtures have near-equivalents to port assertions into; the genuinely unowned ones
+      are requirement-order determinism and the three prover-probe tests). About 1-2 days.
+- [ ] Owner design call: the P0 baseline's congruence-transfer prover layer does not exist in the current
+      `AbstractDimensionValue` (interval + exact + same-variable only), so e.g. `require_divisible_by(n*4, 2)`
+      residualizes a runtime assertion the archive proved statically. Either reinstate congruence transfer in the
+      abstract values and arithmetic bound inference and restore the P0 probe table (3-5 days), or amend the
+      carries-over ledger to drop congruence and record the residual-assertion delta explicitly. Adjacent to the
+      diagnostics abort criterion; do not resolve silently.
+- [ ] Split the behavioral-JAX-parity matrix row out into its own work item: a differential-testing harness against
+      a pinned JAX build plus the P3k group-aware/`pshuffle`/`pswapaxes` surfaces and the tier-3
+      `count(mask); take(x, n)` comparisons. Multi-week; the matrix row stays unchecked and points here.
+- Ledger corrections applied with this audit: the sanctioned-reads drift gate in the closed reconstruction item is
+  superseded — the durable gate is "exactly these eight production sites stage a `DimensionSizeOperation` from a
+  transformed array value": the five batching/padding sites (two now folding static axes through
+  `folded_array_dimension`), `LinearResiduals::retain_shape`, and the two `capture_zero_residual*` readers in
+  `arrays/operations/constants.rs`; all eight are compliant, and the previous five-site helper-scoped wording is
+  retired.
 
 ## Abort and reassessment criteria
 
@@ -5812,3 +6053,424 @@ found zero occurrences of any renamed identifier, confirming that no rendered-IR
 Targeted searches for `LegacyBroadcast`, `LegacyBroadcastOperation`, `LegacyReshapeOperation`, `legacy_broadcast`,
 `HomogeneousBroadcastOperation`, and the abandoned `BroadcastTo` find nothing under `crates/`, and the only surviving
 `broadcast_to` in the workspace is `Broadcastable::broadcast_to` in `arrays/broadcasting.rs`.
+
+### Phase 6 zero/one hygiene (2026-08-07)
+
+Complete inventory of every production (non-`#[cfg(test)]`) zero/one materialization reachable from a transform rule
+(JVP, transposition, batching, partial evaluation) in `ryft-core`. `crates/ryft-xla/src` and
+`crates/ryft-core/src/operations/collectives.rs` were excluded from editing because a concurrent owner held them;
+`collectives.rs` was still audited and contains no materialization at all (every zero there is a structural
+`MaybeZero::Zero` plus one `ZeroLike` capability bound), so nothing is deferred to that owner.
+
+Classification key: **(a)** static by construction, nullary constant is correct and stays; **(b)** possibly dynamic;
+**(c)** shape-metadata materialization.
+
+| Site | Transform / context | Class | Action |
+| --- | --- | --- | --- |
+| `manipulation/padding.rs:636` | mixed `PadOperation<ArrayIrType>` JVP, composite | (b) | **migrated** to `materialize_array_tangent` (primal exemplar) |
+| `manipulation/concatenation.rs:431` | mixed `ConcatenateOperation<ArrayIrType>` JVP, composite | (b) | **migrated** to `materialize_array_tangent` (primal exemplar) |
+| `manipulation/slicing.rs:588,1477,1891,1905,1929` | slice / dynamic-slice / dynamic-update-slice `jvp_in_parent` transpose closures | (b) | already residual-aware (`retain_shape` + `dynamic_dimensions`), no change |
+| `manipulation/gathering.rs:458` | gather `jvp_in_parent` transpose closure | (b) | already residual-aware, no change |
+| `manipulation/padding.rs:826,853` | mixed pad transpose closure | (b) | already residual-aware (`mask_input_extents`, `output_zero_extents`), no change |
+| `manipulation/padding.rs:1136` | mixed pad batching | (b) | already residual-aware (`mask_input_dimensions`), no change |
+| `manipulation/broadcasting.rs:458` | mixed broadcast JVP | (b) | already residual-aware (`dynamic_extents`), no change |
+| `manipulation/scattering.rs:411,412` | homogeneous `ScatterOperation` JVP, reached from the composite family through the unguarded `arrays/operations/mod.rs:373` catch-all | (b) | **real gap** — scatter has no `MemberDifferentiableOperation` rule; needs its own mixed rule or an exemplar bound |
+| `manipulation/slicing.rs:1078,1079,1782,1783` | homogeneous update-slice / dynamic-update-slice JVP | (b) | exemplar available (`operand.primal()`, `update.primal()`); deferred to the generic exemplar slice |
+| `manipulation/concatenation.rs:296`, `manipulation/padding.rs:431`, `control_flow/select.rs:211,212`, `complex.rs:105,106` | homogeneous JVP rules | (b) | exemplar available; deferred to the generic exemplar slice |
+| `control_flow/scan.rs:2156,2162`, `control_flow/while.rs:1836,1956`, `control_flow/condition.rs:1170`, `differentiation/linear.rs:930`, `differentiation/forward.rs:1289`, `tracing_v2/custom_derivatives.rs:276,774`, `tracing_v2/rematerialization.rs:335` | type-generic transform drivers | (b) | exemplar available (`input.primal()`); each needs a `From<ZeroLikeOperation<T>>` bound, deferred to the generic exemplar slice |
+| `differentiation/reverse.rs:1678` | auxiliary-output cotangent seeds | (b) | exemplar available (`value`); deferred |
+| `operations/attention.rs:2166` | `custom_vjp` backward, sequence-length cotangents | (b) | `ArrayType::cotangent()` keeps the shape, so a dynamic length vector yields a dynamic zero-space type; deferred |
+| `manipulation/gathering.rs:623`, `manipulation/slicing.rs:672,2199`, `control_flow/condition.rs:1313`, `control_flow/scan.rs:2426,2563,2574`, `differentiation/linear.rs:1016` | homogeneous / generic transposition | (b) | **no exemplar possible** — the geometry belongs to an `Unknown` linear operand; needs the residual protocol, not `zero_like` |
+| `manipulation/padding.rs:557` | homogeneous pad transpose mask input | (c) | permanent homogeneous baseline |
+| `manipulation/slicing.rs:2451` (`batch_by_item_expansion`), `control_flow/scan.rs:1744,1763` | homogeneous batching stack/empty-batch allocation | (c) | permanent homogeneous baseline — no exemplar exists by construction |
+| `manipulation/padding.rs:990` | homogeneous pad batching mask input | (c) | exemplar `operand.value()` exists but the Boolean retype blocks `one_like`; permanent baseline without a convert |
+| `control_flow/condition.rs:577` | condition partial evaluation branch-edge zeros | (a) | guarded — identity-bearing edge types retain the whole condition (`condition.rs:530-540`) |
+| `differentiation/reverse.rs:1388` | `gradient_seed` | (a) | guarded by `is_scalar()` |
+| `manipulation/slicing.rs:599,717,1115,2264`, `manipulation/padding.rs:507,560,764,830,982,992,1104,1141`, `control_flow/select.rs:269`, `differentiation/coordinate_basis.rs:197,236,237` | assorted | (a) | rank-0 scalars, `static_update_sizes` guards, `static_shape()` requirements, or the existing `identities()` exemplar branch |
+| `arrays/operations/mod.rs:406`, `complex.rs:271,342`, `control_flow/select.rs:262` | projected-member JVP repair, complex transpose, select transpose | — | already exemplar-based (`ZeroLikeOperation`), reference pattern |
+
+The `ProjectedContext<C, ArrayType>` reachability question was settled empirically: a homogeneous `Context<Type =
+ArrayType>` has no `DimensionSize` variant in `ArrayOperation`, so the homogeneous language cannot observe a runtime
+extent and cannot supply one to a mixed constructor. Every class-(c) site above is therefore a permanent baseline for
+as long as its owning rule stays homogeneous, and the productive migrations are the mixed `ArrayIrType` rules and the
+type-generic drivers.
+
+Delivered change: `arrays/differentiation.rs` gains `materialize_array_tangent`, which projects a live tangent
+unchanged, stages `ZeroLikeOperation` over the projected primal when the structural zero's type is identity-bearing
+and the primal already has that type, and otherwise keeps the canonical nullary `ZeroOperation`. Gating on
+`identities()` rather than migrating unconditionally is deliberate and follows the precedent in
+`control_flow/select.rs:258-271`: identity-free zeros keep their zero-producing marker so higher-order partial
+evaluation stays structural, and **no existing rendered-IR fixture changes** because every static program stages
+exactly the same instruction sequence as before. The mixed pad and concatenate JVP rules call it in place of their
+inline `MaybeZero::materialize` closures; both previously materialized the structural zero *before* their
+all-static guard, so the dynamic branch consumed a type-only zero.
+
+Coverage: `test_array_ir_dynamic_pad_disconnected_operand_tangent_uses_a_primal_exemplar` and
+`test_array_ir_dynamic_concatenate_disconnected_input_tangent_uses_a_primal_exemplar` in
+`arrays/operations/manipulation.rs` build a mixed `iota` (a non-differentiable nullary constant with a non-zero
+primal and an identity-bearing type) as the array operand and a live tangent on the other operand, then interpret the
+fused JVP. A mixed *zero* operand does not discriminate, because partial evaluation folds `zero_like(zero)` back to
+the primal.
+
+Verification against the session baseline (workspace check clean, `ryft-core --lib` 1,139, `ryft-xla --lib` 435 plus
+one ignored): `cargo check --workspace --all-targets` is clean with zero errors and zero warnings; `ryft-core --lib`
+is 1,166 passed and 0 failed; `ryft-xla --lib` with `--test-threads=1` is 439 passed, 0 failed, and 1 ignored; and
+`ryft-macros-tests` passes 20 + 17. The core and XLA counts grew past the baseline because a concurrent owner landed
+custom-call batching and capture work in the same tree during this delivery; this change contributes three tests (the
+two mixed dynamic acceptance tests plus the direct `materialize_array_tangent` unit test). No rendered-IR fixture was
+regenerated. Per-file `rustfmt --edition 2024 --check` is clean on `arrays/differentiation.rs`, `arrays/mod.rs`,
+`arrays/operations/manipulation.rs`, `operations/manipulation/padding.rs`, and
+`operations/manipulation/concatenation.rs`.
+
+### Manual-region first-class extents (2026-08-07)
+
+Closed the Phase 9 exit-criterion block of the same name. The blocker was structural: `XlaConstant` was a plain
+`CaptureReference<ArrayIrType>` alias, i.e. index-plus-type with no payload, so `XlaDomain::Constant` could never
+satisfy `From<DimensionValue>` and the canonical collective capabilities — which stage their explicit result extents
+as first-class dimension operands — were unreachable from any XLA value, inside or outside a manual region.
+
+`XlaConstant` is now a two-variant sum in `ryft-xla/src/experimental/ops.rs`, deliberately mirroring the eager
+`ArrayIrValue` universe it is the staged counterpart of: `Captured(CaptureReference<ArrayIrType>)` for array data,
+which stays a reference so device buffers stay resident and executables stay reusable, and `Dimension(DimensionValue)`
+for host-sized extents, which embed directly because they cost nothing and, unlike a capture reference, remain usable
+inside a nested region that owns no capture table. It carries `Typed`, `Value`, `Parameter`,
+`ValueProjection<ArrayType>` (to `XlaArrayConstant`), `ValueProjection<DimensionType>` (to `DimensionValue`),
+`Concretizable<bool>`, both payload `From` conversions, and `CaptureConstant`. `XlaDomain::lift` and its `Constant`
+leaf now materialize the immediate variant instead of rejecting every constant.
+
+Making that possible required generalizing the core capture machinery, which was hard-wired to `CaptureReference`.
+`ryft-core/src/captures.rs` gained `CaptureConstant: Value + From<CaptureReference<Self::Type>>` with `capture_index`
+and `map_capture_index`; `ClosedProgram` gained a `Constant` parameter (`ClosedProgram<V, Constant, O, Input, Output>`)
+and expresses construction validation, dead-capture elimination, and capture lifting through the trait, treating
+index-free immediates as passthroughs — lifting re-adds them as constant atoms instead of resolving them to a leading
+capture argument. `CompilationDomain`'s supertrait became `Domain<Constant: CaptureConstant>`, which let the 21
+repeated `Constant = CaptureReference<<D as Domain>::Type>` bounds in `compilation/function.rs` collapse to plain
+`D: CompilationDomain`. The `CapturingContext` implementation for `TracingContext` was widened from the literal
+`CaptureReference<T>` constant to any `Constant: From<CaptureReference<T>>`, which subsumes the old impl.
+
+Lowering routes both immediate constant atoms and staged `DimensionOperation::Constant` instructions through one new
+shared `lower_dimension_extent` helper (scalar `i64` `stablehlo.constant`), and `lower_constant` dispatches on the
+sum. The shard-map body path needed no separate wiring because it already lowers through `lower_program_outputs`; the
+inline nested-region path was switched from `lower_captured_constant` to `lower_constant` so it picks up immediates
+too.
+
+With extents stageable in a manual region, the three shard-map `all_gather` tests dropped the test-local
+`shard_map_all_gather` direct-bind helper and call `AllGather::all_gather_with_options` directly. No divisibility or
+named-axis resolution gap surfaced: shard-map body traces are already seeded with `NamedAxis::Mesh` bindings, and the
+static extents proved their divisibility requirements without staging an assertion. The transitional
+`LegacyPSumScatter` and `LegacyAllToAll` capabilities were then deleted (both `capability = ...` sections removed from
+their `shape_changing_collective!` invocations); the canonical composite `PSumScatter` and `AllToAll` capabilities
+already existed, so the four XLA call sites moved to `psum_scatter_with_options` / `all_to_all_with_options` and the
+three `ryft-core` batched-axis tests moved from the array-only universe to `ArrayIrValue<Array>` with
+`psum_scatter_tiled` / `all_to_all_tiled`, exactly as the `LegacyAllGather` deletion did. `Ppermute` is untouched.
+
+Three `shard_map` MLIR fixtures were updated: the canonical capabilities stage their result extents, so a tiled
+`all_gather` body now also contains `stablehlo.constant dense<2>` twice plus `stablehlo.multiply`, a tiled
+`psum_scatter` body contains `dense<4>`, `dense<2>` plus `stablehlo.divide`, and a tiled `all_to_all` body contains
+`dense<4>`. These extents are dead in the lowered collective (its result shape is static) and XLA discards them; the
+static-shape case pays a few foldable constants for uniformity with the dynamic-shape case.
+
+Verification: workspace `cargo check --all-targets` is clean with no warnings, `ryft-core --lib` and
+`ryft-xla --lib` both pass with zero failures, and the macro integration crate passes 20 + 17 tests. This work adds
+one `ryft-core` test (`captures::tests::test_closed_program_immediate_constants_bypass_the_capture_table`, which
+exercises validation, dead-capture elimination, lifting, and interpretation of an immediate constant through a
+test-only constant sum) and two `ryft-xla` tests (`experimental::ops::tests::test_xla_constant` and
+`experimental::lowering::tests::test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place`); the
+three migrated `ryft-core` batched-collective tests and the three re-adopted `ryft-xla` shard-map tests keep their
+counts. Concurrent unrelated work in the same working tree accounts for the remaining suite growth over the
+1,139 / 435 baselines. Searches for `LegacyPSumScatter`, `LegacyAllToAll`, and the `shard_map_all_gather` helper find
+nothing under `crates/` (the only remaining substring match is the unchanged test name
+`test_shard_map_all_gather_lowers_and_executes_on_cpu`).
+
+### Foreign-call batching D0/D1 (2026-08-07)
+
+Closed both actionable residues of the foreign-call batching review, plus the two adjacent five-minute audits.
+
+**D0.** `CustomCallOperation`'s blanket `BatchableOperation` rejection became an all-replicated pass-through: when
+every operand's `BatchAxis` is replicated, the call is bound unchanged through `context.parent()` and every output is
+reported replicated. This is JAX parity — a batching rule is consulted only once an operand is actually mapped. A
+mapped operand now reports `custom call '<target>' has no batching rule for operand <i> mapped at batch axis <a>;
+invoke a kernel that understands the batch axis, or select an explicit batching behavior with
+`CustomCallOperation::with_batching``, replacing the previous operand-blind message. The impl rustdoc justifies the
+shortcut narrowly (custom call is region-free by construction: `infer_output_types` rejects every attached region, so
+a foreign kernel is a leaf that cannot observe the transform's named axis) and cites
+`plan_custom_derivative_batching_axis_parity.md`'s JAX fixture as the counterexample that forbids generalizing it to
+region-carrying operations. The payload rustdoc no longer leaves the impression that `custom_jvp`/`custom_vjp` supply
+a batching rule: it states that both structurally batch their own primal region, so a mapped operand reaches this same
+contract. Both `// TODO(eaplatanios): Review this module.` comments (`operations/custom_call.rs` and
+`arrays/operations/custom_call.rs`) were removed; this work is that review.
+
+**D1.** `CustomCallBatching` (`Rejected` default | `Sequential { unroll: Option<usize> }` | `BroadcastAll`) is a new
+`Copy` payload field with a `with_batching` builder and a `batching` accessor, carried through `renamed` and both
+`From` conversions, and rendered as a `batching=` field **only when non-default** — so every pre-existing rendering
+fixture is byte-for-byte unchanged while the three new selections render as `sequential`, `sequential(unroll=N)`, and
+`broadcast_all`. The enum documents why `expand_dims` (a replicated operand would enter with a size-1 axis while its
+aliased output must gain size `b`, so the alias would stop describing one array) and `legacy_vectorized` (an
+XLA-legacy mode JAX already removed) are deliberately absent.
+
+The old blanket impl was replaced by the two-impl `RngBitGeneratorOperation` shape. The homogeneous rule is
+`impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for
+CustomCallOperation<ArrayType>`: `Sequential` realigns mapped operands to batch axis 0 via `P::match_axis`, makes
+replicated operands invariant scan carries, and stages one `ScanOperation` whose body performs exactly one unbatched
+call in the original operand order (`unroll` forwarded through `ScanOperation::with_unroll`); `BroadcastAll` aligns
+every operand to axis 0 and rebinds one call with batch-prefixed output types. The mixed rule is
+`impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CustomCallOperation<ArrayIrType>`:
+it validates every trailing extent operand replicated, delegates extent-free calls to the projected homogeneous rule
+through `batch_projected_operation`, and otherwise threads the extents as leading invariant scan carries
+(`Sequential`) or regroups them so each output's inserted batch axis is grounded by the transform's extent value
+(`BroadcastAll`). Both mapped behaviors keep the staged program's size independent of the batch extent, and both
+compose under nested batching because the rewritten instruction is bound through the parent context carrying the same
+selection (a nested `BroadcastAll` batch of a `f32[3, 2]` call yields one `f32[2, 3, 2]` call).
+
+Two deliberate design decisions beyond the item text. First, the mixed rule's delegation condition is *extent-free
+**and** statically known mapped extent*, not extent-free alone: `DynamicArrayBatchingPolicy`'s extent is a composite
+first-class dimension value that cannot cross the projected array boundary (it is not an array), so the projected
+`Sequential` rule can only express a host `usize` trip count — exactly the same limitation the composite
+`RngBitGeneratorOperation` rule works around by owning its own scan. Delegating unconditionally would have made an
+extent-free mixed call with a dynamic batch extent fail with "requires a statically known mapped-axis extent"; the
+extra condition routes it to the mixed path, which handles zero extents as the degenerate case of its general code.
+Second, `BroadcastAll` derives an aliased output's batched type from its *aligned input's packed type* rather than
+constructing it, because an alias asserts the two describe one logical array and the alignment has already fixed that
+array's batched type; non-aliased outputs are constructed by inserting the batch dimension, placing the context's
+axis sharding on it, and shifting an explicit `TiledLayout` (every logical index `+1`, the new axis appended as the
+most major physical dimension — `tiled{0,1}` on `f32[2, 3]` becomes `tiled{1,2,0}` on `f32[3, 2, 3]`). A
+`StridedLayout` output is rejected with an explicit message, since the inserted axis's byte stride is not derivable
+from the layout alone.
+
+Thirteen `ryft-core` tests were added and two existing rejection tests updated. Coverage: all-replicated pass-through in
+both universes; exact rejection-message text in both universes; non-default-only rendering plus conversion/renaming
+round-trips; sequential scan structure and unroll (including rejection of an unroll factor that does not divide the
+extent); broadcast-all structure with the tiled-layout shift and the strided-layout rejection; nested vmap;
+alias survival under both behaviors; side-effect occurrence counts (one staged call either way, `OrderedIo` preserved
+in both, executed once per scan trip under `Sequential` versus exactly once under `BroadcastAll`); and the mixed
+sequential extent-carry and broadcast-all extent-regrouping shapes. One `ryft-xla` CPU execution fixture
+(`test_eager_custom_call_batching_executes_registered_ffi_handler`) runs `BroadcastAll` against the registered
+`ryft.test.add_one` FFI handler on a real CPU client and checks it agrees with the per-row result.
+
+That fixture surfaced one pre-existing limitation worth recording: `Sequential` cannot run through the *eager* XLA
+path at all, because eager array batching's parent is a `ProjectedContext`, whose `bind` rejects every region-carrying
+operation (`projected operation \`scan\` cannot carry regions`). This is a property of projected binding rather than
+of this rule — the scan-based `RngBitGeneratorOperation` batching rule meets the same wall — so the fixture pins that
+diagnostic next to the behavior that does execute, instead of hiding it.
+
+**Carried addendum (Phase 5/6 consumer-sweep fix (1)).** Because this work already owned `operations/custom_call.rs`,
+the missing homogeneous dynamic-output guard landed here too: `CustomCallOperation<ArrayType>::infer_output_types` now
+rejects, after alias validation, any declared output whose `static_shape()` is `None`, with `'custom_call' requires
+explicit result-extent operands for dynamic output type {t}` — mirroring `RngBitGeneratorOperation`'s guard and the
+reshape guard. The homogeneous universe has no operand that could ground such an extent; only the mixed
+`CustomCallOperation<ArrayIrType>` form accepts the trailing first-class dimension operands, and its arm already
+enforced that contract. One rejection test
+(`test_custom_call_rejects_dynamic_output_types_without_extent_operands`) was added beside the existing inference
+tests; fixes (2)–(4) of that sweep remain open.
+
+**Audits.** (i) `ArrayIrOperation::Array(ArrayOperation::CustomJvp(..))` *is* reachable: the homogeneous-to-composite
+`From` promotes only `Zero`/`Condition`/`While`/`Scan`, so every region-carrying array payload lands in the
+`Array` variant that documents itself as region-free, type inference happily projects the attached region
+interfaces, and the derived projected batching arm then discards the driver, so the rule dies on
+`MalformedProgram("region index 0 is out of range")` — a diagnostic and capability defect, not a miscompute.
+(ii) `LinearCallOperation`'s all-replicated fast path is unsound: `AllGatherOperation`'s transpose stages a
+`PSumScatterOperation` (and vice versa), so differentiation-generated linear regions *can* contain named-axis
+collectives, and `LinearCallOperation::new` is public besides. Neither was fixed here; both are recorded on the audit
+item with the suggested direction.
+
+### LinearCall all-replicated batching guard (2026-08-08)
+
+`LinearCallOperation::batch_regions`'s all-replicated fast path is now additionally guarded by
+`context.axis_name().is_none()`, closing the unsoundness recorded by audit (ii).
+
+**The check's design.** The item asked for a proof that "the regions provably contain no named-axis operation". That
+property is proven from the batching *level* rather than by walking the regions. An attached region's value can vary
+per batch item with no mapped operand at all, but only by addressing the level **by name**: `AxisIndexOperation::batch`
+and `CollectiveOperation::batch` (and every shape-changing collective) decide whether they belong to the active level
+by comparing their own stored axis name against `BatchingContext::axis_name`, and `Option<&str>::None` never equals
+`Some(name)`. So an unnamed level is provably unobservable by all of them, and the fast path is exactly sound there.
+
+Two alternatives were rejected. A recursive instruction walk keyed on `Operation::name()` (`axis_index`, `psum`,
+`pmean`, `pmax`, `all_gather`, `psum_scatter`, `ppermute`, `all_to_all`) is a *denylist* that fails open for any
+named-axis operation defined outside this crate, so it would not prove anything for a generic `C::Operation`; it also
+contradicts the `Effects` contract that transforms consult classifications "instead of hardcoding operation lists". A
+new public `Operation` classification hook (an `effects`-shaped `observes_named_axes`) would be sound but was out of
+scope for this defect and is not needed, since the level-side proof already covers every family. Probing the regions by
+structurally batching them and checking for mapped outputs is *not* a valid guard either: a `psum` over the level's
+axis returns a replicated output while still requiring the rewrite that resolves it.
+
+The guard is deliberately conservative in one direction: a named level with regions that name no axis now batches
+structurally where it previously took the fast path. For the homogeneous `ArrayBatching` policy this costs nothing
+observable — `boundary_operands` is empty and replaying an unobserved region reproduces it — while `ArrayIrBatching`
+gains its usual leading extent residual. Correctness at named levels is worth that.
+
+**Fixture behavior before/after.** The counterexample is a residual-free `linear_call` whose forward and transpose
+regions both compute `u ↦ u · convert_element_type(axis_index("items"), f64)`, batched at extent 3 under a level named
+`items` with its single operand replicated. Before: the fast path bound the call unchanged into the eager parent, which
+interpreted the untouched forward region and reported `` `axis_index` for the device mesh axis 'items' has no eager
+value; it is only defined inside a `shard_map` manual region `` — the vmap axis reference never reached the level that
+binds it. After: both regions are batched structurally, the `axis_index` is consumed by the level that named it (it
+becomes an `iota`), and the call returns `f64[3] = [0, 2, 4]` mapped at batch axis 0.
+
+**Fast-path preservation.** `test_linear_call_operation_batching_preserves_a_replicated_unnamed_call` batches an
+all-replicated `linear_call [residual_count=1]` over two `r · u` regions at an *unnamed* level (the shape every
+differentiation-generated linear call is batched under) and asserts the batched program's full rendering, plus
+`batched.to_string() == program.to_string()` — the residual count, operand order, and both regions are unchanged. The
+pre-existing `test_linear_call_operation_batching_preserves_a_replicated_transpose_only_call` (also unnamed) still
+passes untouched, and the same test's named-level half pins the conservative structural path returning the correct
+replicated `r · u = 8`.
+
+**Test delta.** Two new `ryft-core` tests plus one shared region helper
+(`axis_scaled_multiply_program`):
+`test_linear_call_operation_batching_rewrites_replicated_regions_naming_the_batch_axis` and
+`test_linear_call_operation_batching_preserves_a_replicated_unnamed_call`. One existing test updated:
+`test_linear_call_operation_transpose_only_form_rejects_forward_execution`'s expected rejection text, because the
+transpose-only rejection is now reachable with all-replicated operands at a named level and its message says so
+(`a transpose-only linear call cannot be batched structurally because its unavailable forward program does not
+determine output batch axes; it is preserved unchanged only when every operand is replicated at an unnamed batching
+level`).
+
+**Gates.** `cargo check --workspace --all-targets` clean (0 errors, 0 warnings); `ryft-core --lib` 1,171 passed / 0
+failed (1,169 before, +2 from this change); `ryft-xla --lib` 439 passed / 0 failed / 1 ignored, unchanged;
+`ryft-macros-tests` 17 passed and `ryft-macros` clean; `rustfmt --edition 2024 --check` clean on
+`crates/ryft-core/src/differentiation/linear.rs` (the only file changed).
+
+### Static-axis constant folding in dynamic batching alignment (2026-08-08)
+
+**Change.** `crates/ryft-core/src/arrays/batching.rs` only. Two new small helpers next to `array_dimension`:
+`dimension_constant`, extracted verbatim from the `DimensionSource::Static` arm of
+`DynamicArrayBatchingPolicy::broadcast_input` (which now calls it, so the arm is one line), and
+`folded_array_dimension`, which stages an exact `DimensionOperation::Constant` for a `Dimension::Static` axis and
+otherwise delegates to `array_dimension`. Out-of-range axes still fall through to `array_dimension` so its existing
+`DimensionSizeOperation::new` diagnostic remains the single error owner.
+
+  - Path 1, `DynamicArrayBatchingPolicy::match_axis` replicated-broadcast: the `(0..rank)` sweep now calls
+    `folded_array_dimension`. Instruction count is unchanged for this path; each statically known axis becomes a
+    dimension constant instead of a fresh exact-bounded `size(axis=N)` read.
+  - Path 2, composite `ArrayIrBatching::prepare_inputs` sharding normalization: same folding, plus the mapped axis
+    now takes `axis_extent()` directly inside the `map` instead of staging a read that the previous
+    `output_dimensions[position] = ...` assignment immediately discarded. That dead read is the one net instruction
+    this item removes.
+
+Both paths keep the `DimensionSource::Static`/`collective_input_extents` precedent exactly: constants come from
+`DimensionValue::constant`, so their types are exact-bounded and type inference folds them straight back to
+`Dimension::Static`.
+
+**Fixture-change inventory.** Only one existing fixture moved, and no `ryft-xla` fixture did.
+
+  - `arrays::batching::tests::test_array_ir_batch_entrypoints` (staged composite output materialization, mapped
+    `f32[batch, 3]` plus replicated `f32[3]`): before `[DimensionSize, DimensionSize, Broadcast]`, after
+    `[DimensionSize, Dimension(Constant), Broadcast]`. Instruction count 3 -> 3; the replicated input's static axis 0
+    read became the constant. The broadcast still takes 3 inputs and the asserted staged output type is still exactly
+    `f32[batch, 3]` with the same `batch` variable, which is the type-identity check for this change.
+  - No other `dimension_size` assertion in `arrays/batching.rs` moved: the three
+    `!matches!(.., DimensionSize(_))` sweeps (composite collectives) already assert absence, and the composite golden
+    IR in the `~3457-4760` range does not exercise the replicated-broadcast or normalization paths.
+  - `ryft-xla` needed no fixture edits (`--lib` 439 passed unchanged), so no backend instruction-count assertion
+    covers either path.
+
+**New coverage.** `test_array_ir_batch_folds_static_axes_when_normalizing_input_sharding` pins path 2 directly, which
+previously had no staged-IR fixture at all: two mapped `f32[2, 3]` inputs, one sharded on `x` at the mapped axis and
+one replicated, batched at axis 0 under a tracing context. Before this change the staged program was 6 instructions
+`[DimensionSize, DimensionSize, Requirement, DimensionSize, DimensionSize, Broadcast]` (the fourth being the dead
+mapped-axis read); after it is 5, `[DimensionSize, DimensionSize, Requirement, Dimension(Constant), Broadcast]`, with
+the broadcast still taking 3 inputs and the normalized result type still exactly the sharded input type. The two
+leading reads are the mapped-extent inference site, which this item does not touch.
+
+**Test delta.** One new `ryft-core` test (above); one updated (`test_array_ir_batch_entrypoints`). `ryft-core --lib`
+1,173 passed / 0 failed against a 1,168 baseline: +1 from this change and +4 from concurrent work in
+`arrays/operations/**` and `differentiation/linear.rs`. A transient `arrays/operations/manipulation.rs` failure
+(`'zero' expects one dimension operand per dynamic output dimension`) and a transient `arrays/operations/mod.rs`
+compile error were observed mid-run and both cleared on retry without any change here; neither file was touched.
+
+**Gates.** `cargo check --workspace --all-targets` clean (0 errors, 0 warnings); `ryft-core` 1,173 lib + 5 + 6
+integration + 53 doctests, 0 failed; `ryft-xla` 439 passed / 0 failed / 1 ignored, unchanged from baseline;
+`rustfmt --edition 2024 --check` clean on `crates/ryft-core/src/arrays/batching.rs`, the only file changed.
+
+### Composite region batching and scatter differentiation fixes (2026-08-08)
+
+Two defects opened by the Phase 9 five-minute audits, both living in the composite dispatch of
+`crates/ryft-core/src/arrays/operations/mod.rs`.
+
+**Defect 1: region-carrying payloads inside composite programs.** The reproducing fixture came first and pinned the
+recorded failure exactly: batching a composite program whose instruction is
+`ArrayIrOperation::Array(ArrayOperation::CustomJvp(..))` failed with
+`MalformedProgram("region index 0 is out of range")`, because the derived projected arm discards the instruction's
+driver and passes `EmptyRegionDriver`.
+
+Of the two sanctioned fixes, the *region-aware projected arm* is architecturally impossible, not merely large: a
+projected member rule runs in `BatchingContext<ProjectedContext<C, T>, P::Projected>` and its driver must be
+`RegionDriver<projected constant, projected operation>`, while the instruction's regions are programs in the
+**composite** universe. Forwarding the real driver would require a whole-program projection facility that cannot exist
+in general, since a composite region may contain first-class dimension values with no member counterpart. The same
+reason is why `interpret_projected_operation` already *rejects* region-carrying payloads instead of forwarding.
+
+*Promotion* is therefore the right shape, and it was applied wherever a composite carrier can exist:
+
+  - `LinearCall` (executable, `LinearCallInterface::ForwardAndTranspose`) now promotes to the existing
+    `ArrayIrOperation::LinearCall` carrier in the `From<ArrayOperation<A>>` lift. That carrier's rule is already fully
+    type- and policy-generic (`impl<T, C, P: LinearCallBatchingPolicy<C>> BatchableOperation<C, P>`), so this is a
+    two-line lift arm and a real capability gain with no new rule code. `ryft-xla`'s
+    `From<ArrayOperation<..>> for XlaOperation<..>` delegates through the same lift, so the backend family inherits it.
+  - `CustomJvp`, `CustomVjp`, and `Rematerialize` **cannot** be promoted without a contract change, which execution
+    proved rather than assumed. `ArrayIrBatching::boundary_operands` returns the mapped-extent dimension value and its
+    `BatchedProgram` is `ThreadedExtentBatchedProgram`, so a structurally batched composite region has the boundary
+    `[extent, inputs...] ↦ [extent, outputs...]`. Every one of these three rules rebinds its batched regions as
+    ordinary regions of the same wrapper, and each wrapper's `infer_output_types` requires the region boundaries to
+    equal the wrapper's own (for `custom_jvp`: primal region inputs == wrapper inputs, outputs == wrapper outputs).
+    `LinearCallOperation` survives this because `residual_count` gives it a slot for the extra leading operand, and
+    `Condition`/`While`/`Scan` because they thread extents as loop state. Adding an equivalent slot to three
+    higher-order operations is a design extension, so it is recorded as its own unchecked item above rather than
+    smuggled into a defect fix. A transpose-only `LinearCallOperation` is residue for the same class of reason: it
+    stores its unavailable forward map's member types and `LinearCallInterface` is private, so no cross-universe lift
+    exists yet (and `differentiation/linear.rs` was concurrently owned by another agent).
+  - For all remaining residue the misleading diagnostic is gone. `batch_projected_operation`, `jvp_projected_operation`,
+    and `transpose_projected_operation` now reject a payload that declares `RegionSlot`s up front with an exact typed
+    diagnostic naming the operation and the remedy (for example: ``projected operation `custom_jvp` carries regions and
+    cannot be batched through its member family; batch it through a composite carrier for that operation instead``),
+    mirroring the guard `interpret_projected_operation` already had. The check is on `Operation::region_slots`, not on
+    the driver, so it needs no signature change and no call-site churn (the composite `condition` rule's internal
+    projected `select` call is unaffected). Each adapter's rustdoc now states this contract and the reason.
+  - The `ArrayIrOperation::Array` rustdoc no longer claims "region-free homogeneous array operation" as if it were
+    enforced by the type: it now states why the variant is region-free (every transform reaches it through a projection
+    with no region access), which payloads the lift promotes, and which payloads remain and are rejected by name.
+
+**Defect 2: mixed scatter differentiation.** Reproducing this took a real chase, and the chase is the interesting part:
+the composite family defends dynamic structural zeros in two places, so most obvious fixtures pass. The
+`MemberDifferentiableOperation for ArrayOperation` dispatcher re-materializes any *output* tangent zero whose type has a
+`TypeIdentityPosition::Reference` from the primal result, and the mixed constructors (`Zero`/`DynamicOne`/`DynamicIota`)
+and mixed `broadcast` materialize their own zeros from the extent operands they already consume. The unprotected source
+is a mixed rule that returns `MaybeZero::Zero(dynamic type)` with no identity check, of which mixed `reshape` is the
+simplest: reshaping a *static* nullary `one` constant to a dynamic output shape yields a structurally zero tangent of an
+identity-bearing type. Feeding that as the scattered operand with a live update tangent reproduced the defect exactly:
+`'zero' expects one dimension operand per dynamic output dimension (1) but got 0 operands`, i.e. the homogeneous rule's
+`MaybeZero::materialize` reaching for a nullary type-only zero.
+
+The new rule is `MemberDifferentiableOperation<C> for ScatterOperation` in
+`crates/ryft-core/src/operations/manipulation/scattering.rs` plus a `Self::Scatter(operation)` arm in the dispatcher
+match, which needed no new bounds on that impl. It mirrors gather's mixed rule structurally — fully static operand
+*and* update geometry delegates to `jvp_projected_operation` unchanged, so no static behavior moves — but it
+deliberately does **not** stage a residual-parameterized `LinearCallOperation`. Gather needs one because its transpose
+must build a zero of the original operand, which requires exact retained geometry; scatter-add's transpose needs no
+geometry at all (the operand Jacobian is the identity and the update cotangent gathers the output cotangent at the
+same known indices), so the rule stages a plain tangent scatter and transposition continues through the unchanged
+homogeneous rule. Each missing linear tangent is materialized from its own primal exemplar with
+`materialize_array_tangent`, which is exactly the `ExactShape`-free half of the pad/concatenate precedent. The
+non-additive-combiner rejection and its message are preserved verbatim from the homogeneous rule.
+
+**Fixtures.** Four new `ryft-core` tests, no existing fixture changed and no rendered program moved:
+
+  - `arrays::operations::tests::test_composite_batching_of_a_region_carrying_array_payload` — before: the recorded
+    `MalformedProgram("region index 0 is out of range")`; after: the exact `custom_jvp` diagnostic for the unpromoted
+    payload, plus a promoted executable `LinearCall` whose composite rule batches both attached regions and returns the
+    replicated-residual identity result.
+  - `arrays::operations::tests::test_composite_differentiation_of_a_region_carrying_array_payload` and
+    `..._transposition_...` — the `jvp_projected_operation` and `transpose_projected_operation` guards, each asserting
+    its exact message on a stored composite `custom_jvp` program (the transposition guard fires before the payload's own
+    non-transposable rejection).
+  - `arrays::operations::manipulation::tests`'s
+    `test_array_ir_dynamic_scatter_disconnected_operand_tangent_uses_a_primal_exemplar` — before:
+    `'zero' expects one dimension operand per dynamic output dimension (1) but got 0 operands`; after: the
+    interpreted JVP returns both the primal `[1, 11, 1, 21]` and the tangent `[0, 1, 0, 2]`.
+
+**Test delta.** `ryft-core --lib` 1,175 passed / 0 failed against the 1,170 baseline observed at the start of this item:
++4 from this change and +1 from concurrent work in `arrays/batching.rs`. `ryft-xla` unchanged at 439.
+
+**Gates.** `cargo check --workspace --all-targets` 0 errors / 0 warnings; `ryft-core --lib` 1,175 passed / 0 failed;
+`ryft-xla` 439 passed / 0 failed / 1 ignored; `cargo test -p ryft-macros-tests` passed; `rustfmt --edition 2024 --check`
+clean on all six touched files; `cargo doc -p ryft-core --no-deps` no new warnings.
