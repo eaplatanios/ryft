@@ -33,7 +33,7 @@ pub use batching::{
     BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, MemberBatchableOperation,
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy, batch, batch_projected_operation,
 };
-pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
+pub use captures::{CaptureConstant, CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::*;
