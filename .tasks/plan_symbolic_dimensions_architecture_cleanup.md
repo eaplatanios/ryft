@@ -2531,16 +2531,20 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           −549 lines in reshaping.rs and −229 in XLA lowering, four symbolic-only tests deleted, two rewritten;
           the `reshape_dimension_i32` bounds validator was found to also serve the mixed `dynamic_reshape` path
           and was retained; new suite baselines 1,139 core / 435 XLA).
-    - [x] Rename `LegacyBroadcast` to `BroadcastTo` (the resolved-geometry contract the mixed broadcast delegates
-          to, mirroring the plain `Reshape` capability); drop its `#[doc(hidden)]` and document it as the
-          homogeneous-baseline layer. *(Executed 2026-08-07 as phase C of the rename program: 156 sites across 27
-          files, `#[doc(hidden)]` removed, docs rewritten as the resolved-geometry contract.)*
+    - [x] Rename the mixed `Broadcast` capability to `DynamicBroadcast` (methods `dynamic_broadcast*`) and then
+          `LegacyBroadcast` to the freed `Broadcast` (method `broadcast`), the resolved-geometry contract mirroring
+          `Reshape`; drop the `#[doc(hidden)]` and document it as the homogeneous-baseline layer. *(Executed
+          2026-08-07 as phase C of the rename program, in two compile-green steps to avoid the name collision: C1
+          renamed the mixed trait and its six methods, C2 renamed the resolved trait and its method over 101 sites
+          across 28 files. The unrelated `Broadcastable::broadcast_to` in `arrays/broadcasting.rs` was caught and
+          left untouched.)*
     - [x] Rename the mixed `BroadcastOperation` to `DynamicBroadcastOperation` and the mixed `ReshapeOperation` to
           `DynamicReshapeOperation`, matching the StableHLO `broadcast_in_dim`/`dynamic_broadcast_in_dim` and
           `reshape`/`dynamic_reshape` convention and Ryft's existing `DynamicShapeSlice`/`DynamicZero`/`DynamicOne`/
-          `DynamicIota` vocabulary. The `Broadcast` capability keeps its name as the user-facing verb. *(Executed
-          2026-08-07 as phase A of the rename program: 145 sites across 19 files; composite variant names
-          `Broadcast`/`Reshape` and both operation-name constants unchanged.)*
+          `DynamicIota` vocabulary. The capability layer follows the same scheme: `DynamicBroadcast` is the
+          user-facing first-class-extent verb and the plain `Broadcast` name goes to the resolved-geometry
+          capability. *(Executed 2026-08-07 as phase A of the rename program: 145 sites across 19 files; composite
+          variant names `Broadcast`/`Reshape` and both operation-name constants unchanged.)*
     - [x] Rename `LegacyBroadcastOperation` to the freed `BroadcastOperation` name and `LegacyReshapeOperation` to
           `ReshapeOperation`; drop `#[doc(hidden)]` where present and document both as the homogeneous-baseline
           operations (two-commit swap: mixed renames land first to free the plain names). *(Executed 2026-08-07 as
@@ -5658,13 +5662,34 @@ member-family primitives of the homogeneous array language, whose complete outpu
 metadata and which `ProjectedContext` serves, cross-linking `DynamicBroadcastOperation`/`DynamicReshapeOperation` for
 first-class dynamic extents.
 
-Phase C renamed the capability. `LegacyBroadcast` became `BroadcastTo` and `legacy_broadcast` became `broadcast_to`:
-156 sites across 27 files, covering the `ArrayType` type rule, the eager `Array` kernel, and the staging blanket.
-The `#[doc(hidden)]` was removed and the trait is now documented as the resolved-geometry contract that both
+Phase C renamed the capabilities. Its first draft renamed `LegacyBroadcast` to `BroadcastTo`; the owner revised that
+mid-flight to a fully symmetric scheme in which the capability layer mirrors the operation layer, so `BroadcastTo`
+never landed and Phase C was executed in two compile-green steps instead.
+
+C1 renamed the mixed capability `Broadcast` (bound on `Value<Type = ArrayIrType> + DimensionSize`, staging
+`DynamicBroadcastOperation`) to `DynamicBroadcast`, and prefixed all six of its methods: `broadcast`,
+`broadcast_with_output_sharding`, `broadcast_to`, `broadcast_leading`, `broadcast_to_sizes`, and
+`broadcast_leading_sizes` became `dynamic_broadcast`, `dynamic_broadcast_with_output_sharding`,
+`dynamic_broadcast_to`, `dynamic_broadcast_leading`, `dynamic_broadcast_to_sizes`, and
+`dynamic_broadcast_leading_sizes`, 34 occurrences in three files. The mixed capability's surface turned out to be
+small and fully enumerable: the
+trait declaration and blanket impl in `broadcasting.rs`, the `ArrayIrValue` impl and tests in
+`arrays/operations/manipulation.rs`, the `manipulation` facade re-export, and two doctests.
+
+C2 then took the freed plain name: `LegacyBroadcast` became `Broadcast` and `legacy_broadcast` became `broadcast`,
+86 trait-name sites plus 72 method occurrences across 27 files, covering the `ArrayType` type rule, the eager `Array`
+kernel, and the staging blanket. The `#[doc(hidden)]` was removed and the trait is now documented as the resolved-geometry contract that both
 interpretation and the composite eager path delegate to once operand extents are concrete, mirroring the plain
-`Reshape` capability, while keeping the guidance that new composite-program construction uses `Broadcast`. The
-new `broadcast_to` name coexists with `Broadcast::broadcast_to` without ambiguity because the two traits are
-implemented over disjoint `Value::Type` families (`ArrayType` versus `ArrayIrType`).
+`Reshape` capability, pointing callers that need first-class dynamic extents at `DynamicBroadcast`.
+
+Two hazards were found and handled during C2. First, `arrays/broadcasting.rs` owns an unrelated `Broadcastable` trait
+whose directional method is also spelled `broadcast_to`; the blind rename clobbered it into a duplicate of the
+symmetric `Broadcastable::broadcast`, which the compiler caught immediately, and that file was restored verbatim to
+its committed content (its entire working-tree delta was exactly the erroneous substitution) and excluded. An audit
+of every other `broadcast_to` removal confirmed that no further `Broadcastable` call site was affected. Second,
+`Broadcastable` and the renamed `Broadcast` are both implemented for `ArrayType` and both now expose a `broadcast`
+method; their arities differ and no call site has both traits in scope ambiguously, which the full workspace build
+proves.
 
 One incidental cleanup: the `FillContext` impl header in `operations/constants/fill.rs` was already over the
 120-column limit before this change and stayed over it after the (shorter) rename, so its inline bounds moved into a
@@ -5676,4 +5701,5 @@ is 1,139 tests, `ryft-xla --lib` is 435 tests plus one ignored, the macro integr
 pre-existing and none in `broadcasting.rs` or `reshaping.rs`. A scan of every `indoc!` fixture body in `crates/`
 found zero occurrences of any renamed identifier, confirming that no rendered-IR fixture could have been rewritten.
 Targeted searches for `LegacyBroadcast`, `LegacyBroadcastOperation`, `LegacyReshapeOperation`, `legacy_broadcast`,
-and `HomogeneousBroadcastOperation` find nothing under `crates/`.
+`HomogeneousBroadcastOperation`, and the abandoned `BroadcastTo` find nothing under `crates/`, and the only surviving
+`broadcast_to` in the workspace is `Broadcastable::broadcast_to` in `arrays/broadcasting.rs`.
