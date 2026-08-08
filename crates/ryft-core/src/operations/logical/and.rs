@@ -67,8 +67,8 @@ impl_capability_for_primitive!(usize);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::DataType;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, DataType};
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationTracer, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};

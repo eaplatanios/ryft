@@ -882,10 +882,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
-        StridedLayout,
+        ArrayOperation, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension, StridedLayout,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::Context;
     use crate::differentiation::jacobian_forward;
     use crate::macros::{

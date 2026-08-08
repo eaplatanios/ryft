@@ -811,10 +811,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        ShardingDimension,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, ShardingDimension,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{
         BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
     };

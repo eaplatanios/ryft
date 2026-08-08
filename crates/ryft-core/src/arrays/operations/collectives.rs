@@ -4,9 +4,8 @@
 //! into its array member family. The mixed collective variants whose trailing operands are first-class dimensions are
 //! declared directly by [`ArrayIrOperation`](crate::ArrayIrOperation) instead.
 
-use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
-use crate::backends::ArrayOperation;
 use crate::operations::collectives::PpermuteOperation;
 use crate::programs::Value;
 

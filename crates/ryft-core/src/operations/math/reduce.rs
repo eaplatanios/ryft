@@ -1002,8 +1002,8 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::backends::Array;
     use crate::contexts::StagingContext;
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;

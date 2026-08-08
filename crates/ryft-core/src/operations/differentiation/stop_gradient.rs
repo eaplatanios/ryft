@@ -180,8 +180,10 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{
+        ArrayOperation, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, gradient, jvp, value_and_gradient};

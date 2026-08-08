@@ -416,9 +416,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayOperation, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::differentiation::reverse::ReverseModeDifferentiate;
     use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, SinOperation};

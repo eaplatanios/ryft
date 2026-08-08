@@ -871,9 +871,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType};
     use crate::axes::NamedAxes;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};

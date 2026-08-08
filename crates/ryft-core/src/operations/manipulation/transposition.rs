@@ -446,10 +446,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableOperation, TransposableOperation};
     use crate::macros::{

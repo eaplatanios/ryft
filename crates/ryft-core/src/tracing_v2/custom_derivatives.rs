@@ -955,9 +955,9 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayBatch, ArrayBatching, DataType, Dimension, Shape, ShardingDimension};
+    use crate::arrays::{ArrayBatch, ArrayBatching, ArrayOperation, DataType, Dimension, Shape, ShardingDimension};
     use crate::axes::AxisIndexOperation;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{
         Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
     };

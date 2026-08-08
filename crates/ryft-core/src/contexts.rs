@@ -723,8 +723,8 @@ pub(crate) mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::backends::Array;
     use crate::differentiation::{
         DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
         DifferentiationTracer, TransposableOperation, TranspositionDriver,

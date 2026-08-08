@@ -25,7 +25,9 @@ pub use encoding::{
 };
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
-pub use operations::{ArrayIrOperation, DimensionOperation, DimensionTracingContext};
+pub use operations::{
+    ArrayIrOperation, ArrayOperation, ArrayTracingContext, DimensionOperation, DimensionTracingContext,
+};
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
     ShardingError, ShardingVisualization,

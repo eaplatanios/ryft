@@ -4,4 +4,4 @@
 
 pub mod arrays;
 
-pub use arrays::{Array, ArrayOperation, ArrayTracingContext};
+pub use arrays::Array;

@@ -117,8 +117,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, Memory, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape};
+    use crate::backends::Array;
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
 

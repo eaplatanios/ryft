@@ -505,10 +505,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, Shape,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionVariable, Shape,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, WhileOperation};

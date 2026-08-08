@@ -228,8 +228,8 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::arrays::{ArrayBatch, DataType, Dimension, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayBatch, ArrayOperation, DataType, Dimension, Shape};
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{jvp, value_and_gradient, vjp};

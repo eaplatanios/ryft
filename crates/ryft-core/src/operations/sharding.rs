@@ -501,8 +501,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{
+        ArrayOperation, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+    };
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, jacobian_reverse, vjp};

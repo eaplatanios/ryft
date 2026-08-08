@@ -6,11 +6,10 @@
 //! first-class runtime dimension.
 
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::backends::ArrayOperation;
 use crate::contexts::EagerContext;
 use crate::interpretation::InterpretationDriver;
 use crate::macros::check_count;
@@ -267,12 +266,12 @@ mod tests {
 
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::ForwardModeDifferentiate;
     use crate::operations::{

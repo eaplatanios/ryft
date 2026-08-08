@@ -1,6 +1,7 @@
 use std::ops::{Add, Mul, Neg};
 
-use crate::backends::{Array, ArrayOperation};
+use crate::arrays::ArrayOperation;
+use crate::backends::Array;
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{DifferentiationError, ReverseModeDifferentiate};
 use crate::operations::{Cos, Sin};

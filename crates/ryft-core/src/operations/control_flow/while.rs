@@ -2433,9 +2433,10 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionType, DimensionVariable,
+        Shape,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{

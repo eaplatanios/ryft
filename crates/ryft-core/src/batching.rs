@@ -1460,8 +1460,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayBatch, ArrayBatching, ArrayType, DataType, Dimension, Shape, ShardingDimension};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{
+        ArrayBatch, ArrayBatching, ArrayOperation, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+    };
+    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,

@@ -5,27 +5,41 @@ use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
-use crate::backends::ArrayOperation;
+use crate::axes::AxisIndexOperation;
+use crate::backends::Array;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     LinearCallOperation, MemberDifferentiableOperation, jvp_projected_operation,
 };
-use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation};
+use crate::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
+use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
+use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::random::RngBitGeneratorOperation;
+use crate::operations::sort::SortOperation;
 use crate::operations::{
-    AddOperation, BroadcastOperation, CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation,
-    ConvertElementTypeOperation, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
-    DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalarOperation, DynamicShapeSliceOperation, IotaOperation, OneOperation, PadOperation,
-    ReshapeOperation, ScanOperation, WhileOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    AbsOperation, AddOperation, AndOperation, Atan2Operation, BroadcastOperation, CeilOperation, CollectiveOperation,
+    CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+    CoordinateBasisOperation, CosOperation, DimensionAddOperation, DimensionDivFloorOperation,
+    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
+    DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSaturatingSubOperation,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotOperation,
+    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation,
+    FloorOperation, GatherOperation, IotaOperation, LegacyBroadcastOperation, LegacyReshapeOperation, LogOperation,
+    LogisticOperation, MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation,
+    OneOperation, OrOperation, PadOperation, PowOperation, PrintOperation, ReduceOperation, RemOperation,
+    ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
+    SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanhOperation, TransferToMemoryOperation,
+    TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, Type, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
+use crate::tracing_v2::RematerializeOperation;
+use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 
 // TODO(eaplatanios): Review this module.
 
@@ -35,6 +49,100 @@ mod constants;
 mod control_flow;
 mod dimensions;
 mod manipulation;
+
+/// Reusable [`Operation`] enum for ordinary staged programs over arrays.
+///
+/// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
+/// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
+/// [`crate::tracing_v2::custom_derivatives`].
+///
+/// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
+/// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and
+/// [`Dot`](Self::Dot) a [`DotOperation`].
+#[derive(Clone, Debug, Operation)]
+#[ryft(dispatch(batching, differentiation, transposition))]
+pub enum ArrayOperation<V: Value<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    ZeroLike(ZeroLikeOperation<ArrayType>),
+    One(OneOperation<ArrayType>),
+    OneLike(OneLikeOperation<ArrayType>),
+    Constant(ConstantOperation<Array>),
+    Iota(IotaOperation<ArrayType>),
+    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
+    Abs(AbsOperation<ArrayType>),
+    Neg(NegOperation<ArrayType>),
+    Add(AddOperation<ArrayType>),
+    Sub(SubOperation<ArrayType>),
+    Mul(MulOperation<ArrayType>),
+    Div(DivOperation<ArrayType>),
+    Sin(SinOperation<ArrayType>),
+    Cos(CosOperation<ArrayType>),
+    Atan2(Atan2Operation<ArrayType>),
+    Exp(ExpOperation<ArrayType>),
+    Log(LogOperation<ArrayType>),
+    Sqrt(SqrtOperation<ArrayType>),
+    Rsqrt(RsqrtOperation<ArrayType>),
+    Tanh(TanhOperation<ArrayType>),
+    Logistic(LogisticOperation<ArrayType>),
+    Erf(ErfOperation<ArrayType>),
+    Pow(PowOperation<ArrayType>),
+    Sign(SignOperation<ArrayType>),
+    Floor(FloorOperation<ArrayType>),
+    Ceil(CeilOperation<ArrayType>),
+    Round(RoundOperation<ArrayType>),
+    Max(MaxOperation<ArrayType>),
+    Min(MinOperation<ArrayType>),
+    Rem(RemOperation<ArrayType>),
+    Not(NotOperation<ArrayType>),
+    And(AndOperation<ArrayType>),
+    Or(OrOperation<ArrayType>),
+    Xor(XorOperation<ArrayType>),
+    Complex(ComplexOperation<ArrayType>),
+    Conjugate(ConjugateOperation<ArrayType>),
+    Real(RealOperation<ArrayType>),
+    Imaginary(ImaginaryOperation<ArrayType>),
+    Dot(DotOperation),
+    ScaledDot(ScaledDotOperation),
+    DotProductAttention(DotProductAttentionOperation),
+    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
+    Reduce(ReduceOperation),
+    Sort(SortOperation),
+    RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
+    Collective(CollectiveOperation),
+    AllGather(AllGatherOperation),
+    PSumScatter(PSumScatterOperation),
+    Ppermute(PpermuteOperation),
+    AllToAll(AllToAllOperation),
+    AxisIndex(AxisIndexOperation),
+    Transpose(TransposeOperation),
+    Reshape(LegacyReshapeOperation),
+    Broadcast(LegacyBroadcastOperation),
+    Pad(PadOperation<ArrayType>),
+    Concatenate(ConcatenateOperation<ArrayType>),
+    Gather(GatherOperation),
+    Scatter(ScatterOperation),
+    Slice(SliceOperation),
+    UpdateSlice(UpdateSliceOperation),
+    DynamicSlice(DynamicSliceOperation),
+    DynamicUpdateSlice(DynamicUpdateSliceOperation),
+    Compare(CompareOperation<ArrayType>),
+    Select(SelectOperation<ArrayType>),
+    Condition(ConditionOperation<V>),
+    While(WhileOperation<ArrayType>),
+    Scan(ScanOperation<V>),
+    ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+    TransferToMemory(TransferToMemoryOperation),
+    Reshard(ReshardOperation),
+    ShardingConstraint(ShardingConstraintOperation),
+    StopGradient(StopGradientOperation<ArrayType>),
+    Tag(TagOperation<ArrayType>),
+    Rematerialize(RematerializeOperation<ArrayType>),
+    Print(PrintOperation<ArrayType>),
+    CustomCall(CustomCallOperation<ArrayType>),
+    CustomJvp(CustomJvpOperation<ArrayType>),
+    CustomVjp(CustomVjpOperation<ArrayType>),
+    LinearCall(LinearCallOperation<ArrayType>),
+}
 
 /// [`Operation`](crate::Operation) family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
@@ -159,6 +267,10 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Differentiation-owned executable linear call with ordinary trailing residual operands.
     LinearCall(LinearCallOperation<ArrayIrType>),
 }
+
+/// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
+/// [`ArrayOperation`] family.
+pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 
 /// [`TracingContext`] over [`DimensionValue`]s and [`DimensionOperation`]s.
 pub type DimensionTracingContext = TracingContext<DimensionValue, DimensionOperation<DimensionValue>>;
@@ -291,7 +403,7 @@ mod tests {
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -300,7 +412,7 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::arrays::types::memories::Memory;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};

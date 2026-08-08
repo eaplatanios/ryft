@@ -544,8 +544,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, Shape};
+    use crate::backends::Array;
     use crate::batching::{Batch, BatchAxis, BatchAxisSpecification, BatchingError, batch};
     use crate::contexts::EagerContext;
     use crate::programs::Typed;

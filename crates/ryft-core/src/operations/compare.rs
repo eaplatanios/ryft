@@ -314,10 +314,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
+        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, DifferentiationTracer, TransposableOperation, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};

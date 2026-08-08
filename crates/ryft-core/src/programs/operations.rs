@@ -367,11 +367,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// ```rust
 /// # use ryft_core as ryft;
-/// # use ryft_core::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
-/// # use ryft_core::{Operation, Value, ZeroOperation};
-/// # use ryft_core::arrays::{ArrayIrValue, DimensionOperation, DimensionValue};
-/// # use ryft_core::backends::{Array, ArrayOperation};
-/// # use ryft_core::operations::dimensions::DimensionSizeOperation;
+/// # use ryft_core::{
+/// #   Operation, Value, ZeroOperation, Array, ArrayOperation, ArrayIrValue, DimensionOperation, DimensionValue,
+/// #   DimensionSizeOperation, ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape,
+/// # };
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]

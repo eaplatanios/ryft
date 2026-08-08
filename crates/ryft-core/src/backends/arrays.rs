@@ -1,10 +1,10 @@
-//! Contains the reference array backend that supports concrete [`Array`] values over the [`ArrayOperation`] family,
-//! together with the [`ArrayTracingContext`] used to stage array [`Program`](crate::Program)s. This backend serves
-//! programs whose values are dense multidimensional arrays typed by [`ArrayType`]. It is meant primarily for exercising
-//! the Ryft tracing, transformation, and interpretation machinery without depending on an optimized backend such as
+//! Contains the reference [`Array`] value and its eager implementations of the [`ArrayOperation`] family. Programs
+//! over these dense multidimensional values can be staged using
+//! [`ArrayTracingContext`](crate::arrays::ArrayTracingContext). This backend is meant primarily for exercising the Ryft
+//! tracing, transformation, and interpretation machinery without depending on an optimized backend such as
 //! `ryft-xla`: unit tests, documentation tests, and downstream crates can stage, transform, and interpret complete
-//! programs over arrays eagerly. [`Array`] stores one shared immutable byte buffer whose physical placement follows its
-//! [`ArrayType`]. Checked typed codecs preserve exact element encodings, while the reference kernels implement the
+//! programs over arrays eagerly. [`Array`] stores one shared immutable byte buffer whose physical placement follows
+//! its [`ArrayType`]. Checked typed codecs preserve exact element encodings, while the reference kernels implement the
 //! corresponding arithmetic and shape semantics.
 //!
 //! # Warning
@@ -24,62 +24,45 @@ use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 
-use ryft_macros::{Operation, Parameter};
+use ryft_macros::Parameter;
 
 // TODO(eaplatanios): Review from here onwards.
 
 use crate::arrays::{
-    ArrayAddressing, ArrayElement, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension, Shape, StaticShape,
-    decode_elements, decode_logical_bytes, dispatch_on_array_element_type, encode_elements, encode_logical_bytes,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    i1, i2, i4, u1, u2, u4, validate_storage_bytes,
+    ArrayAddressing, ArrayElement, ArrayOperation, ArraySliceAxis, ArrayType, Broadcastable, DataType, Dimension,
+    Shape, StaticShape, decode_elements, decode_logical_bytes, dispatch_on_array_element_type, encode_elements,
+    encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4, validate_storage_bytes,
 };
-use crate::axes::{Axis, AxisIndexOperation};
+use crate::axes::Axis;
 use crate::contexts::EagerContext;
-use crate::differentiation::LinearCallOperation;
 use crate::macros::{check_count, check_types};
 use crate::operations::attention::{
-    AttentionMask, DotProductAttention, DotProductAttentionBackward, DotProductAttentionBackwardOperation,
-    DotProductAttentionOperation, dot_product_attention_backward_composition, dot_product_attention_composition,
+    AttentionMask, DotProductAttention, DotProductAttentionBackward, dot_product_attention_backward_composition,
+    dot_product_attention_composition,
 };
-use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
-use crate::operations::complex::{
-    ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
-};
+use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::operations::math::erf::erf_f64;
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::random::{
-    RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, philox_u32_words, philox_u64_words, threefry_u32_words,
-    threefry_u64_words,
+    RandomAlgorithm, RngBitGenerator, philox_u32_words, philox_u64_words, threefry_u32_words, threefry_u64_words,
 };
 use crate::operations::sort::{
-    ArgMax, ArgMin, Sort, SortDirection, SortOperation, TopK, extremal_index_from_index_passenger, sort_permutation,
+    ArgMax, ArgMin, Sort, SortDirection, TopK, extremal_index_from_index_passenger, sort_permutation,
     top_k_from_index_passenger, top_k_via_squeezed_view,
 };
 use crate::operations::{
-    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Ceil, CeilOperation,
-    CollectiveOperation, Compare, CompareOperation, ComparisonDirection, Concatenate, ConcatenateOperation,
-    ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, CoordinateBasisOperation,
-    Cos, CosOperation, DIMENSION_SIZE_OPERATION_NAME, DimensionSize, Div, DivOperation, Dot, DotDimensionNumbers,
-    DotOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType,
-    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, GatherScatterMode,
-    IOTA_OPERATION_NAME, IotaOperation, LegacyBroadcast, LegacyBroadcastOperation, LegacyReshapeOperation, Log,
-    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Not, NotOperation, One, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
-    Permutation, Pow, PowOperation, PrintOperation, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Reshape,
-    ReshapeParameters, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation,
-    ScanOperation, Scatter, ScatterOperation, ScatterReductionKind, Select, SelectOperation,
-    ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation,
-    StopGradient, StopGradientOperation, Sub, SubOperation, Tag, TagOperation, Tanh, TanhOperation, TransferToMemory,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, scaled_dot_composition,
+    Abs, Add, And, Atan2, Ceil, Compare, ComparisonDirection, Concatenate, ConcatenateOperation, ConvertElementType,
+    Cos, DIMENSION_SIZE_OPERATION_NAME, DimensionSize, Div, Dot, DotDimensionNumbers, DotOperation, DynamicSlice,
+    DynamicUpdateSlice, ElementType, Erf, Exp, Floor, Gather, GatherOperation, GatherScatterMode, IOTA_OPERATION_NAME,
+    LegacyBroadcast, Log, Logistic, Max, Min, Mul, Neg, Not, One, OneLike, Or, Pad, Permutation, Pow, Reduce,
+    ReductionKind, Rem, Reshape, ReshapeParameters, Round, Rsqrt, ScaledDot, Scatter, ScatterOperation,
+    ScatterReductionKind, Select, Sign, Sin, Slice, Sqrt, StopGradient, Sub, Tag, Tanh, TransferToMemory, Transpose,
+    UpdateSlice, Xor, Zero, ZeroLike, scaled_dot_composition,
 };
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, Operation, ProgramError, TypeError, Typed, Value};
-use crate::tracing::TracingContext;
-use crate::tracing_v2::RematerializeOperation;
-use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 
 /// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
 ///
@@ -1684,104 +1667,6 @@ macro_rules! impl_array_extrema_for_complex {
 
 impl_array_extrema_for_complex!(f32);
 impl_array_extrema_for_complex!(f64);
-
-/// Reusable [`Operation`] enum for ordinary staged programs over arrays.
-///
-/// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
-/// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
-/// [`crate::tracing_v2::custom_derivatives`].
-///
-/// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
-/// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and
-/// [`Dot`](Self::Dot) a [`DotOperation`].
-#[derive(Clone, Debug, Operation)]
-#[ryft(dispatch(batching, differentiation, transposition))]
-pub enum ArrayOperation<V: Value<Type = ArrayType>> {
-    Zero(ZeroOperation<ArrayType>),
-    ZeroLike(ZeroLikeOperation<ArrayType>),
-    One(OneOperation<ArrayType>),
-    OneLike(OneLikeOperation<ArrayType>),
-    Constant(ConstantOperation<Array>),
-    Iota(IotaOperation<ArrayType>),
-    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
-    Abs(AbsOperation<ArrayType>),
-    Neg(NegOperation<ArrayType>),
-    Add(AddOperation<ArrayType>),
-    Sub(SubOperation<ArrayType>),
-    Mul(MulOperation<ArrayType>),
-    Div(DivOperation<ArrayType>),
-    Sin(SinOperation<ArrayType>),
-    Cos(CosOperation<ArrayType>),
-    Atan2(Atan2Operation<ArrayType>),
-    Exp(ExpOperation<ArrayType>),
-    Log(LogOperation<ArrayType>),
-    Sqrt(SqrtOperation<ArrayType>),
-    Rsqrt(RsqrtOperation<ArrayType>),
-    Tanh(TanhOperation<ArrayType>),
-    Logistic(LogisticOperation<ArrayType>),
-    Erf(ErfOperation<ArrayType>),
-    Pow(PowOperation<ArrayType>),
-    Sign(SignOperation<ArrayType>),
-    Floor(FloorOperation<ArrayType>),
-    Ceil(CeilOperation<ArrayType>),
-    Round(RoundOperation<ArrayType>),
-    Max(MaxOperation<ArrayType>),
-    Min(MinOperation<ArrayType>),
-    Rem(RemOperation<ArrayType>),
-    Not(NotOperation<ArrayType>),
-    And(AndOperation<ArrayType>),
-    Or(OrOperation<ArrayType>),
-    Xor(XorOperation<ArrayType>),
-    Complex(ComplexOperation<ArrayType>),
-    Conjugate(ConjugateOperation<ArrayType>),
-    Real(RealOperation<ArrayType>),
-    Imaginary(ImaginaryOperation<ArrayType>),
-    Dot(DotOperation),
-    ScaledDot(ScaledDotOperation),
-    DotProductAttention(DotProductAttentionOperation),
-    DotProductAttentionBackward(DotProductAttentionBackwardOperation),
-    Reduce(ReduceOperation),
-    Sort(SortOperation),
-    RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
-    Collective(CollectiveOperation),
-    AllGather(AllGatherOperation),
-    PSumScatter(PSumScatterOperation),
-    Ppermute(PpermuteOperation),
-    AllToAll(AllToAllOperation),
-    AxisIndex(AxisIndexOperation),
-    Transpose(TransposeOperation),
-    Reshape(LegacyReshapeOperation),
-    Broadcast(LegacyBroadcastOperation),
-    Pad(PadOperation<ArrayType>),
-    Concatenate(ConcatenateOperation<ArrayType>),
-    Gather(GatherOperation),
-    Scatter(ScatterOperation),
-    Slice(SliceOperation),
-    UpdateSlice(UpdateSliceOperation),
-    DynamicSlice(DynamicSliceOperation),
-    DynamicUpdateSlice(DynamicUpdateSliceOperation),
-    Compare(CompareOperation<ArrayType>),
-    Select(SelectOperation<ArrayType>),
-    Condition(ConditionOperation<V>),
-    While(WhileOperation<ArrayType>),
-    Scan(ScanOperation<V>),
-    ConvertElementType(ConvertElementTypeOperation<ArrayType>),
-    TransferToMemory(TransferToMemoryOperation),
-    Reshard(ReshardOperation),
-    ShardingConstraint(ShardingConstraintOperation),
-    StopGradient(StopGradientOperation<ArrayType>),
-    Tag(TagOperation<ArrayType>),
-    Rematerialize(RematerializeOperation<ArrayType>),
-    Print(PrintOperation<ArrayType>),
-    CustomCall(CustomCallOperation<ArrayType>),
-    CustomJvp(CustomJvpOperation<ArrayType>),
-    CustomVjp(CustomVjpOperation<ArrayType>),
-    LinearCall(LinearCallOperation<ArrayType>),
-}
-
-/// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
-/// [`ArrayOperation`] family.
-pub type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
 
 /// Dense multidimensional [`Value`] whose [`Type`] is an [`ArrayType`] and which is meant to be used
 /// primarily for testing the Ryft infrastructure and machinery with programs that involve multidimensional arrays,

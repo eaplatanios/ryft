@@ -42,14 +42,14 @@ mod tests {
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableType, DifferentiationError};

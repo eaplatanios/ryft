@@ -2187,8 +2187,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DimensionBounds, DimensionVariable, ShardingDimension};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, DimensionBounds, DimensionVariable, ShardingDimension};
+    use crate::backends::Array;
     use crate::batching::{BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;

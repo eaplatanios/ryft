@@ -9,11 +9,10 @@
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::ArrayIrOperation;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::backends::ArrayOperation;
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
@@ -395,12 +394,12 @@ mod tests {
 
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::arrays::types::ir::ArrayIrType;
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::compilation::{
         CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,
         JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,

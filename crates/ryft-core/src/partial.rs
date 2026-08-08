@@ -1736,8 +1736,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
-    use crate::backends::{Array, ArrayOperation, ArrayTracingContext};
+    use crate::arrays::{ArrayOperation, ArrayTracingContext, ArrayType, DataType};
+    use crate::backends::Array;
     use crate::contexts::{Context, StagingContext};
     use crate::operations::{
         AddOperation, ConstantOperation, MulOperation, NegOperation, PrintOperation, SinOperation, Zero,

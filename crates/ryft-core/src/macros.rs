@@ -3473,24 +3473,24 @@ macro_rules! check_operation_partial_evaluation {
         expected = $expected:expr $(,)?
     ) => {{
         let operation = $operation;
-        let inputs: Vec<$crate::backends::arrays::Array> = vec![$($input),+];
-        let expected: $crate::backends::arrays::Array = $expected;
+        let inputs: Vec<$crate::Array> = vec![$($input),+];
+        let expected: $crate::Array = $expected;
         let mut builder = $crate::programs::builders::ProgramBuilder::<
-            $crate::backends::arrays::Array,
-            $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+            $crate::Array,
+            $crate::ArrayOperation<$crate::Array>,
         >::new();
         let input_ids = inputs
             .iter()
             .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
             .collect::<Vec<_>>();
-        let operation: $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array> =
+        let operation: $crate::ArrayOperation<$crate::Array> =
             ::core::convert::Into::into(operation);
         let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
         assert_eq!(output_ids.len(), 1);
         let program = builder
             .build::<
-                Vec<$crate::backends::arrays::Array>,
-                Vec<$crate::backends::arrays::Array>,
+                Vec<$crate::Array>,
+                Vec<$crate::Array>,
             >(
                 output_ids,
                 vec![$crate::parameters::Placeholder; inputs.len()],
@@ -3498,8 +3498,8 @@ macro_rules! check_operation_partial_evaluation {
             )
             .unwrap();
         let context = $crate::contexts::EagerContext::<
-            $crate::backends::arrays::Array,
-            $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+            $crate::Array,
+            $crate::ArrayOperation<$crate::Array>,
         >::new();
 
         let known = inputs
@@ -3552,8 +3552,8 @@ macro_rules! check_operation_partial_evaluation {
     ) => {
         $crate::check_operation_partial_evaluation!(
             backend = (
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>
             ),
             operation = $operation,
             cases = $cases,
@@ -3705,8 +3705,8 @@ macro_rules! check_operation_batching {
         $crate::check_operation_batching!(
             @run (@exact),
             context = $crate::contexts::EagerContext::<
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>,
             >::new(),
             driver = &$crate::programs::regions::EmptyRegionDriver,
             operation = $operation,
@@ -3726,8 +3726,8 @@ macro_rules! check_operation_batching {
         $crate::check_operation_batching!(
             @run (@approx($epsilon)),
             context = $crate::contexts::EagerContext::<
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>,
             >::new(),
             driver = &$crate::programs::regions::EmptyRegionDriver,
             operation = $operation,
@@ -3921,10 +3921,7 @@ macro_rules! check_operation_differentiation {
     ) => {
         $crate::check_operation_differentiation!(
             @approx(step = $step, epsilon = $epsilon),
-            backend = (
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
-            ),
+            backend = ($crate::Array, $crate::ArrayOperation<$crate::Array>),
             operation = $operation,
             cases = $cases,
         )
@@ -4082,8 +4079,8 @@ macro_rules! check_operation_transposition {
         $crate::check_operation_transposition!(
             @run (@exact),
             backend = (
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>
             ),
             operation = $operation,
             cases = $cases,
@@ -4099,8 +4096,8 @@ macro_rules! check_operation_transposition {
         $crate::check_operation_transposition!(
             @run (@approx($epsilon)),
             backend = (
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>
             ),
             operation = $operation,
             cases = $cases,
@@ -4206,8 +4203,8 @@ macro_rules! check_operation_transposition {
         $crate::check_operation_transposition!(
             @rejected,
             backend = (
-                $crate::backends::arrays::Array,
-                $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>
+                $crate::Array,
+                $crate::ArrayOperation<$crate::Array>
             ),
             operation = $operation,
             input_types = $input_types,
@@ -4323,8 +4320,8 @@ macro_rules! check_gradient {
             __F: Fn(
                 $crate::differentiation::LinearizationTracer<
                     $crate::contexts::EagerContext<
-                        $crate::backends::arrays::Array,
-                        $crate::backends::arrays::ArrayOperation<$crate::backends::arrays::Array>,
+                        $crate::Array,
+                        $crate::ArrayOperation<$crate::Array>,
                     >,
                 >,
             ) -> __Output,
@@ -4334,17 +4331,17 @@ macro_rules! check_gradient {
         }
 
         fn pin_eager<
-            __F: Fn($crate::backends::arrays::Array) -> __Output,
-            __Output: $crate::MaybeFallible<$crate::backends::arrays::Array, $crate::ProgramError>,
+            __F: Fn($crate::Array) -> __Output,
+            __Output: $crate::MaybeFallible<$crate::Array, $crate::ProgramError>,
         >(
             function: __F,
-        ) -> impl Fn($crate::backends::arrays::Array) -> $crate::backends::arrays::Array {
+        ) -> impl Fn($crate::Array) -> $crate::Array {
             move |input| {
                 $crate::MaybeFallible::into_result(function(input)).unwrap_or_else(|error| panic!("{error}"))
             }
         }
 
-        let input: $crate::backends::arrays::Array = ::core::convert::Into::into($input);
+        let input: $crate::Array = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::gradient(pin_traced($function), input.clone()).unwrap();
@@ -4363,23 +4360,23 @@ macro_rules! check_gradient {
         let tolerance = $tolerance;
 
         // The function output is a rank-0 real array, so the central difference reads its single `f64` element.
-        let central_difference = |plus: $crate::backends::arrays::Array, minus: $crate::backends::arrays::Array| {
+        let central_difference = |plus: $crate::Array, minus: $crate::Array| {
             (evaluate(plus).to_f64s()[0] - evaluate(minus).to_f64s()[0]) / (2.0 * step)
         };
 
         let input_type = $crate::programs::types::Typed::r#type(&input).into_owned();
-        let element_count = $crate::backends::arrays::Array::materialized_element_count(&input_type).unwrap();
+        let element_count = $crate::Array::materialized_element_count(&input_type).unwrap();
         match input_type.data_type() {
             $crate::arrays::DataType::F64 => {
                 let perturbed = |index: usize, delta: f64| {
                     let mut values = input.to_f64s();
                     values[index] += delta;
-                    $crate::backends::arrays::Array::from_f64s(input_type.clone(), values)
+                    $crate::Array::from_f64s(input_type.clone(), values)
                 };
                 let estimates = (0..element_count)
                     .map(|index| central_difference(perturbed(index, step), perturbed(index, -step)))
                     .collect::<Vec<_>>();
-                let estimate = $crate::backends::arrays::Array::from_f64s(input_type.clone(), estimates);
+                let estimate = $crate::Array::from_f64s(input_type.clone(), estimates);
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
             $crate::arrays::DataType::C128 => {
@@ -4394,8 +4391,8 @@ macro_rules! check_gradient {
                     real_values[index] += real_delta;
                     imaginary_values[index] += imaginary_delta;
                     $crate::operations::complex::Complex::complex(
-                        &$crate::backends::arrays::Array::from_f64s(part_type.clone(), real_values),
-                        &$crate::backends::arrays::Array::from_f64s(part_type.clone(), imaginary_values),
+                        &$crate::Array::from_f64s(part_type.clone(), real_values),
+                        &$crate::Array::from_f64s(part_type.clone(), imaginary_values),
                     )
                     .unwrap()
                 };
@@ -4412,8 +4409,8 @@ macro_rules! check_gradient {
                     ));
                 }
                 let estimate = $crate::operations::complex::Complex::complex(
-                    &$crate::backends::arrays::Array::from_f64s(part_type.clone(), real_estimates),
-                    &$crate::backends::arrays::Array::from_f64s(part_type, imaginary_estimates),
+                    &$crate::Array::from_f64s(part_type.clone(), real_estimates),
+                    &$crate::Array::from_f64s(part_type, imaginary_estimates),
                 )
                 .unwrap();
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
@@ -4442,11 +4439,11 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Device, DeviceMesh, Dimension,
-        DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+        ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Device,
+        DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{

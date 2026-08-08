@@ -1853,10 +1853,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayBatch, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayBatch, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{JacobianDifferentiate, jacobian_reverse};
@@ -3190,8 +3190,8 @@ mod tests {
     fn test_dot_batching_preserves_materialized_batch_placement() {
         use std::rc::Rc;
 
-        use crate::arrays::ArrayBatch;
-        use crate::backends::{Array, ArrayOperation};
+        use crate::arrays::{ArrayBatch, ArrayOperation};
+        use crate::backends::Array;
         use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;

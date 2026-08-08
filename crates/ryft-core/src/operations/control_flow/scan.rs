@@ -2720,10 +2720,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType, DimensionVariable,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};

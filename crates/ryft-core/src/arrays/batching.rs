@@ -2306,12 +2306,12 @@ mod tests {
 
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::backends::Array;
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,
@@ -3365,7 +3365,7 @@ mod tests {
         let output = program.interpret(input).unwrap();
         assert_eq!(output.to_f64s(), (0..12).map(|value| value as f64 + 1.0).collect::<Vec<_>>());
     }
-    
+
     // TODO(eaplatanios): Review from here onwards.
 
     #[test]

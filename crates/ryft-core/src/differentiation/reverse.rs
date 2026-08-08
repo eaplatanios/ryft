@@ -1903,8 +1903,8 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
-    use crate::backends::{Array, ArrayOperation};
+    use crate::arrays::{ArrayOperation, ArrayType, DataType};
+    use crate::backends::Array;
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
         ProjectedProgramValue,

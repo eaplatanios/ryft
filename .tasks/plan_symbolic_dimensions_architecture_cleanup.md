@@ -2373,7 +2373,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         semantics in `operations`, generic program machinery in `programs`, and transform policy machinery in its
         transform modules; this hierarchy owns the complete array-language type vocabulary, concrete reference values,
         and their closed operation families.
-    - [ ] Extend `arrays::operations::mod.rs` (created 2026-08-06 with `DimensionOperation` and
+    - [x] Extend `arrays::operations::mod.rs` (created 2026-08-06 with `DimensionOperation` and
           `DimensionTracingContext`) with `ArrayOperation`, `ArrayIrOperation`, `ArrayTracingContext`, and only the
           imports, derives, family conversions, and shared dispatcher/provider logic that genuinely spans operation
           families. Re-export the public family names from `arrays` without retaining a `backends` alias.
@@ -5388,3 +5388,20 @@ unit-test target compiles and links. Nightly formatting of the touched core crat
 searches for all retired specialization paths pass. The larger reference-array backend move remains the next
 hierarchy unit because extracting its value before its operation implementations would require temporary field
 visibility or adapters.
+
+### Phase 9 hierarchy reference operation family (2026-08-07)
+
+Moved the closed `ArrayOperation` family and `ArrayTracingContext` alias unchanged from the transitional reference
+backend into `arrays::operations`, beside `DimensionOperation`, `ArrayIrOperation`, and their tracing aliases.
+`arrays` now re-exports both names, while `backends` re-exports only the reference `Array` value. All core consumers
+use the array ownership boundary, same-owner array modules use the defining `arrays::operations` path,
+macro-generated code uses the public crate-root facade, and XLA no longer names the retired backend path. No
+compatibility re-export or temporary adapter was added.
+
+A direct extracted-source comparison confirms that the enum declaration, variant order, attributes, and
+documentation are byte-for-byte unchanged. Residual searches find no backend-owned `ArrayOperation` or
+`ArrayTracingContext` path or re-export. Verification passes targeted nightly formatting, `git diff --check`, core
+and XLA all-target checks, the complete `ryft-core` suite with `benchmarking` (1,139 unit tests, five allocation
+tests, six region-prototype tests, and 53 runnable doctests with 16 intentional ignores), every macro runtime and
+compile-fail test, and the XLA unit-test build. The reference `Array` value, its capability implementations, and its
+catch-all tests remain together in `backends::arrays`; moving and splitting those owners is the next review unit.

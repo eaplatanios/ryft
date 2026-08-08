@@ -13589,12 +13589,7 @@ mod tests {
     fn test_plain_scalar_bilinear_sin_jit_stablehlo() {
         let (_, compiled): (
             CpuArray,
-            ryft_core::programs::Program<
-                CpuArray,
-                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
-                (CpuArray, CpuArray),
-                CpuArray,
-            >,
+            ryft_core::programs::Program<CpuArray, ryft_core::ArrayOperation<CpuArray>, (CpuArray, CpuArray), CpuArray>,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |inputs| Ok(scalar_bilinear_sin(inputs)),
@@ -13622,12 +13617,7 @@ mod tests {
     fn test_plain_scalar_quartic_plus_sin_grad_stablehlo() {
         let (_, compiled): (
             CpuArray,
-            ryft_core::programs::Program<
-                CpuArray,
-                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
-                CpuArray,
-                CpuArray,
-            >,
+            ryft_core::programs::Program<CpuArray, ryft_core::ArrayOperation<CpuArray>, CpuArray, CpuArray>,
         ) = TEST_ARRAY_DOMAIN
             .interpret_and_trace(
                 |x| {
@@ -14840,7 +14830,7 @@ mod tests {
             (CpuArray, CpuArray),
             ryft_core::programs::Program<
                 CpuArray,
-                ryft_core::backends::arrays::ArrayOperation<CpuArray>,
+                ryft_core::ArrayOperation<CpuArray>,
                 (CpuArray, CpuArray),
                 (CpuArray, CpuArray),
             >,
