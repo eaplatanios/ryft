@@ -49,7 +49,8 @@ tempfile.workspace = true
 
 [features]
 default = []
-benchmarking = ["ryft-core/benchmarking"]
+program-statistics = []
+performance-benchmarking = []
 ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
@@ -60,11 +61,11 @@ metal = ["ryft-pjrt/metal"]
 mps = ["ryft-pjrt/mps"]
 
 [[bin]]
-name = "ir_benchmark"
-path = "src/bin/ir_benchmark.rs"
-required-features = ["benchmarking"]
+name = "program_statistics"
+path = "src/bin/program_statistics.rs"
+required-features = ["program-statistics"]
 
 [[bin]]
 name = "compilation_benchmark"
 path = "src/bin/compilation_benchmark.rs"
-required-features = ["benchmarking"]
+required-features = ["performance-benchmarking"]

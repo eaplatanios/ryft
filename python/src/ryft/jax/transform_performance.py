@@ -14,10 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ryft.jax.benchmark_cases import import_jax
-from ryft.jax.benchmark_snapshots import repo_root
-
-
 DEFAULT_ITERATIONS = 1_000
 DEFAULT_WARMUP = 50
 DEFAULT_MAX_RATIO = 1.0
@@ -361,6 +357,34 @@ def selected_runtime_cases(case_ids: Sequence[str]) -> tuple[RuntimeBenchmarkCas
     return tuple(runtime_case_by_id(case_id) for case_id in case_ids)
 
 
+def repo_root() -> Path:
+    """Returns the repository root."""
+
+    return Path(__file__).resolve().parents[4]
+
+
+def import_jax() -> tuple[Any, Any, Any]:
+    """Imports JAX and returns the modules needed by the runtime benchmark cases."""
+
+    try:
+        import jax
+        import jax.numpy as jnp
+        import numpy as np
+    except (
+        ImportError
+    ) as error:  # pragma: no cover - exercised only when JAX is missing locally.
+        raise SystemExit(
+            "jax is not installed locally; install JAX or rerun with --skip-jax"
+        ) from error
+
+    try:
+        jax.config.update("jax_enable_x64", True)
+    except Exception:
+        pass
+
+    return jax, jnp, np
+
+
 def rust_transform_benchmark_command(case_ids: Sequence[str], iterations: int, warmup: int) -> list[str]:
     """Builds the Rust transform benchmark command."""
 
@@ -373,7 +397,7 @@ def rust_transform_benchmark_command(case_ids: Sequence[str], iterations: int, w
         "--bin",
         "transform_benchmark",
         "--features",
-        "benchmarking ndarray",
+        "performance-benchmarking ndarray",
         "--",
         "--iterations",
         str(iterations),
@@ -409,7 +433,7 @@ def run_jax_records(
 ) -> dict[str, RuntimeBenchmarkRecord]:
     """Runs JAX benchmark cases and returns records keyed by case ID."""
 
-    jax, jnp, np, _ = import_jax()
+    jax, jnp, np = import_jax()
     return {
         case.case_id: measure_jax_case(case, jax, jnp, np, iterations, warmup)
         for case in cases

@@ -579,15 +579,16 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     }
 
     /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached
-    /// [`Region`](crate::Region)s. Both [`LinearCallInterface`] forms preserve a completely replicated call unchanged.
+    /// [`Region`](crate::Region)s. Both [`LinearCallInterface`] forms preserve a completely replicated call unchanged
+    /// when the batching level is _unnamed_, which is precisely when no attached region can observe it.
     ///
-    /// A mapped [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
+    /// Every other [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
     /// output axes, batches its transpose region under those axes, and aligns the transpose outputs with the original
     /// linear-input axes (i.e., a cotangent for a replicated linear input is summed across the batch by `collapse_fn`,
     /// while cotangents for mapped linear inputs retain their packed axes).
     ///
-    /// A mapped [`LinearCallInterface::TransposeOnly`] call is rejected because its unavailable forward program cannot
-    /// determine the batched output axes.
+    /// Every other [`LinearCallInterface::TransposeOnly`] call is rejected because its unavailable forward program
+    /// cannot determine the batched output axes.
     ///
     /// The batching policy owns the boundary shape of its structurally batched programs.
     /// [`BatchingPolicy::adapt_batched_program`] adapts each batched region to the plain two-region linear-call
@@ -622,9 +623,17 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("input", input_axes, inputs.len(), ProgramError);
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
 
-        // A completely replicated call needs no structural region rewrite. Keeping the original call also avoids
-        // manufacturing a batch axis that neither region observes.
-        if input_axes.iter().all(BatchAxis::is_replicated) {
+        // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
+        // original call avoids manufacturing a batch axis that neither region observes. What makes that shortcut sound
+        // is the level being unnamed rather than the operands being replicated: an attached region's value can vary per
+        // batch item with no mapped operand at all, but only by addressing the level _by name_ (e.g., an `axis_index`
+        // or a collective over this level's axis, both of which a transposed program naturally contains because
+        // `all_gather` transposes to `psum_scatter` and vice versa). Every named-axis operation resolves the level it
+        // belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an unnamed level is
+        // provably invisible to all of them, including those of operation families this crate does not know about. A
+        // named level therefore batches its regions structurally, which is also what lets the named-axis operations
+        // inside them resolve against it.
+        if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
             let outputs = context.parent().bind(
                 self.clone(),
                 driver.regions().map(|region| region.to_program()).collect::<Vec<_>>(),
@@ -637,8 +646,9 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             LinearCallInterface::ForwardAndTranspose => {}
             LinearCallInterface::TransposeOnly { .. } => {
                 return Err(BatchingError::UnsupportedOperation {
-                    message: "a transpose-only linear call cannot be batched with mapped inputs because its \
-                             unavailable forward program does not determine output batch axes"
+                    message: "a transpose-only linear call cannot be batched structurally because its unavailable \
+                              forward program does not determine output batch axes; it is preserved unchanged only \
+                              when every operand is replicated at an unnamed batching level"
                         .to_string(),
                 });
             }
@@ -1093,17 +1103,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
     };
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
+    use crate::axes::AxisIndexOperation;
+    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver};
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::operations::{AddOperation, MulOperation, ZeroLikeOperation};
+    use crate::operations::{AddOperation, ConvertElementTypeOperation, MulOperation, ZeroLikeOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
@@ -1123,6 +1135,22 @@ mod tests {
         builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
+    }
+
+    /// Builds the scalar program `u ↦ u · axis_index("items")`, a linear map whose factor is read from the named
+    /// `items` axis rather than from an operand. It serves as both regions of a linear call whose value varies per
+    /// batch item even though every operand is replicated.
+    fn axis_scaled_multiply_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let index = builder
+            .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+            .unwrap()[0];
+        let factor = builder
+            .add_instruction(ConvertElementTypeOperation::new(DataType::F64), Vec::new(), vec![index])
+            .unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, factor]).unwrap()[0];
+        builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Test-only transposition driver exposing one attached region, used to invoke the _transpose-only_ form's
@@ -1436,8 +1464,9 @@ mod tests {
                 ProgramBatchingOutputAxesPolicy::Natural,
             ),
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "a transpose-only linear call cannot be batched with mapped inputs because its \
-                               unavailable forward program does not determine output batch axes",
+                if message == "a transpose-only linear call cannot be batched structurally because its unavailable \
+                               forward program does not determine output batch axes; it is preserved unchanged only \
+                               when every operand is replicated at an unnamed batching level",
         ));
     }
 
@@ -1590,6 +1619,96 @@ mod tests {
         let instruction = &batched.instructions()[0];
         assert_eq!(instruction.operation().name(), "transpose_only_linear_call");
         assert_eq!(instruction.regions().len(), 1);
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_rewrites_replicated_regions_naming_the_batch_axis() {
+        // Both regions of `u ↦ u · axis_index("items")` address the enclosing named batching level, so the call's
+        // value varies per batch item even though its single operand is replicated.
+        let regions = vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()];
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+            .with_axis_name("items".to_string());
+
+        // Batching must therefore rewrite both regions instead of taking the all-replicated fast path, which would bind
+        // the call unchanged and leave the `axis_index` unresolved (it then reaches eager interpretation and reports
+        // "`axis_index` for the device mesh axis 'items' has no eager value").
+        let outputs = LinearCallOperation::new(0)
+            .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0))])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]));
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_preserves_a_replicated_unnamed_call() {
+        let forward = scalar_multiply_program();
+        let transpose = forward.clone();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let forward = builder.import_region(forward.entry_region_ref());
+        let transpose = builder.import_region(transpose.entry_region_ref());
+        let residual = builder.add_input(ArrayType::scalar(DataType::F64));
+        let linear = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // An unnamed level is the shape every differentiation-generated linear call is batched under, and no operation
+        // can address it, so a completely replicated call keeps its fast path: the staged instruction retains its
+        // residual count, its operand order, and both regions byte for byte.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = linear_call [residual_count=1] %0 %1 [
+                    forward={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(batched.to_string(), program.to_string());
+
+        // A *named* level is conservatively structural even for regions that name no axis, because the level's name is
+        // all this rule can decide on. The rewritten regions are semantically the source regions, so the batched call
+        // still computes `r · u` and reports its output replicated.
+        let regions = vec![scalar_multiply_program(), scalar_multiply_program()];
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("items".to_string());
+        let outputs = LinearCallOperation::new(1)
+            .batch(
+                &context,
+                &driver,
+                &[ArrayBatch::replicated(Array::scalar(2.0)), ArrayBatch::replicated(Array::scalar(4.0))],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value(), &Array::scalar(8.0));
     }
 
     #[test]

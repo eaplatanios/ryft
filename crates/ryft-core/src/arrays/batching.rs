@@ -1145,6 +1145,16 @@ impl<
     /// [`ProgramBatchingOutputAxesPolicy::AlignAllTo`] imposes one canonical
     /// output axis when a consumer explicitly requires one common layout.
     ///
+    /// Dynamic per-item dimensions are supported. The mapped axis is always _freshly inserted_ as [`Dimension::Static`]
+    /// carrying the caller's `axis_size`, so program-level batching never reads a batch extent off an input type and
+    /// consequently never raises [`BatchingError::DynamicBatchAxis`] the way the value-level
+    /// [`Batch::batch`](crate::Batch::batch) entry point does, which must recover the batch size from a mapped value's
+    /// own type. A dynamic dimension in an input's per-item type is therefore never the batch axis: it crosses the
+    /// rewritten boundary unchanged, and where a [`BatchableOperation`] rule needs its runtime extent (such as the
+    /// broadcast that aligns a replicated elementwise operand against a mapped one) that extent is resolved through
+    /// [`DimensionSource`] from the source axis that supplied it, or rejected with an exact type diagnostic when no
+    /// source axis carries it.
+    ///
     /// # Parameters
     ///
     ///   - `axis_size`: Dimension of the new batch axis.
@@ -1844,6 +1854,33 @@ pub(crate) fn array_dimension<C: Context<Type = ArrayIrType, Operation: From<Dim
     Ok(context.bind(operation, Vec::new(), std::slice::from_ref(value))?.remove(0))
 }
 
+/// Stages one exact first-class dimension constant carrying `extent` in `context`.
+pub(crate) fn dimension_constant<C>(context: &C, extent: usize) -> Result<C::Value, BatchingError>
+where
+    C: Context<Type = ArrayIrType, Operation: From<DimensionOperation<DimensionValue>>>,
+{
+    let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
+    let mut outputs = context.bind(DimensionOperation::Constant(ConstantOperation::new(value)), Vec::new(), &[])?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
+/// Returns one packed array axis as a first-class dimension value, staging an exact constant when the axis extent is
+/// statically known and reading the axis through [`array_dimension`] only when it is genuinely dynamic. Folding the
+/// static axes keeps staged programs free of `dimension_size` reads whose results the type system already knows.
+pub(crate) fn folded_array_dimension<C>(context: &C, value: &C::Value, axis: usize) -> Result<C::Value, BatchingError>
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<DimensionOperation<DimensionValue>> + From<DimensionSizeOperation>,
+{
+    let value_type = value.r#type();
+    let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
+    match array_type.shape().dimensions().get(axis) {
+        Some(Dimension::Static(extent)) => dimension_constant(context, *extent),
+        _ => array_dimension(context, value, axis),
+    }
+}
+
 /// Requires two composite dimension values to describe the same mapped extent.
 pub(crate) fn require_equal_dimensions<C>(context: &C, left: &C::Value, right: &C::Value) -> Result<(), BatchingError>
 where
@@ -1912,8 +1949,10 @@ where
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
         let outer_context = context.parent().parent();
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
+        // The replicated per-item shape survives unchanged, so each of its axes contributes either an exact constant
+        // or a `dimension_size` read, and the inserted mapped axis takes the transform's own extent.
         let mut output_dimensions = (0..array_type.rank())
-            .map(|axis| array_dimension(outer_context, &value, axis))
+            .map(|axis| folded_array_dimension(outer_context, &value, axis))
             .collect::<Result<Vec<_>, _>>()?;
         output_dimensions.insert(position, context.axis_extent().clone());
         let output_axes = (0..array_type.rank())
@@ -1952,16 +1991,7 @@ where
             .into_iter()
             .map(|dimension_source| -> Result<C::Value, BatchingError> {
                 match dimension_source {
-                    DimensionSource::Static(extent) => {
-                        let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-                        let mut outputs = outer_context.bind(
-                            DimensionOperation::Constant(ConstantOperation::new(value)),
-                            Vec::new(),
-                            &[],
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs.remove(0))
-                    }
+                    DimensionSource::Static(extent) => dimension_constant(outer_context, extent),
                     DimensionSource::Value { source, axis } => {
                         let source = <C::Value as ValueProjection<ArrayType>>::from_projected(source);
                         array_dimension(outer_context, &source, axis)
@@ -2096,10 +2126,14 @@ where
                     return Ok(batch);
                 };
 
-                let mut output_dimensions = (0..array_type.rank())
-                    .map(|axis| array_dimension(batching_context.parent(), &batch.value, axis))
+                // The mapped axis takes the transform's own extent, and every other axis is either an exact constant
+                // or a `dimension_size` read of the input being renormalized.
+                let output_dimensions = (0..array_type.rank())
+                    .map(|axis| match axis == position {
+                        true => Ok(batching_context.axis_extent().clone()),
+                        false => folded_array_dimension(batching_context.parent(), &batch.value, axis),
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
-                output_dimensions[position] = batching_context.axis_extent().clone();
                 let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
                 let batch_axis = batch.batch_axis;
                 let value = broadcast_array(
@@ -2905,6 +2939,59 @@ mod tests {
     }
 
     #[test]
+    fn test_program_batched_carries_dynamic_per_item_dimensions() {
+        // Contract: program batching inserts the mapped axis as `Dimension::Static(axis_size)` taken from the caller's
+        // `axis_size`, so it never reads a batch extent off the input type the way value-level `Batch::batch` does and
+        // therefore never raises `BatchingError::DynamicBatchAxis`. A dynamic per-item dimension is not the batch
+        // axis, and it crosses the rewritten boundary unchanged.
+        let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
+        let unbatched_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].clone() + inputs[0].clone()]),
+            vec![unbatched_type.clone()],
+        )
+        .unwrap();
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(batched.input_types(), &[batched_type.clone()]);
+        assert_eq!(batched.output_types(), &[batched_type]);
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+
+        // Adding a replicated second input routes the elementwise rule through its broadcast path, where each dynamic
+        // target dimension is resolved by `DimensionSource` from the source axis that supplied it instead of being
+        // rejected. The staged homogeneous `broadcast` therefore retains the dynamic extent in its stored output type,
+        // and the replicated input keeps its unbatched dynamically shaped type.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
+            vec![unbatched_type.clone(), unbatched_type],
+        )
+        .unwrap();
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f64[2, n], %1:f64[n] .
+                let %2:f64[2, n] = broadcast [output_type=f64[2, n], output_axes=[1]] %1
+                    %3:f64[2, n] = add %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_batch_entry_points_and_axis_contracts() {
         // `Batch::batch` on an explicit context maps the closure over the mapped input axis: each item of the
         // length-3 batch is squared, and the output carries its mapped axis back at the requested position.
@@ -3562,7 +3649,8 @@ mod tests {
         assert_eq!(nested, matrix);
 
         // Under staging, an inferred dynamic extent remains an explicit `dimension_size` result consumed by
-        // the output broadcast rather than metadata reconstructed from the array type.
+        // the output broadcast rather than metadata reconstructed from the array type, while the replicated
+        // input's statically known axis folds into an exact dimension constant instead of another read.
         type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let trace = TraceContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
@@ -3585,7 +3673,10 @@ mod tests {
         let builder = trace.builder().borrow();
         assert_eq!(builder.instructions().len(), 3);
         assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::DimensionSize(_),));
-        assert!(matches!(builder.instructions()[1].operation(), ArrayIrOperation::DimensionSize(_),));
+        assert!(matches!(
+            builder.instructions()[1].operation(),
+            ArrayIrOperation::Dimension(DimensionOperation::Constant(_)),
+        ));
         assert!(matches!(builder.instructions()[2].operation(), ArrayIrOperation::Broadcast(_),));
         assert_eq!(builder.instructions()[2].inputs().len(), 3);
         assert_eq!(
@@ -3595,6 +3686,56 @@ mod tests {
                 Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]),
             )),
         );
+        drop(builder);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_batch_folds_static_axes_when_normalizing_input_sharding() -> Result<(), ProgramError> {
+        // Renormalizing a mapped input's batch-axis placement stages one dynamic broadcast whose output dimensions
+        // are the transform's own extent at the mapped axis and exact constants at statically known axes, so no
+        // `dimension_size` read is staged for an extent the type system already knows.
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let trace = TraceContext::new();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let shape = Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]);
+        let sharded_type = ArrayType::new(DataType::F32, shape.clone())
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        let replicated_type =
+            ArrayType::new(DataType::F32, shape).with_sharding(Sharding::replicated(mesh, 2)).unwrap();
+        let sharded = trace.input(sharded_type.clone().into());
+        let replicated = trace.input(replicated_type.into());
+        let staged = Batch::batch(
+            &trace,
+            |(_sharded, normalized)| Ok(normalized),
+            (sharded, replicated),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        let builder = trace.builder().borrow();
+        let operations = builder.instructions().iter().map(|instruction| instruction.operation()).collect::<Vec<_>>();
+        assert_eq!(operations.len(), 5);
+
+        // Both mapped inputs still spend explicit extent reads for the mapped axis itself, which the ordered
+        // requirement checks against each other.
+        assert!(matches!(operations[0], ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(operations[1], ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(operations[2], ArrayIrOperation::Dimension(DimensionOperation::Requirement(_))));
+
+        // Only the trailing static axis of the renormalized input costs an instruction, and it is an exact constant
+        // rather than a read. The broadcast consumes the input, the mapped extent, and that constant.
+        assert!(matches!(operations[3], ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(matches!(operations[4], ArrayIrOperation::Broadcast(_)));
+        assert_eq!(builder.instructions()[4].inputs().len(), 3);
+
+        // Folding the static axis leaves the inferred normalized type exactly the sharded input type.
+        assert_eq!(staged.r#type().as_ref(), &ArrayIrType::Array(sharded_type));
         drop(builder);
 
         Ok(())

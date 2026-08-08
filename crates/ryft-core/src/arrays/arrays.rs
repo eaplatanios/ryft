@@ -40,6 +40,15 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// it. The per-family kernels in [`crate::arrays::operations`] own the element-level arithmetic, conversion, and
 /// shape semantics computed over these values.
 ///
+/// A production [`Array`] always carries a fully static [`ArrayType`]: every constructor that sizes or addresses a
+/// payload funnels through [`ArrayAddressing::new`], which rejects any type with a [`Dimension::Dynamic`] axis, so a
+/// dynamically shaped array value cannot be built. Reference kernels may therefore assume static geometry and read
+/// extents directly off the stored type instead of resolving first-class dimension extents; programs that genuinely
+/// need dynamic shapes stage over [`ArrayIrOperation`](crate::ArrayIrOperation) instead, where
+/// each dynamic axis is carried by an explicit dimension operand. The single bypass is the `#[cfg(test)]`-gated
+/// `Array::with_unchecked_type`, which exists so that transform-validation tests can pin how the dynamic-shape
+/// rejections behave when a deliberately malformed value reaches them.
+///
 /// # Warning
 ///
 /// This backend prioritizes transparency over performance. It supports the physical strided and tiled layouts carried
@@ -749,7 +758,8 @@ mod tests {
         assert!(matches!(
             Array::from_elements(dynamic_type, &[1.0f64]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "cannot materialize a value of dynamically sized type f64[dynamic]",
+                if message == "cannot materialize a value of dynamically sized type f64[dynamic]; dynamically \
+                               shaped values exist only in array programs over 'ArrayIrOperation'",
         ));
         // Well-formed logical elements construct successfully and round-trip through typed and byte accessors.
         let array = Array::from_elements(array_type(DataType::F64, &[2]), &[1.0f64, 2.0]).unwrap();

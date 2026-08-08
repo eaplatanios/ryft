@@ -742,6 +742,64 @@ mod tests {
         assert_eq!(read_f32s(&outputs[0]), vec![2.5, 3.5]);
     }
 
+    /// Batching a custom call with `CustomCallBatching::BroadcastAll` executes the registered handler on device:
+    /// every operand is materialized on the batch axis and the elementwise `ryft.test.add_one` handler receives one
+    /// batch-prefixed buffer in a single call, agreeing with the per-row result.
+    ///
+    /// `CustomCallBatching::Sequential` is not available through the *eager* XLA path, whose batching parent is a
+    /// [`ProjectedContext`] that rejects every region-carrying operation. That restriction is a property of projected
+    /// binding rather than of this rule (the scan-based `rng_bit_generator` batching rule meets the same wall), so
+    /// the diagnostic is pinned here alongside the behavior that does execute.
+    #[test]
+    fn test_eager_custom_call_batching_executes_registered_ffi_handler() {
+        use ryft_core::operations::custom_call::{CustomCall, CustomCallBatching, CustomCallOperation};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let mesh = cpu_mesh(&client);
+
+        let row_type = replicated_type(&mesh, DataType::F32, &[2]);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[3, 2]),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
+        )
+        .unwrap();
+
+        let broadcast_row_type = row_type.clone();
+        let output: Array<'_> = batch(
+            move |row| {
+                let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![broadcast_row_type])
+                    .with_batching(CustomCallBatching::BroadcastAll);
+                Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&row))?.remove(0))
+            },
+            input.clone(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_f32s(&output), vec![2.5, 3.5, 4.5, 5.5, 6.5, 7.5]);
+
+        let sequential: Result<Array<'_>, _> = batch(
+            move |row| {
+                let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![row_type])
+                    .with_batching(CustomCallBatching::Sequential { unroll: None });
+                Ok(CustomCall::custom_call(&operation, std::slice::from_ref(&row))?.remove(0))
+            },
+            input,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert!(
+            matches!(&sequential, Err(error) if error.to_string().contains("`scan` cannot carry regions")),
+            "{sequential:?}",
+        );
+    }
+
     /// A custom call wrapped with `custom_vjp` differentiates through the user-provided rule while the primal
     /// executes the registered FFI handler, which is the documented pairing for differentiable foreign kernels
     /// (the bare operation rejects differentiation).

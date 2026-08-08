@@ -26,6 +26,8 @@ use std::fmt::Display;
 use std::ops::Index;
 use std::rc::{Rc, Weak};
 
+use serde::Serialize;
+
 use crate::parameters::Placeholder;
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
@@ -693,7 +695,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Clone for RegionRef<'_, V, O> {
 }
 
 /// Semantic role of a slot for a [`Region`] in an [`Operation`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RegionRole {
     /// The [`Region`] may execute as part of ordinary interpretation, such as a control-flow bodies, callees, or primal
     /// computations. Its recursively derived [`Effects`] are consequently observable effects of the owning operation.

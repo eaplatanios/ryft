@@ -2640,21 +2640,40 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           operations (two-commit swap: mixed renames land first to free the plain names). *(Executed 2026-08-07 as
           phase B of the rename program: 139 sites across 20 files plus the inlined `HomogeneousBroadcastOperation`
           test alias.)*
-  - [ ] Manual-region first-class extents (closes the homogeneous body-replay half of the Phase 4 gate; evidence
+  - [x] Manual-region first-class extents (closes the homogeneous body-replay half of the Phase 4 gate; evidence
         recorded 2026-08-07: `CaptureReference<T>` is index-plus-type only, so the shard-map body context's
         `Constant = CaptureReference<ArrayIrType>` cannot satisfy `From<DimensionValue>` and no extent operand can
         be staged inside a manual region):
-    - [ ] Give the XLA staging domain's constant family an immediate-dimension variant (a
+    - [x] Give the XLA staging domain's constant family an immediate-dimension variant (a
           `Captured(CaptureReference<ArrayIrType>) | Dimension(DimensionValue)` sum with `From<DimensionValue>`);
           arrays stay capture references, host-sized dimension values embed directly.
-    - [ ] Wire the immediate variant through the composite lowerer's dimension-constant arm (scalar `i64`
+          Executed 2026-08-07: `XlaConstant` in `ryft-xla/src/experimental/ops.rs` changed from a
+          `CaptureReference<ArrayIrType>` alias into exactly that two-variant enum, mirroring `ArrayIrValue`'s
+          member split (`ValueProjection<ArrayType> -> XlaArrayConstant`, `ValueProjection<DimensionType> ->
+          DimensionValue`). `XlaDomain::lift` now materializes the immediate variant instead of always rejecting.
+    - [x] Wire the immediate variant through the composite lowerer's dimension-constant arm (scalar `i64`
           `stablehlo.constant`) and the shard-map body lowering path.
-    - [ ] Extend the `map_capture_index` pruning/validation recursion to the new constant sum so nested-region
+          Executed 2026-08-07: one shared `lower_dimension_extent` helper now serves both the immediate constant
+          atom and `DimensionOperation::Constant`, and `lower_constant` dispatches on the sum. The manual-region
+          body already lowers through `lower_program_outputs`, so it picks the immediate arm up unchanged; the
+          inline nested-region path was switched from `lower_captured_constant` to `lower_constant` for the same
+          reason.
+    - [x] Extend the `map_capture_index` pruning/validation recursion to the new constant sum so nested-region
           capture bookkeeping stays correct.
-    - [ ] Re-adopt the canonical `AllGather` capability in the three shard-map tests, replacing the documented
+          Executed 2026-08-07: introduced `CaptureConstant` in `ryft-core/src/captures.rs` (`capture_index` plus
+          `map_capture_index`, with `From<CaptureReference<Self::Type>>` as a supertrait), generalized
+          `ClosedProgram` and `CompilationDomain` over it, and taught construction validation, dead-capture
+          elimination, and capture lifting to treat index-free immediates as passthroughs (lifting re-adds them as
+          constant atoms rather than resolving them to a capture argument).
+    - [x] Re-adopt the canonical `AllGather` capability in the three shard-map tests, replacing the documented
           test-local direct-bind helper added during the `LegacyAllGather` deletion.
-    - [ ] Delete the remaining transitional collective capabilities `LegacyPSumScatter` and `LegacyAllToAll` by the
+          Executed 2026-08-07: the `shard_map_all_gather` helper was deleted and all three tests now call
+          `AllGather::all_gather_with_options` on the body tracer. No divisibility or named-axis gap surfaced.
+    - [x] Delete the remaining transitional collective capabilities `LegacyPSumScatter` and `LegacyAllToAll` by the
           `LegacyAllGather` recipe (the optional-capability macro branch already exists).
+          Executed 2026-08-07: both `capability = ...` sections were removed from their
+          `shape_changing_collective!` invocations and every call site moved to the canonical composite
+          `PSumScatter`/`AllToAll` capabilities, which already existed. `Ppermute` is untouched.
 
 #### Phase 9a: contiguous array storage and scalar-backend retirement
 

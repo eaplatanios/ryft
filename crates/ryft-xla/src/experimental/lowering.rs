@@ -4954,7 +4954,7 @@ impl MlirLowerableValue for CpuArray {
 }
 
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
-#[cfg(any(test, feature = "benchmarking"))]
+#[cfg(test)]
 pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue,
     Input: Parameterized<V>,
@@ -6600,7 +6600,7 @@ where
 }
 
 /// Lowers one plain traced program to values inside a block.
-#[cfg(any(test, feature = "benchmarking"))]
+#[cfg(test)]
 fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     program: &Program<V, O, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -6866,9 +6866,9 @@ fn lower_captured_constant<'b, 'c: 'b, 't: 'c, T: RyftType>(
 
 /// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
 /// represents a dimension in StableHLO. Immediate [`XlaConstant::Dimension`] atoms and staged
-/// [`DimensionOperation::Constant`](ryft_core::DimensionOperation::Constant) instructions must agree on this
-/// representation, and so both lowering paths route through this function.
-pub(crate) fn lower_dimension_extent<'b, 'c: 'b, 't: 'c, B, L>(
+/// [`DimensionOperation::Constant`] instructions must agree on this representation, and so both lowering paths route
+/// through this function.
+fn lower_dimension_extent<'b, 'c: 'b, 't: 'c, B, L>(
     value: &DimensionValue,
     block: &mut B,
     context: &'c MlirContext<'t>,
@@ -9191,7 +9191,8 @@ mod tests {
         let array_type = test_vector_type(4);
         let branch = || {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
+            let output =
+                builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap()

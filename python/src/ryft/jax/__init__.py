@@ -7,26 +7,29 @@ from typing import Any
 
 
 _EXPORTS = {
-    "BenchmarkSnapshotCase": ("ryft.jax.benchmark_snapshots", "BenchmarkSnapshotCase"),
+    "PROGRAM_STATISTICS_CASES": ("ryft.jax.program_statistics_cases", "PROGRAM_STATISTICS_CASES"),
+    "AttachedRegionStatistics": ("ryft.jax.program_statistics", "AttachedRegionStatistics"),
     "JaxprInspection": ("ryft.jax.extraction", "JaxprInspection"),
     "PreservedDumpProgramCase": ("ryft.jax.preserved_dump_cases", "PreservedDumpProgramCase"),
     "ProgramCase": ("ryft.jax.extraction", "ProgramCase"),
     "ProgramInspection": ("ryft.jax.extraction", "ProgramInspection"),
-    "benchmark_snapshot_cases": ("ryft.jax.benchmark_snapshots", "benchmark_snapshot_cases"),
+    "ProgramStatistics": ("ryft.jax.program_statistics", "ProgramStatistics"),
+    "ProgramStatisticsCase": ("ryft.jax.program_statistics_cases", "ProgramStatisticsCase"),
+    "ProgramStatisticsRecord": ("ryft.jax.program_statistics", "ProgramStatisticsRecord"),
+    "RegionStatistics": ("ryft.jax.program_statistics", "RegionStatistics"),
+    "collect_program_statistics": ("ryft.jax.program_statistics", "collect_program_statistics"),
     "extract_jaxpr": ("ryft.jax.extraction", "extract_jaxpr"),
     "inspect_program": ("ryft.jax.extraction", "inspect_program"),
     "lower_to_stablehlo": ("ryft.jax.extraction", "lower_to_stablehlo"),
-    "normalize_mlir_records": ("ryft.jax.ir_analysis", "normalize_mlir_records"),
+    "parse_program_statistics_record": ("ryft.jax.program_statistics", "parse_program_statistics_record"),
     "preserved_dump_program_case_by_id": (
         "ryft.jax.preserved_dump_cases",
         "preserved_dump_program_case_by_id",
     ),
     "preserved_dump_program_cases": ("ryft.jax.preserved_dump_cases", "preserved_dump_program_cases"),
     "program_cases_by_name": ("ryft.jax.examples", "program_cases_by_name"),
+    "program_statistics_case_by_id": ("ryft.jax.program_statistics_cases", "program_statistics_case_by_id"),
     "render_program_inspection": ("ryft.jax.extraction", "render_program_inspection"),
-    "strip_mlir_location_markers": ("ryft.jax.ir_analysis", "strip_mlir_location_markers"),
-    "summarize_jaxpr": ("ryft.jax.ir_analysis", "summarize_jaxpr"),
-    "summarize_mlir": ("ryft.jax.ir_analysis", "summarize_mlir"),
 }
 
 __all__ = sorted(_EXPORTS)

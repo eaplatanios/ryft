@@ -2,19 +2,22 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, Sharding,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, LogicalMesh, Sharding,
+    materialize_array_tangent,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, TransposableOperation, TranspositionDriver,
+    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, TransposableOperation, TranspositionDriver,
+    jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
@@ -22,7 +25,8 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
+    Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -411,6 +415,76 @@ where
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let updates_tangent = updates.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Projected array IR JVP rule for [`ScatterOperation`]. Scatter-add is jointly linear in its operand and updates and
+/// needs both tangents as real values, but a structural zero whose type names an extent by identity carries no runtime
+/// extent, so the type alone cannot construct that zero. This rule therefore materializes each missing tangent from its
+/// own primal exemplar through [`materialize_array_tangent`] before staging the tangent scatter. The transpose needs no
+/// operand geometry of its own — scatter-add's operand Jacobian is the identity and the update cotangent gathers the
+/// output cotangent at the same known indices — so this rule stages a plain tangent scatter rather than a residual-
+/// parameterized [`LinearCallOperation`](crate::LinearCallOperation), and transposition continues through the
+/// homogeneous rule. Fully static operand and update geometry delegates to the homogeneous projected rule unchanged.
+impl<C> MemberDifferentiableOperation<C> for ScatterOperation
+where
+    C: Context<Type = ArrayIrType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<ScatterOperation>
+        + From<ZeroLikeOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let [operand, indices, updates] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() }.into());
+        };
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        let updates_type = <&ArrayType>::try_from(updates.primal().r#type().as_ref())?.clone();
+        let is_static = |r#type: &ArrayType| {
+            r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+        };
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        if is_static(&operand_type) && is_static(&updates_type) {
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
+            MaybeZero::Zero(primal.r#type().tangent())
+        } else if self.kind() != ScatterReductionKind::Add {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "differentiation of scatter with the {} combiner is not yet implemented (only scatter-add is \
+                     linear)",
+                    self.kind(),
+                ),
+            }
+            .into());
+        } else {
+            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+            let tangent_inputs = [
+                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                    &projected_context,
+                    operand,
+                )?),
+                indices.primal().clone(),
+                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                    &projected_context,
+                    updates,
+                )?),
+            ];
+            MaybeZero::Value(context.bind(operation, Vec::new(), tangent_inputs.as_slice())?.remove(0))
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }

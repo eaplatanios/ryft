@@ -9,6 +9,7 @@ from ryft.jax.transform_performance import (
     RuntimeBenchmarkRecord,
     format_comparison_table,
     runtime_case_by_id,
+    rust_transform_benchmark_command,
     selected_runtime_cases,
 )
 
@@ -26,6 +27,12 @@ class TransformPerformanceTest(unittest.TestCase):
         cases = selected_runtime_cases(["array_hessian_scalar", "scalar_jvp_direct"])
 
         self.assertEqual([case.case_id for case in cases], ["array_hessian_scalar", "scalar_jvp_direct"])
+
+    def test_rust_command_requests_performance_benchmarking_feature(self) -> None:
+        command = rust_transform_benchmark_command(["scalar_jvp_direct"], iterations=10, warmup=1)
+
+        features = command[command.index("--features") + 1]
+        self.assertEqual(features, "performance-benchmarking ndarray")
 
     def test_comparison_table_marks_ratio_failures(self) -> None:
         ryft = RuntimeBenchmarkRecord(

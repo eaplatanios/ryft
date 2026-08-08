@@ -939,7 +939,8 @@ mod tests {
             lifted.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %3:f64[] = add %1 %0
+                let %2:f64[] = const
+                    %3:f64[] = add %1 %0
                     %4:f64[] = add %3 %2
                 in (%4)
             "}

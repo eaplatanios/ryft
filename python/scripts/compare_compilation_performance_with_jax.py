@@ -55,7 +55,7 @@ def main() -> int:
             "-p",
             "ryft-xla",
             "--features",
-            "benchmarking",
+            "performance-benchmarking",
             "--bin",
             "compilation_benchmark",
             "--",

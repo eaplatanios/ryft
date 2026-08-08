@@ -24,9 +24,11 @@ pub trait Fill<S, V: Typed> {
 impl<S: ArrayElement, O: Operation<Type = ArrayType>> Fill<S, Array> for EagerContext<Array, O> {
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
         if r#type.static_shape().is_none() {
-            return Err(TypeError::invalid(
-                format!("cannot materialize a value of dynamically sized type {}", r#type,),
-            )
+            return Err(TypeError::invalid(format!(
+                "cannot materialize a value of dynamically sized type {}; stage a rank-zero fill in an array program \
+                 over 'ArrayIrOperation' and expand it with 'dynamic_broadcast' instead",
+                r#type,
+            ))
             .into());
         }
         Array::scalar(value)

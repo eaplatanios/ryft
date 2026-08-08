@@ -1411,7 +1411,10 @@ pub fn batch<
 /// that represents that same extent for the specific projected type `T`. This keeps homogeneous member rules
 /// independent of the enclosing composite type.
 ///
-/// Operations with mixed member types or attached regions require an explicit composite batching rule instead.
+/// Operations with mixed member types or attached regions require an explicit composite batching rule instead. A
+/// member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an exact diagnostic naming it,
+/// because projection reaches the member rule with no region access: the attached regions are programs in the
+/// _composite_ universe, and no projected driver can present them in the member universe.
 ///
 /// # Parameters
 ///
@@ -1433,6 +1436,15 @@ pub fn batch_projected_operation<
     operation: &O,
     inputs: &[P::Batch],
 ) -> Result<Vec<P::Batch>, BatchingError> {
+    if !operation.region_slots().is_empty() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` carries regions and cannot be batched through its member family; batch it \
+                 through a composite carrier for that operation instead",
+                operation.name(),
+            ),
+        });
+    }
     let projected_context = BatchingContext::<_, P::Projected>::with_policy(
         ProjectedContext::new(context.parent().clone()),
         context.axis_extent().clone(),

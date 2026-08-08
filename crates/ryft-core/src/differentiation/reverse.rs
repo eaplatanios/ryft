@@ -1690,7 +1690,9 @@ where
 /// cotangents become splice inputs in encounter order; structural zeros remain types and do not materialize values.
 ///
 /// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit composite
-/// transpose rule instead.
+/// transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an
+/// exact diagnostic naming it, because projection reaches the member rule with no region access: the attached regions
+/// are programs in the _composite_ universe, and no projected driver can present them in the member universe.
 ///
 /// # Parameters
 ///
@@ -1712,6 +1714,17 @@ pub fn transpose_projected_operation<
 where
     for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
 {
+    if !operation.region_slots().is_empty() {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` carries regions and cannot be transposed through its member family; \
+                 transpose it through a composite carrier for that operation instead",
+                operation.name(),
+            ),
+        }
+        .into());
+    }
+
     // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back to
     // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
     let mut rule_context = TracingContext::<<V as ValueProjection<T>>::Projected, P>::new();

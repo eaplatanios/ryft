@@ -47,7 +47,7 @@ pub type XlaArrayConstant = CaptureReference<ArrayType>;
 /// Constant payload stored in the atom table of a staged XLA [`Program`].
 ///
 /// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
-/// [`ArrayIrValue`] universe:
+/// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
 ///   - **Captured array data:** the runtime buffer stays in the surrounding compiled function's capture table and the
 ///     program stores only a lifetime-free [`CaptureReference`] to it. This keeps device buffers on-device, keeps the

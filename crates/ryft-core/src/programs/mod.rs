@@ -103,6 +103,11 @@
 //! preserve the invariants checked by normal program construction rather than treating effects as ordinary unused
 //! values.
 //!
+//! [`Program::statistics`] is the structural-inspection entry point. It reports backend-neutral per-region counts,
+//! operation histograms, dependency depths, and attached-region edges for the stored program structure (including
+//! dormant rule regions and dead instructions) without applying any simplification. Refer to [`ProgramStatistics`]
+//! for more information.
+//!
 //! # Extending Programs
 //!
 //! New primitive behavior normally means adding an operation payload implementing [`Operation`] and including it in the
@@ -125,6 +130,7 @@ pub mod instructions;
 pub mod operations;
 pub mod programs;
 pub mod regions;
+pub mod statistics;
 pub mod types;
 pub mod values;
 
@@ -143,6 +149,7 @@ pub use regions::{
     Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
     RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
+pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{Concretizable, ProjectedValue, Value, ValueId, ValueProjection};
 

@@ -2061,7 +2061,10 @@ pub fn linearize<
 /// resulting duals back into the composite value family.
 ///
 /// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit composite
-/// Jacobian-Vector Product (JVP) rule instead.
+/// Jacobian-Vector Product (JVP) rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
+/// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access: the
+/// attached regions are programs in the _composite_ universe, and no projected driver can present them in the member
+/// universe.
 ///
 /// # Parameters
 ///
@@ -2083,6 +2086,16 @@ pub fn jvp_projected_operation<
     operation: &O,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+    if !operation.region_slots().is_empty() {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "projected operation `{}` carries regions and cannot be differentiated through its member family; \
+                 differentiate it through a composite carrier for that operation instead",
+                operation.name(),
+            ),
+        }
+        .into());
+    }
     let projected_inputs = inputs
         .iter()
         .map(|input| {

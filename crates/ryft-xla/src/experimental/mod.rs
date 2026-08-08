@@ -1,8 +1,5 @@
 /// Runtime assertion support for compiled first-class-dimension programs.
 pub(crate) mod assertions;
-#[cfg(all(feature = "benchmarking"))]
-/// XLA-specific IR benchmark cases layered on top of `ryft_core::tracing_v2::benchmarking`.
-pub mod benchmark_support;
 /// Host-callback debugging support: the `ryft.print` XLA FFI handler and its capturable print sink.
 pub mod debugging;
 /// Backend token used for traced XLA staging and PJRT-backed execution.
@@ -22,6 +19,6 @@ pub use domains::{
 };
 
 pub use shard_map::{
-    ShardMapTraceError, TracedShardMap, TracedXlaProgram, reshard, shard_map, shard_map_with_options,
+    ShardMapTraceError, ShardMapTracer, TracedShardMap, TracedXlaProgram, reshard, shard_map, shard_map_with_options,
     sharding_constraint, trace,
 };

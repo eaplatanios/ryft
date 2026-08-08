@@ -5,8 +5,8 @@ use std::fmt::Debug;
 use ryft_core::{
     ArrayIrType, ArrayType, Atom, AtomId, Context, Dimension, Domain, DomainTracingContext, Instruction, LogicalMesh,
     MeshAxisType, NamedAxis, Operation, Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder,
-    ProgramError, ProjectedValue, ReshardOperation, Shape, Sharding, ShardingConstraintOperation, ShardingDimension,
-    ShardingError, Value, ValueProjection,
+    ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation, Shape, Sharding, ShardingConstraintOperation,
+    ShardingDimension, ShardingError, Value, ValueProjection,
 };
 #[cfg(test)]
 use ryft_core::{StagingContext, Typed};
@@ -213,8 +213,10 @@ impl From<ShardMapError> for ShardMapTraceError {
     }
 }
 
-/// Default static tracer alias used by public XLA tracing helpers.
-pub(crate) type ShardMapTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
+/// Default static tracer alias used by public XLA tracing helpers. This alias is public so that callers outside
+/// this crate (e.g., tooling binaries) can annotate [`trace`] and [`shard_map`] closure parameters and pin the
+/// generic parameters of [`shard_map`], whose tracer-valued regime cannot be inferred from call sites alone.
+pub type ShardMapTracer = ProjectedValue<ArrayType, XlaTracer<'static>>;
 
 /// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API, retyping the
 /// source program's input/output parameter structures while preserving its atoms, instructions, and attached
@@ -456,9 +458,11 @@ where
     )?)
 }
 
-pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
+/// Structured local-trace input produced by re-parameterizing a global input family over [`ShardMapTracer`] leaves.
+pub type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
-pub(crate) type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
+/// Structured local-trace output produced by re-parameterizing a global output family over [`ShardMapTracer`] leaves.
+pub type ShardMapLocalTraceOutput<Output> = <Output as Parameterized<ArrayType>>::To<ShardMapTracer>;
 
 type ShardMapProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
 
@@ -468,9 +472,11 @@ type ShardMapCapturedInput<Input> = ShardMapProgramValues<Input, XlaConstant>;
 
 type ShardMapCapturedOutput<Output> = ShardMapProgramValues<Output, XlaConstant>;
 
-/// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type.
+/// Dispatch trait used by [`shard_map`] to select the appropriate tracing regime from the input leaf type. This
+/// trait is public — although hidden from documentation — because [`shard_map`]'s return type projects through
+/// [`Return`](Self::Return), so external callers could not invoke [`shard_map`] at all if the trait were private.
 #[doc(hidden)]
-pub(crate) trait ShardMapInvocationLeaf: Parameter + Sized {
+pub trait ShardMapInvocationLeaf: Parameter + Sized {
     /// Return type produced by [`shard_map`] for the corresponding input leaf regime.
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
     where
@@ -1111,10 +1117,12 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<ShardMapTracer>,
 {
-    /// Returns the staged traced XLA program backing this handle.
-    #[cfg(feature = "benchmarking")]
-    pub(crate) fn program(&self) -> &XlaProgram<ShardMapCapturedInput<Input>, ShardMapCapturedOutput<Output>> {
-        &self.program
+    /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle. The
+    /// statistics describe the exact unsimplified traced program, so instructions whose outputs reach no program
+    /// output are included in the reported counts. Refer to the documentation of
+    /// [`Program::statistics`](ryft_core::Program::statistics) for the precise semantics of the reported statistics.
+    pub fn statistics(&self) -> ProgramStatistics {
+        self.program.statistics()
     }
 
     /// Returns the traced global input types.
@@ -2058,7 +2066,7 @@ fn escape_shardy_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2070,7 +2078,7 @@ mod tests {
     use ryft_core::operations::collectives::{AllGather, AllGatherOutputVariance, CollectiveOptions};
     use ryft_core::{
         DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, Sin,
+        MeshAxisType, RegionRole, Sharding, ShardingDimension, Sin,
     };
 
     use super::*;
@@ -4124,8 +4132,11 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<4xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
-                      %1 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
-                      sdy.return %1 : tensor<4xf32>
+                      %c = stablehlo.constant dense<2> : tensor<i64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %1 = stablehlo.multiply %c, %c_0 : tensor<i64>
+                      %2 = "stablehlo.all_gather"(%arg1) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> : (tensor<2xf32>) -> tensor<4xf32>
+                      sdy.return %2 : tensor<4xf32>
                     } : (tensor<4xf32>) -> tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
@@ -4377,12 +4388,15 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<4xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
-                      %1 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
+                      %c = stablehlo.constant dense<4> : tensor<i64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                      %1 = stablehlo.divide %c, %c_0 : tensor<i64>
+                      %2 = "stablehlo.reduce_scatter"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, scatter_dimension = 0 : i64, use_global_device_ids}> ({
                       ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
-                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
-                        stablehlo.return %2 : tensor<f32>
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
                       }) : (tensor<4xf32>) -> tensor<2xf32>
-                      sdy.return %1 : tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
                     } : (tensor<8xf32>) -> tensor<4xf32>
                     return %0 : tensor<4xf32>
                   }
@@ -4697,6 +4711,7 @@ mod tests {
                   sdy.mesh @mesh = <["x"=2]>
                   func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %c = stablehlo.constant dense<4> : tensor<i64>
                       %1 = "stablehlo.all_to_all"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, concat_dimension = 0 : i64, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, split_count = 2 : i64, split_dimension = 0 : i64}> {use_global_device_ids} : (tensor<4xf32>) -> tensor<4xf32>
                       sdy.return %1 : tensor<4xf32>
                     } : (tensor<8xf32>) -> tensor<8xf32>
@@ -4856,5 +4871,59 @@ mod tests {
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f32>(output_bytes.as_slice()), expected);
         }
+    }
+
+    /// Verifies that [`TracedXlaProgram::statistics`] delegates to the unsimplified staged program. The asserted
+    /// numbers are cross-checked against `traced.program.to_string()`, which renders the entry region as one
+    /// `shard_map` instruction attaching a single-`sin` body region.
+    #[test]
+    fn test_traced_xla_program_statistics_reports_unsimplified_program() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
+                        |local_x: ShardMapTracer| local_x.sin().unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)])),
+        )
+        .unwrap();
+
+        let statistics = traced.statistics();
+        assert_eq!(statistics.region_count(), 2);
+        assert_eq!(statistics.entry_region_index(), 1);
+
+        let body = &statistics.regions()[0];
+        assert_eq!(body.input_count(), 1);
+        assert_eq!(body.output_count(), 1);
+        assert_eq!(body.instruction_count(), 1);
+        assert_eq!(body.constant_count(), 0);
+        assert_eq!(body.operation_counts(), &BTreeMap::from([("sin".to_string(), 1usize)]));
+        assert_eq!(body.maximum_output_dependency_depth(), 1);
+        assert_eq!(body.attached_regions(), &[]);
+
+        let entry = statistics.entry();
+        assert_eq!(entry.input_count(), 1);
+        assert_eq!(entry.output_count(), 1);
+        assert_eq!(entry.instruction_count(), 1);
+        assert_eq!(entry.operation_counts(), &BTreeMap::from([("shard_map".to_string(), 1usize)]));
+        assert_eq!(entry.maximum_output_dependency_depth(), 1);
+        assert_eq!(entry.attached_regions().len(), 1);
+        let edge = &entry.attached_regions()[0];
+        assert_eq!(edge.instruction_index(), 0);
+        assert_eq!(edge.operation(), "shard_map");
+        assert_eq!(edge.region_slot(), "body");
+        assert_eq!(edge.region_role(), RegionRole::Computation);
+        assert_eq!(edge.region_index(), 0);
+        assert_eq!(edge.label(), "shard_map.body");
     }
 }

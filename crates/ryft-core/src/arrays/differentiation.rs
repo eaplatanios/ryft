@@ -380,6 +380,7 @@ mod tests {
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::DimensionBounds;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::DifferentiableType;
     use crate::programs::TypeError;
 
     use super::*;
@@ -675,15 +676,27 @@ mod tests {
             assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
         }
 
-        // An identity-bearing zero whose type differs from the primal's cannot use the exemplar and fails as the
-        // unconstructible nullary zero of an identity-referencing type.
-        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
-        let mismatched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(m.variable().clone())]));
-        let input = DifferentiationDual::new(primal, MaybeZero::Zero(ArrayIrType::Array(mismatched_type))).unwrap();
-        assert!(matches!(
-            materialize_array_tangent(&projected_context, &input),
-            Err(DifferentiationError::Program(error))
-                if error.to_string().contains("'zero' cannot construct type f64[m] without operands"),
-        ));
+        // A widening element family keeps the nullary path even though its tangent type differs from the primal's.
+        // The identity-free `f32` tangent of an `f8e8m0fnu` primal skips the exemplar and stages a nullary zero of
+        // the widened type (an identity-bearing type mismatch is unreachable here because `DifferentiationDual`
+        // derives a structural zero's type from the primal).
+        let widening_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
+        let widening_primal = context.input(widening_type.clone().into());
+        let widened_tangent_type = widening_type.tangent();
+        assert_eq!(widened_tangent_type.data_type(), DataType::F32);
+        let input = DifferentiationDual::new(
+            widening_primal,
+            MaybeZero::Zero(ArrayIrType::Array(widened_tangent_type.clone())),
+        )
+        .unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &widened_tangent_type);
+        {
+            let builder = context.builder().borrow();
+            let [_, _, instruction] = builder.instructions() else {
+                panic!("expected the two earlier zeros followed by one widened nullary zero");
+            };
+            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+        }
     }
 }

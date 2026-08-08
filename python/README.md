@@ -33,13 +33,25 @@ Run the following command to compare the MLIR emitted by JAX against the MLIR em
 XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python scripts/compare_reshape_mlir_with_jax.py
 ```
 
-Run the following command to verify the shared Rust IR benchmark suite against the committed Python snapshots:
+Run the following command to compare backend-neutral structural program statistics between Ryft and JAX for the
+shared traced workload registry:
 
 ```bash
-uv run python scripts/compare_benchmark_mlir_with_jax.py
+uv run python scripts/compare_program_statistics_with_jax.py
 ```
 
-The committed benchmark IR snapshots live under `python/tests/snapshots/ir_benchmark`.
+The Rust side of the comparison is the `program_statistics` binary, which can also be run directly:
+
+```bash
+cargo run -p ryft-xla --features program-statistics --bin program_statistics -- --list
+```
+
+The comparison reports per-region structural statistics (instruction, input, output, and constant counts, operation
+histograms, dependency depths, and attached-region graphs) for both sides and a structural diff. These are structural
+counts, not performance measurements. The two sides are different IRs, so `constant_count`, attachment labels, and
+region roles are reported without being diffed; cases whose registry entry is marked comparable additionally enforce
+equality of the entry region's counts, normalized operation histogram, and dependency depth. The exact per-case Rust
+statistics are pinned by the binary's own tests, which are the primary structural regression guard.
 
 Run the following command to compare Ryft and JAX runtime transform overhead for the shared AD transform benchmark
 cases:
@@ -48,9 +60,10 @@ cases:
 uv run python scripts/compare_transform_performance_with_jax.py --iterations 1000 --warmup 50
 ```
 
-The runtime comparison uses JAX's eager transform APIs and the release-mode Rust benchmark emitter in
-`crates/ryft-xla/src/bin/transform_benchmark.rs`. It reports the Ryft/JAX median runtime ratio for each case and exits
-with a non-zero status if any selected case exceeds the configured `--max-ratio`.
+The runtime comparison uses JAX's eager transform APIs and reports the Ryft/JAX median runtime ratio for each case,
+exiting with a non-zero status if any selected case exceeds the configured `--max-ratio`. Note that the Rust side of
+this comparison references a `transform_benchmark` binary that is currently absent from `crates/ryft-xla`; restoring
+or retiring that binary is tracked separately, and until then only the JAX side of this comparison can run.
 
 Run the matched compilation lifecycle and asynchronous-execution comparison with:
 
@@ -77,6 +90,7 @@ The committed preserved historical dump snapshots live in
 `ryft.jax.preserved_dump_cases`, and it intentionally keeps only the unique preserved programs that we still care about
 instead of mirroring the old raw artifact tree.
 
-The reusable helpers that back the benchmark snapshot workflow live under `ryft.jax.ir_analysis`,
-`ryft.jax.benchmark_cases`, `ryft.jax.benchmark_snapshots`, `ryft.jax.preserved_dump_cases`, and
-`ryft.jax.benchmark_parity`. The runtime transform benchmark helpers live under `ryft.jax.transform_performance`.
+The reusable helpers that back the program statistics workflow live under `ryft.jax.program_statistics` and
+`ryft.jax.program_statistics_cases`, the preserved historical dump registry lives under
+`ryft.jax.preserved_dump_cases`, and the runtime transform benchmark helpers live under
+`ryft.jax.transform_performance`.
