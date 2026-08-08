@@ -1590,6 +1590,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_array_element_conversions() {
+        // Signed sub-byte destinations narrow modularly into their declared bit width, and real inputs truncate
+        // toward zero before narrowing.
+        assert_eq!(i4::from_signed(-3), Ok(i4::new(-3).unwrap()));
+        assert_eq!(i4::from_signed(23), Ok(i4::new(7).unwrap()));
+        assert_eq!(i4::from_unsigned(9), Ok(i4::new(-7).unwrap()));
+        assert_eq!(i4::from_real(-2.9), Ok(i4::new(-2).unwrap()));
+        assert_eq!(u2::from_signed(-1), Ok(u2::new(3).unwrap()));
+        assert_eq!(u2::from_unsigned(5), Ok(u2::new(1).unwrap()));
+        assert_eq!(u2::from_real(3.7), Ok(u2::new(3).unwrap()));
+
+        // Native integer destinations follow Rust's `as` contract: integer inputs narrow with two's-complement
+        // truncation, and real inputs truncate toward zero.
+        assert_eq!(i8::from_signed(300), Ok(44));
+        assert_eq!(u8::from_signed(-1), Ok(255));
+        assert_eq!(i32::from_real(-1.9), Ok(-1));
+
+        // Floating-point destinations round to nearest with exact ties toward the even encoding: 2049 sits exactly
+        // between the representable `f16` values 2048 and 2050.
+        assert_eq!(f16::from_signed(2049).map(f16::to_f64), Ok(2048.0));
+        assert_eq!(bf16::from_real(1.5).map(bf16::to_f64), Ok(1.5));
+        assert_eq!(f8e4m3fn::from_real(0.3).map(f8e4m3fn::to_f64), Ok(0.3125));
+        assert_eq!(f8e4m3fn::from_unsigned(3).map(f8e4m3fn::to_f64), Ok(3.0));
+
+        // Complex destinations place every real-category input in their real component.
+        assert_eq!(Complex::<f32>::from_real(2.5), Ok(Complex::new(2.5, 0.0)));
+        assert_eq!(Complex::<f64>::from_signed(-3), Ok(Complex::new(-3.0, 0.0)));
+
+        // Boolean destinations test for a nonzero value, so even NaN converts to `true` because it is not zero.
+        assert_eq!(bool::from_signed(-5), Ok(true));
+        assert_eq!(bool::from_unsigned(0), Ok(false));
+        assert_eq!(bool::from_real(0.5), Ok(true));
+        assert_eq!(bool::from_real(f64::NAN), Ok(true));
+
+        // `convert_to` routes each source through its own category's carrier, covering all four categories.
+        assert_eq!(i32::convert_to::<f16>(-7).map(f16::to_f64), Ok(-7.0));
+        assert_eq!(u4::convert_to::<i2>(u4::new(5).unwrap()), Ok(i2::new(1).unwrap()));
+        assert_eq!(f64::convert_to::<u8>(200.9), Ok(200));
+        assert_eq!(bool::convert_to::<bf16>(true).map(bf16::to_f64), Ok(1.0));
+    }
+
+    #[test]
+    fn test_array_element_conversion_losslessness() {
+        // Identity conversions are exact for every category, including the extremes of the widest carriers, because
+        // each carrier holds every source value of its category exactly.
+        assert_eq!(u64::convert_to::<u64>(u64::MAX), Ok(u64::MAX));
+        assert_eq!(i64::convert_to::<i64>(i64::MIN), Ok(i64::MIN));
+        assert_eq!(i4::convert_to::<i4>(i4::new(-8).unwrap()), Ok(i4::new(-8).unwrap()));
+        assert_eq!(bool::convert_to::<bool>(true), Ok(true));
+        assert_eq!(Complex::<f32>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)));
+
+        // Integer-to-integer routing never touches a float: values above 2^53 that `f64` cannot represent survive
+        // exactly, including exact two's-complement truncation of the low bits.
+        let large = (1_i64 << 60) + 1;
+        assert_eq!(i64::convert_to::<i64>(large), Ok(large));
+        assert_eq!(u64::convert_to::<u32>(0xFFFF_FFFF_0000_0001), Ok(1));
+
+        // The destination performs the conversion's only rounding step directly on the exact `u64` carrier value, so
+        // no double rounding is possible: this value rounds differently through an intermediate `f64`.
+        let value = (1_u64 << 63) + (1_u64 << 39) + 1;
+        assert_ne!((value as f64) as f32, value as f32);
+        assert_eq!(u64::convert_to::<f32>(value), Ok(value as f32));
+
+        // Widening a low-precision float into `f64` is exact, so casting out and back is the identity.
+        let element = f8e4m3fn::from_real(0.3125).unwrap();
+        assert_eq!(f8e4m3fn::convert_to::<f64>(element), Ok(0.3125));
+        assert_eq!(f64::convert_to::<f8e4m3fn>(0.3125), Ok(element));
+    }
+
+    #[test]
+    fn test_array_element_conversion_overflow_semantics() {
+        // Overflowing conversions follow each floating-point format's own class: IEEE-style formats produce signed
+        // infinities, `fn`/`fnuz` formats produce their NaN, and microscaling formats saturate to their finite range.
+        assert_eq!(f8e5m2::from_real(1e6).map(f8e5m2::to_f64), Ok(f64::INFINITY));
+        assert_eq!(f8e5m2::from_real(-1e6).map(f8e5m2::to_f64), Ok(f64::NEG_INFINITY));
+        assert!(f8e4m3fn::from_real(1e6).unwrap().is_nan());
+        assert!(f8e4m3fnuz::from_real(1e6).unwrap().is_nan());
+        assert_eq!(f4e2m1fn::from_real(1e6).map(f4e2m1fn::to_f64), Ok(6.0));
+        assert_eq!(f4e2m1fn::from_real(-1e6).map(f4e2m1fn::to_f64), Ok(-6.0));
+
+        // Formats with no encoding for the input at all reject the conversion instead of guessing.
+        assert!(matches!(
+            f4e2m1fn::from_real(f64::NAN),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type f4e2m1fn cannot represent NaN",
+        ));
+        assert!(matches!(
+            f8e8m0fnu::from_real(0.0),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type f8e8m0fnu cannot represent zero",
+        ));
+
+        // Real inputs into native integer destinations saturate at the destination's bounds, and NaN collapses to
+        // zero, matching Rust's `as` contract.
+        assert_eq!(i8::from_real(1e10), Ok(127));
+        assert_eq!(i8::from_real(-1e10), Ok(-128));
+        assert_eq!(u8::from_real(-5.0), Ok(0));
+        assert_eq!(i8::from_real(f64::NAN), Ok(0));
+    }
+
+    #[test]
+    fn test_array_element_complex_conversions() {
+        // Every destination that cannot hold an imaginary part projects a complex input onto its real component and
+        // discards the imaginary one.
+        assert_eq!(f32::from_complex(Complex::new(3.5, -2.0)), Ok(3.5));
+        assert_eq!(i8::from_complex(Complex::new(2.9, 7.0)), Ok(2));
+        assert_eq!(Complex::<f64>::convert_to::<f32>(Complex::new(1.5, 2.5)), Ok(1.5));
+
+        // Complex destinations preserve both components, and the Boolean destination tests both, so a purely
+        // imaginary value still converts to `true`.
+        assert_eq!(Complex::<f64>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)),);
+        assert_eq!(bool::from_complex(Complex::new(0.0, 2.0)), Ok(true));
+        assert_eq!(bool::from_complex(Complex::new(0.0, 0.0)), Ok(false));
+    }
+
+    #[test]
     fn test_sub_byte_integer_construction() {
         assert_eq!(i1::new(-1).map(i1::value), Ok(-1));
         assert_eq!(i1::new(0).map(i1::value), Ok(0));
@@ -2070,122 +2186,6 @@ mod tests {
         assert_eq!(f8e4m3::NAN.to_string(), "NaN");
         assert_eq!(f8e8m0fnu::from_bits(0x7f).to_string(), "1");
         assert_eq!(f4e2m1fn::from_bits(0x03).map(|element| element.to_string()), Ok("1.5".to_string()));
-    }
-
-    #[test]
-    fn test_array_element_conversions() {
-        // Signed sub-byte destinations narrow modularly into their declared bit width, and real inputs truncate
-        // toward zero before narrowing.
-        assert_eq!(i4::from_signed(-3), Ok(i4::new(-3).unwrap()));
-        assert_eq!(i4::from_signed(23), Ok(i4::new(7).unwrap()));
-        assert_eq!(i4::from_unsigned(9), Ok(i4::new(-7).unwrap()));
-        assert_eq!(i4::from_real(-2.9), Ok(i4::new(-2).unwrap()));
-        assert_eq!(u2::from_signed(-1), Ok(u2::new(3).unwrap()));
-        assert_eq!(u2::from_unsigned(5), Ok(u2::new(1).unwrap()));
-        assert_eq!(u2::from_real(3.7), Ok(u2::new(3).unwrap()));
-
-        // Native integer destinations follow Rust's `as` contract: integer inputs narrow with two's-complement
-        // truncation, and real inputs truncate toward zero.
-        assert_eq!(i8::from_signed(300), Ok(44));
-        assert_eq!(u8::from_signed(-1), Ok(255));
-        assert_eq!(i32::from_real(-1.9), Ok(-1));
-
-        // Floating-point destinations round to nearest with exact ties toward the even encoding: 2049 sits exactly
-        // between the representable `f16` values 2048 and 2050.
-        assert_eq!(f16::from_signed(2049).map(f16::to_f64), Ok(2048.0));
-        assert_eq!(bf16::from_real(1.5).map(bf16::to_f64), Ok(1.5));
-        assert_eq!(f8e4m3fn::from_real(0.3).map(f8e4m3fn::to_f64), Ok(0.3125));
-        assert_eq!(f8e4m3fn::from_unsigned(3).map(f8e4m3fn::to_f64), Ok(3.0));
-
-        // Complex destinations place every real-category input in their real component.
-        assert_eq!(Complex::<f32>::from_real(2.5), Ok(Complex::new(2.5, 0.0)));
-        assert_eq!(Complex::<f64>::from_signed(-3), Ok(Complex::new(-3.0, 0.0)));
-
-        // Boolean destinations test for a nonzero value, so even NaN converts to `true` because it is not zero.
-        assert_eq!(bool::from_signed(-5), Ok(true));
-        assert_eq!(bool::from_unsigned(0), Ok(false));
-        assert_eq!(bool::from_real(0.5), Ok(true));
-        assert_eq!(bool::from_real(f64::NAN), Ok(true));
-
-        // `convert_to` routes each source through its own category's carrier, covering all four categories.
-        assert_eq!(i32::convert_to::<f16>(-7).map(f16::to_f64), Ok(-7.0));
-        assert_eq!(u4::convert_to::<i2>(u4::new(5).unwrap()), Ok(i2::new(1).unwrap()));
-        assert_eq!(f64::convert_to::<u8>(200.9), Ok(200));
-        assert_eq!(bool::convert_to::<bf16>(true).map(bf16::to_f64), Ok(1.0));
-    }
-
-    #[test]
-    fn test_array_element_conversion_losslessness() {
-        // Identity conversions are exact for every category, including the extremes of the widest carriers, because
-        // each carrier holds every source value of its category exactly.
-        assert_eq!(u64::convert_to::<u64>(u64::MAX), Ok(u64::MAX));
-        assert_eq!(i64::convert_to::<i64>(i64::MIN), Ok(i64::MIN));
-        assert_eq!(i4::convert_to::<i4>(i4::new(-8).unwrap()), Ok(i4::new(-8).unwrap()));
-        assert_eq!(bool::convert_to::<bool>(true), Ok(true));
-        assert_eq!(Complex::<f32>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)));
-
-        // Integer-to-integer routing never touches a float: values above 2^53 that `f64` cannot represent survive
-        // exactly, including exact two's-complement truncation of the low bits.
-        let large = (1_i64 << 60) + 1;
-        assert_eq!(i64::convert_to::<i64>(large), Ok(large));
-        assert_eq!(u64::convert_to::<u32>(0xFFFF_FFFF_0000_0001), Ok(1));
-
-        // The destination performs the conversion's only rounding step directly on the exact `u64` carrier value, so
-        // no double rounding is possible: this value rounds differently through an intermediate `f64`.
-        let value = (1_u64 << 63) + (1_u64 << 39) + 1;
-        assert_ne!((value as f64) as f32, value as f32);
-        assert_eq!(u64::convert_to::<f32>(value), Ok(value as f32));
-
-        // Widening a low-precision float into `f64` is exact, so casting out and back is the identity.
-        let element = f8e4m3fn::from_real(0.3125).unwrap();
-        assert_eq!(f8e4m3fn::convert_to::<f64>(element), Ok(0.3125));
-        assert_eq!(f64::convert_to::<f8e4m3fn>(0.3125), Ok(element));
-    }
-
-    #[test]
-    fn test_array_element_conversion_overflow_semantics() {
-        // Overflowing conversions follow each floating-point format's own class: IEEE-style formats produce signed
-        // infinities, `fn`/`fnuz` formats produce their NaN, and microscaling formats saturate to their finite range.
-        assert_eq!(f8e5m2::from_real(1e6).map(f8e5m2::to_f64), Ok(f64::INFINITY));
-        assert_eq!(f8e5m2::from_real(-1e6).map(f8e5m2::to_f64), Ok(f64::NEG_INFINITY));
-        assert!(f8e4m3fn::from_real(1e6).unwrap().is_nan());
-        assert!(f8e4m3fnuz::from_real(1e6).unwrap().is_nan());
-        assert_eq!(f4e2m1fn::from_real(1e6).map(f4e2m1fn::to_f64), Ok(6.0));
-        assert_eq!(f4e2m1fn::from_real(-1e6).map(f4e2m1fn::to_f64), Ok(-6.0));
-
-        // Formats with no encoding for the input at all reject the conversion instead of guessing.
-        assert!(matches!(
-            f4e2m1fn::from_real(f64::NAN),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type f4e2m1fn cannot represent NaN",
-        ));
-        assert!(matches!(
-            f8e8m0fnu::from_real(0.0),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type f8e8m0fnu cannot represent zero",
-        ));
-
-        // Real inputs into native integer destinations saturate at the destination's bounds, and NaN collapses to
-        // zero, matching Rust's `as` contract.
-        assert_eq!(i8::from_real(1e10), Ok(127));
-        assert_eq!(i8::from_real(-1e10), Ok(-128));
-        assert_eq!(u8::from_real(-5.0), Ok(0));
-        assert_eq!(i8::from_real(f64::NAN), Ok(0));
-    }
-
-    #[test]
-    fn test_array_element_complex_conversions() {
-        // Every destination that cannot hold an imaginary part projects a complex input onto its real component and
-        // discards the imaginary one.
-        assert_eq!(f32::from_complex(Complex::new(3.5, -2.0)), Ok(3.5));
-        assert_eq!(i8::from_complex(Complex::new(2.9, 7.0)), Ok(2));
-        assert_eq!(Complex::<f64>::convert_to::<f32>(Complex::new(1.5, 2.5)), Ok(1.5));
-
-        // Complex destinations preserve both components, and the Boolean destination tests both, so a purely
-        // imaginary value still converts to `true`.
-        assert_eq!(Complex::<f64>::convert_to::<Complex<f32>>(Complex::new(1.5, -2.5)), Ok(Complex::new(1.5, -2.5)),);
-        assert_eq!(bool::from_complex(Complex::new(0.0, 2.0)), Ok(true));
-        assert_eq!(bool::from_complex(Complex::new(0.0, 0.0)), Ok(false));
     }
 
     #[test]
