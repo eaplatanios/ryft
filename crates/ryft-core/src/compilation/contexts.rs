@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
-use crate::captures::CaptureReference;
+use crate::captures::CaptureConstant;
 use crate::compilation::disk_cache::{CacheDigest, DiskCache};
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
@@ -34,7 +34,7 @@ use super::function::{
 /// The domain is the active service for every transition; staged, lowered, compiled, and executable artifacts remain
 /// passive values. Each method owns its complete backend-specific transition, including any validation, caching, or
 /// runtime conversion policy the backend chooses to apply.
-pub trait CompilationDomain: Domain<Constant = CaptureReference<<Self as Domain>::Type>> + Clone {
+pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-specific lowered program representation produced by [`Self::lower`].
     type LoweredProgram;
 
@@ -1228,6 +1228,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType};
+    use crate::captures::CaptureReference;
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 

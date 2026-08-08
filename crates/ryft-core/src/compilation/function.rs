@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
-use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
+use crate::captures::{CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
@@ -404,7 +404,7 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
 /// structures, and compilation options. It can be inspected, lowered by its domain, or embedded as a compiled-call
 /// boundary in an enclosing trace. No backend lowering or executable compilation has happened yet.
 pub struct StagedFunction<
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
@@ -413,12 +413,12 @@ pub struct StagedFunction<
 }
 
 struct StagedFunctionState<
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
     /// Source program and concrete runtime captures produced by tracing.
-    source_program: ClosedProgram<D::Value, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
+    source_program: ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
 
     /// Flat declared public input types, excluding hidden captures.
     input_types: Vec<D::Type>,
@@ -438,7 +438,7 @@ struct StagedFunctionState<
 
 impl<D, Input, Output> Clone for StagedFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -451,7 +451,7 @@ where
 
 impl<D, Input, Output> StagedFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -461,7 +461,7 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<D::Value, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
+    ) -> &ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
         &self.state.source_program
     }
 
@@ -658,7 +658,7 @@ where
 
 /// Backend lowering of a [`StagedFunction`], ready for executable compilation.
 pub struct LoweredFunction<
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
@@ -674,7 +674,7 @@ pub struct LoweredFunction<
 
 impl<D, Input, Output> Clone for LoweredFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -687,7 +687,7 @@ where
 
 impl<D, Input, Output> LoweredFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -909,7 +909,7 @@ where
 
 /// Compiled executable plus the staged and lowered metadata required to invoke it safely.
 pub struct CompiledFunction<
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
@@ -922,7 +922,7 @@ pub struct CompiledFunction<
 
 impl<D, Input, Output> Clone for CompiledFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -935,7 +935,7 @@ where
 
 impl<D, Input, Output> CompiledFunction<D, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
     Output: Parameterized<D::Type>,
@@ -995,7 +995,7 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<D::Value, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
+    ) -> &ClosedProgram<D::Value, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
         self.staged().source_program()
     }
 
@@ -1024,28 +1024,22 @@ where
 /// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key), which
 /// receives the complete lowering.
 pub struct JittedFunction<
-    D,
+    D: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    D::Type: Eq + Hash,
-{
+> {
     state: Rc<JittedFunctionState<D, F, Static, Input, Output>>,
 }
 
 struct JittedFunctionState<
-    D,
+    D: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
-    D::Type: Eq + Hash,
-{
+> {
     domain: D,
     function: F,
     options: D::Options,
@@ -1058,7 +1052,7 @@ struct JittedFunctionState<
 
 impl<D, F, Static: Specialization, Input, Output> Clone for JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
@@ -1091,7 +1085,7 @@ impl<Key: Eq + Hash> Drop for JitProducerGuard<'_, Key> {
 
 impl<D, F, Static: Specialization, Input, Output> JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
@@ -1323,7 +1317,7 @@ pub fn try_jit_with_options_and_capacity<D, F, Static, Input, Output>(
     capacity: usize,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -1340,7 +1334,7 @@ pub fn try_jit_with_options_and_capacities<D, F, Static, Input, Output>(
     capacities: JitCacheCapacities,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -1357,7 +1351,7 @@ pub fn try_jit_with_options<D, F, Static, Input, Output>(
     options: D::Options,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -1370,7 +1364,7 @@ where
 #[inline]
 pub fn try_jit<D, F, Static, Input, Output>(domain: &D, function: F) -> JittedFunction<D, F, Static, Input, Output>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>, Options: Default>,
+    D: CompilationDomain<Options: Default>,
     D::Type: Eq + Hash,
     Static: Specialization,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -1392,7 +1386,7 @@ pub fn jit_with_options<D, F, Static, Input, Output>(
     Output,
 >
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
     Static: Specialization,
@@ -1417,7 +1411,7 @@ pub fn jit<D, F, Static, Input, Output>(
     Output,
 >
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>, Options: Default>,
+    D: CompilationDomain<Options: Default>,
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
     Static: Specialization,
@@ -1475,7 +1469,7 @@ pub(crate) fn trace_with_capture_references<D, F, Input, Output, NormalizeOutput
     normalize_output_types: NormalizeOutput,
 ) -> Result<StagedFunction<D, Input, Output>, D::Error>
 where
-    D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
+    D: CompilationDomain,
     F: FnOnce(
         Vec<D::Constant>,
         Vec<CompilationTracer<D>>,
@@ -1538,6 +1532,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
+    use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
     use crate::programs::{Operation, RegionInterface, Type, TypeError};
 
