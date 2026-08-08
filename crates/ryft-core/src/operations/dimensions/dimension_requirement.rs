@@ -81,21 +81,21 @@ where
 {
     #[inline]
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::equal(&self.r#type(), &right.r#type());
+        let operation = DimensionRequirementOperation::equal(&self.r#type().as_ref(), &right.r#type());
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }
 
     #[inline]
     fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type());
+        let operation = DimensionRequirementOperation::less_than_or_equal(&self.r#type().as_ref(), &right.r#type());
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }
 
     #[inline]
     fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type());
+        let operation = DimensionRequirementOperation::divisible_by(&self.r#type().as_ref(), &right.r#type());
         self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
         Ok(())
     }

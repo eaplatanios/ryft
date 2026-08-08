@@ -121,6 +121,10 @@ update this file so that they do not need to remind you again in the future.
   `SupportsMul`, `SupportsDiv`, etc.
 - `Type` requires `Clone + Debug + Display + PartialEq + Parameter`, so a `T: Type` bound already implies all of those.
   Never write `T: Parameter + PartialEq + Type` (or any subset). Just write `T: Type`.
+- Do not add inherent type accessors that duplicate `Typed::r#type` (e.g., an inherent `r#type()` or `array_type()`
+  returning `&T` on a concrete `Value`): call the `Typed`-provided `r#type()` directly. It returns `Cow::Borrowed`
+  for concrete values, so it is a zero-cost borrow wrap; expression-position uses work through `Deref`, and a
+  longer-lived reference is obtained by binding the `Cow` and calling `.as_ref()`.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical

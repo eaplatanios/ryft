@@ -16,7 +16,7 @@ use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::operations::{Compare, ComparisonDirection, ElementType};
-use crate::programs::{ProgramError, TypeError, Value, ValueProjection};
+use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review this.
 
@@ -55,7 +55,7 @@ impl Array {
         output_type: ArrayType,
         direction: ComparisonDirection,
     ) -> Result<Self, ProgramError> {
-        let data_type = self.r#type.data_type();
+        let data_type = self.r#type().data_type();
         if data_type.is_complex() {
             // The unordered complex element types define only the equality comparison directions. The compare
             // operation's type inference already rejects ordered complex comparisons, but the direct `Array`
@@ -103,7 +103,7 @@ impl Compare for Array {
         // Empty comparisons inspect no elements, so they succeed vacuously even for payload-free data types.
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
         if target == DataType::Token {
             return Err(TypeError::invalid("cannot compare token scalars".to_string()).into());

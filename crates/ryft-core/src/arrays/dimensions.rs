@@ -51,12 +51,6 @@ impl DimensionValue {
         Self::new(DimensionType::new(DimensionVariable::new(extent.to_string(), bounds)), extent)
     }
 
-    /// Returns the [`DimensionType`] of this [`DimensionValue`].
-    #[inline]
-    pub fn r#type(&self) -> &DimensionType {
-        &self.r#type
-    }
-
     /// Returns the concrete non-negative extent of this [`DimensionValue`].
     #[inline]
     pub fn extent(&self) -> usize {
@@ -123,7 +117,7 @@ mod tests {
         let batch_type =
             DimensionType::new(DimensionVariable::new("batch", DimensionBounds::new(1, Some(65)).unwrap()));
         let batch = DimensionValue::new(batch_type.clone(), 32).unwrap();
-        assert_eq!(batch.r#type(), &batch_type);
+        assert_eq!(batch.r#type().as_ref(), &batch_type);
         assert_eq!(batch.extent(), 32);
         assert_eq!(batch.to_string(), "32");
         assert_eq!(batch.concretize(), Ok(32));

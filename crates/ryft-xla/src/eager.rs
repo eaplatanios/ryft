@@ -55,7 +55,7 @@ impl Concretizable<bool> for Array<'_> {
             let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
                 message: format!(
                     "cannot extract a concrete boolean from an array of type {} with no addressable shards",
-                    self.r#type(),
+                    self.r#type().as_ref(),
                 ),
             })?;
             let bytes = shard_host_bytes(shard)?;
@@ -64,7 +64,7 @@ impl Concretizable<bool> for Array<'_> {
         Err(ProgramError::Concretization {
             message: format!(
                 "cannot extract a concrete boolean from a value of type {}; expected bool[]",
-                self.r#type(),
+                self.r#type().as_ref(),
             ),
         })
     }
@@ -97,7 +97,7 @@ impl DimensionFromScalar<DimensionValue> for Array<'_> {
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
             message: format!(
                 "cannot convert an array of type {} with no addressable shards to a dimension",
-                self.r#type(),
+                self.r#type().as_ref(),
             ),
         })?;
         let bytes = shard_host_bytes(shard)?;
@@ -167,7 +167,7 @@ impl WhilePredicate for Array<'_> {
                 message: format!(
                     "cannot decide a while predicate for an array of type {} whose shards are not all addressable \
                      from the current process",
-                    self.r#type(),
+                    self.r#type().as_ref(),
                 ),
             });
         }
@@ -180,9 +180,9 @@ impl WhilePredicate for Array<'_> {
                 message: format!(
                     "mask_select requires a Boolean prefix-shaped predicate and congruent operands, but got \
                      predicate {} with operands {} and {}",
-                    self.r#type(),
-                    on_true.r#type(),
-                    on_false.r#type(),
+                    self.r#type().as_ref(),
+                    on_true.r#type().as_ref(),
+                    on_false.r#type().as_ref(),
                 ),
             });
         }

@@ -3816,7 +3816,7 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh);
         let left = DimensionValue::constant(2).unwrap();
         let right = DimensionValue::constant(3).unwrap();
-        let add = DimensionAddOperation::new(left.r#type(), right.r#type()).unwrap();
+        let add = DimensionAddOperation::new(left.r#type().as_ref(), right.r#type().as_ref()).unwrap();
 
         let output = domain
             .bind(
@@ -4215,7 +4215,7 @@ mod tests {
         assert_eq!(domain.cache_size(), 0);
 
         let two = DimensionValue::constant(2).unwrap();
-        let division = DimensionDivFloorOperation::new(extent.r#type(), two.r#type()).unwrap();
+        let division = DimensionDivFloorOperation::new(extent.r#type().as_ref(), two.r#type().as_ref()).unwrap();
         let three = domain
             .bind(
                 XlaOperation::Dimension(DimensionOperation::DivFloor(division)),
@@ -4276,7 +4276,7 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap()[0];
-            let add = DimensionAddOperation::new(size_operation.result_type(), one_value.r#type()).unwrap();
+            let add = DimensionAddOperation::new(size_operation.result_type(), one_value.r#type().as_ref()).unwrap();
             let output_extent = builder
                 .add_instruction(XlaOperation::Dimension(DimensionOperation::Add(add)), Vec::new(), vec![size, one])
                 .unwrap()[0];
@@ -5539,7 +5539,7 @@ mod tests {
 
         let branch = |negate: bool| {
             let mut builder = XlaProgramBuilder::new();
-            let extent = builder.add_input(extent.r#type().clone().into());
+            let extent = builder.add_input(extent.r#type().into_owned().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
                 builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar]).unwrap()[0]

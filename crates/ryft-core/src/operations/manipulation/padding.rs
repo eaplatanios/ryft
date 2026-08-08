@@ -1605,7 +1605,11 @@ mod tests {
         let composite_operation = PadOperation::<ArrayIrType>::from(operation.clone());
         assert_eq!(
             composite_operation.infer_output_types(
-                &[input_type.clone().into(), padding_value_type.clone().into(), output_extent.r#type().clone().into(),],
+                &[
+                    input_type.clone().into(),
+                    padding_value_type.clone().into(),
+                    output_extent.r#type().into_owned().into(),
+                ],
                 &[],
             ),
             Ok(vec![output_type.clone().into()]),

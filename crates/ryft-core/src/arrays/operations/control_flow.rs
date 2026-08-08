@@ -165,8 +165,8 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             }
             _ => Err(TypeError::invalid(format!(
                 "while predicate cannot select between mismatched state types {} and {}",
-                on_true.r#type(),
-                on_false.r#type(),
+                on_true.r#type().as_ref(),
+                on_false.r#type().as_ref(),
             ))
             .into()),
         }
@@ -195,7 +195,7 @@ where
                 if runtime_length.r#type().variable() != variable {
                     return Err(TypeError::invalid(format!(
                         "'scan' runtime length operand has type {} but scan length requires {variable}",
-                        runtime_length.r#type(),
+                        runtime_length.r#type().as_ref(),
                     ))
                     .into());
                 }
@@ -274,11 +274,11 @@ impl Select for Array {
         // the three operand shapes broadcast together, and the two branch data types promote together to the output
         // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
         // acts as a mask rather than promoting into the output.
-        assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
+        assert_eq!(condition.r#type().data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
         let output_type = ArrayType::broadcasted(&[
-            condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
-            on_true.r#type.clone(),
-            on_false.r#type.clone(),
+            condition.r#type().into_owned().with_data_type(on_true.r#type().data_type()),
+            on_true.r#type().into_owned(),
+            on_false.r#type().into_owned(),
         ])
         .map_err(|error| TypeError::invalid(error.to_string()))?;
 
@@ -289,17 +289,17 @@ impl Select for Array {
         let on_false = on_false.promoted_to(output_data_type)?;
 
         let output_shape = output_type.static_shape().unwrap();
-        let condition_shape = condition.r#type.static_shape().unwrap();
-        let true_shape = on_true.r#type.static_shape().unwrap();
-        let false_shape = on_false.r#type.static_shape().unwrap();
+        let condition_shape = condition.r#type().static_shape().unwrap();
+        let true_shape = on_true.r#type().static_shape().unwrap();
+        let false_shape = on_false.r#type().static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
         let condition_strides = condition_shape.row_major_strides();
         let true_strides = true_shape.row_major_strides();
         let false_strides = false_shape.row_major_strides();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let condition_addressing = ArrayAddressing::new(condition.r#type.clone())?;
-        let true_addressing = ArrayAddressing::new(on_true.r#type.clone())?;
-        let false_addressing = ArrayAddressing::new(on_false.r#type.clone())?;
+        let condition_addressing = ArrayAddressing::new(condition.r#type().into_owned())?;
+        let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
+        let false_addressing = ArrayAddressing::new(on_false.r#type().into_owned())?;
         let mut output_bytes = vec![0; output_addressing.storage_byte_len()];
         for output_index in 0..output_addressing.element_count() {
             let condition_index = Self::broadcast_index(
@@ -310,19 +310,19 @@ impl Select for Array {
                 &condition_strides,
             );
             let condition_range = condition_addressing.byte_range_for_flat_index(condition_index);
-            let (source, source_range) = if condition.bytes[condition_range.start] != 0 {
+            let (source, source_range) = if condition.storage_bytes()[condition_range.start] != 0 {
                 let source_index =
                     Self::broadcast_index(output_index, &output_shape, &output_strides, &true_shape, &true_strides);
-                (&on_true.bytes, true_addressing.byte_range_for_flat_index(source_index))
+                (on_true.storage_bytes(), true_addressing.byte_range_for_flat_index(source_index))
             } else {
                 let source_index =
                     Self::broadcast_index(output_index, &output_shape, &output_strides, &false_shape, &false_strides);
-                (&on_false.bytes, false_addressing.byte_range_for_flat_index(source_index))
+                (on_false.storage_bytes(), false_addressing.byte_range_for_flat_index(source_index))
             };
             let output_range = output_addressing.byte_range_for_flat_index(output_index);
             output_bytes[output_range].copy_from_slice(&source[source_range]);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
     }
 }
 
@@ -331,21 +331,21 @@ impl Select for Array {
 /// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl crate::operations::control_flow::WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
-        if !self.r#type.data_type().is_boolean() {
+        if !self.r#type().data_type().is_boolean() {
             return Err(ProgramError::Concretization {
-                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
             });
         }
-        let addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         Ok((0..addressing.element_count())
-            .any(|index| self.bytes[addressing.byte_range_for_flat_index(index).start] != 0))
+            .any(|index| self.storage_bytes()[addressing.byte_range_for_flat_index(index).start] != 0))
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let predicate_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let true_addressing = ArrayAddressing::new(on_true.r#type.clone())?;
-        if !self.r#type.data_type().is_boolean()
-            || on_true.r#type != on_false.r#type
+        let predicate_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let true_addressing = ArrayAddressing::new(on_true.r#type().into_owned())?;
+        if !self.r#type().data_type().is_boolean()
+            || on_true.r#type() != on_false.r#type()
             || predicate_addressing.element_count() == 0
             || !true_addressing.element_count().is_multiple_of(predicate_addressing.element_count())
         {
@@ -353,7 +353,9 @@ impl crate::operations::control_flow::WhilePredicate for Array {
                 message: format!(
                     "mask_select requires a Boolean predicate whose element count divides congruent operands, but \
                      got predicate {} with operands {} and {}",
-                    self.r#type, on_true.r#type, on_false.r#type,
+                    self.r#type(),
+                    on_true.r#type(),
+                    on_false.r#type(),
                 ),
             });
         }
@@ -361,11 +363,15 @@ impl crate::operations::control_flow::WhilePredicate for Array {
         let mut output_bytes = vec![0; true_addressing.storage_byte_len()];
         for index in 0..true_addressing.element_count() {
             let predicate_range = predicate_addressing.byte_range_for_flat_index(index / block);
-            let source = if self.bytes[predicate_range.start] != 0 { &on_true.bytes } else { &on_false.bytes };
+            let source = if self.storage_bytes()[predicate_range.start] != 0 {
+                on_true.storage_bytes()
+            } else {
+                on_false.storage_bytes()
+            };
             let source_range = true_addressing.byte_range_for_flat_index(index);
             output_bytes[source_range.clone()].copy_from_slice(&source[source_range]);
         }
-        Ok(Self { r#type: on_true.r#type.clone(), bytes: Arc::new(output_bytes) })
+        Ok(Self::new_unchecked(on_true.r#type().into_owned(), Arc::new(output_bytes)))
     }
 }
 

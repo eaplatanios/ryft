@@ -10,7 +10,7 @@ use crate::arrays::types::data::DataType;
 use crate::operations::random::{
     RandomAlgorithm, RngBitGenerator, philox_u32_words, philox_u64_words, threefry_u32_words, threefry_u64_words,
 };
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -35,12 +35,12 @@ impl RngBitGenerator for Array {
             .into());
         }
         let expected_state_type = algorithm.state_type();
-        if self.r#type.data_type() != expected_state_type.data_type()
-            || self.r#type.shape() != expected_state_type.shape()
+        if self.r#type().data_type() != expected_state_type.data_type()
+            || self.r#type().shape() != expected_state_type.shape()
         {
             return Err(TypeError::invalid(format!(
                 "'rng_bit_generator' with the {algorithm} algorithm needs a {expected_state_type} state but got {}",
-                self.r#type,
+                self.r#type().as_ref(),
             ))
             .into());
         }
@@ -62,7 +62,7 @@ impl RngBitGenerator for Array {
                     let (words, new_counter) = threefry_u32_words(key, counter, count);
                     (new_counter, bits_from_u32_words(words)?)
                 };
-                Ok((Array::from_elements(self.r#type.clone(), &[key, new_counter])?, bits))
+                Ok((Array::from_elements(self.r#type().into_owned(), &[key, new_counter])?, bits))
             }
             RandomAlgorithm::Philox => {
                 // The state-type check above guarantees exactly three decoded `u64` elements.
@@ -76,7 +76,7 @@ impl RngBitGenerator for Array {
                     (new_counter, bits_from_u32_words(words)?)
                 };
                 let advanced_state = [key, new_counter as u64, (new_counter >> 64) as u64];
-                Ok((Array::from_elements(self.r#type.clone(), &advanced_state)?, bits))
+                Ok((Array::from_elements(self.r#type().into_owned(), &advanced_state)?, bits))
             }
         }
     }

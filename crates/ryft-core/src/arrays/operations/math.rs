@@ -32,7 +32,7 @@ use crate::operations::{
     Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, ScaledDot, Sign, Sin, Sqrt, Sub, Tanh,
     scaled_dot_composition,
 };
-use crate::programs::{Operation, ProgramError, TypeError};
+use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -1280,9 +1280,9 @@ impl Array {
         &mut self,
         function: impl Fn(T) -> Result<T, ProgramError>,
     ) -> Result<(), ProgramError> {
-        debug_assert_eq!(self.r#type.data_type(), T::data_type());
-        let addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let bytes = Arc::make_mut(&mut self.bytes);
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let bytes = self.storage_bytes_mut();
         for element in 0..addressing.element_count() {
             let range = addressing.byte_range_for_flat_index(element);
             let value = T::decode(&bytes[range.clone()]);
@@ -1300,10 +1300,10 @@ impl Array {
         identity: T,
         combine: impl Fn(T, T) -> Result<T, ProgramError>,
     ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type.data_type(), T::data_type());
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
         debug_assert_eq!(output_type.data_type(), T::data_type());
-        let input_shape = self.r#type.static_shape().unwrap();
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut reduce_mask = vec![false; input_shape.rank()];
         axes.iter().for_each(|axis| reduce_mask[*axis] = true);
@@ -1323,13 +1323,13 @@ impl Array {
                     output_axis += 1;
                 }
             }
-            let input_value = T::decode(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             let output_range = output_addressing.byte_range_unchecked(&output_index);
             let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
             input_addressing.advance_index(&mut input_index);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 
     /// Executes a typed sum or mean reduction, sharing the same wrapping addition and applying mean division in
@@ -1342,7 +1342,7 @@ impl Array {
     ) -> Result<Self, ProgramError> {
         let mut output = self.reduce_elements::<T>(output_type, axes, T::zero()?, T::add)?;
         if mean {
-            let shape = self.r#type.static_shape().unwrap();
+            let shape = self.r#type().static_shape().unwrap();
             let count = axes.iter().map(|axis| shape[*axis]).product::<usize>().max(1);
             output.map_elements_in_place::<T>(|value| value.divide_by_count(count))?;
         }
@@ -1358,17 +1358,17 @@ impl Array {
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
     ) -> Result<Self, ProgramError> {
-        debug_assert_eq!(self.r#type.data_type(), T::data_type());
-        debug_assert_eq!(rhs.r#type.data_type(), T::data_type());
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        debug_assert_eq!(rhs.r#type().data_type(), T::data_type());
         let mut output_types = DotOperation::new(dimensions.clone())
-            .infer_output_types(&[self.r#type.clone(), rhs.r#type.clone()], &[])?;
+            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
         let output_type = output_types.remove(0);
-        let lhs_shape = self.r#type.static_shape().unwrap();
-        let rhs_shape = rhs.r#type.static_shape().unwrap();
+        let lhs_shape = self.r#type().static_shape().unwrap();
+        let rhs_shape = rhs.r#type().static_shape().unwrap();
         let output_shape = output_type.static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
-        let lhs_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let rhs_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let lhs_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let rhs_addressing = ArrayAddressing::new(rhs.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
 
         let lhs_batching = dimensions.lhs_batching_dimensions();
@@ -1417,13 +1417,13 @@ impl Array {
                     lhs_index[lhs_axis] = coordinate;
                     rhs_index[rhs_axis] = coordinate;
                 }
-                let lhs_value = T::decode(&self.bytes[lhs_addressing.byte_range_unchecked(&lhs_index)]);
-                let rhs_value = T::decode(&rhs.bytes[rhs_addressing.byte_range_unchecked(&rhs_index)]);
+                let lhs_value = T::decode(&self.storage_bytes()[lhs_addressing.byte_range_unchecked(&lhs_index)]);
+                let rhs_value = T::decode(&rhs.storage_bytes()[rhs_addressing.byte_range_unchecked(&rhs_index)]);
                 accumulator = accumulator.add(lhs_value.mul(rhs_value)?)?;
             }
             accumulator.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output_flat)]);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
@@ -1431,17 +1431,17 @@ impl Abs for Array {
     fn abs(&self) -> Result<Self, ProgramError> {
         // The absolute value of a complex array is its elementwise magnitude, so the element data type maps to its
         // real part data type, mirroring the `AbsOperation` type-inference contract.
-        let data_type = match self.r#type.data_type() {
+        let data_type = match self.r#type().data_type() {
             DataType::C64 => DataType::F32,
             DataType::C128 => DataType::F64,
             other => other,
         };
-        let output_type = self.r#type.clone().with_data_type(data_type);
+        let output_type = self.r#type().into_owned().with_data_type(data_type);
         if Self::element_count(&output_type) == 0 {
             let addressing = ArrayAddressing::new(output_type.clone())?;
-            return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+            return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
         }
-        let input_type = self.r#type.data_type();
+        let input_type = self.r#type().data_type();
         if !((input_type.is_signed() && input_type != DataType::I1)
             || input_type.is_floating_point()
             || input_type.is_complex())
@@ -1461,16 +1461,19 @@ impl Abs for Array {
 
 impl Neg for Array {
     fn neg(&self) -> Result<Self, ProgramError> {
-        if Self::element_count(&self.r#type) == 0 {
-            let addressing = ArrayAddressing::new(self.r#type.clone())?;
-            return Ok(Self { r#type: self.r#type.clone(), bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+        if Self::element_count(self.r#type().as_ref()) == 0 {
+            let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+            return Ok(Self::new_unchecked(
+                self.r#type().into_owned(),
+                Arc::new(vec![0; addressing.storage_byte_len()]),
+            ));
         }
-        let data_type = self.r#type.data_type();
+        let data_type = self.r#type().data_type();
         if !data_type.is_numeric() {
             return Err(TypeError::invalid(format!("cannot negate a scalar of data type {data_type}")).into());
         }
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
-            self.map_elements::<Element, Element>(self.r#type.clone(), <Element as ElementNeg>::neg)
+            self.map_elements::<Element, Element>(self.r#type().into_owned(), <Element as ElementNeg>::neg)
         })
     }
 }
@@ -1488,18 +1491,18 @@ macro_rules! impl_array_binary_arithmetic {
     (@numeric $trait:ident, $method:ident, $element_trait:ident) => {
         impl $trait for Array {
             fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(&self.r#type, &right.r#type)
+                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
                     .map_err(|error| TypeError::invalid(error.to_string()))?;
                 if Self::element_count(&output_type) == 0 {
                     let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                if !self.r#type.data_type().is_numeric() || !right.r#type.data_type().is_numeric() {
+                if !self.r#type().data_type().is_numeric() || !right.r#type().data_type().is_numeric() {
                     return Err(TypeError::invalid(format!(
                         "cannot apply `{}` to scalars of data types {} and {}",
                         stringify!($method),
-                        self.r#type.data_type(),
-                        right.r#type.data_type(),
+                        self.r#type().data_type(),
+                        right.r#type().data_type(),
                     ))
                     .into());
                 }
@@ -1519,17 +1522,17 @@ macro_rules! impl_array_binary_arithmetic {
     (@real $trait:ident, $method:ident, $element_trait:ident, $noun:literal) => {
         impl $trait for Array {
             fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(&self.r#type, &right.r#type)
+                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
                     .map_err(|error| TypeError::invalid(error.to_string()))?;
                 if Self::element_count(&output_type) == 0 {
                     let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                if !self.r#type.data_type().is_real() || !right.r#type.data_type().is_real() {
+                if !self.r#type().data_type().is_real() || !right.r#type().data_type().is_real() {
                     return Err(TypeError::invalid(format!(
                         concat!("cannot compute the ", $noun, " of scalars of data types {} and {}"),
-                        self.r#type.data_type(),
-                        right.r#type.data_type(),
+                        self.r#type().data_type(),
+                        right.r#type().data_type(),
                     ))
                     .into());
                 }
@@ -1549,17 +1552,17 @@ macro_rules! impl_array_binary_arithmetic {
     (@extremum $trait:ident, $method:ident, $element_method:ident, $noun:literal) => {
         impl $trait for Array {
             fn $method(&self, right: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(&self.r#type, &right.r#type)
+                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), right.r#type().as_ref())
                     .map_err(|error| TypeError::invalid(error.to_string()))?;
                 if Self::element_count(&output_type) == 0 {
                     let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                if !self.r#type.data_type().is_real() || !right.r#type.data_type().is_real() {
+                if !self.r#type().data_type().is_real() || !right.r#type().data_type().is_real() {
                     return Err(TypeError::invalid(format!(
                         concat!("cannot compute the ", $noun, " of scalars of data types {} and {}"),
-                        self.r#type.data_type(),
-                        right.r#type.data_type(),
+                        self.r#type().data_type(),
+                        right.r#type().data_type(),
                     ))
                     .into());
                 }
@@ -1611,7 +1614,7 @@ impl std::ops::Mul<f64> for Array {
     /// Scales every element by `rhs`, converting `rhs` into this array's element data type first so that scaling
     /// preserves the array's type (e.g., scaling an `f32` array does not promote it to `f64`).
     fn mul(self, rhs: f64) -> Self::Output {
-        let data_type = self.r#type.data_type();
+        let data_type = self.r#type().data_type();
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
             Self::scalar(<Element as ElementConversionTarget>::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
         });
@@ -1632,14 +1635,11 @@ macro_rules! impl_array_unary_math {
     (@float_math $trait:ident, $method:ident, $noun:literal) => {
         impl $trait for Array {
             fn $method(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(&self.r#type) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
-                    return Ok(Self {
-                        r#type: self.r#type.clone(),
-                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
-                    });
+                if Self::element_count(self.r#type().as_ref()) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                let data_type = self.r#type.data_type();
+                let data_type = self.r#type().data_type();
                 if !data_type.is_floating_point() && !data_type.is_complex() {
                     return Err(TypeError::invalid(format!(
                         concat!("cannot compute the ", $noun, " of a scalar of data type {}"),
@@ -1649,13 +1649,13 @@ macro_rules! impl_array_unary_math {
                 }
                 if data_type.is_complex() {
                     dispatch_on_array_element_type!(@complex data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                             <Element as ElementFloatMath>::$method(value)
                         })
                     })
                 } else {
                     dispatch_on_array_element_type!(@float data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                             <Element as ElementFloatMath>::$method(value)
                         })
                     })
@@ -1668,19 +1668,16 @@ macro_rules! impl_array_unary_math {
     (@real_float $trait:ident, $method:ident, $error:literal) => {
         impl $trait for Array {
             fn $method(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(&self.r#type) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
-                    return Ok(Self {
-                        r#type: self.r#type.clone(),
-                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
-                    });
+                if Self::element_count(self.r#type().as_ref()) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                let data_type = self.r#type.data_type();
+                let data_type = self.r#type().data_type();
                 if !data_type.is_floating_point() {
                     return Err(TypeError::invalid(format!($error, data_type)).into());
                 }
                 dispatch_on_array_element_type!(@float data_type, |Element| {
-                    self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                    self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                         <Element as ElementRealFloatMath>::$method(value)
                     })
                 })
@@ -1692,14 +1689,11 @@ macro_rules! impl_array_unary_math {
     (@sign) => {
         impl Sign for Array {
             fn sign(&self) -> Result<Self, ProgramError> {
-                if Self::element_count(&self.r#type) == 0 {
-                    let addressing = ArrayAddressing::new(self.r#type.clone())?;
-                    return Ok(Self {
-                        r#type: self.r#type.clone(),
-                        bytes: Arc::new(vec![0; addressing.storage_byte_len()]),
-                    });
+                if Self::element_count(self.r#type().as_ref()) == 0 {
+                    let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                let data_type = self.r#type.data_type();
+                let data_type = self.r#type().data_type();
                 if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {
                     return Err(TypeError::invalid(format!(
                         "cannot compute the sign of a scalar of data type {}",
@@ -1709,19 +1703,19 @@ macro_rules! impl_array_unary_math {
                 }
                 if data_type.is_signed() {
                     dispatch_on_array_element_type!(@signed data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                             <Element as ElementSign>::sign(value)
                         })
                     })
                 } else if data_type.is_complex() {
                     dispatch_on_array_element_type!(@complex data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                             <Element as ElementSign>::sign(value)
                         })
                     })
                 } else {
                     dispatch_on_array_element_type!(@float data_type, |Element| {
-                        self.map_elements::<Element, Element>(self.r#type.clone(), |value| {
+                        self.map_elements::<Element, Element>(self.r#type().into_owned(), |value| {
                             <Element as ElementSign>::sign(value)
                         })
                     })
@@ -1735,14 +1729,14 @@ macro_rules! impl_array_binary_float_math {
     ($trait:ident, $method:ident, $argument:ident) => {
         impl $trait for Array {
             fn $method(&self, $argument: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(&self.r#type, &$argument.r#type)
+                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), $argument.r#type().as_ref())
                     .map_err(|error| TypeError::invalid(error.to_string()))?;
                 if Self::element_count(&output_type) == 0 {
                     let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self { r#type: output_type, bytes: Arc::new(vec![0; addressing.storage_byte_len()]) });
+                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
                 }
-                let left_type = self.r#type.data_type();
-                let right_type = $argument.r#type.data_type();
+                let left_type = self.r#type().data_type();
+                let right_type = $argument.r#type().data_type();
                 check_types!(@float, stringify!($method), [left_type, right_type]);
                 let data_type = output_type.data_type();
                 let left = self.promoted_to(data_type)?;
@@ -1827,7 +1821,7 @@ impl Dot for Array {
 
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         // TODO(eaplatanios): What about the accumulation type?
-        let data_type = self.r#type.data_type();
+        let data_type = self.r#type().data_type();
         dispatch_on_array_element_type!(@numeric data_type, |Element| {
             self.dot_elements::<Element>(rhs, dimensions)
         })
@@ -1840,10 +1834,11 @@ impl Reduce for Array {
         if axes.is_empty() {
             return self.clone();
         }
-        let data_type = self.r#type.data_type();
+        let data_type = self.r#type().data_type();
         // Reuse the abstract rule for validation and for the complete result metadata. The concrete kernel below then
         // decodes directly from the input's physical layout into the result's addressed storage.
-        let output_type = reduce_abstract(&self.r#type, axes, kind, "reduce").unwrap_or_else(|error| panic!("{error}"));
+        let output_type =
+            reduce_abstract(self.r#type().as_ref(), axes, kind, "reduce").unwrap_or_else(|error| panic!("{error}"));
         if data_type == DataType::Zero {
             return Self::new(output_type, Vec::new()).unwrap();
         }

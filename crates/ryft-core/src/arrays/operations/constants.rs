@@ -410,11 +410,11 @@ impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
 
 impl ZeroLike for Array {
     fn zero_like(&self) -> Self {
-        match self.r#type.data_type() {
+        match self.r#type().data_type() {
             DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
                 let element = <Element as ElementConversionTarget>::from_unsigned(0).unwrap();
-                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
             }),
         }
     }
@@ -436,11 +436,11 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
 
 impl OneLike for Array {
     fn one_like(&self) -> Self {
-        match self.r#type.data_type() {
+        match self.r#type().data_type() {
             DataType::Token | DataType::Zero => self.clone(),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
                 let element = <Element as ElementConversionTarget>::from_unsigned(1).unwrap();
-                Self::from_fn_elements(self.r#type.clone(), |_| Ok(element)).unwrap()
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
             }),
         }
     }

@@ -10,7 +10,7 @@ use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::types::data::DataType;
 use crate::operations::{And, Not, Or, Xor};
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -24,9 +24,9 @@ impl Array {
         operation: &str,
         function: impl Fn(u8, u8) -> u8,
     ) -> Result<Self, ProgramError> {
-        let left_data_type = self.r#type.data_type();
-        let right_data_type = rhs.r#type.data_type();
-        let output_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type)
+        let left_data_type = self.r#type().data_type();
+        let right_data_type = rhs.r#type().data_type();
+        let output_type = Broadcastable::broadcast(self.r#type().as_ref(), rhs.r#type().as_ref())
             .map_err(|error| TypeError::invalid(error.to_string()))?;
         if left_data_type != right_data_type || !(left_data_type.is_boolean() || left_data_type.is_integer()) {
             return Err(TypeError::invalid(format!(
@@ -36,13 +36,13 @@ impl Array {
         }
 
         let output_shape = output_type.static_shape().unwrap();
-        let left_shape = self.r#type.static_shape().unwrap();
-        let right_shape = rhs.r#type.static_shape().unwrap();
+        let left_shape = self.r#type().static_shape().unwrap();
+        let right_shape = rhs.r#type().static_shape().unwrap();
         let output_strides = output_shape.row_major_strides();
         let left_strides = left_shape.row_major_strides();
         let right_strides = right_shape.row_major_strides();
-        let left_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let right_addressing = ArrayAddressing::new(rhs.r#type.clone())?;
+        let left_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let right_addressing = ArrayAddressing::new(rhs.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let left_bytes = self.storage_bytes();
         let right_bytes = rhs.storage_bytes();
@@ -71,13 +71,13 @@ impl Array {
         }
         // Valid inputs, bitwise closure outputs, and zero-initialized unoccupied storage preserve every `Array`
         // encoding invariant without a second validation traversal.
-        Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(output_bytes)))
     }
 }
 
 impl Not for Array {
     fn not(&self) -> Result<Self, ProgramError> {
-        let mask = match self.r#type.data_type() {
+        let mask = match self.r#type().data_type() {
             DataType::Boolean | DataType::I1 | DataType::U1 => 0b1,
             DataType::I2 | DataType::U2 => 0b11,
             DataType::I4 | DataType::U4 => 0b1111,
@@ -89,7 +89,7 @@ impl Not for Array {
                 .into());
             }
         };
-        let addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let input_bytes = self.storage_bytes();
         let mut bytes = vec![0; addressing.storage_byte_len()];
         for element in 0..addressing.element_count() {
@@ -99,7 +99,7 @@ impl Not for Array {
         }
         // Masking retains valid Boolean and sub-byte encodings; full-width integers admit every bit pattern, and
         // zero-initialization preserves all layout holes and padding.
-        Ok(Self { r#type: self.r#type.clone(), bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(bytes)))
     }
 }
 

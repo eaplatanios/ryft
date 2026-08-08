@@ -5090,7 +5090,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         .iter()
         .map(|atom_id| {
             let input_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&input_atom.r#type(), &context, location)
+            lower_tensor_type(&input_atom.r#type().as_ref(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
@@ -5098,7 +5098,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         .iter()
         .map(|atom_id| {
             let output_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&output_atom.r#type(), &context, location)
+            lower_tensor_type(&output_atom.r#type().as_ref(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -13768,7 +13768,7 @@ mod tests {
         let result_extent = DimensionValue::constant(4).unwrap();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
-            &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().clone().into()],
+            &[first_type.clone().into(), second_type.clone().into(), result_extent.r#type().into_owned().into()],
         )
         .unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -14558,7 +14558,7 @@ mod tests {
                 test_literal_dense_bytes(&literal, expected.len()),
                 expected,
                 "integer literal type {}",
-                literal.r#type(),
+                literal.r#type().as_ref(),
             );
         }
 
@@ -14608,7 +14608,7 @@ mod tests {
                 test_literal_dense_bytes(&literal, expected.len()),
                 expected,
                 "floating-point literal type {}",
-                literal.r#type(),
+                literal.r#type().as_ref(),
             );
         }
 

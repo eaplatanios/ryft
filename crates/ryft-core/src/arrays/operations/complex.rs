@@ -8,7 +8,7 @@ use num_complex::Complex;
 use crate::arrays::arrays::Array;
 use crate::arrays::types::data::DataType;
 use crate::operations::complex::{Conjugate, Imaginary, Real};
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -16,14 +16,15 @@ impl crate::operations::complex::Complex for Array {
     fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
         // Mirrors the `ComplexOperation` type-inference contract: the two part arrays must have identical types, and
         // the element data type maps to the complex data type with the parts' precision.
-        if self.r#type != imaginary.r#type {
+        if self.r#type() != imaginary.r#type() {
             return Err(TypeError::invalid(format!(
                 "'complex' requires identical part types but got {} and {}",
-                self.r#type, imaginary.r#type,
+                self.r#type(),
+                imaginary.r#type(),
             ))
             .into());
         }
-        let data_type = match self.r#type.data_type() {
+        let data_type = match self.r#type().data_type() {
             DataType::F32 => DataType::C64,
             DataType::F64 => DataType::C128,
             other => {
@@ -33,7 +34,7 @@ impl crate::operations::complex::Complex for Array {
                 .into());
             }
         };
-        let output_type = self.r#type.clone().with_data_type(data_type);
+        let output_type = self.r#type().into_owned().with_data_type(data_type);
         if data_type == DataType::C64 {
             self.binary_elements::<f32, Complex<f32>>(imaginary, output_type, |real, imaginary| {
                 Ok(Complex::new(real, imaginary))
@@ -48,12 +49,12 @@ impl crate::operations::complex::Complex for Array {
 
 impl Conjugate for Array {
     fn conjugate(&self) -> Result<Self, ProgramError> {
-        match self.r#type.data_type() {
+        match self.r#type().data_type() {
             DataType::C64 => {
-                self.map_elements::<Complex<f32>, Complex<f32>>(self.r#type.clone(), |value| Ok(value.conj()))
+                self.map_elements::<Complex<f32>, Complex<f32>>(self.r#type().into_owned(), |value| Ok(value.conj()))
             }
             DataType::C128 => {
-                self.map_elements::<Complex<f64>, Complex<f64>>(self.r#type.clone(), |value| Ok(value.conj()))
+                self.map_elements::<Complex<f64>, Complex<f64>>(self.r#type().into_owned(), |value| Ok(value.conj()))
             }
             other => Err(TypeError::invalid(format!("cannot conjugate a scalar of data type {other}")).into()),
         }
@@ -64,13 +65,13 @@ impl Real for Array {
     fn real(&self) -> Result<Self, ProgramError> {
         // The real part of a complex array has the parts' real data type, mirroring the `RealOperation`
         // type-inference contract, which requires a complex operand.
-        match self.r#type.data_type() {
+        match self.r#type().data_type() {
             DataType::C64 => self
-                .map_elements::<Complex<f32>, f32>(self.r#type.clone().with_data_type(DataType::F32), |value| {
+                .map_elements::<Complex<f32>, f32>(self.r#type().into_owned().with_data_type(DataType::F32), |value| {
                     Ok(value.re)
                 }),
             DataType::C128 => self
-                .map_elements::<Complex<f64>, f64>(self.r#type.clone().with_data_type(DataType::F64), |value| {
+                .map_elements::<Complex<f64>, f64>(self.r#type().into_owned().with_data_type(DataType::F64), |value| {
                     Ok(value.re)
                 }),
             other => {
@@ -84,13 +85,13 @@ impl Imaginary for Array {
     fn imaginary(&self) -> Result<Self, ProgramError> {
         // The imaginary part of a complex array has the parts' real data type, mirroring the `ImaginaryOperation`
         // type-inference contract, which requires a complex operand.
-        match self.r#type.data_type() {
+        match self.r#type().data_type() {
             DataType::C64 => self
-                .map_elements::<Complex<f32>, f32>(self.r#type.clone().with_data_type(DataType::F32), |value| {
+                .map_elements::<Complex<f32>, f32>(self.r#type().into_owned().with_data_type(DataType::F32), |value| {
                     Ok(value.im)
                 }),
             DataType::C128 => self
-                .map_elements::<Complex<f64>, f64>(self.r#type.clone().with_data_type(DataType::F64), |value| {
+                .map_elements::<Complex<f64>, f64>(self.r#type().into_owned().with_data_type(DataType::F64), |value| {
                     Ok(value.im)
                 }),
             other => {

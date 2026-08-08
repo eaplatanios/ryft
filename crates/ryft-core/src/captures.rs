@@ -574,7 +574,7 @@ mod tests {
         let dimension = crate::DimensionValue::constant(7).unwrap();
         let dimension_reference = dimension_context.capture(dimension.clone()).unwrap();
         assert_eq!(dimension_reference.index(), 1);
-        assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type());
+        assert_eq!(dimension_reference.r#type().as_ref(), dimension.r#type().as_ref());
         assert_eq!(
             parent.captures().borrow().as_slice(),
             &[ArrayIrValue::Array(array), ArrayIrValue::Dimension(dimension),],

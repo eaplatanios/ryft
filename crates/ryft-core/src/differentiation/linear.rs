@@ -181,7 +181,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
                 "{} zero residual {} has type {} but expected {}",
                 site,
                 index,
-                residual.r#type(),
+                residual.r#type().as_ref(),
                 expected_type,
             )));
         }

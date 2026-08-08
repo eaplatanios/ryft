@@ -1728,7 +1728,7 @@ where
                 if storage_input.r#type().as_ref() != storage_type {
                     return Err(TypeError::invalid(format!(
                         "bounded while residual stack item has type {} but expected {}",
-                        storage_input.r#type(),
+                        storage_input.r#type().as_ref(),
                         storage_type,
                     ))
                     .into());
@@ -3226,7 +3226,7 @@ mod tests {
                 value => Err(ProgramError::Concretization {
                     message: format!(
                         "cannot extract a concrete boolean from a value of type {}; expected bool[]",
-                        value.r#type(),
+                        value.r#type().as_ref(),
                     ),
                 }),
             }

@@ -62,9 +62,9 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
                 if tangent.r#type().as_ref() != &tangent_type {
                     return Err(TypeError::invalid(format!(
                         "tangent type {} does not match type {} required by primal type {}",
-                        tangent.r#type(),
+                        tangent.r#type().as_ref(),
                         tangent_type,
-                        primal.r#type(),
+                        primal.r#type().as_ref(),
                     )));
                 }
                 if tangent_type.is_zero_space() { MaybeZero::Zero(tangent_type) } else { MaybeZero::Value(tangent) }
@@ -215,7 +215,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 return Err(ProgramError::MalformedProgram(format!(
                     "linearization tangent input {} has type {} but primal input type {} requires tangent type {}",
                     index,
-                    tangent_input.r#type(),
+                    tangent_input.r#type().as_ref(),
                     primal_type,
                     tangent_type,
                 )));
@@ -230,7 +230,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 return Err(ProgramError::MalformedProgram(format!(
                     "linearization tangent output {} has type {} but primal output type {} requires tangent type {}",
                     index,
-                    tangent_output.r#type(),
+                    tangent_output.r#type().as_ref(),
                     primal_type,
                     tangent_type,
                 )));
@@ -243,8 +243,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 return Err(ProgramError::MalformedProgram(format!(
                     "linearization residual {index} has type {} in the primal program \
                      but type {} in the tangent program",
-                    residual.r#type(),
-                    input.r#type(),
+                    residual.r#type().as_ref(),
+                    input.r#type().as_ref(),
                 )));
             }
         }
@@ -431,8 +431,8 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward residual {index} has type {} in the pushforward program \
                      but carries a value of type {}",
-                    input.r#type(),
-                    residual.r#type(),
+                    input.r#type().as_ref(),
+                    residual.r#type().as_ref(),
                 )));
             }
         }
@@ -454,7 +454,7 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward program tangent input {} has type {} but its public boundary requires tangent type {}",
                     index,
-                    input.r#type(),
+                    input.r#type().as_ref(),
                     tangent_type,
                 )));
             }
@@ -478,7 +478,7 @@ impl<
                     "pushforward program tangent output {} has type {} but its public boundary requires tangent \
                     type {}",
                     index,
-                    output.r#type(),
+                    output.r#type().as_ref(),
                     tangent_type,
                 )));
             }
@@ -566,7 +566,7 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
                     index,
-                    value.r#type(),
+                    value.r#type().as_ref(),
                     tangent_type,
                 )));
             }
@@ -590,8 +590,8 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its program requires type {}",
                     index,
-                    input.r#type(),
-                    expected.r#type(),
+                    input.r#type().as_ref(),
+                    expected.r#type().as_ref(),
                 )));
             }
         }
@@ -2148,7 +2148,7 @@ fn capture_and_validate_zero_residual_atoms<V: Value, O: Operation<Type = V::Typ
                 "{} zero residual {} has type {} but expected {}",
                 site,
                 index,
-                actual_type.r#type(),
+                actual_type.r#type().as_ref(),
                 expected_type,
             )));
         }

@@ -5,6 +5,7 @@
 //! untracked and therefore a complete identity.
 
 use crate::arrays::arrays::Array;
+use crate::programs::Typed;
 
 // TODO(eaplatanios): Review this.
 
@@ -16,13 +17,13 @@ use crate::arrays::arrays::Array;
 impl crate::operations::sharding::Reshard for Array {
     fn reshard(&self, sharding: &crate::arrays::Sharding) -> Self {
         let varying_manual_axes =
-            self.r#type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
+            self.r#type().sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         let sharding = sharding
             .clone()
             .with_varying_manual_axes(varying_manual_axes)
             .unwrap_or_else(|error| panic!("{error}"));
-        let r#type = self.r#type.clone().with_sharding(sharding).unwrap_or_else(|error| panic!("{error}"));
-        Self { r#type, bytes: self.bytes.clone() }
+        let r#type = self.r#type().into_owned().with_sharding(sharding).unwrap_or_else(|error| panic!("{error}"));
+        Self::new_unchecked(r#type, self.shared_storage().clone())
     }
 }
 

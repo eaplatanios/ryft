@@ -1088,7 +1088,7 @@ mod tests {
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap()));
         assert_eq!(
             operation.infer_output_types(
-                &[input_type.into(), two.r#type().clone().into(), dynamic_extent.clone().into(),],
+                &[input_type.into(), two.r#type().into_owned().into(), dynamic_extent.clone().into(),],
                 &[],
             ),
             Ok(vec![
@@ -1110,7 +1110,7 @@ mod tests {
         let three = DimensionValue::constant(3).unwrap();
         assert_eq!(
             operation.infer_output_types(
-                &[input_type.into(), two.r#type().clone().into(), three.r#type().clone().into()],
+                &[input_type.into(), two.r#type().into_owned().into(), three.r#type().into_owned().into()],
                 &[],
             ),
             Ok(vec![
@@ -1129,14 +1129,14 @@ mod tests {
             BroadcastOperation::new(vec![0, 0]).infer_output_types(
                 &[
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]),).into(),
-                    two.r#type().clone().into(),
+                    two.r#type().into_owned().into(),
                 ],
                 &[],
             ),
             Err(TypeError::invalid("broadcasting output axes map two input axes to output axis 0")),
         );
         assert_eq!(
-            operation.infer_output_types(&[two.r#type().clone().into()], &[]),
+            operation.infer_output_types(&[two.r#type().into_owned().into()], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         assert_eq!(

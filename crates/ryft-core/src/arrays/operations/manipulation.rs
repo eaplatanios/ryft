@@ -32,7 +32,7 @@ use crate::operations::{
     DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, LegacyBroadcast, Pad, Permutation, Reshape,
     ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
-use crate::programs::{ProgramError, TypeError, Value, ValueProjection};
+use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review this.
 
@@ -72,16 +72,16 @@ impl Transpose for Array {
         // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
         // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
         let permutation = permutation.into();
-        let output_type = self.r#type.transpose(permutation.clone())?;
+        let output_type = self.r#type().transpose(permutation.clone())?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        let rank = self.r#type.rank();
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let rank = self.r#type().rank();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if output_addressing.element_count() == 0 {
-            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+            return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
         }
         let mut output_index = vec![0usize; rank];
         let mut input_index = vec![0usize; rank];
@@ -90,10 +90,10 @@ impl Transpose for Array {
                 input_index[input_axis] = output_index[position];
             }
             bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             output_addressing.advance_index(&mut output_index);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
@@ -101,45 +101,45 @@ impl Reshape for Array {
     fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
         // Resolve runtime dimension expressions from the concrete eager input shape, then delegate to the type-level
         // reshape so all element-count and sharding validation remains shared with staged execution.
-        let parameters = parameters.into().resolve_target(self.r#type.shape())?;
-        let output_type = self.r#type.reshape(parameters.clone())?;
+        let parameters = parameters.into().resolve_target(self.r#type().shape())?;
+        let output_type = self.r#type().reshape(parameters.clone())?;
         let transposed = parameters.dimensions().map(|dimensions| self.transpose(dimensions)).transpose()?;
         let input = transposed.as_ref().unwrap_or(self);
-        let input_addressing = ArrayAddressing::new(input.r#type.clone())?;
+        let input_addressing = ArrayAddressing::new(input.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if input_addressing.is_dense_row_major() && output_addressing.is_dense_row_major() {
-            bytes.copy_from_slice(&input.bytes);
+            bytes.copy_from_slice(input.storage_bytes());
         } else {
             for index in 0..input_addressing.element_count() {
                 bytes[output_addressing.byte_range_for_flat_index(index)]
-                    .copy_from_slice(&input.bytes[input_addressing.byte_range_for_flat_index(index)]);
+                    .copy_from_slice(&input.storage_bytes()[input_addressing.byte_range_for_flat_index(index)]);
             }
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
 impl BroadcastKernel for Array {
     fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = self.r#type.legacy_broadcast(output_type, output_axes)?;
+        let r#type = self.r#type().legacy_broadcast(output_type, output_axes)?;
         let Some(target_shape) = r#type.static_shape() else {
             return Err(
                 TypeError::invalid(format!("cannot materialize a value of dynamically sized type {}", r#type)).into()
             );
         };
-        if r#type == self.r#type && output_axes.iter().copied().eq(0..r#type.rank()) {
+        if &r#type == self.r#type().as_ref() && output_axes.iter().copied().eq(0..r#type.rank()) {
             return Ok(self.clone());
         }
-        let input_shape = self.r#type.static_shape().unwrap();
+        let input_shape = self.r#type().static_shape().unwrap();
         let input_rank = input_shape.rank();
         let target_rank = target_shape.rank();
         let output_count = Self::materialized_element_count(&r#type)?;
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(r#type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if output_count == 0 {
-            return Ok(Self { r#type, bytes: Arc::new(bytes) });
+            return Ok(Self::new_unchecked(r#type, Arc::new(bytes)));
         }
         let mut target_index = vec![0usize; target_rank];
         let mut input_index = vec![0usize; input_rank];
@@ -149,10 +149,10 @@ impl BroadcastKernel for Array {
                 input_index[input_axis] = if input_shape[input_axis] == 1 { 0 } else { target_index[target_axis] };
             }
             bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             output_addressing.advance_index(&mut target_index);
         }
-        Ok(Self { r#type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
     }
 }
 
@@ -167,7 +167,7 @@ impl Array {
     /// Copies the logical block selected by `axes` into a new array of `output_type`. The caller guarantees that the
     /// selection lies in bounds and contains exactly the output's logical element count.
     fn copy_block(&self, output_type: ArrayType, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
         let ranges = input_addressing.ranges(axes)?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         debug_assert_eq!(ranges.element_count(), output_addressing.element_count());
@@ -180,27 +180,28 @@ impl Array {
             let element_count = range.elements().len();
             if output_is_dense {
                 let output_start = output_index * element_byte_width;
-                bytes[output_start..output_start + input_bytes.len()].copy_from_slice(&self.bytes[input_bytes]);
+                bytes[output_start..output_start + input_bytes.len()]
+                    .copy_from_slice(&self.storage_bytes()[input_bytes]);
                 output_index += element_count;
                 continue;
             }
             for offset in 0..element_count {
                 let input_start = input_bytes.start + offset * element_byte_width;
                 bytes[output_addressing.byte_range_for_flat_index(output_index)]
-                    .copy_from_slice(&self.bytes[input_start..input_start + element_byte_width]);
+                    .copy_from_slice(&self.storage_bytes()[input_start..input_start + element_byte_width]);
                 output_index += 1;
             }
         }
         debug_assert_eq!(output_index, output_addressing.element_count());
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 
     /// Overwrites the logical block of `update`'s shape starting at `start_indices` in this array with `update`. The
     /// caller guarantees that the block lies in bounds.
     fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
-        let update_shape = update.r#type.static_shape().unwrap();
-        let addressing = ArrayAddressing::new(self.r#type.clone()).unwrap();
-        let update_addressing = ArrayAddressing::new(update.r#type.clone()).unwrap();
+        let update_shape = update.r#type().static_shape().unwrap();
+        let addressing = ArrayAddressing::new(self.r#type().into_owned()).unwrap();
+        let update_addressing = ArrayAddressing::new(update.r#type().into_owned()).unwrap();
         let axes = start_indices
             .iter()
             .zip(update_shape.dimensions())
@@ -209,7 +210,7 @@ impl Array {
         let ranges = addressing.ranges(&axes).unwrap();
         let element_byte_width = addressing.element_byte_width();
         let mut output = self;
-        let bytes = Arc::make_mut(&mut output.bytes);
+        let bytes = output.storage_bytes_mut();
         let update_is_dense = update_addressing.is_dense_row_major();
         let mut written = 0usize;
         for range in ranges {
@@ -217,15 +218,16 @@ impl Array {
             let element_count = range.elements().len();
             if update_is_dense {
                 let update_start = written * element_byte_width;
-                bytes[output_bytes]
-                    .copy_from_slice(&update.bytes[update_start..update_start + element_count * element_byte_width]);
+                bytes[output_bytes].copy_from_slice(
+                    &update.storage_bytes()[update_start..update_start + element_count * element_byte_width],
+                );
                 written += element_count;
                 continue;
             }
             for offset in 0..element_count {
                 let output_start = output_bytes.start + offset * element_byte_width;
                 bytes[output_start..output_start + element_byte_width]
-                    .copy_from_slice(&update.bytes[update_addressing.byte_range_for_flat_index(written)]);
+                    .copy_from_slice(&update.storage_bytes()[update_addressing.byte_range_for_flat_index(written)]);
                 written += 1;
             }
         }
@@ -241,7 +243,7 @@ impl Array {
             .iter()
             .enumerate()
             .map(|(axis, index)| {
-                let addressing = ArrayAddressing::new(index.r#type.clone()).unwrap();
+                let addressing = ArrayAddressing::new(index.r#type().into_owned()).unwrap();
                 let raw = index.index_value(&addressing, &[]);
                 let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
                 raw.clamp(0, maximum) as usize
@@ -253,8 +255,8 @@ impl Array {
     /// kernels. Unsigned `u64` values narrow with Rust's two's-complement `as i64` semantics. The type-level validation
     /// performed by every caller rules out non-integer element types and invalid indices.
     fn index_value(&self, addressing: &ArrayAddressing, index: &[usize]) -> i64 {
-        let bytes = &self.bytes[addressing.byte_range_unchecked(index)];
-        match self.r#type.data_type() {
+        let bytes = &self.storage_bytes()[addressing.byte_range_unchecked(index)];
+        match self.r#type().data_type() {
             DataType::I1 => i64::from(i1::decode(bytes).value()),
             DataType::I2 => i64::from(i2::decode(bytes).value()),
             DataType::I4 => i64::from(i4::decode(bytes).value()),
@@ -282,9 +284,13 @@ impl Pad for Array {
         edge_padding_high: &[i64],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
-        let output_type =
-            self.r#type.pad(&padding_value.r#type, edge_padding_low, edge_padding_high, interior_padding)?;
-        let input_shape = self.r#type.static_shape().unwrap();
+        let output_type = self.r#type().pad(
+            padding_value.r#type().as_ref(),
+            edge_padding_low,
+            edge_padding_high,
+            interior_padding,
+        )?;
+        let input_shape = self.r#type().static_shape().unwrap();
         if edge_padding_low.iter().all(|padding| *padding == 0)
             && edge_padding_high.iter().all(|padding| *padding == 0)
             && input_shape
@@ -297,10 +303,10 @@ impl Pad for Array {
         }
         let output_shape = output_type.static_shape().unwrap();
         let rank = input_shape.rank();
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let padding_addressing = ArrayAddressing::new(padding_value.r#type.clone())?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let padding_addressing = ArrayAddressing::new(padding_value.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let padding_bytes = &padding_value.bytes[padding_addressing.byte_range_for_flat_index(0)];
+        let padding_bytes = &padding_value.storage_bytes()[padding_addressing.byte_range_for_flat_index(0)];
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         if output_addressing.is_dense_row_major() && output_addressing.element_byte_width() != 0 {
             for output_bytes in bytes.chunks_exact_mut(output_addressing.element_byte_width()) {
@@ -312,7 +318,7 @@ impl Pad for Array {
             }
         }
         if input_addressing.element_count() == 0 {
-            return Ok(Self { r#type: output_type, bytes: Arc::new(bytes) });
+            return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
         }
         let mut input_index = vec![0usize; rank];
         let mut output_index = vec![0usize; rank];
@@ -342,11 +348,11 @@ impl Pad for Array {
                     .map_err(|_| TypeError::invalid(format!("'pad' output index is too large on axis {axis}")))?;
             }
             bytes[output_addressing.byte_range_unchecked(&output_index)]
-                .copy_from_slice(&self.bytes[input_addressing.byte_range_unchecked(&input_index)]);
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
             written += 1;
             input_addressing.advance_index(&mut input_index);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
@@ -364,19 +370,20 @@ impl Concatenate for Array {
         if inputs.len() == 1 {
             return Ok((*first).clone());
         }
-        let operation = ConcatenateOperation::new(axis, first.r#type.rank())?;
+        let operation = ConcatenateOperation::new(axis, first.r#type().rank())?;
         let axis = operation.axis();
-        let output_type = ArrayType::concatenate(inputs.iter().map(|input| &input.r#type), axis)?;
+        let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
+        let output_type = ArrayType::concatenate(input_types.iter().map(|r#type| r#type.as_ref()), axis)?;
         // Each operand owns a contiguous run of `axis` coordinates. Write its logical block at the running offset
         // along `axis` and offset zero on every other axis.
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         // Zero-initialization establishes every layout hole and tile-padding byte. Every logical element is replaced
         // below, so this does not require the element data type itself to represent zero.
         let mut output =
-            Self { r#type: output_type.clone(), bytes: Arc::new(vec![0; output_addressing.storage_byte_len()]) };
+            Self::new_unchecked(output_type.clone(), Arc::new(vec![0; output_addressing.storage_byte_len()]));
         let mut offset = 0usize;
         for input in inputs {
-            let input_axis_size = input.r#type.static_shape().unwrap()[axis];
+            let input_axis_size = input.r#type().static_shape().unwrap()[axis];
             let mut start_indices = vec![0usize; output_type.rank()];
             start_indices[axis] = offset;
             output = output.replace_block(input, start_indices.as_slice());
@@ -388,11 +395,11 @@ impl Concatenate for Array {
 
 impl Gather for Array {
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let output_type = self.r#type.gather(&indices.r#type, operation)?;
+        let output_type = self.r#type().gather(indices.r#type().as_ref(), operation)?;
         let dimensions = operation.dimensions();
         let slice_sizes = operation.slice_sizes();
-        let operand_shape = self.r#type.static_shape().unwrap();
-        let indices_shape = indices.r#type.static_shape().unwrap();
+        let operand_shape = self.r#type().static_shape().unwrap();
+        let indices_shape = indices.r#type().static_shape().unwrap();
         let operand_rank = operand_shape.rank();
         let indices_rank = indices_shape.rank();
         let output_rank = output_type.rank();
@@ -415,13 +422,13 @@ impl Gather for Array {
         // such as F8E8M0FNU that cannot represent zero at all.
         let dropped_fill = if operation.mode() == GatherScatterMode::FillOrDrop {
             let value = EagerContext::<Array>::new().zero(&ArrayType::scalar(output_type.data_type()))?;
-            let addressing = ArrayAddressing::new(value.r#type.clone())?;
+            let addressing = ArrayAddressing::new(value.r#type().into_owned())?;
             Some((value, addressing))
         } else {
             None
         };
-        let input_addressing = ArrayAddressing::new(self.r#type.clone())?;
-        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let indices_addressing = ArrayAddressing::new(indices.r#type().into_owned())?;
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
         let mut bytes = vec![0; output_addressing.storage_byte_len()];
         let mut output_index = vec![0usize; output_rank];
@@ -466,17 +473,17 @@ impl Gather for Array {
             }
             let source = if dropped {
                 let (value, addressing) = dropped_fill.as_ref().unwrap();
-                &value.bytes[addressing.byte_range_for_flat_index(0)]
+                &value.storage_bytes()[addressing.byte_range_for_flat_index(0)]
             } else {
                 for axis in 0..operand_rank {
                     operand_storage_index[axis] = operand_index[axis] as usize;
                 }
-                &self.bytes[input_addressing.byte_range_unchecked(&operand_storage_index)]
+                &self.storage_bytes()[input_addressing.byte_range_unchecked(&operand_storage_index)]
             };
             bytes[output_addressing.byte_range_for_flat_index(output_element)].copy_from_slice(source);
             output_addressing.advance_index(&mut output_index);
         }
-        Ok(Self { r#type: output_type, bytes: Arc::new(bytes) })
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 }
 
@@ -492,12 +499,12 @@ impl Array {
         combine: impl Fn(&mut [u8], &[u8]) -> Result<(), ProgramError>,
     ) -> Result<Self, ProgramError> {
         let dimensions = operation.dimensions();
-        let operand_shape = self.r#type.static_shape().unwrap();
+        let operand_shape = self.r#type().static_shape().unwrap();
         let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let indices_shape = indices.r#type.static_shape().unwrap();
-        let indices_addressing = ArrayAddressing::new(indices.r#type.clone())?;
-        let updates_shape = updates.r#type.static_shape().unwrap();
-        let updates_addressing = ArrayAddressing::new(updates.r#type.clone())?;
+        let indices_shape = indices.r#type().static_shape().unwrap();
+        let indices_addressing = ArrayAddressing::new(indices.r#type().into_owned())?;
+        let updates_shape = updates.r#type().static_shape().unwrap();
+        let updates_addressing = ArrayAddressing::new(updates.r#type().into_owned())?;
         let operand_rank = operand_shape.rank();
         let indices_rank = indices_shape.rank();
         let updates_rank = updates_shape.rank();
@@ -518,8 +525,8 @@ impl Array {
             operand_window_size[operand_axis] = updates_shape[dimensions.update_window_dimensions()[window]];
         }
 
-        let mut output = Self { r#type: output_type, bytes: self.bytes.clone() };
-        let output_bytes = Arc::make_mut(&mut output.bytes);
+        let mut output = Self::new_unchecked(output_type, self.shared_storage().clone());
+        let output_bytes = output.storage_bytes_mut();
         let mut update_index = vec![0usize; updates_rank];
         let mut indices_index = vec![0usize; indices_rank];
         let mut starts = vec![0i64; index_vector_extent];
@@ -564,7 +571,7 @@ impl Array {
                 }
                 combine(
                     &mut output_bytes[output_addressing.byte_range_unchecked(&operand_storage_index)],
-                    &updates.bytes[updates_addressing.byte_range_for_flat_index(written)],
+                    &updates.storage_bytes()[updates_addressing.byte_range_for_flat_index(written)],
                 )?;
             }
             updates_addressing.advance_index(&mut update_index);
@@ -575,7 +582,7 @@ impl Array {
 
 impl Scatter for Array {
     fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let output_type = self.r#type.scatter(&indices.r#type, &updates.r#type, operation)?;
+        let output_type = self.r#type().scatter(indices.r#type().as_ref(), updates.r#type().as_ref(), operation)?;
         let data_type = output_type.data_type();
         if operation.kind() == ScatterReductionKind::Overwrite || data_type == DataType::Zero {
             return self.scatter_with_combiner(indices, updates, output_type, operation, |current, update| {
@@ -621,7 +628,7 @@ impl Scatter for Array {
 
 impl Slice for Array {
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
-        let output_type = self.r#type.slice(start_indices, limit_indices, strides)?;
+        let output_type = self.r#type().slice(start_indices, limit_indices, strides)?;
         let axes = start_indices
             .iter()
             .zip(limit_indices.iter())
@@ -634,16 +641,16 @@ impl Slice for Array {
 
 impl UpdateSlice for Array {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        self.r#type.update_slice(&update.r#type, start_indices)?;
+        self.r#type().update_slice(update.r#type().as_ref(), start_indices)?;
         Ok(self.clone().replace_block(update, start_indices))
     }
 }
 
 impl DynamicSlice for Array {
     fn dynamic_slice(&self, start_indices: &[Self], sizes: &[usize]) -> Result<Self, ProgramError> {
-        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
-        let output_type = self.r#type.dynamic_slice(&index_types, sizes)?;
-        let input_shape = self.r#type.static_shape().unwrap();
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type().into_owned()).collect();
+        let output_type = self.r#type().dynamic_slice(&index_types, sizes)?;
+        let input_shape = self.r#type().static_shape().unwrap();
         let starts = Self::clamped_start_indices(start_indices, &input_shape, sizes);
         let axes = starts
             .iter()
@@ -656,10 +663,10 @@ impl DynamicSlice for Array {
 
 impl DynamicUpdateSlice for Array {
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
-        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type.clone()).collect();
-        self.r#type.dynamic_update_slice(&update.r#type, &index_types)?;
-        let input_shape = self.r#type.static_shape().unwrap();
-        let update_shape = update.r#type.static_shape().unwrap();
+        let index_types: Vec<ArrayType> = start_indices.iter().map(|index| index.r#type().into_owned()).collect();
+        self.r#type().dynamic_update_slice(update.r#type().as_ref(), &index_types)?;
+        let input_shape = self.r#type().static_shape().unwrap();
+        let update_shape = update.r#type().static_shape().unwrap();
         let starts = Self::clamped_start_indices(start_indices, &input_shape, update_shape.dimensions());
         Ok(self.clone().replace_block(update, starts.as_slice()))
     }
@@ -1029,7 +1036,7 @@ impl_element_conversion_target_for_complex!(f32, f64);
 
 impl ConvertElementType for Array {
     fn convert_element_type(&self, data_type: DataType) -> Result<Self, ProgramError> {
-        let source_data_type = self.r#type.data_type();
+        let source_data_type = self.r#type().data_type();
         if source_data_type.is_token() || data_type.is_token() {
             return Err(TypeError::invalid("cannot convert values to or from the token data type".to_string()).into());
         }
@@ -1039,7 +1046,7 @@ impl ConvertElementType for Array {
         if source_data_type.is_zero() || data_type.is_zero() {
             return Err(TypeError::invalid("cannot convert values to or from the zero data type".to_string()).into());
         }
-        let output_type = self.r#type.clone().with_data_type(data_type);
+        let output_type = self.r#type().into_owned().with_data_type(data_type);
         dispatch_on_array_element_type!(source_data_type, |Input| {
             dispatch_on_array_element_type!(data_type, |Output| {
                 self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
@@ -1180,7 +1187,7 @@ mod tests {
             .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input])
             .unwrap()[0];
         let two_value = DimensionValue::constant(2).unwrap();
-        let two_type = two_value.r#type().clone();
+        let two_type = two_value.r#type().into_owned();
         let two = builder.add_constant(ArrayIrValue::Dimension(two_value));
         let source_type = DimensionType::new(input_type.shape().dimensions()[0].variable().unwrap().clone());
         let doubled_extent = builder
@@ -2645,7 +2652,7 @@ in (%4)
         let extent_value = DimensionValue::constant(3).unwrap();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
             0,
-            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().clone().into()],
+            &[left_type.clone().into(), right_type.clone().into(), extent_value.r#type().into_owned().into()],
         )
         .unwrap();
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -2862,7 +2869,7 @@ in (%4)
         // Same-type conversion shares the original bytes, preserving NaN payloads and every unoccupied layout byte.
         let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
         let unchanged = nan.convert_element_type(DataType::F32).unwrap();
-        assert!(Arc::ptr_eq(&nan.bytes, &unchanged.bytes));
+        assert!(Arc::ptr_eq(nan.shared_storage(), unchanged.shared_storage()));
         assert_eq!(unchanged.storage_bytes(), nan.storage_bytes());
 
         // Token conversion is always rejected. Structural-zero conversion is valid only when it is a same-type no-op.

@@ -390,7 +390,7 @@ where
             return Err(TypeError::invalid(format!(
                 "coordinate basis for leaf type {} has type {} but expected {}",
                 value_type,
-                value.r#type(),
+                value.r#type().as_ref(),
                 expected_type,
             ))
             .into());

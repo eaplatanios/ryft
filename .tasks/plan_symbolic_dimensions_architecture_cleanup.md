@@ -2367,24 +2367,33 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       and values; array-IR types and values; `ArrayType` plus the reference value; then the concrete operation enums and
       family implementations, old-module deletion, facade cleanup, rustdoc/path residual searches, and the complete
       hierarchy gate. Each unit updates all affected paths directly and adds no temporary compatibility re-export.
-  - [ ] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, place the current dimension
+  - [x] Move the current `backends::arrays` reference backend to `ryft_core::arrays`, place the current dimension
         backend and heterogeneous array IR beneath `arrays::dimensions` and `arrays::ir`, and place `ArrayOperation`,
         `ArrayIrOperation`, and their array-owned implementations beneath `arrays::operations`. Keep generic operation
         semantics in `operations`, generic program machinery in `programs`, and transform policy machinery in its
         transform modules; this hierarchy owns the complete array-language type vocabulary, concrete reference values,
-        and their closed operation families.
+        and their closed operation families. *(Completed 2026-08-07: the `Array` value lives in `arrays::reference`,
+        `backends` is deleted, and all sub-items below are done.)*
     - [x] Extend `arrays::operations::mod.rs` (created 2026-08-06 with `DimensionOperation` and
           `DimensionTracingContext`) with `ArrayOperation`, `ArrayIrOperation`, `ArrayTracingContext`, and only the
           imports, derives, family conversions, and shared dispatcher/provider logic that genuinely spans operation
           families. Re-export the public family names from `arrays` without retaining a `backends` alias.
-    - [ ] Relocate reference `Array` capability implementations and mixed `ArrayIrValue` interpretation/provider glue
+    - [x] Relocate reference `Array` capability implementations and mixed `ArrayIrValue` interpretation/provider glue
           into the private family submodules specified above. Keep family-local typed traversal helpers in the same
           submodule as their sole consumers; keep only representation-wide construction, addressing, projection, and
-          value contracts with the value types. *(The `ArrayIrValue` half is done: the interim `operations::array_ir`
-          catch-all was dissolved on 2026-08-07 into `collectives`, `compare`, `constants`, `control_flow`,
-          `dimensions`, and `manipulation`, with the trivial member-lift `From` impls in `mod.rs` and the value-level
-          `Concretizable<bool>` impl with `ArrayIrValue` in `arrays::ir`. The reference `Array` half waits on the
-          `backends::arrays` move.)*
+          value contracts with the value types. *(The `ArrayIrValue` half was done on 2026-08-07 via the
+          `operations::array_ir` dissolution. The reference `Array` half completed later the same day: the interim
+          `arrays::reference` catch-all (the former `backends/arrays.rs` moved whole) was dissolved into the family
+          submodules — eleven new ones (`attention`, `complex`, `custom_call`, `differentiation`, `logical`, `math`,
+          `memory`, `random`, `sharding`, `sort`, `tag`) plus the existing five — with `ScaledDot` corrected to the
+          `math` family per its defining module. `arrays::reference` now holds only the `Array` value: storage,
+          construction, typed combinators, the value contracts (`Debug`/`PartialEq`/`Display`/`Typed`/`Value`/
+          `AbsDiffEq`/`Concretizable<bool>`), and the shared per-dtype element-kernel layer (the fifteen `Element*`
+          traits and their macro impls, raised to `pub(crate)` because their consumers span several family files and
+          single macro bodies implement several traits jointly). Family-local kernel helpers (`reduce_elements`,
+          `compare_elements`, `copy_block`, `scatter_with_combiner`, …) moved with their families; `Array::r#type`
+          and `Array::bytes` became `pub(crate)` so moved kernels can keep constructing validated arrays. The public
+          `BroadcastKernel` trait moved to `operations::manipulation` and is re-exported through `arrays`.)*
     - [x] Dissolve the former `backends/array_programs/differentiation.rs` (executed 2026-08-07; an interim move had
           kept it whole as `arrays::operations::differentiation`): the linearization residual vocabulary
           (`LinearResiduals`, `ExactShape`) moved together with the array `LinearCallBatchingPolicy` implementations
@@ -2394,16 +2403,22 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           composite `MemberDifferentiableOperation` boundary adapter moved to `arrays::operations::mod.rs` as
           family-spanning dispatch glue. The `arrays::operations::differentiation` name stays reserved for array
           implementations of the custom-derivative operation family.
-    - [ ] Split the two backend catch-all test modules beside their new owners: enum normalization and generated
+    - [x] Split the two backend catch-all test modules beside their new owners: enum normalization and generated
           dispatcher tests in `operations::tests`, reference storage/value tests with `Array`, IR value/projection tests
           with `ArrayIrValue`, and operation behavior tests in the corresponding family submodule. Preserve test names,
           ordering within each owner, comments, and exact fixtures unless ownership makes a focused rename necessary.
           *(The array-IR catch-all's 49 tests were split on 2026-08-07: value/projection tests with `ArrayIrValue` in
           `arrays::ir`, dispatcher-level tests in `operations::mod.rs`, and behavior tests in their family
-          submodules. The `backends/arrays.rs` catch-all tests remain.)*
-    - [ ] Gate: neither former backend catch-all file remains; every array-owned operation implementation has exactly
+          submodules. The reference catch-all's 42 tests were split later the same day: 14 storage/encoding/
+          combinator/value tests stayed with `Array` in `arrays::reference`, and 28 behavior tests moved to their
+          family submodules; the shared `array_type` fixture was hoisted to a `#[cfg(test)] pub(crate)` helper at
+          the `reference` module scope instead of being duplicated nine times.)*
+    - [x] Gate: neither former backend catch-all file remains; every array-owned operation implementation has exactly
           one family home; no generic semantic or transform rule was copied; no family submodule exists solely to hold
-          an enum variant; and targeted core/macro/XLA tests plus residual path searches pass.
+          an enum variant; and targeted core/macro/XLA tests plus residual path searches pass. *(Verified 2026-08-07:
+          `arrays::reference` retains zero operation-capability impls; workspace check with `--all-targets` is
+          warning-free; ryft-core 1,136 / ryft-xla 438 serial / ryft-macros-tests 20+17 all pass; no
+          `arrays::reference::` path remains for any moved item.)*
   - [ ] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
         under `ryft_core::arrays`:
     - [x] Move `DataType`/`DataTypeError` under `arrays::types::data`; after the scalar backend is deleted, these

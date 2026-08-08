@@ -45,8 +45,8 @@ where
 
 impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionAddOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionAddOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_add(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
@@ -63,8 +63,8 @@ impl Add for DimensionValue {
 
 impl Sub for DimensionValue {
     fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionSubOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionSubOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_sub(right.extent()).ok_or_else(|| {
             let left_variable = self.r#type().variable().to_string();
@@ -83,8 +83,8 @@ impl Sub for DimensionValue {
 
 impl DimensionSaturatingSub for DimensionValue {
     fn dimension_saturating_sub(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionSaturatingSubOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionSaturatingSubOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(result_type, self.extent().saturating_sub(right.extent()))?)
     }
@@ -92,8 +92,8 @@ impl DimensionSaturatingSub for DimensionValue {
 
 impl Mul for DimensionValue {
     fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMulOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionMulOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent = self.extent().checked_mul(right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
             message: format!(
@@ -110,8 +110,8 @@ impl Mul for DimensionValue {
 
 impl DimensionPow for DimensionValue {
     fn dimension_pow(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionPowOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionPowOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         let extent =
             checked_power(self.extent(), right.extent()).ok_or_else(|| DimensionError::ArithmeticOverflow {
@@ -130,8 +130,8 @@ impl DimensionPow for DimensionValue {
 
 impl Div for DimensionValue {
     fn div(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionDivFloorOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionDivFloorOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
             let left_variable = self.r#type().variable().to_string();
@@ -151,8 +151,8 @@ impl Div for DimensionValue {
 
 impl Rem for DimensionValue {
     fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionRemOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionRemOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         if right.extent() == 0 {
             let left_variable = self.r#type().variable().to_string();
@@ -172,8 +172,8 @@ impl Rem for DimensionValue {
 
 impl DimensionMin for DimensionValue {
     fn dimension_min(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMinOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionMinOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(result_type, self.extent().min(right.extent()))?)
     }
@@ -181,8 +181,8 @@ impl DimensionMin for DimensionValue {
 
 impl DimensionMax for DimensionValue {
     fn dimension_max(&self, right: &Self) -> Result<Self, ProgramError> {
-        let operation = DimensionMaxOperation::new(&self.r#type(), &right.r#type())?;
-        let inputs = &[self.r#type().clone(), right.r#type().clone()];
+        let operation = DimensionMaxOperation::new(&self.r#type().as_ref(), &right.r#type())?;
+        let inputs = &[self.r#type().into_owned(), right.r#type().into_owned()];
         let result_type = operation.infer_output_types(inputs, &[])?.remove(0);
         Ok(Self::new(result_type, self.extent().max(right.extent()))?)
     }
@@ -238,19 +238,19 @@ impl_dimension_operator!(Rem, rem, Rem, rem);
 
 impl DimensionRequirement for DimensionValue {
     fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::equal(&self.r#type(), &right.r#type())
+        DimensionRequirementOperation::equal(&self.r#type().as_ref(), &right.r#type())
             .evaluate_extents(self.extent(), Some(right.extent()))
             .map_err(Into::into)
     }
 
     fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::less_than_or_equal(&self.r#type(), &right.r#type())
+        DimensionRequirementOperation::less_than_or_equal(&self.r#type().as_ref(), &right.r#type())
             .evaluate_extents(self.extent(), Some(right.extent()))
             .map_err(Into::into)
     }
 
     fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        DimensionRequirementOperation::divisible_by(&self.r#type(), &right.r#type())
+        DimensionRequirementOperation::divisible_by(&self.r#type().as_ref(), &right.r#type())
             .evaluate_extents(self.extent(), Some(right.extent()))
             .map_err(Into::into)
     }
@@ -348,13 +348,14 @@ impl<A: DimensionFromScalar<DimensionValue> + Value<Type = ArrayType>> Dimension
 impl DimensionSize<usize> for Array {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
         let axis = axis.into();
-        let position = axis.normalize(self.r#type.rank()).map_err(|_| {
+        let position = axis.normalize(self.r#type().rank()).map_err(|_| {
             TypeError::invalid(format!(
                 "'{DIMENSION_SIZE_OPERATION_NAME}' axis {axis} is out of bounds for rank {}",
-                self.r#type.rank(),
+                self.r#type().rank(),
             ))
         })?;
-        let dimension = &self.r#type.shape().dimensions()[position];
+        let r#type = self.r#type();
+        let dimension = &r#type.shape().dimensions()[position];
         dimension.value().ok_or_else(|| {
             TypeError::invalid(format!("materialized reference array has a dynamic dimension at axis {position}",))
                 .into()

@@ -127,8 +127,8 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pullback residual {} has type {} in the pullback program but carries a value of type {}",
                     index,
-                    input.r#type(),
-                    residual.r#type(),
+                    input.r#type().as_ref(),
+                    residual.r#type().as_ref(),
                 )));
             }
         }
@@ -151,7 +151,7 @@ impl<
                     "pullback program cotangent input {} has type {} but its public boundary requires cotangent \
                     type {}",
                     index,
-                    input.r#type(),
+                    input.r#type().as_ref(),
                     cotangent_type,
                 )));
             }
@@ -175,7 +175,7 @@ impl<
                     "pullback program cotangent output {} has type {} but its public boundary requires \
                     cotangent type {}",
                     index,
-                    output.r#type(),
+                    output.r#type().as_ref(),
                     cotangent_type,
                 )));
             }
@@ -247,7 +247,7 @@ impl<
                 return Err(ProgramError::MalformedProgram(format!(
                     "pullback cotangent {index} has type {} but its primal boundary requires cotangent type \
                      {cotangent_type}",
-                    value.r#type(),
+                    value.r#type().as_ref(),
                 )));
             }
             if !cotangent_type.is_zero_space() {

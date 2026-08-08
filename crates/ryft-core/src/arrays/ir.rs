@@ -46,7 +46,7 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
     fn r#type(&self) -> Cow<'_, ArrayIrType> {
         Cow::Owned(match self {
             Self::Array(value) => ArrayIrType::Array(value.r#type().into_owned()),
-            Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().clone()),
+            Self::Dimension(value) => ArrayIrType::Dimension(value.r#type().into_owned()),
         })
     }
 }

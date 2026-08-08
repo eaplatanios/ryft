@@ -1060,7 +1060,7 @@ mod tests {
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
         let second_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)]));
-        let four = DimensionValue::constant(4).unwrap().r#type().clone();
+        let four = DimensionValue::constant(4).unwrap().r#type().into_owned();
         let static_input_types = [first_type.clone().into(), second_type.clone().into(), four.clone().into()];
         let proven_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(-2, &static_input_types).unwrap();
         assert_eq!(proven_operation.axis(), 0);
@@ -1084,7 +1084,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            infer(&[first_type.clone().into(), DimensionValue::constant(1).unwrap().r#type().clone().into()]),
+            infer(&[first_type.clone().into(), DimensionValue::constant(1).unwrap().r#type().into_owned().into()]),
             Ok(vec![first_type.clone().into()]),
         );
 
@@ -1177,7 +1177,7 @@ mod tests {
             infer(&[
                 first_type.clone().into(),
                 second_type.clone().into(),
-                DimensionValue::constant(5).unwrap().r#type().clone().into(),
+                DimensionValue::constant(5).unwrap().r#type().into_owned().into(),
             ]),
             Err(TypeError::invalid(format!(
                 "'{}' result extent is 5 but the static input extent sum is 4",
@@ -1190,7 +1190,7 @@ mod tests {
                 &[
                     first_type.clone().into(),
                     second_type.into(),
-                    DimensionValue::constant(5).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(5).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Err(TypeError::invalid(format!(
@@ -1202,7 +1202,7 @@ mod tests {
             ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(1, 2).unwrap()).infer_output_types(
                 &[
                     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                    DimensionValue::constant(1).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(1).unwrap().r#type().into_owned().into(),
                 ],
                 &[],
             ),

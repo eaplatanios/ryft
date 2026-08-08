@@ -693,7 +693,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(6)]));
         assert_eq!(
             reshape.infer_output_types(
-                &[input_type.clone().into(), two.r#type().clone().into(), three.r#type().clone().into()],
+                &[input_type.clone().into(), two.r#type().into_owned().into(), three.r#type().into_owned().into()],
                 &[],
             ),
             Ok(vec![
@@ -704,7 +704,7 @@ mod tests {
             DimensionType::new(DimensionVariable::new("output", DimensionBounds::new(1, Some(7)).unwrap()));
         assert_eq!(
             reshape.infer_output_types(
-                &[input_type.into(), output_extent.clone().into(), three.r#type().clone().into()],
+                &[input_type.into(), output_extent.clone().into(), three.r#type().into_owned().into()],
                 &[],
             ),
             Ok(vec![
@@ -716,7 +716,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            reshape.infer_output_types(&[two.r#type().clone().into()], &[]),
+            reshape.infer_output_types(&[two.r#type().into_owned().into()], &[]),
             Err(TypeError::invalid("expected array type but got dimension type")),
         );
         assert_eq!(
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(permuted.to_string(), "reshape [dimensions=[1, 0]]");
         assert_eq!(
             permuted.infer_output_types(
-                &[placed_input_type.into(), DimensionValue::constant(6).unwrap().r#type().clone().into(),],
+                &[placed_input_type.into(), DimensionValue::constant(6).unwrap().r#type().into_owned().into(),],
                 &[],
             ),
             Ok(vec![
@@ -755,7 +755,7 @@ mod tests {
             &[
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
                 ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
-                DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
             ],
         )
         .unwrap();
@@ -1478,7 +1478,7 @@ mod tests {
         let input = builder.add_input(input_type.clone().into());
         let extent = builder.add_input(extent_type.clone().into());
         let one_value = DimensionValue::constant(1).unwrap();
-        let one_type = one_value.r#type().clone();
+        let one_type = one_value.r#type().into_owned();
         let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
         let repeated_extent = builder
             .add_instruction(

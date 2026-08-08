@@ -13,7 +13,7 @@ use crate::operations::sort::{
     ArgMax, ArgMin, Sort, SortDirection, TopK, extremal_index_from_index_passenger, sort_permutation,
     top_k_from_index_passenger, top_k_via_squeezed_view,
 };
-use crate::programs::{ProgramError, TypeError};
+use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
 
@@ -75,18 +75,18 @@ impl Sort for Array {
             ))
             .into());
         }
-        let shape = key.r#type.static_shape().unwrap();
+        let shape = key.r#type().static_shape().unwrap();
         if axis >= shape.rank() {
             return Err(
                 TypeError::invalid(format!("'sort' axis {axis} is out of bounds for rank {}", shape.rank())).into()
             );
         }
         for operand in operands {
-            if operand.r#type.shape() != key.r#type.shape() {
+            if operand.r#type().shape() != key.r#type().shape() {
                 return Err(TypeError::invalid(format!(
                     "'sort' operands must agree on shape but got {} and {}",
-                    key.r#type.shape(),
-                    operand.r#type.shape(),
+                    key.r#type().shape(),
+                    operand.r#type().shape(),
                 ))
                 .into());
             }
@@ -94,16 +94,16 @@ impl Sort for Array {
         let key_ranks = operands[..key_count]
             .iter()
             .map(|key| {
-                let data_type = key.r#type.data_type();
+                let data_type = key.r#type().data_type();
                 let unsupported = || {
                     ProgramError::from(TypeError::invalid(format!("'sort' does not support key data type {data_type}")))
                 };
-                let addressing = ArrayAddressing::new(key.r#type.clone())?;
+                let addressing = ArrayAddressing::new(key.r#type().into_owned())?;
                 (0..addressing.element_count())
                     .map(|index| {
                         Self::element_total_order_rank(
                             data_type,
-                            &key.bytes[addressing.byte_range_for_flat_index(index)],
+                            &key.storage_bytes()[addressing.byte_range_for_flat_index(index)],
                         )
                         .ok_or_else(unsupported)
                     })
@@ -116,7 +116,7 @@ impl Sort for Array {
         // (including the sub-byte ones without a scalar representation) sort without being decoded.
         operands
             .iter()
-            .map(|operand| operand.gather_elements(operand.r#type.clone(), |index| gather[index]))
+            .map(|operand| operand.gather_elements(operand.r#type().into_owned(), |index| gather[index]))
             .collect()
     }
 }
@@ -125,7 +125,7 @@ impl Sort for Array {
 /// (the transform tracers stage it as an [`IotaOperation`](crate::operations::constants::IotaOperation) instead),
 /// returning it together with the operand's static dimensions.
 fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize>), ProgramError> {
-    let shape = value.r#type.static_shape().unwrap();
+    let shape = value.r#type().static_shape().unwrap();
     let dimensions = shape.dimensions().to_vec();
     if axis >= dimensions.len() {
         return Err(
@@ -134,7 +134,7 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
     }
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let axis_size = dimensions[axis];
-    let indices = Array::from_fn_elements(ArrayType::new(DataType::I32, value.r#type.shape().clone()), |index| {
+    let indices = Array::from_fn_elements(ArrayType::new(DataType::I32, value.r#type().shape().clone()), |index| {
         Ok(((index / inner_stride) % axis_size) as i32)
     })?;
     Ok((indices, dimensions))

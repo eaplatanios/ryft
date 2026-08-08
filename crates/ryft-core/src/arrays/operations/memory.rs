@@ -5,6 +5,7 @@
 
 use crate::arrays::arrays::Array;
 use crate::operations::TransferToMemory;
+use crate::programs::Typed;
 
 // TODO(eaplatanios): Review this.
 
@@ -15,6 +16,6 @@ impl TransferToMemory for Array {
     /// interpreted value.
     #[inline]
     fn transfer_to_memory(&self, destination: crate::arrays::Memory) -> Self {
-        Self { r#type: self.r#type.clone().with_memory(destination), bytes: self.bytes.clone() }
+        Self::new_unchecked(self.r#type().into_owned().with_memory(destination), self.shared_storage().clone())
     }
 }

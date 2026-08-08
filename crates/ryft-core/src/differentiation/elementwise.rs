@@ -65,7 +65,7 @@ impl<V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Reshape
         if rank > target.rank() {
             return Err(TypeError::invalid(format!(
                 "cannot align tangent type {} to output type {}",
-                value.r#type(),
+                value.r#type().as_ref(),
                 target,
             ))
             .into());
@@ -90,7 +90,7 @@ impl<V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Reshape
         let offset = self.r#type().rank().checked_sub(target.rank()).ok_or_else(|| {
             TypeError::invalid(format!(
                 "cannot unalign cotangent type {} to input cotangent type {}",
-                self.r#type(),
+                self.r#type().as_ref(),
                 target,
             ))
         })?;
@@ -204,7 +204,7 @@ impl<V: Value<Type = ArrayType> + LegacyBroadcast + ConvertElementType + Reshape
         if contribution.r#type().as_ref() != target {
             return Err(TypeError::invalid(format!(
                 "unaligned cotangent type {} does not match required input cotangent type {}",
-                contribution.r#type(),
+                contribution.r#type().as_ref(),
                 target,
             ))
             .into());

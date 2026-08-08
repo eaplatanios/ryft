@@ -4069,9 +4069,9 @@ mod tests {
                 ),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
@@ -4081,8 +4081,8 @@ mod tests {
                 &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(3)]).into()]),
@@ -4092,9 +4092,9 @@ mod tests {
                 &AllToAllOperation::new("x".to_string(), 4, 1, 0, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![shape(vec![Dimension::Static(4), Dimension::Static(2), Dimension::Static(3)]).into()]),
@@ -4104,9 +4104,9 @@ mod tests {
                 &AllToAllOperation::new("x".to_string(), 4, 1, 1, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(4).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(4).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![shape(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Static(3)]).into()]),
@@ -4116,7 +4116,7 @@ mod tests {
                 &PSumScatterOperation::new("x".to_string(), 4, 1, CollectiveOptions::default()),
                 &[
                     shape(vec![Dimension::Static(2), Dimension::Static(5)]).into(),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Err(TypeError::invalid("'psum_scatter' untiled scatter axis 1 size 5 must equal group size 4",)),
@@ -4126,7 +4126,7 @@ mod tests {
     #[test]
     fn test_grouped_collective_shape_arithmetic_uses_group_size() {
         let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let result_extent = DimensionValue::constant(6).unwrap().r#type().clone();
+        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
@@ -4137,7 +4137,7 @@ mod tests {
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 4, 0, grouped),
-                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().clone().into()],
+                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
             ),
             Ok(vec![f32_vector(3).into()]),
         );
@@ -4154,8 +4154,8 @@ mod tests {
                 &AllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::default(), output_variance),
                 &[
                     ArrayIrType::Array(input.clone()),
-                    DimensionValue::constant(2).unwrap().r#type().clone().into(),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(2).unwrap().r#type().into_owned().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             )
         };
@@ -4180,7 +4180,7 @@ mod tests {
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default()),
-                &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().clone().into(),],
+                &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
             ),
             Ok(vec![input.cotangent().into()]),
         );
@@ -4208,7 +4208,7 @@ mod tests {
                 &[
                     input_type.clone().into(),
                     ArrayIrType::Dimension(DimensionType::new(concat_result.clone())),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![
@@ -4225,7 +4225,7 @@ mod tests {
                 &[
                     input_type.clone().into(),
                     ArrayIrType::Dimension(DimensionType::new(split_result.clone())),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![
@@ -4259,13 +4259,13 @@ mod tests {
                 &[
                     ArrayIrType::Array(input_type.clone()),
                     ArrayIrType::Dimension(DimensionType::new(input_axis)),
-                    DimensionValue::constant(3).unwrap().r#type().clone().into(),
+                    DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
                 ],
             ),
             Ok(vec![input_type.into()]),
         );
 
-        let exact_six = DimensionValue::constant(6).unwrap().r#type().clone();
+        let exact_six = DimensionValue::constant(6).unwrap().r#type().into_owned();
         assert_eq!(
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new(
@@ -4279,7 +4279,7 @@ mod tests {
             ),
             Ok(vec![f32_vector(6).into()]),
         );
-        let exact_five = DimensionValue::constant(5).unwrap().r#type().clone();
+        let exact_five = DimensionValue::constant(5).unwrap().r#type().into_owned();
         assert_eq!(
             infer_explicit_all_gather_output_types(
                 &AllGatherOperation::new(
@@ -4301,7 +4301,7 @@ mod tests {
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
-                &[f32_vector(3).into(), DimensionValue::constant(3).unwrap().r#type().clone().into()],
+                &[f32_vector(3).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
             ),
             Err(TypeError::invalid("'psum_scatter' axis size must be greater than zero")),
         );
@@ -4871,7 +4871,7 @@ mod tests {
         let mut context = Context::new();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let output_cotangent = context.input(array_type.clone().into());
-        let extent_type = DimensionValue::constant(3)?.r#type().clone();
+        let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
         let cotangents = transpose_mixed_operation(
             &mut context,
             &PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),

@@ -4053,7 +4053,7 @@ mod tests {
         // boundary types differ, so structural IR does not grow with or specialize on the mapped extent's runtime
         // value.
         let static_trace = TraceContext::new();
-        let static_extent_type = DimensionValue::constant(2)?.r#type().clone();
+        let static_extent_type = DimensionValue::constant(2)?.r#type().into_owned();
         let static_extent = static_trace.input(static_extent_type.clone().into());
         let static_context = BatchingContext::<_, ArrayIrBatching>::new(static_trace, static_extent);
         let static_natural = <ArrayIrBatching as RecursiveBatchingPolicy<TraceContext>>::batch_program(
