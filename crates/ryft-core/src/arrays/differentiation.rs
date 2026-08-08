@@ -627,4 +627,63 @@ mod tests {
             Err(BatchingError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
         ));
     }
+
+    #[test]
+    fn test_materialize_array_tangent() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let n = DimensionType::new(DimensionVariable::new("n", DimensionBounds::new(1, Some(9)).unwrap()));
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let context = TestContext::new();
+        let projected_context = ProjectedContext::<TestContext, ArrayType>::new(context.clone());
+        let primal = context.input(dynamic_type.clone().into());
+
+        // A concrete tangent is projected and returned unchanged, staging nothing.
+        let tangent = context.input(dynamic_type.clone().into());
+        let input = DifferentiationDual::new(primal.clone(), MaybeZero::Value(tangent.clone())).unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.value().atom_id().unwrap(), tangent.atom_id().unwrap());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // A structural zero whose identity-bearing type matches the primal's stages one zero-like over the primal
+        // exemplar, because the type-only nullary zero cannot supply the runtime extent that `n` names.
+        let input = DifferentiationDual::new(primal.clone(), MaybeZero::Zero(ArrayIrType::Array(dynamic_type.clone())))
+            .unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &dynamic_type);
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected exactly one staged zero-like");
+            };
+            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::ZeroLike(_))));
+        }
+
+        // An identity-free structural zero keeps the canonical nullary zero, whose zero-producing marker keeps
+        // higher-order partial evaluation structural.
+        let static_primal = context.input(static_type.clone().into());
+        let input =
+            DifferentiationDual::new(static_primal, MaybeZero::Zero(ArrayIrType::Array(static_type.clone()))).unwrap();
+        let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
+        assert_eq!(materialized.r#type().as_ref(), &static_type);
+        {
+            let builder = context.builder().borrow();
+            let [_, instruction] = builder.instructions() else {
+                panic!("expected the staged zero-like followed by one staged nullary zero");
+            };
+            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+        }
+
+        // An identity-bearing zero whose type differs from the primal's cannot use the exemplar and fails as the
+        // unconstructible nullary zero of an identity-referencing type.
+        let m = DimensionType::new(DimensionVariable::new("m", DimensionBounds::new(1, Some(9)).unwrap()));
+        let mismatched_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(m.variable().clone())]));
+        let input = DifferentiationDual::new(primal, MaybeZero::Zero(ArrayIrType::Array(mismatched_type))).unwrap();
+        assert!(matches!(
+            materialize_array_tangent(&projected_context, &input),
+            Err(DifferentiationError::Program(error))
+                if error.to_string().contains("'zero' cannot construct type f64[m] without operands"),
+        ));
+    }
 }

@@ -686,8 +686,8 @@ mod tests {
         CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionMulOperation,
         DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
         DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers,
-        GatherOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SliceOperation,
-        UpdateSliceOperation, ZeroOperation,
+        GatherOperation, IotaOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+        SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
@@ -1243,12 +1243,12 @@ in (%4)
         let source_extent = builder.add_input(source_type.clone().into());
         let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output_extent = builder.add_input(result_type.clone().into());
-        // A mixed zero is a nullary constant, so its tangent stays a structural zero of the identity-bearing operand
-        // type while the padding-value tangent is live. The rule must still hand a concrete operand tangent to the
-        // staged pad.
+        // A mixed iota is a non-differentiable nullary constant, so its tangent is a structural zero of the
+        // identity-bearing operand type while its primal is a non-zero exemplar and the padding-value tangent stays
+        // live. The rule must still hand a concrete operand tangent to the staged pad.
         let operand = builder
             .add_instruction(
-                ArrayIrOperation::<Array>::from(ZeroOperation::new(input_type)),
+                ArrayIrOperation::<Array>::from(IotaOperation::new(input_type, 0).unwrap()),
                 Vec::new(),
                 vec![source_extent],
             )
@@ -1304,7 +1304,7 @@ in (%4)
         let extent = builder.add_input(result_type.clone().into());
         let left = builder
             .add_instruction(
-                ArrayIrOperation::<Array>::from(ZeroOperation::new(left_type)),
+                ArrayIrOperation::<Array>::from(IotaOperation::new(left_type, 0).unwrap()),
                 Vec::new(),
                 vec![left_extent],
             )
