@@ -647,10 +647,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
         DimensionError, DimensionVariable, Shape,
     };
-    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};

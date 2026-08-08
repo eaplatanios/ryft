@@ -207,8 +207,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;

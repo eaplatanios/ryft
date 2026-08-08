@@ -1394,7 +1394,7 @@ fn test_operation_default_crate_path_is_ryft() {
 /// [`transpose_mixed_operation`](ryft::transpose_mixed_operation)) are defined over real member universes, and a
 /// stand-in could not pin how the real machinery classifies an interleaved operand list.
 mod mixed_members {
-    use ryft::backends::arrays::Array;
+    use ryft::arrays::Array;
     use ryft::{
         ArrayIrType, ArrayIrValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
         DifferentiationDriver, DifferentiationDual, Dimension, DimensionBounds, DimensionOperation, DimensionType,

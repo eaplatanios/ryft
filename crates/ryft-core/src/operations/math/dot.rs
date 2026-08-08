@@ -1638,7 +1638,7 @@ pub trait BlockQuantize: Sized {
 }
 
 /// Every value with the elementwise, reduction, and reshaping capabilities used by the recipe (which covers both
-/// the concrete reference [`Array`](crate::backends::arrays::Array) backend and the transform tracers) quantizes
+/// the concrete reference [`Array`](crate::arrays::Array) backend and the transform tracers) quantizes
 /// through the shared composition.
 impl<V> BlockQuantize for V
 where
@@ -1853,10 +1853,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayBatch, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{JacobianDifferentiate, jacobian_reverse};
@@ -3190,8 +3189,7 @@ mod tests {
     fn test_dot_batching_preserves_materialized_batch_placement() {
         use std::rc::Rc;
 
-        use crate::arrays::{ArrayBatch, ArrayOperation};
-        use crate::backends::Array;
+        use crate::arrays::{Array, ArrayBatch, ArrayOperation};
         use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
         use crate::parameters::Placeholder;
         use crate::tracing::TracingContext;

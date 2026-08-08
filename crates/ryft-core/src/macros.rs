@@ -4439,11 +4439,10 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Device,
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Device,
         DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::backends::Array;
     use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{

@@ -778,7 +778,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::Slice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Slice the middle 1x2 block out of a 2x3 matrix.
@@ -1190,7 +1190,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::UpdateSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Overwrite the last two elements of the first row of a 2x3 matrix.
@@ -1587,7 +1587,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::DynamicSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::arrays::DataType;
 /// # use ryft_core::arrays::ArrayType;
 /// #
@@ -2049,7 +2049,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::DynamicUpdateSlice;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::arrays::DataType;
 /// # use ryft_core::arrays::ArrayType;
 /// #
@@ -2490,11 +2490,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension, StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
+        DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
+        Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{LinearizationTracer, jacobian_forward, value_and_gradient};

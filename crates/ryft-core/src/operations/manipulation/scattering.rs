@@ -569,7 +569,7 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
 /// ```rust
 /// # use ryft_core::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::arrays::DataType;
 /// # use ryft_core::arrays::{ArrayType, Dimension, Shape};
 /// #
@@ -882,10 +882,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout,
+        Array, ArrayOperation, DataType, Dimension, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::contexts::Context;
     use crate::differentiation::jacobian_forward;
     use crate::macros::{

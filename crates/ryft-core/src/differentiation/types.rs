@@ -651,10 +651,9 @@ mod tests {
 
     use crate::arrays::DataType::*;
     use crate::arrays::{
-        ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
 

@@ -275,8 +275,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
-    use crate::arrays::{ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape, f6e2m3fn, f6e3m2fn};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape, f6e2m3fn, f6e3m2fn};
     use crate::contexts::EagerContext;
     use crate::differentiation::{jacobian_forward, jacobian_reverse};
     use crate::interpretation::InterpretableOperation;

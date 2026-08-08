@@ -364,7 +364,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::Array;
+    use crate::arrays::Array;
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::jvp;
     use crate::interpretation::InterpretableOperation;

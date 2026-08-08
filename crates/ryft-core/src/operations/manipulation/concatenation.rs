@@ -710,7 +710,7 @@ where
 /// The following example shows how to use [`Concatenate`] in practice:
 ///
 /// ```rust
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::operations::manipulation::Concatenate;
 /// # use ryft_core::programs::ProgramError;
 /// #
@@ -1034,10 +1034,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        Array, ArrayOperation, DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
+        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,

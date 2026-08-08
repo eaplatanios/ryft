@@ -141,7 +141,7 @@ impl DimensionFromScalar<DimensionValue> for Array<'_> {
 }
 
 /// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
-/// [`Array`](ryft_core::backends::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
+/// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
 /// `or` via device-to-host readback of every shard, and [`WhilePredicate::mask_select`] broadcasts the predicate
 /// against the operands along its leading (prefix) axes on device before selecting.
 impl WhilePredicate for Array<'_> {

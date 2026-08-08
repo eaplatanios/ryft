@@ -35,7 +35,7 @@ pub const DIMENSION_TO_SCALAR_OPERATION_NAME: &str = "dimension_to_scalar";
 ///
 /// ```rust
 /// # use ryft_core::{ArrayIrValue, DimensionToScalar, DimensionValue, ProgramError};
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
 /// let scalar = dimension.to_scalar()?;
@@ -173,9 +173,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
+        Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
     };
-    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::TransposableOperation;
     use crate::macros::check_operation_partial_evaluation;

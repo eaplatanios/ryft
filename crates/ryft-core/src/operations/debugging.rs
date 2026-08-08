@@ -157,8 +157,7 @@ impl_differentiable_elementwise_operation! {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::EagerContext;
     use crate::differentiation::value_and_gradient;
     use crate::programs::EmptyRegionDriver;

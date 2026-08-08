@@ -172,8 +172,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, Shape};
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;

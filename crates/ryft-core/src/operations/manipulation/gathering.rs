@@ -659,7 +659,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::{Gather, GatherDimensionNumbers, GatherOperation};
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::arrays::DataType;
 /// # use ryft_core::arrays::ArrayType;
 /// #
@@ -1006,10 +1006,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, DimensionBounds, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Sharding, ShardingDimension,
+        Array, ArrayOperation, DataType, DimensionBounds, DimensionVariable, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension,
     };
-    use crate::backends::Array;
     use crate::contexts::Context;
     use crate::differentiation::jacobian_forward;
     use crate::macros::{

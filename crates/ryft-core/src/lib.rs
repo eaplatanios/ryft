@@ -4,7 +4,6 @@ extern crate self as ryft;
 
 pub mod arrays;
 pub mod axes;
-pub mod backends;
 pub mod batching;
 pub mod captures;
 pub mod compilation;
@@ -28,11 +27,6 @@ pub mod utilities;
 #[allow(ambiguous_glob_reexports)]
 pub use arrays::*;
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
-// Both `backends` and `operations` expose a public `dimensions` module, so these glob exports make the crate-level
-// `dimensions` name ambiguous. P9 replaces these temporary glob exports with an explicit facade; suppress the known
-// ambiguity until that dedicated API increment.
-#[allow(ambiguous_glob_reexports)]
-pub use backends::*;
 pub use batching::{
     Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection, BatchingTracer,

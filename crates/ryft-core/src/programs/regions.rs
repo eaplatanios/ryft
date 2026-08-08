@@ -1159,8 +1159,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::contexts::EagerContext;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;

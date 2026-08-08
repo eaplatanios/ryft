@@ -821,8 +821,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrType, ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayIrType, ArrayType, DataType};
     use crate::operations::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;

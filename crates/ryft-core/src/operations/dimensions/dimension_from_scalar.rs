@@ -37,7 +37,7 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// ```rust
 /// # use ryft_core::arrays::{DimensionBounds, DimensionVariable};
 /// # use ryft_core::{ArrayIrValue, DimensionFromScalar, DimensionValue, Mul, ProgramError};
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
 /// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
@@ -58,7 +58,7 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// ```rust
 /// # use ryft_core::arrays::{DimensionBounds, DimensionVariable, Shape};
 /// # use ryft_core::{DimensionFromScalar, ProgramError, Reshape, Slice};
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let extents = Array::vector(vec![3_i32, 5_i32]);
 /// let sequence = extents.slice(&[1], &[2], &[1])?.reshape(Shape::scalar())?;
@@ -241,10 +241,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionError, DimensionValue,
         MAX_DIMENSION_EXTENT, Shape,
     };
-    use crate::backends::Array;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::TransposableOperation;
     use crate::macros::check_operation_partial_evaluation;

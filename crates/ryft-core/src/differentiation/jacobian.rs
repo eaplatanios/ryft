@@ -1200,8 +1200,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType::{F32, F64};
-    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+    };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};

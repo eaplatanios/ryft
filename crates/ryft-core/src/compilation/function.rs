@@ -1537,8 +1537,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType};
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
     use crate::programs::{Operation, RegionInterface, Type, TypeError};
 

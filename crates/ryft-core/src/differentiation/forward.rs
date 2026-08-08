@@ -2188,8 +2188,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue,

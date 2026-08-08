@@ -228,7 +228,7 @@ where
 ///
 /// ```rust
 /// # use ryft_core::{ArrayIrValue, Compare, DimensionValue, ProgramError};
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let left = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
 /// let right = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(5)?);
@@ -314,10 +314,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, Memory, Shape, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, DifferentiationTracer, TransposableOperation, jvp};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};

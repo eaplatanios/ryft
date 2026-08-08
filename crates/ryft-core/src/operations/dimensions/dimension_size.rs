@@ -47,7 +47,7 @@ pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 ///
 /// ```rust
 /// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # fn main() -> Result<(), ProgramError> {
 /// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
 /// let columns = array.dimension_size(-1)?;
@@ -295,8 +295,7 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, Shape};
     use crate::contexts::{Context, EagerContext};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};

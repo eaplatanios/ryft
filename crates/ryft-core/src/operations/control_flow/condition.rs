@@ -1343,10 +1343,9 @@ mod tests {
     use std::borrow::Cow;
 
     use crate::arrays::{
-        ArrayBatch, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
+        Array, ArrayBatch, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};

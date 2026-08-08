@@ -244,8 +244,7 @@ impl<V: Value<Type: ElementType, DispatchDomain: Context<Operation: From<Convert
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
     use crate::differentiation::jvp;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,

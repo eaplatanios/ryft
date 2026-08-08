@@ -300,7 +300,7 @@ where
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::operations::manipulation::Transpose;
 /// # use ryft_core::programs::ProgramError;
 /// #
@@ -446,10 +446,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
+        Array, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
-    use crate::backends::Array;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableOperation, TransposableOperation};
     use crate::macros::{

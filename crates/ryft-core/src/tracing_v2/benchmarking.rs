@@ -533,8 +533,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::ArrayOperation;
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::Sin;
     use crate::programs::Program;

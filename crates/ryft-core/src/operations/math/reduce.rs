@@ -789,7 +789,7 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperat
 where
     O: Operation<Type = ArrayType>
         + From<LegacyBroadcastOperation>
-        + From<ConstantOperation<crate::backends::arrays::Array>>
+        + From<ConstantOperation<crate::arrays::Array>>
         + From<MulOperation<ArrayType>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1002,8 +1002,9 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+    };
     use crate::contexts::StagingContext;
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::check_operation_batching;

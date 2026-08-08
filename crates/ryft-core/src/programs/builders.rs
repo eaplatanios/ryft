@@ -552,8 +552,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+    };
     use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::instructions::InstructionId;

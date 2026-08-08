@@ -32,7 +32,7 @@ impl<V: Max + Min> Clamp for V {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::Array;
+    use crate::arrays::Array;
     use crate::differentiation::value_and_gradient;
     use crate::operations::constants::one_like::OneLike;
 

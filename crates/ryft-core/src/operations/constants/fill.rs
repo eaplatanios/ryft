@@ -1,5 +1,4 @@
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayElement, ArrayType};
-use crate::backends::Array;
+use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayType};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -117,8 +116,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape};
     use crate::parameters::Placeholder;
     use crate::tracing::TracingContext;
 

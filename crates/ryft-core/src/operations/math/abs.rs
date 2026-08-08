@@ -184,8 +184,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::ArrayType;
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType};
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, jvp, value_and_gradient};
     use crate::interpretation::InterpretableOperation;

@@ -2389,7 +2389,7 @@ where
 ///
 /// The default implementations are the scalar-predicate semantics, expressed through [`Concretizable<bool>`]: the predicate's
 /// own truth decides continuation, and a true predicate takes the candidate wholesale. Value types with genuinely
-/// batched payloads (e.g. [`Array`](crate::backends::arrays::Array)) override both methods with per-item semantics, and
+/// batched payloads (e.g. [`Array`](crate::arrays::Array)) override both methods with per-item semantics, and
 /// symbolic values (tracers and capture references) inherit the defaults, which surface [`Concretizable::concretize`]'s
 /// concretization errors — a staged while is consumed by staging and lowering rather than by this eager loop.
 pub trait WhilePredicate: Concretizable<bool> + Clone + Sized {
@@ -2433,10 +2433,9 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-        Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionType,
+        DimensionVariable, Shape,
     };
-    use crate::backends::Array;
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{

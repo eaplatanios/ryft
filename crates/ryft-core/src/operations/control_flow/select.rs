@@ -311,7 +311,7 @@ impl_select_differentiation! {
 /// ```rust
 /// # use ryft_core::operations::control_flow::Select;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Array values pair with a Boolean-typed condition array of the same shape.
@@ -351,8 +351,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Dimension, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, Dimension, Shape};
     use crate::differentiation::{jvp, value_and_gradient};
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,

@@ -1227,8 +1227,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use crate::arrays::{ArrayOperation, ArrayType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType};
     use crate::contexts::Domain;
     use crate::programs::ProgramError;
 

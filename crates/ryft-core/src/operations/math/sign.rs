@@ -81,8 +81,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,

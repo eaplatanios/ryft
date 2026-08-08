@@ -2138,8 +2138,7 @@ mod tests {
     use std::fmt::Debug;
     use std::rc::Rc;
 
-    use crate::arrays::{ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};

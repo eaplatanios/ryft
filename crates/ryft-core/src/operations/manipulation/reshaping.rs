@@ -1157,7 +1157,7 @@ fn remap_reshape_dimension_expression(
 /// ```rust
 /// # use ryft_core::operations::manipulation::Reshape;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// # use ryft_core::arrays::{Shape, Dimension};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
@@ -1556,10 +1556,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        Array, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, Sharding, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,

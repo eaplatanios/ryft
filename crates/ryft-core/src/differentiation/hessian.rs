@@ -626,8 +626,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::DataType::{F32, F64};
-    use crate::arrays::{ArrayType, DataType, Dimension, Shape};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, Shape};
     use crate::differentiation::jacobian::jacobian_forward;
     use crate::operations::Sin;
     use crate::parameters::{ParameterPath, Parameterized};

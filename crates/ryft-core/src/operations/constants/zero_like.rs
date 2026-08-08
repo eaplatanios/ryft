@@ -107,8 +107,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{ArrayType, DataType};
-    use crate::backends::Array;
+    use crate::arrays::{Array, ArrayType, DataType};
     use crate::contexts::EagerContext;
     use crate::differentiation::jacobian_reverse;
     use crate::interpretation::InterpretableOperation;

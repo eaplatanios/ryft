@@ -3729,11 +3729,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayBatch, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        Array, ArrayBatch, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
         MeshAxisType, Shape, Sharding,
     };
-    use crate::backends::Array;
     use crate::batching::{
         BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
     };
@@ -3819,9 +3818,8 @@ mod tests {
 
     #[test]
     fn test_collective_over_unbound_axis_is_rejected() {
-        use crate::arrays::ArrayOperation;
+        use crate::arrays::{Array, ArrayOperation};
         use crate::axes::AxisError;
-        use crate::backends::Array;
         use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer};
         use crate::contexts::EagerContext;
 
@@ -3844,8 +3842,7 @@ mod tests {
 
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
-        use crate::arrays::ArrayOperation;
-        use crate::backends::Array;
+        use crate::arrays::{Array, ArrayOperation};
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;
@@ -3875,8 +3872,7 @@ mod tests {
 
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
-        use crate::arrays::ArrayOperation;
-        use crate::backends::Array;
+        use crate::arrays::{Array, ArrayOperation};
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
         use crate::differentiation::LinearizationTracer;

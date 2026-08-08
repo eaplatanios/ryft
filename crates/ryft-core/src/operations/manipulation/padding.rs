@@ -1204,7 +1204,7 @@ where
 /// ```rust
 /// # use ryft_core::operations::manipulation::Pad;
 /// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::backends::arrays::Array;
+/// # use ryft_core::arrays::Array;
 /// #
 /// # fn main() -> Result<(), ProgramError> {
 /// // Pad [1, 2, 3] with one leading zero, two trailing zeros, and one zero between adjacent elements. With
@@ -1520,11 +1520,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
         DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension, StridedLayout,
     };
-    use crate::backends::Array;
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::macros::{
