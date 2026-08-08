@@ -1660,7 +1660,7 @@ fn value_and_gradient_with_aux_in_context<C, F, Input, Output, Aux>(
 ) -> Result<((C::Value, Aux), Input::To<C::Value>), DifferentiationError>
 where
     C: ReverseModeDifferentiate + Zero<C::Value>,
-    C::Operation: From<OneOperation<C::Type>> + From<ZeroLikeOperation<C::Type>>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<OneOperation<C::Type>>,
     F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Output: MaybeFallible<(LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>), DifferentiationError>,
@@ -1675,12 +1675,19 @@ where
     let ((output, auxiliary), pullback): ((C::Value, Aux), _) =
         context.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
 
-    // Each auxiliary leaf is its own cotangent-geometry exemplar. A reference-bearing cotangent type names runtime
-    // extents that only a live value pins, and the leaf itself is exactly such a value whenever the two types agree.
+    // Each auxiliary leaf supplies its own cotangent geometry. A reference-bearing cotangent type names runtime
+    // extents that only a live value pins, and the leaf is such a value. The cotangent type derivation preserves
+    // geometry exactly, so the leaf names every quantity the cotangent type omits even where the two types differ.
     let auxiliary_structure = auxiliary.parameter_structure();
     let auxiliary_cotangents = auxiliary
         .parameters()
-        .map(|value| MaybeZero::Zero(value.r#type().cotangent()).materialize_like(context, value))
+        .map(|value| {
+            C::Operation::materialize_zero_with_geometry(
+                context,
+                MaybeZero::Zero(value.r#type().cotangent()),
+                std::iter::once(value),
+            )
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
 

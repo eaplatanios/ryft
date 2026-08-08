@@ -85,6 +85,7 @@
 //! [`Region`](crate::Region). Wrapper operation enums should provide family dispatch and forward to those
 //! payload rules.
 
+pub mod batching;
 pub mod elementwise;
 pub mod forward;
 pub mod hessian;
@@ -100,6 +101,7 @@ use thiserror::Error;
 use crate::parameters::ParameterError;
 use crate::programs::{ProgramError, TypeError};
 
+pub use batching::CotangentBatchingPolicy;
 pub use elementwise::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
     UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,
@@ -118,7 +120,7 @@ pub use jacobian::{
     jacobian_forward_holomorphic_with_aux, jacobian_forward_with_aux, jacobian_reverse, jacobian_reverse_holomorphic,
     jacobian_reverse_holomorphic_with_aux, jacobian_reverse_with_aux,
 };
-pub use linear::{LinearCallBatchingPolicy, LinearCallOperation, ResidualZeroProvider};
+pub use linear::{LinearCallOperation, ResidualZeroProvider};
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, gradient, gradient_holomorphic,
     gradient_holomorphic_with_aux, gradient_with_aux, transpose_mixed_operation, transpose_projected_operation,
