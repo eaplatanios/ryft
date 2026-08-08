@@ -2844,6 +2844,23 @@ the plugin's `PadToStatic` legalization.
       diagnostic naming the operation; silent truncation or garbage propagation is an abort criterion.
 - [ ] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
       Phase 12 fixtures, proving one compiled specialization serves multiple runtime extents.
+- [ ] Add a dispatch-time bound-bucketing policy for input-derived extents as pure retained-JIT policy (2026-08-07).
+      XLA's bounded dynamism executes at the padded bound — kernel launch geometry, fusion shapes, and FLOPs are all
+      bound-sized, with masking preserving correctness — so a loose declared bound costs compute proportional to the
+      bound on every call; the same holds for the route-(b) static-plus-masks encoding. When the extent is known on
+      the host at dispatch time (tier-2 input-derived dimensions), round the observed extent up to a bucket (e.g.,
+      logarithmically spaced), compile one specialization per bucketed bound, and pad inputs to the bucket. This
+      bounds padding waste at the bucket ratio (2x worst case for power-of-two buckets) in exchange for log-many
+      compilations, requires no new semantics — it is a cache-key bound-tightening policy over the existing
+      retained-JIT machinery, with the bucket participating in cache identity — and matches standard practice in
+      serving stacks (e.g., TensorRT optimization profiles, sequence-length bucketing).
+- Gateway-split bucketing for *data-derived* extents is an explicit non-goal for this phase (recorded 2026-08-07): a
+  tier-3 extent is born on the device mid-program, so bucketed dispatch of the continuation would require splitting
+  the program at the gateway and reading the extent back to the host — a stream-stalling device-to-host
+  synchronization that breaks fusion across the split and multiplies executables per split point. Bound-padded
+  execution keeps one fused program with no synchronization, which wins for moderate bound-to-extent ratios. Revisit
+  only with a measured workload whose declared bounds are loose enough that padded compute dominates the
+  synchronization cost, and record that measurement here before designing anything.
 - [ ] Gate: bounded data-dependent programs compile and execute correctly on supported backends, padding effects are
       unobservable in every supported operation's results, unsupported operations fail before execution with exact
       diagnostics, and the route decision is recorded with its measured evidence.
