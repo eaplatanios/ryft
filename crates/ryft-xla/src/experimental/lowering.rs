@@ -17,17 +17,17 @@ use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SortDirection, SortOperation};
 use ryft_core::{
     AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AtomId,
-    AxisIndexOperation, BroadcastOperation, CaptureReference, CeilOperation, CollectiveKind, CollectiveOperation,
-    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation,
-    DataType, Dimension, DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate,
-    DimensionType, DimensionValue, DivOperation, DotOperation, Effect, Effects, ErfOperation, ExpOperation,
-    FloorOperation, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation, LogicalMesh,
-    LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation,
-    NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError, ReductionKind, RegionId,
-    RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType,
-    Typed, Value, WhileOperation,
+    AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CeilOperation, CollectiveKind,
+    CollectiveOperation, ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation,
+    CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
+    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DotOperation, Effect, Effects,
+    ErfOperation, ExpOperation, FloorOperation, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout,
+    LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType,
+    MinOperation, MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program,
+    ProgramError, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
+    TransposeOperation, Type as RyftType, Typed, Value, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
@@ -6108,7 +6108,7 @@ fn captured_prefix_values<'b, 'c: 'b, 't: 'c>(
         .regions()
         .iter()
         .flat_map(|region| region.atoms())
-        .filter_map(|atom| atom.as_constant().map(XlaConstant::index))
+        .filter_map(|atom| atom.as_constant().and_then(CaptureConstant::capture_index))
         .max()
         .map(|index| index + 1)
         .unwrap_or(0);
@@ -6458,7 +6458,9 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
         block,
         context,
         location,
-        |_, value, _block, _context, _location| lower_captured_constant(value, captured_values),
+        |atom_id, value, block, context, location| {
+            lower_constant(atom_id, value, captured_values, block, context, location)
+        },
         |instruction, inputs, block, context, location| {
             let input_types = instruction
                 .inputs()
@@ -6862,20 +6864,48 @@ fn lower_captured_constant<'b, 'c: 'b, 't: 'c, T: RyftType>(
         .ok_or(LoweringError::MissingCapturedConstant { index: value.index() })
 }
 
-/// Lowers a traced constant atom to a StableHLO constant operation and returns its result value.
-fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
-    _atom_id: AtomId,
-    value: &XlaConstant,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    _block: &mut B,
-    _context: &'c MlirContext<'t>,
-    _location: L,
+/// Lowers one first-class dimension extent to the scalar `i64` [`stablehlo.constant`](stable_hlo::constant) that
+/// represents a dimension in StableHLO. Immediate [`XlaConstant::Dimension`] atoms and staged
+/// [`DimensionOperation::Constant`](ryft_core::DimensionOperation::Constant) instructions must agree on this
+/// representation, and so both lowering paths route through this function.
+pub(crate) fn lower_dimension_extent<'b, 'c: 'b, 't: 'c, B, L>(
+    value: &DimensionValue,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
 where
     B: Block<'b, 'c, 't>,
     L: Copy + Location<'c, 't>,
 {
-    lower_captured_constant(value, captured_values)
+    let tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+    let extent = i64::try_from(value.extent()).map_err(|_| LoweringError::UnsupportedOp {
+        op: format!("first-class dimension extent {} does not fit in an i64", value.extent()),
+    })?;
+    let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, extent, context)?;
+    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
+    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+}
+
+/// Lowers a traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden capture
+/// argument that carries its runtime value, while an immediate dimension extent is materialized in place — which is
+/// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
+fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
+    _atom_id: AtomId,
+    value: &XlaConstant,
+    captured_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    match value {
+        XlaConstant::Captured(value) => lower_captured_constant(value, captured_values),
+        XlaConstant::Dimension(value) => lower_dimension_extent(value, block, context, location),
+    }
 }
 
 /// Lowers one production composite XLA operation while preserving the enclosing lowering state.
@@ -9072,7 +9102,7 @@ mod tests {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
-        let capture = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
+        let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -9102,7 +9132,7 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
-        let output = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
+        let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -9129,7 +9159,7 @@ mod tests {
         let array_type = test_vector_type(4);
         let branch = || {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let output = builder.add_constant(XlaConstant::new(0, array_type.clone().into()));
+            let output = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
                 .unwrap()

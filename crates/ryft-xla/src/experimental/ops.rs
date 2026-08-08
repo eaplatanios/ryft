@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::fmt::Display;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -16,33 +18,200 @@ use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
     ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
     BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver,
-    CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
+    CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
     ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
     CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation, DimensionOperation,
     DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
     DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation,
-    IotaOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
+    GatherOperation, IotaOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
+    PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ReduceOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
-    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type,
-    TypeError, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, RegionInterface, RegionSlot, RemOperation,
+    ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
+use ryft_macros::Parameter;
 
 use crate::experimental::operations::ShardMapOperation;
 
 /// Lifetime-free reference to an array member captured by an XLA program.
 pub type XlaArrayConstant = CaptureReference<ArrayType>;
 
-/// Production XLA program constant.
-pub type XlaConstant = CaptureReference<ArrayIrType>;
+/// Constant payload stored in the atom table of a staged XLA [`Program`].
+///
+/// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
+/// [`ArrayIrValue`] universe:
+///
+///   - **Captured array data:** the runtime buffer stays in the surrounding compiled function's capture table and the
+///     program stores only a lifetime-free [`CaptureReference`] to it. This keeps device buffers on-device, keeps the
+///     IR compact, and lets one compiled executable serve any captured value of a given type.
+///   - **Immediate first-class dimensions:** a [`DimensionValue`] is a checked host integer, so embedding it costs
+///     nothing and it lowers to a scalar `stablehlo.constant`. Unlike a capture reference it also stays usable inside
+///     a nested region — most importantly a `shard_map` manual computation, which owns no capture table of its own —
+///     and that is what lets shape arithmetic such as the explicit result extents of the collectives be staged
+///     against a manual region's shard-local values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub enum XlaConstant {
+    /// Reference to a value held in the surrounding compiled function's capture table.
+    Captured(CaptureReference<ArrayIrType>),
+
+    /// Immediate checked host-side first-class dimension extent.
+    Dimension(DimensionValue),
+}
+
+impl Display for XlaConstant {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Captured(value) => Display::fmt(value, formatter),
+            Self::Dimension(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl Typed for XlaConstant {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        match self {
+            Self::Captured(value) => value.r#type(),
+            Self::Dimension(value) => Cow::Owned(ArrayIrType::Dimension(value.r#type().into_owned())),
+        }
+    }
+}
+
+impl Value for XlaConstant {
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
+
+    #[inline]
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn rename_type_identities(
+        &self,
+        renaming: &TypeIdentityRenaming<<ArrayIrType as Type>::Identity>,
+    ) -> Result<Self, TypeError> {
+        match self {
+            Self::Captured(value) => Ok(Self::Captured(value.rename_type_identities(renaming)?)),
+            Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
+        }
+    }
+}
+
+impl CaptureConstant for XlaConstant {
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        match self {
+            Self::Captured(value) => Some(value.index()),
+            Self::Dimension(_) => None,
+        }
+    }
+
+    #[inline]
+    fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
+        match self {
+            Self::Captured(value) => Self::Captured(value.map_capture_index(map)),
+            Self::Dimension(value) => Self::Dimension(value.clone()),
+        }
+    }
+}
+
+impl ValueProjection<ArrayType> for XlaConstant {
+    type Projected = XlaArrayConstant;
+    type ProjectedRef<'v> = ProjectedValue<ArrayType, &'v Self>;
+
+    #[inline]
+    fn from_projected(value: XlaArrayConstant) -> Self {
+        Self::Captured(ValueProjection::<ArrayType>::from_projected(value))
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        ArrayType: 'v,
+    {
+        Ok(ProjectedValue::new(self, <&ArrayType>::try_from(self.r#type().as_ref())?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<XlaArrayConstant, TypeError> {
+        match self {
+            Self::Captured(value) => value.into_projected(),
+            Self::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
+        }
+    }
+}
+
+impl ValueProjection<DimensionType> for XlaConstant {
+    type Projected = DimensionValue;
+    type ProjectedRef<'v> = &'v DimensionValue;
+
+    #[inline]
+    fn from_projected(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<&'v DimensionValue, TypeError>
+    where
+        DimensionType: 'v,
+    {
+        match self {
+            Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Dimension(value) => Ok(value),
+        }
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<DimensionValue, TypeError> {
+        match self {
+            Self::Captured(_) => Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+            Self::Dimension(value) => Ok(value),
+        }
+    }
+}
+
+impl From<CaptureReference<ArrayIrType>> for XlaConstant {
+    #[inline]
+    fn from(value: CaptureReference<ArrayIrType>) -> Self {
+        Self::Captured(value)
+    }
+}
+
+impl From<DimensionValue> for XlaConstant {
+    #[inline]
+    fn from(value: DimensionValue) -> Self {
+        Self::Dimension(value)
+    }
+}
+
+/// A captured constant is a reference into a side table rather than the concrete predicate value itself, and an
+/// immediate dimension is an extent rather than Boolean array data, and so neither variant can be read back as a
+/// concrete predicate. Control-flow staging must keep predicates in the IR or add a transform-specific rule instead.
+impl Concretizable<bool> for XlaConstant {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        Err(ProgramError::Concretization {
+            message: format!("cannot extract a concrete boolean from the staged xla constant `{self}`"),
+        })
+    }
+}
 
 /// Ordinary staged-operation universe owned by the XLA backend.
 ///
@@ -949,8 +1118,8 @@ mod tests {
     use std::rc::Rc;
 
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, ConditionOperation, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, ConditionOperation,
+        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh,
         MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder,
         RegionDriver, RegionInterface, RegionRef, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext,
@@ -1296,7 +1465,8 @@ mod tests {
         let source = {
             let mut builder = XlaProgramBuilder::new();
             let value = builder.add_input(value_program_type.clone());
-            let predicate = builder.add_constant(XlaConstant::new(0, predicate_program_type.clone()));
+            let predicate =
+                builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value, predicate],
@@ -1351,7 +1521,7 @@ mod tests {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
-            let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
+            let literal = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, r#type.clone())));
             let shifted =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, literal]).unwrap()[0];
             let scaled =

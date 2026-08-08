@@ -1029,11 +1029,12 @@ mod tests {
     use std::ops::{Deref, DerefMut};
 
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayType, Context, DataType, DifferentiableType, DifferentiationError, Dimension,
-        DimensionBounds, DimensionType, DimensionVariable, DomainTracingContext, Effects, EmptyRegionDriver,
-        LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, Program,
-        RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
-        TransposableOperation, TranspositionDriver, TypeError, Typed,
+        AddOperation, ArrayIrType, ArrayType, CaptureReference, Context, DataType, DifferentiableType,
+        DifferentiationError, Dimension, DimensionBounds, DimensionType, DimensionVariable, DomainTracingContext,
+        Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation,
+        PartialValue, Placeholder, Program, RegionDriver, RegionInterface, RegionRef, Shape, Sharding,
+        ShardingDimension, StagingContext, TracingContext, TransposableOperation, TranspositionDriver, TypeError,
+        Typed,
     };
 
     use crate::experimental::domains::XlaDomain;
@@ -1327,7 +1328,10 @@ mod tests {
         let source = {
             let mut builder = XlaProgramBuilder::new();
             let value = builder.add_input(value_type.clone());
-            let predicate = builder.add_constant(XlaConstant::new(0, ArrayIrType::Array(predicate_type.clone())));
+            let predicate = builder.add_constant(XlaConstant::Captured(CaptureReference::new(
+                0,
+                ArrayIrType::Array(predicate_type.clone()),
+            )));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value, predicate],

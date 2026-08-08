@@ -335,7 +335,13 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<XlaProgramValue<'c>, XlaOperation, XlaProgramConstants<In>, XlaSourceProgramOutput<Out>> {
+    ) -> &ClosedProgram<
+        XlaProgramValue<'c>,
+        XlaConstant,
+        XlaOperation,
+        XlaProgramConstants<In>,
+        XlaSourceProgramOutput<Out>,
+    > {
         self.function.source_program()
     }
 
@@ -654,7 +660,13 @@ where
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &ClosedProgram<XlaProgramValue<'c>, XlaOperation, XlaProgramConstants<In>, XlaSourceProgramOutput<Out>> {
+    ) -> &ClosedProgram<
+        XlaProgramValue<'c>,
+        XlaConstant,
+        XlaOperation,
+        XlaProgramConstants<In>,
+        XlaSourceProgramOutput<Out>,
+    > {
         self.function.source_program()
     }
 

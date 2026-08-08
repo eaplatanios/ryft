@@ -347,12 +347,18 @@ impl<'c> Domain for XlaDomain<'c> {
 }
 
 impl<'c> Context for XlaDomain<'c> {
-    /// [`XlaConstant`] is a [`CaptureReference`](ryft_core::captures::CaptureReference) — a symbolic index into a
-    /// compiled function's capture table carrying only a type and no data — so there is nothing to materialize
-    /// without the surrounding capture table and lifting is always rejected.
+    /// An immediate [`XlaConstant::Dimension`] extent is a checked host integer and materializes directly. A
+    /// [`XlaConstant::Captured`] payload is a symbolic index into a compiled function's capture table carrying only a
+    /// type and no data, so there is nothing to materialize without the surrounding capture table and lifting it is
+    /// always rejected.
     fn lift(&self, constant: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
-        Err(TypeError::invalid(format!("xla captured constant {constant} requires a captured program capture table"))
-            .into())
+        match constant {
+            XlaConstant::Captured(constant) => Err(TypeError::invalid(format!(
+                "xla captured constant {constant} requires a captured program capture table"
+            ))
+            .into()),
+            XlaConstant::Dimension(value) => Ok(ArrayIrValue::Dimension(value)),
+        }
     }
 
     /// Eagerly executes `operation` on concrete input [`Array`]s, mirroring JAX's op-by-op dispatch: the operation
@@ -411,11 +417,12 @@ impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
     }
 }
 
-/// [`XlaConstant`] is a [`CaptureReference`](ryft_core::captures::CaptureReference) carrying only a type and no
-/// data, so — exactly like [`Context::lift`], to which this delegates — captured-constant materialization is always
-/// rejected outside a surrounding capture table. The implementation exists because interpretation- and
-/// batching-capable operation families require a [`Constant`] leaf on their contexts; programs whose constants were
-/// compiled into capture tables never take this path.
+/// Materialization delegates to [`Context::lift`] and therefore shares its semantics: an immediate
+/// [`XlaConstant::Dimension`] extent materializes directly as a host-side dimension value, while a
+/// [`XlaConstant::Captured`] payload carries only a type and no data and is always rejected outside a surrounding
+/// capture table. The implementation exists because interpretation- and batching-capable operation families require a
+/// [`Constant`] leaf on their contexts; programs whose constants were compiled into capture tables never take the
+/// captured path.
 impl<'c> Constant<ArrayIrValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
     fn constant(&self, value: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
         self.lift(value)

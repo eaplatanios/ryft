@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use crate::arrays::{
     ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, Dimension, DimensionType, DimensionVariable,
 };
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
+use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
@@ -14,8 +14,6 @@ use crate::programs::{
     Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`CustomCallOperation`].
 pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
@@ -150,10 +148,15 @@ impl Display for CustomCallInputOutputAlias {
 /// the executing PJRT client under the same target name (e.g., via `ryft-pjrt`'s `Client::register_ffi_handler`).
 /// The reference array backend cannot execute foreign kernels, so eager interpretation on it reports an error.
 ///
-/// Because the kernel is opaque, the operation has no differentiation or batching rules: differentiating it reports
-/// an error directing users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
-/// [`custom_vjp`](crate::tracing_v2::CustomVjp), and batching it reports an error (invoke a kernel that understands
-/// the batch axis instead). Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect)
+/// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error
+/// directing users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
+/// [`custom_vjp`](crate::tracing_v2::CustomVjp), which supply the missing derivative. Those wrappers do *not* supply
+/// a batching rule: each of them structurally batches its own primal region, so a mapped operand reaches this same
+/// operation and meets this same batching contract. Batching a call whose operands are all replicated binds it
+/// unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand
+/// instead reports an error naming that operand, and the remedies are to invoke a kernel that already understands
+/// the batch axis or to select an explicit batching behavior for this call.
+/// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect)
 /// reports [`Effect::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its
 /// execution order relative to other ordered effects; the lowered custom call is then also marked
 /// `has_side_effect = true` so the XLA compiler never elides or reorders it.
@@ -293,6 +296,20 @@ impl<T: Type> CustomCallOperation<T> {
             has_side_effect: self.has_side_effect,
             marker: PhantomData,
         })
+    }
+
+    /// Returns the [`BatchingError`] reported when operand `index` carries the mapped `batch_axis` and this call has
+    /// no way to thread that axis through its opaque kernel.
+    fn mapped_operand_error(&self, index: usize, batch_axis: BatchAxis) -> BatchingError {
+        BatchingError::UnsupportedOperation {
+            message: format!(
+                "custom call '{}' has no batching rule for operand {index} mapped at batch axis {}; invoke a kernel \
+                 that understands the batch axis, or select an explicit batching behavior with \
+                 `CustomCallOperation::with_batching`",
+                self.target_name,
+                batch_axis.axis().map(|axis| axis.to_string()).unwrap_or_else(|| "replicated".to_string()),
+            ),
+        }
     }
 
     /// Renders this payload independently of its homogeneous or composite operation contract.
@@ -567,24 +584,39 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-/// Foreign kernels are opaque, so there is no batching rule to derive: batching reports an error, and callers
-/// should invoke a kernel that understands the batch axis instead.
+/// Batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how a batch axis
+/// threads through it. A call whose operands are *all replicated* is nevertheless bound unchanged through the parent
+/// context and reports replicated outputs, matching JAX, which only invokes a batching rule once some operand is
+/// actually mapped. Any mapped operand reports a [`BatchingError::UnsupportedOperation`] that names the operand and
+/// its mapped axis.
+///
+/// The all-replicated shortcut is sound *for this operation specifically* because a custom call is region-free by
+/// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf whose only
+/// observable inputs are its operands. A foreign kernel therefore cannot observe the transform's named axis, and
+/// running it unchanged over replicated operands computes exactly what each batch item would have computed on its
+/// own. The shortcut must never be generalized to region-carrying operations. A region can contain a named-axis
+/// operation whose value differs per batch item even when every operand of the enclosing instruction is replicated;
+/// `.tasks/plan_custom_derivative_batching_axis_parity.md` records the pinning JAX fixture for that counterexample
+/// (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still produces `[0, 1, 2]`), which is why
+/// the custom-derivative wrappers always batch their regions structurally.
 impl<C: Context, P: BatchingPolicy<C>> BatchableOperation<C, P> for CustomCallOperation<C::Type>
 where
+    C::Operation: From<CustomCallOperation<C::Type>>,
     CustomCallOperation<C::Type>: Operation<Type = C::Type>,
 {
     fn batch<D: BatchingDriver<C, P>>(
         &self,
-        _context: &BatchingContext<C, P>,
+        context: &BatchingContext<C, P>,
         _driver: &D,
-        _inputs: &[P::Batch],
+        inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "custom call '{}' has no batching rule; invoke a kernel that understands the batch axis instead",
-                self.target_name,
-            ),
-        })
+        if let Some((index, batch)) = inputs.iter().enumerate().find(|(_, input)| !P::batch_axis(input).is_replicated())
+        {
+            return Err(self.mapped_operand_error(index, P::batch_axis(batch)));
+        }
+        let inputs = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
+        let outputs = context.parent().bind(self.clone(), Vec::new(), inputs.as_slice())?;
+        Ok(outputs.into_iter().map(P::replicated).collect())
     }
 }
 

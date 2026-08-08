@@ -14,7 +14,7 @@ use super::{
     CollectiveLoweringState, EffectTokens, LowerableXlaOperation, LoweringError, MlirLowerableValue, PlainMlirLowerer,
     PlainMlirLoweringMode, broadcast_changes_explicit_sharding, lower_all_gather_to_mlir, lower_all_to_all_to_mlir,
     lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
-    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion,
+    lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dimension_requirement_to_assertion, lower_pad_to_mlir, lower_psum_scatter_to_mlir,
     lower_rng_bit_generator_to_mlir, lower_sharding_constraint, lower_static_index_constants, lower_tensor_type,
     reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
@@ -306,11 +306,7 @@ where
                     if !input_values.is_empty() {
                         return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                     }
-                    let tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-                    let extent = i64::try_from(operation.value().extent()).unwrap();
-                    let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, extent, context)?;
-                    let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-                    Ok(vec![constant.result(0).unwrap().as_ref()])
+                    Ok(vec![lower_dimension_extent(operation.value(), block, context, location)?])
                 }
                 DimensionOperation::Add(_)
                 | DimensionOperation::Sub(_)
