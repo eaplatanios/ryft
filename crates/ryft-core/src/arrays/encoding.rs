@@ -44,6 +44,39 @@ use crate::programs::{ProgramError, TypeError};
 /// [DLPack v1.x](https://dmlc.github.io/dlpack/latest/index.html) data-type standard and whose
 /// rounding conversions to and from [`f32`] and [`f64`] follow [`ml_dtypes`](https://github.com/jax-ml/ml_dtypes),
 /// the reference implementation of these formats.
+///
+/// # Conversions
+///
+/// [`ArrayElement`] also owns the element interchange contract that all array casting is built on. Rather than defining
+/// one conversion per ordered pair of element types, every element type declares how to build itself from each of the
+/// following four _interchange categories_, and which category carries it as a source:
+///
+///   - Signed integers are carried by [`i64`] and conversion is handled by [`Self::from_signed`].
+///   - Unsigned integers and Booleans are carried by [`u64`] and conversion is handled by [`Self::from_unsigned`].
+///   - Real floating-point values are carried by [`f64`] and conversion is handled by [`Self::from_real`].
+///   - Complex values are carried by [`Complex<f64>`] and conversion is handled by [`Self::from_complex`].
+///
+/// ## Losslessness
+///
+/// Routing through a category carrier never loses information, because each carrier is an exact superset of every
+/// source type in its category: every signed integer element type (i.e., [`i1`] through [`i64`]) is exactly
+/// representable in [`i64`], every unsigned integer element type (i.e., [`u1`] through [`u64`]) and [`bool`] is exactly
+/// representable in [`u64`], every real floating-point element type (i.e., the sub-byte and one-byte formats, [`bf16`],
+/// [`f16`](struct@f16), [`f32`], and [`f64`]) widens to [`f64`] exactly because widening between IEEE binary formats
+/// with strictly more exponent and mantissa bits is exact, and both complex element types are exactly representable in
+/// [`Complex<f64>`]. The destination therefore always receives the exact source value and performs the single rounding,
+/// truncation, or saturation step itself, so a routed conversion is bit-identical to a handwritten direct conversion
+/// between the same pair of element types. In particular, no double rounding is possible (the carrier step is exact by
+/// construction and so there is only ever one inexact step).
+///
+/// ## Cost
+///
+/// [`ArrayElement::convert_to`] is generic in the destination element type, so the compiler monomorphizes it once per
+/// `(source, destination)` pair actually used and then inlines both halves. What remains after inlining is the widening
+/// no-op into the carrier followed by the destination's own direct conversion (i.e., exactly the instructions a
+/// handwritten pairwise conversion would emit). The routing therefore costs nothing at run time while keeping the
+/// source at four constructors plus one routing per element type instead of one body per ordered pair, which for the
+/// 32 element types below is 160 entry points instead of 1,024 pairwise bodies.
 pub trait ArrayElement: private::Codec {
     /// Returns the [`DataType`] represented by this element type.
     #[inline]
@@ -52,24 +85,52 @@ pub trait ArrayElement: private::Codec {
     }
 
     /// Writes this element's portable representation to an exactly sized byte slice.
-    fn encode(self, bytes: &mut [u8]);
-
-    /// Decodes one element from a byte slice whose length matches its portable representation.
-    fn decode(bytes: &[u8]) -> Self;
-}
-
-impl<T: private::Codec> ArrayElement for T {
     #[inline]
     fn encode(self, bytes: &mut [u8]) {
-        debug_assert_eq!(bytes.len(), T::BYTE_COUNT);
+        debug_assert_eq!(bytes.len(), <Self as private::Codec>::BYTE_COUNT);
         <Self as private::Codec>::encode_unchecked(self, bytes);
     }
 
+    /// Decodes one element from a byte slice whose length matches its portable representation.
     #[inline]
     fn decode(bytes: &[u8]) -> Self {
-        debug_assert_eq!(bytes.len(), T::BYTE_COUNT);
+        debug_assert_eq!(bytes.len(), <Self as private::Codec>::BYTE_COUNT);
         <Self as private::Codec>::decode_unchecked(bytes)
     }
+
+    /// Converts one value carried by the signed integer interchange category into this [`ArrayElement`] type.
+    /// The carrier holds the source value exactly, so this performs the conversion's only inexact step: integer
+    /// destinations narrow with two's-complement truncation, floating-point destinations round to nearest, and
+    /// Boolean destinations test for a nonzero value.
+    fn from_signed(value: i64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the unsigned integer interchange category, which also carries [`bool`] (i.e.,
+    /// `false` as `0` and `true` as `1`), into this element type. The carrier holds the source value exactly, so this
+    /// performs the conversion's only inexact step.
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the real floating-point interchange category into this [`ArrayElement`] type. The
+    /// carrier holds the source value exactly, so this performs the conversion's only inexact step: floating-point
+    /// destinations round to nearest and saturate or fail according to their own format contract, and integer
+    /// destinations truncate toward zero.
+    fn from_real(value: f64) -> Result<Self, ProgramError>;
+
+    /// Converts one value carried by the complex interchange category into this [`ArrayElement`] type. The default
+    /// projects the value onto its real component and discards the imaginary one, which is the conversion contract for
+    /// every destination that cannot hold an imaginary part; the complex and Boolean element types override it to keep
+    /// both components.
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Self::from_real(value.re)
+    }
+
+    /// Converts this [`ArrayElement`] into `Output` by widening it into its own interchange category's carrier
+    /// and handing that carrier to the corresponding `Output` constructor. Both halves are exact-then-inexact by
+    /// construction, and so the result is bit-identical to a handwritten direct conversion from `Self` to `Output`.
+    /// Refer to the trait documentation's [Conversions](ArrayElement#conversions) section. Because this function is
+    /// generic in `Output`, the compiler monomorphizes it per `(Self, Output)` pair and inlines both halves, leaving
+    /// a widening no-op followed by `Output`'s direct conversion (i.e., the same code a pairwise implementation would
+    /// produce).
+    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError>;
 }
 
 mod private {
@@ -1015,6 +1076,274 @@ impl private::Codec for Complex<f64> {
         Self::new(f64::decode(&bytes[..8]), f64::decode(&bytes[8..]))
     }
 }
+
+// The element interchange implementations below complete `ArrayElement` for every element type. Each one declares
+// how the type is built from the four interchange carriers and which carrier it widens into as a source, per the
+// `Conversions` section of the trait's documentation.
+
+// The Boolean element type carries `false` as `0` and `true` as `1`, and reads back as "the value is nonzero" from
+// every category. Complex sources are true when either component is nonzero, so the imaginary part is not discarded.
+impl ArrayElement for bool {
+    #[inline]
+    fn from_signed(value: i64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+        Ok(value != 0)
+    }
+
+    #[inline]
+    fn from_real(value: f64) -> Result<Self, ProgramError> {
+        Ok(value != 0.0)
+    }
+
+    #[inline]
+    fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+        Ok(value.re != 0.0 || value.im != 0.0)
+    }
+
+    #[inline]
+    fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+        Output::from_unsigned(u64::from(self))
+    }
+}
+
+// Implements the interchange contract for the checked signed sub-byte integer element types. Conversions into them
+// narrow modularly into the declared bit width, and conversions out of them widen their sign-extended native value
+// exactly into `i64`.
+macro_rules! impl_array_element_for_signed_sub_byte_integer_types {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                let bit_mask = Self::MIN.to_bits() | Self::MAX.to_bits();
+                Ok(Self::from_bits(value as i8 as u8 & bit_mask).unwrap())
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_signed(i64::from(self.value()))
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_signed_sub_byte_integer_types!(i1, i2, i4);
+
+// Implements the interchange contract for the checked unsigned sub-byte integer element types. Conversions into them
+// narrow modularly into the declared bit width, and conversions out of them widen their native value exactly into
+// `u64`.
+macro_rules! impl_array_element_for_unsigned_sub_byte_integer_types {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::from_bits(value as u8 & Self::MAX.to_bits()).unwrap())
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_unsigned(u64::from(self.value()))
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_unsigned_sub_byte_integer_types!(u1, u2, u4);
+
+// Implements the interchange contract for native integer element types. Conversions into them use Rust's `as`
+// semantics, which are also the reference backend's C-style narrowing and truncation contract, while conversions out
+// of them widen exactly into `$carrier`, the carrier of the `$route` category.
+macro_rules! impl_array_element_for_integer_types {
+    ($carrier:ty, $route:ident, $($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(value as Self)
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::$route(self as $carrier)
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_integer_types!(i64, from_signed, i8, i16, i32, i64);
+impl_array_element_for_integer_types!(u64, from_unsigned, u8, u16, u32, u64);
+
+// Implements the interchange contract for the low-precision floating-point element types. Conversions into them go
+// through each format's own checked rounding contract, which is also where an unrepresentable value (such as zero in
+// `f8e8m0fnu`) is rejected, and conversions out of them widen exactly into `f64`.
+macro_rules! impl_array_element_for_low_precision_floating_point_types {
+    ($($type:ty),+ $(,)?) => {$(
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value as f64)?)
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value as f64)?)
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::from_f64(value)?)
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real(self.to_f64())
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_low_precision_floating_point_types!(
+    f4e2m1fn,
+    f6e2m3fn,
+    f6e3m2fn,
+    f8e3m4,
+    f8e4m3,
+    f8e4m3fn,
+    f8e4m3fnuz,
+    f8e4m3b11fnuz,
+    f8e5m2,
+    f8e5m2fnuz,
+    f8e8m0fnu,
+);
+
+// Implements the interchange contract for the native and half-precision real floating-point element types,
+// whose widening into `f64` (i.e., `$to_real`) is exact for every one of them.
+macro_rules! impl_array_element_for_floating_point_type {
+    ($type:ty, $from_signed:expr, $from_unsigned:expr, $from_real:expr, $to_real:expr $(,)?) => {
+        impl ArrayElement for $type {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok($from_signed(value))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok($from_unsigned(value))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok($from_real(value))
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_real($to_real(self))
+            }
+        }
+    };
+}
+
+impl_array_element_for_floating_point_type!(
+    bf16,
+    |value: i64| bf16::from_f64(value as f64),
+    |value: u64| bf16::from_f64(value as f64),
+    bf16::from_f64,
+    bf16::to_f64,
+);
+
+impl_array_element_for_floating_point_type!(
+    f16,
+    |value: i64| f16::from_f64(value as f64),
+    |value: u64| f16::from_f64(value as f64),
+    f16::from_f64,
+    f16::to_f64,
+);
+
+impl_array_element_for_floating_point_type!(
+    f32,
+    |value: i64| value as f32,
+    |value: u64| value as f32,
+    |value: f64| value as f32,
+    f64::from,
+);
+
+impl_array_element_for_floating_point_type!(
+    f64,
+    |value: i64| value as f64,
+    |value: u64| value as f64,
+    |value| value,
+    |value| value,
+);
+
+// Implements the interchange contract for the complex element types, which place a real source in the real component
+// and preserve both components of a complex source.
+macro_rules! impl_array_element_for_complex_types {
+    ($($component:ty),+ $(,)?) => {$(
+        impl ArrayElement for Complex<$component> {
+            #[inline]
+            fn from_signed(value: i64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_unsigned(value: u64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_real(value: f64) -> Result<Self, ProgramError> {
+                Ok(Self::new(value as $component, 0.0))
+            }
+
+            #[inline]
+            fn from_complex(value: Complex<f64>) -> Result<Self, ProgramError> {
+                Ok(Self::new(value.re as $component, value.im as $component))
+            }
+
+            #[inline]
+            fn convert_to<Output: ArrayElement>(self) -> Result<Output, ProgramError> {
+                Output::from_complex(Complex::new(self.re as f64, self.im as f64))
+            }
+        }
+    )+};
+}
+
+impl_array_element_for_complex_types!(f32, f64);
 
 /// Encodes `elements`, provided in logical row-major order, into a new physical storage buffer for `r#type`. A missing
 /// [`Layout`](crate::arrays::Layout) means dense row-major storage, while explicit strided and tiled layouts determine
