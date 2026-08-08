@@ -20,7 +20,6 @@ use crate::arrays::encoding::{
     f8e5m2fnuz, f8e8m0fnu, i1, i2, i4, u1, u2, u4,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::manipulation::ElementConversionTarget;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::StaticShape;
@@ -1616,7 +1615,7 @@ impl std::ops::Mul<f64> for Array {
     fn mul(self, rhs: f64) -> Self::Output {
         let data_type = self.r#type().data_type();
         let factor = dispatch_on_array_element_type!(data_type, |Element| {
-            Self::scalar(<Element as ElementConversionTarget>::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
+            Self::scalar(Element::from_real(rhs).unwrap_or_else(|error| panic!("{error}")))
         });
         Mul::mul(&self, &factor).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -1637,7 +1636,10 @@ macro_rules! impl_array_unary_math {
             fn $method(&self) -> Result<Self, ProgramError> {
                 if Self::element_count(self.r#type().as_ref()) == 0 {
                     let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
+                    return Ok(Self::new_unchecked(
+                        self.r#type().into_owned(),
+                        Arc::new(vec![0; addressing.storage_byte_len()]),
+                    ));
                 }
                 let data_type = self.r#type().data_type();
                 if !data_type.is_floating_point() && !data_type.is_complex() {
@@ -1670,7 +1672,10 @@ macro_rules! impl_array_unary_math {
             fn $method(&self) -> Result<Self, ProgramError> {
                 if Self::element_count(self.r#type().as_ref()) == 0 {
                     let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
+                    return Ok(Self::new_unchecked(
+                        self.r#type().into_owned(),
+                        Arc::new(vec![0; addressing.storage_byte_len()]),
+                    ));
                 }
                 let data_type = self.r#type().data_type();
                 if !data_type.is_floating_point() {
@@ -1691,7 +1696,10 @@ macro_rules! impl_array_unary_math {
             fn sign(&self) -> Result<Self, ProgramError> {
                 if Self::element_count(self.r#type().as_ref()) == 0 {
                     let addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-                    return Ok(Self::new_unchecked(self.r#type().into_owned(), Arc::new(vec![0; addressing.storage_byte_len()])));
+                    return Ok(Self::new_unchecked(
+                        self.r#type().into_owned(),
+                        Arc::new(vec![0; addressing.storage_byte_len()]),
+                    ));
                 }
                 let data_type = self.r#type().data_type();
                 if !data_type.is_signed() && !data_type.is_floating_point() && !data_type.is_complex() {

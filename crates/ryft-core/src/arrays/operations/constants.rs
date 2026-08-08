@@ -9,9 +9,9 @@
 use crate::arrays::arrays::Array;
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::dimensions::DimensionValue;
+use crate::arrays::encoding::ArrayElement;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::manipulation::ElementConversionTarget;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
@@ -401,7 +401,7 @@ impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
             DataType::Token => Err(TypeError::invalid("data type token cannot represent zero".to_string()).into()),
             DataType::Zero => Array::new(r#type.clone(), Vec::new()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = <Element as ElementConversionTarget>::from_unsigned(0)?;
+                let element = Element::from_unsigned(0)?;
                 Array::from_fn_elements(r#type.clone(), |_| Ok(element))
             }),
         }
@@ -413,7 +413,7 @@ impl ZeroLike for Array {
         match self.r#type().data_type() {
             DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = <Element as ElementConversionTarget>::from_unsigned(0).unwrap();
+                let element = Element::from_unsigned(0).unwrap();
                 Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
             }),
         }
@@ -427,7 +427,7 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
                 Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
             }
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = <Element as ElementConversionTarget>::from_unsigned(1)?;
+                let element = Element::from_unsigned(1)?;
                 Array::from_fn_elements(r#type.clone(), |_| Ok(element))
             }),
         }
@@ -439,7 +439,7 @@ impl OneLike for Array {
         match self.r#type().data_type() {
             DataType::Token | DataType::Zero => self.clone(),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = <Element as ElementConversionTarget>::from_unsigned(1).unwrap();
+                let element = Element::from_unsigned(1).unwrap();
                 Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
             }),
         }
@@ -478,9 +478,7 @@ impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> f
         let stride: usize = sizes[dimension + 1..].iter().product();
         let data_type = r#type.data_type();
         dispatch_on_array_element_type!(data_type, |Element| {
-            Array::from_fn_elements(r#type.clone(), |flat| {
-                <Element as ElementConversionTarget>::from_unsigned(((flat / stride) % size) as u64)
-            })
+            Array::from_fn_elements(r#type.clone(), |flat| Element::from_unsigned(((flat / stride) % size) as u64))
         })
     }
 }

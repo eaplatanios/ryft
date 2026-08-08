@@ -18,12 +18,11 @@ use crate::arrays::encoding::{
     u4, validate_storage_bytes,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::{ArrayOperation, ElementConversionTarget};
+use crate::arrays::operations::ArrayOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};
 use crate::contexts::EagerContext;
-use crate::operations::ConvertElementType;
 use crate::parameters::Parameter;
 use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 
@@ -248,6 +247,49 @@ impl Array {
         Ok(Self { r#type: output_type, bytes: Arc::new(output_bytes) })
     }
 
+    /// Creates a new array holding this array's elements converted into `data_type`, preserving the shape, the
+    /// physical layout, and every other component of the array's type. This is the foundational cast of the reference
+    /// backend: the [`ConvertElementType`](crate::operations::ConvertElementType) capability delegates to it, and so
+    /// does every kernel that promotes mixed-type operands through [`Array::promoted_to`].
+    ///
+    /// Conversion of an individual element is exactly [`ArrayElement::convert_to`], so the per-element semantics
+    /// (which category carries each source, which destination performs the single rounding, truncation, or
+    /// saturation step, and which formats reject a value outright) are the ones documented on that trait. Converting
+    /// an array to its own element data type shares the existing payload instead of copying it, and the token and
+    /// structural-zero data types have no elements to convert, so only that same-type no-op is accepted for them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `data_type`: Element [`DataType`] of the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either data type is [`DataType::Token`], if exactly one of them is [`DataType::Zero`], or
+    /// if any element has no representation in `data_type` (for example, converting a zero into `f8e8m0fnu`, which
+    /// cannot represent it).
+    pub fn converted_to(&self, data_type: DataType) -> Result<Self, ProgramError> {
+        let source_data_type = self.r#type.data_type();
+        if source_data_type.is_token() || data_type.is_token() {
+            return Err(TypeError::invalid("cannot convert values to or from the token data type".to_string()).into());
+        }
+        if source_data_type == data_type {
+            return Ok(self.clone());
+        }
+        if source_data_type.is_zero() || data_type.is_zero() {
+            return Err(TypeError::invalid("cannot convert values to or from the zero data type".to_string()).into());
+        }
+        let output_type = self.r#type.clone().with_data_type(data_type);
+        // The nested dispatch selects the concrete source and destination element types, which monomorphizes
+        // `convert_to` into the pair's direct conversion (refer to the documentation of
+        // [`ArrayElement::convert_to`]). Should a measured hot pair ever justify a bespoke kernel, it can be matched
+        // here ahead of the generic path without changing the element interchange contract.
+        dispatch_on_array_element_type!(source_data_type, |Input| {
+            dispatch_on_array_element_type!(data_type, |Output| {
+                self.map_elements::<Input, Output>(output_type, Input::convert_to::<Output>)
+            })
+        })
+    }
+
     /// Converts this array to the provided element data type, borrowing it unchanged when it already has that data
     /// type so that already-promoted operands keep their exact physical storage and layout. Kernels that promote
     /// mixed-type operands to a common element data type (which each kernel computes from its own type-inference
@@ -256,7 +298,7 @@ impl Array {
         if self.r#type.data_type() == data_type {
             Ok(Cow::Borrowed(self))
         } else {
-            Ok(Cow::Owned(self.convert_element_type(data_type)?))
+            Ok(Cow::Owned(self.converted_to(data_type)?))
         }
     }
 
@@ -1106,15 +1148,151 @@ mod tests {
     }
 
     #[test]
+    fn test_array_convert_element_type() {
+        // Every materialized element data type converts to every other one without falling back to a dynamic scalar
+        // representation. The common value one is exactly representable in every supported format.
+        let data_types = [
+            DataType::Boolean,
+            DataType::I1,
+            DataType::I2,
+            DataType::I4,
+            DataType::I8,
+            DataType::I16,
+            DataType::I32,
+            DataType::I64,
+            DataType::U1,
+            DataType::U2,
+            DataType::U4,
+            DataType::U8,
+            DataType::U16,
+            DataType::U32,
+            DataType::U64,
+            DataType::F4E2M1FN,
+            DataType::F6E2M3FN,
+            DataType::F6E3M2FN,
+            DataType::F8E3M4,
+            DataType::F8E4M3,
+            DataType::F8E4M3FN,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E4M3B11FNUZ,
+            DataType::F8E5M2,
+            DataType::F8E5M2FNUZ,
+            DataType::F8E8M0FNU,
+            DataType::BF16,
+            DataType::F16,
+            DataType::F32,
+            DataType::F64,
+            DataType::C64,
+            DataType::C128,
+        ];
+        for source_data_type in data_types {
+            let source = Array::from_f64s(array_type(source_data_type, &[1]), vec![1.0]);
+            for target_data_type in data_types {
+                let converted = source.converted_to(target_data_type).unwrap();
+                assert_eq!(converted.r#type().into_owned(), array_type(target_data_type, &[1]));
+            }
+        }
+
+        // Representative values pin Boolean truth, integer truncation and sub-byte modular narrowing.
+        let vector = Array::vector(vec![0.0, 1.5]);
+        assert_eq!(vector.converted_to(DataType::Boolean).unwrap(), Array::vector(vec![false, true]));
+        assert_eq!(vector.converted_to(DataType::I32).unwrap(), Array::vector(vec![0i32, 1]));
+        let signed = Array::from_elements(
+            array_type(DataType::I4, &[3]),
+            &[i4::new(-8).unwrap(), i4::new(-1).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            signed.converted_to(DataType::U2).unwrap().elements::<u2>(),
+            Ok(vec![u2::new(0).unwrap(), u2::new(3).unwrap(), u2::new(3).unwrap()]),
+        );
+        assert_eq!(
+            Array::from_elements(array_type(DataType::U4, &[1]), &[u4::new(15).unwrap()])
+                .unwrap()
+                .converted_to(DataType::I4)
+                .unwrap()
+                .elements::<i4>(),
+            Ok(vec![i4::new(-1).unwrap()]),
+        );
+
+        // Complex conversion preserves both components only for complex destinations and otherwise converts the real
+        // component, except that Boolean conversion observes whether either component is nonzero.
+        let complex = Array::vector(vec![ComplexNumber::new(0.0f32, 2.0), ComplexNumber::new(-1.5, 0.0)]);
+        assert_eq!(complex.converted_to(DataType::Boolean).unwrap().elements::<bool>(), Ok(vec![true, true]),);
+        assert_eq!(complex.converted_to(DataType::I32).unwrap().elements::<i32>(), Ok(vec![0, -1]),);
+        assert_eq!(
+            complex.converted_to(DataType::C128).unwrap().elements::<ComplexNumber<f64>>(),
+            Ok(vec![ComplexNumber::new(0.0, 2.0), ComplexNumber::new(-1.5, 0.0)]),
+        );
+
+        // Conversions into low-precision floating-point element types produce exact encodings, including their
+        // format-specific fallible cases.
+        let low_precision = vector.converted_to(DataType::F8E5M2).unwrap();
+        assert_eq!(low_precision.elements::<f8e5m2>().unwrap()[1].to_bits(), 0x3e);
+        assert_eq!(
+            Array::scalar(1e9f64).converted_to(DataType::F8E4M3FN).unwrap().elements::<f8e4m3fn>().unwrap()[0]
+                .to_bits(),
+            0x7f,
+        );
+        assert!(matches!(
+            Array::scalar(0.0f64).converted_to(DataType::F8E8M0FNU),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "data type f8e8m0fnu cannot represent zero",
+        ));
+
+        // Cross-type conversion traverses the logical order selected by the input layout and preserves the same
+        // physical-layout descriptor on its output type.
+        let input_type = array_type(DataType::F64, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let converted = Array::from_elements(input_type, &[1.9f64, -2.9]).unwrap().converted_to(DataType::I32).unwrap();
+        assert_eq!(
+            converted.r#type().into_owned(),
+            array_type(DataType::I32, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16]))),
+        );
+        assert_eq!(converted.elements::<i32>(), Ok(vec![1, -2]));
+        assert_eq!(converted.storage_bytes().len(), 20);
+
+        // Same-type conversion shares the original bytes, preserving NaN payloads and every unoccupied layout byte.
+        let nan = Array::vector(vec![f32::from_bits(0x7fc0_1234)]);
+        let unchanged = nan.converted_to(DataType::F32).unwrap();
+        assert!(Arc::ptr_eq(nan.shared_storage(), unchanged.shared_storage()));
+        assert_eq!(unchanged.storage_bytes(), nan.storage_bytes());
+
+        // Token conversion is always rejected. Structural-zero conversion is valid only when it is a same-type no-op.
+        assert!(matches!(
+            vector.converted_to(DataType::Token),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the token data type",
+        ));
+        let token = Array::from_logical_bytes(array_type(DataType::Token, &[1]), &[]).unwrap();
+        assert!(matches!(
+            token.converted_to(DataType::Token),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the token data type",
+        ));
+        let zero = Array::from_logical_bytes(array_type(DataType::Zero, &[2]), &[]).unwrap();
+        assert_eq!(zero.converted_to(DataType::Zero), Ok(zero.clone()));
+        assert!(matches!(
+            vector.converted_to(DataType::Zero),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the zero data type",
+        ));
+        assert!(matches!(
+            zero.converted_to(DataType::F32),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot convert values to or from the zero data type",
+        ));
+    }
+
+    #[test]
     fn test_array_encoding_fidelity() {
         // Conversions and arithmetic on low-precision floating-point arrays operate on genuine encodings: the payload
         // round-trips through the exact bit patterns rather than an `f64` pun.
         let array = Array::from_f64s(array_type(DataType::F8E8M0FNU, &[2]), vec![2.0, 0.5]);
         assert_eq!(array.elements::<f8e8m0fnu>().unwrap()[0].to_bits(), 0x80);
         assert_eq!(array.elements::<f8e8m0fnu>().unwrap()[1].to_bits(), 0x7e);
-        let converted = array.convert_element_type(DataType::BF16).unwrap();
+        let converted = array.converted_to(DataType::BF16).unwrap();
         assert_eq!(converted.to_f64s(), vec![2.0, 0.5]);
-        let round_trip = converted.convert_element_type(DataType::F8E8M0FNU).unwrap();
+        let round_trip = converted.converted_to(DataType::F8E8M0FNU).unwrap();
         assert_eq!(round_trip, array);
     }
 }

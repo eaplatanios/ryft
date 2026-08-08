@@ -274,7 +274,7 @@ impl Select for Array {
         // the three operand shapes broadcast together, and the two branch data types promote together to the output
         // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
         // acts as a mask rather than promoting into the output.
-        assert_eq!(condition.r#type().data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
+        assert_eq!(condition.r#type().data_type(), DataType::Boolean, "select condition must have a Boolean data type");
         let output_type = ArrayType::broadcasted(&[
             condition.r#type().into_owned().with_data_type(on_true.r#type().data_type()),
             on_true.r#type().into_owned(),

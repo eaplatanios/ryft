@@ -68,8 +68,6 @@ mod sharding;
 mod sort;
 mod tag;
 
-pub(crate) use manipulation::ElementConversionTarget;
-
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
