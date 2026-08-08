@@ -1273,20 +1273,37 @@ where
                 .map(|output_atom| {
                     // Atoms not connected to an input tangent (i.e., constants and dead inputs)
                     // take a structural zero typed with the atom's tangent boundary type.
+                    let primal =
+                        primals[output_atom.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: output_atom })?;
                     let tangent = match &tangents[output_atom.index()] {
                         Some(tangent) => tangent.clone(),
-                        None => MaybeZero::Zero(
-                            primals[output_atom.index()]
-                                .as_ref()
-                                .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-                                .r#type()
-                                .tangent(),
-                        ),
+                        None => MaybeZero::Zero(primal.r#type().tangent()),
                     };
                     if tangent.r#type().is_zero_space() {
                         Ok(None)
                     } else {
-                        Ok(Some(tangent.materialize(&context)?.atom_id()?))
+                        // A structural zero tangent has to become a real boundary value here. Its type alone cannot
+                        // construct it when it references runtime identities, so the operation family's residual
+                        // protocol reads the missing extents from the output's own primal, which is a live value of
+                        // the same shape. An identity-free tangent type declares no residuals and therefore stages
+                        // exactly the nullary zero it staged before.
+                        let tangent = match tangent {
+                            MaybeZero::Value(tangent) => tangent,
+                            MaybeZero::Zero(tangent_type) => {
+                                let residuals = capture_and_validate_zero_residual_values(
+                                    &context,
+                                    primal,
+                                    &tangent_type,
+                                    "jvp output tangent",
+                                )?;
+                                let (operation, operands) =
+                                    O::zero_operation_with_residuals(tangent_type, residuals.as_slice())?;
+                                let mut outputs = context.stage_operation(operation, Vec::new(), &operands)?;
+                                check_count!("output", outputs, 1, ProgramError);
+                                outputs.remove(0)
+                            }
+                        };
+                        Ok(Some(tangent.atom_id()?))
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?

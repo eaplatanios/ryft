@@ -2360,8 +2360,8 @@ mod tests {
         AddOperation, CollectiveKind, CollectiveOperation, CompareOperation, ComparisonDirection, ConcatenateOperation,
         ConditionOperation, DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
         DimensionToScalar, DimensionToScalarOperation, DynamicReshapeOperation, IotaOperation, NegOperation, OneLike,
-        OneOperation, PadOperation, Reduce, ReductionKind, ScanOperation, SelectOperation, WhileOperation,
-        ZeroOperation,
+        OneOperation, PadOperation, Reduce, ReductionKind, ReshardOperation, ScanOperation, SelectOperation,
+        WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -3739,6 +3739,55 @@ mod tests {
         drop(builder);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_batch_axis_sharding_normalization_is_not_a_reshard() {
+        // Drift gate for the rejected proposal to stage batch-axis sharding normalization as a `reshard` instead of an
+        // axis-identity broadcast. Both operations replace an array's placement, but `reshard` does not honor the two
+        // parts of the normalized type that batching depends on: it takes its varying-manual axes from the operand
+        // rather than from the requested sharding, and it rejects any requested sharding that references an auto mesh
+        // axis. If either assertion below stops holding, the normalization can be restaged as a single `reshard` bind.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+
+        // Normalizing a replicated mapped axis onto a manual placement also makes the value vary along that manual
+        // axis. A reshard to the very same target sharding drops that fact, because its inference substitutes the
+        // operand's varying-manual axes for the target's.
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()]).unwrap())
+            .unwrap();
+        let normalized = normalized_batch_axis_type(&input, 0, &ShardingDimension::sharded(["m"])).unwrap().unwrap();
+        assert_eq!(
+            normalized.sharding().unwrap().varying_manual_axes().iter().collect::<Vec<_>>(),
+            vec!["m"],
+            "normalization adds the manual axis introduced by the new placement",
+        );
+        let resharded = ReshardOperation::new(normalized.sharding().unwrap().clone())
+            .infer_output_types(std::slice::from_ref(&input), &[])
+            .unwrap();
+        assert!(resharded[0].sharding().unwrap().varying_manual_axes().is_empty());
+        assert_ne!(resharded[0], normalized);
+
+        // A non-batch dimension placed on an auto mesh axis passes through normalization untouched, but the resulting
+        // sharding is not a legal reshard target at all, so the swap would turn a placement relabel into a hard error.
+        let input = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(6)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"])]).unwrap(),
+            )
+            .unwrap();
+        let normalized = normalized_batch_axis_type(&input, 0, &ShardingDimension::sharded(["m"])).unwrap().unwrap();
+        assert_eq!(
+            ReshardOperation::new(normalized.sharding().unwrap().clone())
+                .infer_output_types(std::slice::from_ref(&input), &[]),
+            Err(TypeError::invalid(
+                "reshard cannot target auto mesh axes; use a sharding constraint to hint propagation over auto axes"
+                    .to_string(),
+            )),
+        );
     }
 
     #[test]

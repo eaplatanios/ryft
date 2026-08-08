@@ -13,7 +13,7 @@ use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::{Zero, ZeroOperation, ZeroOperationProvider};
+use crate::operations::{Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     AtomId, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramBuilder, ProgramError,
@@ -898,8 +898,8 @@ impl<
     }
 }
 
-impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
-    for LinearCallOperation<C::Type>
+impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::Type>>> + Zero<C::Value>>
+    DifferentiableOperation<C> for LinearCallOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -937,7 +937,10 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
         let mut jvp_inputs = primals;
         for input in inputs {
             if !input.tangent().r#type().is_zero_space() {
-                jvp_inputs.push(input.tangent().clone().materialize(context)?);
+                // The operand primal is a live value of exactly the tangent's type, so it supplies the runtime
+                // geometry that a reference-bearing tangent type omits; statically shaped operands keep the nullary
+                // zero and stage the same instruction sequence as before.
+                jvp_inputs.push(input.tangent().clone().materialize_like(context, input.primal())?);
             }
         }
 
@@ -962,7 +965,10 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type> + ZeroOperationProvider<V::Type> + From<LinearCallOperation<V::Type>>,
+    O: Operation<Type = V::Type>
+        + ZeroOperationProvider<V::Type>
+        + From<ZeroLikeOperation<V::Type>>
+        + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1021,9 +1027,20 @@ impl<
             })
             .collect::<Vec<_>>();
 
+        // A dead output's structural-zero cotangent still becomes a real operand of the transposed call. Its type alone
+        // cannot construct it when it references runtime identities, but the boundary already carries that geometry. At
+        // least one peer cotangent is live here (the all-zero case returned above) and the retained residuals are live
+        // too, so a value of exactly the required type is searched for among them before falling back to the nullary
+        // zero that every identity-free type keeps.
+        let materialized_cotangents = outputs
+            .iter()
+            .cloned()
+            .map(|output| {
+                output.materialize_like_any(context, outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut transpose_inputs = residuals;
-        transpose_inputs
-            .extend(outputs.iter().cloned().map(|output| output.materialize(context)).collect::<Result<Vec<_>, _>>()?);
+        transpose_inputs.extend(materialized_cotangents);
         let input_cotangents = if self.is_transpose_only() {
             // The transpose-only form's region is a user-supplied backward program with no linearity contract of its
             // own, so it cannot be re-transposed and is replayed inline into the pullback.

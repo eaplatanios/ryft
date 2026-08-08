@@ -9,7 +9,7 @@ use crate::differentiation::linear::{ResidualZeroProvider, ZeroSpaceBoundaryReco
 use crate::differentiation::types::DifferentiableType;
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::{AddOperation, OneOperation, Zero};
+use crate::operations::{AddOperation, OneOperation, Zero, ZeroLikeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -1181,7 +1181,7 @@ macro_rules! define_value_and_gradient_auxiliary_function_in_trait {
         ) -> Result<$result, DifferentiationError>
         where
             Self: Zero<Self::Value>,
-            Self::Operation: From<OneOperation<Self::Type>>,
+            Self::Operation: From<OneOperation<Self::Type>> + From<ZeroLikeOperation<Self::Type>>,
             (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>): Parameterized<
                     LinearizationTracer<Self>,
                     To<Self::Value> = (Self::Value, Aux),
@@ -1486,7 +1486,9 @@ macro_rules! define_value_and_gradient_auxiliary_function {
         pub fn $function_name<
             V: Value<
                     Type: DifferentiableType,
-                    ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>> + Zero<V>,
+                    ExecutionDomain: ReverseModeDifferentiate<
+                        Operation: From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+                    > + Zero<V>,
                 >,
             F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
             Input: Parameterized<
@@ -1658,7 +1660,7 @@ fn value_and_gradient_with_aux_in_context<C, F, Input, Output, Aux>(
 ) -> Result<((C::Value, Aux), Input::To<C::Value>), DifferentiationError>
 where
     C: ReverseModeDifferentiate + Zero<C::Value>,
-    C::Operation: From<OneOperation<C::Type>>,
+    C::Operation: From<OneOperation<C::Type>> + From<ZeroLikeOperation<C::Type>>,
     F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Output: MaybeFallible<(LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>), DifferentiationError>,
@@ -1672,12 +1674,16 @@ where
 {
     let ((output, auxiliary), pullback): ((C::Value, Aux), _) =
         context.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
+
+    // Each auxiliary leaf is its own cotangent-geometry exemplar. A reference-bearing cotangent type names runtime
+    // extents that only a live value pins, and the leaf itself is exactly such a value whenever the two types agree.
     let auxiliary_structure = auxiliary.parameter_structure();
     let auxiliary_cotangents = auxiliary
         .parameters()
-        .map(|value| context.zero(&value.r#type().cotangent()))
+        .map(|value| MaybeZero::Zero(value.r#type().cotangent()).materialize_like(context, value))
         .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
+
     let gradient = pullback.apply((context.gradient_seed(&output, holomorphic)?, auxiliary_cotangents))?;
     Ok(((output, auxiliary), gradient))
 }
