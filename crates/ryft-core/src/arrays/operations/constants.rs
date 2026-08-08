@@ -22,8 +22,8 @@ use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::operations::{
     DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, ZERO_OPERATION_NAME,
-    Zero, ZeroLike, ZeroOperation, ZeroOperationProvider, check_constructor_type_has_no_identity_references,
-    infer_dynamic_constructor_output_types,
+    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    check_constructor_type_has_no_identity_references, infer_dynamic_constructor_output_types,
 };
 use crate::programs::{
     AtomId, MemberOperation, Operation, ProgramBuilder, ProgramError, RegionInterface, TypeError, TypeIdentityRenaming,
@@ -190,6 +190,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Why is this not generated from our derive macro?
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayType>) -> Self {
@@ -206,6 +207,19 @@ impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOpera
         } else {
             Self::Array(ArrayOperation::Zero(operation))
         }
+    }
+}
+
+// TODO(eaplatanios): Why is this not generated from our derive macro?
+impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(_: ZeroLikeOperation<ArrayIrType>) -> Self {
+        // A zero-like reads its complete output type, including every runtime extent, from its exemplar operand, so
+        // the composite family needs no mixed encoding for it: the homogeneous member constructor already expresses
+        // the dynamic case. This conversion exists so that type-generic transform drivers can name the exemplar-based
+        // zero in the composite universe with a plain `From<ZeroLikeOperation<C::Type>>` bound. A first-class
+        // dimension exemplar is rejected by member type inference, which is correct because a dimension has no zero.
+        Self::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new()))
     }
 }
 
@@ -658,6 +672,101 @@ mod tests {
         assert_eq!(statistics.lowerings, 1);
         assert_eq!(statistics.compilation_requests, 1);
         assert_eq!(domain.compilation_count(), 1);
+    }
+
+    #[test]
+    fn test_array_ir_dynamic_zero_retained_jit_specializes_on_dimension_identity() {
+        let domain = RetainedJitDomain::new();
+        let function: JittedFunction<RetainedJitDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit(&domain, |(), extents: Vec<CompilationTracer<RetainedJitDomain>>| {
+                let dimensions = extents
+                    .iter()
+                    .map(|extent| match extent.r#type().into_owned() {
+                        ArrayIrType::Dimension(extent_type) => Ok(Dimension::Dynamic(extent_type.variable().clone())),
+                        ArrayIrType::Array(_) => {
+                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(extents[0]
+                    .context()
+                    .bind(
+                        ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(dimensions))),
+                        Vec::new(),
+                        extents.as_slice(),
+                    )?
+                    .remove(0))
+            });
+
+        let bounds = DimensionBounds::new(1, Some(5)).unwrap();
+        let rows = DimensionType::new(DimensionVariable::new("rows", bounds));
+        let columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+
+        // Only the declared dimension identities enter the dispatch key, so two calls that differ solely in their
+        // runtime extents share one specialization.
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 2).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 3).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(rows.clone(), 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(columns.clone(), 2).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.statistics().dispatch_hits, 1);
+        assert_eq!(function.specialization_count(), 1);
+
+        // Dimension identity is nominal: each `DimensionVariable::new` creates an independent variable even when its
+        // name and bounds match another one. An alpha-equivalent instantiation therefore describes a *different*
+        // input type and gets its own specialization, exactly as independently built but structurally equal callees
+        // stay distinct at the region-interning level. Alpha-invariance in this system is invariance to the runtime
+        // extent above, not to the declared identity.
+        let alpha_rows = DimensionType::new(DimensionVariable::new("rows", bounds));
+        let alpha_columns = DimensionType::new(DimensionVariable::new("columns", bounds));
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(alpha_rows, 2).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(alpha_columns, 3).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.specialization_count(), 2);
+
+        // A permutation of the *same* two live identities also stays distinct, because the key is the ordered list of
+        // input types rather than the set of identities they mention.
+        assert_eq!(
+            function.call(
+                (),
+                vec![
+                    ArrayIrValue::Dimension(DimensionValue::new(columns, 3).unwrap()),
+                    ArrayIrValue::Dimension(DimensionValue::new(rows, 2).unwrap()),
+                ],
+            ),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0_f32; 6]))),
+        );
+        assert_eq!(function.specialization_count(), 3);
+
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 3);
+        assert_eq!(statistics.traces, 3);
+        assert_eq!(statistics.lowerings, 3);
+        assert_eq!(statistics.compilation_requests, 3);
+        assert_eq!(domain.compilation_count(), 3);
     }
 
     #[test]

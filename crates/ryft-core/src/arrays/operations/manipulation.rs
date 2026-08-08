@@ -683,11 +683,11 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionMulOperation,
-        DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
-        DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers,
-        GatherOperation, IotaOperation, OneOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, SliceOperation, UpdateSliceOperation,
+        CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionFromScalarOperation,
+        DimensionMulOperation, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
+        DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        GatherDimensionNumbers, GatherOperation, IotaOperation, OneOperation, PadOperation, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
@@ -963,6 +963,121 @@ in (%4)
         let linearization = program.linearize().unwrap();
         assert!(!linearization.primal().to_string().contains("dimension_size"));
         assert!(!linearization.tangent().to_string().contains("dimension_size"));
+    }
+
+    #[test]
+    fn test_array_ir_reshape_differentiation_over_a_data_derived_extent() {
+        // The reshape's output extent is produced by the `dimension_from_scalar` gateway over an ordinary integer
+        // scalar array input, so it is a tier-3 data-derived dimension rather than a shape read off an operand. The
+        // linear-call residual contract must carry it exactly like any other primal dimension the tangent needs.
+        let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source), Dimension::Static(4)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(input_type.into());
+        let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(33)).unwrap());
+        let extent = builder
+            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar])
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[source, 4], %1:i32[] .
+                let %2:dimension<total ∈ [1, 33)> = dimension_from_scalar [bounds=[1, 33)] %1
+                    %3:f64[total] = reshape %0 %2
+                    %4:dimension<source ∈ [1, 9)> = dimension_size [axis=0] %0
+                in (%3, %2, %4)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[source, 4], %1:dimension<total ∈ [1, 33)>, %2:dimension<source ∈ [1, 9)> .
+                let %3:f64[total] = linear_call [residual_count=2] %1 %2 %0 [
+                    forward={
+                        lambda %0:dimension<total ∈ [1, 33)>, %1:dimension<source ∈ [1, 9)>, %2:f64[source, 4] .
+                        let %3:f64[total] = reshape %2 %0
+                        in (%3)
+                    },
+                    transpose={
+                        lambda %0:dimension<total ∈ [1, 33)>, %1:dimension<source ∈ [1, 9)>, %2:f64[total] .
+                        let %3:dimension<4> = constant [value=4]
+                            %4:f64[source, 4] = reshape %2 %1 %3
+                        in (%4)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        // The data-derived extent rides the ordinary residual path: it is a primal output, a tangent input, and a
+        // leading residual operand of the linear call. Nothing about it is special-cased relative to the geometry-read
+        // `source` residual beside it, and no dimension acquires a tangent input of its own.
+        assert_eq!(linearization.residual_count(), 2);
+        assert_eq!(linearization.tangent().input_types().len(), 3);
+        assert!(
+            linearization
+                .tangent()
+                .input_types()
+                .iter()
+                .skip(1)
+                .all(|r#type| matches!(r#type, ArrayIrType::Dimension(_)))
+        );
+
+        // The complete contract executes: the primal emits the checked extent as a residual and the tangent consumes
+        // it to reshape the live tangent array.
+        let primal_values = (0..12).map(|value| value as f64).collect::<Vec<_>>();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(Array::matrix(3, 4, primal_values.clone())),
+                ArrayIrValue::Array(Array::scalar(12_i32)),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![ArrayIrValue::Array(Array::vector(primal_values))]);
+        assert_eq!(residuals.len(), 2);
+
+        let tangent_values = (12..24).map(|value| value as f64).collect::<Vec<_>>();
+        let mut tangent_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        tangent_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.tangent().interpret(tangent_inputs),
+            Ok(vec![ArrayIrValue::Array(Array::vector(tangent_values.clone()))]),
+        );
+
+        let cotangent_values = (24..36).map(|value| value as f64).collect::<Vec<_>>();
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::vector(cotangent_values.clone()))];
+        pullback_inputs.extend(residuals.clone());
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 4, cotangent_values))]),
+        );
+
+        // Nested forward differentiation of the linear program treats only the array input as differentiable, so the
+        // two residual dimensions pass through the second-order boundary unchanged rather than acquiring tangents.
+        let nested_jvp = linearization.tangent().jvp().unwrap();
+        assert_eq!(nested_jvp.input_ids().len(), 2 + residuals.len());
+        let mut nested_inputs = vec![ArrayIrValue::Array(Array::matrix(3, 4, tangent_values.clone()))];
+        nested_inputs.extend(residuals);
+        nested_inputs.push(ArrayIrValue::Array(Array::matrix(3, 4, (36..48).map(|value| value as f64).collect())));
+        assert_eq!(
+            nested_jvp.interpret(nested_inputs),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(tangent_values)),
+                ArrayIrValue::Array(Array::vector((36..48).map(|value| value as f64).collect())),
+            ]),
+        );
     }
 
     #[test]

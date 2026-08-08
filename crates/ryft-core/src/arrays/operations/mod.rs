@@ -455,11 +455,13 @@ mod tests {
     use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
+    use crate::operations::collectives::{AllGatherOutputVariance, CollectiveMode, CollectiveOptions};
+    use crate::operations::random::RandomAlgorithm;
     use crate::operations::{
-        AddOperation, ConcatenateOperation, ConditionOperation, DimensionAddOperation, DimensionMulOperation,
-        DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-        MulOperation, ReduceOperation, ReductionKind, ScanOperation, WhileOperation, ZeroOperation,
-        ZeroOperationProvider,
+        AddOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation, DimensionAddOperation,
+        DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation,
+        DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind, ScanOperation, WhileOperation,
+        ZeroOperation, ZeroOperationProvider,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1802,5 +1804,206 @@ mod tests {
         assert_eq!(imported_reshape.inputs()[0], imported_input);
         assert_eq!(imported_broadcast.inputs()[0], imported_reshape.outputs()[0]);
         assert_eq!(imported_broadcast.outputs(), imported_outputs.as_slice());
+    }
+
+    /// Member-kind signature of one [`ArrayIrOperation`] variant, in terms of which member kinds it consumes and
+    /// produces as *values*.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum MemberKindSignature {
+        /// Homogeneous array boundary, reached through the [`ArrayType`] operation projection.
+        ArrayToArray,
+
+        /// Homogeneous first-class-dimension boundary, reached through the [`DimensionType`] projection.
+        DimensionToDimension,
+
+        /// Converts a first-class dimension value into ordinary array data.
+        DimensionToArrayGateway,
+
+        /// Converts ordinary array data into a first-class dimension value.
+        ArrayToDimensionGateway,
+
+        /// Consumes first-class dimensions as geometry (or reads an array's geometry as a dimension) without ever
+        /// converting a value from one member kind into the other.
+        GeometryMixed,
+
+        /// Forwards composite regions whose bodies may carry both member kinds.
+        RegionForwarding,
+    }
+
+    /// Classifies one composite operation by its member-kind signature.
+    ///
+    /// The match is deliberately exhaustive with no wildcard arm, so adding an [`ArrayIrOperation`] variant fails to
+    /// compile until its member-kind signature is declared here and recorded in the expected table of
+    /// `test_array_ir_operation_member_kinds_are_a_closed_family`. That is the compile-forced drift gate for the two
+    /// closed-family enumeration matrix rows: dimension-to-data conversion happens only through explicit gateways,
+    /// and data-to-dimension conversion happens only through the checked `dimension_from_scalar` gateway.
+    fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
+        match operation {
+            ArrayIrOperation::Zero(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::DynamicOne(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::DynamicIota(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Array(_) => MemberKindSignature::ArrayToArray,
+            ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
+            ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
+            ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
+            ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
+            ArrayIrOperation::Reshape(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Broadcast(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Concatenate(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::CustomCall(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Pad(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::DynamicShapeSlice(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::AllGather(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::PSumScatter(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::AllToAll(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
+        }
+    }
+
+    #[test]
+    fn test_array_ir_operation_member_kinds_are_a_closed_family() {
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let first_type = DimensionType::new(first.clone());
+        let second_type = DimensionType::new(second.clone());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
+        let dynamic_integer_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(first.clone())]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+
+        // One instance of every variant, in declaration order, paired with its hand-maintained expected member-kind
+        // signature. Exactly two variants may turn a dimension value into array data (the explicit `dimension_to_scalar`
+        // gateway and the deliberately composite-level dimension comparison) and exactly one may turn array data into a
+        // dimension value (the checked `dimension_from_scalar` gateway). Everything else either stays inside one
+        // homogeneous member family, treats dimensions as geometry, or forwards regions.
+        let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
+            (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
+            (ArrayIrOperation::DynamicOne(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
+            (
+                ArrayIrOperation::DynamicIota(IotaOperation::new(dynamic_integer_type, 0).unwrap()),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())), MemberKindSignature::ArrayToArray),
+            (
+                ArrayIrOperation::Dimension(DimensionOperation::Add(
+                    DimensionAddOperation::new(&first_type, &second_type).unwrap(),
+                )),
+                MemberKindSignature::DimensionToDimension,
+            ),
+            (
+                ArrayIrOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                MemberKindSignature::DimensionToArrayGateway,
+            ),
+            (
+                ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone())),
+                MemberKindSignature::ArrayToDimensionGateway,
+            ),
+            (
+                ArrayIrOperation::DimensionToScalar(DimensionToScalarOperation),
+                MemberKindSignature::DimensionToArrayGateway,
+            ),
+            (ArrayIrOperation::Reshape(DynamicReshapeOperation::new()), MemberKindSignature::GeometryMixed),
+            (ArrayIrOperation::Broadcast(DynamicBroadcastOperation::new(vec![0])), MemberKindSignature::GeometryMixed),
+            (
+                ArrayIrOperation::Concatenate(
+                    ConcatenateOperation::<ArrayIrType>::from_input_types(
+                        0,
+                        &[
+                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
+                            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                            DimensionValue::constant(3).unwrap().r#type().into_owned().into(),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::CustomCall(
+                    CustomCallOperation::new("ryft.test.identity", vec![scalar_type.clone()]).into(),
+                ),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::Pad(PadOperation::new(vec![0], vec![0], vec![0]).unwrap().into()),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::DynamicShapeSlice(DynamicShapeSliceOperation::new(1)),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
+                    RandomAlgorithm::ThreeFry,
+                    dynamic_type.clone(),
+                )),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::AllGather(AllGatherOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                    AllGatherOutputVariance::Varying,
+                )),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::PSumScatter(PSumScatterOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                )),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (
+                ArrayIrOperation::AllToAll(AllToAllOperation::new(
+                    "x".to_string(),
+                    2,
+                    0,
+                    0,
+                    CollectiveOptions::new(CollectiveMode::Untiled),
+                )),
+                MemberKindSignature::GeometryMixed,
+            ),
+            (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
+        ];
+
+        assert_eq!(
+            expected.iter().map(|(operation, _)| member_kind_signature(operation)).collect::<Vec<_>>(),
+            expected.iter().map(|(_, signature)| *signature).collect::<Vec<_>>(),
+        );
+
+        // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
+        // once, so the two enumeration claims above are enumerated rather than sampled.
+        assert_eq!(expected.len(), 23);
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, signature)| *signature == MemberKindSignature::DimensionToArrayGateway)
+                .count(),
+            2,
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, signature)| *signature == MemberKindSignature::ArrayToDimensionGateway)
+                .count(),
+            1,
+        );
     }
 }

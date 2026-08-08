@@ -377,6 +377,7 @@ impl crate::operations::control_flow::WhilePredicate for Array {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::{Array, array_type};
@@ -393,7 +394,7 @@ mod tests {
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ScanOperation, Select, WhileOperation, ZeroOperation,
+        ScanOperation, Select, StopGradientOperation, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -610,6 +611,217 @@ mod tests {
         let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
         let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
         assert_eq!(pushforward.apply(vec![predicate_tangent, extent_tangent]).unwrap().r#type(), tangent.r#type(),);
+    }
+
+    #[test]
+    fn test_composite_condition_jvp_shapes_a_disconnected_dynamic_operand_tangent_from_its_primal() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+            let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let sum = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                    Vec::new(),
+                    vec![left, right],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![extent, sum], vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let left = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let right = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        // Severing the second operand's tangent leaves the fused conditional with one live and one structurally zero
+        // dynamic tangent operand, which is exactly the case a type-only nullary zero cannot construct.
+        let severed = builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
+                Vec::new(),
+                vec![right],
+            )
+            .unwrap()[0];
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, left, severed],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        // The severed operand's tangent is staged as `zero_like` over its own primal, which pins the runtime extent.
+        let jvp = program.jvp().unwrap();
+        let rendered = jvp.to_string();
+        assert!(rendered.contains("zero_like"), "{rendered}");
+        assert_eq!(
+            jvp.interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0])),
+                array(Array::vector(vec![10.0, 20.0, 30.0])),
+                array(Array::vector(vec![1.0, 1.0, 1.0])),
+                array(Array::vector(vec![5.0, 5.0, 5.0])),
+            ]),
+            Ok(vec![array(Array::vector(vec![11.0, 22.0, 33.0])), array(Array::vector(vec![1.0, 1.0, 1.0]))]),
+        );
+    }
+
+    #[test]
+    fn test_composite_condition_pullback_shapes_a_dead_dynamic_output_cotangent_from_a_live_peer() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+            let operand = builder.add_input(ArrayIrType::Array(array_type.clone()));
+            let doubled = builder
+                .add_instruction(
+                    TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                    Vec::new(),
+                    vec![operand, operand],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    vec![extent, doubled, operand],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let extent = builder.add_input(ArrayIrType::Dimension(extent_type.clone()));
+        let operand = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let regions = vec![
+            builder.import_region(branch().entry_region_ref()),
+            builder.import_region(branch().entry_region_ref()),
+        ];
+        let outputs = builder
+            .add_instruction(
+                TestOperation::Condition(ConditionOperation::new()),
+                regions,
+                vec![predicate, extent, operand],
+            )
+            .unwrap()
+            .to_vec();
+        // Keeping only the doubled output leaves the third branch output dead, so its dynamic cotangent reaches the
+        // transposed condition as a structural zero that no type-only constructor can build.
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[extent], %1:bool[] .
+                let %2:f64[extent] = zero_like %0
+                    %3:f64[extent] = condition %1 %0 %2 [
+                        true={
+                            lambda %0:f64[extent], %1:f64[extent] .
+                            let %2:f64[extent] = add %1 %0
+                                %3:f64[extent] = add %2 %0
+                            in (%3)
+                        },
+                        false={
+                            lambda %0:f64[extent], %1:f64[extent] .
+                            let %2:f64[extent] = add %1 %0
+                                %3:f64[extent] = add %2 %0
+                            in (%3)
+                        },
+                    ]
+                in (%3)"}
+            .trim_end(),
+        );
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0])),
+                dimension(&extent_type, 3),
+                array(Array::vector(vec![1.0, 2.0, 3.0])),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
+        pullback_inputs.extend(residuals);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(vec![2.0, 2.0, 2.0]))]));
+    }
+
+    #[test]
+    fn test_composite_scan_pullback_shapes_a_dead_dynamic_carry_cotangent_from_a_live_peer() {
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let array_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let second = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let sum = body_builder
+            .add_instruction(
+                TestOperation::Array(ArrayOperation::from(AddOperation::new())),
+                Vec::new(),
+                vec![first, second],
+            )
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum, second], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let second = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![first, second])
+            .unwrap()
+            .to_vec();
+        // Keeping only the accumulating carry leaves the second carry dead, so the reversed scan needs a dynamic zero
+        // cotangent for it. The live first-carry cotangent has exactly that type and supplies the runtime extent.
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[extent] .
+                let %1:f64[extent] = zero_like %0
+                    %2:f64[extent], %3:f64[extent] = scan [carry_count=2, length=2, reverse=true] %0 %1 [
+                        body={
+                            lambda %0:f64[extent], %1:f64[extent] .
+                            let %2:f64[extent] = add %1 %0
+                            in (%0, %2)
+                        },
+                    ]
+                in (%2, %3)"}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback.interpret(vec![array(Array::vector(vec![1.0, 1.0, 1.0]))]),
+            Ok(vec![array(Array::vector(vec![1.0, 1.0, 1.0])), array(Array::vector(vec![2.0, 2.0, 2.0]))]),
+        );
     }
 
     fn product_scan_body(
