@@ -1704,16 +1704,52 @@ where
 /// Implements the shared structure of the shape-changing collectives: the operation struct with its accessors, the
 /// `Display`/`Operation` implementations (with payload-dependent output-shape inference provided as a closure over
 /// the operand dimensions), degenerate interpretation, default partial evaluation, the linear forward-mode rule
-/// (the tangent rides the same collective), and the value-level staging capability that resolves the named axis size
-/// from the active [`NamedAxes`] environment. The batching rules are hand-written below the macro invocations
-/// because each collective materializes the mapped batch axis differently.
+/// (the tangent rides the same collective), and, for the collectives that request it, the homogeneous value-level
+/// staging capability that resolves the named axis size from the active [`NamedAxes`] environment. The batching rules
+/// are hand-written below the macro invocations because each collective materializes the mapped batch axis
+/// differently.
 macro_rules! shape_changing_collective {
+    // Public form: the operation is always generated, while the `capability = Trait::method` section is optional and
+    // only requested by collectives that still expose a homogeneous staging capability. The field list is forwarded
+    // as an opaque token tree so that the optional capability section stays independent of the field repetition.
     (
         $(#[$operation_documentation:meta])*
         operation = $operation:ident,
         name = $operation_name:ident = $name_literal:literal,
-        $(#[$capability_documentation:meta])*
-        capability = $capability:ident::$method:ident,
+        $(
+            $(#[$capability_documentation:meta])*
+            capability = $capability:ident::$method:ident,
+        )?
+        fields = $fields:tt,
+        infer = |$infer_self:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
+    ) => {
+        shape_changing_collective! {
+            @operation
+            $(#[$operation_documentation])*
+            operation = $operation,
+            name = $operation_name = $name_literal,
+            fields = $fields,
+            infer = |$infer_self, $input_type, $dimensions| $infer,
+        }
+
+        $(
+            shape_changing_collective! {
+                @capability
+                operation = $operation,
+                $(#[$capability_documentation])*
+                capability = $capability::$method,
+                fields = $fields,
+            }
+        )?
+    };
+
+    // Internal branch: generates the operation struct with its accessors, the `Display`/`Operation` implementations,
+    // degenerate interpretation, default partial evaluation, and the linear forward-mode rule.
+    (
+        @operation
+        $(#[$operation_documentation:meta])*
+        operation = $operation:ident,
+        name = $operation_name:ident = $name_literal:literal,
         fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? },
         infer = |$infer_self:ident, $input_type:ident, $dimensions:ident| $infer:block $(,)?
     ) => {
@@ -1837,7 +1873,17 @@ macro_rules! shape_changing_collective {
                 Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
         }
+    };
 
+    // Internal branch: generates the homogeneous value-level staging capability that resolves the named axis size
+    // from the active [`NamedAxes`] environment.
+    (
+        @capability
+        operation = $operation:ident,
+        $(#[$capability_documentation:meta])*
+        capability = $capability:ident::$method:ident,
+        fields = { $($(#[$field_documentation:meta])* $field:ident: $field_type:ty),* $(,)? } $(,)?
+    ) => {
         $(#[$capability_documentation])*
         pub trait $capability: Sized {
             /// Stages this collective over axis `axis_name`, resolving the axis size from the active [`NamedAxes`]
@@ -1878,9 +1924,6 @@ shape_changing_collective! {
     /// item-major into `concat_axis`, replicating the gathered value across the batch items.
     operation = AllGatherOperation,
     name = ALL_GATHER_OPERATION_NAME = "all_gather",
-    #[doc(hidden)]
-    /// Homogeneous capability retained for the array-only operation and transform language.
-    capability = LegacyAllGather::all_gather,
     fields = {
         /// Axis of the operand along which the participants' values are concatenated.
         concat_axis: usize,
@@ -4481,11 +4524,11 @@ mod tests {
         // The batch binds only the axis `"i"`, but the `all_gather` names `"x"`, which no enclosing transform binds.
         // Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
         // acting as identity.
-        let result: Result<Array, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
+        let result: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_gather_tiled("x", 0)
             },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
             BatchAxis::new(0),
             BatchAxis::replicated(),
             BatchAxisSpecification::named("i"),
@@ -4501,17 +4544,23 @@ mod tests {
         // mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
         // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_gather_tiled("x", 0)
             },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
             BatchAxis::new(0),
             BatchAxis::replicated(),
             BatchAxisSpecification::named("x"),
         )
         .unwrap();
-        assert_eq!(output.r#type().into_owned(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)])));
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))),
+        );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("'all_gather' must preserve the array member kind");
+        };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 

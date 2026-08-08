@@ -2067,6 +2067,7 @@ mod tests {
 
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt, ToMlir};
+    use ryft_core::operations::collectives::{AllGatherOperation, AllGatherOutputVariance, CollectiveOptions};
     use ryft_core::{
         DataType, Device, DeviceMesh, DimensionBounds, DimensionVariable, Dot, DotDimensionNumbers, MeshAxis,
         MeshAxisType, Sharding, ShardingDimension, Sin,
@@ -2096,6 +2097,29 @@ mod tests {
             MeshAxis::new("model", 4, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap()
+    }
+
+    /// Stages an `all_gather` over the manual mesh axis `axis_name` inside a `shard_map` body. The composite
+    /// [`AllGather`](ryft_core::operations::collectives::AllGather) capability is not reachable from a body value
+    /// because the body tracer's constants cannot carry [`DimensionValue`](ryft_core::DimensionValue)s, so the
+    /// operation is bound directly with the manual-axis size that the enclosing mesh already fixes.
+    fn shard_map_all_gather(
+        input: &ShardMapTracer,
+        axis_name: &str,
+        axis_size: usize,
+        concat_axis: usize,
+        options: CollectiveOptions,
+        output_variance: AllGatherOutputVariance,
+    ) -> ShardMapTracer {
+        input
+            .dispatch_domain()
+            .bind(
+                AllGatherOperation::new(axis_name.to_string(), axis_size, concat_axis, options, output_variance),
+                Vec::new(),
+                std::slice::from_ref(input),
+            )
+            .unwrap()
+            .remove(0)
     }
 
     fn static_sharded_array_type(data_type: DataType, global_shape: &[usize], sharding: Sharding) -> ArrayType {
@@ -4065,8 +4089,6 @@ mod tests {
 
     #[test]
     fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
@@ -4096,9 +4118,14 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x
-                                .all_gather("x", 0, CollectiveOptions::tiled(), AllGatherOutputVariance::Varying)
-                                .unwrap()
+                            shard_map_all_gather(
+                                &local_x,
+                                "x",
+                                2,
+                                0,
+                                CollectiveOptions::tiled(),
+                                AllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),
@@ -4179,8 +4206,6 @@ mod tests {
 
     #[test]
     fn test_shard_map_untiled_all_gather_lowers_rank_insertion() {
-        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
@@ -4204,9 +4229,14 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x
-                                .all_gather("x", 0, CollectiveOptions::default(), AllGatherOutputVariance::Varying)
-                                .unwrap()
+                            shard_map_all_gather(
+                                &local_x,
+                                "x",
+                                2,
+                                0,
+                                CollectiveOptions::default(),
+                                AllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),
@@ -4276,8 +4306,6 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_all_gather_preserves_group_order_across_mesh_coordinates() {
-        use ryft_core::operations::collectives::{AllGatherOutputVariance, CollectiveOptions, LegacyAllGather};
-
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
@@ -4290,14 +4318,14 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x
-                                .all_gather(
-                                    "x",
-                                    0,
-                                    CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
-                                    AllGatherOutputVariance::Varying,
-                                )
-                                .unwrap()
+                            shard_map_all_gather(
+                                &local_x,
+                                "x",
+                                4,
+                                0,
+                                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]),
+                                AllGatherOutputVariance::Varying,
+                            )
                         },
                         x,
                         mesh.clone(),

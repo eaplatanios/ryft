@@ -17,10 +17,7 @@ pub use conversion::{
 };
 pub use gathering::{GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
-pub use reshaping::{
-    LegacyReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeDimensionExpression, ReshapeOperation,
-    ReshapeParameters, ReshapeTarget,
-};
+pub use reshaping::{LegacyReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, ReshapeParameters};
 pub use scattering::{
     SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
 };

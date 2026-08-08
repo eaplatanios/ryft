@@ -1457,7 +1457,9 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
 - [ ] Phase 5/6 owner: migrate public/reference `EagerContext<Array, ArrayOperation<Array>>` consumers to the canonical
       array-program domain where they need dynamic shape, mixed control-flow, or composite transform functionality.
       Retain the homogeneous reference backend and focused transform fixtures until their composite replacements land;
-      they are comparison baselines, not unfinished production-XLA migration.
+      they are comparison baselines, not unfinished production-XLA migration. *(Scope narrowed 2026-08-07 by the
+      removability audit: the homogeneous surface is the permanent baseline vocabulary, so this item covers only the
+      per-consumer dynamic-shape checks — no blanket migration remains; see the Phase 9 exit criterion.)*
 - [x] Replace production tests that rely on the complete homogeneous backend with canonical array-program tests;
       retain small local homogeneous enums only for focused generic tests.
 - [x] Migrate XLA operation conversion and compilation entry points to the sole stored array-program operation family.
@@ -1468,7 +1470,10 @@ Execute the XLA portion as one dependency-ordered migration, not as a second bod
       assertions.
 - [x] Verify conditional and loop-carried extents, gateway compaction, region forwarding, and alpha-equivalent imports.
 - [ ] Phase 8/9 owner: rename the narrowed primitive family only after the old full family is deleted and all residual
-      references are classified.
+      references are classified. *(Superseded in direction on 2026-08-07: the removability audit concluded the
+      homogeneous family is the permanent baseline, so the endgame is the rename program recorded in the Phase 9
+      exit criterion — `Legacy*` names are retired by renaming the mixed operations to `Dynamic*` and giving the
+      static operations the freed plain names, not by deleting the family.)*
 - [x] Gate: targeted searches find no `with_dimensions`, `with_source_array`, `bind_replayed`, ambient replay
       environment, or full homogeneous implicit-shape graph.
 
@@ -2506,6 +2511,51 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       behaviors without introducing a second batching path.
 - [x] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
+- [ ] Phase 9 exit criterion (added 2026-08-07, owner decision): Phase 9 concludes only after every unchecked residual
+      of Phases 0–8 recorded anywhere in this plan is closed — including the Phase 4–6 owner items (the
+      `ZeroOperation<ArrayType>` staging migration, shape-metadata zero/one materialization, deletion of copied
+      dimension-operand validation, and the Phase 4–6 integration gate that every shape dependency in rendered IR is
+      an operand edge or an explicit `dimension_size`), the homogeneous/mixed naming endgame below, the manual-region
+      first-class-extent work below, and every unchecked verification-matrix row. The Phase 5/6 owner question about
+      `EagerContext<Array, ArrayOperation<Array>>` consumers is RESOLVED by the 2026-08-07 removability audit: the
+      homogeneous surface is the permanent baseline vocabulary (`ProjectedContext` exists to serve it; the mixed
+      operations' own transposition rules stage into member-typed traces), not unfinished migration — reword that
+      item's remaining scope to the per-consumer dynamic-shape checks only.
+  - [ ] Homogeneous/mixed naming endgame (decided 2026-08-07 after the removability audit: RENAME, not deletion —
+        the audit proved the mixed operations depend on the static ones in their transposition rules, that
+        expressiveness is incomparable rather than nested (layout retype and sharding strip exist only on the static
+        side; dynamic unit-axis expansion only on the mixed side), and that conversion would add uncompensated
+        dimension-constant instructions on hot pullback/batching paths):
+    - [x] Delete `ReshapeDimensionExpression` and `ReshapeTarget::DimensionExpressions`, collapsing
+          `ReshapeParameters`' target to a plain `Shape` (zero production constructors; executed 2026-08-07 —
+          −549 lines in reshaping.rs and −229 in XLA lowering, four symbolic-only tests deleted, two rewritten;
+          the `reshape_dimension_i32` bounds validator was found to also serve the mixed `dynamic_reshape` path
+          and was retained; new suite baselines 1,139 core / 435 XLA).
+    - [ ] Rename `LegacyBroadcast` to `BroadcastTo` (the resolved-geometry contract the mixed broadcast delegates
+          to, mirroring the plain `Reshape` capability); drop its `#[doc(hidden)]` and document it as the
+          homogeneous-baseline layer.
+    - [ ] Rename the mixed `BroadcastOperation` to `DynamicBroadcastOperation` and the mixed `ReshapeOperation` to
+          `DynamicReshapeOperation`, matching the StableHLO `broadcast_in_dim`/`dynamic_broadcast_in_dim` and
+          `reshape`/`dynamic_reshape` convention and Ryft's existing `DynamicShapeSlice`/`DynamicZero`/`DynamicOne`/
+          `DynamicIota` vocabulary. The `Broadcast` capability keeps its name as the user-facing verb.
+    - [ ] Rename `LegacyBroadcastOperation` to the freed `BroadcastOperation` name and `LegacyReshapeOperation` to
+          `ReshapeOperation`; drop `#[doc(hidden)]` where present and document both as the homogeneous-baseline
+          operations (two-commit swap: mixed renames land first to free the plain names).
+  - [ ] Manual-region first-class extents (closes the homogeneous body-replay half of the Phase 4 gate; evidence
+        recorded 2026-08-07: `CaptureReference<T>` is index-plus-type only, so the shard-map body context's
+        `Constant = CaptureReference<ArrayIrType>` cannot satisfy `From<DimensionValue>` and no extent operand can
+        be staged inside a manual region):
+    - [ ] Give the XLA staging domain's constant family an immediate-dimension variant (a
+          `Captured(CaptureReference<ArrayIrType>) | Dimension(DimensionValue)` sum with `From<DimensionValue>`);
+          arrays stay capture references, host-sized dimension values embed directly.
+    - [ ] Wire the immediate variant through the composite lowerer's dimension-constant arm (scalar `i64`
+          `stablehlo.constant`) and the shard-map body lowering path.
+    - [ ] Extend the `map_capture_index` pruning/validation recursion to the new constant sum so nested-region
+          capture bookkeeping stays correct.
+    - [ ] Re-adopt the canonical `AllGather` capability in the three shard-map tests, replacing the documented
+          test-local direct-bind helper added during the `LegacyAllGather` deletion.
+    - [ ] Delete the remaining transitional collective capabilities `LegacyPSumScatter` and `LegacyAllToAll` by the
+          `LegacyAllGather` recipe (the optional-capability macro branch already exists).
 
 #### Phase 9a: contiguous array storage and scalar-backend retirement
 
@@ -5539,3 +5589,44 @@ otherwise-retained array-only `ArrayOperation` member family; then delete both l
 capability/transform implementations, `ReshapeDimensionExpression`, exports, and tests in one zero-residual gate. This
 work begins immediately after this audit and before Phase 10 measurement; it is not deferred to the final Phase 11
 dead-code sweep.
+
+### Legacy reshape symbolic-target deletion (2026-08-07)
+
+A read-only audit confirmed that `ReshapeDimensionExpression` had zero production constructors anywhere in the
+workspace: every occurrence outside its own definition, transform rules, and XLA lowering was a test that built the
+symbolic target explicitly. The mixed `ReshapeOperation`, which takes one explicit first-class dimension operand per
+output axis, is its strict successor and already covers every runtime shape relationship the expression language could
+express, so the expression layer was deleted outright rather than deprecated.
+
+The deletion removed the `ReshapeDimensionExpression` enum and its `Display` implementation, the `ReshapeTarget` enum
+(both variants, its `Display`, and its `From<Shape>`), `ReshapeParameters::{from_dimension_expressions,
+output_dimension_expressions, target, resolve_target}`, the `ReshapeDimensionMonomial` normalization type, and the
+`invert_symbolic_reshape_target`, `normalize_reshape_dimension_expression`, `infer_symbolic_reshape_shape`,
+`evaluate_reshape_dimension_expression`, and `remap_reshape_dimension_expression` helpers, together with the symbolic
+arms of `LegacyReshapeOperation::rename_type_identities`, the legacy transpose rule, the legacy batching lift,
+`Reshape for ArrayType`, and eager `Reshape for Array`. In XLA lowering it removed
+`lower_reshape_dimension_expression`, `lower_reshape_shape`, and the `stablehlo.dynamic_reshape` branch of
+`lower_reshape_to_mlir`, which only symbolic targets could reach; `reshape_dimension_i32` survives because the mixed
+composite reshape path in `lowering/composite.rs` still needs it. That is roughly 450 production lines plus their
+tests.
+
+Since a single variant remained, `ReshapeTarget` was collapsed away entirely: `ReshapeParameters` now stores a plain
+`Shape` in an `output_shape` field, `ReshapeParameters::new` accepts `impl Into<Shape>`, and `output_shape()` returns
+`&Shape` instead of `Option<&Shape>`. The two type-inference diagnostics that previously advertised dimension
+expressions now name the successor mechanism ("'reshape' requires explicit result-dimension operands for a dynamic
+input/output shape"), and the public `Reshape` trait documentation points shape-polymorphic callers at
+`ReshapeOperation` instead.
+
+Public API impact: `ReshapeDimensionExpression` and `ReshapeTarget` were public, non-hidden, facade-exported items,
+and both were removed without a deprecation cycle per the owner's explicit decision for this pre-1.0 crate.
+`ReshapeParameters::output_shape` also changed its return type, which is a source-breaking signature change for any
+external caller. `LegacyReshapeOperation` itself remains, still pending the rename/deletion decision tracked by the
+Phase 9 naming audit above.
+
+Verification: workspace `cargo check --all-targets` is clean, `ryft-core --lib` is 1,139 tests (one deleted:
+`test_symbolic_reshape`), `ryft-xla --lib` is 435 tests (three deleted:
+`test_plain_symbolic_reshape_lowers_runtime_shape_from_original_input_dimensions`,
+`test_plain_symbolic_reshape_refines_inferred_mixed_output_dimensions`, and
+`test_plain_symbolic_reshape_rejects_derived_dynamic_bounds_without_result_operands`), the macro integration crate
+passes 20 + 17 tests, `cargo doc` adds no new warnings, and residual searches for the deleted identifiers find
+nothing under `crates/`.

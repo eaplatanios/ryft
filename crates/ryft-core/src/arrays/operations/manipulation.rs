@@ -83,9 +83,9 @@ impl Transpose for Array {
 
 impl Reshape for Array {
     fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
-        // Resolve runtime dimension expressions from the concrete eager input shape, then delegate to the type-level
-        // reshape so all element-count and sharding validation remains shared with staged execution.
-        let parameters = parameters.into().resolve_target(self.r#type().shape())?;
+        // Delegate to the type-level reshape so all element-count and sharding validation remains shared with staged
+        // execution.
+        let parameters = parameters.into();
         let output_type = self.r#type().reshape(parameters.clone())?;
         let transposed = parameters.dimensions().map(|dimensions| self.transpose(dimensions)).transpose()?;
         let input = transposed.as_ref().unwrap_or(self);

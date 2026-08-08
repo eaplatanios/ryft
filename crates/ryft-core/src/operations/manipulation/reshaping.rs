@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -274,83 +273,16 @@ where
     }
 }
 
-/// One dimension of a symbolic reshape target.
-///
-/// Input dimension references use the operand's original dimension order, before an optional
-/// [`ReshapeParameters::dimensions`] permutation is applied.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReshapeDimensionExpression {
-    /// A statically known dimension size.
-    Constant(usize),
-
-    /// The runtime size of the input dimension at the provided index.
-    InputDimension(usize),
-
-    /// The checked product of the nested dimension expressions.
-    Product(Vec<Self>),
-
-    /// An exact division of one dimension expression by another.
-    ExactDivision {
-        /// Expression forming the dividend.
-        numerator: Box<Self>,
-
-        /// Expression forming the divisor.
-        denominator: Box<Self>,
-    },
-}
-
-impl Display for ReshapeDimensionExpression {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Constant(value) => write!(formatter, "{value}"),
-            Self::InputDimension(dimension) => write!(formatter, "dim({dimension})"),
-            Self::Product(factors) => {
-                write!(formatter, "({})", factors.iter().map(ToString::to_string).collect::<Vec<_>>().join(" * "),)
-            }
-            Self::ExactDivision { numerator, denominator } => write!(formatter, "({numerator} / {denominator})"),
-        }
-    }
-}
-
-/// Target of a [`LegacyReshapeOperation`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReshapeTarget {
-    /// A conventional target shape whose dimensions are known by the type system.
-    Shape(Shape),
-
-    /// Runtime dimension expressions evaluated from the input shape.
-    DimensionExpressions(Vec<ReshapeDimensionExpression>),
-}
-
-impl Display for ReshapeTarget {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Shape(shape) => Display::fmt(shape, formatter),
-            Self::DimensionExpressions(expressions) => {
-                write!(formatter, "[{}]", expressions.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),)
-            }
-        }
-    }
-}
-
-impl From<Shape> for ReshapeTarget {
-    #[inline]
-    fn from(shape: Shape) -> Self {
-        Self::Shape(shape)
-    }
-}
-
 /// Semantic parameters accepted by [`Reshape`].
 ///
-/// A fixed [`Shape`] converts directly into `ReshapeParameters`, preserving the ordinary
-/// `value.reshape(shape)` spelling. Callers that need an input permutation, runtime dimension expressions, or an
-/// explicit output [`Sharding`] can construct these parameters and apply the corresponding builder methods. Unlike
-/// [`LegacyReshapeOperation`], this type contains no Intermediate Representation (IR) behavior and can be consumed
-/// directly by eager backends and type inference.
+/// A [`Shape`] converts directly into `ReshapeParameters`, preserving the ordinary `value.reshape(shape)` spelling.
+/// Callers that need an input permutation or an explicit output [`Sharding`] can construct these parameters and apply
+/// the corresponding builder methods. Unlike [`LegacyReshapeOperation`], this type contains no Intermediate
+/// Representation (IR) behavior and can be consumed directly by eager backends and type inference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshapeParameters {
-    /// Output target of this reshape.
-    target: ReshapeTarget,
+    /// Output shape of this reshape.
+    output_shape: Shape,
 
     /// Optional permutation of the input dimensions applied before reshaping.
     dimensions: Option<Permutation>,
@@ -360,16 +292,10 @@ pub struct ReshapeParameters {
 }
 
 impl ReshapeParameters {
-    /// Creates reshape parameters with the provided output target.
+    /// Creates reshape parameters with the provided output shape.
     #[inline]
-    pub fn new(target: impl Into<ReshapeTarget>) -> Self {
-        Self { target: target.into(), dimensions: None, output_sharding: None }
-    }
-
-    /// Creates reshape parameters from runtime output-dimension `expressions`.
-    #[inline]
-    pub fn from_dimension_expressions(expressions: Vec<ReshapeDimensionExpression>) -> Self {
-        Self { target: ReshapeTarget::DimensionExpressions(expressions), dimensions: None, output_sharding: None }
+    pub fn new(output_shape: impl Into<Shape>) -> Self {
+        Self { output_shape: output_shape.into(), dimensions: None, output_sharding: None }
     }
 
     /// Returns this operation with `dimensions` used to permute the input before reshaping.
@@ -386,28 +312,10 @@ impl ReshapeParameters {
         self
     }
 
-    /// Returns the output target.
+    /// Returns the output shape.
     #[inline]
-    pub fn target(&self) -> &ReshapeTarget {
-        &self.target
-    }
-
-    /// Returns the fixed output shape, or `None` for a symbolic target.
-    #[inline]
-    pub fn output_shape(&self) -> Option<&Shape> {
-        match &self.target {
-            ReshapeTarget::Shape(shape) => Some(shape),
-            ReshapeTarget::DimensionExpressions(_) => None,
-        }
-    }
-
-    /// Returns the symbolic output-dimension expressions, or `None` for a fixed target.
-    #[inline]
-    pub fn output_dimension_expressions(&self) -> Option<&[ReshapeDimensionExpression]> {
-        match &self.target {
-            ReshapeTarget::Shape(_) => None,
-            ReshapeTarget::DimensionExpressions(expressions) => Some(expressions),
-        }
+    pub fn output_shape(&self) -> &Shape {
+        &self.output_shape
     }
 
     /// Returns the optional input-dimension permutation.
@@ -428,21 +336,6 @@ impl ReshapeParameters {
         self.dimensions
             .as_ref()
             .is_none_or(|dimensions| dimensions.len() == rank && dimensions.iter().copied().eq(0..rank))
-    }
-
-    /// Resolves this reshape target against `input_shape`, retaining the remaining parameters.
-    pub(crate) fn resolve_target(&self, input_shape: &Shape) -> Result<Self, TypeError> {
-        let ReshapeTarget::DimensionExpressions(expressions) = &self.target else {
-            return Ok(self.clone());
-        };
-        let dimensions = expressions
-            .iter()
-            .map(|expression| evaluate_reshape_dimension_expression(expression, input_shape))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut parameters = Self::new(Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
-        parameters.dimensions.clone_from(&self.dimensions);
-        parameters.output_sharding.clone_from(&self.output_sharding);
-        Ok(parameters)
     }
 }
 
@@ -473,221 +366,6 @@ impl LegacyReshapeOperation {
     #[inline]
     pub fn parameters(&self) -> &ReshapeParameters {
         &self.parameters
-    }
-}
-
-/// Normalized multiplicative form of a reshape dimension expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReshapeDimensionMonomial {
-    /// Static coefficient.
-    coefficient: usize,
-
-    /// Exponents of runtime input-dimension symbols.
-    dynamic_dimensions: BTreeMap<usize, usize>,
-}
-
-impl ReshapeDimensionMonomial {
-    /// Returns the multiplicative identity.
-    fn one() -> Self {
-        Self { coefficient: 1, dynamic_dimensions: BTreeMap::new() }
-    }
-
-    /// Multiplies this monomial by `other` with overflow checking.
-    fn checked_mul(mut self, other: Self) -> Result<Self, TypeError> {
-        self.coefficient = self.coefficient.checked_mul(other.coefficient).ok_or_else(|| {
-            TypeError::invalid("'reshape' dimension expression coefficient does not fit in usize".to_string())
-        })?;
-        if self.coefficient == 0 {
-            self.dynamic_dimensions.clear();
-            return Ok(self);
-        }
-        for (dimension, exponent) in other.dynamic_dimensions {
-            let current = self.dynamic_dimensions.entry(dimension).or_default();
-            *current = current.checked_add(exponent).ok_or_else(|| {
-                TypeError::invalid("'reshape' dimension expression exponent does not fit in usize".to_string())
-            })?;
-        }
-        Ok(self)
-    }
-
-    /// Converts this monomial to a static extent or an unchanged dynamic input leaf.
-    fn to_dimension(&self, input_shape: &Shape) -> Result<Dimension, TypeError> {
-        if self.coefficient == 0 {
-            return Ok(Dimension::Static(0));
-        }
-        if self.dynamic_dimensions.is_empty() {
-            return Ok(Dimension::Static(self.coefficient));
-        }
-        if self.coefficient == 1
-            && self.dynamic_dimensions.len() == 1
-            && let Some((&dimension, &1)) = self.dynamic_dimensions.first_key_value()
-        {
-            return Ok(input_shape[dimension].clone());
-        }
-        Err(TypeError::invalid(
-            "'reshape' dynamic dimension arithmetic requires explicit result-dimension operands".to_string(),
-        ))
-    }
-}
-
-/// Constructs a symbolic inverse target when each dynamic input dimension remains recoverable from one output axis.
-fn invert_symbolic_reshape_target(
-    expressions: &[ReshapeDimensionExpression],
-    input_shape: &Shape,
-    dimensions: Option<&Permutation>,
-) -> Result<Vec<ReshapeDimensionExpression>, TypeError> {
-    let output_monomials = expressions
-        .iter()
-        .map(|expression| normalize_reshape_dimension_expression(expression, input_shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    let original_dimensions = input_shape
-        .dimensions()
-        .iter()
-        .enumerate()
-        .map(|(input_dimension, size)| match size {
-            Dimension::Static(value) => {
-                Ok::<ReshapeDimensionExpression, TypeError>(ReshapeDimensionExpression::Constant(*value))
-            }
-            Dimension::Dynamic(_) => {
-                let (output_dimension, monomial) = output_monomials
-                    .iter()
-                    .enumerate()
-                    .find(|(_, monomial)| {
-                        monomial.dynamic_dimensions.len() == 1
-                            && monomial.dynamic_dimensions.get(&input_dimension) == Some(&1)
-                    })
-                    .ok_or_else(|| TypeError::invalid(format!(
-                            "'reshape' transpose cannot recover dynamic input dimension {input_dimension} from the output shape",
-                        )))?;
-                let output = ReshapeDimensionExpression::InputDimension(output_dimension);
-                if monomial.coefficient == 1 {
-                    Ok(output)
-                } else {
-                    Ok(ReshapeDimensionExpression::ExactDivision {
-                        numerator: Box::new(output),
-                        denominator: Box::new(ReshapeDimensionExpression::Constant(monomial.coefficient)),
-                    })
-                }
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(match dimensions {
-        Some(dimensions) => dimensions.iter().map(|dimension| original_dimensions[*dimension].clone()).collect(),
-        None => original_dimensions,
-    })
-}
-
-/// Normalizes a dimension expression using the symbolic dimensions in `input_shape`.
-fn normalize_reshape_dimension_expression(
-    expression: &ReshapeDimensionExpression,
-    input_shape: &Shape,
-) -> Result<ReshapeDimensionMonomial, TypeError> {
-    match expression {
-        ReshapeDimensionExpression::Constant(value) => {
-            Ok(ReshapeDimensionMonomial { coefficient: *value, dynamic_dimensions: BTreeMap::new() })
-        }
-        ReshapeDimensionExpression::InputDimension(dimension) => {
-            let size = input_shape.dimensions().get(*dimension).ok_or_else(|| {
-                TypeError::invalid(format!(
-                    "'reshape' dimension expression references input dimension {dimension}, but the input rank is {}",
-                    input_shape.rank(),
-                ))
-            })?;
-            match size {
-                Dimension::Static(value) => {
-                    Ok(ReshapeDimensionMonomial { coefficient: *value, dynamic_dimensions: BTreeMap::new() })
-                }
-                Dimension::Dynamic(_) => Ok(ReshapeDimensionMonomial {
-                    coefficient: 1,
-                    dynamic_dimensions: BTreeMap::from([(*dimension, 1)]),
-                }),
-            }
-        }
-        ReshapeDimensionExpression::Product(factors) => {
-            factors.iter().try_fold(ReshapeDimensionMonomial::one(), |product, factor| {
-                product.checked_mul(normalize_reshape_dimension_expression(factor, input_shape)?)
-            })
-        }
-        ReshapeDimensionExpression::ExactDivision { numerator, denominator } => {
-            let mut numerator = normalize_reshape_dimension_expression(numerator, input_shape)?;
-            let denominator = normalize_reshape_dimension_expression(denominator, input_shape)?;
-            if !denominator.dynamic_dimensions.is_empty() {
-                return Err(TypeError::invalid(
-                    "'reshape' cannot prove exact division by a dynamic dimension".to_string(),
-                ));
-            }
-            if denominator.coefficient == 0 {
-                return Err(TypeError::invalid("'reshape' dimension expression divides by zero".to_string()));
-            }
-            if numerator.coefficient % denominator.coefficient != 0 {
-                return Err(TypeError::invalid("'reshape' dimension expression division is not exact".to_string()));
-            }
-            numerator.coefficient /= denominator.coefficient;
-            Ok(numerator)
-        }
-    }
-}
-
-/// Infers and validates a symbolic reshape target.
-fn infer_symbolic_reshape_shape(
-    expressions: &[ReshapeDimensionExpression],
-    input_shape: &Shape,
-) -> Result<Shape, TypeError> {
-    let output_dimensions = expressions
-        .iter()
-        .map(|expression| normalize_reshape_dimension_expression(expression, input_shape))
-        .collect::<Result<Vec<_>, _>>()?;
-    let input_elements = (0..input_shape.rank()).try_fold(ReshapeDimensionMonomial::one(), |product, dimension| {
-        product.checked_mul(normalize_reshape_dimension_expression(
-            &ReshapeDimensionExpression::InputDimension(dimension),
-            input_shape,
-        )?)
-    })?;
-    let output_elements = output_dimensions
-        .iter()
-        .cloned()
-        .try_fold(ReshapeDimensionMonomial::one(), ReshapeDimensionMonomial::checked_mul)?;
-    if input_elements != output_elements {
-        return Err(TypeError::invalid("'reshape' changes the number of elements".to_string()));
-    }
-    Ok(Shape::new(
-        output_dimensions
-            .iter()
-            .map(|dimension| dimension.to_dimension(input_shape))
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
-}
-
-/// Evaluates one reshape dimension expression for a concrete input shape.
-fn evaluate_reshape_dimension_expression(
-    expression: &ReshapeDimensionExpression,
-    input_shape: &Shape,
-) -> Result<usize, TypeError> {
-    match expression {
-        ReshapeDimensionExpression::Constant(value) => Ok(*value),
-        ReshapeDimensionExpression::InputDimension(dimension) => {
-            input_shape.dimensions().get(*dimension).and_then(Dimension::value).ok_or_else(|| {
-                TypeError::invalid(format!(
-                    "cannot evaluate input dimension {dimension} from non-concrete shape {input_shape}"
-                ))
-            })
-        }
-        ReshapeDimensionExpression::Product(factors) => factors.iter().try_fold(1usize, |product, factor| {
-            product.checked_mul(evaluate_reshape_dimension_expression(factor, input_shape)?).ok_or_else(|| {
-                TypeError::invalid("'reshape' dimension expression value does not fit in usize".to_string())
-            })
-        }),
-        ReshapeDimensionExpression::ExactDivision { numerator, denominator } => {
-            let numerator = evaluate_reshape_dimension_expression(numerator, input_shape)?;
-            let denominator = evaluate_reshape_dimension_expression(denominator, input_shape)?;
-            if denominator == 0 {
-                return Err(TypeError::invalid("'reshape' dimension expression divides by zero".to_string()));
-            }
-            if numerator % denominator != 0 {
-                return Err(TypeError::invalid("'reshape' dimension expression division is not exact".to_string()));
-            }
-            Ok(numerator / denominator)
-        }
     }
 }
 
@@ -723,12 +401,7 @@ impl Operation for LegacyReshapeOperation {
         renaming: &TypeIdentityRenaming<<ArrayType as crate::Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self::new(ReshapeParameters {
-            target: match self.parameters.target() {
-                ReshapeTarget::Shape(shape) => ReshapeTarget::Shape(shape.rename_type_identities(renaming)),
-                ReshapeTarget::DimensionExpressions(expressions) => {
-                    ReshapeTarget::DimensionExpressions(expressions.clone())
-                }
-            },
+            output_shape: self.parameters.output_shape().rename_type_identities(renaming),
             dimensions: self.parameters.dimensions().cloned(),
             output_sharding: self.parameters.output_sharding().cloned(),
         }))
@@ -736,7 +409,7 @@ impl Operation for LegacyReshapeOperation {
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("shape", self.parameters.target())?;
+            operation.field("shape", self.parameters.output_shape())?;
             if let Some(dimensions) = self.parameters.dimensions() {
                 operation.field("dimensions", format_args!("{:?}", dimensions.as_slice()))?;
             }
@@ -816,18 +489,7 @@ impl_differentiable_operation! {
                         )),
                         (None, None) => None,
                     };
-                    let mut inverse_parameters = match operation.parameters().target() {
-                        ReshapeTarget::Shape(_) => {
-                            ReshapeParameters::new(permuted_input_cotangent_type.shape().clone())
-                        }
-                        ReshapeTarget::DimensionExpressions(expressions) => {
-                            ReshapeParameters::from_dimension_expressions(invert_symbolic_reshape_target(
-                                expressions,
-                                input_cotangent_type.shape(),
-                                operation.parameters().dimensions(),
-                            )?)
-                        }
-                    };
+                    let mut inverse_parameters = ReshapeParameters::new(permuted_input_cotangent_type.shape().clone());
                     if let Some(bridge_sharding) = bridge_sharding {
                         inverse_parameters = inverse_parameters.with_output_sharding(bridge_sharding);
                     }
@@ -1059,24 +721,11 @@ where
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let moved_input = inputs[0].move_axis(0)?;
-        let mut lifted_parameters = match self.parameters.target() {
-            ReshapeTarget::Shape(shape) => {
-                let mut lifted_output_dimensions = Vec::with_capacity(shape.rank() + 1);
-                lifted_output_dimensions.push(Dimension::Static(axis_size));
-                lifted_output_dimensions.extend_from_slice(shape.dimensions());
-                ReshapeParameters::new(Shape::new(lifted_output_dimensions))
-            }
-            ReshapeTarget::DimensionExpressions(expressions) => {
-                let mut lifted_expressions = Vec::with_capacity(expressions.len() + 1);
-                lifted_expressions.push(ReshapeDimensionExpression::Constant(axis_size));
-                lifted_expressions.extend(
-                    expressions
-                        .iter()
-                        .map(|expression| remap_reshape_dimension_expression(expression, &|dimension| dimension + 1)),
-                );
-                ReshapeParameters::from_dimension_expressions(lifted_expressions)
-            }
-        };
+        let output_shape = self.parameters.output_shape();
+        let mut lifted_output_dimensions = Vec::with_capacity(output_shape.rank() + 1);
+        lifted_output_dimensions.push(Dimension::Static(axis_size));
+        lifted_output_dimensions.extend_from_slice(output_shape.dimensions());
+        let mut lifted_parameters = ReshapeParameters::new(Shape::new(lifted_output_dimensions));
         if let Some(dimensions) = self.parameters.dimensions() {
             let mut lifted_dimensions = Vec::with_capacity(dimensions.len() + 1);
             lifted_dimensions.push(0);
@@ -1117,38 +766,17 @@ pub(crate) fn lift_output_sharding_for_leading_batch_axis(
         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
 }
 
-/// Remaps every input-dimension reference in `expression`.
-fn remap_reshape_dimension_expression(
-    expression: &ReshapeDimensionExpression,
-    remap: &impl Fn(usize) -> usize,
-) -> ReshapeDimensionExpression {
-    match expression {
-        ReshapeDimensionExpression::Constant(value) => ReshapeDimensionExpression::Constant(*value),
-        ReshapeDimensionExpression::InputDimension(dimension) => {
-            ReshapeDimensionExpression::InputDimension(remap(*dimension))
-        }
-        ReshapeDimensionExpression::Product(factors) => ReshapeDimensionExpression::Product(
-            factors.iter().map(|factor| remap_reshape_dimension_expression(factor, remap)).collect(),
-        ),
-        ReshapeDimensionExpression::ExactDivision { numerator, denominator } => {
-            ReshapeDimensionExpression::ExactDivision {
-                numerator: Box::new(remap_reshape_dimension_expression(numerator, remap)),
-                denominator: Box::new(remap_reshape_dimension_expression(denominator, remap)),
-            }
-        }
-    }
-}
-
 /// Represents the ability to reshape an array without changing its element count or row-major element order.
 ///
 /// `t.reshape(target_shape)` reinterprets `t`'s payload under the specified target [`Shape`]. The input and target
-/// shapes must have equal element counts. [`ReshapeDimensionExpression`] provides checked runtime shape arithmetic for
-/// shape-polymorphic programs whose equality cannot be represented by anonymous dynamic [`Dimension`] values alone. When
-/// the input carries a [`Sharding`], singleton dimensions are ignored and contiguous split/merge groups redistribute
-/// compatible mesh axes over their output factors. Ambiguous dynamic, zero-sized, unconstrained, or non-contiguous
-/// placement changes require an explicit output sharding. A non-identity reshape preserves the input memory space and
-/// clears explicit physical layout metadata because the logical shape change does not determine a unique output
-/// storage layout.
+/// shapes must have equal element counts, which the type system must be able to establish from the two shapes alone.
+/// Shape-polymorphic programs whose output extents are not recoverable from anonymous dynamic [`Dimension`] values
+/// stage [`ReshapeOperation`] instead, which takes one explicit first-class dimension operand per output axis and so
+/// expresses runtime shape arithmetic as ordinary graph values. When the input carries a [`Sharding`], singleton
+/// dimensions are ignored and contiguous split/merge groups redistribute compatible mesh axes over their output
+/// factors. Ambiguous dynamic, zero-sized, unconstrained, or non-contiguous placement changes require an explicit
+/// output sharding. A non-identity reshape preserves the input memory space and clears explicit physical layout
+/// metadata because the logical shape change does not determine a unique output storage layout.
 ///
 /// # Examples
 ///
@@ -1181,41 +809,33 @@ impl Reshape for ArrayType {
             Some(dimensions) => self.transpose(dimensions)?,
             None => self.clone(),
         };
-        let shape = match parameters.target() {
-            ReshapeTarget::Shape(shape) => {
-                if permuted_input.shape() != shape {
-                    if shape.dimensions().iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
-                        return Err(TypeError::invalid(
-                            "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-                        )
-                        .into());
-                    }
-                    let Some(input_elements) =
-                        permuted_input.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
-                    else {
-                        return Err(TypeError::invalid(
-                            "'reshape' requires dimension expressions for a dynamic input shape".to_string(),
-                        )
-                        .into());
-                    };
-                    let Some(output_elements) =
-                        shape.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
-                    else {
-                        return Err(TypeError::invalid(
-                            "'reshape' requires dimension expressions for a dynamic output shape".to_string(),
-                        )
-                        .into());
-                    };
-                    if input_elements != output_elements {
-                        return Err(TypeError::invalid("'reshape' changes the number of elements".to_string()).into());
-                    }
-                }
-                shape.clone()
+        let shape = parameters.output_shape().clone();
+        if permuted_input.shape() != &shape {
+            if shape.dimensions().iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
+                return Err(TypeError::invalid(
+                    "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string(),
+                )
+                .into());
             }
-            ReshapeTarget::DimensionExpressions(expressions) => {
-                infer_symbolic_reshape_shape(expressions, self.shape())?
+            let Some(input_elements) =
+                permuted_input.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
+            else {
+                return Err(TypeError::invalid(
+                    "'reshape' requires explicit result-dimension operands for a dynamic input shape".to_string(),
+                )
+                .into());
+            };
+            let Some(output_elements) = shape.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
+            else {
+                return Err(TypeError::invalid(
+                    "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string(),
+                )
+                .into());
+            };
+            if input_elements != output_elements {
+                return Err(TypeError::invalid("'reshape' changes the number of elements".to_string()).into());
             }
-        };
+        }
 
         let sharding = match parameters.output_sharding() {
             Some(requested) => Some(validate_requested_reshape_sharding(&permuted_input, &shape, requested)?),
@@ -1577,7 +1197,7 @@ mod tests {
         // Operation identity and accessors.
         assert_eq!(operation.name(), RESHAPE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "reshape [shape=[2, 3]]");
-        assert_eq!(operation.parameters().output_shape(), Some(&shape));
+        assert_eq!(operation.parameters().output_shape(), &shape);
 
         // Type inference validates the element count and returns the target shape.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
@@ -1781,181 +1401,10 @@ mod tests {
     }
 
     #[test]
-    fn test_symbolic_reshape() {
-        let parameters = ReshapeParameters::from_dimension_expressions(vec![
-            ReshapeDimensionExpression::ExactDivision {
-                numerator: Box::new(ReshapeDimensionExpression::Product(vec![
-                    ReshapeDimensionExpression::InputDimension(0),
-                    ReshapeDimensionExpression::Constant(4),
-                ])),
-                denominator: Box::new(ReshapeDimensionExpression::Constant(2)),
-            },
-            ReshapeDimensionExpression::Constant(2),
-        ]);
-        let operation = LegacyReshapeOperation::new(parameters.clone());
-        assert_eq!(operation.parameters().output_shape(), None);
-        assert_eq!(format!("{operation}"), "reshape [shape=[((dim(0) * 4) / 2), 2]]",);
-
-        // Abstract evaluation cannot manufacture a stable leaf identity for a derived extent. The future mixed
-        // operation signature supplies that extent as an explicit result-dimension operand.
-        let input_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                Dimension::Dynamic(DimensionVariable::new("input", DimensionBounds::non_negative(Some(9)).unwrap())),
-                Dimension::Static(4),
-            ]),
-        );
-        assert_eq!(
-            input_type.reshape(parameters.clone()),
-            Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' dynamic dimension arithmetic requires explicit result-dimension operands".to_string(),
-            ))),
-        );
-
-        // Eager execution resolves the same expressions from the concrete runtime shape.
-        let input = Array::from_f64s(
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)])),
-            (0..12).map(|value| value as f64).collect(),
-        );
-        assert_eq!(
-            input.reshape(parameters.clone()).map(|output| (output.r#type().shape().clone(), output.to_f64s())),
-            Ok((
-                Shape::new(vec![Dimension::Static(6), Dimension::Static(2)]),
-                (0..12).map(|value| value as f64).collect(),
-            )),
-        );
-
-        // Batching remaps input-dimension references after moving the mapped axis to the front.
-        check_operation_batching!(
-            @exact,
-            operation = operation.clone(),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 1), Array::from_f64s(
-                    ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
-                    ),
-                    (0..24).map(|value| value as f64).collect(),
-                ))],
-                outputs = [(@mapped(axis = 0), Array::from_f64s(
-                    ArrayType::new(
-                        DataType::F64,
-                        Shape::new(vec![Dimension::Static(2), Dimension::Static(6), Dimension::Static(2)]),
-                    ),
-                    vec![
-                        0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0, 16.0, 17.0, 18.0, 19.0,
-                        4.0, 5.0, 6.0, 7.0, 12.0, 13.0, 14.0, 15.0, 20.0, 21.0, 22.0, 23.0,
-                    ],
-                ))],
-            }],
-        );
-        check_operation_differentiation!(
-            @approx(step = 0.125, epsilon = 1e-9),
-            operation = operation.clone(),
-            cases = [{
-                primals = [Array::matrix(3, 4, (0..12).map(|value| value as f64).collect())],
-                tangents = [Array::matrix(3, 4, (12..24).map(|value| value as f64).collect())],
-                primal_outputs = [Array::matrix(6, 2, (0..12).map(|value| value as f64).collect())],
-                tangent_outputs = [Array::matrix(6, 2, (12..24).map(|value| value as f64).collect())],
-            }],
-        );
-        check_operation_transposition!(
-            @exact,
-            operation = operation.clone(),
-            cases = [{
-                inputs = [(@linear(type = ArrayType::new(
-                    DataType::F64,
-                    Shape::new(vec![3.into(), 4.into()]),
-                )))],
-                output_cotangents = [Array::matrix(6, 2, (0..12).map(|value| value as f64).collect())],
-                input_cotangents = [Array::matrix(3, 4, (0..12).map(|value| value as f64).collect())],
-            }],
-        );
-
-        assert_eq!(
-            input_type.reshape(ReshapeParameters::from_dimension_expressions(vec![
-                ReshapeDimensionExpression::InputDimension(0),
-                ReshapeDimensionExpression::Constant(2),
-            ])),
-            Err(ProgramError::Type(TypeError::invalid("'reshape' changes the number of elements".to_string()))),
-        );
-        assert_eq!(
-            input_type.reshape(ReshapeParameters::from_dimension_expressions(vec![
-                ReshapeDimensionExpression::InputDimension(2),
-            ])),
-            Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' dimension expression references input dimension 2, but the input rank is 2".to_string()
-            ))),
-        );
-        assert_eq!(
-            input_type.reshape(ReshapeParameters::from_dimension_expressions(vec![
-                ReshapeDimensionExpression::ExactDivision {
-                    numerator: Box::new(ReshapeDimensionExpression::InputDimension(0)),
-                    denominator: Box::new(ReshapeDimensionExpression::InputDimension(0)),
-                },
-                ReshapeDimensionExpression::Constant(4),
-            ])),
-            Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' cannot prove exact division by a dynamic dimension".to_string()
-            ))),
-        );
-        assert_eq!(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).reshape(
-                ReshapeParameters::from_dimension_expressions(vec![
-                    ReshapeDimensionExpression::ExactDivision {
-                        numerator: Box::new(ReshapeDimensionExpression::InputDimension(0)),
-                        denominator: Box::new(ReshapeDimensionExpression::Constant(2)),
-                    },
-                    ReshapeDimensionExpression::Constant(2),
-                ]),
-            ),
-            Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' dimension expression division is not exact".to_string()
-            ))),
-        );
-        assert_eq!(
-            ArrayType::scalar(DataType::F32).reshape(ReshapeParameters::from_dimension_expressions(vec![
-                ReshapeDimensionExpression::Product(vec![
-                    ReshapeDimensionExpression::Constant(usize::MAX),
-                    ReshapeDimensionExpression::Constant(2),
-                ]),
-            ])),
-            Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' dimension expression coefficient does not fit in usize".to_string()
-            ))),
-        );
-
-        // An empty expression list is the rank-0 shape and preserves scalar payloads.
-        let scalar = Array::scalar(7_i32);
-        assert_eq!(
-            scalar
-                .reshape(ReshapeParameters::from_dimension_expressions(Vec::new()))
-                .map(|output| (output.r#type().into_owned(), output.elements::<i32>().unwrap())),
-            Ok((scalar.r#type().into_owned(), scalar.elements::<i32>().unwrap())),
-        );
-
-        // The transpose target is derivable when each dynamic input dimension remains individually recoverable.
-        assert_eq!(
-            invert_symbolic_reshape_target(
-                operation.parameters().output_dimension_expressions().unwrap(),
-                input_type.shape(),
-                None,
-            ),
-            Ok(vec![
-                ReshapeDimensionExpression::ExactDivision {
-                    numerator: Box::new(ReshapeDimensionExpression::InputDimension(0)),
-                    denominator: Box::new(ReshapeDimensionExpression::Constant(2)),
-                },
-                ReshapeDimensionExpression::Constant(4),
-            ]),
-        );
-    }
-
-    #[test]
     fn test_array_type_reshape() {
         // Dynamic dimensions can only be reshaped without explicit dimension operands when equality follows directly
-        // from identical identity-bearing shapes. Dimension expressions encode other runtime relationships.
+        // from identical identity-bearing shapes. Other runtime relationships require the mixed reshape operation and
+        // its explicit result-dimension operands.
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
         let dynamic_shape = Shape::new(vec![
             Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
@@ -1965,24 +1414,26 @@ mod tests {
         assert_eq!(
             dynamic_type.reshape(Shape::new(vec![Dimension::Static(6)])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires dimension expressions for a dynamic input shape".to_string()
+                "'reshape' requires explicit result-dimension operands for a dynamic input shape".to_string()
             ))),
         );
         assert_eq!(
             static_type.reshape(dynamic_shape.clone()),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
         assert_eq!(
             LegacyReshapeOperation::new(dynamic_shape.clone())
                 .infer_output_types(std::slice::from_ref(&static_type), &[]),
-            Err(TypeError::invalid("'reshape' requires dimension expressions for a dynamic output shape".to_string())),
+            Err(TypeError::invalid(
+                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string(),
+            )),
         );
         assert_eq!(
             Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
 
@@ -2000,7 +1451,7 @@ mod tests {
                 Dimension::Static(0)
             ])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires dimension expressions for a dynamic output shape".to_string()
+                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
         assert_eq!(
