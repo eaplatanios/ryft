@@ -670,11 +670,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatching, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
+        DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy};
-    use crate::contexts::EagerContext;
+    use crate::batching::{
+        BatchAxis, BatchedProgram, BatchingContext, BatchingTracer, ProgramBatchingOutputAxesPolicy,
+    };
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
@@ -888,9 +890,99 @@ mod tests {
                 if error.to_string().contains("custom call 'ryft.test.add_one' has no differentiation rule"),
         ));
         assert!(matches!(
-            program.batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural),
-            Err(error) if error.to_string().contains("custom call 'ryft.test.add_one' has no batching rule"),
+            program.batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(error)
+                if error.to_string()
+                    == "custom call 'ryft.test.add_one' has no batching rule for operand 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
         ));
+    }
+
+    /// A custom call whose operands are all replicated is bound unchanged and reports replicated outputs. This is the
+    /// JAX-parity behavior: a batching rule is consulted only once an operand is actually mapped, and this shortcut is
+    /// sound because the region-free foreign kernel cannot observe the transform's axis.
+    #[test]
+    fn test_custom_call_batches_all_replicated_operands_unchanged() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
+                Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
+            },
+            vec![vector_type(), vector_type()],
+        )
+        .unwrap();
+
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        let batched = batched.to_flat_program();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = custom_call [target=ryft.test.add_one] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    /// The mixed universe applies the same all-replicated shortcut, including the trailing first-class output-extent
+    /// operand, which stays an ordinary replicated operand of the unchanged call.
+    #[test]
+    fn test_array_ir_custom_call_batches_all_replicated_operands_unchanged() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![output_type.clone()],
+        ));
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = trace.input(vector_type().into());
+        let extent = trace.input(DimensionType::new(rows).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(input)),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
+
+        let output_id = output.into_batch().into_value().atom_id().unwrap();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
+                let %2:dimension<2> = const
+                    %3:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 
     #[test]
@@ -921,12 +1013,18 @@ mod tests {
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
+        let mapped = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+            BatchAxis::new(0),
+        )
+        .unwrap();
         assert!(matches!(
-            operation.batch(&batching_context, &EmptyRegionDriver, &[]),
+            operation.batch(&batching_context, &EmptyRegionDriver, &[mapped]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
-                    == "custom call 'ryft.test.add_one' has no batching rule; invoke a kernel that understands the \
-                        batch axis instead",
+                    == "custom call 'ryft.test.add_one' has no batching rule for operand 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
         ));
 
         let mut transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();

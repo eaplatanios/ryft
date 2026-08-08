@@ -2001,9 +2001,6 @@ shape_changing_collective! {
     /// `scatter_axis` onto it, so batch item `i` receives chunk `i` of the sum.
     operation = PSumScatterOperation,
     name = PSUM_SCATTER_OPERATION_NAME = "psum_scatter",
-    #[doc(hidden)]
-    /// Homogeneous capability retained for the array-only operation and transform language.
-    capability = LegacyPSumScatter::psum_scatter,
     fields = {
         /// Axis of the operand along which the summed result is scattered across the participants.
         scatter_axis: usize,
@@ -2138,9 +2135,6 @@ shape_changing_collective! {
     /// item's chunk `i` of `split_axis`, concatenated item-major along `concat_axis`.
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
-    #[doc(hidden)]
-    /// Homogeneous capability retained for the array-only operation and transform language.
-    capability = LegacyAllToAll::all_to_all,
     fields = {
         /// Axis of the operand that is split into one chunk per participant.
         split_axis: usize,
@@ -4633,11 +4627,11 @@ mod tests {
         // `[33, 44]`, matching the verified cross-device `shard_map` execution semantics of StableHLO's
         // `reduce_scatter`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]);
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.psum_scatter("x", 0, CollectiveOptions::tiled())
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.psum_scatter_tiled("x", 0)
             },
-            x,
+            ArrayIrValue::Array(x),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
@@ -4645,8 +4639,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]),
+            )),
         );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("'psum_scatter' must preserve the array member kind");
+        };
         assert_eq!(output.to_f64s(), vec![11.0, 22.0, 33.0, 44.0]);
     }
 
@@ -4701,11 +4701,11 @@ mod tests {
         // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.all_to_all("x", 0, 0, CollectiveOptions::tiled())
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_to_all_tiled("x", 0, 0)
             },
-            x,
+            ArrayIrValue::Array(x),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
@@ -4713,8 +4713,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
+            )),
         );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("'all_to_all' must preserve the array member kind");
+        };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
@@ -4733,11 +4739,11 @@ mod tests {
             ),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.all_to_all("x", 0, 1, CollectiveOptions::tiled())
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_to_all_tiled("x", 0, 1)
             },
-            x,
+            ArrayIrValue::Array(x),
             BatchAxis::new(0),
             BatchAxis::new(0),
             BatchAxisSpecification::named("x"),
@@ -4745,11 +4751,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             output.r#type().into_owned(),
-            ArrayType::new(
+            ArrayIrType::Array(ArrayType::new(
                 DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(1), Dimension::Static(4)])
-            ),
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(1), Dimension::Static(4)]),
+            )),
         );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("'all_to_all' must preserve the array member kind");
+        };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 

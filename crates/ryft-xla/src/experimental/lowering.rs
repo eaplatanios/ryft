@@ -9129,6 +9129,38 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_lowers_immediate_dimension_constants_in_place() {
+        use ryft_core::DimensionToScalarOperation;
+
+        // An immediate dimension constant carries its own host-sized extent, and so — unlike a capture reference —
+        // it materializes as a scalar `i64` `stablehlo.constant` in the function body instead of consuming a hidden
+        // capture argument. That is exactly what makes first-class extents usable where no capture table is
+        // reachable, such as inside a `shard_map` manual region.
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let extent = builder.add_constant(XlaConstant::Dimension(DimensionValue::new(extent_type, 4).unwrap()));
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let input_types: [ArrayType; 0] = [];
+        let stablehlo = to_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &vec![ArrayType::scalar(DataType::I64)],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(stablehlo.contains("func.func @main() -> tensor<i64>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.constant dense<4> : tensor<i64>"), "{stablehlo}");
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_lowers_capture_output_as_a_hidden_argument() {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();

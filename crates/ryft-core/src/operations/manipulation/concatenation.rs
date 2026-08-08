@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
+    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -21,6 +21,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
@@ -380,7 +381,7 @@ where
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
-        + OperationProjection<ArrayType, Projected: From<ZeroOperation<ArrayType>>>
+        + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -421,15 +422,10 @@ where
             let mut tangent_inputs = array_inputs
                 .iter()
                 .map(|input| -> Result<C::Value, DifferentiationError> {
-                    let tangent = match input.tangent() {
-                        MaybeZero::Zero(r#type) => MaybeZero::Zero(<&ArrayType>::try_from(r#type)?.clone()),
-                        MaybeZero::Value(value) => {
-                            MaybeZero::Value(<C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?)
-                        }
-                    };
-                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(
-                        tangent.materialize(&projected_context)?,
-                    ))
+                    Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                        &projected_context,
+                        input,
+                    )?))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let input_cotangent_types = array_inputs

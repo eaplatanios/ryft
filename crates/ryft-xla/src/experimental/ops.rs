@@ -1117,17 +1117,19 @@ where
 mod tests {
     use std::rc::Rc;
 
+    use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, ConditionOperation,
         DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh,
-        MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder,
-        RegionDriver, RegionInterface, RegionRef, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext,
-        TracingContext, TranspositionDriver, Typed, WhileOperation, ZeroOperation,
+        DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver,
+        LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, PartialValue, Placeholder,
+        ProgramBuilder, RegionDriver, RegionInterface, RegionRef, ScanOperation, Shape, Sharding, ShardingDimension,
+        StagingContext, TracingContext, TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation,
+        ZeroOperation,
     };
 
     use super::{
-        JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
+        CaptureConstant, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
         materialize_transpose_cotangent, transpose_primal_jit_call,
     };
 
@@ -1162,6 +1164,56 @@ mod tests {
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    #[test]
+    fn test_xla_constant() {
+        let array_type = vector_type();
+        let capture = CaptureReference::new(2, ArrayIrType::Array(array_type.clone()));
+        let extent_type =
+            DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap()));
+        let extent = DimensionValue::new(extent_type.clone(), 4).unwrap();
+
+        // Both variants are reachable through the payload conversions, report their own member type, and render
+        // exactly like the payload they wrap.
+        let captured = XlaConstant::from(capture.clone());
+        let immediate = XlaConstant::from(extent.clone());
+        assert_eq!(captured, XlaConstant::Captured(capture));
+        assert_eq!(immediate, XlaConstant::Dimension(extent.clone()));
+        assert_eq!(captured.r#type().into_owned(), ArrayIrType::Array(array_type.clone()));
+        assert_eq!(immediate.r#type().into_owned(), ArrayIrType::Dimension(extent_type));
+        assert_eq!(captured.to_string(), "capture#2:f64[4]");
+        assert_eq!(immediate.to_string(), extent.to_string());
+
+        // Only the captured variant names a capture-table slot, and so only it is renumbered by capture bookkeeping.
+        // An immediate is index-free and passes through every remapping unchanged.
+        assert_eq!(captured.capture_index(), Some(2));
+        assert_eq!(immediate.capture_index(), None);
+        assert_eq!(
+            captured.map_capture_index(|index| index + 3),
+            XlaConstant::Captured(CaptureReference::new(5, ArrayIrType::Array(array_type.clone()))),
+        );
+        assert_eq!(immediate.map_capture_index(|_| 7), immediate);
+
+        // Each variant projects to exactly its own member universe and rejects the other one.
+        assert_eq!(
+            <XlaConstant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
+            Ok(XlaArrayConstant::new(2, array_type.clone())),
+        );
+        assert_eq!(
+            <XlaConstant as ValueProjection<ArrayType>>::into_projected(immediate.clone()),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            <XlaConstant as ValueProjection<ArrayType>>::from_projected(XlaArrayConstant::new(2, array_type)),
+            captured,
+        );
+        assert_eq!(<XlaConstant as ValueProjection<DimensionType>>::projected(&immediate), Ok(&extent));
+        assert_eq!(<XlaConstant as ValueProjection<DimensionType>>::into_projected(immediate), Ok(extent),);
+        assert_eq!(
+            <XlaConstant as ValueProjection<DimensionType>>::projected(&captured),
+            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
     }
 
     #[test]

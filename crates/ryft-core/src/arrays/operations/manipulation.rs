@@ -687,7 +687,7 @@ mod tests {
         DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
         DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherDimensionNumbers,
         GatherOperation, PadOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, SliceOperation,
-        UpdateSliceOperation,
+        UpdateSliceOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
@@ -1224,6 +1224,111 @@ in (%4)
             Ok(vec![
                 ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f64, 3.0, 6.0, 7.0])),
                 ArrayIrValue::Array(Array::scalar(18.0_f64)),
+            ]),
+        );
+    }
+
+    /// A mixed pad whose operand tangent is a structural zero of an identity-bearing type cannot construct that zero
+    /// from the type alone, because a dynamic zero needs one explicit extent operand per dynamic axis. The rule uses
+    /// the operand primal as the runtime-geometry exemplar instead, so forward mode succeeds where an input-free
+    /// dynamic `zero` would be rejected by constructor inference.
+    #[test]
+    fn test_array_ir_dynamic_pad_disconnected_operand_tangent_uses_a_primal_exemplar() {
+        let source = DimensionVariable::new("source", DimensionBounds::new(1, Some(5)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(3, Some(7)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let source_type = DimensionType::new(source);
+        let result_type = DimensionType::new(result);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source_extent = builder.add_input(source_type.clone().into());
+        let padding_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let output_extent = builder.add_input(result_type.clone().into());
+        // A mixed zero is a nullary constant, so its tangent stays a structural zero of the identity-bearing operand
+        // type while the padding-value tangent is live. The rule must still hand a concrete operand tangent to the
+        // staged pad.
+        let operand = builder
+            .add_instruction(
+                ArrayIrOperation::<Array>::from(ZeroOperation::new(input_type)),
+                Vec::new(),
+                vec![source_extent],
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                PadOperation::new(vec![1], vec![1], vec![0]).unwrap(),
+                Vec::new(),
+                vec![operand, padding_value, output_extent],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(source_type, 2).unwrap()),
+                ArrayIrValue::Array(Array::scalar(-1.0_f64)),
+                ArrayIrValue::Dimension(DimensionValue::new(result_type, 4).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1.0_f64)),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![-1.0_f64, 0.0, 0.0, -1.0])),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64, 0.0, 0.0, 1.0])),
+            ]),
+        );
+    }
+
+    /// Mixed concatenation applies the same operand-exemplar rule: a structurally zero array tangent whose type names
+    /// its extent by identity is materialized from that operand's primal rather than from the type.
+    #[test]
+    fn test_array_ir_dynamic_concatenate_disconnected_input_tangent_uses_a_primal_exemplar() {
+        let left = DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap());
+        let result = DimensionVariable::new("result", DimensionBounds::new(2, Some(5)).unwrap());
+        let left_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(left.clone())]));
+        let right_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));
+        let left_extent_type = DimensionType::new(left);
+        let result_type = DimensionType::new(result);
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &[left_type.clone().into(), right_type.clone().into(), result_type.clone().into()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let left_extent = builder.add_input(left_extent_type.clone().into());
+        let right = builder.add_input(right_type.into());
+        let extent = builder.add_input(result_type.clone().into());
+        let left = builder
+            .add_instruction(
+                ArrayIrOperation::<Array>::from(ZeroOperation::new(left_type)),
+                Vec::new(),
+                vec![left_extent],
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::new(left_extent_type, 2).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![30.0_f64])),
+                ArrayIrValue::Dimension(DimensionValue::new(result_type, 3).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f64])),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 30.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 1.0])),
             ]),
         );
     }
