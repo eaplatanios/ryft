@@ -1,3 +1,12 @@
+//! Closed operation families and array-owned operation implementations.
+//!
+//! [`ArrayOperation`], [`DimensionOperation`], and [`ArrayIrOperation`] are the staged operation families for the
+//! array universe. The private child modules group concrete reference-array capabilities and mixed array-IR machinery
+//! by the same semantic families used under [`crate::operations`]; generic operation contracts and payload types
+//! remain owned there.
+
+// TODO(eaplatanios): Review this module.
+
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
@@ -41,9 +50,6 @@ use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
 use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 
-// TODO(eaplatanios): Review this module.
-
-// TODO(eaplatanios): All these should be `pub mod` and we should have appropriate `pub use` statements right after.
 mod attention;
 mod collectives;
 mod compare;
@@ -54,7 +60,7 @@ mod custom_call;
 mod differentiation;
 mod dimensions;
 mod logical;
-pub mod manipulation;
+mod manipulation;
 mod math;
 mod memory;
 mod random;
@@ -62,7 +68,7 @@ mod sharding;
 mod sort;
 mod tag;
 
-pub use manipulation::BroadcastKernel;
+pub(crate) use manipulation::ElementConversionTarget;
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
 ///

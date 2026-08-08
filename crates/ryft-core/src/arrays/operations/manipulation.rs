@@ -5,6 +5,8 @@
 //! universe's answers to those contracts, together with the reference backend's element conversion contracts, which
 //! pair each source element category with the destination's exact conversion category.
 
+// TODO(eaplatanios): Review this.
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -34,19 +36,7 @@ use crate::operations::{
 };
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
-// TODO(eaplatanios): Review this.
-
-/// Backend execution contract for broadcasting to an already-concrete [`ArrayType`].
-///
-/// This kernel does not stage a program operation or create first-class dimension values. Composite eager
-/// interpretation resolves first-class dimension operands and validates the result type before invoking it. Program
-/// construction uses [`Broadcast`](crate::operations::manipulation::Broadcast) instead.
-pub trait BroadcastKernel: Sized {
-    /// Broadcasts `self` to `output_type` using `output_axes`.
-    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
-}
-
-impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadcast for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + DimensionSize<usize> + LegacyBroadcast> Broadcast for ArrayIrValue<A> {
     fn broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -63,7 +53,7 @@ impl<A: BroadcastKernel + DimensionSize<usize> + Value<Type = ArrayType>> Broadc
         );
         let operation = BroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
-        Ok(Self::Array(input.broadcast_to_type(output_type, output_axes)?))
+        Ok(Self::Array(input.legacy_broadcast(output_type, output_axes)?))
     }
 }
 
@@ -120,8 +110,8 @@ impl Reshape for Array {
     }
 }
 
-impl BroadcastKernel for Array {
-    fn broadcast_to_type(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
+impl LegacyBroadcast for Array {
+    fn legacy_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let r#type = self.r#type().legacy_broadcast(output_type, output_axes)?;
         let Some(target_shape) = r#type.static_shape() else {
             return Err(
@@ -153,13 +143,6 @@ impl BroadcastKernel for Array {
             output_addressing.advance_index(&mut target_index);
         }
         Ok(Self::new_unchecked(r#type, Arc::new(bytes)))
-    }
-}
-
-impl LegacyBroadcast for Array {
-    #[inline]
-    fn legacy_broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        self.broadcast_to_type(output_type, output_axes)
     }
 }
 
@@ -2912,7 +2895,7 @@ in (%4)
         let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
         let output_type =
             array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
-        let broadcast = input.broadcast_to_type(output_type.clone(), &[1]).unwrap();
+        let broadcast = input.legacy_broadcast(output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().as_ref(), &output_type);
         assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
         assert_eq!(broadcast.storage_bytes(), [0x22, 0x11, 0x44, 0x33, 0, 0, 0x22, 0x11, 0x44, 0x33]);
@@ -2930,7 +2913,7 @@ in (%4)
         );
         for output_axes in [vec![0, 1], vec![1, 0]] {
             assert!(matches!(
-                dynamic.broadcast_to_type(dynamic_type.clone(), output_axes.as_slice()),
+                dynamic.legacy_broadcast(dynamic_type.clone(), output_axes.as_slice()),
                 Err(ProgramError::Type(TypeError::Invalid { message }))
                     if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
             ));

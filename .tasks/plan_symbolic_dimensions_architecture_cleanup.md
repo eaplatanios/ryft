@@ -1226,11 +1226,12 @@ waterfall; every deferred checkbox names its owner so the open Phase 3 gate rema
 - [x] P3g public broadcast API consolidation: make `Broadcast` the sole public program-construction capability, with
       exact and computed first-class extents accepted by the same `BroadcastOperation`; remove
       `BroadcastToDimensions`, the public packed-array `DynamicBroadcast` capability, and all old method names; retain
-      one backend-only `backends::arrays::BroadcastKernel` contract for already-concrete eager output types. The frozen
-      `LegacyBroadcastOperation` remains hidden only for the homogeneous `ArrayOperation` transform language and its
-      XLA lowering/import consumers assigned to Phases 4–9. Phase 4 deleted the obsolete packed-array
-      `DynamicBroadcastOperation` after proving the canonical explicit-dimension broadcast superseded it. Exact
-      implementation and verification evidence is recorded here and in
+      one resolved eager-materialization path for already-concrete output types. This path originally used a separate
+      `backends::arrays::BroadcastKernel`, but the Phase 9 trait-deduplication audit removed it as an exact duplicate
+      of the retained `LegacyBroadcast` capability. The frozen `LegacyBroadcastOperation` remains hidden only for the
+      homogeneous `ArrayOperation` transform language and its XLA lowering/import consumers assigned to Phases 4–9.
+      Phase 4 deleted the obsolete packed-array `DynamicBroadcastOperation` after proving the canonical explicit-
+      dimension broadcast superseded it. Exact implementation and verification evidence is recorded here and in
       `.tasks/plan_broadcast_api_consolidation.md`.
 - [x] P3h Delivery A: give the existing `ConcatenateOperation` a canonical mixed contract with a trailing explicit
       result-extent operand while retaining its unchanged homogeneous contract on the same axis-only payload. Mixed
@@ -2292,7 +2293,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         algorithm, and `backends` contains concrete eager values/operation families rather than transform policy types.
         Update every in-repo path directly and decide the intentional `batching` facade during this move without adding
         compatibility re-exports.
-- [ ] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
+- [x] After the batching hierarchy and operation ownership have settled, consolidate the reference array stack under
       one top-level `ryft_core::arrays` hierarchy as a separate, measured API and representation change:
   - [x] Execute the Phase 9a representation and scalar-retirement sequence specified below. Storage must migrate
         before scalar deletion because the current `Array` uses `Vec<Scalar>` in production; keep existing public
@@ -2317,8 +2318,8 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
     - The kind-first rule: `arrays::types` owns the complete staged-type vocabulary in kind-internal submodules
       (`arrays`, `data`, `dimensions`, `layouts`, `memories`, and later `ir`) because those types form one
       interlocking vocabulary (`ArrayType` embeds `Shape`, `DataType`, `Layout`, `Memory`, and `Sharding`); each
-      concrete value family owns exactly one value module (`arrays::dimensions` owns `DimensionValue` today;
-      `arrays::ir` will own `ArrayIrValue`, and the reference `Array` gets its own module); and all closed operation
+      concrete value family owns exactly one value module (`arrays::dimensions` owns `DimensionValue`, `arrays::ir`
+      owns `ArrayIrValue`, and private `arrays::arrays` owns the reference `Array`); and all closed operation
       dispatch enums live in `arrays::operations`. Splitting one family's types, values, and operations across a
       per-family directory is rejected because it fragments the type vocabulary the way the old top-level
       `types`-vs-`arrays` split did.
@@ -2332,11 +2333,9 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       today; `ArrayOperation` when the reference backend moves) and their tracing contexts, together with their
       family-level normalization/conversion contract: the trivial member-lift `From` impls and family-spanning
       boundary adapters such as the composite `MemberDifferentiableOperation` impl live here. Private per-family
-      submodules (`collectives`, `compare`, `constants`, `control_flow`, `dimensions`, and `manipulation` today) own
-      concrete capability implementations, mixed array-IR interpretation and provider glue, composite/batching glue,
-      and the tests that exercise those implementations. `arrays` re-exports the operation enums and tracing
-      contexts; users may also name the enums through `arrays::operations`, but family implementation submodules do
-      not create additional public API paths.
+      modules own concrete capability implementations, mixed array-IR interpretation and provider glue,
+      composite/batching glue, and the tests that exercise those implementations. `arrays` re-exports the operation
+      enums and tracing contexts; implementation-only family modules do not create additional public API paths.
     - Transform instantiations get their own domain modules beside `operations`: `arrays::differentiation` owns the
       linearization residual vocabulary (`LinearResiduals`, `ExactShape`) and the array `LinearCallBatchingPolicy`
       implementations, and the planned `arrays::batching` owns the batching instantiations. The durable rule from the
@@ -2344,12 +2343,11 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       instantiations live in the domain — which also keeps transform modules such as `differentiation::linear` free
       of non-test array imports.
     - Mirror the backend-neutral `operations` hierarchy where array-owned implementation code exists, using
-      `attention`, `compare`, `complex`, `constants`, `control_flow`, `custom_call`, `debugging`, `differentiation`,
+      `attention`, `collectives`, `compare`, `complex`, `constants`, `control_flow`, `custom_call`, `differentiation`,
       `dimensions`, `logical`, `manipulation`, `math`, `memory`, `random`, `sharding`, `sort`, and `tag` family
-      submodules. Do not create empty files merely because an enum has a variant: collectives and any other operations
-      whose complete implementation remains with their generic payload need only their enum variants in `mod.rs`.
-      Begin with one file per meaningful top-level family, and split a dense family such as `math` or `manipulation`
-      into a matching directory only when the moved implementation is large enough to make that split clearer.
+      submodules. Do not create empty files merely because an enum has a variant. Begin with one file per meaningful
+      top-level family, and split a dense family such as `math` or `manipulation` into a matching directory only when
+      the moved implementation is large enough to make that split clearer.
     - Keep generic operation payload structs, type inference, effects, and operation-specific batching,
       differentiation, transposition, partial-evaluation, and lowering contracts beside their owners in
       `ryft_core::operations`. The array-owned family modules implement capabilities for `Array`/`ArrayIrValue` and
@@ -2372,28 +2370,34 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `ArrayIrOperation`, and their array-owned implementations beneath `arrays::operations`. Keep generic operation
         semantics in `operations`, generic program machinery in `programs`, and transform policy machinery in its
         transform modules; this hierarchy owns the complete array-language type vocabulary, concrete reference values,
-        and their closed operation families. *(Completed 2026-08-07: the `Array` value lives in `arrays::reference`,
-        `backends` is deleted, and all sub-items below are done.)*
+        and their closed operation families. *(Completed 2026-08-07: the `Array` value lives in private
+        `arrays::arrays`, `backends` is deleted, and all sub-items below are done.)*
     - [x] Extend `arrays::operations::mod.rs` (created 2026-08-06 with `DimensionOperation` and
           `DimensionTracingContext`) with `ArrayOperation`, `ArrayIrOperation`, `ArrayTracingContext`, and only the
           imports, derives, family conversions, and shared dispatcher/provider logic that genuinely spans operation
-          families. Re-export the public family names from `arrays` without retaining a `backends` alias.
+          families. Re-export the public operation enums and tracing contexts from `arrays` without retaining a
+          `backends` alias.
     - [x] Relocate reference `Array` capability implementations and mixed `ArrayIrValue` interpretation/provider glue
-          into the private family submodules specified above. Keep family-local typed traversal helpers in the same
+          into the family modules specified above. Keep family-local typed traversal helpers in the same
           submodule as their sole consumers; keep only representation-wide construction, addressing, projection, and
           value contracts with the value types. *(The `ArrayIrValue` half was done on 2026-08-07 via the
           `operations::array_ir` dissolution. The reference `Array` half completed later the same day: the interim
-          `arrays::reference` catch-all (the former `backends/arrays.rs` moved whole) was dissolved into the family
-          submodules — eleven new ones (`attention`, `complex`, `custom_call`, `differentiation`, `logical`, `math`,
-          `memory`, `random`, `sharding`, `sort`, `tag`) plus the existing five — with `ScaledDot` corrected to the
-          `math` family per its defining module. `arrays::reference` now holds only the `Array` value: storage,
+          `arrays::arrays` catch-all (the former `backends/arrays.rs`, interim name `arrays::reference`) was dissolved
+          into the family submodules — eleven new ones (`attention`, `complex`, `custom_call`, `differentiation`,
+          `logical`, `math`,
+          `memory`, `random`, `sharding`, `sort`, `tag`) plus the existing six — with `ScaledDot` corrected to the
+          `math` family per its defining module. Private `arrays::arrays` now holds only the `Array` value: storage,
           construction, typed combinators, the value contracts (`Debug`/`PartialEq`/`Display`/`Typed`/`Value`/
-          `AbsDiffEq`/`Concretizable<bool>`), and the shared per-dtype element-kernel layer (the fifteen `Element*`
-          traits and their macro impls, raised to `pub(crate)` because their consumers span several family files and
-          single macro bodies implement several traits jointly). Family-local kernel helpers (`reduce_elements`,
-          `compare_elements`, `copy_block`, `scatter_with_combiner`, …) moved with their families; `Array::r#type`
-          and `Array::bytes` became `pub(crate)` so moved kernels can keep constructing validated arrays. The public
-          `BroadcastKernel` trait moved to `operations::manipulation` and is re-exported through `arrays`.)*
+          `AbsDiffEq`/`Concretizable<bool>`), and representation-wide typed traversal. Element-kernel traits and their
+          macro implementations live with `operations::math` or `operations::manipulation`. Family-local kernel
+          helpers (`reduce_elements`,
+          `compare_elements`, `copy_block`, `scatter_with_combiner`, …) moved with their families. `Array`'s fields
+          remain private: moved kernels use `new_unchecked`, `shared_storage`, and `storage_bytes_mut` to preserve the
+          storage invariants without redundant validation or copying, and use the existing `Typed::r#type` rather than
+          a duplicate inherent accessor. Four element contracts cross family boundaries: `ElementAdd`, `ElementMul`,
+          `ElementExtremum`, and `ElementConversionTarget`. A subsequent Phase 9 audit deleted the temporary public
+          `BroadcastKernel` bridge and reused the existing `LegacyBroadcast` capability for resolved eager
+          materialization.)*
     - [x] Dissolve the former `backends/array_programs/differentiation.rs` (executed 2026-08-07; an interim move had
           kept it whole as `arrays::operations::differentiation`): the linearization residual vocabulary
           (`LinearResiduals`, `ExactShape`) moved together with the array `LinearCallBatchingPolicy` implementations
@@ -2410,16 +2414,16 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
           *(The array-IR catch-all's 49 tests were split on 2026-08-07: value/projection tests with `ArrayIrValue` in
           `arrays::ir`, dispatcher-level tests in `operations::mod.rs`, and behavior tests in their family
           submodules. The reference catch-all's 42 tests were split later the same day: 14 storage/encoding/
-          combinator/value tests stayed with `Array` in `arrays::reference`, and 28 behavior tests moved to their
+          combinator/value tests stayed with `Array` in `arrays::arrays`, and 28 behavior tests moved to their
           family submodules; the shared `array_type` fixture was hoisted to a `#[cfg(test)] pub(crate)` helper at
-          the `reference` module scope instead of being duplicated nine times.)*
+          the `arrays` value-module scope instead of being duplicated nine times.)*
     - [x] Gate: neither former backend catch-all file remains; every array-owned operation implementation has exactly
           one family home; no generic semantic or transform rule was copied; no family submodule exists solely to hold
           an enum variant; and targeted core/macro/XLA tests plus residual path searches pass. *(Verified 2026-08-07:
-          `arrays::reference` retains zero operation-capability impls; workspace check with `--all-targets` is
+          `arrays::arrays` retains zero operation-capability impls; workspace check with `--all-targets` is
           warning-free; ryft-core 1,136 / ryft-xla 438 serial / ryft-macros-tests 20+17 all pass; no
-          `arrays::reference::` path remains for any moved item.)*
-  - [ ] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
+          `arrays::arrays::` or `arrays::reference::` path remains for any moved item.)*
+  - [x] Move every array-language-specific type out of the top-level `types` hierarchy and give it one canonical home
         under `ryft_core::arrays`:
     - [x] Move `DataType`/`DataTypeError` under `arrays::types::data`; after the scalar backend is deleted, these
           describe array element data rather than an independent scalar execution universe.
@@ -2471,15 +2475,15 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
         `DimensionSource` is part of the `ArrayBatchingPolicy::broadcast_input` contract. Known residual coupling:
         the neutral `batching.rs` still names `ArrayType`/`DimensionType` in its error variants and
         `ShardingDimension` in `BatchingContext`; generifying those is optional follow-up polish.)*
-  - [ ] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
+  - [x] Gate: the top-level hierarchy has one obvious public path for reference arrays, dimensions, and array IR; no
         scalar backend or per-element `Scalar` payload remains; all reference-backend semantics, transformations,
         exact-literal tests, core/XLA execution suites, and allocation/performance thresholds pass.
 - [ ] Audit names after responsibilities settle; rename only where the final name is materially clearer.
 - [ ] Known residual from the P4b audit: `ryft-xla/src/profile_guided.rs` names `ArrayIrValue<Array>` in the
       `where` clauses of two public functions (`interpret` and `profile_baseline`). Bounds only — no public value
       positions — but it is public-signature/rustdoc surface; tighten or accept explicitly during this cleanup.
-- [ ] Update every in-repo use site directly without compatibility re-exports.
-- [ ] Update rustdoc, examples, error links, and behavioral JAX fixtures.
+- [x] Update every in-repo use site directly without compatibility re-exports.
+- [x] Update rustdoc, examples, error links, and behavioral JAX fixtures.
 - [ ] Close the foreign-call batching gap as an isolated transform/API review after the operation contracts settle.
       Follow JAX's current direction rather than copying the deprecated `ffi_call(vmap_method = ...)` parameter:
       prototype a general user-defined custom batching rule that can wrap foreign calls, and retain it only if one
@@ -2487,7 +2491,7 @@ intentionally ignored), XLA doctests, formatting, and diff hygiene.
       ordered effects, and first-class dynamic output extents. Add small convenience rules only where they reproduce
       the useful `sequential`, `sequential_unrolled`, `expand_dims`, `broadcast_all`, and `legacy_vectorized`
       behaviors without introducing a second batching path.
-- [ ] Run targeted searches for every old canonical path and classify all remaining matches.
+- [x] Run targeted searches for every old canonical path and classify all remaining matches.
 - [ ] Gate: core language semantics no longer appear to be backend implementation details.
 
 #### Phase 9a: contiguous array storage and scalar-backend retirement
@@ -3782,12 +3786,13 @@ execution, partial evaluation, batching, JVP, identity instantiation, import, di
 PJRT execution.
 
 The public API now exposes only `Broadcast`: exact constants, computed dimensions, right-aligned expansion, and
-leading expansion all bind the same mixed operation. `backends::arrays::BroadcastKernel` is the backend-only eager
-kernel over an already-concrete `ArrayType`; it cannot stage an operation or turn metadata into shape authority.
-Phase 4 removed the packed integer-array `DynamicBroadcastOperation` representation and its backend capability,
-transform rules, XLA lowering, and tests. The static-metadata `LegacyBroadcastOperation` remains hidden and frozen
-until its homogeneous `ArrayOperation` transform and XLA consumers migrate to the composite graph. The detailed
-consolidation and residual evidence is in `.tasks/plan_broadcast_api_consolidation.md` and the P4a review below.
+leading expansion all bind the same mixed operation. Resolved eager materialization over an already-concrete
+`ArrayType` originally used the backend-only `BroadcastKernel`; the Phase 9 trait-deduplication audit later removed
+that duplicate and reused `LegacyBroadcast`, whose signature already expresses the same resolved operation. Phase 4
+removed the packed integer-array `DynamicBroadcastOperation` representation and its backend capability, transform
+rules, XLA lowering, and tests. The static-metadata `LegacyBroadcastOperation` remains hidden and frozen until its
+homogeneous `ArrayOperation` transform and XLA consumers migrate to the composite graph. The detailed consolidation
+and residual evidence is in `.tasks/plan_broadcast_api_consolidation.md` and the P4a review below.
 
 ### Execution: P3h Delivery A explicit concatenate result extent
 
@@ -5228,11 +5233,12 @@ universe needs the top-level sharding module. Universe-neutral named-axis and pr
 existing modules.
 
 The public end state is
-`arrays::{addressing, data, dimensions, encoding, ir, layouts, macros, memories, operations, sharding}`. Private
-`reference` and `types` modules keep implementation organization from creating duplicate public paths. Dimensions
-colocate their descriptor, value, and small homogeneous operation family; array IR colocates its descriptor and value.
-The closed `ArrayOperation` and `ArrayIrOperation` dispatchers live together in `arrays::operations::mod.rs`, while
-private family submodules own the concrete reference-value capabilities, mixed-family glue, and colocated tests now
+`arrays::{addressing, batching, broadcasting, differentiation, dimensions, encoding, ir, macros, operations,
+sharding, types}`. Private `arrays` keeps the reference value implementation organized without creating a second
+public path. The kind-first `arrays::types` hierarchy owns all staged type descriptors; `arrays::dimensions` and
+`arrays::ir` own their concrete values. The closed `ArrayOperation`, `DimensionOperation`, and `ArrayIrOperation`
+dispatchers live together in `arrays::operations::mod.rs`, while
+private family modules own the concrete reference-value capabilities, mixed-family glue, and colocated tests formerly
 embedded in the two backend catch-all files. Those submodules mirror the backend-neutral operation hierarchy only when
 array-owned code exists, avoiding both empty modules and a second copy of generic inference or transform rules.
 
@@ -5247,7 +5253,7 @@ A follow-up ownership refinement adds `arrays::operations` rather than carrying 
 the new hierarchy. Its `mod.rs` owns `ArrayOperation` and `ArrayIrOperation`; private family modules own only
 array-specific capability implementations, mixed interpretation/provider glue, and their tests. This keeps the source
 layout recognizable beside `ryft_core::operations` without duplicating the generic payload definitions or the
-operation-owned transform rules established in Phase 8. `Array` remains a value owned by private `arrays::reference`,
+operation-owned transform rules established in Phase 8. `Array` remains a value owned by private `arrays::arrays`,
 `ArrayIrValue` remains under `arrays::ir`, and both public operation enums are re-exported from `arrays`.
 
 ### Phase 9 hierarchy leaf modules (2026-08-06)
@@ -5420,3 +5426,54 @@ and XLA all-target checks, the complete `ryft-core` suite with `benchmarking` (1
 tests, six region-prototype tests, and 53 runnable doctests with 16 intentional ignores), every macro runtime and
 compile-fail test, and the XLA unit-test build. The reference `Array` value, its capability implementations, and its
 catch-all tests remain together in `backends::arrays`; moving and splitting those owners is the next review unit.
+
+### Phase 9 hierarchy closure (2026-08-07)
+
+The owner completed the reference-array move as one atomic ownership change rather than preserving the interim
+catch-all structure. Private `arrays::arrays` now owns only the `Array` representation, construction, typed
+combinators, and value contracts. Its fields remain private; family kernels use the narrow `new_unchecked`,
+`shared_storage`, and `storage_bytes_mut` methods where representation-level access is required and use
+`Typed::r#type` rather than a duplicate inherent accessor. Reference and mixed array-IR capabilities, their local
+kernel traits, and their tests live in the corresponding semantic family beneath `arrays::operations`.
+
+The hierarchy closure keeps all 17 operation-family implementation modules private in their existing semantic order
+and documents the operation-family root and the dimension family. The sole outside-root dependency,
+`ElementConversionTarget`, crosses through a narrow `pub(crate)` re-export for the reference `Array` constructor
+instead of exposing the entire manipulation module. Targeted searches find no retired core `backends`, top-level
+array `types`, top-level array `sharding`, top-level `broadcasting`, `arrays::reference`, scalar backend, per-element
+`Vec<Scalar>` storage, or compatibility facade. The remaining `crate::sharding` import belongs to `ryft-xla`'s
+independent Shardy lowering module and is not a retired `ryft-core` path.
+
+Verification passes nightly formatting and diff hygiene; core and XLA all-target checks; all 1,139 core unit tests,
+five allocation tests, six region-prototype tests, and 53 runnable doctests with 16 intentional ignores; all 20
+operation and 17 parameter macro tests plus their compile-fail fixtures; and the XLA unit-test compile/link gate.
+Ordinary core documentation builds successfully with no warning under `arrays`; strict whole-crate `-Dwarnings`
+remains blocked by 92 pre-existing warnings in unrelated generic operation, program, and differentiation docs. The
+hierarchy consolidation and its type/path/rustdoc gates are complete. The naming audit, the `profile_guided.rs`
+public-bound review, foreign-call batching, and the final phase-wide semantic-ownership gate remain separate review
+units.
+
+### Phase 9 array-trait deduplication (2026-08-07)
+
+The array-owned trait audit removed `BroadcastKernel`, the sole exact duplicate. Mixed eager broadcast interpretation
+already resolves its first-class dimension operands to a concrete `ArrayType`, after which the existing
+`LegacyBroadcast` capability has precisely the required receiver, output-type, axis-map, error, and materialization
+semantics. `ArrayIrValue<A>` and `BroadcastOperation` interpretation now require `A: LegacyBroadcast`; the reference
+`Array` materialization body lives directly in its existing `LegacyBroadcast` implementation; and the trait and both
+of its facade exports are gone.
+
+Every remaining trait declared under `ryft_core::arrays` was classified. `Broadcastable` is type-level least-common
+shape/data-type algebra rather than value execution. `ArrayElement` is the sealed physical byte codec.
+`ArrayBatchingPolicy` extends the generic batching protocol with array-axis dimension and replicated-materialization
+decisions. The family-local element arithmetic traits deliberately implement device-compatible wrapping,
+low-precision re-encoding, unsupported-data-type errors, and reduction-count conversion; the similarly named
+program-level capabilities dispatch operations and, for host integers, use checked rather than wrapping arithmetic.
+The source/target element conversion traits preserve exact integer and complex conversion categories, whereas
+`ConvertElementType` is the array-level operation capability. None of those contracts is semantically substitutable,
+and only `ElementAdd`, `ElementMul`, `ElementExtremum`, and `ElementConversionTarget`, which are shared across family
+files, remain `pub(crate)`.
+
+Verification passes nightly formatting and diff hygiene, the core and XLA all-target checks, all 1,139 core unit
+tests, five allocation tests, six region-prototype tests, 53 runnable doctests with 16 intentional ignores, and all 20
+operation and 17 parameter macro tests plus their compile-fail fixtures. Residual searches find no `BroadcastKernel`
+or `broadcast_to_type` reference.

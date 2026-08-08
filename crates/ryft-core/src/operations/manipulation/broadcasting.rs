@@ -1,9 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType,
-    BroadcastKernel, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
-    ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -129,7 +128,7 @@ impl Operation for BroadcastOperation {
 impl<C> InterpretableOperation<C> for BroadcastOperation
 where
     C: Domain<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + BroadcastKernel>
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + LegacyBroadcast>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -155,7 +154,7 @@ where
         );
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, self)?;
         Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(
-            input.broadcast_to_type(output_type, self.output_axes())?,
+            input.legacy_broadcast(output_type, self.output_axes())?,
         )])
     }
 }

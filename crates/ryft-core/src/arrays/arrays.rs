@@ -18,8 +18,7 @@ use crate::arrays::encoding::{
     u4, validate_storage_bytes,
 };
 use crate::arrays::macros::dispatch_on_array_element_type;
-use crate::arrays::operations::ArrayOperation;
-use crate::arrays::operations::manipulation::ElementConversionTarget;
+use crate::arrays::operations::{ArrayOperation, ElementConversionTarget};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, Shape, StaticShape};

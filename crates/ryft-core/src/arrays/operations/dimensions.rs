@@ -1,3 +1,11 @@
+//! Array-universe implementations of the dimension operation family contracts.
+//!
+//! First-class dimensions execute as checked host integers, project through the mixed array IR, and batch only as
+//! replicated values. This module also owns the explicit dimension-to-array and array-to-dimension gateways and
+//! concrete reference-array dimension-size queries.
+
+// TODO(eaplatanios): Review this module.
+
 use crate::arrays::arrays::Array;
 use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
@@ -19,8 +27,6 @@ use crate::operations::{
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, Div, Mul, Rem, Sub,
 };
 use crate::programs::{Operation, OperationProjection, ProgramError, TypeError, Typed, Value, ValueProjection};
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Composite batching executes homogeneous dimension operations only over replicated projected values. A mapped
 /// dimension is rejected by [`ReplicatedDimensionBatchingPolicy`] before this rule is called because representing one
