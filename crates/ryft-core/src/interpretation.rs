@@ -644,6 +644,7 @@ pub fn interpret_projected_operation<
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -651,7 +652,7 @@ mod tests {
         DimensionError, DimensionVariable, Shape,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::{AddOperation, NegOperation};
+    use crate::operations::{AddOperation, BroadcastOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::{AtomId, ProgramBuilder, ProgramError, RegionInterface, TypeError};
     use crate::tests::TestRegionOperation;
@@ -918,6 +919,69 @@ mod tests {
                         actual: 3,
                     }),
         ));
+    }
+
+    #[test]
+    fn test_program_interpret_does_not_refine_operation_payloads() {
+        // Batching a program with a dynamic per-item dimension stages a homogeneous `broadcast` whose stored output
+        // type retains that dynamic extent (refer to `test_program_batched_carries_dynamic_per_item_dimensions`).
+        // The same payload is built directly here so that the limitation is pinned independently of batching.
+        let dynamic = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::unbounded()));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic.clone()]));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), dynamic]));
+        let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input])
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[n] .
+                let %1:f64[2, n] = broadcast [output_type=f64[2, n], output_axes=[1]] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // This pins an accepted limitation. Replay refines only program and region boundaries, never the types stored
+        // inside an `Instruction`'s operation payload, so the boundary identity `n` is refined to `3` while the payload
+        // keeps naming `n`. The payload therefore re-runs its own inference against the refined input and fails with
+        // its own inference diagnostic, phrased purely in terms of the broadcasting rule and not in terms of the
+        // refinement the boundary established. Refining the payload would require substituting extents into stored
+        // types, which the type model deliberately does not provide: extents reach an operation only as explicit
+        // Static Single Assignment (SSA) operands, as in `DynamicBroadcastOperation`. A diagnostic that named the
+        // stale payload would have to originate from a structured operation error that causally identifies the failing
+        // payload constraint, because the surfaced error alone does not establish that cause.
+        let error = program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap_err();
+        assert!(matches!(error, ProgramError::Type(_)));
+        assert_eq!(
+            error.to_string(),
+            "broadcasting input axis 0 has size 3 but the output has size n; a dynamic dimension only broadcasts to \
+             an identical dynamic dimension",
+        );
+
+        // A statically typed payload establishes no boundary facts, so ordinary replay is untouched.
+        let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
+        let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
+        let output = builder
+            .add_instruction(
+                BroadcastOperation::new(
+                    ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                    vec![1],
+                ),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])]),
+        );
     }
 
     #[test]
