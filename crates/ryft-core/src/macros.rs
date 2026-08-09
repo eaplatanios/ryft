@@ -2741,7 +2741,7 @@ macro_rules! impl_nullary_batchable_operation {
                 context: &$crate::BatchingContext<__C, $policy>,
                 _driver: &__D,
                 inputs: &[<$policy as $crate::BatchingPolicy<__C>>::Batch],
-            ) -> Result<Vec<<$policy as $crate::BatchingPolicy<__C>>::Batch>, $crate::BatchingError> {
+            ) -> Result<$crate::BatchedOutputs<__C, $policy>, $crate::BatchingError> {
                 for (index, input) in inputs.iter().enumerate() {
                     let axis = <$policy as $crate::BatchingPolicy<__C>>::batch_axis(input);
                     if !axis.is_replicated() {
@@ -2764,7 +2764,8 @@ macro_rules! impl_nullary_batchable_operation {
                     .bind(self.clone(), Vec::new(), inputs.as_slice())?
                     .into_iter()
                     .map(<$policy as $crate::BatchingPolicy<__C>>::replicated)
-                    .collect())
+                    .collect::<Vec<_>>()
+                    .into())
             }
         }
     };
@@ -2799,7 +2800,7 @@ macro_rules! impl_nullary_batchable_operation {
                 context: &$crate::BatchingContext<__C, __P>,
                 _driver: &__D,
                 inputs: &[__P::Batch],
-            ) -> Result<Vec<__P::Batch>, $crate::BatchingError> {
+            ) -> Result<$crate::BatchedOutputs<__C, __P>, $crate::BatchingError> {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 Ok($crate::InterpretableOperation::interpret(
                     self,
@@ -2809,7 +2810,8 @@ macro_rules! impl_nullary_batchable_operation {
                 )?
                 .into_iter()
                 .map(__P::replicated)
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
             }
         }
     };
@@ -3806,13 +3808,14 @@ macro_rules! check_operation_batching {
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
             let expected_outputs = vec![$($crate::check_operation_batching!(@batch_value $output)),*];
-            let actual_outputs = $crate::batching::BatchableOperation::batch(
+            let (actual_outputs, _) = $crate::batching::BatchableOperation::batch(
                 &operation,
                 &context,
                 driver,
                 inputs.as_slice(),
             )
-            .unwrap();
+            .unwrap()
+            .into_parts();
             $crate::check_operation_batching!(@compare_batches $comparison, actual_outputs, expected_outputs);
         )*
     }};
@@ -6266,7 +6269,9 @@ mod tests {
             EagerContext<Array, TestNullaryOperation<ArrayType>>,
             ArrayBatching,
         >>::batch(&operation, &context, &EmptyRegionDriver, &[])
-        .unwrap();
+        .unwrap()
+        .into_parts()
+        .0;
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].value(), &Array::scalar(3.0));
         assert_eq!(outputs[1].value(), &Array::scalar(4.0));

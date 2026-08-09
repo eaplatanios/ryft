@@ -6,7 +6,7 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,
@@ -515,7 +515,7 @@ impl<
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped packed `[size]` dimension is then stripped
@@ -525,14 +525,14 @@ impl<
             let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
-            Ok(vec![ArrayBatch::new(r#type, index.remove(0), Some(0))?])
+            Ok(vec![ArrayBatch::new(r#type, index.remove(0), Some(0))?].into())
         } else {
             // The axis is bound by an outer `batch` level or a device mesh. Re-bind into the parent, which repeats the
             // resolution and present the forwarded index as replicated across this level.
             let operation = AxisIndexOperation::new(self.axis_name.clone());
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
-            Ok(vec![ArrayBatch::replicated(index.remove(0))])
+            Ok(vec![ArrayBatch::replicated(index.remove(0))].into())
         }
     }
 }
