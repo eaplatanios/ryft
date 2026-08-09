@@ -1,5 +1,6 @@
 /// Higher-order custom-derivative operations (`custom_jvp` / `custom_vjp`).
 pub mod custom_derivatives;
+mod operands;
 pub mod rematerialization;
 
 pub use crate::operations::{Cos, Sin, TAG_OPERATION_NAME, Tag, TagOperation};

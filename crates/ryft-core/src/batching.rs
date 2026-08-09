@@ -1062,10 +1062,10 @@ impl<C: Context<Type: BatchableType<Policy: BatchingPolicy<C>>>>
 }
 
 impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
-    /// Returns the transformed [`Program`] carried by `batched_program` when its output axes already equal
-    /// `target_output_axes`, or structurally batches `region` again while aligning its live outputs to those target
-    /// axes. The returned program retains the complete boundary selected by `P::BatchedProgram`, including any
-    /// [`BatchingPolicy`]-owned bookkeeping inputs or outputs.
+    /// Aligns the logical outputs of `batched_program` to `target_output_axes` while preserving the complete program
+    /// boundary selected by `P::BatchedProgram`, including any [`BatchingPolicy`]-owned bookkeeping inputs or outputs.
+    /// The existing transformed [`Program`] is returned when its output axes already match. Otherwise, `region` is
+    /// batched again with its live outputs aligned to the target axes.
     ///
     /// [`Region`](crate::Region)-carrying operation rules use this after discovering and semantically reconciling
     /// natural output axes across related regions. This method only performs the mechanical output-boundary alignment.
@@ -1089,8 +1089,65 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
         batched_program: P::BatchedProgram,
         target_output_axes: &[BatchAxis],
     ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
+        let aligned_program =
+            self.align_batched_program(driver, region, input_axes, batched_program, target_output_axes)?;
+        Ok(aligned_program.into_parts().0)
+    }
+
+    /// Aligns the logical outputs in the same way as [`Self::align_batched_program_outputs`], then uses
+    /// [`BatchingPolicy::adapt_batched_program`] to convert the policy-specific boundary into an ordinary attached
+    /// [`Region`](crate::Region) boundary. Adaptation preserves bookkeeping inputs required by the region itself but
+    /// removes bookkeeping outputs used only by operations that thread batching state through their regions.
+    ///
+    /// Alignment happens before adaptation because the reconciled `target_output_axes` describe the source region's
+    /// outputs, which is exactly the axis vector both steps are stated over (a policy's bookkeeping outputs never
+    /// appear in [`BatchedProgram::output_axes`]). Callers must reintroduce the shed inputs by prepending
+    /// [`BatchingPolicy::boundary_operands`] to the operands of the operation they attach the result to.
+    ///
+    /// Like [`Self::align_batched_program_outputs`], this performs no mapped-to-replicated collapse. Alignment resolves
+    /// every structurally movable mismatch, and collapsing a genuinely mapped output requires [`Operation`]-specific
+    /// semantics such as cotangent summation. Callers that need a collapse must batch and adapt the region themselves
+    /// with their own collapse function.
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: [`BatchingDriver`] that structurally transforms `region` if alignment is required.
+    ///   - `region`: Source [`Region`](crate::Region) from which `batched_program` was produced.
+    ///   - `input_axes`: Batch axes used to produce `batched_program` and to perform any aligned replay.
+    ///   - `batched_program`: Batched [`Program`] with its policy-specific boundary and natural output axes.
+    ///   - `target_output_axes`: Semantically reconciled output axes targeted by the region's consumer.
+    pub(crate) fn align_and_adapt_batched_program_outputs<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        batched_program: P::BatchedProgram,
+        target_output_axes: &[BatchAxis],
+    ) -> Result<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, BatchingError> {
+        let aligned_program =
+            self.align_batched_program(driver, region, input_axes, batched_program, target_output_axes)?;
+        let adapted_program = P::adapt_batched_program(aligned_program, None, |_, _, axis| {
+            Err(BatchingError::MisalignedBatchAxes {
+                message: format!("cannot collapse a batched region output mapped along {axis} without a consumer rule"),
+            })
+        })?;
+        Ok(adapted_program.into_parts().0)
+    }
+
+    /// Returns `batched_program` when its output axes already equal `target_output_axes`, or structurally batches
+    /// `region` again while aligning its live outputs to those axes. This is the shared alignment step behind
+    /// [`Self::align_batched_program_outputs`] and [`Self::align_and_adapt_batched_program_outputs`], which differ
+    /// only in whether they adapt the policy-specific program boundary afterwards.
+    fn align_batched_program<D: BatchingDriver<C, P>>(
+        &self,
+        driver: &D,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        batched_program: P::BatchedProgram,
+        target_output_axes: &[BatchAxis],
+    ) -> Result<P::BatchedProgram, BatchingError> {
         if batched_program.output_axes() == target_output_axes {
-            return Ok(batched_program.into_parts().0);
+            return Ok(batched_program);
         }
         let aligned_program = driver.batch_program(
             self,
@@ -1109,7 +1166,7 @@ impl<C: Context, P: BatchingPolicy<C>> BatchingContext<C, P> {
                 ),
             });
         }
-        Ok(aligned_program.into_parts().0)
+        Ok(aligned_program)
     }
 }
 
