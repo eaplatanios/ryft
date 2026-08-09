@@ -335,7 +335,7 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::
 ///   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
 ///      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
 ///      forward tail; the tail is split off after the primal outputs.
-///   2. The tangent program maps `(non-differentiated..., forward_tail..., differentiated_input_tangents...) ->
+///   2. The tangent program maps `(non_differentiated..., forward_tail..., differentiated_input_tangents...) ->
 ///      output_tangents`, exactly the leading non-differentiated operands and the forward tail followed by the
 ///      differentiated inputs' tangents (per [`RematerializeOperation::new`]'s signature validation), so those leading
 ///      operands and the tail are passed ahead of the dual tangents and replayed to produce the output tangents. The
@@ -387,7 +387,7 @@ where
 
         check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
 
-        // Replay the tangent region on `(non-differentiated..., forward_tail..., differentiated_input_tangents...)`,
+        // Replay the tangent region on `(non_differentiated..., forward_tail..., differentiated_input_tangents...)`,
         // yielding one output tangent per primal output.
         let mut tangent_operands =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -528,7 +528,7 @@ where
             output_axes.as_slice(),
         )?;
 
-        // The backward region maps `(non-differentiated..., forward_tail..., output_cotangents...)` to the
+        // The backward region maps `(non_differentiated..., forward_tail..., output_cotangents...)` to the
         // differentiated inputs' cotangents. Its structurally movable axes are aligned during batching; adaptation
         // sums a mapped cotangent when the corresponding primal input was replicated.
         let backward_input_axes = non_differentiated_axes

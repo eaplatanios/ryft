@@ -808,7 +808,7 @@ where
             forward_required_output_axes.as_slice(),
         )?;
 
-        // The backward rule maps `(non-differentiated..., residuals..., output_cotangents...)` to the differentiated
+        // The backward rule maps `(non_differentiated..., residuals..., output_cotangents...)` to the differentiated
         // inputs' cotangents. Align mapped results to their primal input positions while they are live; adaptation
         // then sums the only non-structural mismatch, namely a mapped cotangent corresponding to a replicated primal
         // input.
@@ -859,7 +859,7 @@ where
 /// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
 /// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over
 /// the dual primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
-/// `[non-differentiated..., residuals..., differentiated_input_tangents...]` with the leading non-differentiated
+/// `[non_differentiated..., residuals..., differentiated_input_tangents...]` with the leading non-differentiated
 /// operands and the residuals as ordinary linear-call *residual operands* (not capture factors). That carrier
 /// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it fails
 /// with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
@@ -905,7 +905,7 @@ where
             differentiated_inputs.iter().map(|input| input.primal().r#type().tangent()).collect::<Vec<_>>();
         let output_tangent_types = primal_outputs.iter().map(|output| output.r#type().tangent()).collect::<Vec<_>>();
 
-        // Stage one opaque carrier over `[non-differentiated..., residuals..., differentiated_input_tangents...]`,
+        // Stage one opaque carrier over `[non_differentiated..., residuals..., differentiated_input_tangents...]`,
         // producing the output tangents. The carrier rejects forward interpretation and transposes by replaying the
         // user's backward region, whose own inputs are exactly that leading residual group followed by the output
         // cotangents. The transpose-only carrier takes every differentiated input tangent as a real operand, so

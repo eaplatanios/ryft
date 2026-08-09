@@ -1,19 +1,19 @@
 use std::fmt::Display;
 use std::ops::Range;
 
-use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationError;
+use crate::differentiation::batching::CotangentBatchingPolicy;
 use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
 use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
 use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::{Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider};
+use crate::operations::{Zero, ZeroOperation, ZeroOperationProvider};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     AtomId, MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramBuilder, ProgramError,
@@ -61,6 +61,12 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 /// validate against the declared types, and the spend site validates the residual count), never a silently wrong-shaped
 /// zero.
 ///
+/// [`Self::materialize_zero_from_residual_sources`] runs the same three steps at a transform _boundary_, where the
+/// primal that pinned a zero's extents is out of scope and the named quantities must instead be gathered one at a time
+/// from the peers that are (i.e., live sibling cotangents, known operands, and first-class dimension operands). It
+/// replaces the exemplar-matching materialization that structural zeros previously used, which could only construct a
+/// zero whose type some live value reproduced exactly and therefore rejected every widened differential representation.
+///
 /// # Who Implements It
 ///
 /// Almost nobody needs to implement this trait, by design. Every operation family with an input-free zero (i.e., every
@@ -105,14 +111,45 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
     /// Captures the residual values declared by [`Self::zero_residual_types`] from the primal value `source`
     /// in a live `context`, returning them in declaration order. This is the value-level counterpart of
     /// [`Self::capture_zero_residuals`] used by reusable pullback callables, whose captured residuals are
-    /// concrete values or tracers closed over by the callable rather than atoms of a program under construction.
-    #[inline]
+    /// concrete values or tracers closed over by the callable rather than atoms of a program under construction. The
+    /// default resolves each declared residual independently through [`Self::capture_zero_residual_value`], which lets
+    /// operation families implement one identity-directed value-level capture primitive. Input-free families declare
+    /// no residuals and therefore return an empty list without consulting `source`.
     fn capture_zero_residual_values<C: Context<Type = T, Operation = Self>>(
+        context: &C,
+        source: &C::Value,
+        r#type: &T,
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        Self::zero_residual_types(r#type)
+            .into_iter()
+            .enumerate()
+            .map(|(index, residual_type)| {
+                Self::capture_zero_residual_value(context, source, &residual_type)?.ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "zero residual {index} of type {residual_type} cannot be captured from source of type {}",
+                        source.r#type().as_ref(),
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Captures the single residual value declared at `residual_type` from `source`, or returns [`None`] when `source`
+    /// does not carry the runtime quantity that residual names. This is the _identity-directed_ capture step used by
+    /// [`Self::materialize_zero_from_residual_sources`], where the geometry of one zero may have to be assembled from
+    /// several unrelated values rather than read off one primal of exactly the zero's own type.
+    ///
+    /// Implementations must inspect `source`'s [`Type`] before staging anything and return [`None`] without side
+    /// effects when it does not carry the named quantity, because the caller tries candidates in order and a
+    /// speculative read would leave dead instructions behind. Input-free [`Operation`] families declare no residuals
+    /// and therefore never reach this function, so the default answers [`None`].
+    #[inline]
+    fn capture_zero_residual_value<C: Context<Type = T, Operation = Self>>(
         _context: &C,
         _source: &C::Value,
-        _type: &T,
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        Ok(Vec::new())
+        _residual_type: &T,
+    ) -> Result<Option<C::Value>, ProgramError> {
+        Ok(None)
     }
 
     /// Returns the canonical zero operation for `r#type` and expands `residuals` into its operand order. The default
@@ -129,6 +166,86 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
             });
         }
         Ok((Self::zero_operation(r#type)?, Vec::new()))
+    }
+
+    /// Returns the value inside `zero`, materializing a structural [`MaybeZero::Zero`] whose [`Type`] cannot construct
+    /// it alone by reading the runtime geometry it names from the values in `geometry_sources`. This is the boundary
+    /// form of the residual protocol. [`Self::capture_zero_residuals`] and [`Self::capture_zero_residual_values`]
+    /// capture from _the_ primal, which every linearization site has in hand. A transform boundary often does not.
+    /// A transposed control-flow instruction needs a real operand for the cotangent of a dead output, and the primal
+    /// that pinned that output's extents is long out of scope. What is in scope is a set of peers (i.e., live sibling
+    /// cotangents, known operands, and first-class dimension operands), among which the named runtime quantities are
+    /// collectively available even when no single peer has the zero's type. This function therefore works _per declared
+    /// residual_ rather than per exemplar: it asks each candidate in turn for one named quantity through
+    /// [`Self::capture_zero_residual_value`] and assembles the zero from the answers.
+    ///
+    /// Being identity-directed rather than exemplar-directed is what makes it type-general. A tangent or cotangent
+    /// type is derived from its primal's by [`DifferentiableType`], which rewrites element representation, layout, and
+    /// sharding while preserving geometry exactly, so requiring an exemplar of the zero's own type would reject every
+    /// widened differential representation (e.g., an `f8e8m0fnu[n]` primal whose tangent is `f32[n]`). Naming the
+    /// runtime quantity instead of matching the whole type accepts them all.
+    ///
+    /// A type that declares no residuals keeps the type-only nullary zero, so a statically shaped program stages
+    /// no additional instruction and its zero-producing marker keeps higher-order partial evaluation structural. A
+    /// declared residual that no candidate supplies is a loud [`ProgramError::UnsupportedOperation`] naming the type
+    /// and the missing quantity, never a silently wrong-shaped zero.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] in which the zero and any geometry reads are staged or computed.
+    ///   - `zero`: Structural zero or live value to materialize.
+    ///   - `sources`: Candidate values in scope at the boundary, searched in order for each declared residual. Only
+    ///     zero types that declare residuals consult them.
+    fn materialize_zero_from_residual_sources<
+        'v,
+        C: Context<Type = T, Value: 'v, Operation = Self> + Zero<C::Value>,
+        I: IntoIterator<Item = &'v C::Value>,
+    >(
+        context: &C,
+        zero: MaybeZero<C::Value>,
+        sources: I,
+    ) -> Result<C::Value, ProgramError>
+    where
+        Self: Operation<Type = T>,
+    {
+        let r#type = match zero {
+            MaybeZero::Value(value) => return Ok(value),
+            MaybeZero::Zero(r#type) => r#type,
+        };
+        let residual_types = Self::zero_residual_types(&r#type);
+        if residual_types.is_empty() {
+            return context.zero(&r#type);
+        }
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let mut residuals = Vec::with_capacity(residual_types.len());
+        for (index, residual_type) in residual_types.iter().enumerate() {
+            let mut captured = None;
+            for source in &sources {
+                if let Some(value) = Self::capture_zero_residual_value(context, source, residual_type)? {
+                    captured = Some(value);
+                    break;
+                }
+            }
+            let residual = captured.ok_or_else(|| ProgramError::UnsupportedOperation {
+                message: format!(
+                    "cannot materialize a zero of type {type} because no value in scope supplies the runtime \
+                     geometry {residual_type} that its residual {index} names",
+                ),
+            })?;
+            if residual.r#type().as_ref() != residual_type {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "zero residual {} has type {} but expected {}",
+                    index,
+                    residual.r#type().as_ref(),
+                    residual_type,
+                )));
+            }
+            residuals.push(residual);
+        }
+        let (operation, operands) = Self::zero_operation_with_residuals(r#type, residuals.as_slice())?;
+        let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -491,6 +608,25 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         matches!(self.interface, LinearCallInterface::TransposeOnly { .. })
     }
 
+    // TODO(eaplatanios): Do we really need this function?
+    /// Returns the input and output [`Type`]s of the unavailable forward map stored by the _transpose-only_ form, or
+    /// [`None`] for the _forward-and-transpose_ form, whose complete interface is derived from its attached `forward`
+    /// [`Region`](crate::Region) instead.
+    ///
+    /// A transpose-only call cannot be reconstructed from its [`residual_count`](Self::residual_count) alone, so
+    /// rebuilding one in a different type universe (e.g., lifting it from [`ArrayType`](crate::ArrayType) into the
+    /// enclosing [`ArrayIrType`](crate::ArrayIrType) family) requires reading these types and mapping each of them
+    /// through the universes' own type conversion.
+    #[inline]
+    pub fn transpose_only_interface(&self) -> Option<(&[T], &[T])> {
+        match &self.interface {
+            LinearCallInterface::ForwardAndTranspose => None,
+            LinearCallInterface::TransposeOnly { input_types, output_types } => {
+                Some((input_types.as_slice(), output_types.as_slice()))
+            }
+        }
+    }
+
     /// Splits the provided `input_types` into its leading residual types and trailing linear types.
     fn split_inputs<'a>(&self, input_types: &'a [T]) -> Result<(&'a [T], &'a [T]), TypeError> {
         if self.residual_count > input_types.len() {
@@ -603,7 +739,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///   - `input_axes`: Batch axis of each operand in `inputs`.
     pub(crate) fn batch_regions<
         C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
-        P: LinearCallBatchingPolicy<C>,
+        P: CotangentBatchingPolicy<C>,
         D: BatchingDriver<C, P>,
     >(
         &self,
@@ -884,7 +1020,7 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 impl<
     T: DifferentiableType,
     C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
-    P: LinearCallBatchingPolicy<C>,
+    P: CotangentBatchingPolicy<C>,
 > BatchableOperation<C, P> for LinearCallOperation<T>
 {
     fn batch<D: BatchingDriver<C, P>>(
@@ -898,7 +1034,7 @@ impl<
     }
 }
 
-impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::Type>>> + Zero<C::Value>>
+impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type>> + Zero<C::Value>>
     DifferentiableOperation<C> for LinearCallOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -937,10 +1073,14 @@ impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::T
         let mut jvp_inputs = primals;
         for input in inputs {
             if !input.tangent().r#type().is_zero_space() {
-                // The operand primal is a live value of exactly the tangent's type, so it supplies the runtime
-                // geometry that a reference-bearing tangent type omits; statically shaped operands keep the nullary
+                // The operand primal names every runtime quantity a reference-bearing tangent type omits, because the
+                // tangent type derivation preserves geometry exactly; statically shaped operands keep the nullary
                 // zero and stage the same instruction sequence as before.
-                jvp_inputs.push(input.tangent().clone().materialize_like(context, input.primal())?);
+                jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+                    context,
+                    input.tangent().clone(),
+                    std::iter::once(input.primal()),
+                )?);
             }
         }
 
@@ -965,10 +1105,7 @@ impl<C: Context<Type: DifferentiableType, Operation: From<ZeroLikeOperation<C::T
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type>
-        + ZeroOperationProvider<V::Type>
-        + From<ZeroLikeOperation<V::Type>>
-        + From<LinearCallOperation<V::Type>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1027,16 +1164,20 @@ impl<
             })
             .collect::<Vec<_>>();
 
-        // A dead output's structural-zero cotangent still becomes a real operand of the transposed call. Its type alone
-        // cannot construct it when it references runtime identities, but the boundary already carries that geometry. At
-        // least one peer cotangent is live here (the all-zero case returned above) and the retained residuals are live
-        // too, so a value of exactly the required type is searched for among them before falling back to the nullary
-        // zero that every identity-free type keeps.
+        // A dead output's structural-zero cotangent still becomes a real operand of the transposed call. Its type
+        // alone cannot construct it when it references runtime identities, but the boundary collectively names every
+        // such quantity: at least one peer cotangent is live here (the all-zero case returned above) and the retained
+        // residuals are live too, so the zero is assembled from them one identity at a time before falling back to the
+        // nullary zero that every identity-free type keeps.
         let materialized_cotangents = outputs
             .iter()
             .cloned()
             .map(|output| {
-                output.materialize_like_any(context, outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals))
+                O::materialize_zero_from_residual_sources(
+                    context,
+                    output,
+                    outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut transpose_inputs = residuals;
@@ -1072,46 +1213,6 @@ impl<
     }
 }
 
-/// [`BatchingPolicy`] that collapses a mapped cotangent when batching a [`LinearCallOperation`].
-///
-/// Batching a residual-parameterized linear map may replicate one of its linear inputs across the mapped axis. If the
-/// batched transpose subsequently produces one cotangent `ūᵢ` for each batch item, the transpose of that replication
-/// is summation, so the single cotangent for the original replicated input is:
-///
-/// ```text
-/// ū = Σᵢ ūᵢ.
-/// ```
-///
-/// [`LinearCallOperation::batch_regions`] owns every universe-independent part of this transformation: structurally
-/// batching the forward and transpose regions, aligning their boundaries, threading policy-owned bookkeeping values,
-/// and rebuilding the linear call. The representation of `ūᵢ` is the one step it cannot determine generically. An
-/// ordinary array policy reduces the cotangent directly along its mapped axis, while a composite policy may first need
-/// to project the cotangent to its differentiable member, perform that member's reduction, and lift the result back.
-/// This capability supplies exactly that representation-dependent step and lets one generic [`BatchableOperation`]
-/// implementation retain the complete linear-call algorithm.
-///
-/// Implement this trait for a [`BatchingPolicy`] only when its program universe supports batching executable linear
-/// calls. An implementation must return a value owned by `context`, of the same program type as `cotangent`, with
-/// `axis` removed and all batch-item cotangents combined by addition. Policies that do not support linear calls
-/// should omit the implementation. This is deliberately an operation-specific opt-in rather than a method on
-/// [`BatchingPolicy`] and ordinary batching policies need not provide differentiation semantics, and other operation
-/// families must not acquire parallel policy traits unless they expose an independently irreducible universe-specific
-/// step of their own.
-///
-/// # Parameters
-///
-///   - `context`: [`TracingContext`] that owns the structurally batched transpose program being adapted.
-///   - `cotangent`: Mapped cotangent produced by that transpose program.
-///   - `axis`: Physical axis containing the packed family of per-item cotangents.
-pub trait LinearCallBatchingPolicy<C: Context<Type: DifferentiableType>>: BatchingPolicy<C> {
-    /// Sums the per-item cotangents packed along `axis`.
-    fn sum_mapped_cotangents(
-        context: &TracingContext<C::Constant, C::Operation>,
-        cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
-        axis: Axis,
-    ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>;
-}
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -1121,8 +1222,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
+        Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver};
@@ -1967,5 +2068,145 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
+    }
+
+    // TODO(eaplatanios): Is this test named and placed according to our conventions?
+    #[test]
+    fn test_residual_zero_provider_value_capture() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let first = DimensionVariable::new("first", DimensionBounds::positive(Some(8)).unwrap());
+        let second = DimensionVariable::new("second", DimensionBounds::positive(Some(8)).unwrap());
+        let primal_type = ArrayType::new(
+            DataType::F8E8M0FNU,
+            Shape::new(vec![
+                Dimension::Dynamic(first.clone()),
+                Dimension::Dynamic(first.clone()),
+                Dimension::Dynamic(second.clone()),
+            ]),
+        );
+        let tangent_type = ArrayIrType::Array(primal_type.tangent());
+        let context = TestContext::new();
+        let primal = context.input(primal_type.into());
+
+        // The default bulk value capture resolves each declared residual through the singular hook. Distinct
+        // identities retain first-occurrence order, repeated identities share one residual, and the source may use a
+        // different element representation than the zero being constructed.
+        let residuals = TestOperation::capture_zero_residual_values(&context, &primal, &tangent_type).unwrap();
+        assert_eq!(
+            residuals.iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>(),
+            vec![ArrayIrType::Dimension(DimensionType::new(first)), ArrayIrType::Dimension(DimensionType::new(second)),],
+        );
+        let builder = context.builder().borrow();
+        let [first, second] = builder.instructions() else {
+            panic!("expected two dimension-size instructions");
+        };
+        assert!(matches!(first.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(second.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 2));
+        assert_eq!(residuals[0].atom_id(), Ok(first.outputs()[0]));
+        assert_eq!(residuals[1].atom_id(), Ok(second.outputs()[0]));
+    }
+
+    // TODO(eaplatanios): Is this test named and placed according to our conventions?
+    #[test]
+    fn test_materialize_zero_from_residual_sources() {
+        // The boundary form of the residual protocol assembles a zero's runtime geometry from the values in scope,
+        // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
+        // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
+        // geometry is split across a first-class dimension operand and a per-iteration peer.
+
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
+        let context = TestContext::new();
+
+        // A live value is returned unchanged and stages nothing.
+        let live = context.input(ArrayType::scalar(DataType::F64).into());
+        let materialized =
+            TestOperation::materialize_zero_from_residual_sources(&context, MaybeZero::Value(live.clone()), &[])
+                .unwrap();
+        assert_eq!(materialized.atom_id().unwrap(), live.atom_id().unwrap());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // An identity-free type declares no residuals and keeps the nullary zero, consulting no source.
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(static_type.clone().into()),
+            &[],
+        )
+        .unwrap();
+
+        // A widened differential representation: the `f32` tangent of an `f8e8m0fnu[k]` primal has no live value of
+        // its own type, yet the primal names the extent `k` and therefore supplies its geometry.
+        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(k.clone())]));
+        let narrow_primal = context.input(narrow_type.clone().into());
+        let widened_tangent_type = narrow_type.tangent();
+        assert_eq!(widened_tangent_type.data_type(), DataType::F32);
+        let widened = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(widened_tangent_type.clone().into()),
+            std::slice::from_ref(&narrow_primal),
+        )
+        .unwrap();
+        assert_eq!(widened.r#type().as_ref(), &ArrayIrType::Array(widened_tangent_type));
+
+        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length operand is a
+        // first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
+        let stacked_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k.clone())]),
+        );
+        let runtime_length = context.input(DimensionType::new(length.clone()).into());
+        let peer = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(k)])).into());
+        let stacked = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(stacked_type.clone().into()),
+            [&runtime_length, &peer],
+        )
+        .unwrap();
+        assert_eq!(stacked.r#type().as_ref(), &ArrayIrType::Array(stacked_type.clone()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![stacked.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %2:f8e8m0fnu[k], %5:dimension<length \u{2208} [1, 8)>, %6:f64[k] .
+                let %1:f64[2] = zero [type=f64[2]]
+                    %3:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %2
+                    %4:f32[k] = zero [type=f32[k]] %3
+                    %7:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %6
+                    %8:f64[length, k] = zero [type=f64[length, k]] %5 %7
+                in (%8)
+            "}
+            .trim_end(),
+        );
+
+        // A named quantity that no candidate carries is a loud diagnostic rather than a wrong-shaped zero.
+        let error = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(stacked_type.into()),
+            std::slice::from_ref(&peer),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f64[length, k] because no value in scope supplies the \
+                          runtime geometry dimension<length \u{2208} [1, 8)> that its residual 0 names"
+                    .to_string(),
+            },
+        );
     }
 }
