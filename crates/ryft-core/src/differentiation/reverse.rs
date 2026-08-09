@@ -1682,7 +1682,7 @@ where
     let auxiliary_cotangents = auxiliary
         .parameters()
         .map(|value| {
-            C::Operation::materialize_zero_with_geometry(
+            C::Operation::materialize_zero_from_residual_sources(
                 context,
                 MaybeZero::Zero(value.r#type().cotangent()),
                 std::iter::once(value),

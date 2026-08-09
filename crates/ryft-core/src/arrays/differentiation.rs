@@ -7,13 +7,13 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, ProjectedContext};
-use crate::differentiation::{DifferentiationDual, DifferentiationError, LinearCallBatchingPolicy};
-use crate::macros::check_count;
+use crate::differentiation::{
+    CotangentBatchingPolicy, DifferentiationDual, DifferentiationError, ResidualZeroProvider,
+};
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, Permutation, Reduce, ReduceOperation, ReductionKind, Zero,
-    ZeroLikeOperation, ZeroOperation,
 };
-use crate::programs::{MaybeZero, OperationProjection, ProgramError, Type, Typed, Value, ValueProjection};
+use crate::programs::{OperationProjection, ProgramError, Typed, Value, ValueProjection};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Ordered residual list accumulated by an extent-sensitive linearization rule (e.g., for slice, reshape, pad, reduce
@@ -284,7 +284,7 @@ pub enum ExactShapeDimension {
 }
 
 impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayBatchingPolicy<C>>
-    LinearCallBatchingPolicy<C> for ArrayBatching<P>
+    CotangentBatchingPolicy<C> for ArrayBatching<P>
 {
     fn sum_mapped_cotangents(
         _context: &TracingContext<C::Constant, C::Operation>,
@@ -305,7 +305,7 @@ impl<
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
         >,
-> LinearCallBatchingPolicy<C> for ArrayIrBatching
+> CotangentBatchingPolicy<C> for ArrayIrBatching
 {
     fn sum_mapped_cotangents(
         _context: &TracingContext<C::Constant, C::Operation>,
@@ -323,51 +323,43 @@ impl<
     }
 }
 
-/// Materializes one array operand's forward-mode tangent as a concrete projected array value, using the operand's
-/// primal as the runtime-geometry exemplar whenever the tangent type cannot supply that geometry itself. A mixed array
-/// rule that has to hand a concrete tangent to a staged operation cannot always materialize a [`MaybeZero::Zero`] from
-/// its type: an identity-bearing [`ArrayType`] names its dynamic extents by [`DimensionVariable`] rather than pinning
-/// them, so the type-only nullary [`ZeroOperation`] is unconstructible. The primal is a live value of exactly the
-/// operand's shape, so [`ZeroLikeOperation`] over it produces the same zero with runtime geometry and no extra
-/// residual. Identity-free tangent types keep the canonical nullary zero, whose zero-producing marker keeps
-/// higher-order partial evaluation structural.
+/// Materializes one array operand's forward-mode tangent as a concrete projected array value, reading whatever runtime
+/// geometry the tangent type omits from the operand's primal. A mixed array rule that has to hand a concrete tangent to
+/// a staged operation cannot always materialize a structural zero from its type (an identity-bearing [`ArrayType`]
+/// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
+/// [`ZeroOperation`](crate::ZeroOperation) is unconstructible for it). The primal names every one of those extents,
+/// because the tangent type derivation preserves geometry exactly and rewrites only element representation, layout,
+/// and sharding.
 ///
-/// The exemplar is used only when the primal's type already equals the tangent type. Array families whose tangent
-/// representation widens the element type (e.g., `f8e8m0fnu`) keep the nullary path, which their identity-free types
-/// support; the widening exemplar path belongs to the generic projected-member dispatch rather than to an individual
-/// mixed rule.
+/// The zero is therefore staged through the *mixed* parent family's residual protocol rather than the projected array
+/// view, and the result is projected back. That is deliberate: the mixed family owns the dynamic zero constructor that
+/// consumes one first-class dimension operand per dynamic axis, while the projected homogeneous family has only the
+/// nullary form. Routing through the parent is also what makes widened tangent representations (e.g., the `f32` tangent
+/// of an `f8e8m0fnu` primal) work at a dynamic shape, which naming the primal's whole type as an exemplar could not.
+/// Identity-free tangent types declare no residuals and keep the canonical nullary zero, whose zero-producing marker
+/// keeps higher-order partial evaluation structural.
 ///
 /// # Parameters
 ///
-///   - `context`: Projected array view of the active mixed [`Context`] in which the zero is staged.
-///   - `input`: Forward-mode dual whose tangent is materialized and whose primal is the geometry exemplar.
+///   - `context`: Projected array view of the active mixed [`Context`], whose parent stages the zero.
+///   - `input`: Forward-mode dual whose tangent is materialized and whose primal supplies its runtime geometry.
 pub fn materialize_array_tangent<
     C: Context<
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<
-                ArrayType,
-                Projected: From<ZeroOperation<ArrayType>> + From<ZeroLikeOperation<ArrayType>>,
-            >,
-        >,
+            Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
+        > + Zero<C::Value>,
 >(
     context: &ProjectedContext<C, ArrayType>,
     input: &DifferentiationDual<C::Value>,
 ) -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, DifferentiationError> {
-    let tangent_type = match input.tangent() {
-        MaybeZero::Value(value) => {
-            return Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?);
-        }
-        MaybeZero::Zero(r#type) => <&ArrayType>::try_from(r#type)?.clone(),
-    };
-    let primal = <C::Value as ValueProjection<ArrayType>>::into_projected(input.primal().clone())?;
-    if tangent_type.identities().next().is_some() && primal.r#type().as_ref() == &tangent_type {
-        let mut zero = context.bind(ZeroLikeOperation::new(), Vec::new(), std::slice::from_ref(&primal))?;
-        check_count!("output", zero, 1, ProgramError);
-        return Ok(zero.remove(0));
-    }
-    Ok(context.zero(&tangent_type)?)
+    let tangent = C::Operation::materialize_zero_from_residual_sources(
+        context.parent(),
+        input.tangent().clone(),
+        std::iter::once(input.primal()),
+    )?;
+    Ok(<C::Value as ValueProjection<ArrayType>>::into_projected(tangent)?)
 }
 
 #[cfg(test)]
@@ -381,7 +373,7 @@ mod tests {
     use crate::arrays::types::dimensions::DimensionBounds;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiableType;
-    use crate::programs::TypeError;
+    use crate::programs::{MaybeZero, TypeError};
 
     use super::*;
 
@@ -564,7 +556,7 @@ mod tests {
         let cotangent_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = context.input(cotangent_type);
-        let summed = <ArrayBatching as LinearCallBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+        let summed = <ArrayBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
             &context,
             cotangent.clone(),
             Axis::from(0),
@@ -580,7 +572,7 @@ mod tests {
 
         // An axis outside the cotangent's rank is rejected.
         assert!(matches!(
-            <ArrayBatching as LinearCallBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            <ArrayBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
                 cotangent,
                 Axis::from(5),
@@ -599,7 +591,7 @@ mod tests {
         let cotangent_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = context.input(cotangent_type.into());
-        let summed = <ArrayIrBatching as LinearCallBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+        let summed = <ArrayIrBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
             &context,
             cotangent,
             Axis::from(-2),
@@ -620,7 +612,7 @@ mod tests {
         let dimension = context
             .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
         assert!(matches!(
-            <ArrayIrBatching as LinearCallBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            <ArrayIrBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
                 dimension,
                 Axis::from(0),
@@ -647,22 +639,24 @@ mod tests {
         assert_eq!(materialized.value().atom_id().unwrap(), tangent.atom_id().unwrap());
         assert!(context.builder().borrow().instructions().is_empty());
 
-        // A structural zero whose identity-bearing type matches the primal's stages one zero-like over the primal
-        // exemplar, because the type-only nullary zero cannot supply the runtime extent that `n` names.
+        // A structural zero whose type names a runtime extent reads that extent from the primal and stages the mixed
+        // dynamic zero constructor over it, because the type-only nullary zero cannot supply what `n` names.
         let input = DifferentiationDual::new(primal.clone(), MaybeZero::Zero(ArrayIrType::Array(dynamic_type.clone())))
             .unwrap();
         let materialized = materialize_array_tangent(&projected_context, &input).unwrap();
         assert_eq!(materialized.r#type().as_ref(), &dynamic_type);
         {
             let builder = context.builder().borrow();
-            let [instruction] = builder.instructions() else {
-                panic!("expected exactly one staged zero-like");
+            let [size, zero] = builder.instructions() else {
+                panic!("expected one staged extent read followed by one staged dynamic zero");
             };
-            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::ZeroLike(_))));
+            assert!(matches!(size.operation(), ArrayIrOperation::DimensionSize(_)));
+            assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+            assert_eq!(zero.inputs(), size.outputs());
         }
 
-        // An identity-free structural zero keeps the canonical nullary zero, whose zero-producing marker keeps
-        // higher-order partial evaluation structural.
+        // An identity-free structural zero declares no residuals and keeps the canonical nullary zero, whose
+        // zero-producing marker keeps higher-order partial evaluation structural.
         let static_primal = context.input(static_type.clone().into());
         let input =
             DifferentiationDual::new(static_primal, MaybeZero::Zero(ArrayIrType::Array(static_type.clone()))).unwrap();
@@ -670,17 +664,17 @@ mod tests {
         assert_eq!(materialized.r#type().as_ref(), &static_type);
         {
             let builder = context.builder().borrow();
-            let [_, instruction] = builder.instructions() else {
-                panic!("expected the staged zero-like followed by one staged nullary zero");
+            let [_, _, instruction] = builder.instructions() else {
+                panic!("expected the two earlier instructions followed by one staged nullary zero");
             };
             assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
         }
 
-        // A widening element family keeps the nullary path even though its tangent type differs from the primal's.
-        // The identity-free `f32` tangent of an `f8e8m0fnu` primal skips the exemplar and stages a nullary zero of
-        // the widened type (an identity-bearing type mismatch is unreachable here because `DifferentiationDual`
-        // derives a structural zero's type from the primal).
-        let widening_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
+        // A widening element family is materialized from the same primal even though the two types differ. The `f32`
+        // tangent of a dynamically shaped `f8e8m0fnu` primal has no exemplar of its own type anywhere, and naming the
+        // extent instead of matching the whole type is what makes it constructible.
+        let widening_type =
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
         let widening_primal = context.input(widening_type.clone().into());
         let widened_tangent_type = widening_type.tangent();
         assert_eq!(widened_tangent_type.data_type(), DataType::F32);
@@ -693,10 +687,12 @@ mod tests {
         assert_eq!(materialized.r#type().as_ref(), &widened_tangent_type);
         {
             let builder = context.builder().borrow();
-            let [_, _, instruction] = builder.instructions() else {
-                panic!("expected the two earlier zeros followed by one widened nullary zero");
+            let [.., size, zero] = builder.instructions() else {
+                panic!("expected one staged extent read followed by one staged widened dynamic zero");
             };
-            assert!(matches!(instruction.operation(), ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+            assert!(matches!(size.operation(), ArrayIrOperation::DimensionSize(_)));
+            assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
+            assert_eq!(zero.inputs(), size.outputs());
         }
     }
 }
