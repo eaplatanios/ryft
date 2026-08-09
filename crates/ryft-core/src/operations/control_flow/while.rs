@@ -2549,6 +2549,26 @@ mod tests {
                     .to_string(),
             )),
         );
+
+        // A body-local gateway may define a fresh dimension, but that identity cannot replace the declared carry
+        // identity on each iteration. Bounds widening is deliberately not inferred for loop-carried state.
+        let carry = DimensionVariable::new("carry", DimensionBounds::positive(Some(8)).unwrap());
+        let next = DimensionVariable::new("next", DimensionBounds::positive(Some(8)).unwrap());
+        let carry_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(carry)])));
+        let next_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(next)])));
+        let condition_interface = RegionInterface::new(
+            vec![carry_type.clone()],
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+            Effects::PURE,
+        );
+        let shape_varying_body = RegionInterface::new(vec![carry_type.clone()], vec![next_type], Effects::PURE);
+        assert_eq!(
+            operation
+                .infer_output_types(std::slice::from_ref(&carry_type), &[condition_interface, shape_varying_body],),
+            Err(TypeError::invalid(
+                "while body output type signature mismatch: expected [f32[carry]] but got [f32[next]]".to_string(),
+            )),
+        );
     }
 
     #[test]

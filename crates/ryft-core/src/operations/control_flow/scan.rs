@@ -2873,6 +2873,23 @@ mod tests {
                 "scan stacked body input 1 must be an array but got dimension<extent ∈ [1, 8)>".to_string(),
             )),
         );
+
+        // A fresh dimension produced by the body cannot replace the declared carry identity on each iteration.
+        // Supporting such shape-varying state would require an explicit widening contract. `scan` instead keeps its
+        // loop-carried type invariant and reports the exact incompatible signatures.
+        let carry = DimensionVariable::new("carry", DimensionBounds::positive(Some(8)).unwrap());
+        let next = DimensionVariable::new("next", DimensionBounds::positive(Some(8)).unwrap());
+        let carry_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(carry.clone())])));
+        let next_type = ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(next)])));
+        let shape_varying_body = RegionInterface::new(vec![carry_type.clone()], vec![next_type], Effects::PURE);
+        assert_eq!(
+            ScanOperation::<CaptureReference<ArrayIrType>>::new(1, 3)
+                .infer_output_types(std::slice::from_ref(&carry_type), &[shape_varying_body]),
+            Err(TypeError::invalid(
+                "scan body carry type signature mismatch: expected [f32[carry]] but got [f32[next]]".to_string(),
+            )),
+        );
     }
 
     #[test]

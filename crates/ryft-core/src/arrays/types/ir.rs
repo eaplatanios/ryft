@@ -22,11 +22,12 @@ use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenamin
 ///
 /// Both members carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
 /// signature. An [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
-/// member *defines* its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
+/// member _defines_ its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
 /// array and dimension members for consistency, exactly as it does within one member kind.
 ///
-/// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values in the
-/// first place, the input-derived provenance restriction they encode, and how it enables shape-polymorphic programs.
+/// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values, the
+/// three supported provenance categories, the single checked data-to-dimension gateway, and how those contracts enable
+/// shape-polymorphic programs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayIrType {
     Array(ArrayType),

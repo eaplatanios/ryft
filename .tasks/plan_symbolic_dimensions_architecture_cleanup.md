@@ -163,29 +163,29 @@ eager bounds-checked execution, PE fold/residualize behavior, the mapped-batchin
 `Effect::OrderedAssertion` effects model, and differentiation through the unchanged linear-call residual contract
 (all pinned by fixtures; see the archive plan's Phase 12 and verification-matrix tier-3 rows).
 
-- [ ] Add a retained-JIT cache-identity test proving one compiled specialization serves multiple runtime extents of a
+- [x] Add a retained-JIT cache-identity test proving one compiled specialization serves multiple runtime extents of a
       *data-derived* dimension (the pinned fixture covers input-derived extents; this one must source the extent from
       the gateway).
-- [ ] Verify gateway-defined variables need no boundary `TypeRefinements` entry: they are internal identities
+- [x] Verify gateway-defined variables need no boundary `TypeRefinements` entry: they are internal identities
       established by their producing instruction under the existing structural-closure rules. Cover closure, import,
       alpha-renaming, and repeated splicing.
-- [ ] Batching: pin the tier-3 MVP policy with fixtures — a replicated scalar operand produces ordinary replicated
+- [x] Batching: pin the tier-3 MVP policy with fixtures — a replicated scalar operand produces ordinary replicated
       dimension authority; a mapped operand keeps its exact typed rejection diagnostic, updated to name Phase 6
       raggedness as the missing capability.
-- [ ] Control flow: verify the existing carry-type equality checks reject shape-varying loop-carried state with exact
+- [x] Control flow: verify the existing carry-type equality checks reject shape-varying loop-carried state with exact
       diagnostics (a fresh per-iteration variable cannot instantiate the declared carry type). Bounds-widened
       loop-carried extents are an explicit non-goal; record the rejection fixture rather than designing widening.
-- [ ] Confirm the Phase 8 authoritative operation declaration covers the gateway (generated dispatch, conversions,
+- [x] Confirm the Phase 8 authoritative operation declaration covers the gateway (generated dispatch, conversions,
       classification); the closed-family classifier test already asserts exactly one gateway variant, so this is
       likely a verification tick.
-- [ ] Update the `DimensionType` motivation rustdoc in `types/dimensions.rs` so the provenance story describes the
+- [x] Update the `DimensionType` motivation rustdoc in `types/dimensions.rs` so the provenance story describes the
       tiers and names the gateway as the single data-to-dimension boundary; update the `ArrayIrType` cross-reference
       if its wording changes.
-- [ ] Add JAX comparison fixtures for eager and staged `n = count(mask); take(x, n)`-shaped programs that JAX rejects
+- [x] Add JAX comparison fixtures for eager and staged `n = count(mask); take(x, n)`-shaped programs that JAX rejects
       (`ConcretizationTypeError`) and Ryft accepts eagerly and stages symbolically. Compiled execution may reject
       with an exact "requires Phase 5 bounded data-dependent lowering" diagnostic until Phase 5 lands. (Overlaps the
       Phase 7 harness; the fixtures may live there.)
-- [ ] Gate: tier-3 programs interpret eagerly end to end; staged tier-3 programs type-check, batch (replicated),
+- [x] Gate: tier-3 programs interpret eagerly end to end; staged tier-3 programs type-check, batch (replicated),
       differentiate, and partially evaluate; the bounds check provably survives DCE with deterministic ordering;
       every unsupported surface fails with an exact diagnostic; and no expression trees, side tables, or ambient
       environments were added.
@@ -599,3 +599,30 @@ outside this phase's doctest/API-move gate. The final code diff is limited to th
 documentation/style/fixture corrections. Generic program machinery contains no composite variant knowledge; array,
 dimension, and mixed operation semantics remain owned by their respective operation families; lowering consumes
 first-class scalar SSA directly; and no compatibility shim or duplicate semantic path remains. Phase 3 is closed.
+
+### Phase 4 tier-3 semantic closure (2026-08-09)
+
+**Gateway and transform contracts.** A retained XLA JIT fixture now derives an extent from scalar data, executes two
+different admitted extents through one specialization, and records one trace, lowering, compilation request, compiled
+artifact, and cache entry. Existing gateway closure/import coverage now explicitly proves that neither the source nor
+two repeatedly spliced copies acquire an input identity: each gateway result is a fresh internal identity and each
+imported condition region is alpha-renamed to its corresponding definition. The closed operation-family classifier
+still contains exactly one array-to-dimension gateway. Replicated batching remains ordinary dimension flow; mapped
+batching retains `BatchingError::MappedDimension` and now names Phase 6 ragged batching in its exact diagnostic. The
+existing scan/while carry equality rules reject a fresh per-iteration shape identity exactly, with no widening layer.
+
+**Behavioral fixture and documentation.** The Ryft golden converts a Boolean mask to an integer count, reduces it to
+rank-zero scalar SSA, crosses `dimension_from_scalar`, and dynamically slices a prefix using the resulting bounded
+dimension. It stages with a dynamic `f32[count]` result and interprets both nonempty and zero-length results. The paired
+pinned-JAX test executes eagerly but raises `jax.errors.ConcretizationTypeError` while staging `jnp.arange(count)`.
+`DimensionType` now documents the static, input-derived, and bounded data-derived tiers, the gateway as the sole
+data-to-dimension boundary, and why gateway identities need no boundary refinement; `ArrayIrType` links to that exact
+provenance contract. No temporary Phase 5 lowering abstraction or diagnostic was added: the compiled retained-JIT
+fixture uses the already-supported internal bounded-dynamic broadcast/reduce route, while general bounded
+data-dependent output materialization remains Phase 5's explicit scope.
+
+**Verification.** `ryft-core --lib` passes 1,208/1,208; all 53 runnable `ryft-core` doctests pass (16 ignored);
+`ryft-xla --lib --test-threads=1` passes 448 tests with one timing benchmark ignored; and the focused pinned-JAX test
+passes. Nightly formatting and diff hygiene are clean. The implementation adds tests, exact diagnostics, and rustdoc
+only; it introduces no expression representation, side table, ambient environment, compatibility layer, or duplicate
+semantic path. Phase 4 is closed.

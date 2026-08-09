@@ -3571,12 +3571,12 @@ mod tests {
 
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
-        ComparisonDirection, ConditionOperation, ConstantOperation, Dimension, DimensionAddOperation,
-        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
-        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, MulOperation,
-        NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, SelectOperation, Sharding,
-        ShardingDimension, StaticShape, WhileOperation,
+        ComparisonDirection, CompilationTracer, ConditionOperation, ConstantOperation, Dimension,
+        DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation,
+        DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+        DivOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
+        JittedFunction, MulOperation, NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind,
+        SelectOperation, Sharding, ShardingDimension, StaticShape, WhileOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -5231,6 +5231,61 @@ mod tests {
             panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
         };
         assert!(error.to_string().contains("only supports ranked tensors with a static shape"), "{error}");
+    }
+
+    #[test]
+    fn test_data_derived_extent_retained_jit_reuses_one_specialization() {
+        fn trace<'c>(
+            extent: DimensionVariable,
+            inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            let [size, value] = inputs.as_slice() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            };
+            let dimension = size.to_dimension(extent)?;
+            let broadcast = size
+                .context()
+                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
+                .remove(0);
+            Ok(size
+                .context()
+                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
+                .remove(0))
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
+        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let function: JittedFunction<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = try_jit_with_options(
+            &domain,
+            move |(), inputs| trace(extent.clone(), inputs),
+            XlaOptions::new(mesh.clone()),
+        );
+
+        let call = |size: i64| {
+            let size =
+                Array::from_host_buffer(&client, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let value =
+                Array::from_host_buffer(&client, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)]).unwrap()
+        };
+
+        assert_eq!(read_f32s(&client, program_array(&call(2))), vec![4.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(4))), vec![8.0]);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.traces, 1);
+        assert_eq!(statistics.lowerings, 1);
+        assert_eq!(statistics.compilation_requests, 1);
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(domain.cache_size(), 1);
     }
 
     #[test]

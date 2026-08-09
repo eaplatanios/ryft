@@ -683,11 +683,12 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        CONCATENATE_OPERATION_NAME, ConcatenateOperation, DimensionAddOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        GatherDimensionNumbers, GatherOperation, IotaOperation, OneOperation, PadOperation, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, SliceOperation, UpdateSliceOperation,
+        CONCATENATE_OPERATION_NAME, ConcatenateOperation, ConvertElementTypeOperation, DimensionAddOperation,
+        DimensionFromScalarOperation, DimensionMulOperation, DimensionSizeOperation, DynamicBroadcast,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, GatherDimensionNumbers, GatherOperation, IotaOperation, OneOperation,
+        PadOperation, ReduceOperation, ReductionKind, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+        SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder, ProgramError, Typed};
@@ -2196,6 +2197,71 @@ in (%4)
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation 'dynamic_shape_slice' does not yet support reverse-mode differentiation",
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_data_dependent_prefix_slice() -> Result<(), ProgramError> {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])).into());
+        let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into());
+        let mask = builder.add_instruction(
+            ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64))),
+            Vec::new(),
+            vec![mask],
+        )?[0];
+        let count = builder.add_instruction(
+            ArrayIrOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
+            Vec::new(),
+            vec![mask],
+        )?[0];
+        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5))?);
+        let count = builder.add_instruction(
+            DimensionFromScalarOperation::new(count_variable.clone()),
+            Vec::new(),
+            vec![count],
+        )?[0];
+        let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
+        let output =
+            builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])?[0];
+        let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+
+        // The count remains ordinary scalar SSA until the checked gateway defines one fresh internal identity. The
+        // slice consumes that first-class dimension directly, so staging needs neither a concrete count nor an
+        // input-boundary refinement for `count`.
+        assert!(program.type_identity_signature().input_identities().is_empty());
+        assert!(program.type_identity_signature().internal_identities().contains(&count_variable));
+        assert_eq!(
+            program.output_types(),
+            vec![ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(count_variable)]),
+            ))],
+        );
+        let [_, _, gateway, _] = program.instructions() else {
+            panic!("expected convert, reduce, dimension gateway, and dynamic slice instructions");
+        };
+        assert!(matches!(gateway.operation(), ArrayIrOperation::DimensionFromScalar(_)));
+
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![true, false, true, false])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0]))]),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![false, false, false, false])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 20.0, 30.0, 40.0])),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(Vec::<f32>::new()))]),
+        );
 
         Ok(())
     }

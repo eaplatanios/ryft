@@ -5280,12 +5280,18 @@ mod tests {
         );
         let mapped_gateway_input =
             ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![4_i32, 5_i32])), BatchAxis::new(0)).unwrap();
+        let error = gateway_operation.batch(&context, &EmptyRegionDriver, &[mapped_gateway_input]).unwrap_err();
         assert_eq!(
-            gateway_operation.batch(&context, &EmptyRegionDriver, &[mapped_gateway_input]),
-            Err(BatchingError::MappedDimension {
+            error,
+            BatchingError::MappedDimension {
                 r#type: Box::new(DimensionType::new(gateway_variable.clone())),
                 axis: BatchAxis::new(0),
-            }),
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "dimension type dimension<gateway ∈ [0, 9)> cannot carry mapped axis 0 because ragged batching is \
+             deferred to Phase 6",
         );
         assert_eq!(
             gateway_operation.batch(&context, &EmptyRegionDriver, &[]),

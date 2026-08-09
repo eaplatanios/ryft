@@ -269,7 +269,9 @@ impl TypeIdentity for DimensionVariable {
 /// Concrete extents observed at execution boundaries are deliberately *not* part of the type (i.e., structural type
 /// equality, hashing, display, and retained-compilation cache identity must not distinguish two calls whose dynamic
 /// extents differ, or every concrete extent would acquire its own specialization). Boundary facts instead live in the
-/// complete-signature [`TypeRefinements`](crate::TypeRefinements) environment established at program boundaries.
+/// complete-signature [`TypeRefinements`](crate::TypeRefinements) environment established from boundary inputs. A
+/// variable defined by an instruction inside a program needs no input-boundary refinement (its producing instruction
+/// closes the identity structurally and establishes its concrete value when the program executes).
 ///
 /// # Motivation
 ///
@@ -291,21 +293,29 @@ impl TypeIdentity for DimensionVariable {
 ///     are keyed by the symbolic signature and reused across every admitted extent, with the boundary
 ///     [`TypeRefinements`](crate::TypeRefinements) environment binding actual extents per call.
 ///
-/// The restriction this type encodes is therefore one of *provenance*. Dimension values derive from the input signature
-/// (i.e., dimension inputs, extents of array inputs, and explicit dimension arithmetic over those), with exactly one
-/// deliberate, checked exception (the [`DimensionFromScalar`](crate::DimensionFromScalar) gateway converts rank-zero
-/// integer array *data* into a fresh bounded dimension). The gateway admits data-dependent extents while keeping the
-/// invariant above intact, because its output type is a fresh variable plus declared bounds (computable at trace time
-/// like every other dimension type) with the concrete extent checked against those bounds at execution time. Backend
-/// IRs are more permissive. For example, a StableHLO
-/// [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary runtime integer tensor
-/// with no provenance requirement, so lowering does not need this machinery. The restriction is a frontend type-system
-/// choice: an *unchecked* data-derived extent would make output types depend on unbounded runtime values, and
-/// data-dependent dynamism also remains unevenly supported across backends (refer to the
+/// The restriction this type encodes is therefore one of _provenance_. Ryft supports three increasingly dynamic tiers:
+///
+///   1. **Tier 1 — Static Extents:** A [`Dimension::Static`] axis or an exact singleton-bounded dimension is known
+///      completely while tracing.
+///   2. **Tier 2 — Input-Derived Extents:** Dimension inputs, dynamic axes of array inputs,
+///      [`DimensionSize`](crate::DimensionSize) results, and explicit arithmetic over those values remain symbolic
+///      while tracing but are determined by the program boundary.
+///   3. **Tier 3 — Bounded Data-Derived Extents:** The deliberate [`DimensionFromScalar`](crate::DimensionFromScalar)
+///      gateway converts rank-zero integer array _data_ into a fresh bounded dimension. This is the only
+///      data-to-dimension boundary. Ordinary array computation cannot implicitly acquire shape authority.
+///
+/// The tier-3 gateway keeps the trace-time type invariant intact because its output type is a fresh variable plus
+/// declared bounds, which are computable before execution like every other dimension type. Its producing instruction
+/// makes that variable an internal identity, so it neither appears in nor needs an input-boundary
+/// [`TypeRefinements`](crate::TypeRefinements) entry. Execution reads the scalar and checks the observed extent against
+/// the declared bounds before the value may control array geometry. Backend representations are more permissive. For
+/// example, a StableHLO [`dynamic_reshape`](https://openxla.org/stablehlo/spec#dynamic_reshape) consumes an ordinary
+/// runtime integer tensor with no provenance requirement, so lowering does not need this machinery. The restriction is
+/// a frontend type-system choice: an _unchecked_ data-derived extent would make output types depend on unbounded
+/// runtime values, and data-dependent dynamism also remains unevenly supported across backends (refer to the
 /// [dynamism in StableHLO](https://openxla.org/stablehlo/dynamism) documentation for more information). The
-/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each dynamic extent,
-/// input-derived or gateway-derived, inside a static envelope that backends can plan buffers and generate loops
-/// against.
+/// authoritative [`DimensionBounds`] carried by every [`DimensionVariable`] additionally keep each tier-2 or tier-3
+/// dynamic extent inside a static envelope that backends can plan buffers and generate loops against.
 ///
 /// # Example
 ///

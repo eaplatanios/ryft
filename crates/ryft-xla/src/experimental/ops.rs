@@ -1504,6 +1504,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(source.output_types(), vec![ArrayIrType::Array(output_type)]);
+        assert!(source.type_identity_signature().input_identities().is_empty());
+        assert_eq!(
+            source.type_identity_signature().internal_identities(),
+            std::slice::from_ref(extent_type.variable())
+        );
 
         let mut destination = XlaProgramBuilder::new();
         let integer = destination.add_input(integer_type.into());
@@ -1537,13 +1542,19 @@ mod tests {
             }
         }
 
-        destination
+        let destination = destination
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![first, second],
                 vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
+        let signature = destination.type_identity_signature();
+        assert!(signature.input_identities().is_empty());
+        assert_eq!(
+            signature.internal_identities(),
+            &[first_dimension.variable().clone(), second_dimension.variable().clone()],
+        );
     }
 
     #[test]
