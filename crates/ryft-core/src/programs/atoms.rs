@@ -60,6 +60,12 @@ impl<V: Typed> MaybeZero<V> {
     /// Returns the value inside this [`MaybeZero`], materializing a structural [`MaybeZero::Zero`] as a real typed
     /// zero value in the provided [`Context`] through its [`Zero`] capability (a staging context stages a typed
     /// [`ZeroOperation`](crate::ZeroOperation) instruction, while an eager context constructs a concrete zero value).
+    ///
+    /// This is the type-only form, which requires the carried [`Type`](crate::Type) to pin everything the zero needs.
+    /// A type that names runtime quantities it does not pin (e.g., an array type with dynamic axes) has no such zero,
+    /// and its materialization is a differentiation-owned concern that reads those quantities from the values in scope.
+    /// [`materialize_zero_from_residual_sources`](crate::ResidualZeroProvider::materialize_zero_from_residual_sources)
+    /// should be used instead in that case.
     #[inline]
     pub fn materialize<C: Context<Value = V> + Zero<V>>(self, context: &C) -> Result<V, ProgramError> {
         match self {
@@ -122,7 +128,7 @@ impl Display for AtomId {
 
 /// [`Atom`]s represent nodes in the [`Region`](crate::Region)s of [`Program`](crate::Program)s that represent either
 /// concrete values or variables of specific [`Type`](crate::Type)s.
-#[derive(Clone, Debug, Parameter)]
+#[derive(Clone, Debug, PartialEq, Parameter)]
 pub enum Atom<V: Typed> {
     /// Literal constant value that appears in a [`Program`](crate::Program).
     Constant(V),
