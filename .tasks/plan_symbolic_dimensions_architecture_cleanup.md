@@ -44,11 +44,15 @@ These constrain all remaining phases; the full rationale is in the archive plan'
 Archive Phase 9's exit criterion requires every unchecked residual of phases 0–8 to be closed. This is the complete
 list.
 
-- [ ] P3k collective-parity tail: group-aware *production* reachability for the collectives, Phase 7 bounded-dynamic
-      multi-device execution, and the final current-JAX behavioral/StableHLO comparisons (the comparisons overlap the
-      Phase 7 harness below and may land there). Already complete: public semantics, validated `axis_index_groups`,
-      all-gather variance, `pshuffle`/`pswapaxes` compositions, shared native lowerers, direct composite binder
-      fixture, production composite shard-map reachability, and static two-device execution
+- [x] P3k collective-parity tail: closed with one four-device production `shard_map` that executes grouped tiled
+      all-gather, psum-scatter, and all-to-all together and pins the exact ordered StableHLO replica groups and
+      per-device results. A separate four-device fixture executes one bounded-dynamic program that declares three
+      dynamic extents at two distinct runtime shapes sharing one cached executable, through the checked physical ABI.
+      The backend boundary is explicit: pinned Shardy rejects dynamic tensors, so static programs use Shardy SPMD,
+      fully replicated bounded-dynamic programs use one replica per device, and non-replicated bounded-dynamic
+      multi-device placement is rejected exactly. Current JAX 0.6.2
+      comparisons pin the three grouped collectives plus `pshuffle` and `pswapaxes`; JAX's public collective path is
+      static, so Ryft's replicated bounded-dynamic execution exceeds that supported surface
       (`.tasks/plan_p3k_collective_dimensions.md`).
 - [x] Zero-materialization migration of the type-generic transform drivers and transpose boundaries: replaced by
       identity-directed residual materialization
@@ -66,11 +70,12 @@ list.
       per-operation diagnostics, rule rustdoc, and pinned fixtures. `attention.rs` needed no rejection: its own
       `infer_output_types` already requires static shapes; only the comment's justification was wrong and is
       corrected.
-- [ ] Close-out decision on the five permanent homogeneous batching zero/one sites (`padding.rs` mask-input one and
-      transpose mask-input zero, `slicing.rs` `batch_by_item_expansion` empty-batch zero, `scan.rs` zero-length and
-      accumulator stack zeros): they live in `Context<Type = ArrayType>` with no way to observe a runtime extent, so
-      either re-affirm them as the permanent homogeneous baseline at the Phase 1 gate or move their owning rules to
-      the mixed family. Do not leave the question implicit.
+- [x] Close-out decision on the five homogeneous batching zero/one sites: retain `padding.rs`'s mask-input one and
+      transpose mask-input zero, `slicing.rs`'s `batch_by_item_expansion` empty-batch zero, and `scan.rs`'s zero-length
+      and accumulator-stack zeros as the permanent homogeneous baseline. Their `Context<Type = ArrayType>` contract
+      deliberately has no first-class extent operands; the corresponding mixed `ArrayIrType` rules own dynamic
+      materialization. Moving these sites would couple the homogeneous reference path to the mixed carrier without
+      making any currently unsupported dynamic program representable.
 - [x] Composite carriers for custom-derivative and rematerialization payloads: carriers, landed 2026-08-08. Each of
       `CustomJvpOperation`, `CustomVjpOperation`, and `RematerializeOperation` gained a `nondifferentiated_count`
       leading-operand group (the `LinearCallOperation::residual_count` shape, and the direct analogue of JAX's
@@ -78,37 +83,46 @@ list.
       CustomVjp, Rematerialize}` variants over `ArrayIrType`. The former by-name rejections in interpretation,
       projected binding, batching, JVP, and transposition are gone, and the projected `ArrayIrOperation::Array`
       variant now holds only region-free operations. This closes the verification-matrix row.
-- [ ] Verify the 2026-08-08 scatter `MemberDifferentiableOperation` rule fully closes the former "mixed scatter
-      reaches the homogeneous rule through the catch-all" gap (dynamic-shape acceptance test per the archive Phase 6
-      owner item), then record the closure.
+- [x] Verified the 2026-08-08 scatter `MemberDifferentiableOperation` rule closes the former "mixed scatter reaches
+      the homogeneous rule through the catch-all" gap. `test_array_ir_scatter_differentiation` exercises the mixed
+      rule, and `test_array_ir_dynamic_scatter_disconnected_operand_tangent_uses_runtime_extent_residuals` pins a
+      disconnected dynamically shaped operand tangent materialized from ordinary runtime-extent residuals.
 - [x] Naming-endgame close-out: all four rename/delete sub-items are executed (reshape expression deletion, the
       `DynamicBroadcast`/`DynamicReshape` operation and capability renames, and the freed homogeneous names).
       Confirmed 2026-08-08: repository-wide searches under `crates/` for `LegacyBroadcast`, `LegacyReshape`,
       `legacy_broadcast`, `legacy_reshape`, the abandoned `BroadcastTo`, `HomogeneousBroadcastOperation`,
       `ReshapeDimensionExpression`, and `DimensionExpressions` are all empty, so the endgame is ticked.
-- [ ] Owner design call (do not resolve silently): the P0 baseline's congruence-transfer prover layer does not exist
-      in the current `AbstractDimensionValue` (interval + exact + same-variable only), so e.g.
-      `require_divisible_by(n*4, 2)` residualizes a runtime assertion the archive proved statically. Either reinstate
-      congruence transfer in abstract values and arithmetic bound inference and restore the P0 probe table (3–5
-      days), or amend the carries-over ledger to drop congruence and record the residual-assertion delta explicitly.
-      This decision also gates the "exact diagnostics match the baseline" row below.
-- [ ] Exact-diagnostics-match-baseline verification row: after the congruence decision, sweep the frozen P0
-      diagnostic templates against current behavior and record the outcome.
-- [ ] Gate: core language semantics no longer appear to be backend implementation details, and every item above is
-      closed.
+- [x] Owner design call: do not reinstate the retired modular-congruence prover. The retained abstract interpreter's
+      exact-value, interval, and shared-identity facts remain the deliberately decidable compile-time layer; modular
+      relationships stay ordinary SSA plus ordered runtime requirements rather than recreating a parallel symbolic
+      algebra. The exact measured delta is one residual `OrderedAssertion` for `require_divisible_by(n * 4, 2)` where
+      the retired prover emitted zero, pinned by
+      `test_dimension_requirement_partial_evaluation_retains_unproven_congruence`.
+- [x] Exact-diagnostics-match-baseline verification row: all five frozen runtime requirement messages, the bounds
+      diagnostic, both type-time impossibility messages, deterministic first-failure ordering, PE preservation, and
+      relocation are pinned by the dimension-requirement fixtures. Dropping congruence changes only whether the one
+      requirement above is residualized; it does not change its actor-named runtime diagnostic.
+- [x] Gate: every phases 0–8 residual is closed, generic core semantics remain independent of XLA implementation
+      details, and the only backend-specific limitation is an exact placement rejection at the XLA domain boundary.
 
 ## Phase 2: persistence and measured performance closure (archive Phase 10)
 
-- [ ] Verify cache keys remain invariant to runtime extents and distinguish semantically different dimension graphs.
-      The behavior pinned by fixtures at both levels (region interning and retained JIT) is: two calls differing only
-      in the *runtime extent* of a dynamic dimension share one specialization, while independently created same-named
-      `DimensionVariable`s and permutations of live identities each take their own — dimension identity is nominal
-      (`Arc::ptr_eq`), so alpha-equivalent-but-distinct programs intentionally do *not* share a cache key. This item
-      is the final sweep over the remaining persistence surfaces under those semantics.
-- [ ] Re-run the Phase 0 graph-size, allocation, compile-time, memory, executable-size, and runtime measurements.
-- [ ] Gate: no performance regression exceeds the existing evidence-based thresholds without explicit approval.
+- [x] Verify cache keys remain invariant to runtime extents and distinguish semantically different dimension graphs.
+      The final contract has two deliberate levels. Region instantiation and retained-JIT dispatch preserve nominal
+      `DimensionVariable` identity (`Arc::ptr_eq`), so independently created identities and permutations take separate
+      specializations. The persistent compiled-artifact key is computed after lowering and canonicalizes
+      diagnostic-only identity names: the same lowered dimension graph under a fresh nominal identity shares an
+      artifact, while changed dimension SSA does not. At runtime, two distinct concrete extents execute through one
+      retained specialization and one compiled executable.
+- [x] Re-run the Phase 0 graph-size, allocation, compile-time, memory, executable-size, and runtime measurements.
+- [x] Gate: no performance regression exceeds the existing evidence-based thresholds without explicit approval.
 
 ## Phase 3: deletion and minimality gate (archive Phase 11)
+
+Phase 2 preflight: this is not a small follow-on review unit. Current source includes substantial post-baseline
+functionality and exceeds the historical Phase 0 total, while this gate demands both an adapter-specific accounting
+and a lower final production total. Execute Phase 3 separately: classify growth by subsystem and decide the valid
+comparison scope before deleting or silently re-baselining anything.
 
 - [ ] Delete every item in the archive plan's deletes ledger.
 - [ ] Treat `u/eaplatanios/wip/dimensions-remainder` as retired historical state at `12398a196`; prove final
@@ -402,3 +416,126 @@ red at `HEAD` and untouched here); `ryft-core` integration binaries 6 + 6 and do
 `ryft-xla --lib --test-threads=1` 443 passed / 1 ignored (the 442 baseline plus the new multi-source fixture);
 `ryft-macros-tests` 20 + 17. `rustfmt --edition 2024 --check` clean on the one edited source file. No rendered
 fixture changed.
+
+### Phase 1 residual closure (2026-08-08)
+
+**Collectives and multi-device dynamism.** A four-device production `shard_map` now executes grouped tiled
+all-gather, psum-scatter, and all-to-all in one program, pins all three ordered replica-group attributes, and checks
+the exact result on every device. Current JAX 0.6.2 produces the same grouped results and StableHLO collective forms;
+its `pshuffle` and `pswapaxes` compositions likewise match Ryft's existing `ppermute` and untiled-all-to-all
+fixtures. A second four-device fixture executes a fully replicated bounded-dynamic array with three pairwise-distinct
+logical extents. Pinned Shardy rejects dynamic tensors, so the XLA domain now selects Shardy SPMD only for static
+boundaries, selects one executable replica per device for fully replicated bounded-dynamic boundaries, and rejects a
+requested non-replicated bounded-dynamic multi-device placement with one exact diagnostic. No collective payload,
+core type, or transform contract learned this backend limitation.
+
+**Core decisions.** The five listed homogeneous batching constants remain the permanent `ArrayType` reference
+baseline; `ArrayIrType` remains the owner of first-class dynamic extent materialization. Mixed scatter's dedicated
+member differentiation path is pinned at a dynamic shape, including a disconnected tangent whose geometry is
+supplied by runtime residuals. Modular congruence is deliberately dropped from the carries-over ledger: rebuilding it
+would recreate part of the parallel symbolic algebra this architecture removed. The accepted cost is exactly one
+residual ordered assertion for `(n * 4) % 2 == 0`, now pinned by a focused partial-evaluation test.
+
+**Diagnostics.** The frozen five runtime requirement messages, bounds error, two type-time impossibility messages,
+same-class ordering, PE preservation, and relocation fixtures remain exact. The congruence decision changes assertion
+elimination density, not diagnostic wording. The grouped-collective, bounded-dynamic multi-device, mixed-scatter,
+congruence, frozen-diagnostic, `pshuffle`, and `pswapaxes` fixtures pass. All 445 runnable `ryft-xla` unit tests pass
+(one benchmark ignored); all 53 runnable `ryft-core` doctests pass (16 ignored); and
+`cargo check --workspace --all-targets`, nightly formatting, and `git diff --check` are clean. Of 1,207 `ryft-core`
+unit tests, 1,206 pass and the pre-existing `test_array_constants` exact-string mismatch remains red at `HEAD`: the
+production `fill` diagnostic ends in `instead` while its fixture does not. This Phase 1 slice neither changes nor
+depends on that unrelated wording.
+
+### Phase 2 persistence and measured performance closure (2026-08-08)
+
+**Cache identity.** The final fixtures separate the two cache layers instead of conflating them. Core region
+instantiation and retained-JIT dispatch remain nominal: exact identities reuse their specialization, while a fresh
+`DimensionVariable` takes another. The persistent XLA artifact key is a property of the final lowered program, so it
+canonicalizes a fresh diagnostic-only identity name for an otherwise identical graph but changes when the dimension
+SSA changes (the pinned pair uses `extent + 1` versus `extent + 2`). A four-device bounded-dynamic executable runs
+logical shapes `[4, 2, 3, 5]` and `[4, 3, 4, 6]` through one retained specialization and leaves the domain cache at
+exactly one entry. The focused builder, dynamic-zero retained-JIT, persistent-signature, canonical-key, dynamic-graph,
+and multi-device fixtures all pass.
+
+**Graph size and allocation.** `program_statistics` reproduces the Phase 0 structural counts for all eight successor
+cases: scalar entry regions remain at 3/4/15/18/11 instructions with maximum dependency depths 2/2/7/7/7;
+`shard_map_basic` and `shard_map_matmul` remain one entry instruction plus one single-instruction child; and
+`nested_shard_map` remains a one-instruction entry, two-instruction intermediate region, and one-instruction leaf.
+Raw rendered-IR bytes and lines are intentionally unavailable because the approved statistics migration deleted that
+unstable metric. The replacement allocation suite passes 6/6: borrowed and consuming array/dimension projections
+allocate zero times; large clones add no payload allocation; and elementwise/constructor kernels retain a constant
+allocation count with exactly one output-payload byte slope. The retired expression-allocation harness is not
+reintroduced.
+
+**Build and size measurements.** Clean `ryft-core` checking took 12.49 s and 970,489,856 B peak RSS; the immediate
+incremental check took 0.18 s and 65,208,320 B. Relative to Phase 0 integration, clean time is +13.0% (inside the 20%
+gate) and incremental behavior is flat; clean RSS is +39.3%, while no memory percentage threshold was approved. The
+retained release performance harness built in 100.52 s at 2,390,065,152 B, +4.3% time and -27.3% peak RSS versus the
+archive emitter build. For the direct tool replacement, two clean `program_statistics` builds took 117.49 s and
+116.96 s at roughly 2.407 GB; this informational tool-build comparison is +21.4% versus the retired emitter, but it is
+not the timed trace/lower/compile acceptance workload. Its executable is 45,292,720 B versus the corrected Phase 0
+integration emitter's 57,564,144 B (-21.3%).
+
+**Runtime.** Across five release runs of 50 iterations at 1,024 elements, the median run recorded cold trace/lower/
+compile of 74,334/618,209/16,579,166 ns; warm dispatch p50/p95 of 6,333/9,250 ns; enqueue p50/p95 of 5,792/8,834 ns;
+and synchronized p50/p95 of 9,333/25,042 ns. Every value improves on the Phase 0 integration smoke baseline
+(485,500/3,919,958/47,597,583 ns; 11,042/27,583 ns; 10,500/51,875 ns; 38,334/49,584 ns), so no runtime threshold is
+approached.
+
+**Verification.** `ryft-xla --lib --test-threads=1` passes 445 tests with one timing benchmark ignored. The Phase 1
+full-core and doctest results remain applicable because Phase 2 changes only XLA fixtures and the plan: 1,206 of 1,207
+core unit tests pass, with only the pre-existing `test_array_constants` exact diagnostic mismatch red at `HEAD`; all
+53 runnable doctests pass (16 ignored). The projection allocation suite passes 6/6. Workspace all-target checking,
+nightly formatting, and diff hygiene are clean.
+
+**Phase 3 sizing decision.** Phase 3 was not started in this combined review. Current `tokei` code counts are 116,431
+for `ryft-core/src`, 39,690 for `ryft-xla/src`, and 5,977 for `ryft-macros/src`, versus Phase 0 integration counts of
+78,838, 34,271, and 4,766. Those totals include substantial post-baseline functionality, but the Phase 3 gate still
+requires a lower total plus an adapter-specific 40% reduction. That makes Phase 3 a material deletion and accounting
+review, not a small cleanup suitable for appending here. A preliminary retired-identifier search is clean in `crates/`
+for `ArrayProgramProjection`, both context views, replay/source helpers, the old dimension-expression/lowering
+machinery, `SymbolValueResolver`, and all legacy broadcast/reshape names; the remaining plan-text mentions are
+historical requirements rather than code residuals.
+
+### Shardy-guard coverage fixes (2026-08-08)
+
+**Shardy rejects dynamic tensors everywhere, not only at the boundary (measured).** The `use_shardy_partitioner`
+predicate in `XlaDomain::lower_xla_program` only inspected the input and output types, so a program with a fully
+static boundary but a gateway-derived dynamic interior still enabled Shardy. Compiling exactly such a program on a
+four-device CPU mesh fails with `Shardy propagation only supports ranked tensors with a static shape. type:
+'tensor<?xf32, #stablehlo.bounds<4>>'` on the `stablehlo.set_dimension_size`. The predicate is therefore now the
+whole-program walk `has_only_static_array_types`, which iterates the region arena (covering every region boundary,
+constant, and instruction result, recursively through attached regions) and ignores first-class dimension atoms
+because those lower to ordinary scalars. The old boundary check was dropped rather than kept alongside it: the entry
+region's atoms already subsume the boundary types. Fixture:
+`test_internal_dynamic_tensor_behind_a_static_boundary_takes_the_replica_path` pins the replica path (4/1, no SPMD,
+no Shardy, no `sdy.` in the module) and correct execution, *and* pins the counterfactual by re-lowering the same
+program with Shardy annotations and asserting the compile failure above.
+
+**`shard_map` escapes the replicated-sharding guard (upstream rejection is narrower than it looks).** Dynamic
+`shard_map` *boundaries* are rejected upstream at `ShardMap::trace` via `static_dimensions`
+(`crates/ryft-xla/src/experimental/shard_map.rs`), unconditionally and before any sharding is consulted, so even a
+fully replicated spec with a dynamic extent fails with `input type #0 dimension #0 must be static for traced
+shard_map` (pinned by `test_shard_map_trace_rejects_dynamic_input_types`). That does *not* close the hole: because a
+`shard_map` body is always static, it can sit beside dynamic tensors staged elsewhere in the same program, whose
+replicated boundary shardings pass the existing guard. Its `sdy.manual_computation` lowering would then be compiled
+with `use_shardy_partitioner = false`, and its collectives address partitions rather than replicas. The dynamic
+multi-device guard therefore gained a second, separately worded rejection driven by `contains_shard_map`:
+`bounded-dynamic multi-device programs cannot contain shard_map regions because sdy.manual_computation requires the
+Shardy partitioner`. Fixture: `test_bounded_dynamic_multi_device_programs_reject_shard_map_regions`. Named-axis
+collectives need no companion guard: mesh-bound collectives only lower inside a manual region (`axis_index` and the
+mesh replica-group derivation both require `collective_state.manual_shard_map()`), so they are unreachable outside
+the case just rejected.
+
+**`Sharding::is_replicated`.** The guard compared against a freshly allocated `Sharding::replicated(...)` per element.
+`crates/ryft-core/src/arrays/sharding/shardings.rs` now owns a documented `is_replicated` (all dimensions
+`Replicated` and all three auxiliary axis sets empty), stating why reduction and manual-axis metadata are
+deliberately *not* replicated and why `Unconstrained` is not either. It replaces both the guard comparison and the
+duplicated private `is_fully_replicated` in `crates/ryft-xla/src/arrays_v0/compiled_reshard.rs`. Fixture:
+`test_sharding_is_replicated`.
+
+**Gates** (all `CARGO_INCREMENTAL=0`): `cargo check --workspace --all-targets` clean with zero warnings; `ryft-core
+--lib` 1,207 passed / 1 failed (the pre-existing `test_array_constants` `Fill` diagnostic wording drift, red at
+`HEAD` and untouched here; +1 test from `test_sharding_is_replicated`); `ryft-xla --lib --test-threads=1` 447 passed
+/ 1 ignored (+2 tests, both new fixtures above); `ryft-macros-tests` 20 + 17. `rustfmt --edition 2024 --check` clean
+on the three edited source files. No rendered fixture changed.

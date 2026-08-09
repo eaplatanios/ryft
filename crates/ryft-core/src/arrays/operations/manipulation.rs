@@ -1679,11 +1679,10 @@ in (%4)
         );
     }
 
-    /// Mixed scatter applies the same operand-exemplar rule as pad and concatenation: a structurally zero operand
-    /// tangent whose type names its extent by identity is materialized from that operand's primal rather than from the
-    /// type, which carries no runtime extent.
     #[test]
-    fn test_array_ir_dynamic_scatter_disconnected_operand_tangent_uses_a_primal_exemplar() {
+    fn test_array_ir_dynamic_scatter_disconnected_operand_tangent_uses_runtime_extent_residuals() {
+        // Mixed scatter materializes a structurally zero operand tangent through the residual protocol, using the
+        // operand primal as the runtime source for each identity-bearing extent omitted by its tangent type.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(7)).unwrap());
         let extent_type = DimensionType::new(extent);
         let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
@@ -1696,9 +1695,9 @@ in (%4)
         // The reshaped operand is a static nullary one constant, so its tangent is a structural zero of a static type
         // that no rule needs to materialize. Mixed reshape then carries that zero tangent into a structural zero of its
         // own identity-bearing output type, which is exactly the disconnected dynamic operand tangent the scattered
-        // operand receives. Its primal is a non-zero exemplar and the update tangent stays live, so the rule must hand
-        // a concrete operand tangent to the staged tangent scatter from that exemplar rather than from the type, which
-        // carries no runtime extent.
+        // operand receives. Its primal carries the required runtime extent and the update tangent stays live, so the
+        // rule must materialize a concrete operand tangent through the residual protocol before staging tangent
+        // scatter.
         let ones = builder
             .add_instruction(
                 ArrayOperation::One(OneOperation::new(ArrayType::new(

@@ -707,6 +707,7 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 })
         );
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
+        assert!(!sharding.is_replicated());
         assert_eq!(
             sharding.to_string(),
             "{mesh<['data'=4:explicit, 'manual'=2:manual]>, [{'data'}, {}], reduced={'manual'}}",
@@ -740,7 +741,18 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 3, rank: 3 })
         );
         assert_eq!(replicated.replicated_axes(), Vec::from(["data", "manual"]));
+        assert!(replicated.is_replicated());
         assert_eq!(replicated.to_string(), "{mesh<['data'=4:explicit, 'manual'=2:manual]>, [{}, {}, {}]}");
+
+        assert!(Sharding::replicated(mesh.clone(), 0).is_replicated());
+        assert!(Sharding::replicated(mesh.clone(), 2).is_replicated());
+        assert!(!Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap().is_replicated());
+
+        // Reduction and manual-axis markers record cross-device obligations that a partitioner still has to act on,
+        // so they are deliberately not replicated even though every ranked dimension is.
+        assert!(!Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["data"]).unwrap().is_replicated());
+        assert!(!Sharding::replicated(mesh.clone(), 2).with_reduced_axes(["data"]).unwrap().is_replicated());
+        assert!(!Sharding::replicated(mesh.clone(), 2).with_varying_manual_axes(["manual"]).unwrap().is_replicated());
 
         assert!(matches!(
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["z"])]),
@@ -750,30 +762,6 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(Vec::new())]),
             Err(ShardingError::EmptySharding { dimension }) if dimension == 0,
         ));
-    }
-
-    #[test]
-    fn test_sharding_is_replicated() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-
-        assert!(Sharding::replicated(mesh.clone(), 0).is_replicated());
-        assert!(Sharding::replicated(mesh.clone(), 2).is_replicated());
-        assert!(
-            !Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()])
-                .unwrap()
-                .is_replicated()
-        );
-        assert!(!Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained()]).unwrap().is_replicated());
-
-        // Reduction and manual-axis markers record cross-device obligations that a partitioner still has to act on,
-        // so they are deliberately not replicated even though every ranked dimension is.
-        assert!(!Sharding::replicated(mesh.clone(), 2).with_unreduced_axes(["data"]).unwrap().is_replicated());
-        assert!(!Sharding::replicated(mesh.clone(), 2).with_reduced_axes(["data"]).unwrap().is_replicated());
-        assert!(!Sharding::replicated(mesh, 2).with_varying_manual_axes(["manual"]).unwrap().is_replicated());
     }
 
     #[test]
