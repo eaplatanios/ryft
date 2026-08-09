@@ -329,10 +329,10 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 Self::Scan(operation.with_captures(captures))
             }
             ArrayOperation::CustomJvp(operation) => Self::CustomJvp(
-                CustomJvpOperation::new().with_nondifferentiated_count(operation.nondifferentiated_count()),
+                CustomJvpOperation::new().with_non_differentiated_count(operation.non_differentiated_count()),
             ),
             ArrayOperation::CustomVjp(operation) => Self::CustomVjp(
-                CustomVjpOperation::new().with_nondifferentiated_count(operation.nondifferentiated_count()),
+                CustomVjpOperation::new().with_non_differentiated_count(operation.non_differentiated_count()),
             ),
             // The executable linear-call form is fully described by its residual count. The transpose-only form
             // additionally stores its unavailable forward map's member interface types, which lift one by one into the
@@ -351,7 +351,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(
                 RematerializeOperation::new()
                     .with_prevent_cse(operation.prevent_cse())
-                    .with_nondifferentiated_count(operation.nondifferentiated_count()),
+                    .with_non_differentiated_count(operation.non_differentiated_count()),
             ),
             operation => Self::Array(operation),
         }
@@ -1402,21 +1402,21 @@ mod tests {
     fn test_composite_lift_promotes_every_region_carrying_array_payload() {
         // Every region-carrying array payload has a composite carrier, so none of them reaches the region-free
         // projected `Array` variant. The custom-derivative wrappers and rematerialization carry their
-        // nondifferentiated operand split (and rematerialization its lowering hint) across the lift.
+        // non-differentiated operand split (and rematerialization its lowering hint) across the lift.
         assert!(matches!(
-            TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new().with_nondifferentiated_count(1))),
-            ArrayIrOperation::CustomJvp(operation) if operation.nondifferentiated_count() == 1,
+            TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new().with_non_differentiated_count(1))),
+            ArrayIrOperation::CustomJvp(operation) if operation.non_differentiated_count() == 1,
         ));
         assert!(matches!(
-            TestOperation::from(ArrayOperation::CustomVjp(CustomVjpOperation::new().with_nondifferentiated_count(2))),
-            ArrayIrOperation::CustomVjp(operation) if operation.nondifferentiated_count() == 2,
+            TestOperation::from(ArrayOperation::CustomVjp(CustomVjpOperation::new().with_non_differentiated_count(2))),
+            ArrayIrOperation::CustomVjp(operation) if operation.non_differentiated_count() == 2,
         ));
         assert!(matches!(
             TestOperation::from(ArrayOperation::Rematerialize(
-                RematerializeOperation::new().with_prevent_cse(true).with_nondifferentiated_count(1),
+                RematerializeOperation::new().with_prevent_cse(true).with_non_differentiated_count(1),
             )),
             ArrayIrOperation::Rematerialize(operation)
-                if operation.prevent_cse() && operation.nondifferentiated_count() == 1,
+                if operation.prevent_cse() && operation.non_differentiated_count() == 1,
         ));
         assert!(matches!(
             TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::new(1))),
@@ -1443,7 +1443,7 @@ mod tests {
     #[test]
     fn test_composite_batching_of_a_custom_jvp_payload() {
         // The composite carrier batches both regions structurally and threads the first-class mapped extent into
-        // them as one additional leading nondifferentiated operand of the batched call.
+        // them as one additional leading non-differentiated operand of the batched call.
         let (program, batch_axis) = batched_composite_payload(
             ArrayOperation::CustomJvp(CustomJvpOperation::new()),
             composite_custom_jvp_regions(),
@@ -1453,7 +1453,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_jvp [nondifferentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_jvp [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const
@@ -1491,7 +1491,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = custom_vjp [nondifferentiated_count=1] %0 %1 [
+                let %2:f64[batch] = custom_vjp [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const
@@ -1532,7 +1532,7 @@ mod tests {
             program,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                let %2:f64[batch] = rematerialize [nondifferentiated_count=1] %0 %1 [
+                let %2:f64[batch] = rematerialize [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
                         let %2:f64[] = const
@@ -1571,7 +1571,7 @@ mod tests {
     #[test]
     fn test_composite_batching_of_a_linear_call_payload() {
         // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
-        // the custom-derivative carriers follow with their nondifferentiated operand split.
+        // the custom-derivative carriers follow with their non-differentiated operand split.
         let array_type = ArrayType::scalar(DataType::F64);
         let identity_program = || -> TestProgram {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();

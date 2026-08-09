@@ -323,7 +323,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
     );
 
     define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes a forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`jacobian_forward_with_aux`] for details.
         jacobian_forward_with_aux,
         delegate = jacobian_forward_in_context,
@@ -336,7 +336,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
     );
 
     define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes a holomorphic forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`jacobian_forward_holomorphic_with_aux`] for details.
         jacobian_forward_holomorphic_with_aux,
         delegate = jacobian_forward_in_context,
@@ -379,7 +379,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
     );
 
     define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes a reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`jacobian_reverse_with_aux`] for details.
         jacobian_reverse_with_aux,
         delegate = jacobian_reverse_in_context,
@@ -395,7 +395,7 @@ pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
     );
 
     define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`jacobian_reverse_holomorphic_with_aux`] for details.
         jacobian_reverse_holomorphic_with_aux,
         delegate = jacobian_reverse_in_context,
@@ -543,7 +543,7 @@ define_jacobian_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Computes a forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// Computes a forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The closure returns
     /// `(output, auxiliary)`. Only `output` contributes to the Jacobian. `auxiliary` is materialized from its primal
     /// trace and returned with it. Refer to [`jacobian_forward`] for the mathematical interpretation, block layout,
     /// context recovery, and ordinary complex-type rules.
@@ -566,7 +566,7 @@ define_jacobian_auxiliary_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Computes a holomorphic forward-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// Computes a holomorphic forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The
     /// closure and auxiliary-output behavior are described by [`jacobian_forward_with_aux`]. The holomorphy promise
     /// and complex-type requirements are the same as for [`jacobian_forward_holomorphic`].
     ///
@@ -653,7 +653,7 @@ define_jacobian_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Computes a reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// Computes a reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The closure returns
     /// `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is materialized from its primal
     /// trace and returned with it. Refer to [`jacobian_reverse`] for the mathematical interpretation, block layout,
     /// context recovery, and ordinary complex-type rules.
@@ -682,7 +682,7 @@ define_jacobian_auxiliary_function!(
 );
 
 define_jacobian_auxiliary_function!(
-    /// Computes a holomorphic reverse-mode [`Jacobian`] and returns nondifferentiated auxiliary outputs. The
+    /// Computes a holomorphic reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The
     /// closure and auxiliary-output behavior are described by [`jacobian_reverse_with_aux`]. The holomorphy promise
     /// and complex-type requirements are the same as for [`jacobian_reverse_holomorphic`].
     ///

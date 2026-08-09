@@ -1530,7 +1530,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayOperation, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
@@ -2024,6 +2025,57 @@ mod tests {
             aligned_program.interpret(vec![Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])]),
             Ok(vec![Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]),
         );
+    }
+
+    #[test]
+    fn test_batching_context_align_and_adapt_batched_program_outputs() {
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut source_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let source_input = source_builder.add_input(vector_type.clone().into());
+        let source_program = source_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![source_input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let trace = TraceContext::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(8)).unwrap());
+        let extent_type = DimensionType::new(batch.clone());
+        let extent = trace.input(extent_type.clone().into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+        let input_axes = [BatchAxis::new(0)];
+        let batched_program = <ArrayIrBatching as RecursiveBatchingPolicy<TraceContext>>::batch_program(
+            &context,
+            source_program.entry_region_ref(),
+            input_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )
+        .unwrap();
+
+        // The target axis already matches, so the empty driver proves that the fast path is used. Adaptation retains
+        // the leading extent input that grounds the dynamic batch dimension but removes its bookkeeping output.
+        let adapted_program = context
+            .align_and_adapt_batched_program_outputs(
+                &EmptyRegionDriver,
+                source_program.entry_region_ref(),
+                input_axes.as_slice(),
+                batched_program,
+                input_axes.as_slice(),
+            )
+            .unwrap();
+        let packed_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
+        assert_eq!(
+            adapted_program.input_types(),
+            &[ArrayIrType::Dimension(extent_type), ArrayIrType::Array(packed_type.clone())],
+        );
+        assert_eq!(adapted_program.output_types(), &[ArrayIrType::Array(packed_type)]);
+        assert_eq!(adapted_program.output_ids(), &adapted_program.input_ids()[1..]);
+        assert!(adapted_program.instructions().is_empty());
     }
 
     #[test]

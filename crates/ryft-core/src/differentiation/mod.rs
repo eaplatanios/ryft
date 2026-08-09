@@ -18,7 +18,7 @@
 //! - [`vjp`] runs the primal computation and returns a reusable [`Pullback`] mapping output cotangents to input
 //!   cotangents. Conceptually, `vjp = linearize + transpose`.
 //! - [`value_and_gradient`] and [`gradient`] are scalar-output conveniences that seed the pullback with one. The
-//!   `*_with_aux` variants preserve nondifferentiated auxiliary output, while the `*_holomorphic` variants explicitly
+//!   `*_with_aux` variants preserve non-differentiated auxiliary output, while the `*_holomorphic` variants explicitly
 //!   opt into the complex holomorphic contract.
 //!
 //! Context-generic code can use [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`] directly, and already

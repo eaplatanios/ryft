@@ -428,14 +428,14 @@ pub trait HessianDifferentiate:
     );
 
     define_hessian_auxiliary_function_in_trait!(
-        /// Materializes the complete [`Hessian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes the complete [`Hessian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`hessian_with_aux`] for details.
         hessian_with_aux,
         holomorphic = false,
     );
 
     define_hessian_auxiliary_function_in_trait!(
-        /// Materializes the complete holomorphic [`Hessian`] and returns nondifferentiated auxiliary outputs.
+        /// Materializes the complete holomorphic [`Hessian`] and returns non-differentiated auxiliary outputs.
         /// Refer to [`hessian_holomorphic_with_aux`] for details.
         hessian_holomorphic_with_aux,
         holomorphic = true,
@@ -593,7 +593,7 @@ define_hessian_function!(
 );
 
 define_hessian_auxiliary_function!(
-    /// Computes a [`Hessian`] and returns nondifferentiated auxiliary outputs. The closure returns
+    /// Computes a [`Hessian`] and returns non-differentiated auxiliary outputs. The closure returns
     /// `(output, auxiliary)`. Only `output` contributes to the Hessian. `auxiliary` is materialized from its primal
     /// trace and returned with it. Refer to [`hessian`] for the mathematical interpretation, block layout, context
     /// recovery, and ordinary complex-type rules.
@@ -606,7 +606,7 @@ define_hessian_auxiliary_function!(
 );
 
 define_hessian_auxiliary_function!(
-    /// Computes a holomorphic [`Hessian`] and returns nondifferentiated auxiliary outputs. The closure and auxiliary
+    /// Computes a holomorphic [`Hessian`] and returns non-differentiated auxiliary outputs. The closure and auxiliary
     /// output behavior are described by [`hessian_with_aux`]. The holomorphy promise and complex-type requirements are
     /// the same as for [`hessian_holomorphic`].
     ///

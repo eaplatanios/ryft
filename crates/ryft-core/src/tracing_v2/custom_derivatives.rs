@@ -19,7 +19,7 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
-use crate::tracing_v2::operands::{check_nondifferentiated_tangents_are_zero, split_nondifferentiated};
+use crate::tracing_v2::operands::{check_non_differentiated_tangents_are_zero, split_non_differentiated};
 
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
@@ -34,13 +34,13 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// Keeping the primal program separate from the JVP program means un-differentiated calls never pay for tangent
 /// computation.
 ///
-/// The leading [`nondifferentiated_count`](Self::nondifferentiated_count) operands parameterize the call without being
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without being
 /// differentiated: every attached region receives them in the same leading positions, but they contribute no tangent
 /// to the JVP region's input signature and receive no cotangent. This is the same operand split
 /// [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's `nondiff_argnums`. Batching
 /// is its canonical producer: a policy that threads batching state through a structurally batched region's boundary
 /// (e.g., a composite universe's first-class mapped extent) reintroduces that state as additional leading
-/// nondifferentiated operands of the batched call.
+/// non-differentiated operands of the batched call.
 ///
 /// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
 /// call whose operands are all known and otherwise residualizes it unchanged; batching preserves the call around
@@ -61,7 +61,7 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomJvpOperation<T: DifferentiableType> {
     /// Number of leading operands that parameterize the call without being differentiated.
-    nondifferentiated_count: usize,
+    non_differentiated_count: usize,
 
     /// Type universe in which this custom-JVP call is valid.
     marker: PhantomData<fn() -> T>,
@@ -81,27 +81,27 @@ impl<T: DifferentiableType> CustomJvpOperation<T> {
     /// differentiated.
     #[inline]
     pub const fn new() -> Self {
-        Self { nondifferentiated_count: 0, marker: PhantomData }
+        Self { non_differentiated_count: 0, marker: PhantomData }
     }
 
     /// Sets the number of leading operands that parameterize this call without being differentiated. Refer to the
     /// documentation of [`CustomJvpOperation`] for the resulting region interfaces.
     #[inline]
-    pub fn with_nondifferentiated_count(mut self, nondifferentiated_count: usize) -> Self {
-        self.nondifferentiated_count = nondifferentiated_count;
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
+        self.non_differentiated_count = non_differentiated_count;
         self
     }
 
     /// Returns the number of leading operands that parameterize this call without being differentiated.
     #[inline]
-    pub fn nondifferentiated_count(&self) -> usize {
-        self.nondifferentiated_count
+    pub fn non_differentiated_count(&self) -> usize {
+        self.non_differentiated_count
     }
 
-    /// Splits `values` into the leading nondifferentiated group and the trailing differentiated group.
+    /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_nondifferentiated(self.name(), self.nondifferentiated_count, values)
+        split_non_differentiated(self.name(), self.non_differentiated_count, values)
     }
 }
 
@@ -176,13 +176,13 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // A call whose operands are all differentiated renders as a bare name, so the nondifferentiated split appears
+        // A call whose operands are all differentiated renders as a bare name, so the non-differentiated split appears
         // in rendered programs exactly where it exists.
         let operation = OperationFormatter::new(formatter, indentation, CUSTOM_JVP_OPERATION_NAME)?;
-        if self.nondifferentiated_count == 0 {
+        if self.non_differentiated_count == 0 {
             return Ok(());
         }
-        operation.bracketed(|operation| operation.field("nondifferentiated_count", self.nondifferentiated_count))
+        operation.bracketed(|operation| operation.field("non_differentiated_count", self.non_differentiated_count))
     }
 }
 
@@ -217,7 +217,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// region back to the plain custom-JVP region boundary, and any
 /// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
 /// first-class mapped extent) become additional leading
-/// [nondifferentiated](CustomJvpOperation::nondifferentiated_count) operands of the batched call, which is precisely
+/// [non-differentiated](CustomJvpOperation::non_differentiated_count) operands of the batched call, which is precisely
 /// the operand role those bookkeeping values play: every region consumes them and none of them carries a
 /// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
@@ -289,11 +289,11 @@ where
         )?;
 
         let boundary_operands = P::boundary_operands(context.axis_extent());
-        let nondifferentiated_count = self.nondifferentiated_count + boundary_operands.len();
+        let non_differentiated_count = self.non_differentiated_count + boundary_operands.len();
         let mut packed_inputs = boundary_operands;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(
-            self.with_nondifferentiated_count(nondifferentiated_count),
+            self.with_non_differentiated_count(non_differentiated_count),
             vec![primal, jvp],
             packed_inputs.as_slice(),
         )?;
@@ -328,10 +328,10 @@ where
         // `(inputs..., differentiated_input_tangents...)` to `(outputs..., output_tangents...)`.
         let jvp_region = driver.region(1)?;
         let output_count = jvp_region.output_types().len() / 2;
-        let (nondifferentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
+        let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
         check_count!("input", jvp_region.input_types(), inputs.len() + differentiated_inputs.len(), ProgramError);
 
-        check_nondifferentiated_tangents_are_zero(self.name(), nondifferentiated_inputs)?;
+        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
 
         // The JVP region consumes `(primals..., differentiated_input_tangents...)`, so feed every dual primal followed
         // by the differentiated duals' tangents.
@@ -487,17 +487,17 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 /// passed to [`Context::bind`]) in the region order `["primal", "forward", "backward"]`, and
 /// [`Operation::infer_output_types`] validates the interface contract between them: the forward region consumes the
 /// primal inputs and produces the primal outputs followed by arbitrarily many residual values, and the backward region
-/// consumes the leading nondifferentiated operands, then those residuals, then one cotangent per primal output, and
+/// consumes the leading non-differentiated operands, then those residuals, then one cotangent per primal output, and
 /// produces one cotangent per *differentiated* primal input. Keeping the primal program separate from the forward
 /// program means un-differentiated calls never pay for residual computation.
 ///
-/// The leading [`nondifferentiated_count`](Self::nondifferentiated_count) operands parameterize the call without being
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without being
 /// differentiated: the primal and forward regions receive them in their own leading positions, the backward region
 /// receives them ahead of the residuals, and they receive no cotangent. This is the same operand split
 /// [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's `nondiff_argnums`. Batching
 /// is its canonical producer: a policy that threads batching state through a structurally batched region's boundary
 /// (e.g., a composite universe's first-class mapped extent) reintroduces that state as additional leading
-/// nondifferentiated operands of the batched call.
+/// non-differentiated operands of the batched call.
 ///
 /// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
 /// call whose operands are all known and otherwise residualizes it unchanged; batching preserves the call around
@@ -521,7 +521,7 @@ pub const CUSTOM_VJP_OPERATION_NAME: &str = "custom_vjp";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CustomVjpOperation<T: DifferentiableType> {
     /// Number of leading operands that parameterize the call without being differentiated.
-    nondifferentiated_count: usize,
+    non_differentiated_count: usize,
 
     /// Type universe in which this custom-VJP call is valid.
     marker: PhantomData<fn() -> T>,
@@ -541,27 +541,27 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
     /// differentiated.
     #[inline]
     pub const fn new() -> Self {
-        Self { nondifferentiated_count: 0, marker: PhantomData }
+        Self { non_differentiated_count: 0, marker: PhantomData }
     }
 
     /// Sets the number of leading operands that parameterize this call without being differentiated. Refer to the
     /// documentation of [`CustomVjpOperation`] for the resulting region interfaces.
     #[inline]
-    pub fn with_nondifferentiated_count(mut self, nondifferentiated_count: usize) -> Self {
-        self.nondifferentiated_count = nondifferentiated_count;
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
+        self.non_differentiated_count = non_differentiated_count;
         self
     }
 
     /// Returns the number of leading operands that parameterize this call without being differentiated.
     #[inline]
-    pub fn nondifferentiated_count(&self) -> usize {
-        self.nondifferentiated_count
+    pub fn non_differentiated_count(&self) -> usize {
+        self.non_differentiated_count
     }
 
-    /// Splits `values` into the leading nondifferentiated group and the trailing differentiated group.
+    /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_nondifferentiated(self.name(), self.nondifferentiated_count, values)
+        split_non_differentiated(self.name(), self.non_differentiated_count, values)
     }
 
     /// Validates the custom-VJP contract over the three attached region interfaces
@@ -582,7 +582,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         let backward_interface = &region_interfaces[2];
         let input_types = primal_interface.input_types();
         let output_types = primal_interface.output_types();
-        let (nondifferentiated_types, differentiated_types) = self.split_inputs(input_types)?;
+        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
         check_types!(@same, "custom_vjp forward input", [input_types, forward_interface.input_types()]);
         let forward_output_types = forward_interface.output_types();
         if forward_output_types.len() < output_types.len() {
@@ -598,7 +598,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         ]);
         let residual_types = &forward_output_types[output_types.len()..];
         let output_cotangent_types = output_types.iter().map(|r#type| r#type.cotangent());
-        let expected_backward_input_types: Vec<T> = nondifferentiated_types
+        let expected_backward_input_types: Vec<T> = non_differentiated_types
             .iter()
             .chain(residual_types)
             .cloned()
@@ -674,8 +674,8 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
                 forward_output_types.len(),
             )));
         }
-        let (nondifferentiated_types, _) = self.split_inputs(input_types)?;
-        let mut backward_input_types = nondifferentiated_types.to_vec();
+        let (non_differentiated_types, _) = self.split_inputs(input_types)?;
+        let mut backward_input_types = non_differentiated_types.to_vec();
         backward_input_types.extend_from_slice(&forward_output_types[primal_output_types.len()..]);
         backward_input_types.extend(primal_output_types.iter().map(DifferentiableType::cotangent));
         Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec()), Some(backward_input_types)])
@@ -693,13 +693,13 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // A call whose operands are all differentiated renders as a bare name, so the nondifferentiated split appears
+        // A call whose operands are all differentiated renders as a bare name, so the non-differentiated split appears
         // in rendered programs exactly where it exists.
         let operation = OperationFormatter::new(formatter, indentation, CUSTOM_VJP_OPERATION_NAME)?;
-        if self.nondifferentiated_count == 0 {
+        if self.non_differentiated_count == 0 {
             return Ok(());
         }
-        operation.bracketed(|operation| operation.field("nondifferentiated_count", self.nondifferentiated_count))
+        operation.bracketed(|operation| operation.field("non_differentiated_count", self.non_differentiated_count))
     }
 }
 
@@ -725,7 +725,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 
 /// Batching rule for [`CustomVjpOperation`]. The primal and forward regions receive the wrapper operands' existing
 /// axes; corresponding primal outputs are reconciled while forward residuals keep their natural axes. The backward
-/// region then receives the nondifferentiated operands' axes, those residual axes, and the reconciled
+/// region then receives the non-differentiated operands' axes, those residual axes, and the reconciled
 /// output-cotangent axes, and its result cotangents are aligned back to the differentiated operands' axes. A cotangent
 /// that is mapped for a replicated primal input is summed across the mapped axis, as required by the transpose of
 /// replication.
@@ -735,7 +735,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 /// region back to the plain custom-VJP region boundary, and any
 /// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
 /// first-class mapped extent) become additional leading
-/// [nondifferentiated](CustomVjpOperation::nondifferentiated_count) operands of the batched call, which is precisely
+/// [non-differentiated](CustomVjpOperation::non_differentiated_count) operands of the batched call, which is precisely
 /// the operand role those bookkeeping values play: every region consumes them and none of them carries a
 /// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
@@ -750,7 +750,7 @@ where
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-        let (nondifferentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
+        let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let differentiated_axes = differentiated_axes.to_vec();
         let primal_region = driver.region(0)?;
         let forward_region = driver.region(1)?;
@@ -808,12 +808,16 @@ where
             forward_required_output_axes.as_slice(),
         )?;
 
-        // The backward rule maps `(nondifferentiated..., residuals..., output_cotangents...)` to the differentiated
+        // The backward rule maps `(non-differentiated..., residuals..., output_cotangents...)` to the differentiated
         // inputs' cotangents. Align mapped results to their primal input positions while they are live; adaptation
         // then sums the only non-structural mismatch, namely a mapped cotangent corresponding to a replicated primal
         // input.
-        let backward_input_axes =
-            nondifferentiated_axes.iter().chain(&residual_axes).chain(&output_axes).copied().collect::<Vec<_>>();
+        let backward_input_axes = non_differentiated_axes
+            .iter()
+            .chain(&residual_axes)
+            .chain(&output_axes)
+            .copied()
+            .collect::<Vec<_>>();
         let batched_backward = driver.batch_program(
             context,
             backward_region,
@@ -833,11 +837,11 @@ where
         }
 
         let boundary_operands = P::boundary_operands(context.axis_extent());
-        let nondifferentiated_count = self.nondifferentiated_count + boundary_operands.len();
+        let non_differentiated_count = self.non_differentiated_count + boundary_operands.len();
         let mut packed_inputs = boundary_operands;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(
-            self.with_nondifferentiated_count(nondifferentiated_count),
+            self.with_non_differentiated_count(non_differentiated_count),
             vec![primal, forward, backward],
             packed_inputs.as_slice(),
         )?;
@@ -855,7 +859,7 @@ where
 /// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
 /// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over
 /// the dual primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
-/// `[nondifferentiated..., residuals..., differentiated_input_tangents...]` with the leading nondifferentiated
+/// `[non-differentiated..., residuals..., differentiated_input_tangents...]` with the leading non-differentiated
 /// operands and the residuals as ordinary linear-call *residual operands* (not capture factors). That carrier
 /// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it fails
 /// with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
@@ -893,24 +897,24 @@ where
         }
         let residuals = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
-        let (nondifferentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
+        let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
 
-        check_nondifferentiated_tangents_are_zero(self.name(), nondifferentiated_inputs)?;
+        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
 
         let input_tangent_types =
             differentiated_inputs.iter().map(|input| input.primal().r#type().tangent()).collect::<Vec<_>>();
         let output_tangent_types = primal_outputs.iter().map(|output| output.r#type().tangent()).collect::<Vec<_>>();
 
-        // Stage one opaque carrier over `[nondifferentiated..., residuals..., differentiated_input_tangents...]`,
+        // Stage one opaque carrier over `[non-differentiated..., residuals..., differentiated_input_tangents...]`,
         // producing the output tangents. The carrier rejects forward interpretation and transposes by replaying the
         // user's backward region, whose own inputs are exactly that leading residual group followed by the output
         // cotangents. The transpose-only carrier takes every differentiated input tangent as a real operand, so
         // materialize structural zeros against their own primal, which names every runtime quantity a
         // reference-bearing tangent type omits.
         let mut carrier_operands =
-            nondifferentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         carrier_operands.extend(residuals);
-        // The carrier's leading non-tangent group is the nondifferentiated operands followed by the residuals, and
+        // The carrier's leading non-tangent group is the non-differentiated operands followed by the residuals, and
         // both are passed through the residual-count slot: to the linear call they are alike operands that its
         // transpose forwards to the backward region rather than transposing.
         let leading_operand_count = carrier_operands.len();

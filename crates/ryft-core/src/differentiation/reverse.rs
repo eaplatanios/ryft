@@ -1649,7 +1649,7 @@ where
 /// # Parameters
 ///
 ///   - `context`: Context that executes or stages the reverse-mode transform.
-///   - `function`: Function returning the scalar value to differentiate and nondifferentiated auxiliary outputs.
+///   - `function`: Function returning the scalar value to differentiate and non-differentiated auxiliary outputs.
 ///   - `primals`: Structured input values specifying the differentiation point.
 ///   - `holomorphic`: Whether the scalar output is validated under a holomorphy promise.
 fn value_and_gradient_with_aux_in_context<C, F, Input, Output, Aux>(

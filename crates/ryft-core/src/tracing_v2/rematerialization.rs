@@ -62,7 +62,7 @@ use crate::programs::{
     RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::tracing_v2::operands::{check_nondifferentiated_tangents_are_zero, split_nondifferentiated};
+use crate::tracing_v2::operands::{check_non_differentiated_tangents_are_zero, split_non_differentiated};
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
@@ -76,13 +76,13 @@ use crate::tracing_v2::operands::{check_nondifferentiated_tangents_are_zero, spl
 /// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
 /// requested memory/computation tradeoff.
 ///
-/// The leading [`nondifferentiated_count`](Self::nondifferentiated_count) operands parameterize the call without being
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without being
 /// differentiated: the primal and forward regions receive them in their own leading positions, the backward and
 /// tangent regions receive them ahead of the forward tail, and they receive neither a tangent nor a cotangent. This is
 /// the same operand split [`LinearCallOperation`](crate::LinearCallOperation) draws with its residual count, and the
 /// direct analogue of JAX's `nondiff_argnums`. Batching is its canonical producer: a policy that threads batching
 /// state through a structurally batched region's boundary (e.g., a composite universe's first-class mapped extent)
-/// reintroduces that state as additional leading nondifferentiated operands of the batched call.
+/// reintroduces that state as additional leading non-differentiated operands of the batched call.
 ///
 /// The `T` parameter fixes the type universe of every attached region and the call boundary. Each concrete payload
 /// therefore has exactly one [`Operation<Type = T>`](Operation) contract, while the rematerialization algorithm remains one
@@ -93,7 +93,7 @@ pub struct RematerializeOperation<T: Type> {
     prevent_cse: bool,
 
     /// Number of leading operands that parameterize the call without being differentiated.
-    nondifferentiated_count: usize,
+    non_differentiated_count: usize,
 
     /// Type universe in which the attached rematerialization regions operate.
     marker: PhantomData<fn() -> T>,
@@ -109,21 +109,21 @@ impl<T: Type> RematerializeOperation<T> {
     /// primal interface.
     #[inline]
     pub fn new() -> Self {
-        Self { prevent_cse: false, nondifferentiated_count: 0, marker: PhantomData }
+        Self { prevent_cse: false, non_differentiated_count: 0, marker: PhantomData }
     }
 
     /// Sets the number of leading operands that parameterize this call without being differentiated. Refer to the
     /// documentation of [`RematerializeOperation`] for the resulting region interfaces.
     #[inline]
-    pub fn with_nondifferentiated_count(mut self, nondifferentiated_count: usize) -> Self {
-        self.nondifferentiated_count = nondifferentiated_count;
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
+        self.non_differentiated_count = non_differentiated_count;
         self
     }
 
     /// Returns the number of leading operands that parameterize this call without being differentiated.
     #[inline]
-    pub fn nondifferentiated_count(&self) -> usize {
-        self.nondifferentiated_count
+    pub fn non_differentiated_count(&self) -> usize {
+        self.non_differentiated_count
     }
 
     /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
@@ -141,10 +141,10 @@ impl<T: Type> RematerializeOperation<T> {
         self.prevent_cse
     }
 
-    /// Splits `values` into the leading nondifferentiated group and the trailing differentiated group.
+    /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_nondifferentiated(self.name(), self.nondifferentiated_count, values)
+        split_non_differentiated(self.name(), self.non_differentiated_count, values)
     }
 
     /// Validates the rematerialization contract over the four attached region interfaces
@@ -166,7 +166,7 @@ impl<T: Type> RematerializeOperation<T> {
         let tangent_interface = &region_interfaces[3];
         let input_types = primal_interface.input_types();
         let output_types = primal_interface.output_types();
-        let (nondifferentiated_types, differentiated_types) = self.split_inputs(input_types)?;
+        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
         check_types!(@same, "rematerialize forward input", [input_types, forward_interface.input_types()]);
         let forward_output_types = forward_interface.output_types();
         if forward_output_types.len() < output_types.len() {
@@ -182,7 +182,7 @@ impl<T: Type> RematerializeOperation<T> {
         ]);
         let residual_types = &forward_output_types[output_types.len()..];
         let expected_backward_input_types: Vec<T> =
-            nondifferentiated_types.iter().chain(residual_types).chain(output_types.iter()).cloned().collect();
+            non_differentiated_types.iter().chain(residual_types).chain(output_types.iter()).cloned().collect();
         check_types!(@same, "rematerialize backward input", [
             &expected_backward_input_types,
             backward_interface.input_types(),
@@ -192,7 +192,7 @@ impl<T: Type> RematerializeOperation<T> {
             backward_interface.output_types(),
         ]);
         let expected_tangent_input_types: Vec<T> =
-            nondifferentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
+            non_differentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
         check_types!(@same, "rematerialize tangent input", [
             &expected_tangent_input_types,
             tangent_interface.input_types(),
@@ -268,15 +268,15 @@ impl<T: Type> Operation for RematerializeOperation<T> {
             )));
         }
         let residual_types = &forward_output_types[primal_output_types.len()..];
-        let (nondifferentiated_types, differentiated_types) = self.split_inputs(input_types)?;
-        let backward_input_types = nondifferentiated_types
+        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
+        let backward_input_types = non_differentiated_types
             .iter()
             .chain(residual_types)
             .chain(primal_output_types.iter())
             .cloned()
             .collect::<Vec<_>>();
         let tangent_input_types =
-            nondifferentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
+            non_differentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
         Ok(vec![
             Some(input_types.to_vec()),
             Some(input_types.to_vec()),
@@ -297,13 +297,13 @@ impl<T: Type> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // A call whose operands are all differentiated renders as a bare name, so the nondifferentiated split appears
+        // A call whose operands are all differentiated renders as a bare name, so the non-differentiated split appears
         // in rendered programs exactly where it exists.
         let operation = OperationFormatter::new(formatter, indentation, self.name())?;
-        if self.nondifferentiated_count == 0 {
+        if self.non_differentiated_count == 0 {
             return Ok(());
         }
-        operation.bracketed(|operation| operation.field("nondifferentiated_count", self.nondifferentiated_count))
+        operation.bracketed(|operation| operation.field("non_differentiated_count", self.non_differentiated_count))
     }
 }
 
@@ -335,8 +335,8 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::
 ///   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
 ///      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
 ///      forward tail; the tail is split off after the primal outputs.
-///   2. The tangent program maps `(nondifferentiated..., forward_tail..., differentiated_input_tangents...) ->
-///      output_tangents`, exactly the leading nondifferentiated operands and the forward tail followed by the
+///   2. The tangent program maps `(non-differentiated..., forward_tail..., differentiated_input_tangents...) ->
+///      output_tangents`, exactly the leading non-differentiated operands and the forward tail followed by the
 ///      differentiated inputs' tangents (per [`RematerializeOperation::new`]'s signature validation), so those leading
 ///      operands and the tail are passed ahead of the dual tangents and replayed to produce the output tangents. The
 ///      tangent program
@@ -383,14 +383,14 @@ where
         }
         let forward_tail = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
-        let (nondifferentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
+        let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
 
-        check_nondifferentiated_tangents_are_zero(self.name(), nondifferentiated_inputs)?;
+        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
 
-        // Replay the tangent region on `(nondifferentiated..., forward_tail..., differentiated_input_tangents...)`,
+        // Replay the tangent region on `(non-differentiated..., forward_tail..., differentiated_input_tangents...)`,
         // yielding one output tangent per primal output.
         let mut tangent_operands =
-            nondifferentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         tangent_operands.extend(forward_tail);
 
         // The rematerialize call takes every differentiated input tangent as a real operand, so materialize structural
@@ -418,9 +418,9 @@ where
 crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: Type);
 
 /// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
-/// axes, forward-tail residuals retain their natural axes, and the tangent region receives the nondifferentiated
+/// axes, forward-tail residuals retain their natural axes, and the tangent region receives the non-differentiated
 /// operands' axes, those residual axes, and the differentiated operands' tangent axes. Corresponding primal, forward,
-/// and tangent outputs are reconciled to one axis. The backward region receives the nondifferentiated, residual, and
+/// and tangent outputs are reconciled to one axis. The backward region receives the non-differentiated, residual, and
 /// reconciled output-cotangent axes, and mapped cotangents for replicated primal inputs are summed back to
 /// replication. Rebuilding all four regions keeps the rematerialization boundary and its `prevent_cse` policy intact
 /// without imposing a wrapper-wide axis position.
@@ -430,7 +430,7 @@ crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: T
 /// region back to the plain rematerialization region boundary, and any
 /// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
 /// first-class mapped extent) become additional leading
-/// [nondifferentiated](RematerializeOperation::nondifferentiated_count) operands of the batched call, which is
+/// [non-differentiated](RematerializeOperation::non_differentiated_count) operands of the batched call, which is
 /// precisely the operand role those bookkeeping values play: every region consumes them and none of them carries a
 /// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
@@ -445,7 +445,7 @@ where
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-        let (nondifferentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
+        let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let differentiated_axes = differentiated_axes.to_vec();
         let primal_region = driver.region(0)?;
         let forward_region = driver.region(1)?;
@@ -477,10 +477,10 @@ where
         let (forward_primal_output_axes, residual_axes) = forward_output_axes.split_at(primal_output_axes.len());
         let residual_axes = residual_axes.to_vec();
 
-        // The tangent region consumes the leading nondifferentiated operands and the exact forward tail, followed by
+        // The tangent region consumes the leading non-differentiated operands and the exact forward tail, followed by
         // one tangent per differentiated wrapper input. Its natural output axes participate in the same boundary
         // decision as the ordinary primal and forward-prefix outputs.
-        let tangent_input_axes = nondifferentiated_axes
+        let tangent_input_axes = non_differentiated_axes
             .iter()
             .chain(&residual_axes)
             .chain(&differentiated_axes)
@@ -528,11 +528,15 @@ where
             output_axes.as_slice(),
         )?;
 
-        // The backward region maps `(nondifferentiated..., forward_tail..., output_cotangents...)` to the
+        // The backward region maps `(non-differentiated..., forward_tail..., output_cotangents...)` to the
         // differentiated inputs' cotangents. Its structurally movable axes are aligned during batching; adaptation
         // sums a mapped cotangent when the corresponding primal input was replicated.
-        let backward_input_axes =
-            nondifferentiated_axes.iter().chain(&residual_axes).chain(&output_axes).copied().collect::<Vec<_>>();
+        let backward_input_axes = non_differentiated_axes
+            .iter()
+            .chain(&residual_axes)
+            .chain(&output_axes)
+            .copied()
+            .collect::<Vec<_>>();
         let batched_backward = driver.batch_program(
             context,
             backward_region,
@@ -552,11 +556,11 @@ where
         }
 
         let boundary_operands = P::boundary_operands(context.axis_extent());
-        let nondifferentiated_count = self.nondifferentiated_count + boundary_operands.len();
+        let non_differentiated_count = self.non_differentiated_count + boundary_operands.len();
         let mut packed_inputs = boundary_operands;
         packed_inputs.extend(inputs.iter().map(P::value).cloned());
         let outputs = context.parent().bind(
-            self.with_nondifferentiated_count(nondifferentiated_count),
+            self.with_non_differentiated_count(non_differentiated_count),
             vec![primal, forward, backward, tangent],
             packed_inputs.as_slice(),
         )?;
