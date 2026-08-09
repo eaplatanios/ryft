@@ -608,22 +608,29 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         matches!(self.interface, LinearCallInterface::TransposeOnly { .. })
     }
 
-    // TODO(eaplatanios): Do we really need this function?
-    /// Returns the input and output [`Type`]s of the unavailable forward map stored by the _transpose-only_ form, or
-    /// [`None`] for the _forward-and-transpose_ form, whose complete interface is derived from its attached `forward`
-    /// [`Region`](crate::Region) instead.
+    /// Maps this operation from type universe `T` into type universe `U` while preserving its interface form and
+    /// [`residual_count`](Self::residual_count). A _forward-and-transpose_ call stores no interface types and therefore
+    /// changes only its type parameter. A _transpose-only_ call applies `map` to every stored input and output type of
+    /// its unavailable forward map.
     ///
-    /// A transpose-only call cannot be reconstructed from its [`residual_count`](Self::residual_count) alone, so
-    /// rebuilding one in a different type universe (e.g., lifting it from [`ArrayType`](crate::ArrayType) into the
-    /// enclosing [`ArrayIrType`](crate::ArrayIrType) family) requires reading these types and mapping each of them
-    /// through the universes' own type conversion.
+    /// This operation is consuming so lifting a linear call into a composite type universe can move and map its stored
+    /// types without cloning them or exposing the private [`LinearCallInterface`] representation.
+    ///
+    /// # Parameters
+    ///
+    ///   - `map`: Function that converts each stored type from `T` into `U`.
     #[inline]
-    pub fn transpose_only_interface(&self) -> Option<(&[T], &[T])> {
-        match &self.interface {
-            LinearCallInterface::ForwardAndTranspose => None,
-            LinearCallInterface::TransposeOnly { input_types, output_types } => {
-                Some((input_types.as_slice(), output_types.as_slice()))
-            }
+    pub fn map_types<U: DifferentiableType, F: FnMut(T) -> U>(self, mut map: F) -> LinearCallOperation<U> {
+        LinearCallOperation {
+            residual_count: self.residual_count,
+            interface: match self.interface {
+                LinearCallInterface::ForwardAndTranspose => LinearCallInterface::ForwardAndTranspose,
+                LinearCallInterface::TransposeOnly { input_types, output_types } => {
+                    let input_types = input_types.into_iter().map(&mut map).collect();
+                    let output_types = output_types.into_iter().map(map).collect();
+                    LinearCallInterface::TransposeOnly { input_types, output_types }
+                }
+            },
         }
     }
 
@@ -1341,6 +1348,144 @@ mod tests {
     }
 
     #[test]
+    fn test_residual_zero_provider_captures_zero_residual_values() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let first = DimensionVariable::new("first", DimensionBounds::positive(Some(8)).unwrap());
+        let second = DimensionVariable::new("second", DimensionBounds::positive(Some(8)).unwrap());
+        let primal_type = ArrayType::new(
+            DataType::F8E8M0FNU,
+            Shape::new(vec![
+                Dimension::Dynamic(first.clone()),
+                Dimension::Dynamic(first.clone()),
+                Dimension::Dynamic(second.clone()),
+            ]),
+        );
+        let tangent_type = ArrayIrType::Array(primal_type.tangent());
+        let context = TestContext::new();
+        let primal = context.input(primal_type.into());
+
+        // The default bulk value capture resolves each declared residual through the singular hook. Distinct
+        // identities retain first-occurrence order, repeated identities share one residual, and the source may use a
+        // different element representation than the zero being constructed.
+        let residuals = TestOperation::capture_zero_residual_values(&context, &primal, &tangent_type).unwrap();
+        assert_eq!(
+            residuals.iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>(),
+            vec![ArrayIrType::Dimension(DimensionType::new(first)), ArrayIrType::Dimension(DimensionType::new(second)),],
+        );
+        let builder = context.builder().borrow();
+        let [first, second] = builder.instructions() else {
+            panic!("expected two dimension-size instructions");
+        };
+        assert!(matches!(first.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(second.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 2));
+        assert_eq!(residuals[0].atom_id(), Ok(first.outputs()[0]));
+        assert_eq!(residuals[1].atom_id(), Ok(second.outputs()[0]));
+    }
+
+    #[test]
+    fn test_residual_zero_provider_materializes_zero_from_residual_sources() {
+        // The boundary form of the residual protocol assembles a zero's runtime geometry from the values in scope,
+        // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
+        // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
+        // geometry is split across a first-class dimension operand and a per-iteration peer.
+
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
+        let context = TestContext::new();
+
+        // A live value is returned unchanged and stages nothing.
+        let live = context.input(ArrayType::scalar(DataType::F64).into());
+        let materialized =
+            TestOperation::materialize_zero_from_residual_sources(&context, MaybeZero::Value(live.clone()), &[])
+                .unwrap();
+        assert_eq!(materialized.atom_id().unwrap(), live.atom_id().unwrap());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // An identity-free type declares no residuals and keeps the nullary zero, consulting no source.
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
+        TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(static_type.clone().into()),
+            &[],
+        )
+        .unwrap();
+
+        // A widened differential representation: the `f32` tangent of an `f8e8m0fnu[k]` primal has no live value of
+        // its own type, yet the primal names the extent `k` and therefore supplies its geometry.
+        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(k.clone())]));
+        let narrow_primal = context.input(narrow_type.clone().into());
+        let widened_tangent_type = narrow_type.tangent();
+        assert_eq!(widened_tangent_type.data_type(), DataType::F32);
+        let widened = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(widened_tangent_type.clone().into()),
+            std::slice::from_ref(&narrow_primal),
+        )
+        .unwrap();
+        assert_eq!(widened.r#type().as_ref(), &ArrayIrType::Array(widened_tangent_type));
+
+        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length operand is a
+        // first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
+        let stacked_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k.clone())]),
+        );
+        let runtime_length = context.input(DimensionType::new(length.clone()).into());
+        let peer = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(k)])).into());
+        let stacked = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(stacked_type.clone().into()),
+            [&runtime_length, &peer],
+        )
+        .unwrap();
+        assert_eq!(stacked.r#type().as_ref(), &ArrayIrType::Array(stacked_type.clone()));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![stacked.atom_id().unwrap()],
+                vec![Placeholder; 4],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %2:f8e8m0fnu[k], %5:dimension<length \u{2208} [1, 8)>, %6:f64[k] .
+                let %1:f64[2] = zero [type=f64[2]]
+                    %3:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %2
+                    %4:f32[k] = zero [type=f32[k]] %3
+                    %7:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %6
+                    %8:f64[length, k] = zero [type=f64[length, k]] %5 %7
+                in (%8)
+            "}
+            .trim_end(),
+        );
+
+        // A named quantity that no candidate carries is a loud diagnostic rather than a wrong-shaped zero.
+        let error = TestOperation::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(stacked_type.into()),
+            std::slice::from_ref(&peer),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type f64[length, k] because no value in scope supplies the \
+                          runtime geometry dimension<length \u{2208} [1, 8)> that its residual 0 names"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
     fn test_zero_space_boundary_reconstruction_reconstructs_dynamic_zero() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let key_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)]));
@@ -1434,6 +1579,23 @@ mod tests {
         assert!(operation.is_transpose_only());
         assert_eq!(operation.to_string(), "transpose_only_linear_call [residual_count=1]");
         assert_eq!(operation.region_slots(), &[RegionSlot::rule("transpose")]);
+
+        // Mapping changes only the type universe: the executable form retains its marker-only interface, while the
+        // transpose-only form maps every stored input and output type without changing the residual boundary.
+        assert_eq!(
+            LinearCallOperation::<ArrayType>::new(2).map_types(ArrayIrType::Array),
+            LinearCallOperation::<ArrayIrType>::new(2),
+        );
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        assert_eq!(
+            LinearCallOperation::transpose_only(1, vec![scalar_type.clone()], vec![scalar_type.clone()])
+                .map_types(ArrayIrType::Array),
+            LinearCallOperation::transpose_only(
+                1,
+                vec![ArrayIrType::Array(scalar_type.clone())],
+                vec![ArrayIrType::Array(scalar_type)],
+            ),
+        );
 
         // The transpose-only form derives its transpose region's expected interface from the stored forward interface
         // through the cotangent type mapping, so it infers the stored output types whenever the attached region agrees.
@@ -2068,145 +2230,5 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
-    }
-
-    // TODO(eaplatanios): Is this test named and placed according to our conventions?
-    #[test]
-    fn test_residual_zero_provider_value_capture() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type TestOperation = ArrayIrOperation<Array>;
-
-        let first = DimensionVariable::new("first", DimensionBounds::positive(Some(8)).unwrap());
-        let second = DimensionVariable::new("second", DimensionBounds::positive(Some(8)).unwrap());
-        let primal_type = ArrayType::new(
-            DataType::F8E8M0FNU,
-            Shape::new(vec![
-                Dimension::Dynamic(first.clone()),
-                Dimension::Dynamic(first.clone()),
-                Dimension::Dynamic(second.clone()),
-            ]),
-        );
-        let tangent_type = ArrayIrType::Array(primal_type.tangent());
-        let context = TestContext::new();
-        let primal = context.input(primal_type.into());
-
-        // The default bulk value capture resolves each declared residual through the singular hook. Distinct
-        // identities retain first-occurrence order, repeated identities share one residual, and the source may use a
-        // different element representation than the zero being constructed.
-        let residuals = TestOperation::capture_zero_residual_values(&context, &primal, &tangent_type).unwrap();
-        assert_eq!(
-            residuals.iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>(),
-            vec![ArrayIrType::Dimension(DimensionType::new(first)), ArrayIrType::Dimension(DimensionType::new(second)),],
-        );
-        let builder = context.builder().borrow();
-        let [first, second] = builder.instructions() else {
-            panic!("expected two dimension-size instructions");
-        };
-        assert!(matches!(first.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
-        assert!(matches!(second.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 2));
-        assert_eq!(residuals[0].atom_id(), Ok(first.outputs()[0]));
-        assert_eq!(residuals[1].atom_id(), Ok(second.outputs()[0]));
-    }
-
-    // TODO(eaplatanios): Is this test named and placed according to our conventions?
-    #[test]
-    fn test_materialize_zero_from_residual_sources() {
-        // The boundary form of the residual protocol assembles a zero's runtime geometry from the values in scope,
-        // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
-        // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
-        // geometry is split across a first-class dimension operand and a per-iteration peer.
-
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type TestOperation = ArrayIrOperation<Array>;
-
-        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
-        let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
-        let context = TestContext::new();
-
-        // A live value is returned unchanged and stages nothing.
-        let live = context.input(ArrayType::scalar(DataType::F64).into());
-        let materialized =
-            TestOperation::materialize_zero_from_residual_sources(&context, MaybeZero::Value(live.clone()), &[])
-                .unwrap();
-        assert_eq!(materialized.atom_id().unwrap(), live.atom_id().unwrap());
-        assert!(context.builder().borrow().instructions().is_empty());
-
-        // An identity-free type declares no residuals and keeps the nullary zero, consulting no source.
-        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
-        TestOperation::materialize_zero_from_residual_sources(
-            &context,
-            MaybeZero::Zero(static_type.clone().into()),
-            &[],
-        )
-        .unwrap();
-
-        // A widened differential representation: the `f32` tangent of an `f8e8m0fnu[k]` primal has no live value of
-        // its own type, yet the primal names the extent `k` and therefore supplies its geometry.
-        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(k.clone())]));
-        let narrow_primal = context.input(narrow_type.clone().into());
-        let widened_tangent_type = narrow_type.tangent();
-        assert_eq!(widened_tangent_type.data_type(), DataType::F32);
-        let widened = TestOperation::materialize_zero_from_residual_sources(
-            &context,
-            MaybeZero::Zero(widened_tangent_type.clone().into()),
-            std::slice::from_ref(&narrow_primal),
-        )
-        .unwrap();
-        assert_eq!(widened.r#type().as_ref(), &ArrayIrType::Array(widened_tangent_type));
-
-        // The scan stacked-output geometry: no peer has the `f64[length, k]` type, but the runtime length operand is a
-        // first-class dimension that is reused directly and a per-iteration peer names `k` on its own axis `0`.
-        let stacked_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k.clone())]),
-        );
-        let runtime_length = context.input(DimensionType::new(length.clone()).into());
-        let peer = context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(k)])).into());
-        let stacked = TestOperation::materialize_zero_from_residual_sources(
-            &context,
-            MaybeZero::Zero(stacked_type.clone().into()),
-            [&runtime_length, &peer],
-        )
-        .unwrap();
-        assert_eq!(stacked.r#type().as_ref(), &ArrayIrType::Array(stacked_type.clone()));
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![stacked.atom_id().unwrap()],
-                vec![Placeholder; 4],
-                vec![Placeholder],
-            )
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %2:f8e8m0fnu[k], %5:dimension<length \u{2208} [1, 8)>, %6:f64[k] .
-                let %1:f64[2] = zero [type=f64[2]]
-                    %3:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %2
-                    %4:f32[k] = zero [type=f32[k]] %3
-                    %7:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %6
-                    %8:f64[length, k] = zero [type=f64[length, k]] %5 %7
-                in (%8)
-            "}
-            .trim_end(),
-        );
-
-        // A named quantity that no candidate carries is a loud diagnostic rather than a wrong-shaped zero.
-        let error = TestOperation::materialize_zero_from_residual_sources(
-            &context,
-            MaybeZero::Zero(stacked_type.into()),
-            std::slice::from_ref(&peer),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            ProgramError::UnsupportedOperation {
-                message: "cannot materialize a zero of type f64[length, k] because no value in scope supplies the \
-                          runtime geometry dimension<length \u{2208} [1, 8)> that its residual 0 names"
-                    .to_string(),
-            },
-        );
     }
 }

@@ -334,20 +334,9 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
             ArrayOperation::CustomVjp(operation) => Self::CustomVjp(
                 CustomVjpOperation::new().with_non_differentiated_count(operation.non_differentiated_count()),
             ),
-            // The executable linear-call form is fully described by its residual count. The transpose-only form
-            // additionally stores its unavailable forward map's member interface types, which lift one by one into the
-            // composite universe, so both forms reach the composite carrier that owns the extent-threaded region rule.
-            ArrayOperation::LinearCall(operation) => {
-                let residual_count = operation.residual_count();
-                Self::LinearCall(match operation.transpose_only_interface() {
-                    None => LinearCallOperation::new(residual_count),
-                    Some((input_types, output_types)) => LinearCallOperation::transpose_only(
-                        residual_count,
-                        input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-                        output_types.iter().cloned().map(ArrayIrType::Array).collect(),
-                    ),
-                })
-            }
+            // The executable form stores no types. The transpose-only form maps its unavailable forward interface into
+            // the composite universe, so both reach the carrier that owns the extent-threaded region rule.
+            ArrayOperation::LinearCall(operation) => Self::LinearCall(operation.map_types(ArrayIrType::Array)),
             ArrayOperation::Rematerialize(operation) => Self::Rematerialize(
                 RematerializeOperation::new()
                     .with_prevent_cse(operation.prevent_cse())
@@ -1435,8 +1424,12 @@ mod tests {
             panic!("expected a promoted composite linear call");
         };
         assert_eq!(
-            promoted.transpose_only_interface(),
-            Some(([ArrayIrType::Array(scalar_type.clone())].as_slice(), [ArrayIrType::Array(scalar_type)].as_slice())),
+            promoted,
+            LinearCallOperation::transpose_only(
+                1,
+                vec![ArrayIrType::Array(scalar_type.clone())],
+                vec![ArrayIrType::Array(scalar_type)],
+            ),
         );
     }
 
