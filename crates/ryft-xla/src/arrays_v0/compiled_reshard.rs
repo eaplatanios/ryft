@@ -132,6 +132,7 @@ fn try_same_mesh<'o>(
         out_shardings: Some(vec![dst_sharding.clone()]),
         donation_flags: Some(vec![donate]),
         feedback_directed_profile: None,
+        input_bound_bucketing: None,
     };
 
     let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =

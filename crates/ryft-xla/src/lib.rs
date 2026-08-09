@@ -17,8 +17,8 @@ pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
 pub use experimental::domains::{
-    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
-    XlaOptimizedProgram, XlaOptions,
+    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
+    XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions,
 };
 pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{

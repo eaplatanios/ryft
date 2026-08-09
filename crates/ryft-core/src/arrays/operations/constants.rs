@@ -576,10 +576,19 @@ mod tests {
     }
 
     impl CompilationDomain for RetainedJitDomain {
+        type DispatchKey = Vec<ArrayIrType>;
         type LoweredProgram = FlatCompilationProgram<Self>;
         type CompiledProgram = FlatCompilationProgram<Self>;
         type Options = RetainedJitOptions;
         type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayIrType>,
+            _options: &Self::Options,
+        ) -> Result<(Self::DispatchKey, Vec<ArrayIrType>), Self::Error> {
+            Ok((input_types.clone(), input_types))
+        }
 
         fn stage<Request>(
             &self,

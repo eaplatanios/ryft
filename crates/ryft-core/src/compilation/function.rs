@@ -351,10 +351,10 @@ impl JitCacheStatisticsState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct JitCacheKey<T, Static> {
+struct JitCacheKey<Dispatch, Static> {
     static_parameters: Static,
     input_paths: Vec<ParameterPath>,
-    input_types: Vec<T>,
+    dispatch: Dispatch,
 }
 
 /// Default number of compiled specializations retained by one [`JittedFunction`].
@@ -1043,10 +1043,10 @@ struct JittedFunctionState<
     domain: D,
     function: F,
     options: D::Options,
-    traces: RefCell<LruCache<JitCacheKey<D::Type, Static>, StagedFunction<D, Input, Output>>>,
-    lowerings: RefCell<LruCache<JitCacheKey<D::Type, Static>, LoweredFunction<D, Input, Output>>>,
-    specializations: RefCell<LruCache<JitCacheKey<D::Type, Static>, CompiledFunction<D, Input, Output>>>,
-    in_flight: RefCell<HashSet<JitCacheKey<D::Type, Static>>>,
+    traces: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, StagedFunction<D, Input, Output>>>,
+    lowerings: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, LoweredFunction<D, Input, Output>>>,
+    specializations: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, CompiledFunction<D, Input, Output>>>,
+    in_flight: RefCell<HashSet<JitCacheKey<D::DispatchKey, Static>>>,
     statistics: JitCacheStatisticsState,
 }
 
@@ -1216,7 +1216,8 @@ where
         let abstractification_start = Instant::now();
         let input_paths = inputs.parameter_paths().collect::<Vec<_>>();
         let input_structure = inputs.parameter_structure();
-        let input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let (dispatch, input_types) = self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
         let input_types = Input::from_parameters(input_structure, input_types)
             .map_err(|error| D::Error::from(ProgramError::from(error)))?;
         let abstractification_duration = abstractification_start.elapsed();
@@ -1224,11 +1225,7 @@ where
             &self.state.statistics.input_abstractification_duration_ns,
             abstractification_duration,
         );
-        let key = JitCacheKey {
-            static_parameters: static_parameters.clone(),
-            input_paths,
-            input_types: input_types.parameters().cloned().collect(),
-        };
+        let key = JitCacheKey { static_parameters: static_parameters.clone(), input_paths, dispatch };
 
         let dispatch_start = Instant::now();
         if let Some(compiled) = self.state.specializations.borrow_mut().get(&key).cloned() {
@@ -1604,10 +1601,19 @@ mod tests {
     }
 
     impl CompilationDomain for TestDomain {
+        type DispatchKey = Vec<ArrayType>;
         type LoweredProgram = TestLoweredProgram;
         type CompiledProgram = TestCompiledProgram;
         type Options = TestOptions;
         type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayType>,
+            _options: &Self::Options,
+        ) -> Result<(Self::DispatchKey, Vec<ArrayType>), Self::Error> {
+            Ok((input_types.clone(), input_types))
+        }
 
         fn stage<Request>(
             &self,

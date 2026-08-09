@@ -35,6 +35,9 @@ use super::function::{
 /// passive values. Each method owns its complete backend-specific transition, including any validation, caching, or
 /// runtime conversion policy the backend chooses to apply.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
+    /// Backend-defined key for one retained-JIT input specialization.
+    type DispatchKey: Clone + Eq + Hash;
+
     /// Backend-specific lowered program representation produced by [`Self::lower`].
     type LoweredProgram;
 
@@ -48,6 +51,17 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Backend-specific error type. Staging and call-boundary errors flow through it as [`ProgramError`]s and
     /// that is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
+
+    /// Derives the effective staged input types and their retained-JIT cache key from one runtime input signature.
+    ///
+    /// Most domains return the input types unchanged and use them as the key. Backends may instead apply a
+    /// semantics-preserving dispatch policy such as bounded-shape bucketing. The returned key must compare equal
+    /// exactly when the returned effective types are interchangeable for tracing, lowering, compilation, and calls.
+    fn dispatch_signature(
+        &self,
+        input_types: Vec<Self::Type>,
+        options: &Self::Options,
+    ) -> Result<(Self::DispatchKey, Vec<Self::Type>), Self::Error>;
 
     /// Traces a fallible function with explicit runtime captures and their symbolic references.
     ///
@@ -1256,10 +1270,19 @@ mod tests {
     }
 
     impl CompilationDomain for TestDomain {
+        type DispatchKey = Vec<ArrayType>;
         type LoweredProgram = Vec<ArrayType>;
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
         type Error = ProgramError;
+
+        fn dispatch_signature(
+            &self,
+            input_types: Vec<ArrayType>,
+            _options: &Self::Options,
+        ) -> Result<(Self::DispatchKey, Vec<ArrayType>), Self::Error> {
+            Ok((input_types.clone(), input_types))
+        }
 
         fn stage<Request>(
             &self,

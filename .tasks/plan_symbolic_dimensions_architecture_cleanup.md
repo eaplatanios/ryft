@@ -200,17 +200,17 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
       dynamism through the existing bounded-input ABI, `set_dimension_size`, and `PadToStatic`; or (b) fully static
       bound-shaped StableHLO plus explicit Ryft-generated masks. Prototype (a) first because the ABI exists; record
       CPU and CUDA coverage evidence before committing, and fall back to (b) per backend rather than globally.
-- [ ] Require a finite upper bound at the gateway for any program that reaches compilation; reject unbounded
+- [x] Require a finite upper bound at the gateway for any program that reaches compilation; reject unbounded
       data-derived dimensions at lowering with an exact diagnostic naming the variable and its bounds.
-- [ ] Complete the per-operation padding-discipline inventory started in archive Phase 7 and record it here as the
+- [x] Complete the per-operation padding-discipline inventory started in archive Phase 7 and record it here as the
       authoritative table: padding-oblivious (elementwise, reshape-within-bounds), mask-required (reductions,
       argmin/argmax, cumulative and windowed operations), or zero-padding-required (contractions, convolutions).
-- [ ] Implement the padding rules for the supported operation matrix so padding garbage is unobservable in results.
+- [x] Implement the padding rules for the supported operation matrix so padding garbage is unobservable in results.
       Every unclassified or unsupported operation must reject lowering of data-derived extents with an exact
       diagnostic naming the operation; silent truncation or garbage propagation is an abort criterion.
 - [ ] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
       Phase 4 fixtures, proving one compiled specialization serves multiple runtime extents.
-- [ ] Add a dispatch-time bound-bucketing policy for *input-derived* extents as pure retained-JIT policy: round the
+- [x] Add a dispatch-time bound-bucketing policy for *input-derived* extents as pure retained-JIT policy: round the
       host-observed extent up to a bucket (e.g., logarithmically spaced), compile one specialization per bucketed
       bound, and pad inputs to the bucket, with the bucket participating in cache identity. Bounds padding waste at
       the bucket ratio in exchange for log-many compilations; no new semantics. Gateway-split bucketing for
@@ -220,6 +220,43 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
       unobservable in every supported operation's results, unsupported operations fail before execution with exact
       diagnostics, and the route decision is recorded with its measured evidence. This gate also closes the tier-3
       verification row "every operation without data-dependent lowering support fails with an exact diagnostic".
+
+### Phase 5 padding-discipline inventory
+
+The implementation keeps this inventory exhaustive over both `ArrayOperation` and `XlaOperation`; adding a variant to
+either enum now requires an explicit classification before `ryft-xla` compiles.
+
+| Discipline | Operations | Owner |
+| --- | --- | --- |
+| Padding-oblivious | Constructors; elementwise arithmetic, logical, comparison, selection, and conversion operations; shape-preserving and shape-rearranging operations; proven-bounded dynamic shape slices; control flow and pure nested-call carriers; placement metadata | StableHLO/XLA dynamic-dimension propagation; dynamic shape slice uses a Ryft bounded `dynamic_slice` + static stride + `set_dimension_size` fallback because XLA rejects `real_dynamic_slice` |
+| Mask-required | `reduce`, `sort`, and their decomposed higher-level consumers such as argmin/argmax | XLA's bounded-dynamic legalizer inserts identity/sentinel masking |
+| Zero-padding-required | `dot`, `scaled_dot`, and dot-product-attention forward/backward contractions | XLA's bounded-dynamic legalizer prevents physical padding lanes from contributing to contractions |
+| Unsupported/opaque | `custom_call`, `print`, `rng_bit_generator`, and `shard_map` when their boundary references a data-derived identity | Ryft rejects before MLIR construction with an operation-named diagnostic; these boundaries cannot safely infer logical padding semantics |
+
+### Phase 5 review (2026-08-09)
+
+- Selected native XLA bounded dynamism as the implementation route on CPU. One compiled executable produced exact
+  logical results at extents 2 and 4 for dynamic iota, descending sort, sum reduction, inner-product contraction, and
+  the Phase 4 data-dependent prefix-slice fixture. The prefix slice exposed that the pinned XLA translator rejects
+  `stablehlo.real_dynamic_slice`, so Ryft now uses a proof-gated supported fallback composed from ordinary
+  `dynamic_slice`, static striding, and result-size refinement.
+- Added a pre-lowering provenance closure over identities born from `dimension_from_scalar`. It rejects an unbounded
+  gateway as ``data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound for XLA compilation``
+  and rejects opaque consumers before MLIR construction, naming the operation.
+- Added `CompilationDomain::dispatch_signature` so a backend can choose effective staged types and a retained-dispatch
+  key without leaking backend policy into generic JIT machinery. `XlaInputBoundBucketing::PowerOfTwo` converts
+  host-observed static input axes to bounded-dynamic axes, routes equal buckets to one alpha-normalized dispatch key,
+  and reuses the existing bounded-input materialization path. Extents 3 and 4 share one specialization; extent 5 uses
+  the next bucket (two traces, lowerings, compilations, and specializations across three calls).
+- CPU verification is green: all 1,208 `ryft-core` library tests and all 452 runnable `ryft-xla` library tests pass
+  (one timing-sensitive XLA test is ignored). The four data-derived compiled tests, both dynamic-shape-slice execution
+  tests, the bucketing test, and the pinned JAX prefix-take boundary fixture pass. The first core run exposed one stale
+  batching-error expectation after the Phase 4 diagnostic cleanup; the duplicated `axis` wording and its expectation
+  are corrected, and the complete rerun passes.
+- CUDA source coverage extends the existing bounded-dynamic CUDA-13 test with the device-born gateway, dynamic
+  broadcast, masked reduction, two runtime extents, and one retained specialization. Final accelerator execution is
+  still pending: Tailscale reports `sparky` offline (last seen two days ago), `.local` resolution fails, and its prior
+  LAN address times out. The two CUDA-dependent checkboxes above remain deliberately open until that exact test runs.
 
 ## Phase 6: ragged batching for data-dependent extents (archive Phase 14)
 

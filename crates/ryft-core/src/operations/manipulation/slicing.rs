@@ -103,9 +103,10 @@ pub struct SliceOperation {
 /// shape is defined directly by the size operands, so bounded-dynamic slices retain exact runtime geometry without
 /// storing identities or values in the operation payload. The strides are static, positive operation parameters.
 /// Every start and size is nonnegative and execution requires the final selected element on each nonempty axis,
-/// `start + (size - 1) * stride`, to lie within the corresponding input axis. XLA lowers this operation through
-/// `stablehlo.real_dynamic_slice`; [`DynamicSliceOperation`] remains the convenient form for scalar-array starts and
-/// statically known slice sizes.
+/// `start + (size - 1) * stride`, to lie within the corresponding input axis. XLA lowers statically proven bounded
+/// cases through an ordinary `stablehlo.dynamic_slice`, a static strided slice when needed, and dynamic result-size
+/// refinement; [`DynamicSliceOperation`] remains the convenient form for scalar-array starts and statically known
+/// slice sizes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicShapeSliceOperation {
     /// Static stride applied along each sliced axis.

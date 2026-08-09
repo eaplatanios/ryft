@@ -5288,11 +5288,7 @@ mod tests {
                 axis: BatchAxis::new(0),
             },
         );
-        assert_eq!(
-            error.to_string(),
-            "dimension type dimension<gateway ∈ [0, 9)> cannot carry mapped axis 0 because ragged batching is \
-             deferred to Phase 6",
-        );
+        assert_eq!(error.to_string(), "dimension type dimension<gateway ∈ [0, 9)> cannot carry mapped batch axis 0");
         assert_eq!(
             gateway_operation.batch(&context, &EmptyRegionDriver, &[]),
             Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),

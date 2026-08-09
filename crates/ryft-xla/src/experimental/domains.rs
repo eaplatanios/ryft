@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -11,15 +11,15 @@ use std::time::{Duration, Instant};
 use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayType, BatchingError, BindingRegionDriver, CallRequest,
-    CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest, Constant, ConstantOperation,
-    Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension, DimensionBounds,
-    DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue, DimensionVariable,
-    DiskCache, Domain, DomainTracer, EagerContext, InterpretableOperation, InterpretationDriver, Layout, LogicalMesh,
-    LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, Parameterized, Placeholder,
-    ProgramError, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile,
-    TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
-    ZeroOperationProvider,
+    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BatchingError,
+    BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
+    Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
+    DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
+    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, InterpretableOperation, InterpretationDriver,
+    Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, Parameterized,
+    Placeholder, ProgramError, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StaticShape,
+    StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection,
+    ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as ReferenceArray, ProjectedContext};
@@ -992,9 +992,36 @@ impl XlaFeedbackDirectedProfile {
     }
 }
 
+/// Host-side policy for grouping concrete input extents into bounded retained-JIT specializations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum XlaInputBoundBucketing {
+    /// Rounds each host-observed positive axis extent up to the next power of two. The resulting dynamic type admits
+    /// extents through that bucket, bounding padding overhead below two times the logical extent while retaining only
+    /// logarithmically many compiled specializations.
+    PowerOfTwo,
+}
+
+/// Opaque retained-JIT specialization key derived by [`XlaDomain`].
+///
+/// Exact dispatch preserves nominal [`DimensionVariable`] identity. Dispatch with input-bound bucketing instead uses
+/// an alpha-normalized physical-bound signature so calls routed to the same bucket share one staged and compiled
+/// specialization.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct XlaDispatchKey(XlaDispatchKeyKind);
+
+/// Internal representation of [`XlaDispatchKey`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum XlaDispatchKeyKind {
+    /// Exact runtime abstract signature used when bucketing is disabled.
+    Exact(Vec<ArrayIrType>),
+
+    /// Canonical serialized bounded signature used when bucketing is enabled.
+    Bucketed(Vec<u8>),
+}
+
 /// Backend-specific per-call options for the [`CompilationDomain`] implementation on
 /// [`XlaDomain`]. Carries the device mesh, optional sharding overrides for inputs/outputs,
-/// and optional per-input donation flags.
+/// optional per-input donation flags, and retained-dispatch policies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XlaOptions {
     /// Concrete device mesh the compiled program runs against.
@@ -1012,13 +1039,23 @@ pub struct XlaOptions {
 
     /// Optional opaque feedback-directed optimization profile forwarded to XLA.
     pub feedback_directed_profile: Option<XlaFeedbackDirectedProfile>,
+
+    /// Optional host-side bound bucketing policy for retained-JIT input signatures.
+    pub input_bound_bucketing: Option<XlaInputBoundBucketing>,
 }
 
 impl XlaOptions {
     /// Constructs default options for `mesh` with no shardings overrides and no donation.
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
-        Self { mesh, in_shardings: None, out_shardings: None, donation_flags: None, feedback_directed_profile: None }
+        Self {
+            mesh,
+            in_shardings: None,
+            out_shardings: None,
+            donation_flags: None,
+            feedback_directed_profile: None,
+            input_bound_bucketing: None,
+        }
     }
 
     /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
@@ -1064,6 +1101,19 @@ impl XlaOptions {
         self.feedback_directed_profile = Some(profile);
         self
     }
+
+    /// Enables host-side retained-JIT input-bound bucketing.
+    ///
+    /// Static runtime array axes become bounded-dynamic axes in the staged signature, with bounds selected by
+    /// `bucketing`. The observed extent remains entirely host-side, participates in dispatch identity only through its
+    /// bucket, and is transported through the existing bounded-input ABI. Data-derived extents created inside the
+    /// program are deliberately unaffected because observing them here would require a device-to-host synchronization
+    /// and a split compilation boundary.
+    #[inline]
+    pub fn with_input_bound_bucketing(mut self, bucketing: XlaInputBoundBucketing) -> Self {
+        self.input_bound_bucketing = Some(bucketing);
+        self
+    }
 }
 
 impl std::hash::Hash for XlaOptions {
@@ -1076,6 +1126,7 @@ impl std::hash::Hash for XlaOptions {
         self.out_shardings.hash(state);
         self.donation_flags.hash(state);
         self.feedback_directed_profile.hash(state);
+        self.input_bound_bucketing.hash(state);
     }
 }
 
@@ -2147,10 +2198,59 @@ impl<'c> XlaDomain<'c> {
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
+    type DispatchKey = XlaDispatchKey;
     type LoweredProgram = XlaLoweredProgram;
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
+
+    fn dispatch_signature(
+        &self,
+        input_types: Vec<ArrayIrType>,
+        options: &Self::Options,
+    ) -> Result<(Self::DispatchKey, Vec<ArrayIrType>), Self::Error> {
+        let Some(bucketing) = options.input_bound_bucketing else {
+            return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
+        };
+        let mut bucketed_array_types = Vec::with_capacity(input_types.len());
+        for (input_index, r#type) in input_types.iter().enumerate() {
+            let array_type = <&ArrayType>::try_from(r#type).map_err(ProgramError::from)?;
+            let dimensions = array_type
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(|(axis, dimension)| match dimension {
+                    Dimension::Static(extent) => {
+                        let bound = match bucketing {
+                            XlaInputBoundBucketing::PowerOfTwo => extent.checked_next_power_of_two(),
+                        }
+                        .and_then(|bound| bound.checked_add(1))
+                        .ok_or_else(|| ProgramError::InvalidArgument {
+                            message: format!(
+                                "cannot select a finite input-bound bucket for input {input_index} axis {axis} with \
+                                 extent {extent}",
+                            ),
+                        })?;
+                        let bounds = DimensionBounds::new(0, Some(bound))?;
+                        Ok(Dimension::Dynamic(DimensionVariable::new(
+                            format!("input_{input_index}_axis_{axis}"),
+                            bounds,
+                        )))
+                    }
+                    Dimension::Dynamic(variable) => Ok(Dimension::Dynamic(variable.clone())),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
+        }
+        let input_types = bucketed_array_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>();
+        let canonical = PersistentArraySignatureV3::encode(bucketed_array_types.as_slice(), &[]).into_canonical();
+        let key = serde_json::to_vec(&canonical).map_err(|error| ProgramError::InvalidArgument {
+            message: format!("failed to encode the XLA retained-dispatch signature: {error}"),
+        })?;
+        Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types))
+    }
+
     fn stage<Request>(
         &self,
         mut request: Request,
@@ -2242,6 +2342,7 @@ impl<'c> XlaDomain<'c> {
         capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        validate_data_dependent_compilation(program)?;
         let input_types = program.input_types();
         if capture_count > input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
@@ -2880,6 +2981,225 @@ fn contains_shard_map(program: &FlatXlaProgram) -> bool {
             .iter()
             .any(|instruction| matches!(instruction.operation(), XlaOperation::ShardMap(_)))
     })
+}
+
+/// Padding discipline used by XLA's bounded-dynamic legalization for one staged operation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DataDependentPaddingDiscipline {
+    /// The operation preserves logical dynamic dimensions without inspecting padding lanes.
+    Oblivious,
+
+    /// XLA must mask padding lanes with the operation's identity or ordering sentinel.
+    Masked,
+
+    /// XLA must zero padding lanes before an operation that combines values across an extent.
+    ZeroPadded,
+
+    /// The operation crosses an opaque boundary whose padding semantics Ryft cannot verify.
+    Unsupported,
+}
+
+/// Classifies every homogeneous array operation by the padding discipline required for data-derived dimensions.
+/// Keeping this match exhaustive makes a newly added operation a compile-time inventory update rather than silently
+/// assuming that arbitrary padding is safe.
+fn array_data_dependent_padding_discipline(
+    operation: &ArrayOperation<crate::experimental::ops::XlaArrayConstant>,
+) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::{Masked, Oblivious, Unsupported, ZeroPadded};
+
+    match operation {
+        ArrayOperation::Reduce(_) | ArrayOperation::Sort(_) => Masked,
+        ArrayOperation::Dot(_)
+        | ArrayOperation::ScaledDot(_)
+        | ArrayOperation::DotProductAttention(_)
+        | ArrayOperation::DotProductAttentionBackward(_) => ZeroPadded,
+        ArrayOperation::RngBitGenerator(_) | ArrayOperation::CustomCall(_) | ArrayOperation::Print(_) => Unsupported,
+        ArrayOperation::Zero(_)
+        | ArrayOperation::ZeroLike(_)
+        | ArrayOperation::One(_)
+        | ArrayOperation::OneLike(_)
+        | ArrayOperation::Constant(_)
+        | ArrayOperation::Iota(_)
+        | ArrayOperation::CoordinateBasis(_)
+        | ArrayOperation::Abs(_)
+        | ArrayOperation::Neg(_)
+        | ArrayOperation::Add(_)
+        | ArrayOperation::Sub(_)
+        | ArrayOperation::Mul(_)
+        | ArrayOperation::Div(_)
+        | ArrayOperation::Sin(_)
+        | ArrayOperation::Cos(_)
+        | ArrayOperation::Atan2(_)
+        | ArrayOperation::Exp(_)
+        | ArrayOperation::Log(_)
+        | ArrayOperation::Sqrt(_)
+        | ArrayOperation::Rsqrt(_)
+        | ArrayOperation::Tanh(_)
+        | ArrayOperation::Logistic(_)
+        | ArrayOperation::Erf(_)
+        | ArrayOperation::Pow(_)
+        | ArrayOperation::Sign(_)
+        | ArrayOperation::Floor(_)
+        | ArrayOperation::Ceil(_)
+        | ArrayOperation::Round(_)
+        | ArrayOperation::Max(_)
+        | ArrayOperation::Min(_)
+        | ArrayOperation::Rem(_)
+        | ArrayOperation::Not(_)
+        | ArrayOperation::And(_)
+        | ArrayOperation::Or(_)
+        | ArrayOperation::Xor(_)
+        | ArrayOperation::Complex(_)
+        | ArrayOperation::Conjugate(_)
+        | ArrayOperation::Real(_)
+        | ArrayOperation::Imaginary(_)
+        | ArrayOperation::Collective(_)
+        | ArrayOperation::AllGather(_)
+        | ArrayOperation::PSumScatter(_)
+        | ArrayOperation::Ppermute(_)
+        | ArrayOperation::AllToAll(_)
+        | ArrayOperation::AxisIndex(_)
+        | ArrayOperation::Transpose(_)
+        | ArrayOperation::Reshape(_)
+        | ArrayOperation::Broadcast(_)
+        | ArrayOperation::Pad(_)
+        | ArrayOperation::Concatenate(_)
+        | ArrayOperation::Gather(_)
+        | ArrayOperation::Scatter(_)
+        | ArrayOperation::Slice(_)
+        | ArrayOperation::UpdateSlice(_)
+        | ArrayOperation::DynamicSlice(_)
+        | ArrayOperation::DynamicUpdateSlice(_)
+        | ArrayOperation::Compare(_)
+        | ArrayOperation::Select(_)
+        | ArrayOperation::Condition(_)
+        | ArrayOperation::While(_)
+        | ArrayOperation::Scan(_)
+        | ArrayOperation::ConvertElementType(_)
+        | ArrayOperation::TransferToMemory(_)
+        | ArrayOperation::Reshard(_)
+        | ArrayOperation::ShardingConstraint(_)
+        | ArrayOperation::StopGradient(_)
+        | ArrayOperation::Tag(_)
+        | ArrayOperation::Rematerialize(_)
+        | ArrayOperation::CustomJvp(_)
+        | ArrayOperation::CustomVjp(_)
+        | ArrayOperation::LinearCall(_) => Oblivious,
+    }
+}
+
+/// Classifies every XLA operation by the bounded-dynamic padding discipline it requires.
+fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentPaddingDiscipline {
+    use DataDependentPaddingDiscipline::{Oblivious, Unsupported};
+
+    match operation {
+        XlaOperation::Array(operation) => array_data_dependent_padding_discipline(operation),
+        XlaOperation::RngBitGenerator(_) | XlaOperation::CustomCall(_) | XlaOperation::ShardMap(_) => Unsupported,
+        XlaOperation::Zero(_)
+        | XlaOperation::DynamicOne(_)
+        | XlaOperation::DynamicIota(_)
+        | XlaOperation::Dimension(_)
+        | XlaOperation::Compare(_)
+        | XlaOperation::DimensionSize(_)
+        | XlaOperation::DimensionFromScalar(_)
+        | XlaOperation::DimensionToScalar(_)
+        | XlaOperation::Reshape(_)
+        | XlaOperation::Broadcast(_)
+        | XlaOperation::Concatenate(_)
+        | XlaOperation::Pad(_)
+        | XlaOperation::DynamicShapeSlice(_)
+        | XlaOperation::AllGather(_)
+        | XlaOperation::PSumScatter(_)
+        | XlaOperation::AllToAll(_)
+        | XlaOperation::Condition(_)
+        | XlaOperation::While(_)
+        | XlaOperation::Scan(_)
+        | XlaOperation::CustomJvp(_)
+        | XlaOperation::CustomVjp(_)
+        | XlaOperation::LinearCall(_)
+        | XlaOperation::Rematerialize(_)
+        | XlaOperation::JitCall(_) => Oblivious,
+    }
+}
+
+/// Returns whether `r#type` carries an identity derived from `dimension_from_scalar`.
+fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<DimensionVariable>) -> bool {
+    r#type.identities().any(|(_, identity)| variables.contains(identity))
+}
+
+/// Validates the bounded-dynamic compilation contract for dimensions produced by `dimension_from_scalar`.
+///
+/// XLA owns the concrete masking and zero-padding rewrites for operations in the supported inventory above. Ryft
+/// rejects unbounded gateways and opaque consumers before MLIR construction so no backend can silently expose physical
+/// padding or truncate the logical result.
+fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), XlaDomainError> {
+    let mut variables = HashSet::new();
+    for region in program.regions() {
+        for instruction in region.instructions() {
+            if let XlaOperation::DimensionFromScalar(operation) = instruction.operation() {
+                let variable = operation.result_type().variable();
+                if variable.bounds().upper().is_none() {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "data-derived dimension `{variable}` with bounds {} needs a finite upper bound for XLA \
+                             compilation",
+                            variable.bounds(),
+                        ),
+                    }
+                    .into());
+                }
+                variables.insert(variable.clone());
+            }
+        }
+    }
+    if variables.is_empty() {
+        return Ok(());
+    }
+
+    // Dimension arithmetic produces fresh identities, so close the data-derived set transitively over dimension-typed
+    // instruction outputs before classifying the array operations that consume those identities.
+    loop {
+        let count = variables.len();
+        for region in program.regions() {
+            for instruction in region.instructions() {
+                if !instruction.inputs().iter().any(|input| {
+                    references_data_derived_dimension(region.atoms()[input.index()].r#type().as_ref(), &variables)
+                }) {
+                    continue;
+                }
+                for output in instruction.outputs() {
+                    if let ArrayIrType::Dimension(r#type) = region.atoms()[output.index()].r#type().as_ref() {
+                        variables.insert(r#type.variable().clone());
+                    }
+                }
+            }
+        }
+        if variables.len() == count {
+            break;
+        }
+    }
+
+    for region in program.regions() {
+        for instruction in region.instructions() {
+            let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
+                references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
+            });
+            if consumes_data_derived_extent
+                && data_dependent_padding_discipline(instruction.operation())
+                    == DataDependentPaddingDiscipline::Unsupported
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{}` cannot consume data-derived dimensions during XLA lowering because its \
+                         physical-padding semantics are opaque",
+                        instruction.operation().name(),
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Overlays the selected multi-device execution mode on the base [`CompilationOptions`] template. Static programs
@@ -3569,14 +3889,17 @@ fn execute_pjrt_buffers<'c>(
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use ryft_core::operations::custom_call::CustomCallOperation;
+    use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
-        ComparisonDirection, CompilationTracer, ConditionOperation, ConstantOperation, Dimension,
-        DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation,
-        DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-        DivOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
-        JittedFunction, MulOperation, NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind,
-        SelectOperation, Sharding, ShardingDimension, StaticShape, WhileOperation, try_jit_with_options,
+        ComparisonDirection, CompilationTracer, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+        Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
+        DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
+        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
+        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation, JittedFunction, MulOperation,
+        NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, SelectOperation, Sharding,
+        ShardingDimension, StaticShape, WhileOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -4425,6 +4748,24 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     #[test]
     fn test_cuda_13_plugin_executes_bounded_dynamic_program_at_two_sizes() {
+        fn trace_data_derived<'c>(
+            extent: DimensionVariable,
+            inputs: Vec<CompilationTracer<XlaDomain<'c>>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            let [size, value] = inputs.as_slice() else {
+                return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
+            };
+            let dimension = size.to_dimension(extent)?;
+            let broadcast = size
+                .context()
+                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[value.clone(), dimension])?
+                .remove(0);
+            Ok(size
+                .context()
+                .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[broadcast])?
+                .remove(0))
+        }
+
         let plugin = load_cuda_13_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::GPU(GpuClientOptions {
@@ -4479,6 +4820,32 @@ mod tests {
                 assert_eq!(domain.cache_size(), 1, "executing a loaded executable must not trigger recompilation");
             }
         }
+
+        // The same plugin route also accepts an extent born from device data inside the program. The gateway's
+        // ordered bounds assertion and the reduction's dynamic masking both survive compilation, and the scalar input
+        // values select different logical extents without producing another retained specialization.
+        let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
+        let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
+        let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let function: JittedFunction<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = try_jit_with_options(
+            &domain,
+            move |(), inputs| trace_data_derived(extent.clone(), inputs),
+            XlaOptions::new(mesh.clone()),
+        );
+        let call = |size: i64| {
+            let size =
+                Array::from_host_buffer(&client, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            let value =
+                Array::from_host_buffer(&client, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)]).unwrap()
+        };
+        assert_eq!(read_f32s(&client, program_array(&call(4))), vec![8.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(7))), vec![14.0]);
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().dispatch_misses, 1);
+        assert_eq!(function.statistics().dispatch_hits, 1);
     }
 
     #[test]
@@ -4520,7 +4887,9 @@ mod tests {
             .unwrap();
 
         let lowering = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        assert!(lowering.stable_hlo().contains("stablehlo.real_dynamic_slice"));
+        assert!(lowering.stable_hlo().contains("stablehlo.dynamic_slice"));
+        assert!(lowering.stable_hlo().contains("stablehlo.slice"));
+        assert!(!lowering.stable_hlo().contains("stablehlo.real_dynamic_slice"));
         let compiled = domain.compile_xla_program(&lowering).unwrap();
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
@@ -5286,6 +5655,215 @@ mod tests {
         assert_eq!(statistics.compilation_requests, 1);
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(domain.cache_size(), 1);
+    }
+
+    #[test]
+    fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+
+        // Iota is padding-oblivious, sort and sum require masked padding, and the inner product requires zero padding.
+        // Returning all three results makes any leaked bound-shaped lane observable.
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let iota = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .unwrap()[0];
+        let sorted = builder
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota])
+            .unwrap()[0];
+        let sum = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota])
+            .unwrap()[0];
+        let dot = builder
+            .add_instruction(DotOperation::new(DotDimensionNumbers::inner_product()), Vec::new(), vec![iota, iota])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sorted, sum, dot],
+                vec![Placeholder],
+                vec![Placeholder, Placeholder, Placeholder],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let execute = |size: i64| {
+            let input =
+                Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
+                    .unwrap();
+            domain.execute_xla_program(&compiled, vec![input]).unwrap()
+        };
+
+        let small = execute(2);
+        assert_eq!(small[0].shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_f32s(&client, &small[0]), vec![1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &small[1]), vec![1.0]);
+        assert_eq!(read_f32s(&client, &small[2]), vec![1.0]);
+
+        let at_bound = execute(4);
+        assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, &at_bound[0]), vec![3.0, 2.0, 1.0, 0.0]);
+        assert_eq!(read_f32s(&client, &at_bound[1]), vec![6.0]);
+        assert_eq!(read_f32s(&client, &at_bound[2]), vec![14.0]);
+    }
+
+    #[test]
+    fn test_data_derived_prefix_slice_executes_at_multiple_extents() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(input_sharding.clone())
+            .unwrap();
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(input_sharding)
+            .unwrap();
+        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
+
+        // This is the compiled counterpart of the Phase 4 prefix-take fixture: the mask determines a device-side
+        // count, the checked gateway turns that count into a bounded dimension, and the slice returns that many
+        // leading values without a host readback.
+        let mut builder = XlaProgramBuilder::new();
+        let mask = builder.add_input(mask_type.into());
+        let values = builder.add_input(values_type.into());
+        let mask = builder
+            .add_instruction(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64), Vec::new(), vec![mask])
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask])
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count])
+            .unwrap()[0];
+        let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
+        let output = builder
+            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let values = || f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let execute = |mask: &[bool]| {
+            domain.execute_xla_program(&compiled, vec![boolean_vector(&client, &mesh, mask), values()]).unwrap()
+        };
+
+        let two = execute(&[true, false, true, false]);
+        assert_eq!(two[0].shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_f32s(&client, &two[0]), vec![10.0, 20.0]);
+        let four = execute(&[true, true, true, true]);
+        assert_eq!(four[0].shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, &four[0]), vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_data_derived_compilation_rejects_unbounded_and_opaque_consumers() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
+                    for XLA compilation",
+        ));
+
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.opaque_dynamic", vec![dynamic_type]),
+                Vec::new(),
+                vec![input, dimension],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
+                    because its physical-padding semantics are opaque",
+        ));
+    }
+
+    #[test]
+    fn test_input_bound_bucketing_reuses_power_of_two_specializations() {
+        fn trace<'c>(
+            input: CompilationTracer<XlaDomain<'c>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            let context = input.context().clone();
+            Ok(context.bind(AddOperation::new(), Vec::new(), &[input.clone(), input])?.remove(0))
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let function: JittedFunction<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = try_jit_with_options(
+            &domain,
+            |(), input| trace(input),
+            XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
+        );
+        let call = |values: &[f32]| {
+            let input = f32_vector(&client, &mesh, values);
+            function.call((), ArrayIrValue::Array(input)).unwrap()
+        };
+
+        let three = call(&[1.0, 2.0, 3.0]);
+        assert_eq!(program_array(&three).shape(), StaticShape::new(vec![3]));
+        assert_eq!(read_f32s(&client, program_array(&three)), vec![2.0, 4.0, 6.0]);
+        let four = call(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(program_array(&four).shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, program_array(&four)), vec![2.0, 4.0, 6.0, 8.0]);
+        let five = call(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(program_array(&five).shape(), StaticShape::new(vec![5]));
+        assert_eq!(read_f32s(&client, program_array(&five)), vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 2);
+        assert_eq!(statistics.traces, 2);
+        assert_eq!(statistics.lowerings, 2);
+        assert_eq!(statistics.compilation_requests, 2);
+        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(domain.cache_size(), 2);
     }
 
     #[test]
