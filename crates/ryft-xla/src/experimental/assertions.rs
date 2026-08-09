@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+use ryft_pjrt::extensions::ffi::FfiStream;
 use ryft_pjrt::extensions::ffi::{
     FfiAttribute, FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits,
     FfiInput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
@@ -57,27 +59,95 @@ pub(crate) const ASSERT_DIV_FLOOR_KIND: &str = "div_floor";
 /// Formatting kind used for a nonzero remainder divisor.
 pub(crate) const ASSERT_REM_KIND: &str = "rem";
 
-/// Registers the [`ASSERT_CUSTOM_CALL_TARGET`] CPU handler with the plugin backing `client`.
-///
-/// Registration is lazy and process-global because XLA's FFI registry rejects duplicate target registrations. The
-/// handler reads scalar operand buffers directly on the host and therefore must only be registered for CPU clients.
-pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result<(), Error> {
-    static ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
-    ASSERTION_HANDLER_REGISTRATION
-        .get_or_init(|| {
-            let platform_name = client.platform_name()?.into_owned();
-            client.register_ffi_handler(
-                ASSERT_CUSTOM_CALL_TARGET,
-                platform_name,
-                FfiHandler::from(assertion_handler as XLA_FFI_Handler),
-                FfiHandlerTraits::NONE,
-            )
-        })
-        .clone()
+/// CUDA Driver API success result.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+const CUDA_SUCCESS: i32 = 0;
+
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+#[link(name = "cuda")]
+unsafe extern "C" {
+    /// Enqueues one device-to-host copy on a CUDA stream.
+    fn cuMemcpyDtoHAsync_v2(
+        destination: *mut std::ffi::c_void,
+        source: u64,
+        byte_count: usize,
+        stream: FfiStream,
+    ) -> i32;
+
+    /// Waits for all previously enqueued work on a CUDA stream.
+    fn cuStreamSynchronize(stream: FfiStream) -> i32;
 }
 
-/// XLA FFI handler for [`ASSERT_CUSTOM_CALL_TARGET`].
+/// Memory location of the scalar buffers passed to one assertion callback.
+#[derive(Copy, Clone)]
+enum AssertionBufferMemory {
+    /// CPU buffers that the callback can read directly.
+    Host,
+
+    /// CUDA device buffers read back through the invocation's stream.
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    Cuda(FfiStream),
+}
+
+/// Registers the [`ASSERT_CUSTOM_CALL_TARGET`] handler with the plugin backing `client`.
+///
+/// Registration is lazy and process-global because XLA's FFI registry rejects duplicate target registrations. The
+/// CPU handler reads scalar operands directly. The CUDA handler copies them through the invocation's CUDA stream
+/// before applying the same validation and diagnostic logic.
+pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result<(), Error> {
+    let platform_name = client.platform_name()?.into_owned();
+    if platform_name.eq_ignore_ascii_case("cpu") {
+        static CPU_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        return CPU_ASSERTION_HANDLER_REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    ASSERT_CUSTOM_CALL_TARGET,
+                    platform_name,
+                    FfiHandler::from(assertion_handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone();
+    }
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    if platform_name.eq_ignore_ascii_case("cuda") {
+        static CUDA_ASSERTION_HANDLER_REGISTRATION: OnceLock<Result<(), Error>> = OnceLock::new();
+        return CUDA_ASSERTION_HANDLER_REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    ASSERT_CUSTOM_CALL_TARGET,
+                    platform_name,
+                    FfiHandler::from(cuda_assertion_handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone();
+    }
+    Err(Error::unimplemented(format!(
+        "compiled runtime assertions are not supported on XLA platform '{platform_name}'",
+    )))
+}
+
+/// XLA FFI handler for host-resident assertion operands.
 unsafe extern "C" fn assertion_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+    unsafe { assertion_handler_for_memory(call_frame, |_| Ok(AssertionBufferMemory::Host)) }
+}
+
+/// XLA FFI handler for CUDA-resident assertion operands.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+unsafe extern "C" fn cuda_assertion_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+    unsafe {
+        assertion_handler_for_memory(call_frame, |call_frame| {
+            Ok(AssertionBufferMemory::Cuda(call_frame.context()?.stream()?))
+        })
+    }
+}
+
+/// Decodes one XLA FFI invocation and evaluates it using the memory location returned by `memory`.
+unsafe fn assertion_handler_for_memory(
+    call_frame: *mut XLA_FFI_CallFrame,
+    memory: impl FnOnce(&FfiCallFrame<'_>) -> Result<AssertionBufferMemory, FfiError>,
+) -> *mut XLA_FFI_Error {
     // SAFETY: XLA owns the call frame for this invocation. All access is localized in `FfiCallFrame` and the checked
     // scalar-buffer readers below.
     unsafe {
@@ -87,17 +157,66 @@ unsafe extern "C" fn assertion_handler(call_frame: *mut XLA_FFI_CallFrame) -> *m
             Ok(call_frame) if call_frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
             Ok(call_frame) => match call_frame.api() {
                 Err(_) => std::ptr::null_mut(),
-                Ok(api) => match handle_assertion_call_frame(&call_frame) {
-                    Ok(()) => std::ptr::null_mut(),
-                    Err(error) => error.to_c_api(api),
-                },
+                Ok(api) => {
+                    match memory(&call_frame).and_then(|memory| handle_assertion_call_frame(&call_frame, memory)) {
+                        Ok(()) => std::ptr::null_mut(),
+                        Err(error) => error.to_c_api(api),
+                    }
+                }
             },
         }
     }
 }
 
+/// Copies `byte_count` bytes from one CUDA device allocation into host memory and waits for completion.
+#[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+fn copy_cuda_bytes(
+    source: *mut std::ffi::c_void,
+    destination: *mut std::ffi::c_void,
+    byte_count: usize,
+    stream: FfiStream,
+) -> Result<(), FfiError> {
+    let copy_result = unsafe { cuMemcpyDtoHAsync_v2(destination, source as usize as u64, byte_count, stream) };
+    if copy_result != CUDA_SUCCESS {
+        return Err(FfiError::internal(format!("CUDA assertion operand copy failed with driver error {copy_result}",)));
+    }
+    let synchronize_result = unsafe { cuStreamSynchronize(stream) };
+    if synchronize_result != CUDA_SUCCESS {
+        return Err(FfiError::internal(format!(
+            "CUDA assertion operand synchronization failed with driver error {synchronize_result}",
+        )));
+    }
+    Ok(())
+}
+
+/// Reads `BYTE_COUNT` bytes from a validated scalar assertion buffer.
+fn scalar_bytes<const BYTE_COUNT: usize>(
+    buffer: &FfiBuffer<'_>,
+    memory: AssertionBufferMemory,
+) -> Result<[u8; BYTE_COUNT], FfiError> {
+    // SAFETY: The scalar readers validate the element type and rank before calling this function, so XLA owns at
+    // least `BYTE_COUNT` bytes at the returned invocation-scoped address.
+    let source = unsafe { buffer.data() };
+    if source.is_null() {
+        return Err(FfiError::invalid_argument(format!(
+            "encountered a null scalar buffer in '{ASSERT_CUSTOM_CALL_TARGET}'",
+        )));
+    }
+    let mut bytes = [0; BYTE_COUNT];
+    match memory {
+        AssertionBufferMemory::Host => unsafe {
+            std::ptr::copy_nonoverlapping(source.cast::<u8>(), bytes.as_mut_ptr(), BYTE_COUNT);
+        },
+        #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+        AssertionBufferMemory::Cuda(stream) => {
+            copy_cuda_bytes(source, bytes.as_mut_ptr().cast(), BYTE_COUNT, stream)?;
+        }
+    }
+    Ok(bytes)
+}
+
 /// Decodes and evaluates one assertion call frame.
-fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionBufferMemory) -> Result<(), FfiError> {
     let mut buffers = Vec::new();
     for input in call_frame.inputs() {
         let FfiInput::Buffer { buffer } = input?;
@@ -121,8 +240,9 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiE
                  least one input extent"
             )));
         }
-        let actual = scalar_i64(&buffers[1])?;
-        let input_extents = buffers[2..].iter().map(scalar_i64).collect::<Result<Vec<_>, _>>()?;
+        let actual = scalar_i64(&buffers[1], memory)?;
+        let input_extents =
+            buffers[2..].iter().map(|buffer| scalar_i64(buffer, memory)).collect::<Result<Vec<_>, _>>()?;
         let axis = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
         return validate_concatenate(actor, axis, actual, input_extents.as_slice()).map_err(FfiError::invalid_argument);
     }
@@ -138,9 +258,9 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiE
             )));
         }
         let left_name = string_attribute(call_frame, ASSERT_LEFT_ATTRIBUTE)?;
-        let left = scalar_i64(&buffers[1])?;
+        let left = scalar_i64(&buffers[1], memory)?;
         let right_name = string_attribute(call_frame, ASSERT_RIGHT_ATTRIBUTE)?;
-        let right = scalar_i64(&buffers[2])?;
+        let right = scalar_i64(&buffers[2], memory)?;
         return validate_arithmetic(kind, left_name, left, right_name, right).map_err(FfiError::invalid_argument);
     }
 
@@ -159,15 +279,15 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiE
              extent(s)"
         )));
     }
-    if scalar_predicate(&buffers[0])? {
+    if scalar_predicate(&buffers[0], memory)? {
         return Ok(());
     }
     let left_name = string_attribute(call_frame, ASSERT_LEFT_ATTRIBUTE)?;
-    let left = scalar_i64(&buffers[1])?;
+    let left = scalar_i64(&buffers[1], memory)?;
     let message = match kind {
         ASSERT_EQUAL_KIND | ASSERT_LESS_THAN_OR_EQUAL_KIND | ASSERT_DIVISIBLE_BY_KIND => {
             let right_name = string_attribute(call_frame, ASSERT_RIGHT_ATTRIBUTE)?;
-            let right = scalar_i64(&buffers[2])?;
+            let right = scalar_i64(&buffers[2], memory)?;
             let requirement = match kind {
                 ASSERT_EQUAL_KIND => format!("{left_name} == {right_name}"),
                 ASSERT_LESS_THAN_OR_EQUAL_KIND => format!("{left_name} <= {right_name}"),
@@ -275,37 +395,23 @@ fn string_attribute<'o>(call_frame: &FfiCallFrame<'o>, expected_name: &str) -> R
 }
 
 /// Reads one rank-zero predicate buffer.
-fn scalar_predicate(buffer: &FfiBuffer<'_>) -> Result<bool, FfiError> {
+fn scalar_predicate(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<bool, FfiError> {
     if buffer.element_type() != FfiBufferType::Predicate || buffer.rank() != 0 {
         return Err(FfiError::invalid_argument(format!(
             "expected the '{ASSERT_CUSTOM_CALL_TARGET}' predicate to be a rank-zero predicate buffer"
         )));
     }
-    // SAFETY: XLA reports a rank-zero predicate buffer, whose CPU allocation contains one byte for this invocation.
-    let data = unsafe { buffer.data() as *const u8 };
-    if data.is_null() {
-        return Err(FfiError::invalid_argument(format!(
-            "encountered a null predicate buffer in '{ASSERT_CUSTOM_CALL_TARGET}'"
-        )));
-    }
-    Ok(unsafe { *data != 0 })
+    Ok(scalar_bytes::<1>(buffer, memory)?[0] != 0)
 }
 
 /// Reads one rank-zero signed 64-bit extent buffer.
-fn scalar_i64(buffer: &FfiBuffer<'_>) -> Result<i64, FfiError> {
+fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i64, FfiError> {
     if buffer.element_type() != FfiBufferType::I64 || buffer.rank() != 0 {
         return Err(FfiError::invalid_argument(format!(
             "expected the '{ASSERT_CUSTOM_CALL_TARGET}' observed extent to be a rank-zero i64 buffer"
         )));
     }
-    // SAFETY: XLA reports a rank-zero i64 buffer, whose CPU allocation contains one `i64` for this invocation.
-    let data = unsafe { buffer.data() as *const i64 };
-    if data.is_null() {
-        return Err(FfiError::invalid_argument(format!(
-            "encountered a null extent buffer in '{ASSERT_CUSTOM_CALL_TARGET}'"
-        )));
-    }
-    Ok(unsafe { *data })
+    Ok(i64::from_ne_bytes(scalar_bytes(buffer, memory)?))
 }
 
 #[cfg(test)]

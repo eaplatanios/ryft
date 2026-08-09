@@ -196,7 +196,7 @@ The dominant tier-3 cost and the piece most exposed to backend maturity. The phy
 buffers carrying smaller logical extents — but the encoding route is an explicit measured decision. The gateway's own
 compiled lowering (range check as an ordered assertion, riding the per-class token chain) is already complete.
 
-- [ ] Decide the compiled route for operations consuming data-derived extents, on measured evidence: (a) XLA bounded
+- [x] Decide the compiled route for operations consuming data-derived extents, on measured evidence: (a) XLA bounded
       dynamism through the existing bounded-input ABI, `set_dimension_size`, and `PadToStatic`; or (b) fully static
       bound-shaped StableHLO plus explicit Ryft-generated masks. Prototype (a) first because the ABI exists; record
       CPU and CUDA coverage evidence before committing, and fall back to (b) per backend rather than globally.
@@ -208,7 +208,7 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
 - [x] Implement the padding rules for the supported operation matrix so padding garbage is unobservable in results.
       Every unclassified or unsupported operation must reject lowering of data-derived extents with an exact
       diagnostic naming the operation; silent truncation or garbage propagation is an abort criterion.
-- [ ] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
+- [x] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
       Phase 4 fixtures, proving one compiled specialization serves multiple runtime extents.
 - [x] Add a dispatch-time bound-bucketing policy for *input-derived* extents as pure retained-JIT policy: round the
       host-observed extent up to a bucket (e.g., logarithmically spaced), compile one specialization per bucketed
@@ -216,7 +216,7 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
       the bucket ratio in exchange for log-many compilations; no new semantics. Gateway-split bucketing for
       *data-derived* extents is an explicit recorded non-goal (device-born extents would force a stream-stalling
       host readback and program split); revisit only with a measured workload recorded here first.
-- [ ] Gate: bounded data-dependent programs compile and execute correctly on supported backends, padding effects are
+- [x] Gate: bounded data-dependent programs compile and execute correctly on supported backends, padding effects are
       unobservable in every supported operation's results, unsupported operations fail before execution with exact
       diagnostics, and the route decision is recorded with its measured evidence. This gate also closes the tier-3
       verification row "every operation without data-dependent lowering support fails with an exact diagnostic".
@@ -253,10 +253,14 @@ either enum now requires an explicit classification before `ryft-xla` compiles.
   tests, the bucketing test, and the pinned JAX prefix-take boundary fixture pass. The first core run exposed one stale
   batching-error expectation after the Phase 4 diagnostic cleanup; the duplicated `axis` wording and its expectation
   are corrected, and the complete rerun passes.
-- CUDA source coverage extends the existing bounded-dynamic CUDA-13 test with the device-born gateway, dynamic
-  broadcast, masked reduction, two runtime extents, and one retained specialization. Final accelerator execution is
-  still pending: Tailscale reports `sparky` offline (last seen two days ago), `.local` resolution fails, and its prior
-  LAN address times out. The two CUDA-dependent checkboxes above remain deliberately open until that exact test runs.
+- Completed CUDA-13 execution on the reconnected DGX Spark in a clean checkout of the exact pushed Phase 5 base with
+  only this CUDA-assertion completion patch overlaid. The focused test ran on its NVIDIA GB10 with CUDA
+  driver/runtime/toolkit 13.0 and cuDNN 9.20, producing exact results for bounded input extents 4 and 7 and
+  data-derived extents 4 and 7 through one retained specialization. The gateway's ordered
+  bounds assertion now registers a CUDA typed-FFI handler that reads its scalar operands through the invocation's
+  stream while reusing the CPU validation and diagnostic implementation. The same CUDA test passes extent 8 through
+  the compiled gateway, awaits the asynchronous callback failure, and observes the exact actor-, variable-, value-,
+  and bounds-named diagnostic. The complete CPU `ryft-xla` library suite remains green (452 passed, one ignored).
 
 ## Phase 6: ragged batching for data-dependent extents (archive Phase 14)
 

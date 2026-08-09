@@ -2021,9 +2021,9 @@ impl<'c> XlaDomain<'c> {
         if !requires_assertion_handler {
             return Ok(());
         }
-        // The callback reads scalar buffers directly from host memory. Until a device callback implementation exists,
-        // rejecting non-CPU programs here is required for correctness rather than merely a registration limitation.
-        if !platform_name.eq_ignore_ascii_case("cpu") {
+        let supported = platform_name.eq_ignore_ascii_case("cpu")
+            || (cfg!(any(feature = "cuda-12", feature = "cuda-13")) && platform_name.eq_ignore_ascii_case("cuda"));
+        if !supported {
             return Err(XlaDomainError::UnsupportedRuntimeAssertionPlatform { platform: platform_name.to_string() });
         }
         super::assertions::ensure_assertion_handler_registered(self.client()?)?;
@@ -4839,13 +4839,21 @@ mod tests {
             let value =
                 Array::from_host_buffer(&client, scalar_f32.clone(), mesh.clone(), 2.0_f32.to_ne_bytes().as_slice())
                     .unwrap();
-            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)]).unwrap()
+            function.call((), vec![ArrayIrValue::Array(size), ArrayIrValue::Array(value)])
         };
-        assert_eq!(read_f32s(&client, program_array(&call(4))), vec![8.0]);
-        assert_eq!(read_f32s(&client, program_array(&call(7))), vec![14.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(4).unwrap())), vec![8.0]);
+        assert_eq!(read_f32s(&client, program_array(&call(7).unwrap())), vec![14.0]);
+        let invalid = call(8).unwrap();
+        let error = program_array(&invalid).block_until_ready().unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "'dimension_from_scalar' failed: input dimension `data_extent` = 8 is outside its declared bounds [1, 8)"
+            ),
+            "{error}",
+        );
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 1);
-        assert_eq!(function.statistics().dispatch_hits, 1);
+        assert_eq!(function.statistics().dispatch_hits, 2);
     }
 
     #[test]
