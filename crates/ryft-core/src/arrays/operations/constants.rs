@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(
             context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(),
             "cannot materialize a value of dynamically sized type f64[dynamic, 3]; stage a rank-zero fill in an array \
-             program over 'ArrayIrOperation' and expand it with 'dynamic_broadcast'",
+             program over 'ArrayIrOperation' and expand it with 'dynamic_broadcast' instead",
         );
         assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),

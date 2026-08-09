@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!(dynamic_type.reshape(dynamic_type.shape().clone()), Ok(dynamic_type.clone()));
 
         // A static zero product does not justify anonymous dynamic output dimensions unless a permutation identifies
-        // their runtime source. A fully static zero-sized target needs no runtime witness.
+        // their runtime source. A fully static zero-sized target needs no runtime extent source.
         let trailing = DimensionVariable::new("trailing", DimensionBounds::unbounded());
         let zero_dynamic_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Dynamic(trailing.clone())]));

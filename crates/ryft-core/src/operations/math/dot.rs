@@ -967,13 +967,6 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-/// Value-level generalized dot capability.
-///
-/// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It
-/// performs the contraction described by `dimensions`, supporting standard matrix
-/// multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor
-/// contractions.
-
 /// Canonical operation name for [`ScaledDotOperation`].
 pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
 
@@ -1758,6 +1751,11 @@ where
     }
 }
 
+/// Value-level generalized dot capability.
+///
+/// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It performs the contraction
+/// described by `dimensions`, supporting standard matrix multiplication, batched matrix multiplication, vector inner
+/// products, and arbitrary tensor contractions.
 pub trait Dot<Rhs = Self>: Sized {
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`.
     fn dot(&self, rhs: &Rhs, dimensions: &DotDimensionNumbers) -> Self;
