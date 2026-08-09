@@ -2290,23 +2290,56 @@ impl<'c> XlaDomain<'c> {
             .collect::<Vec<_>>();
         let result_shardings =
             output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+        // Shardy rejects bounded-dynamic tensors anywhere in the module, not only at the computation boundary, so a
+        // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
+        // still has to take the replica path. This is why the whole region arena is inspected instead of just the
+        // boundary types, which it already subsumes.
+        let use_shardy_partitioner = has_only_static_array_types(program);
+        if !use_shardy_partitioner && options.mesh.devices().len() > 1 {
+            if logical_argument_shardings
+                .iter()
+                .chain(output_types.iter().filter_map(ArrayType::sharding))
+                .any(|sharding| !sharding.is_replicated())
+            {
+                return Err(XlaDomainError::InvalidCompilationOptions {
+                    reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
+                             because Shardy rejects dynamic tensors"
+                        .to_string(),
+                });
+            }
+            // A `shard_map` body only ever has static boundary types, so it can coexist with dynamic tensors staged
+            // elsewhere in the same program. Its `sdy.manual_computation` lowering is meaningless without Shardy, and
+            // its collectives address partitions rather than replicas, so the replica path cannot execute it.
+            if contains_shard_map(program) {
+                return Err(XlaDomainError::InvalidCompilationOptions {
+                    reason: "bounded-dynamic multi-device programs cannot contain shard_map regions because \
+                             sdy.manual_computation requires the Shardy partitioner"
+                        .to_string(),
+                });
+            }
+        }
         let compilation_options = jit_compilation_options(
             self.compilation_options.as_ref(),
             options.mesh.devices().len(),
+            use_shardy_partitioner,
             options.feedback_directed_profile.as_ref(),
         );
         // The target platform gates platform-specific lowerings (e.g., the block-scaled dot fast path); a failed
         // platform query degrades to the portable lowerings instead of failing compilation.
         let target_platform =
             self.client.and_then(|client| client.platform_name().ok()).map(|platform| platform.into_owned());
+        // Shardy currently rejects bounded-dynamic tensors. Fully replicated dynamic programs need no partitioning,
+        // so lower them without Shardy metadata and execute one replica per mesh device instead.
+        let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
+        let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
         let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program(
             program,
             &[],
             &effective_input_types,
             &output_types,
             "main",
-            Some(logical_argument_shardings.as_slice()),
-            result_shardings.as_deref(),
+            lowered_argument_shardings,
+            lowered_result_shardings,
             target_platform.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
@@ -2824,10 +2857,38 @@ fn apply_signature_shardings(
     Ok(types)
 }
 
-/// Overlays SPMD partitioning fields on the base [`CompilationOptions`] template.
+/// Returns whether every array type that occurs anywhere in `program` has a static shape. The walk covers the whole
+/// region arena, and therefore every region boundary, constant, and instruction result, recursively through attached
+/// regions. First-class dimension-typed atoms are ignored because they lower to ordinary scalars; only dynamically
+/// shaped *array* types make the lowered module unacceptable to the Shardy partitioner.
+fn has_only_static_array_types(program: &FlatXlaProgram) -> bool {
+    program.regions().iter().all(|region| {
+        region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
+            ArrayIrType::Array(array_type) => array_type.static_shape().is_some(),
+            ArrayIrType::Dimension(_) => true,
+        })
+    })
+}
+
+/// Returns whether `program` stages a `shard_map` anywhere, including inside nested regions. Traced `shard_map`
+/// boundaries are required to be static by [`ShardMap::trace`](crate::experimental::shard_map::ShardMap::trace), so a
+/// `shard_map` can still appear in a program that is bounded-dynamic elsewhere, which this predicate detects.
+fn contains_shard_map(program: &FlatXlaProgram) -> bool {
+    program.regions().iter().any(|region| {
+        region
+            .instructions()
+            .iter()
+            .any(|instruction| matches!(instruction.operation(), XlaOperation::ShardMap(_)))
+    })
+}
+
+/// Overlays the selected multi-device execution mode on the base [`CompilationOptions`] template. Static programs
+/// use Shardy SPMD partitioning, while bounded-dynamic programs use one fully replicated executable replica per
+/// device because Shardy does not yet accept dynamic tensors.
 fn jit_compilation_options(
     base: &CompilationOptions,
-    partition_count: usize,
+    device_count: usize,
+    use_shardy_partitioner: bool,
     feedback_directed_profile: Option<&XlaFeedbackDirectedProfile>,
 ) -> CompilationOptions {
     use ryft_pjrt::protos::ExecutableCompilationOptions;
@@ -2836,10 +2897,10 @@ fn jit_compilation_options(
     if exec_options.device_ordinal == 0 {
         exec_options.device_ordinal = -1;
     }
-    exec_options.replica_count = 1;
-    exec_options.partition_count = partition_count as i64;
-    exec_options.use_spmd_partitioning = true;
-    exec_options.use_shardy_partitioner = true;
+    exec_options.replica_count = if use_shardy_partitioner { 1 } else { device_count as i64 };
+    exec_options.partition_count = if use_shardy_partitioner { device_count as i64 } else { 1 };
+    exec_options.use_spmd_partitioning = use_shardy_partitioner;
+    exec_options.use_shardy_partitioner = use_shardy_partitioner;
     if let Some(profile) = feedback_directed_profile {
         exec_options.fdo_profile = profile.bytes().to_vec();
         options.profile_version = profile.version();
@@ -3514,13 +3575,14 @@ mod tests {
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, MulOperation,
-        NegOperation, OneOperation, PrintOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
-        WhileOperation,
+        NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, SelectOperation, Sharding,
+        ShardingDimension, StaticShape, WhileOperation,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
+    use crate::experimental::shard_map::ShardMap;
     use crate::tests::{values_from_bytes, values_to_bytes};
 
     use super::*;
@@ -3671,8 +3733,8 @@ mod tests {
         assert_eq!(restored, profile);
         assert_eq!(restored.digest(), profile.digest());
 
-        let baseline = jit_compilation_options(&CompilationOptions::default(), 2, None);
-        let profiled = jit_compilation_options(&CompilationOptions::default(), 2, Some(&profile));
+        let baseline = jit_compilation_options(&CompilationOptions::default(), 2, true, None);
+        let profiled = jit_compilation_options(&CompilationOptions::default(), 2, true, Some(&profile));
         assert!(baseline.executable_build_options.unwrap().fdo_profile.is_empty());
         assert_eq!(profiled.executable_build_options.unwrap().fdo_profile, vec![1, 2, 3, 4]);
         assert_eq!(profiled.profile_version, 7);
@@ -4274,23 +4336,30 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
-        let build_program = |vector_type: &ArrayType| {
+        let build_program = |vector_type: &ArrayType, increment: usize| {
             let mut builder = XlaProgramBuilder::new();
             let vector = builder.add_input(vector_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let size_operation = DimensionSizeOperation::new(vector_type, 0).unwrap();
             let size = builder.add_instruction(size_operation.clone(), Vec::new(), vec![vector]).unwrap()[0];
-            let one_value = DimensionValue::constant(1).unwrap();
-            let one = builder
+            let increment_value = DimensionValue::constant(increment).unwrap();
+            let increment = builder
                 .add_instruction(
-                    XlaOperation::Dimension(DimensionOperation::Constant(ConstantOperation::new(one_value.clone()))),
+                    XlaOperation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                        increment_value.clone(),
+                    ))),
                     Vec::new(),
                     Vec::new(),
                 )
                 .unwrap()[0];
-            let add = DimensionAddOperation::new(size_operation.result_type(), one_value.r#type().as_ref()).unwrap();
+            let add =
+                DimensionAddOperation::new(size_operation.result_type(), increment_value.r#type().as_ref()).unwrap();
             let output_extent = builder
-                .add_instruction(XlaOperation::Dimension(DimensionOperation::Add(add)), Vec::new(), vec![size, one])
+                .add_instruction(
+                    XlaOperation::Dimension(DimensionOperation::Add(add)),
+                    Vec::new(),
+                    vec![size, increment],
+                )
                 .unwrap()[0];
             let broadcast = builder
                 .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, output_extent])
@@ -4307,7 +4376,7 @@ mod tests {
                 .unwrap()
         };
 
-        let dynamic_program = build_program(&vector_type);
+        let dynamic_program = build_program(&vector_type, 1);
         let dynamic_lowering = domain.lower_xla_program(&dynamic_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert!(dynamic_lowering.stable_hlo().contains("stablehlo.get_dimension_size"));
         assert!(dynamic_lowering.stable_hlo().contains("stablehlo.add"));
@@ -4315,11 +4384,27 @@ mod tests {
         assert!(dynamic_lowering.stable_hlo().contains("stablehlo.set_dimension_size"));
         assert!(dynamic_lowering.stable_hlo().contains("stablehlo.dynamic_reshape"));
 
+        // Persistent compilation identity canonicalizes diagnostic-only variable names while retaining dimension-SSA
+        // semantics. Rebuilding the same graph over a fresh nominal identity therefore shares its compilation key,
+        // while changing the dimension arithmetic does not.
+        let renamed_extent = DimensionVariable::new("renamed_extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let renamed_type = ArrayType::new(DataType::F32, Shape::new(vec![renamed_extent.into()]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let renamed_program = build_program(&renamed_type, 1);
+        let renamed_lowering = domain.lower_xla_program(&renamed_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let different_program = build_program(&vector_type, 2);
+        let different_lowering =
+            domain.lower_xla_program(&different_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let dynamic_key = domain.compilation_key(&dynamic_lowering).unwrap();
+        assert_eq!(dynamic_key, domain.compilation_key(&renamed_lowering).unwrap());
+        assert_ne!(dynamic_key, domain.compilation_key(&different_lowering).unwrap());
+
         // CPU PJRT does not provide the bounded-input `PadToStatic` custom call. Execute the same first-class
         // dimension graph with a static input axis; this changes only dimension-size lowering from a runtime read to
         // its exact scalar constant and still exercises dimension SSA arithmetic and both mixed shape operations.
         let static_vector_type = replicated_vector_type(&mesh, 3);
-        let executable_program = build_program(&static_vector_type);
+        let executable_program = build_program(&static_vector_type, 1);
         let executable_lowering =
             domain.lower_xla_program(&executable_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         let compiled = domain.compile_xla_program(&executable_lowering).unwrap();
@@ -4971,6 +5056,247 @@ mod tests {
         assert_eq!(warm.report.cache_hits, 1);
         assert_eq!(warm.report.device_to_host_shard_copies, 0);
         assert_eq!(warm.report.host_to_device_shard_uploads, 0);
+    }
+
+    #[test]
+    fn test_bounded_dynamic_program_executes_on_multiple_cpu_devices() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
+        let depth = DimensionVariable::new("depth", DimensionBounds::new(4, Some(7)).unwrap());
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(4),
+                Dimension::Dynamic(rows),
+                Dimension::Dynamic(columns),
+                Dimension::Dynamic(depth),
+            ]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            declared_type,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let executable_options =
+            compiled.compiled_program().compilation_options.executable_build_options.as_ref().unwrap();
+        assert_eq!(executable_options.replica_count, 4);
+        assert_eq!(executable_options.partition_count, 1);
+        assert!(!executable_options.use_spmd_partitioning);
+        assert!(!executable_options.use_shardy_partitioner);
+
+        for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
+            let actual_type =
+                ArrayType::new(DataType::F32, Shape::new(shape.into_iter().map(Dimension::Static).collect()))
+                    .with_sharding(sharding.clone())
+                    .unwrap();
+            let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &client,
+                actual_type,
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = ryft_core::compilation::call_function(
+                &domain,
+                compiled.executable_program(),
+                ArrayIrValue::Array(input),
+            )
+            .unwrap();
+            let ArrayIrValue::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output.block_until_ready().unwrap();
+
+            assert_eq!(output.shape().as_slice(), shape.as_slice());
+            assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
+        }
+        assert_eq!(domain.cache_size(), 1);
+
+        // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
+        // requested placement to replication.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let sharded_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Dynamic(extent)]))
+                .with_sharding(
+                    Sharding::new(
+                        mesh.logical_mesh().clone(),
+                        vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            sharded_type,
+            &domain,
+            XlaOptions::new(mesh),
+        )
+        .unwrap()
+        .into_inner();
+        let Err(error) = domain.lower(staged) else {
+            panic!("bounded-dynamic sharded program unexpectedly lowered");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid compilation options: bounded-dynamic multi-device programs currently require fully replicated \
+             shardings because Shardy rejects dynamic tensors",
+        );
+    }
+
+    #[test]
+    fn test_internal_dynamic_tensor_behind_a_static_boundary_takes_the_replica_path() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let value_type = replicated_scalar_type(&mesh, DataType::F32);
+
+        // The boundary of this program is fully static, but its interior derives a dynamic extent from a runtime
+        // scalar, broadcasts to it, and reduces back to a scalar.
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let value = builder.add_input(value_type.clone().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let broadcast = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![broadcast])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let executable_options = lowered.compilation_options.executable_build_options.as_ref().unwrap();
+        assert_eq!(executable_options.replica_count, 4);
+        assert_eq!(executable_options.partition_count, 1);
+        assert!(!executable_options.use_spmd_partitioning);
+        assert!(!executable_options.use_shardy_partitioner);
+        assert!(!lowered.stable_hlo().contains("sdy."), "{}", lowered.stable_hlo());
+
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let size =
+            Array::from_host_buffer(&client, size_type.clone(), mesh.clone(), 3_i64.to_ne_bytes().as_slice()).unwrap();
+        let value = Array::from_host_buffer(
+            &client,
+            value_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[2.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![size, value]).unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![6.0]);
+
+        // The replica path is a hard requirement rather than a preference: annotating the very same program for
+        // Shardy and compiling it with the Shardy partitioner enabled fails on the internal dynamic tensor, even
+        // though every boundary type is static.
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let annotated = crate::experimental::lowering::lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![size_type, value_type.clone()],
+            &vec![value_type],
+            "main",
+            Some(&[replicated.clone(), replicated.clone()]),
+            Some(std::slice::from_ref(&replicated)),
+            None,
+        )
+        .unwrap();
+        let mut shardy_lowered = lowered.clone();
+        shardy_lowered.stable_hlo = annotated.into_parts().0.into();
+        shardy_lowered.compilation_options =
+            jit_compilation_options(domain.compilation_options.as_ref(), 4, true, None);
+        let Err(error) = domain.compile_xla_program(&shardy_lowered) else {
+            panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
+        };
+        assert!(error.to_string().contains("only supports ranked tensors with a static shape"), "{error}");
+    }
+
+    #[test]
+    fn test_bounded_dynamic_multi_device_programs_reject_shard_map_regions() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let value_type = replicated_scalar_type(&mesh, DataType::F32);
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let local_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
+
+        // A `shard_map` body always has static boundary types, so it can coexist with dynamic tensors that are staged
+        // beside it. Here the gateway makes the program bounded-dynamic while the `shard_map` stays fully static.
+        let mut body_builder = XlaProgramBuilder::new();
+        let local = body_builder.add_input(local_type.into());
+        let doubled = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![local, local]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let shard_map =
+            ShardMap::new(manual_mesh, vec![manual_sharding.clone()], vec![manual_sharding], Vec::new(), true).unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let size = builder.add_input(size_type.into());
+        let value = builder.add_input(value_type.into());
+        let global = builder.add_input(global_type.clone().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dynamic = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension])
+            .unwrap()[0];
+        let mapped = builder
+            .add_instruction(
+                XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
+                    shard_map,
+                    vec![global_type.clone()],
+                    vec![global_type],
+                ))),
+                vec![body_region],
+                vec![global],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![mapped, dynamic],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+
+        let Err(error) = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)) else {
+            panic!("bounded-dynamic program containing a shard_map unexpectedly lowered");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid compilation options: bounded-dynamic multi-device programs cannot contain shard_map regions \
+             because sdy.manual_computation requires the Shardy partitioner",
+        );
     }
 
     #[test]

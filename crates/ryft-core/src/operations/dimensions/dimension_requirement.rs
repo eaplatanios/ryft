@@ -624,6 +624,7 @@ mod tests {
     use crate::arrays::{DimensionOperation, DimensionValue};
     use crate::contexts::{Context, EagerContext};
     use crate::operations::dimensions::dimension_add::{DIMENSION_ADD_OPERATION_NAME, DimensionAddOperation};
+    use crate::operations::dimensions::dimension_mul::{DIMENSION_MUL_OPERATION_NAME, DimensionMulOperation};
     use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -776,6 +777,48 @@ mod tests {
                 message: "left == right; observed left=4, right=5".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_dimension_requirement_partial_evaluation_retains_unproven_congruence() {
+        let extent = test_dimension_type("extent", 1, 9);
+        let four = DimensionValue::constant(4).unwrap();
+        let two = DimensionValue::constant(2).unwrap();
+        let multiplication = DimensionMulOperation::new(&extent, four.r#type().as_ref()).unwrap();
+        let product_type = multiplication
+            .infer_output_types(&[extent.clone(), four.r#type().into_owned()], &[])
+            .unwrap()
+            .remove(0);
+        let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
+        let extent_atom = builder.add_input(extent.clone());
+        let four_atom = builder.add_constant(four);
+        let two_atom = builder.add_constant(two.clone());
+        let product = builder.add_instruction(multiplication, Vec::new(), vec![extent_atom, four_atom]).unwrap()[0];
+        builder
+            .add_instruction(
+                DimensionRequirementOperation::divisible_by(&product_type, two.r#type().as_ref()),
+                Vec::new(),
+                vec![product, two_atom],
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<DimensionValue>, Vec<DimensionValue>>(vec![product], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The current abstract interpreter intentionally tracks exact values, intervals, and shared identities, but
+        // not modular congruence. Although `extent * 4` is mathematically divisible by `2`, that relationship remains
+        // one ordered runtime assertion instead of being reconstructed in a second symbolic algebra.
+        let residual = program.partially_evaluate(&[PartialValue::Unknown(extent)]).unwrap();
+        assert_eq!(
+            residual
+                .program()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec![DIMENSION_MUL_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME],
+        );
+        assert_eq!(residual.program().effects(), Effects::single(Effect::OrderedAssertion));
     }
 
     #[test]

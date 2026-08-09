@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ryft_core::{ArrayType, DeviceMesh, MeshAxisType, Sharding, ShardingDimension, Typed};
+use ryft_core::{ArrayType, DeviceMesh, MeshAxisType, Sharding, Typed};
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
@@ -96,18 +96,11 @@ pub(crate) fn reshard_with_donation<'o>(
     let src_mesh = source.mesh();
     if &src_mesh == dst_mesh {
         try_same_mesh(source, engine, dst_mesh, dst_sharding, donate)
-    } else if is_fully_replicated(source.sharding()) {
+    } else if source.sharding().is_replicated() {
         try_replicated_cross_mesh(source, engine, dst_mesh, dst_sharding)
     } else {
         try_sharded_cross_mesh(source, engine, &src_mesh, dst_mesh, dst_sharding)
     }
-}
-
-fn is_fully_replicated(sharding: &Sharding) -> bool {
-    sharding.dimensions().iter().all(|dim| matches!(dim, ShardingDimension::Replicated))
-        && sharding.unreduced_axes().is_empty()
-        && sharding.reduced_axes().is_empty()
-        && sharding.varying_manual_axes().is_empty()
 }
 
 /// Runs the compiled identity-with-sharding-constraints program against `dst_mesh`. Assumes the

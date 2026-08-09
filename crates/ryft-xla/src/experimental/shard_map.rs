@@ -4336,6 +4336,129 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_grouped_shape_changing_collectives_execute_on_cpu() {
+        use ryft_core::operations::collectives::{AllToAll, PSumScatter};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .expect("failed to create 4-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let mesh = device_mesh.logical_mesh().clone();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedXlaProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, (ArrayType, ArrayType, ArrayType), _>(
+                        |local_x: ShardMapTracer| {
+                            let options =
+                                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+                            (
+                                local_x
+                                    .all_gather_with_options("x", 0, options.clone(), AllGatherOutputVariance::Varying)
+                                    .unwrap(),
+                                local_x.clone().psum_scatter_with_options("x", 0, options.clone()).unwrap(),
+                                local_x.all_to_all_with_options("x", 0, 0, options).unwrap(),
+                            )
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        (sharding.clone(), sharding.clone(), sharding.clone()),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(16)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(module.matches("replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>").count(), 3, "{module}",);
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let values = (0..4).map(|offset| (device_index * 4 + offset) as f32).collect::<Vec<_>>();
+                client
+                    .buffer(
+                        values_to_bytes(values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &client,
+            static_sharded_array_type(DataType::F32, &[16], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let execution_device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        let expected_gather = [
+            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0],
+            vec![12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 7.0],
+            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0],
+            vec![12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 7.0],
+        ];
+        let expected_scatter = [vec![8.0, 10.0], vec![20.0, 22.0], vec![12.0, 14.0], vec![16.0, 18.0]];
+        let expected_all_to_all = [
+            vec![0.0, 1.0, 8.0, 9.0],
+            vec![14.0, 15.0, 6.0, 7.0],
+            vec![2.0, 3.0, 10.0, 11.0],
+            vec![12.0, 13.0, 4.0, 5.0],
+        ];
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 3);
+            let actual = output
+                .outputs
+                .into_iter()
+                .map(|buffer| {
+                    let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![
+                    expected_gather[device_index].clone(),
+                    expected_scatter[device_index].clone(),
+                    expected_all_to_all[device_index].clone(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn test_shard_map_psum_scatter_lowers_and_executes_on_cpu() {
         use ryft_core::operations::collectives::{CollectiveOptions, PSumScatter};
 
