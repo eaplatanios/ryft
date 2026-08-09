@@ -595,6 +595,14 @@ pub(crate) fn validate_unique_in_range(
 /// axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an ordinary additive
 /// [`ScatterOperation`], so linearization retains the indices as regular SSA residuals. The indices receive a
 /// structural zero, and a zero output cotangent stays a structural zero.
+///
+/// **Contract:** this homogeneous rule requires a statically shaped operand. The scatter target is a zero of the
+/// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
+/// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
+/// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+/// dynamically shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
+/// transpose region rebuilds the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
 where
     O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
@@ -620,7 +628,17 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
+                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
+                let operand_cotangent_type = inputs[0].r#type().cotangent();
+                if operand_cotangent_type.static_shape().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "'{GATHER_OPERATION_NAME}' transpose requires a statically shaped operand but got \
+                         {operand_cotangent_type}",
+                    ))
+                    .into());
+                }
+                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),
@@ -1015,6 +1033,8 @@ mod tests {
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
+    use crate::parameters::Placeholder;
+    use crate::programs::ProgramBuilder;
 
     use super::*;
 
@@ -1325,6 +1345,28 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
                 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, //
             ],
+        );
+    }
+
+    /// The homogeneous gather transpose scatters into a zero of the operand's cotangent type, and the homogeneous
+    /// `ArrayType` family has no constructor that can supply a runtime extent for one. A dynamically shaped operand is
+    /// therefore part of the rule's rejected contract rather than an accident of zero construction.
+    #[test]
+    fn test_gather_transposition_rejects_dynamic_operand_shapes() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(4, Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]));
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(dynamic_type);
+        let indices = builder.add_constant(Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]));
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+        let output = builder.add_instruction(operation, Vec::new(), vec![operand, indices]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            TypeError::invalid("'gather' transpose requires a statically shaped operand but got f32[rows, 2]").into(),
         );
     }
 }

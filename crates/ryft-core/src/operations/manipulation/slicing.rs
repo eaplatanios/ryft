@@ -180,11 +180,7 @@ impl Operation for DynamicShapeSliceOperation {
         for start in starts {
             <&DimensionType>::try_from(start)?;
         }
-        let dimensions = sizes
-            .iter()
-            .map(<&DimensionType>::try_from)
-            .map(|result| result.map(DimensionType::to_dimension))
-            .collect::<Result<Vec<_>, _>>()?;
+        let dimensions = ArrayIrType::extents(sizes)?;
         let output_type = ArrayType::new(input_type.data_type(), Shape::new(dimensions.clone()))
             .with_memory(input_type.memory())
             .with_sharding(resized_output_sharding(input_type, dimensions.as_slice(), self.name())?)
@@ -649,6 +645,14 @@ where
 ///     zero-filled length-`6` array.
 ///
 /// Symbolic-zero cotangents propagate unchanged.
+///
+/// **Contract:** this homogeneous rule requires a statically shaped input on both strategies. Each writes into a zero
+/// of the input's cotangent type (or reconstructs its extents), and the homogeneous [`ArrayType`] operation family owns
+/// no first-class dimension operations, so it has no constructor that can supply a runtime extent. A dynamically shaped
+/// input is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+/// dynamically shaped slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
+/// zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
     O: Operation<Type = ArrayType>
@@ -669,7 +673,17 @@ where
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
             MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
-                let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
+                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                // contract explicitly, matching the strided strategy's own check below.
+                let input_cotangent_type = inputs[0].r#type().cotangent();
+                if input_cotangent_type.static_shape().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "'{SLICE_OPERATION_NAME}' transpose requires a static input shape but got \
+                         {input_cotangent_type}",
+                    ))
+                    .into());
+                }
+                let zeros = MaybeZero::Zero(input_cotangent_type).materialize(context)?;
                 let outputs = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -2171,6 +2185,14 @@ where
 /// dynamic update-slice at those indices. The transpose reads the known start indices from the pullback boundary and
 /// stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains the indices as regular SSA residuals.
 /// The start indices receive structural zeros, and a zero output cotangent stays a structural zero.
+///
+/// **Contract:** this homogeneous rule requires a statically shaped operand. The update target is a zero of the
+/// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
+/// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
+/// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+/// dynamically shaped dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds
+/// the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
 where
     O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
@@ -2196,7 +2218,17 @@ where
             .collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
-            let zeros = MaybeZero::Zero(inputs[0].r#type().cotangent()).materialize(context)?;
+            // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+            // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
+            let operand_cotangent_type = inputs[0].r#type().cotangent();
+            if operand_cotangent_type.static_shape().is_none() {
+                return Err(TypeError::invalid(format!(
+                    "'{DYNAMIC_SLICE_OPERATION_NAME}' transpose requires a statically shaped operand but got \
+                     {operand_cotangent_type}",
+                ))
+                .into());
+            }
+            let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
             let mut operands = Vec::with_capacity(2 + start_indices.len());
             operands.push(zeros);
             operands.push(cotangent.clone());
@@ -4002,5 +4034,41 @@ mod tests {
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
         assert_abs_diff_eq!(value.to_f64s()[0], 33.0, epsilon = 1e-9);
         assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 5.0, 4.0]);
+    }
+
+    /// Both homogeneous slice-family transpose rules write into a zero of the operand's cotangent type, and the
+    /// homogeneous `ArrayType` family has no constructor that can supply a runtime extent for one. A dynamically
+    /// shaped operand is therefore part of the rules' rejected contract rather than an accident of zero construction,
+    /// so each reports its own exact diagnostic.
+    #[test]
+    fn test_slice_family_transposition_rejects_dynamic_operand_shapes() {
+        let elements = DimensionVariable::new("elements", DimensionBounds::new(4, Some(8)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(elements)]));
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(dynamic_type.clone());
+        let output =
+            builder.add_instruction(SliceOperation::new(vec![0], vec![2]), Vec::new(), vec![operand]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            TypeError::invalid("'slice' transpose requires a static input shape but got f64[elements]").into(),
+        );
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(dynamic_type);
+        let start = builder.add_input(ArrayType::scalar(DataType::I32));
+        let output = builder
+            .add_instruction(DynamicSliceOperation::new(vec![2]), Vec::new(), vec![operand, start])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            TypeError::invalid("'dynamic_slice' transpose requires a statically shaped operand but got f64[elements]")
+                .into(),
+        );
     }
 }

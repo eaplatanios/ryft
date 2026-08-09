@@ -11,8 +11,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, TransposableOperation, TranspositionDriver,
-    jvp_projected_operation,
+    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -423,17 +423,17 @@ where
 /// Projected array IR JVP rule for [`ScatterOperation`]. Scatter-add is jointly linear in its operand and updates and
 /// needs both tangents as real values, but a structural zero whose type names an extent by identity carries no runtime
 /// extent, so the type alone cannot construct that zero. This rule therefore materializes each missing tangent from its
-/// own primal exemplar through [`materialize_array_tangent`] before staging the tangent scatter. The transpose needs no
+/// own primal through [`materialize_array_tangent`], which names those extents, before staging the tangent scatter. The transpose needs no
 /// operand geometry of its own — scatter-add's operand Jacobian is the identity and the update cotangent gathers the
 /// output cotangent at the same known indices — so this rule stages a plain tangent scatter rather than a residual-
 /// parameterized [`LinearCallOperation`](crate::LinearCallOperation), and transposition continues through the
 /// homogeneous rule. Fully static operand and update geometry delegates to the homogeneous projected rule unchanged.
 impl<C> MemberDifferentiableOperation<C> for ScatterOperation
 where
-    C: Context<Type = ArrayIrType>,
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: OperationProjection<ArrayType>,
+    C::Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<ScatterOperation>
         + From<ZeroLikeOperation<ArrayType>>

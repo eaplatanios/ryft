@@ -19,7 +19,7 @@ use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, jvp_projected_operation,
+    LinearCallOperation, MemberDifferentiableOperation, ResidualZeroProvider, jvp_projected_operation,
 };
 use crate::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
@@ -213,15 +213,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Homogeneous array operation whose complete boundary is projected into the array member family. Every transform
     /// reaches the member rule through that projection, which carries no region access: an operation's attached
     /// regions are programs in the *composite* universe, and no projected view can present them in the member
-    /// universe. This variant therefore holds only region-free array operations, and the array-operation lift promotes
-    /// every region-carrying member payload that has a composite carrier — [`Condition`](Self::Condition),
-    /// [`While`](Self::While), [`Scan`](Self::Scan), and the executable form of [`LinearCall`](Self::LinearCall) — to
-    /// that carrier instead.
+    /// universe. This variant therefore holds only region-free array operations: the array-operation lift promotes
+    /// every region-carrying member payload to its composite carrier — [`Condition`](Self::Condition),
+    /// [`While`](Self::While), [`Scan`](Self::Scan), [`CustomJvp`](Self::CustomJvp), [`CustomVjp`](Self::CustomVjp),
+    /// [`LinearCall`](Self::LinearCall) (both interface forms), and [`Rematerialize`](Self::Rematerialize).
     ///
-    /// The remaining region-carrying array payloads ([`CustomJvpOperation`], [`CustomVjpOperation`],
-    /// [`RematerializeOperation`], and the transpose-only [`LinearCallOperation`] form) have no composite carrier yet,
-    /// so they still reach this variant. They are not silently mis-transformed: each transform rejects a region-
-    /// carrying projected payload with an exact diagnostic naming the operation.
+    /// No region-carrying array payload therefore reaches this variant. Should one ever be constructed directly, it is
+    /// not silently mis-transformed: each transform rejects a region-carrying projected payload with an exact
+    /// diagnostic naming the operation.
     #[ryft(projected(ArrayType), skip_from)]
     Array(ArrayOperation<A>),
 
@@ -293,8 +292,20 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Composite scan whose body may carry arrays and first-class dimensions.
     Scan(ScanOperation<ArrayIrValue<A>>),
 
-    /// Differentiation-owned executable linear call with ordinary trailing residual operands.
+    /// Composite custom-JVP call whose primal and JVP regions may carry arrays and first-class dimensions.
+    CustomJvp(CustomJvpOperation<ArrayIrType>),
+
+    /// Composite custom-VJP call whose primal, forward, and backward regions may carry arrays and first-class
+    /// dimensions.
+    CustomVjp(CustomVjpOperation<ArrayIrType>),
+
+    /// Differentiation-owned linear call with ordinary trailing residual operands, in either its executable
+    /// forward-and-transpose form or its reverse-only transpose-only form.
     LinearCall(LinearCallOperation<ArrayIrType>),
+
+    /// Composite rematerialized call whose primal, forward, backward, and tangent regions may carry arrays and
+    /// first-class dimensions.
+    Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
 /// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
@@ -317,13 +328,31 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
                 let captures = operation.captures().iter().cloned().map(ArrayIrValue::Array).collect();
                 Self::Scan(operation.with_captures(captures))
             }
-            // The executable linear-call form is fully described by its residual count and therefore promotes to the
-            // composite carrier, which owns the extent-threaded region rule. The transpose-only form additionally
-            // stores its unavailable forward map's member types, which have no composite counterpart here, so it stays
-            // in the projected variant and is rejected by name if a transform ever reaches its regions.
-            ArrayOperation::LinearCall(operation) if !operation.is_transpose_only() => {
-                Self::LinearCall(LinearCallOperation::new(operation.residual_count()))
+            ArrayOperation::CustomJvp(operation) => Self::CustomJvp(
+                CustomJvpOperation::new().with_nondifferentiated_count(operation.nondifferentiated_count()),
+            ),
+            ArrayOperation::CustomVjp(operation) => Self::CustomVjp(
+                CustomVjpOperation::new().with_nondifferentiated_count(operation.nondifferentiated_count()),
+            ),
+            // The executable linear-call form is fully described by its residual count. The transpose-only form
+            // additionally stores its unavailable forward map's member interface types, which lift one by one into the
+            // composite universe, so both forms reach the composite carrier that owns the extent-threaded region rule.
+            ArrayOperation::LinearCall(operation) => {
+                let residual_count = operation.residual_count();
+                Self::LinearCall(match operation.transpose_only_interface() {
+                    None => LinearCallOperation::new(residual_count),
+                    Some((input_types, output_types)) => LinearCallOperation::transpose_only(
+                        residual_count,
+                        input_types.iter().cloned().map(ArrayIrType::Array).collect(),
+                        output_types.iter().cloned().map(ArrayIrType::Array).collect(),
+                    ),
+                })
             }
+            ArrayOperation::Rematerialize(operation) => Self::Rematerialize(
+                RematerializeOperation::new()
+                    .with_prevent_cse(operation.prevent_cse())
+                    .with_nondifferentiated_count(operation.nondifferentiated_count()),
+            ),
             operation => Self::Array(operation),
         }
     }
@@ -363,7 +392,8 @@ where
     C: Context<
             Type = ArrayIrType,
             Constant: ValueProjection<ArrayType, Projected = A>,
-            Operation: From<ArrayIrOperation<A>>
+            Operation: ResidualZeroProvider<ArrayIrType>
+                           + From<ArrayIrOperation<A>>
                            + From<DynamicBroadcastOperation>
                            + From<DimensionSizeOperation>
                            + From<DimensionToScalarOperation>
@@ -450,9 +480,11 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::arrays::types::memories::Memory;
-    use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingTracer, batch};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate};
+    use crate::differentiation::{
+        DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
+    };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{AllGatherOutputVariance, CollectiveMode, CollectiveOptions};
@@ -466,7 +498,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder, ProgramError,
+        AtomId, Effect, Effects, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder, ProgramError,
         RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
@@ -475,6 +507,7 @@ mod tests {
 
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
+    type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
     #[test]
     fn test_composite_pullback_materializes_a_dynamic_zero_space_input_cotangent() {
@@ -1289,82 +1322,263 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_composite_batching_of_a_region_carrying_array_payload() {
-        type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
-
+    /// Builds a composite scalar `f64` [`Program`] from `build`, which receives the region builder together with its
+    /// `input_count` scalar inputs and returns the region's output atoms.
+    fn composite_scalar_program<BuildFn>(input_count: usize, build: BuildFn) -> TestProgram
+    where
+        BuildFn: FnOnce(&mut ProgramBuilder<TestValue, TestOperation>, &[AtomId]) -> Vec<AtomId>,
+    {
         let array_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let inputs = (0..input_count).map(|_| builder.add_input(array_type.clone().into())).collect::<Vec<_>>();
+        let outputs = build(&mut builder, inputs.as_slice());
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
+    }
 
-        // `primal(x) = 2 * x` with the deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a custom JVP
-        // boundary that survived a transform would be detectable.
-        let scaling_program = |primal_scale: f64, tangent_scale: Option<f64>| -> TestProgram {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(array_type.clone().into());
-            let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(primal_scale)));
-            let mut outputs = builder
-                .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale])
-                .unwrap()
-                .to_vec();
-            let mut input_count = 1;
-            if let Some(tangent_scale) = tangent_scale {
-                let tangent_input = builder.add_input(array_type.clone().into());
-                let tangent_scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(tangent_scale)));
-                outputs.extend(
-                    builder
-                        .add_instruction(
-                            ArrayOperation::Mul(MulOperation::new()),
-                            Vec::new(),
-                            vec![tangent_input, tangent_scale],
-                        )
-                        .unwrap(),
-                );
-                input_count = 2;
-            }
-            let output_count = outputs.len();
-            builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
+    /// Stages `input * scale` in `builder` and returns its result atom.
+    fn composite_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
+        let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale)));
+        builder
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale])
+            .unwrap()[0]
+    }
+
+    /// Builds the `["primal", "jvp"]` regions of a composite `custom_jvp` implementing `primal(x) = 2 * x` with the
+    /// deliberately wrong rule `jvp(x, dx) = (2 * x, 3 * dx)`, so a surviving custom-derivative boundary stays
+    /// detectable in a transformed program's numbers.
+    fn composite_custom_jvp_regions() -> Vec<TestProgram> {
+        vec![
+            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
+            composite_scalar_program(2, |builder, inputs| {
+                vec![composite_scaled(builder, inputs[0], 2.0), composite_scaled(builder, inputs[1], 3.0)]
+            }),
+        ]
+    }
+
+    /// Builds the `["primal", "forward", "backward"]` regions of a composite `custom_vjp` implementing
+    /// `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, and the deliberately wrong rule `backward(r, ȳ) = 3 * ȳ`.
+    fn composite_custom_vjp_regions() -> Vec<TestProgram> {
+        vec![
+            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0)]),
+            composite_scalar_program(1, |builder, inputs| vec![composite_scaled(builder, inputs[0], 2.0), inputs[0]]),
+            composite_scalar_program(2, |builder, inputs| vec![composite_scaled(builder, inputs[1], 3.0)]),
+        ]
+    }
+
+    /// Builds the `["primal", "forward", "backward", "tangent"]` regions of a composite `rematerialize` implementing
+    /// `primal(x) = 2 * x`, `forward(x) = (2 * x, x)`, `backward(r, ȳ) = 3 * ȳ`, and `tangent(r, dx) = 3 * dx`.
+    fn composite_rematerialize_regions() -> Vec<TestProgram> {
+        let mut regions = composite_custom_vjp_regions();
+        regions.push(composite_scalar_program(2, |builder, inputs| vec![composite_scaled(builder, inputs[1], 3.0)]));
+        regions
+    }
+
+    /// Batches one composite region-carrying payload over a single operand mapped along axis zero and returns the
+    /// rendered staged program together with the result's [`BatchAxis`].
+    fn batched_composite_payload(operation: ArrayOperation<Array>, regions: Vec<TestProgram>) -> (String, BatchAxis) {
+        let extent = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let trace = TracingContext::<TestValue, TestOperation>::new();
+        let extent_input = trace.input(DimensionType::new(extent.clone()).into());
+        let mapped = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), extent_input);
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
+        let output = context.bind(operation, regions, std::slice::from_ref(&input)).unwrap().remove(0);
+        let batch_axis = output.batch().batch_axis();
+        let program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![output.batch().value().atom_id().unwrap()],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        (program.to_string(), batch_axis)
+    }
+
+    #[test]
+    fn test_composite_lift_promotes_every_region_carrying_array_payload() {
+        // Every region-carrying array payload has a composite carrier, so none of them reaches the region-free
+        // projected `Array` variant. The custom-derivative wrappers and rematerialization carry their
+        // nondifferentiated operand split (and rematerialization its lowering hint) across the lift.
+        assert!(matches!(
+            TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new().with_nondifferentiated_count(1))),
+            ArrayIrOperation::CustomJvp(operation) if operation.nondifferentiated_count() == 1,
+        ));
+        assert!(matches!(
+            TestOperation::from(ArrayOperation::CustomVjp(CustomVjpOperation::new().with_nondifferentiated_count(2))),
+            ArrayIrOperation::CustomVjp(operation) if operation.nondifferentiated_count() == 2,
+        ));
+        assert!(matches!(
+            TestOperation::from(ArrayOperation::Rematerialize(
+                RematerializeOperation::new().with_prevent_cse(true).with_nondifferentiated_count(1),
+            )),
+            ArrayIrOperation::Rematerialize(operation)
+                if operation.prevent_cse() && operation.nondifferentiated_count() == 1,
+        ));
+        assert!(matches!(
+            TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::new(1))),
+            ArrayIrOperation::LinearCall(operation) if operation.residual_count() == 1,
+        ));
+
+        // The transpose-only form stores the member types of the forward map it does not attach, so its lift maps
+        // each of them into the composite type universe instead of dropping the interface.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let promoted = TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::transpose_only(
+            1,
+            vec![scalar_type.clone()],
+            vec![scalar_type.clone()],
+        )));
+        let ArrayIrOperation::LinearCall(promoted) = promoted else {
+            panic!("expected a promoted composite linear call");
         };
-
-        // A region-carrying payload with no composite carrier still reaches the projected `Array` variant. Batching it
-        // names the operation and the remedy instead of reporting an out-of-range region index from a driver the
-        // projection had already discarded.
-        let lifted = TestOperation::from(ArrayOperation::CustomJvp(CustomJvpOperation::new()));
-        assert!(matches!(lifted, ArrayIrOperation::Array(ArrayOperation::CustomJvp(_))));
-        let error = batch(
-            |input: BatchingTracer<_, ArrayIrBatching>| {
-                let context = input.context().clone();
-                Ok(context
-                    .bind(
-                        ArrayOperation::CustomJvp(CustomJvpOperation::new()),
-                        vec![scaling_program(2.0, None), scaling_program(2.0, Some(3.0))],
-                        &[input],
-                    )?
-                    .remove(0))
-            },
-            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap_err();
         assert_eq!(
-            error,
-            BatchingError::UnsupportedOperation {
-                message: "projected operation `custom_jvp` carries regions and cannot be batched through its member \
-                          family; batch it through a composite carrier for that operation instead"
-                    .to_string(),
-            },
+            promoted.transpose_only_interface(),
+            Some(([ArrayIrType::Array(scalar_type.clone())].as_slice(), [ArrayIrType::Array(scalar_type)].as_slice())),
         );
+    }
 
-        // The executable linear call does have a composite carrier, so the lift promotes it and its extent-threading
-        // composite rule batches the attached regions.
+    #[test]
+    fn test_composite_batching_of_a_custom_jvp_payload() {
+        // The composite carrier batches both regions structurally and threads the first-class mapped extent into
+        // them as one additional leading nondifferentiated operand of the batched call.
+        let (program, batch_axis) = batched_composite_payload(
+            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+            composite_custom_jvp_regions(),
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = custom_jvp [nondifferentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    jvp={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const
+                            %4:f64[] = const
+                            %5:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %6:f64[batch] = mul %1 %5
+                            %7:f64[batch] = broadcast [output_axes=[]] %4 %0
+                            %8:f64[batch] = mul %2 %7
+                        in (%6, %8)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_batching_of_a_custom_vjp_payload() {
+        // The backward region receives the threaded extent ahead of its residuals, and its result cotangents align
+        // with the differentiated operands only.
+        let (program, batch_axis) = batched_composite_payload(
+            ArrayOperation::CustomVjp(CustomVjpOperation::new()),
+            composite_custom_vjp_regions(),
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = custom_vjp [nondifferentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4, %1)
+                    },
+                    backward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_batching_of_a_rematerialize_payload() {
+        // All four regions are rebuilt around the threaded extent, keeping the rematerialization boundary intact.
+        let (program, batch_axis) = batched_composite_payload(
+            ArrayOperation::Rematerialize(RematerializeOperation::new()),
+            composite_rematerialize_regions(),
+        );
+        assert_eq!(batch_axis, BatchAxis::new(0));
+        assert_eq!(
+            program,
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                let %2:f64[batch] = rematerialize [nondifferentiated_count=1] %0 %1 [
+                    primal={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4)
+                    },
+                    forward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
+                        let %2:f64[] = const
+                            %3:f64[batch] = broadcast [output_axes=[]] %2 %0
+                            %4:f64[batch] = mul %1 %3
+                        in (%4, %1)
+                    },
+                    backward={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                    tangent={
+                        lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
+                        let %3:f64[] = const
+                            %4:f64[batch] = broadcast [output_axes=[]] %3 %0
+                            %5:f64[batch] = mul %2 %4
+                        in (%5)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_composite_batching_of_a_linear_call_payload() {
+        // The executable linear call threads the mapped extent as one more leading residual, which is the precedent
+        // the custom-derivative carriers follow with their nondifferentiated operand split.
+        let array_type = ArrayType::scalar(DataType::F64);
         let identity_program = || -> TestProgram {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             builder.add_input(array_type.clone().into());
             let linear = builder.add_input(array_type.clone().into());
             builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder]).unwrap()
         };
-        let promoted = TestOperation::from(ArrayOperation::LinearCall(LinearCallOperation::new(1)));
-        assert!(matches!(promoted, ArrayIrOperation::LinearCall(operation) if operation.residual_count() == 1));
         let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
         let output: TestValue = batch(
             |(residual, linear): (BatchingTracer<_, ArrayIrBatching>, BatchingTracer<_, ArrayIrBatching>)| {
@@ -1386,32 +1600,14 @@ mod tests {
         assert_eq!(output, linear);
     }
 
-    /// Builds a composite program holding one region-carrying array payload with identity `primal` and `jvp` regions,
-    /// which is the projected-variant residue that has no composite carrier.
-    fn composite_custom_jvp_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
-        let array_type = ArrayType::scalar(DataType::F64);
+    /// Builds a composite program holding one `custom_jvp` call over a scalar input.
+    fn composite_custom_jvp_program() -> TestProgram {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let primal = {
-            let mut region = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = region.add_input(array_type.clone().into());
-            region
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let jvp = {
-            let mut region = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = region.add_input(array_type.clone().into());
-            let tangent = region.add_input(array_type.clone().into());
-            region
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![input, tangent],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let regions = [primal, jvp].map(|region| builder.import_region(region.entry_region_ref())).to_vec();
-        let input = builder.add_input(array_type.into());
+        let regions = composite_custom_jvp_regions()
+            .into_iter()
+            .map(|region| builder.import_region(region.entry_region_ref()))
+            .collect::<Vec<_>>();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
             .add_instruction(ArrayOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input])
             .unwrap()[0];
@@ -1420,28 +1616,54 @@ mod tests {
 
     #[test]
     fn test_composite_differentiation_of_a_region_carrying_array_payload() {
-        // Forward mode reaches the projected member rule with no region access, so it names the operation and the
-        // remedy instead of reporting an out-of-range region index.
+        // Forward mode reaches the composite carrier with its regions attached, so it replays the user JVP rule
+        // instead of failing without region access. The rule's deliberately wrong tangent scale of three is what
+        // proves the custom derivative governed the staged result.
         assert_eq!(
-            composite_custom_jvp_program().jvp().unwrap_err(),
-            DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "projected operation `custom_jvp` carries regions and cannot be differentiated through its \
-                          member family; differentiate it through a composite carrier for that operation instead"
-                    .to_string(),
-            }),
+            composite_custom_jvp_program().jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = const
+                    %3:f64[] = const
+                    %4:f64[] = mul %0 %2
+                    %5:f64[] = mul %1 %3
+                in (%4, %5)
+            "}
+            .trim_end(),
         );
     }
 
     #[test]
     fn test_composite_transposition_of_a_region_carrying_array_payload() {
-        // Transposition records member rules in a member-typed trace and therefore also reaches the payload without
-        // its regions. The diagnostic precedes the payload's own non-transposable rejection.
+        // Reverse mode linearizes first, and the composite carrier's JVP rule replaces the call with plain staged
+        // operations, so transposition reaches a tangent program the payload has already left. The gradient is the
+        // user rule's deliberately wrong scale of three rather than the primal's true derivative of two.
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let (value, pullback) = context
+            .vjp(
+                |input: LinearizationTracer<_>| {
+                    let context = input.context().clone();
+                    Ok(context
+                        .bind(
+                            ArrayOperation::CustomJvp(CustomJvpOperation::new()),
+                            composite_custom_jvp_regions(),
+                            &[input],
+                        )?
+                        .remove(0))
+                },
+                ArrayIrValue::Array(Array::scalar(5.0_f64)),
+            )
+            .unwrap();
+        let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64))).unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(10.0_f64)));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::scalar(3.0_f64)));
+
+        // Transposing the raw, un-linearized call directly is still rejected, but now by the composite payload's own
+        // non-transposable rule instead of by a projected adapter that never received its regions.
         assert_eq!(
             composite_custom_jvp_program().transpose_with_respect_to(&[0]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
-                message: "projected operation `custom_jvp` carries regions and cannot be transposed through its \
-                          member family; transpose it through a composite carrier for that operation instead"
-                    .to_string(),
+                message: "operation `custom_jvp` is not transposable".to_string(),
             }),
         );
     }
@@ -1806,6 +2028,144 @@ mod tests {
         assert_eq!(imported_broadcast.outputs(), imported_outputs.as_slice());
     }
 
+    #[test]
+    fn test_array_ir_batching_stages_one_composite_graph() {
+        // Batching a body that mixes ordinary array arithmetic with first-class dimension arithmetic stages exactly
+        // one composite graph. The array instructions gain a packed batch axis, the dimension instructions stay
+        // replicated shape values, and both kinds live in the same program with a single flat region: nothing is
+        // split into a second universe and no shape is recovered from ambient metadata.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let per_item_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let extent_operation = DimensionSizeOperation::new(&per_item_type, 0).unwrap();
+        let extent_type = extent_operation.result_type().clone();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(per_item_type.clone().into());
+        let doubled = builder
+            .add_instruction(ArrayOperation::Add(AddOperation::new()), Vec::new(), vec![input, input])
+            .unwrap()[0];
+        let extent = builder.add_instruction(extent_operation, Vec::new(), vec![doubled]).unwrap()[0];
+        let total = builder
+            .add_instruction(
+                DimensionOperation::Add(DimensionAddOperation::new(&extent_type, &extent_type).unwrap()),
+                Vec::new(),
+                vec![extent, extent],
+            )
+            .unwrap()[0];
+        let widened = builder
+            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![doubled, total, extent])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
+                Vec::new(),
+                vec![widened],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows] .
+                let %1:f32[rows] = add %0 %0
+                    %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %1
+                    %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
+                    %4:f32[rows + rows, rows] = broadcast [output_axes=[1]] %1 %3 %2
+                    %5:f32[rows] = reduce_sum [axes=[0]] %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        // Batch the body under a staging parent so that the composite graph batching produces is observable as a
+        // program rather than as concrete per-item values. The per-item extent stays symbolic, so the batched graph
+        // remains shape polymorphic in `rows` even though the mapped axis itself has a known size.
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let trace = TraceContext::new();
+        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let packed = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(rows.clone())]))
+                .into(),
+        );
+        let axis_extent_id = axis_extent.atom_id().unwrap();
+        let packed_id = packed.atom_id().unwrap();
+        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let batched_output = program
+            .interpret_in_context(
+                &batching_context,
+                vec![BatchingTracer::new(
+                    batching_context.clone(),
+                    ArrayIrBatch::new(packed, BatchAxis::new(0)).unwrap(),
+                )],
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(batched_output.batch().batch_axis(), BatchAxis::new(0));
+        let batched_output_id = batched_output.into_batch().into_value().atom_id().unwrap();
+
+        // One composite graph: the batched body is a flat instruction sequence over the single composite operation
+        // family, in source order, with array and dimension instructions interleaved and no nested region.
+        let builder = trace.builder().borrow();
+        assert_eq!(
+            builder.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["add", "dimension_size", "dimension_add", "broadcast", "reduce_sum"],
+        );
+        assert!(builder.instructions().iter().all(|instruction| instruction.regions().is_empty()));
+        let [add, dimension_size, dimension_add, broadcast, reduce] = builder.instructions() else {
+            panic!("expected one batched composite graph with five instructions");
+        };
+        assert_eq!(add.inputs(), &[packed_id, packed_id]);
+        assert_eq!(dimension_size.inputs(), &[add.outputs()[0]]);
+        assert_eq!(dimension_add.inputs(), &[dimension_size.outputs()[0], dimension_size.outputs()[0]]);
+        assert_eq!(
+            broadcast.inputs(),
+            &[add.outputs()[0], axis_extent_id, dimension_add.outputs()[0], dimension_size.outputs()[0]],
+        );
+        assert_eq!(reduce.inputs(), &[broadcast.outputs()[0]]);
+        drop(builder);
+
+        let batched_program = trace
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![batched_output_id],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            batched_program.to_string(),
+            indoc! {"
+                lambda %1:f32[2, rows] .
+                let %0:dimension<2> = const
+                    %2:f32[2, rows] = add %1 %1
+                    %3:dimension<rows ∈ [1, 5)> = dimension_size [axis=1] %2
+                    %4:dimension<rows + rows ∈ [2, 9)> = dimension_add %3 %3
+                    %5:f32[2, rows + rows, rows] = broadcast [output_axes=[0, 2]] %2 %0 %4 %3
+                    %6:f32[2, rows] = reduce_sum [axes=[1]] %5
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            batched_program.interpret(vec![ArrayIrValue::Array(Array::from_f64s(
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ))]),
+            Ok(vec![ArrayIrValue::Array(Array::from_f64s(
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+                vec![12.0, 24.0, 36.0, 48.0, 60.0, 72.0],
+            ))]),
+        );
+    }
+
     /// Member-kind signature of one [`ArrayIrOperation`] variant, in terms of which member kinds it consumes and
     /// produces as *values*.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1861,7 +2221,10 @@ mod tests {
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CustomJvp(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::CustomVjp(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::LinearCall(_) => MemberKindSignature::RegionForwarding,
+            ArrayIrOperation::Rematerialize(_) => MemberKindSignature::RegionForwarding,
         }
     }
 
@@ -1980,7 +2343,10 @@ mod tests {
             (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::CustomVjp(CustomVjpOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::LinearCall(LinearCallOperation::new(0)), MemberKindSignature::RegionForwarding),
+            (ArrayIrOperation::Rematerialize(RematerializeOperation::new()), MemberKindSignature::RegionForwarding),
         ];
 
         assert_eq!(
@@ -1990,7 +2356,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 23);
+        assert_eq!(expected.len(), 26);
         assert_eq!(
             expected
                 .iter()

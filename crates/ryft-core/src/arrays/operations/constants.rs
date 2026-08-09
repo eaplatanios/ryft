@@ -298,34 +298,42 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
             .collect()
     }
 
-    /// Captures the value-level counterpart of
-    /// [`capture_zero_residuals`](Self::capture_zero_residuals) in `context`.
-    pub fn capture_zero_residual_values<C>(
+    /// Captures the one extent named by `residual_type` from `source`, or [`None`] when `source`'s type does not carry
+    /// that [`DimensionVariable`]. A first-class dimension of exactly the residual type already _is_ the extent and is
+    /// reused without staging anything, while an array carrying the variable on some axis contributes a
+    /// [`DimensionSizeOperation`] read of that axis. The source's type is inspected before anything is staged,
+    /// so a candidate that does not carry the variable leaves no instruction behind.
+    pub fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>(
         context: &C,
         source: &C::Value,
-        r#type: &ArrayIrType,
-    ) -> Result<Vec<C::Value>, ProgramError>
-    where
-        C: Context<Type = ArrayIrType>,
-        C::Operation: From<DimensionSizeOperation>,
-    {
-        let r#type = <&ArrayType>::try_from(r#type)?;
-        let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
-        if first_axes.is_empty() {
-            return Ok(Vec::new());
+        residual_type: &ArrayIrType,
+    ) -> Result<Option<C::Value>, ProgramError> {
+        let ArrayIrType::Dimension(residual_type) = residual_type else {
+            return Ok(None);
+        };
+        let variable = residual_type.variable();
+        match source.r#type().as_ref() {
+            ArrayIrType::Dimension(source_type) if source_type.variable() == variable => Ok(Some(source.clone())),
+            ArrayIrType::Dimension(_) => Ok(None),
+            ArrayIrType::Array(source_type) => {
+                let axis =
+                    source_type.shape().dimensions().iter().position(
+                        |dimension| matches!(dimension, Dimension::Dynamic(candidate) if candidate == variable),
+                    );
+                match axis {
+                    None => Ok(None),
+                    Some(axis) => Ok(Some(
+                        context
+                            .bind(
+                                DimensionSizeOperation::new(source_type, axis)?,
+                                Vec::new(),
+                                std::slice::from_ref(source),
+                            )?
+                            .remove(0),
+                    )),
+                }
+            }
         }
-        let source_type = source.r#type();
-        let source_type = <&ArrayType>::try_from(source_type.as_ref())?;
-        // Capture one concrete extent per identity from its first source axis; repeated axes reuse that value when the
-        // dynamic zero's per-axis operand list is reconstructed.
-        first_axes
-            .into_iter()
-            .map(|(axis, _)| {
-                Ok(context
-                    .bind(DimensionSizeOperation::new(source_type, axis)?, Vec::new(), std::slice::from_ref(source))?
-                    .remove(0))
-            })
-            .collect()
     }
 
     /// Returns the canonical zero operation for `r#type` and expands one explicit extent residual per distinct dynamic
@@ -374,6 +382,7 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
         }
     }
 
+    #[inline]
     fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
         builder: &mut ProgramBuilder<V, Self>,
         source: AtomId,
@@ -382,14 +391,16 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
         ArrayIrOperation::<A>::capture_zero_residuals(builder, source, r#type)
     }
 
-    fn capture_zero_residual_values<C: Context<Type = ArrayIrType, Operation = Self>>(
+    #[inline]
+    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = Self>>(
         context: &C,
         source: &C::Value,
-        r#type: &ArrayIrType,
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        ArrayIrOperation::<A>::capture_zero_residual_values(context, source, r#type)
+        residual_type: &ArrayIrType,
+    ) -> Result<Option<C::Value>, ProgramError> {
+        ArrayIrOperation::<A>::capture_zero_residual_value(context, source, residual_type)
     }
 
+    #[inline]
     fn zero_operation_with_residuals<R: Clone>(
         r#type: ArrayIrType,
         residuals: &[R],
@@ -1446,5 +1457,71 @@ mod tests {
         .unwrap();
         assert_eq!(array.zero_like(), array);
         assert_eq!(array.one_like().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
+    }
+
+    /// Identity-directed capture answers per declared residual rather than per exemplar, so it must inspect a
+    /// candidate's type before staging anything: a candidate that does not name the requested quantity has to be
+    /// rejected without leaving a dead read behind, and a first-class dimension that already *is* the quantity has to
+    /// be reused rather than re-read.
+    #[test]
+    fn test_capture_zero_residual_value() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::positive(Some(8)).unwrap());
+        let rows_residual_type = ArrayIrType::Dimension(DimensionType::new(rows.clone()));
+        let context = TestContext::new();
+
+        // A first-class dimension of exactly the residual type is the extent already and is reused verbatim.
+        let dimension = context.input(rows_residual_type.clone());
+        let captured =
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &dimension, &rows_residual_type).unwrap();
+        assert_eq!(captured.unwrap().atom_id(), dimension.atom_id());
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        // An array naming the quantity on a non-leading axis contributes a read of that axis, even though its element
+        // type and its other axes differ from anything the zero's own type mentions.
+        let array = context.input(
+            ArrayType::new(
+                DataType::F8E8M0FNU,
+                Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(rows.clone())]),
+            )
+            .into(),
+        );
+        let captured =
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &array, &rows_residual_type).unwrap();
+        assert_eq!(captured.unwrap().r#type().as_ref(), &rows_residual_type);
+        {
+            let builder = context.builder().borrow();
+            let [instruction] = builder.instructions() else {
+                panic!("expected exactly one staged extent read");
+            };
+            let ArrayIrOperation::DimensionSize(operation) = instruction.operation() else {
+                panic!("expected a dimension-size read");
+            };
+            assert_eq!(operation.axis(), 1);
+        }
+
+        // Candidates that do not name the quantity, and residual types that are not first-class dimensions at all,
+        // both answer `None` without staging anything.
+        let unrelated =
+            context.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(columns)])).into());
+        assert!(
+            ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &unrelated, &rows_residual_type)
+                .unwrap()
+                .is_none(),
+        );
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new(rows));
+        assert!(
+            ArrayIrOperation::<Array>::capture_zero_residual_value(
+                &context,
+                &dimension,
+                &ArrayType::scalar(DataType::F64).into(),
+            )
+            .unwrap()
+            .is_none(),
+        );
+        assert_eq!(dimension.r#type().as_ref(), &dimension_type);
+        assert_eq!(context.builder().borrow().instructions().len(), 1);
     }
 }

@@ -115,13 +115,7 @@ impl Operation for DynamicReshapeOperation {
             return Err(TypeError::invalid("'reshape' expects an array followed by its output extents"));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
-        let output_shape = Shape::new(
-            output_extent_types
-                .iter()
-                .map(<&DimensionType>::try_from)
-                .map(|result| result.map(DimensionType::to_dimension))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        let output_shape = Shape::new(ArrayIrType::extents(output_extent_types)?);
         Ok(vec![infer_explicit_reshape_output_type(input_type, output_shape, self)?.into()])
     }
 

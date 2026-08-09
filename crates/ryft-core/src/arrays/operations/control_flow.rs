@@ -799,7 +799,8 @@ mod tests {
             .unwrap()
             .to_vec();
         // Keeping only the doubled output leaves the third branch output dead, so its dynamic cotangent reaches the
-        // transposed condition as a structural zero that no type-only constructor can build.
+        // transposed condition as a structural zero that no type-only constructor can build. The transpose boundary
+        // reads the runtime extent it names off the live peer cotangent and stages the mixed dynamic zero.
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[1]], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
@@ -810,8 +811,9 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[extent], %1:bool[] .
-                let %2:f64[extent] = zero_like %0
-                    %3:f64[extent] = condition %1 %0 %2 [
+                let %2:dimension<extent \u{2208} [1, 8)> = dimension_size [axis=0] %0
+                    %3:f64[extent] = zero [type=f64[extent]] %2
+                    %4:f64[extent] = condition %1 %0 %3 [
                         true={
                             lambda %0:f64[extent], %1:f64[extent] .
                             let %2:f64[extent] = add %1 %0
@@ -825,7 +827,7 @@ mod tests {
                             in (%3)
                         },
                     ]
-                in (%3)"}
+                in (%4)"}
             .trim_end(),
         );
         let mut primal_outputs = linearization
@@ -871,7 +873,8 @@ mod tests {
             .unwrap()
             .to_vec();
         // Keeping only the accumulating carry leaves the second carry dead, so the reversed scan needs a dynamic zero
-        // cotangent for it. The live first-carry cotangent has exactly that type and supplies the runtime extent.
+        // cotangent for it. The live first-carry cotangent names the same runtime extent, which the transpose boundary
+        // reads off it before staging the mixed dynamic zero.
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -882,15 +885,16 @@ mod tests {
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[extent] .
-                let %1:f64[extent] = zero_like %0
-                    %2:f64[extent], %3:f64[extent] = scan [carry_count=2, length=2, reverse=true] %0 %1 [
+                let %1:dimension<extent \u{2208} [1, 8)> = dimension_size [axis=0] %0
+                    %2:f64[extent] = zero [type=f64[extent]] %1
+                    %3:f64[extent], %4:f64[extent] = scan [carry_count=2, length=2, reverse=true] %0 %2 [
                         body={
                             lambda %0:f64[extent], %1:f64[extent] .
                             let %2:f64[extent] = add %1 %0
                             in (%0, %2)
                         },
                     ]
-                in (%2, %3)"}
+                in (%3, %4)"}
             .trim_end(),
         );
         assert_eq!(

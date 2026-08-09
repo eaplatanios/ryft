@@ -627,7 +627,7 @@ mod tests {
     use crate::operations::dimensions::test_dimension_type;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{Program, ProgramBuilder};
+    use crate::programs::{Program, ProgramBuilder, Typed};
 
     use super::*;
 
@@ -992,8 +992,9 @@ mod tests {
         }
 
         // Requirements are ordered assertions, so a program that states them in a different order is a different
-        // program. Both orderings bind exactly the same atoms, and the rendering distinguishes them purely by where
-        // the resultless statements fall in the statement sequence.
+        // program. Both orderings bind exactly the same atoms (compared by declared type, because each `dimension_add`
+        // mints a fresh `left + right` variable identity), and the rendering distinguishes them purely by where the
+        // resultless statements fall in the statement sequence.
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let left_atom = builder.add_input(left.clone());
         let right_atom = builder.add_input(right.clone());
@@ -1025,7 +1026,10 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert_eq!(swapped.atoms(), programs[0].atoms());
+        assert_eq!(
+            swapped.atoms().iter().map(|atom| atom.r#type().to_string()).collect::<Vec<_>>(),
+            programs[0].atoms().iter().map(|atom| atom.r#type().to_string()).collect::<Vec<_>>(),
+        );
         assert_eq!(
             swapped.to_string(),
             indoc! {"

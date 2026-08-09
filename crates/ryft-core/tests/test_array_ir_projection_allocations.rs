@@ -13,14 +13,11 @@ use std::hint::black_box;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ryft_core::arrays::{
-    Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
-};
-use ryft_core::contexts::EagerContext;
-use ryft_core::operations::constants::{Fill, Iota};
-use ryft_core::operations::math::{Add, Sin};
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
-use ryft_core::{ArrayIrValue, ValueProjection};
+use ryft_core::{
+    Add, Array, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+    DimensionVariable, EagerContext, Fill, Iota, Shape, Sin, ValueProjection,
+};
 
 /// Allocator that counts allocations made by this integration-test binary.
 struct CountingAllocator;

@@ -14,8 +14,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation, TransposableOperation, TranspositionDriver,
-    transpose_projected_operation,
+    ElementwiseDerivativeAlignment, LinearCallOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -224,10 +224,7 @@ impl Operation for PadOperation<ArrayIrType> {
             ProgramError::Type(error) => error,
             error => TypeError::invalid(error.to_string()),
         })?;
-        let output_dimensions = input_types[2..]
-            .iter()
-            .map(|r#type| <&DimensionType>::try_from(r#type).map(DimensionType::to_dimension))
-            .collect::<Result<Vec<_>, _>>()?;
+        let output_dimensions = ArrayIrType::extents(&input_types[2..])?;
 
         if is_effective_identity(input, self.edge_padding_low(), self.edge_padding_high(), self.interior_padding()) {
             if output_dimensions != input.shape().dimensions() {
@@ -592,10 +589,11 @@ where
 /// extents so the linear transpose can reconstruct both the operand and padding-value cotangents.
 impl<C> DifferentiableOperation<C> for PadOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayIrType>,
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<DimensionSizeOperation>
+    C::Operation: ResidualZeroProvider<ArrayIrType>
+        + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<PadOperation<ArrayIrType>>

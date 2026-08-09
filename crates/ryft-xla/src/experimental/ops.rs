@@ -556,12 +556,12 @@ where
         ArrayIrOperation::<Capture::Projected>::capture_zero_residuals(builder, source, r#type)
     }
 
-    fn capture_zero_residual_values<C: Context<Type = ArrayIrType, Operation = Self>>(
+    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = Self>>(
         context: &C,
         source: &C::Value,
-        r#type: &ArrayIrType,
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        ArrayIrOperation::<Capture::Projected>::capture_zero_residual_values(context, source, r#type)
+        residual_type: &ArrayIrType,
+    ) -> Result<Option<C::Value>, ProgramError> {
+        ArrayIrOperation::<Capture::Projected>::capture_zero_residual_value(context, source, residual_type)
     }
 
     fn zero_operation_with_residuals<R: Clone>(
@@ -1128,8 +1128,9 @@ mod tests {
         DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
         DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
         MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
-        RematerializeOperation, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
-        TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation, ZeroOperation,
+        RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
+        StagingContext, TracingContext, TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation,
+        ZeroOperation,
     };
 
     use super::{
@@ -1324,6 +1325,76 @@ mod tests {
         let zero = pullback.instructions().last().unwrap();
         assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[ryft_core::AtomId::new(1)]);
+    }
+
+    #[test]
+    fn test_xla_residual_zero_provider_materializes_dynamic_zero_from_array_source() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let tangent_type = primal_type.tangent();
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let primal = context.input(ArrayIrType::Array(primal_type));
+
+        // The XLA family delegates the singular identity-directed capture hook to the Array-IR implementation. A
+        // source with the same geometry but a different element representation therefore supplies the extent for the
+        // dynamic tangent zero instead of falling through to the input-free default.
+        let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(ArrayIrType::Array(tangent_type.clone())),
+            std::slice::from_ref(&primal),
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &ArrayIrType::Array(tangent_type));
+
+        let builder = context.builder().borrow();
+        let [dimension_size, zero] = builder.instructions() else {
+            panic!("expected one dimension-size instruction followed by one dynamic zero instruction");
+        };
+        assert!(matches!(dimension_size.operation(), XlaOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert_eq!(dimension_size.inputs(), &[primal.atom_id().unwrap()]);
+        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[dimension_size.outputs()[0]]);
+    }
+
+    #[test]
+    fn test_xla_residual_zero_provider_assembles_dynamic_zero_from_several_sources() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(7)).unwrap());
+        let zero_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
+        );
+        let context = TracingContext::<XlaConstant, XlaOperation>::new();
+        let sources = [
+            context.input(ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])))),
+            context.input(ArrayIrType::Array(ArrayType::new(
+                DataType::F8E8M0FNU,
+                Shape::new(vec![Dimension::Dynamic(rows)]),
+            ))),
+            context.input(ArrayIrType::Dimension(DimensionType::new(columns))),
+        ];
+
+        // No single source has the zero's type, so the geometry is assembled per declared residual: the statically
+        // shaped candidate names neither identity and is skipped without staging anything, the dynamic array supplies
+        // the row extent through a `dimension_size` read, and the first-class dimension supplies the column extent as
+        // itself. Only the composite delegation makes this reachable in the XLA family; the input-free default would
+        // report every residual as unsupplied.
+        let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
+            &context,
+            MaybeZero::Zero(ArrayIrType::Array(zero_type.clone())),
+            &sources,
+        )
+        .unwrap();
+        assert_eq!(zero.r#type().as_ref(), &ArrayIrType::Array(zero_type));
+
+        let builder = context.builder().borrow();
+        let [dimension_size, zero] = builder.instructions() else {
+            panic!("expected one dimension-size instruction followed by one dynamic zero instruction");
+        };
+        assert!(matches!(dimension_size.operation(), XlaOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert_eq!(dimension_size.inputs(), &[sources[1].atom_id().unwrap()]);
+        assert!(matches!(zero.operation(), XlaOperation::Zero(_)));
+        assert_eq!(zero.inputs(), &[dimension_size.outputs()[0], sources[2].atom_id().unwrap()]);
     }
 
     #[test]

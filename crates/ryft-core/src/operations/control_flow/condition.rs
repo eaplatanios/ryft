@@ -1169,7 +1169,7 @@ where
             if !operand.tangent().r#type().is_zero_space() {
                 // The operand primal names every runtime quantity a reference-bearing tangent type omits, because
                 // the tangent type derivation preserves geometry exactly.
-                condition_operands.push(C::Operation::materialize_zero_with_geometry(
+                condition_operands.push(C::Operation::materialize_zero_from_residual_sources(
                     context,
                     operand.tangent().clone(),
                     std::iter::once(operand.primal()),
@@ -1320,7 +1320,7 @@ where
         // type alone cannot construct it when it references runtime identities, but the boundary already carries that
         // geometry: at least one peer cotangent is live here (the all-zero case returned above), and the known
         // residuals are live too.
-        operands.push(O::materialize_zero_with_geometry(
+        operands.push(O::materialize_zero_from_residual_sources(
             context,
             cotangent.clone(),
             outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals),

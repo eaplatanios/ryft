@@ -14,8 +14,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation, TransposableOperation, TranspositionDriver,
-    transpose_projected_operation,
+    ElementwiseDerivativeAlignment, LinearCallOperation, ResidualZeroProvider, TransposableOperation,
+    TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
@@ -374,10 +374,11 @@ impl_differentiable_operation! {
 /// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
 impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
 where
-    C: Context<Type = ArrayIrType>,
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<ConcatenateOperation<ArrayIrType>>
+    C::Operation: ResidualZeroProvider<ArrayIrType>
+        + From<ConcatenateOperation<ArrayIrType>>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
@@ -513,13 +514,22 @@ where
     }
 }
 
-/// Direct transposition rule for mixed array IR concatenation. Static concatenated axes delegate to the
-/// homogeneous array pullback, while the explicit result extent receives a structural-zero cotangent. Dynamic input
-/// extents require linearization so they can be retained as residuals by [`DifferentiableOperation::jvp`].
+/// Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
+/// cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
+/// concatenated axis. Fully static operands delegate that slicing to the homogeneous array pullback. Operands with a
+/// dynamic extent on a *non-concatenated* axis are sliced directly in the composite universe instead, reading each
+/// such extent off the live output cotangent, which repeats the operand's dimension identity on every preserved axis.
+/// A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold, because the
+/// per-operand offsets are then runtime sums, so that case requires linearization instead, which retains those input
+/// extents as explicit residuals through [`DifferentiableOperation::jvp`].
 impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType>
+        + From<DimensionOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + From<DynamicShapeSliceOperation>,
     <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,
@@ -551,10 +561,12 @@ where
                 .into()),
             };
         }
+        let axis = self.axis();
+        let mut array_types = Vec::with_capacity(array_inputs.len());
         for input in array_inputs {
             let input_type = input.r#type();
             let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
-            if matches!(input_type.dimension(self.axis()), Dimension::Dynamic(_)) {
+            if matches!(input_type.dimension(axis), Dimension::Dynamic(_)) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
                         "direct transposition of a dynamic '{CONCATENATE_OPERATION_NAME}' requires linearization so \
@@ -563,12 +575,107 @@ where
                 }
                 .into());
             }
+            array_types.push(input_type.clone());
         }
 
-        let operation = <O as OperationProjection<ArrayType>>::Projected::from(
-            ConcatenateOperation::<ArrayType>::from(self.clone()),
-        );
-        let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
+        if array_types.iter().all(|input_type| input_type.static_shape().is_some()) {
+            let operation = <O as OperationProjection<ArrayType>>::Projected::from(
+                ConcatenateOperation::<ArrayType>::from(self.clone()),
+            );
+            let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
+            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
+            return Ok(cotangents);
+        }
+
+        // A dynamic extent on a non-concatenated axis needs no residual, because the exact geometry the pullback
+        // requires is already live at this boundary. Concatenation preserves every non-concatenated axis, so the
+        // output cotangent repeats each operand's dimension identity there, and a repeated identity denotes one
+        // runtime quantity. Reading those extents off the cotangent therefore recovers the operand geometry exactly
+        // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
+        // express this because its [`SliceOperation`] bounds are static payload values, so the composite slice is
+        // staged here directly.
+        check_count!("output", outputs, 1, ProgramError);
+        let mut cotangents = Vec::with_capacity(inputs.len());
+        match &outputs[0] {
+            MaybeZero::Zero(_) => {
+                cotangents.extend(array_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
+            }
+            MaybeZero::Value(cotangent) => {
+                let cotangent_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
+                let rank = cotangent_type.rank();
+
+                // Stage the geometry shared by every operand slice once: a zero start, and one extent per
+                // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
+                // read of the live cotangent for a dynamic one. The concatenated axis is filled in per operand below.
+                let zero = context
+                    .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                        DimensionValue::constant(0).map_err(ProgramError::from)?,
+                    )))?
+                    .remove(0);
+                let mut extents = Vec::with_capacity(rank);
+                for (other_axis, dimension) in cotangent_type.shape().dimensions().iter().enumerate() {
+                    extents.push(match dimension {
+                        _ if other_axis == axis => None,
+                        Dimension::Static(extent) => Some(
+                            context
+                                .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                                    DimensionValue::constant(*extent).map_err(ProgramError::from)?,
+                                )))?
+                                .remove(0),
+                        ),
+                        Dimension::Dynamic(_) => Some(
+                            context
+                                .stage_operation(
+                                    DimensionSizeOperation::new(&cotangent_type, other_axis)?,
+                                    Vec::new(),
+                                    std::slice::from_ref(cotangent),
+                                )?
+                                .remove(0),
+                        ),
+                    });
+                }
+
+                // Slice the output cotangent back into per-operand pieces at cumulative offsets along the
+                // concatenated axis. Those offsets and the operand extents along it are static by the guard above,
+                // so they stage as exact dimension constants.
+                let mut offset = 0usize;
+                for input_type in &array_types {
+                    let Dimension::Static(input_axis_size) = input_type.dimension(axis) else {
+                        unreachable!("the guard above rejects a dynamic concatenated axis");
+                    };
+                    let start = if offset == 0 {
+                        zero.clone()
+                    } else {
+                        context
+                            .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                                DimensionValue::constant(offset).map_err(ProgramError::from)?,
+                            )))?
+                            .remove(0)
+                    };
+                    let size = context
+                        .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                            DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
+                        )))?
+                        .remove(0);
+                    let mut slice_inputs = Vec::with_capacity(1 + 2 * rank);
+                    slice_inputs.push(cotangent.clone());
+                    for other_axis in 0..rank {
+                        slice_inputs.push(if other_axis == axis { start.clone() } else { zero.clone() });
+                    }
+                    for extent in &extents {
+                        slice_inputs.push(extent.clone().unwrap_or_else(|| size.clone()));
+                    }
+                    let slice = context.stage_operation(
+                        DynamicShapeSliceOperation::new(rank),
+                        Vec::new(),
+                        slice_inputs.as_slice(),
+                    )?;
+                    check_count!("output", slice, 1, ProgramError);
+                    cotangents.push(MaybeZero::Value(slice.into_iter().next().unwrap()));
+                    offset += input_axis_size;
+                }
+            }
+        }
         cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
         Ok(cotangents)
     }
@@ -877,15 +984,11 @@ fn infer_array_ir_concatenation(
     Ok((axis, output_type, static_sum.is_none()))
 }
 
-/// Validates concatenation array inputs and returns their axis sum when every input axis is static.
+/// Validates concatenation array inputs and returns their axis sum when every input axis is static. Both call sites
+/// normalize `axis` against `inputs[0]`'s rank first, so `axis` is always in bounds here.
 fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<Option<usize>, TypeError> {
     let first = inputs[0];
     let rank = first.rank();
-    if axis >= rank {
-        return Err(TypeError::invalid(format!(
-            "'{CONCATENATE_OPERATION_NAME}' axis {axis} is out of bounds for operands of rank {rank}",
-        )));
-    }
     let mut concatenated_static = 0usize;
     let mut all_static = true;
     for (index, operand) in inputs.iter().enumerate() {
@@ -1030,10 +1133,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionValue,
+        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        StridedLayout,
     };
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -1559,9 +1663,12 @@ mod tests {
             }],
         );
 
-        // A dynamic non-concatenated axis cannot be reconstructed by this homogeneous static-slice rule. Composite
-        // differentiation retains that runtime extent as an explicit residual. Direct homogeneous transposition
-        // rejects the case instead of consulting hidden input-shape metadata.
+        // A dynamic non-concatenated axis cannot be expressed by this homogeneous rule, whose `slice` bounds are
+        // static payload values, so transposition rejects the case instead of consulting hidden input-shape metadata.
+        // The composite rule does not inherit that rejection: it delegates here only for fully static operands and
+        // otherwise stages a `dynamic_shape_slice` whose extents it reads off the live output cotangent, which is
+        // pinned by `test_array_ir_concatenate_transpose_slices_a_dynamic_non_concatenated_extent` in
+        // `arrays::operations`.
         let columns = DimensionVariable::new("columns", DimensionBounds::unbounded());
         let left_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(columns.clone())]));
@@ -1837,5 +1944,53 @@ mod tests {
                 "'concatenate' output size overflows usize on axis 0".to_string(),
             ))),
         );
+    }
+
+    /// Driver-side coverage for the widened differential representation at a dynamic shape. The `f32` tangent of an
+    /// `f8e8m0fnu[n]` operand has no live value of its own type anywhere, so the mixed JVP rule reads the extent `n`
+    /// from the operand's own primal and stages the mixed dynamic zero rather than an unconstructible nullary one.
+    #[test]
+    fn test_concatenate_jvp_materializes_a_widened_dynamic_zero_tangent() {
+        type CompositeValue = ArrayIrValue<Array>;
+        type CompositeOperation = ArrayIrOperation<Array>;
+        type TestContext = TracingContext<CompositeValue, CompositeOperation>;
+
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.clone())]));
+        let widened_type = narrow_type.tangent();
+        assert_eq!(widened_type.data_type(), DataType::F32);
+
+        let context = TestContext::new();
+        let first_primal = context.input(narrow_type.clone().into());
+        let second_primal = context.input(narrow_type.clone().into());
+        let live_tangent = context.input(widened_type.clone().into());
+        let result_extent = context.input(DimensionType::new(n).into());
+
+        // The first operand carries a live tangent so the rule does not short-circuit, while the second carries a
+        // structural zero whose type names the runtime extent `n` but pins nothing.
+        let inputs = vec![
+            DifferentiationDual::new(first_primal, MaybeZero::Value(live_tangent)).unwrap(),
+            DifferentiationDual::new(second_primal, MaybeZero::Zero(widened_type.clone().into())).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(result_extent),
+        ];
+        let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
+            .jvp(&context, &EmptyRegionDriver, inputs.as_slice())
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayIrType::Array(widened_type));
+
+        // The staged extent read and the mixed dynamic zero both target the second operand's own primal.
+        let builder = context.builder().borrow();
+        let size = builder
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::DimensionSize(_)))
+            .expect("expected one staged extent read");
+        let zero = builder
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Zero(_)))
+            .expect("expected one staged mixed dynamic zero");
+        assert_eq!(zero.inputs(), size.outputs());
     }
 }

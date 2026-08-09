@@ -1838,7 +1838,7 @@ where
             .zip(&element_has_tangent)
             .filter_map(|(input, &has_tangent)| {
                 has_tangent.then(|| {
-                    C::Operation::materialize_zero_with_geometry(
+                    C::Operation::materialize_zero_from_residual_sources(
                         context,
                         input.tangent().clone(),
                         std::iter::once(input.primal()),
@@ -1965,7 +1965,7 @@ where
     operands.extend(inputs.iter().map(|input| input.primal().clone()));
     for (input, &has_tangent) in inputs.iter().zip(&element_has_tangent) {
         if has_tangent {
-            operands.push(C::Operation::materialize_zero_with_geometry(
+            operands.push(C::Operation::materialize_zero_from_residual_sources(
                 context,
                 input.tangent().clone(),
                 std::iter::once(input.primal()),

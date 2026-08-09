@@ -18,8 +18,7 @@ pub use batching::{
     ReplicatedDimensionBatchingPolicy, StaticArrayBatchingPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
-pub use differentiation::materialize_array_tangent;
-pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals};
+pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};
 pub use dimensions::DimensionValue;
 pub use encoding::{
     ArrayElement, Complex, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,

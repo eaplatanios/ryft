@@ -2154,7 +2154,7 @@ where
         operands.extend(body_inputs[..carry_count].iter().map(|input| input.primal().clone()));
         for (input, &live) in body_inputs[..carry_count].iter().zip(&input_has_tangent[..carry_count]) {
             if live {
-                operands.push(C::Operation::materialize_zero_with_geometry(
+                operands.push(C::Operation::materialize_zero_from_residual_sources(
                     context,
                     input.tangent().clone(),
                     std::iter::once(input.primal()),
@@ -2164,7 +2164,7 @@ where
         operands.extend(body_inputs[carry_count..].iter().map(|input| input.primal().clone()));
         for (input, &live) in body_inputs[carry_count..].iter().zip(&input_has_tangent[carry_count..]) {
             if live {
-                operands.push(C::Operation::materialize_zero_with_geometry(
+                operands.push(C::Operation::materialize_zero_from_residual_sources(
                     context,
                     input.tangent().clone(),
                     std::iter::once(input.primal()),
@@ -2436,7 +2436,7 @@ where
     let mut materialized = outputs
         .iter()
         .map(|cotangent| {
-            Target::materialize_zero_with_geometry(
+            Target::materialize_zero_from_residual_sources(
                 context,
                 cotangent.clone(),
                 outputs
@@ -2595,7 +2595,11 @@ where
     let mut operands = Vec::with_capacity(outputs.len() + operand_linear.len());
     for index in 0..carry_count {
         if operand_linear[index] {
-            operands.push(O::materialize_zero_with_geometry(context, outputs[index].clone(), geometry_sources())?);
+            operands.push(O::materialize_zero_from_residual_sources(
+                context,
+                outputs[index].clone(),
+                geometry_sources(),
+            )?);
         } else {
             operands.push(scan_inputs[index].as_known().cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
@@ -2606,7 +2610,7 @@ where
     }
     for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
         if !output_type.cotangent().is_zero_space() {
-            operands.push(O::materialize_zero_with_geometry(context, cotangent.clone(), geometry_sources())?);
+            operands.push(O::materialize_zero_from_residual_sources(context, cotangent.clone(), geometry_sources())?);
         }
     }
 
@@ -3862,6 +3866,87 @@ mod tests {
         assert_eq!(threaded.input_types(), vec![key_type.clone(), accumulator_type.clone()]);
         assert_eq!(threaded.output_types(), vec![key_type, accumulator_type]);
         assert_eq!(threaded.instructions().len(), 0);
+    }
+
+    /// A dead *stacked* output's cotangent has the scan-length-prefixed type `f64[length, k]`, which no single value at
+    /// the transpose boundary carries: the length rides the runtime length operand and the inner extent rides the
+    /// per-iteration carry cotangent. Identity-directed materialization assembles the zero from both, so the reversed
+    /// scan gets a well-typed operand instead of failing on an unconstructible nullary zero.
+    #[test]
+    fn test_scan_transpose_materializes_dead_dynamic_stacked_cotangent() {
+        type CompositeValue = ArrayIrValue<Array>;
+        type CompositeOperation = ArrayIrOperation<Array>;
+
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
+        let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
+        let item_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(k.clone())])));
+        let stacked_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(k)]),
+        ));
+
+        // The body maps `[carry, x]` to `[carry + x, carry]`, so the scan produces a final carry and a stacked
+        // per-iteration output. Both halves are linear in the operands.
+        let mut body_builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
+        let carry = body_builder.add_input(item_type.clone());
+        let x = body_builder.add_input(item_type.clone());
+        let sum = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, x])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<CompositeValue>, Vec<CompositeValue>>(
+                vec![sum, carry],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Only the final carry is a program output, so the stacked output is dead and its cotangent is a structural
+        // zero of the dynamically shaped stacked type.
+        let mut builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
+        let runtime_length = builder.add_input(ArrayIrType::Dimension(DimensionType::new(length.clone())));
+        let carry_init = builder.add_input(item_type);
+        let stacked_input = builder.add_input(stacked_type.clone());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                CompositeOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
+                vec![body_region],
+                vec![carry_init, stacked_input, runtime_length],
+            )
+            .unwrap()
+            .to_vec();
+        assert_eq!(builder.atoms()[outputs[1].index()].r#type().as_ref(), &stacked_type);
+        let program = builder
+            .build::<Vec<CompositeValue>, Vec<CompositeValue>>(
+                vec![outputs[0]],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Transposing with respect to the carry initializer and the stacked operand reaches the dead stacked
+        // cotangent. The pullback reads the inner extent off the live carry cotangent, reuses the runtime length
+        // operand, and stages the mixed dynamic zero over both.
+        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[k], %1:dimension<length \u{2208} [1, 8)> .
+                let %2:dimension<k \u{2208} [1, 8)> = dimension_size [axis=0] %0
+                    %3:f64[length, k] = zero [type=f64[length, k]] %1 %2
+                    %4:f64[k], %5:f64[length, k] = scan [carry_count=1, length=length, reverse=true] %0 %3 %1 [
+                        body={
+                            lambda %0:f64[k], %1:f64[k] .
+                            let %2:f64[k] = add %1 %0
+                            in (%2, %0)
+                        },
+                    ]
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
     }
 
     /// The fused JVP rule stages exactly one scan with doubled carries and **no** per-iteration residual stacks:
