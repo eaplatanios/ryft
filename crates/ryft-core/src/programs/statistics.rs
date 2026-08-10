@@ -82,8 +82,6 @@ impl ProgramStatistics {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Structural statistics of one [`Region`](crate::Region) in a [`Program`]'s region arena. All statistics are
 /// local to a region: instructions and constants of attached regions are reported as part of those regions' own
 /// [`RegionStatistics`], and attached regions do not contribute to
@@ -96,73 +94,77 @@ pub struct RegionStatistics {
     /// Number of output [`Atom`](crate::Atom)s in the [`Region`](crate::Region)'s boundary.
     output_count: usize,
 
+    /// Number of constant [`Atom`](crate::Atom)s stored in the [`Region`](crate::Region)'s atom table.
+    constant_count: usize,
+
     /// Number of [`Instruction`](crate::Instruction)s in the [`Region`](crate::Region), including instructions whose
     /// outputs reach no region output.
     instruction_count: usize,
 
-    // TODO(eaplatanios): Move before `instruction_count` here and in all constructor calls.
-    /// Number of constant [`Atom`](crate::Atom)s stored in the [`Region`](crate::Region)'s atom table.
-    constant_count: usize,
-
-    /// Per-operation instruction counts, keyed by exact [`Operation::name`] strings.
+    /// Per-[`Operation`] [`Instruction`](crate::Instruction) counts, keyed by [`Operation::name`].
     operation_counts: BTreeMap<&'static str, usize>,
 
-    /// Maximum data-dependency depth over the region's outputs. Inputs and constants have depth zero, an instruction
-    /// output has depth one plus the maximum depth of the instruction's inputs (so the outputs of a zero-input
-    /// instruction have depth one), and the maximum is taken over region outputs only, so deeper dead work is
-    /// excluded. A region without outputs, and a region output that is an input or constant atom, both yield depth
-    /// zero. Attached regions contribute nothing: a `while` instruction is one step regardless of its body's depth.
+    /// Maximum data-dependency depth over the [`Region`](crate::Region)'s outputs. Refer to the documentation of
+    /// [`Self::maximum_output_dependency_depth`] for more information.
     maximum_output_dependency_depth: usize,
 
-    /// Attached-region edges recorded at their use sites, ordered by instruction index and then slot order.
+    /// Attached-[`Region`](crate::Region) statistics recorded at their use sites, ordered by
+    /// [`Instruction`](crate::Instruction) index and then slot order.
     attached_regions: Vec<AttachedRegionStatistics>,
 }
 
 impl RegionStatistics {
-    /// Returns the number of input atoms in the region's boundary.
+    /// Returns the number of input [`Atom`](crate::Atom)s in the [`Region`](crate::Region)'s boundary.
     #[inline]
     pub fn input_count(&self) -> usize {
         self.input_count
     }
 
-    /// Returns the number of output atoms in the region's boundary.
+    /// Returns the number of output [`Atom`](crate::Atom)s in the [`Region`](crate::Region)'s boundary.
     #[inline]
     pub fn output_count(&self) -> usize {
         self.output_count
     }
 
-    /// Returns the number of instructions in the region, including instructions whose outputs reach no region output.
-    #[inline]
-    pub fn instruction_count(&self) -> usize {
-        self.instruction_count
-    }
-
-    /// Returns the number of constant atoms stored in the region's atom table.
+    /// Returns the number of constant [`Atom`](crate::Atom)s stored in the [`Region`](crate::Region)'s atom table.
     #[inline]
     pub fn constant_count(&self) -> usize {
         self.constant_count
     }
 
-    /// Returns the per-operation instruction counts, keyed by exact [`Operation::name`] strings.
+    /// Returns the number of [`Instruction`](crate::Instruction)s in the [`Region`](crate::Region), including
+    /// instructions whose outputs reach no region output.
+    #[inline]
+    pub fn instruction_count(&self) -> usize {
+        self.instruction_count
+    }
+
+    /// Returns the per-[`Operation`] [`Instruction`](crate::Instruction) counts, keyed by [`Operation::name`].
     #[inline]
     pub fn operation_counts(&self) -> &BTreeMap<&'static str, usize> {
         &self.operation_counts
     }
 
-    /// Returns the maximum data-dependency depth over the region's outputs. Refer to the documentation of the
-    /// corresponding field for the precise definition.
+    /// Returns the maximum data-dependency depth over the [`Region`](crate::Region)'s outputs. Inputs and constants
+    /// have depth zero, an [`Instruction`](crate::Instruction) output has depth one plus the maximum depth of the
+    /// instruction's inputs (so the outputs of a zero-input instruction have depth one), and the maximum is taken over
+    /// region outputs only, so deeper dead work is excluded. A region without outputs, and a region output that is an
+    /// input or constant atom, both yield depth zero. Attached regions contribute nothing (e.g., a `while` instruction
+    /// is one step regardless of its body's depth).
     #[inline]
     pub fn maximum_output_dependency_depth(&self) -> usize {
         self.maximum_output_dependency_depth
     }
 
-    /// Returns the attached-region edges recorded at their use sites, ordered by instruction index and then slot
-    /// order.
+    /// Returns the attached-[`Region`](crate::Region) statistics recorded at their use sites, ordered by
+    /// [`Instruction`](crate::Instruction) index and then slot order.
     #[inline]
     pub fn attached_regions(&self) -> &[AttachedRegionStatistics] {
         &self.attached_regions
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One attached-region edge in a [`RegionStatistics`] node: the use site at which an instruction attaches a region.
 /// Edges are recorded per use, so a region attached several times — by several instructions or by several slots of
@@ -269,8 +271,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 RegionStatistics {
                     input_count: region.input_ids().len(),
                     output_count: region.output_ids().len(),
-                    instruction_count: region.instructions().len(),
                     constant_count: region.atoms().iter().filter(|atom| atom.is_constant()).count(),
+                    instruction_count: region.instructions().len(),
                     operation_counts,
                     maximum_output_dependency_depth: region
                         .output_ids()
@@ -331,8 +333,8 @@ mod tests {
             &RegionStatistics {
                 input_count: 1,
                 output_count: 1,
-                instruction_count: 2,
                 constant_count: 1,
+                instruction_count: 2,
                 operation_counts: BTreeMap::from([(ADD_OPERATION_NAME, 1usize), ("sin", 1usize)]),
                 maximum_output_dependency_depth: 2,
                 attached_regions: Vec::new(),
@@ -631,8 +633,8 @@ mod tests {
                     {
                       "input_count": 1,
                       "output_count": 1,
-                      "instruction_count": 0,
                       "constant_count": 0,
+                      "instruction_count": 0,
                       "operation_counts": {},
                       "maximum_output_dependency_depth": 0,
                       "attached_regions": []
@@ -640,8 +642,8 @@ mod tests {
                     {
                       "input_count": 1,
                       "output_count": 1,
-                      "instruction_count": 2,
                       "constant_count": 1,
+                      "instruction_count": 2,
                       "operation_counts": {
                         "add": 1,
                         "with_regions": 1
