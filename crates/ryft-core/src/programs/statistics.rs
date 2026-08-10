@@ -164,69 +164,70 @@ impl RegionStatistics {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One attached-region edge in a [`RegionStatistics`] node: the use site at which an instruction attaches a region.
-/// Edges are recorded per use, so a region attached several times — by several instructions or by several slots of
-/// one instruction — produces several edges referencing the same [`region_index`](Self::region_index). Edge lists are
-/// ordered rather than keyed by label, because slot-name uniqueness is a convention rather than an enforced
-/// invariant.
+/// Statics of an attached [`Region`](crate::Region) that is part of a [`RegionStatistics`] instance. Region attachment
+/// edges are recorded per use, so that a region that is attached several times (i.e., by several instructions or by
+/// several slots of one [`Instruction`](crate::Instruction)) produces several edges referencing the same
+/// [`region_index`](Self::region_index). Edge lists are ordered rather than keyed by label, because slot-name
+/// uniqueness is a convention rather than an enforced invariant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AttachedRegionStatistics {
-    /// Index of the attaching instruction within its region's instruction list.
+    /// Index of the attaching [`Instruction`](crate::Instruction) within its [`Region`](crate::Region)'s instructions.
     instruction_index: usize,
 
-    /// Exact [`Operation::name`] of the attaching instruction's operation.
+    /// Exact [`Operation::name`] of the attaching [`Instruction`](crate::Instruction)'s operation.
     operation: &'static str,
 
-    /// Name of the [`RegionSlot`](crate::programs::regions::RegionSlot) through which the region is attached.
+    /// Name of the [`RegionSlot`](crate::RegionSlot) through which the [`Region`](crate::Region) is attached.
     region_slot: &'static str,
 
-    /// Semantic [`RegionRole`] of the slot through which the region is attached.
+    /// Semantic [`RegionRole`] of the slot through which the [`Region`](crate::Region) is attached.
     region_role: RegionRole,
 
-    /// Index of the attached region's [`RegionStatistics`] node inside [`ProgramStatistics::regions`].
+    /// Index of the attached region's [`RegionStatistics`] instance inside [`ProgramStatistics::regions`].
     region_index: usize,
 }
 
 impl AttachedRegionStatistics {
-    /// Returns the index of the attaching instruction within its region's instruction list.
+    /// Returns the index of the attaching [`Instruction`](crate::Instruction) within its [`Region`](crate::Region)'s
+    /// instructions.
     #[inline]
     pub fn instruction_index(&self) -> usize {
         self.instruction_index
     }
 
-    /// Returns the exact [`Operation::name`] of the attaching instruction's operation.
+    /// Returns the exact [`Operation::name`] of the attaching [`Instruction`](crate::Instruction)'s operation.
     #[inline]
     pub fn operation(&self) -> &'static str {
         self.operation
     }
 
-    /// Returns the name of the [`RegionSlot`](crate::programs::regions::RegionSlot) through which the region is
-    /// attached.
+    /// Returns the name of the [`RegionSlot`](crate::RegionSlot) through which the [`Region`](crate::Region)
+    /// is attached.
     #[inline]
     pub fn region_slot(&self) -> &'static str {
         self.region_slot
     }
 
-    /// Returns the semantic [`RegionRole`] of the slot through which the region is attached.
+    /// Returns the semantic [`RegionRole`] of the slot through which the [`Region`](crate::Region) is attached.
     #[inline]
     pub fn region_role(&self) -> RegionRole {
         self.region_role
     }
 
-    /// Returns the index of the attached region's [`RegionStatistics`] node inside [`ProgramStatistics::regions`].
+    /// Returns the index of the attached region's [`RegionStatistics`] instance inside [`ProgramStatistics::regions`].
     #[inline]
     pub fn region_index(&self) -> usize {
         self.region_index
     }
 
-    /// Returns the fused `"{operation}.{region_slot}"` display label for this edge.
+    /// Returns a display label for this edge that is formatted as `"{operation}.{region_slot}"`.
     #[inline]
     pub fn label(&self) -> String {
         format!("{}.{}", self.operation, self.region_slot)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<V, O, Input, Output>
