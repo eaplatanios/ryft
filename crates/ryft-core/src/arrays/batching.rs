@@ -6812,11 +6812,8 @@ mod tests {
         let trace = TraceContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
         let rows = trace.input(
-            ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]),
-            )
-            .into(),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]))
+                .into(),
         );
         let vector = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
         let output = batch(
@@ -6845,13 +6842,16 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                program(%0: f32[batch, 3], %1: f32[3]) -> f32[batch] {
-                  %2 = dimension_size[axis=0](%0)
-                  %3 = dimension[value=3]()
-                  %4 = dynamic_broadcast[output_axes=[1]](%1, %2, %3)
-                  %5 = dot[dimensions=([1], [1], [0], [0])](%0, %4)
-                  return %5
-                }"},
+                lambda %0:f32[batch, 3], %1:f32[3] .
+                let %2:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %3:dimension<3> = constant [value=3]
+                    %4:f32[batch, 3] = broadcast [output_axes=[1]] %1 %2 %3
+                    %5:f32[batch] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    ] %0 %4
+                in (%5)
+            "}
+            .trim_end(),
         );
         assert_eq!(
             program.interpret(vec![

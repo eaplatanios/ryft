@@ -511,18 +511,6 @@ pub(crate) fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &Shardi
         if axis_names.iter().any(|name| mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
 }
 
-/// Returns whether `sharding` references any auto mesh axis in a placement or reduction-state set. Shared with
-/// [`super::scattering`].
-pub(crate) fn references_auto_axis(sharding: &Sharding) -> bool {
-    let placement_auto = sharding.dimensions().iter().any(|dimension| {
-        matches!(dimension, ShardingDimension::Sharded(axis_names)
-            if axis_names.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto)))
-    });
-    let set_auto =
-        |axes: &BTreeSet<String>| axes.iter().any(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto));
-    placement_auto || set_auto(sharding.unreduced_axes()) || set_auto(sharding.reduced_axes())
-}
-
 /// Resolves the common mesh of two optional shardings, erroring on a mesh mismatch. Returns `None` when neither side
 /// is sharded.
 fn resolve_mesh(
@@ -911,7 +899,7 @@ impl Gather for ArrayType {
                 ))
                 .into());
             }
-            if references_auto_axis(requested) {
+            if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
                     "'{GATHER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
                 ))

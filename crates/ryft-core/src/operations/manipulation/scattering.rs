@@ -34,7 +34,7 @@ use crate::tracing::{Tracer, TracingContext};
 // TODO(eaplatanios): Review this.
 
 use super::gathering::{
-    GatherDimensionNumbers, GatherOperation, GatherScatterMode, dimension_has_explicit_axis, references_auto_axis,
+    GatherDimensionNumbers, GatherOperation, GatherScatterMode, dimension_has_explicit_axis,
     validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use super::slicing::batch_by_item_expansion;
@@ -885,7 +885,7 @@ impl Scatter for ArrayType {
                 ))
                 .into());
             }
-            if references_auto_axis(requested) {
+            if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
                     "'{SCATTER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
                 ))

@@ -241,6 +241,20 @@ impl Sharding {
         self.dimensions.len()
     }
 
+    /// Returns whether this [`Sharding`] references any [`MeshAxisType::Auto`] mesh axis, either in one
+    /// of its dimension placements or in one of its reduction-state sets (i.e., [`Self::unreduced_axes`] and
+    /// [`Self::reduced_axes`]). Operations that accept explicitly requested output shardings use this function to
+    /// reject requests that constrain auto axes, whose placement is owned by the partitioner.
+    pub fn references_auto_axis(&self) -> bool {
+        let placement_auto = self.dimensions.iter().any(|dimension| {
+            matches!(dimension, ShardingDimension::Sharded(axis_names)
+                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Auto)))
+        });
+        let set_auto =
+            |axes: &BTreeSet<String>| axes.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Auto));
+        placement_auto || set_auto(&self.unreduced_axes) || set_auto(&self.reduced_axes)
+    }
+
     /// Returns whether this [`Sharding`] places a full copy of the array on every device of its mesh and carries no
     /// auxiliary axis state, meaning that every entry of [`Self::dimensions`] is [`ShardingDimension::Replicated`] and
     /// [`Self::unreduced_axes`], [`Self::reduced_axes`], and [`Self::varying_manual_axes`] are all empty. Shardings
@@ -311,7 +325,6 @@ impl Sharding {
 
     /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
     /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
-    #[inline]
     pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
         let mut sharding = Self::new(self.mesh.clone(), dimensions)?;
         for axis_name in self.unreduced_axes.iter().chain(&self.reduced_axes) {

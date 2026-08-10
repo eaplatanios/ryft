@@ -17,7 +17,6 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::gathering::references_auto_axis;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -917,7 +916,7 @@ fn validate_requested_reshape_sharding(
     if input.sharding().is_some_and(|input| input.mesh() != requested.mesh()) {
         return Err(TypeError::invalid("'reshape' requested output sharding uses a different mesh".to_string()));
     }
-    if references_auto_axis(requested) {
+    if requested.references_auto_axis() {
         return Err(TypeError::invalid(
             "'reshape' requested output sharding cannot reference auto mesh axes".to_string(),
         ));
