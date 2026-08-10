@@ -6,7 +6,8 @@ use crate::arrays::{
     materialize_array_tangent,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -610,12 +611,12 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
-        batch_by_item_expansion(context, SCATTER_OPERATION_NAME, self, inputs, axis_size)
+        Ok(batch_by_item_expansion(context, SCATTER_OPERATION_NAME, self, inputs, axis_size)?.into())
     }
 }
 

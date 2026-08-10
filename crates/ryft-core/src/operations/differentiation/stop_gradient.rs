@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -124,13 +124,13 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
         check_count!("output", outputs, 1, ProgramError);
         let output = outputs.remove(0);
-        Ok(vec![ArrayBatch::new(output.r#type().into_owned(), output, input.batch_axis())?])
+        Ok(vec![ArrayBatch::new(output.r#type().into_owned(), output, input.batch_axis())?].into())
     }
 }
 

@@ -7,7 +7,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -28,8 +29,8 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, TypeError, Typed,
-    Value, ValueProjection,
+    Effect, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -156,6 +157,15 @@ impl Operation for DynamicShapeSliceOperation {
     #[inline]
     fn name(&self) -> &'static str {
         "dynamic_shape_slice"
+    }
+
+    /// A dynamic shape slice may need a runtime bounds check because independent input, start, and size identities do
+    /// not encode the relationship `start + (size - 1) * stride < input_size`. XLA lowering omits the assertion when
+    /// declared bounds prove the relationship; this conservative effect classification ensures transforms preserve
+    /// the potentially failing check in every other case.
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedAssertion)
     }
 
     fn infer_output_types(
@@ -342,7 +352,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((input, bounds)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -357,7 +367,8 @@ where
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect());
+                .collect::<Vec<_>>()
+                .into());
         }
 
         let batch_axis = input.batch_axis_position().unwrap();
@@ -377,12 +388,13 @@ where
         let mut strides = self.strides().to_vec();
         strides.insert(batch_axis, 1);
         let operation = Self::new(input_type.rank() + 1).with_strides(strides)?;
-        context
+        Ok(context
             .parent()
             .bind(operation, Vec::new(), packed_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -755,10 +767,10 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
-            None => self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]),
+            None => Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into()),
             Some(batch_axis) => {
                 let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
                 let mut start_indices = self.start_indices().to_vec();
@@ -768,7 +780,7 @@ where
                 let mut strides = self.strides().to_vec();
                 strides.insert(batch_axis, 1);
                 let lifted = SliceOperation::new(start_indices, limit_indices).with_strides(strides)?;
-                lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])
+                Ok(lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?.into())
             }
         }
     }
@@ -1168,20 +1180,18 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
-        UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
-            context,
-            &[input, update],
-            &[BatchAxis::from_position(batch_axis)],
-        )
+        Ok(UpdateSliceOperation::new(start_indices)
+            .interpret_with_batch_axes(context, &[input, update], &[BatchAxis::from_position(batch_axis)])?
+            .into())
     }
 }
 
@@ -1543,26 +1553,27 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 }.into());
         }
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1..].iter().any(Option::is_some) {
-            return batch_by_item_expansion(
+            return Ok(batch_by_item_expansion(
                 context,
                 crate::operations::manipulation::DYNAMIC_SLICE_OPERATION_NAME,
                 self,
                 inputs,
                 axis_size.expect("a mapped input pins the batch size"),
-            );
+            )?
+            .into());
         }
         let Some(batch_axis) = batch_axes[0] else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         if self.sizes().is_empty() {
-            return Ok(vec![inputs[0].clone()]);
+            return Ok(vec![inputs[0].clone()].into());
         }
         let axis_size = axis_size.expect("a mapped input pins the batch size");
         let mut sizes = self.sizes().to_vec();
@@ -1570,11 +1581,9 @@ where
         let zero_index = ArrayBatch::replicated(inputs[1].value().clone().zero_like());
         let mut lifted_inputs = inputs.to_vec();
         lifted_inputs.insert(1 + batch_axis, zero_index);
-        DynamicSliceOperation::new(sizes).interpret_with_batch_axes(
-            context,
-            lifted_inputs.as_slice(),
-            &[BatchAxis::from_position(batch_axis)],
-        )
+        Ok(DynamicSliceOperation::new(sizes)
+            .interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])?
+            .into())
     }
 }
 
@@ -2013,26 +2022,27 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[2..].iter().any(Option::is_some) {
-            return batch_by_item_expansion(
+            return Ok(batch_by_item_expansion(
                 context,
                 crate::operations::manipulation::DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 self,
                 inputs,
                 axis_size.expect("a mapped input pins the batch size"),
-            );
+            )?
+            .into());
         }
         let Some(batch_axis) = batch_axes[..2].iter().copied().flatten().next() else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         if inputs.len() == 2 {
-            return Ok(vec![inputs[1].clone()]);
+            return Ok(vec![inputs[1].clone()].into());
         }
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
@@ -2040,7 +2050,9 @@ where
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
         lifted_inputs.insert(2 + batch_axis, zero_index);
-        self.interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])
+        Ok(self
+            .interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])?
+            .into())
     }
 }
 
@@ -2567,6 +2579,16 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_shape_slice() {
+        let operation = DynamicShapeSliceOperation::new(2).with_strides(vec![1, 2]).unwrap();
+
+        assert_eq!(operation.name(), "dynamic_shape_slice");
+        assert_eq!(operation.strides(), &[1, 2]);
+        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(format!("{operation}"), "dynamic_shape_slice [strides=[1, 2]]");
+    }
+
+    #[test]
     fn test_dynamic_shape_slice_batching_inserts_the_mapped_axis_geometry() {
         let context = BatchingContext::<_, ArrayIrBatching>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
@@ -2582,7 +2604,9 @@ mod tests {
 
         let outputs = DynamicShapeSliceOperation::new(1)
             .batch(&context, &EmptyRegionDriver, &[input, start, size])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -3893,14 +3917,18 @@ mod tests {
 
             let static_outputs = UpdateSliceOperation::new(vec![1])
                 .batch(&context, &crate::EmptyRegionDriver, &[make_input(), make_update()])
-                .unwrap();
+                .unwrap()
+                .into_parts()
+                .0;
             let dynamic_outputs = DynamicUpdateSliceOperation
                 .batch(
                     &context,
                     &crate::EmptyRegionDriver,
                     &[make_input(), make_update(), ArrayBatch::replicated(index(1.0))],
                 )
-                .unwrap();
+                .unwrap()
+                .into_parts()
+                .0;
 
             for output in [static_outputs[0].clone(), dynamic_outputs[0].clone()] {
                 assert_eq!(output.batch_axis(), BatchAxis::new(0));
@@ -3921,7 +3949,9 @@ mod tests {
                 &crate::EmptyRegionDriver,
                 &[uniform, batch_varying_indices(vec![0.0, 2.0])],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(2)]);
@@ -3940,7 +3970,9 @@ mod tests {
                 &crate::EmptyRegionDriver,
                 &[input, batch_varying_indices(vec![1.0, 3.0])],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
 
@@ -3957,7 +3989,9 @@ mod tests {
                 &crate::EmptyRegionDriver,
                 &[trailing, batch_varying_indices(vec![1.0, 2.0])],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 6.0, 7.0]);
     }
@@ -3978,7 +4012,9 @@ mod tests {
                 &crate::EmptyRegionDriver,
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(2), Dimension::Static(4)]);
@@ -3997,7 +4033,9 @@ mod tests {
                 &crate::EmptyRegionDriver,
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 9.0, 9.0, 6.0, 7.0]);
     }

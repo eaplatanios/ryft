@@ -12,7 +12,7 @@ use crate::arrays::{
     MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -255,8 +255,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 {
 }
 
-/// Batching reads the same logical array axis after accounting for an inserted packed batch axis. The resulting
-/// first-class dimension is shared shape metadata and therefore remains replicated.
+/// Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
+/// or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
+/// per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
+/// exposing its packed storage bound.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> BatchableOperation<C, ArrayIrBatching>
     for DimensionSizeOperation
 {
@@ -265,7 +267,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Ba
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -278,13 +280,34 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Ba
             }
             None => self.axis(),
         };
+        if let Some(ragged_axis) = input.ragged_axes().iter().find(|ragged_axis| ragged_axis.axis() == packed_axis) {
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return Err(BatchingError::InvalidBatchMetadata {
+                    message: format!("ragged axis {packed_axis} has no mapped batch axis"),
+                });
+            };
+            let Some(extent_axis) = ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis) else {
+                return Err(BatchingError::InvalidBatchMetadata {
+                    message: format!(
+                        "ragged axis {packed_axis} does not carry extents for mapped batch axis {batch_axis}",
+                    ),
+                });
+            };
+            return Ok(vec![ArrayIrBatch::mapped_dimension(
+                ragged_axis.extents().clone(),
+                BatchAxis::from_position(extent_axis),
+                self.result_type().clone(),
+            )?]
+            .into());
+        }
         let operation = Self::new(batched_type, packed_axis)?;
         Ok(context
             .parent()
             .bind(operation, Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
             .map(ArrayIrBatch::replicated)
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 

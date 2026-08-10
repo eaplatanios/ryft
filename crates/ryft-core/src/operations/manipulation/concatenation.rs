@@ -9,7 +9,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -691,7 +692,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         // Align all operands on one physical batch axis (replicated operands are broadcast to gain it via
         // `ArrayBatch::match_axis`, so each batch item concatenates its own operands), and shift the concatenated
         // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
@@ -703,18 +704,16 @@ where
             .into());
         }
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let materialized = inputs
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?.interpret_with_batch_axes(
-            context,
-            materialized.as_slice(),
-            &[BatchAxis::from_position(batch_axis)],
-        )
+        Ok(ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?
+            .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?
+            .into())
     }
 }
 
@@ -735,7 +734,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((result_extent, inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "'{CONCATENATE_OPERATION_NAME}' expects at least one array followed by its result extent",
@@ -772,7 +771,8 @@ where
                 )?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect());
+                .collect::<Vec<_>>()
+                .into());
         };
 
         // Align every packed array on one mapped axis. Replicated operands gain that axis using the transform's
@@ -787,12 +787,13 @@ where
         lifted_inputs.push(result_extent.value().clone());
         let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
-        context
+        Ok(context
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 

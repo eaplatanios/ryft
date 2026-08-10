@@ -4,7 +4,8 @@ use std::ops::Deref;
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Shape, Sharding};
 use crate::axes::{Axes, Axis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, ElementwiseDerivativeAlignment};
@@ -264,7 +265,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
@@ -284,7 +285,9 @@ where
             None => (self.permutation().to_vec(), None),
         };
         let lifted_operation = TransposeOperation::new(lifted_permutation);
-        lifted_operation.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
+        Ok(lifted_operation
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
     }
 }
 
@@ -699,6 +702,8 @@ mod tests {
         let symbolic_output = TransposeOperation::new([2, 0, 1])
             .batch(&BatchingContext::new(context.clone(), 2), &EmptyRegionDriver, &[symbolic_input])
             .unwrap()
+            .into_parts()
+            .0
             .remove(0);
         assert_eq!(symbolic_output.batch_axis(), BatchAxis::new(1));
         assert_eq!(

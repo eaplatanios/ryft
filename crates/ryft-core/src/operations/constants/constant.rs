@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
-use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, BatchingTracer};
+use crate::batching::{
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
+};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -129,14 +131,15 @@ impl<
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(context
             .parent()
             .bind(self.clone(), Vec::new(), &[])?
             .into_iter()
             .map(ArrayBatch::replicated)
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 

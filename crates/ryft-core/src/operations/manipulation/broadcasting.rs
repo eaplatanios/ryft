@@ -1,10 +1,12 @@
 use std::fmt::Display;
 
+use crate::arrays::batching::{RaggedAxis, align_array_batch, dimension_constant};
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
     DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
-use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::axes::Axis;
+use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
@@ -180,45 +182,62 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
     }
 }
 
-/// Batching rule for [`DynamicBroadcastOperation`]. Explicit output extents remain replicated shape values. A mapped
-/// input is canonicalized to a leading batch axis, which is then represented in both the lifted output extents and
-/// the input-to-output axis mapping.
+/// Batching rule for [`DynamicBroadcastOperation`]. A mapped input is canonicalized to a leading batch axis, which is
+/// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its
+/// declared finite bound as physical packed storage and records its per-item extent vector as transform-owned ragged
+/// metadata; replicated extents retain their existing first-class representation.
 impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicBroadcastOperation
 where
-    C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
+    C: Context<Type = ArrayIrType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<DynamicBroadcastOperation>
+        + From<DimensionOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         <&ArrayType>::try_from(input.unbatched_type())?;
+        let ragged_extents = output_extents
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, extent)| extent.mapped_dimension_extents().map(|extents| (axis, extent, extents)))
+            .collect::<Vec<_>>();
+        let has_ragged_axes = !ragged_extents.is_empty() || !input.ragged_axes().is_empty();
+        let logical_output_type = if has_ragged_axes {
+            let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
+            let mut logical_output_types = self.infer_output_types(logical_input_types.as_slice(), &[])?;
+            check_count!("output", logical_output_types, 1, ProgramError);
+            Some(<&ArrayType>::try_from(&logical_output_types.remove(0))?.clone())
+        } else {
+            None
+        };
         for extent in output_extents {
-            extent.validate_replicated_dimension()?;
+            if extent.mapped_dimension_extents().is_none() {
+                extent.validate_replicated_dimension()?;
+            }
         }
 
-        if input.batch_axis().is_replicated() {
+        if input.batch_axis().is_replicated() && ragged_extents.is_empty() {
             return Ok(context
                 .parent()
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect());
+                .collect::<Vec<_>>()
+                .into());
         }
 
-        let batched_type = <&ArrayType>::try_from(input.value().r#type().as_ref())?.clone();
-        let moved_input = ArrayBatch::new(
-            batched_type,
-            <C::Value as ValueProjection<ArrayType>>::into_projected(input.value().clone())?,
-            input.batch_axis(),
-        )?
-        .move_axis(0)?;
-        let moved_input = <C::Value as ValueProjection<ArrayType>>::from_projected(moved_input.into_value());
+        let moved_input = align_array_batch(context, input.clone(), Axis::from(0))?;
 
         let mut lifted_output_axes = Vec::with_capacity(self.output_axes().len() + 1);
         lifted_output_axes.push(0);
@@ -232,15 +251,57 @@ where
         }
 
         let mut lifted_inputs = Vec::with_capacity(inputs.len() + 1);
-        lifted_inputs.push(moved_input);
+        lifted_inputs.push(moved_input.value().clone());
         lifted_inputs.push(context.axis_extent().clone());
-        lifted_inputs.extend(output_extents.iter().map(|extent| extent.value().clone()));
-        context
-            .parent()
-            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
-            .into_iter()
-            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(0)))
-            .collect()
+        for extent in output_extents {
+            if extent.mapped_dimension_extents().is_some() {
+                let extent_type = <&DimensionType>::try_from(extent.unbatched_type())?;
+                let physical_extent =
+                    extent_type.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
+                        BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "ragged broadcast dimension {} requires a finite, nonempty declared upper bound",
+                                extent_type.variable(),
+                            ),
+                        }
+                    })?;
+                lifted_inputs.push(dimension_constant(context.parent(), physical_extent)?);
+            } else {
+                lifted_inputs.push(extent.value().clone());
+            }
+        }
+        let mut outputs = context.parent().bind(operation, Vec::new(), lifted_inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+
+        let mut ragged_axes = moved_input
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| {
+                let axis = if ragged_axis.axis() == 0 { 0 } else { self.output_axes()[ragged_axis.axis() - 1] + 1 };
+                let extent_axes = ragged_axis
+                    .extent_axes()
+                    .iter()
+                    .map(|axis| if *axis == 0 { 0 } else { self.output_axes()[*axis - 1] + 1 })
+                    .collect();
+                RaggedAxis::new(axis, ragged_axis.extents().clone(), ragged_axis.dimension().clone(), extent_axes)
+            })
+            .collect::<Vec<_>>();
+        ragged_axes.extend(
+            ragged_extents
+                .into_iter()
+                .map(|(axis, extent, extents)| -> Result<_, BatchingError> {
+                    let extent_type = <&DimensionType>::try_from(extent.unbatched_type())?;
+                    Ok(RaggedAxis::new(axis + 1, extents.clone(), extent_type.variable().clone(), vec![0]))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let output = ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(0))?;
+        let output = match logical_output_type {
+            Some(logical_output_type) => output.with_logical_array_type(logical_output_type)?,
+            None => output,
+        };
+        Ok(vec![output.with_ragged_axes(ragged_axes)?].into())
     }
 }
 
@@ -634,13 +695,13 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayBatchingPolicy<C>> 
         _context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
             None => {
                 // A replicated input has no mapped axis to lift, so the original broadcast remains replicated.
                 let output_value = inputs[0].value().broadcast(self.output_type().clone(), self.output_axes())?;
-                Ok(vec![ArrayBatch::replicated(output_value)])
+                Ok(vec![ArrayBatch::replicated(output_value)].into())
             }
             Some(batch_axis) => {
                 // Insert the mapped axis at the same physical output position and shift every existing broadcast-axis
@@ -676,7 +737,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayBatchingPolicy<C>> 
                     );
                 }
                 let output_value = inputs[0].value().broadcast(output_type.clone(), output_axes.as_slice())?;
-                Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::from_position(batch_axis))?])
+                Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::from_position(batch_axis))?].into())
             }
         }
     }
@@ -1168,6 +1229,8 @@ mod tests {
                 &[ArrayIrBatch::new(input, BatchAxis::new(0)).unwrap(), ArrayIrBatch::replicated(declared_extent)],
             )
             .unwrap()
+            .into_parts()
+            .0
             .try_into()
             .unwrap();
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
@@ -1513,6 +1576,8 @@ mod tests {
             )
             .batch(&context, &EmptyRegionDriver, &[input])
             .unwrap()
+            .into_parts()
+            .0
             .remove(0);
             let mut output_dimensions = vec![Dimension::Static(3), Dimension::Static(2)];
             output_dimensions.insert(batch_axis, Dimension::Static(2));

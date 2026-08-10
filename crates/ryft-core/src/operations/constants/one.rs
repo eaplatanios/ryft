@@ -228,7 +228,9 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);

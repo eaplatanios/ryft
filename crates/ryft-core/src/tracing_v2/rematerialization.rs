@@ -45,7 +45,8 @@ use thiserror::Error;
 
 use crate::arrays::{ArrayType, Memory};
 use crate::batching::{
-    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
+    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -443,7 +444,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let differentiated_axes = differentiated_axes.to_vec();
@@ -565,7 +566,12 @@ where
             packed_inputs.as_slice(),
         )?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
+        Ok(outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| P::batch(output, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 

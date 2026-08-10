@@ -15,7 +15,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
@@ -542,7 +542,9 @@ impl ScanTypeSemantics for ArrayIrType {
         }
         if let Some(variable) = length.variable() {
             let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
-            if runtime_length_type.variable() != variable {
+            let exact_refinement = runtime_length_type.extent().is_some()
+                && DimensionType::new(variable.clone()).is_refined_by(runtime_length_type);
+            if runtime_length_type.variable() != variable && !exact_refinement {
                 return Err(TypeError::invalid(format!(
                     "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
                      requires {variable}",
@@ -578,7 +580,9 @@ impl ScanTypeSemantics for ArrayIrType {
         }
         if let Some(variable) = length.variable() {
             let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
-            if runtime_length_type.variable() != variable {
+            let exact_refinement = runtime_length_type.extent().is_some()
+                && DimensionType::new(variable.clone()).is_refined_by(runtime_length_type);
+            if runtime_length_type.variable() != variable && !exact_refinement {
                 return Err(TypeError::invalid(format!(
                     "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
                      requires {variable}",
@@ -1595,7 +1599,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let body = driver.region(0)?;
         let carry_count = self.carry_count();
         if self.captures().is_empty() && !context.parent().is_eager() {
@@ -1689,14 +1693,15 @@ where
                 Some(axis) => BatchAxis::new(axis.value() + 1),
                 None => BatchAxis::replicated(),
             }));
-            return outputs
+            return Ok(outputs
                 .into_iter()
                 .zip(output_axes)
                 .map(|(output, axis)| {
                     let batched_type = output.r#type().into_owned();
                     ArrayBatch::new(batched_type, output, axis)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?
+                .into());
         }
 
         if self.length().value() == Some(0) {
@@ -1744,7 +1749,7 @@ where
                 let stacked_value = context.parent().zero(&stacked_type)?;
                 outputs.push(ArrayBatch::new(stacked_type, stacked_value, stacked_axis)?);
             }
-            return Ok(outputs);
+            return Ok(outputs.into());
         }
 
         let y_slice_types = body.output_types().split_off(self.carry_count());
@@ -1754,7 +1759,7 @@ where
                 self.length(),
             ),
         })?;
-        batch_scan_with_interpreter(
+        Ok(batch_scan_with_interpreter(
             self.carry_count(),
             length,
             self.reverse(),
@@ -1762,7 +1767,8 @@ where
             inputs,
             |stacked_type| context.parent().zero(stacked_type),
             |_, iteration_inputs| driver.batch_region(context, 0, iteration_inputs),
-        )
+        )?
+        .into())
     }
 }
 
@@ -1953,7 +1959,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let body = driver.region(0)?;
         let (scan_inputs, runtime_length) = if self.length().variable().is_some() {
             let Some((runtime_length, scan_inputs)) = inputs.split_last() else {
@@ -2074,7 +2080,12 @@ where
             Some(axis) => BatchAxis::new(axis.value() + 1),
             None => BatchAxis::replicated(),
         }));
-        outputs.into_iter().zip(output_axes).map(|(output, axis)| ArrayIrBatch::new(output, axis)).collect()
+        Ok(outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayIrBatch::new(output, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -2835,7 +2846,7 @@ mod tests {
             ArrayIrType::Array(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())])));
         let stacked_type = ArrayIrType::Array(ArrayType::new(
             DataType::F32,
-            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent)]),
+            Shape::new(vec![Dimension::Static(3), Dimension::Dynamic(extent.clone())]),
         ));
         let body_input_types = vec![dimension_type.clone(), slice_type.clone()];
         let body_output_types = vec![dimension_type.clone(), slice_type];
@@ -2889,6 +2900,39 @@ mod tests {
             Err(TypeError::invalid(
                 "scan body carry type signature mismatch: expected [f32[carry]] but got [f32[next]]".to_string(),
             )),
+        );
+
+        // A dynamic runtime-length operand must carry the scan length's nominal identity. An unrelated dynamic
+        // identity with compatible bounds cannot redefine the stacked axis, while an exact concrete refinement is
+        // accepted during eager execution.
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
+        let unrelated = DimensionVariable::new("unrelated", DimensionBounds::positive(Some(5)).unwrap());
+        let dynamic_stacked_type = ArrayIrType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(extent)]),
+        ));
+        let dynamic_scan = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, Dimension::Dynamic(length.clone()));
+        assert_eq!(
+            dynamic_scan.infer_output_types(
+                &[dimension_type.clone(), dynamic_stacked_type.clone(), DimensionType::new(unrelated).into(),],
+                std::slice::from_ref(&body_interface),
+            ),
+            Err(TypeError::invalid(
+                "'scan' runtime length operand has type dimension<unrelated ∈ [1, 5)> but scan length requires length"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            dynamic_scan.infer_output_types(
+                &[
+                    dimension_type.clone(),
+                    dynamic_stacked_type.clone(),
+                    DimensionType::new(DimensionVariable::new("three", DimensionBounds::new(3, Some(4)).unwrap(),))
+                        .into(),
+                ],
+                &[body_interface],
+            ),
+            Ok(vec![dimension_type, dynamic_stacked_type]),
         );
     }
 
@@ -4419,7 +4463,7 @@ mod tests {
             ArrayBatch::new(f64_type(&[3, 2]), xs, BatchAxis::new(1)).unwrap(),
         ];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 1);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -4467,7 +4511,7 @@ mod tests {
         let inputs =
             vec![ArrayBatch::replicated(carry), ArrayBatch::new(f64_type(&[2, 3]), xs, BatchAxis::new(0)).unwrap()];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

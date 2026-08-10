@@ -9,7 +9,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -949,11 +950,11 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         if inputs[1].batch_axis_position().is_none() {
             let Some(batch_axis) = inputs[0].batch_axis_position() else {
-                return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+                return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
             };
             let mut edge_padding_low = self.edge_padding_low().to_vec();
             edge_padding_low.insert(batch_axis, 0);
@@ -962,7 +963,9 @@ where
             let mut interior_padding = self.interior_padding().to_vec();
             interior_padding.insert(batch_axis, 0);
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
-            return lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)]);
+            return Ok(lifted
+                .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])?
+                .into());
         }
         let batch_axis = inputs[0].batch_axis_position().unwrap_or(0);
         let operand = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
@@ -994,7 +997,7 @@ where
         let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
         let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
         let output_type = output.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?])
+        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?].into())
     }
 }
 
@@ -1018,7 +1021,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -1056,7 +1059,8 @@ where
                 )?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect());
+                .collect::<Vec<_>>()
+                .into());
         };
 
         let operand_batch = align_array_batch(context, operand.clone(), Axis::from(batch_axis))?;
@@ -1082,12 +1086,13 @@ where
             lifted_inputs.push(<C::Value as ValueProjection<ArrayType>>::from_projected(operand_batch.into_value()));
             lifted_inputs.push(padding_value.value().clone());
             lifted_inputs.extend(lifted_output_extents);
-            return context
+            return Ok(context
                 .parent()
                 .bind(operation, Vec::new(), lifted_inputs.as_slice())?
                 .into_iter()
                 .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?
+                .into());
         }
 
         // `pad` requires a scalar padding operand. Pad the aligned input with zero, build a Boolean mask for its
@@ -1164,7 +1169,8 @@ where
         Ok(vec![ArrayIrBatch::new(
             <C::Value as ValueProjection<ArrayType>>::from_projected(output.remove(0)),
             BatchAxis::from_position(batch_axis),
-        )?])
+        )?]
+        .into())
     }
 }
 
@@ -2283,7 +2289,9 @@ mod tests {
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()
                 .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
-                .unwrap();
+                .unwrap()
+                .into_parts()
+                .0;
 
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -2326,7 +2334,9 @@ mod tests {
             let outputs = PadOperation::new(vec![1], vec![0], vec![0])
                 .unwrap()
                 .batch(&context, &crate::EmptyRegionDriver, &[input, padding])
-                .unwrap();
+                .unwrap()
+                .into_parts()
+                .0;
 
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

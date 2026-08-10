@@ -5,7 +5,8 @@ use crate::arrays::{
     DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
@@ -213,11 +214,16 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         <&ArrayType>::try_from(input.unbatched_type())?;
+        if !input.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "dynamic reshape does not support bounded ragged array operands".to_string(),
+            });
+        }
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
         }
@@ -228,7 +234,8 @@ where
                 .bind(self.clone(), Vec::new(), &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>())?
                 .into_iter()
                 .map(ArrayIrBatch::replicated)
-                .collect());
+                .collect::<Vec<_>>()
+                .into());
         }
 
         let batched_type = <&ArrayType>::try_from(input.value().r#type().as_ref())?.clone();
@@ -258,12 +265,13 @@ where
         lifted_inputs.push(moved_input);
         lifted_inputs.push(context.axis_extent().clone());
         lifted_inputs.extend(output_extents.iter().map(|extent| extent.value().clone()));
-        context
+        Ok(context
             .parent()
             .bind(operation, Vec::new(), lifted_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(0)))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -715,12 +723,12 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let Some(_) = inputs[0].batch_axis_position() else {
             // Replicated input: there is no batch axis to thread through the reshape, so interpret it as given and
             // report the output replicated.
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let moved_input = inputs[0].move_axis(0)?;
@@ -741,11 +749,9 @@ where
                 ArrayBatch::sharding_for_inputs(inputs)?,
             )?);
         }
-        ReshapeOperation::new(lifted_parameters).interpret_with_batch_axes(
-            context,
-            &[moved_input],
-            &[BatchAxis::from_position(0)],
-        )
+        Ok(ReshapeOperation::new(lifted_parameters)
+            .interpret_with_batch_axes(context, &[moved_input], &[BatchAxis::from_position(0)])?
+            .into())
     }
 }
 

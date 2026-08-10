@@ -7,16 +7,24 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionVariable};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::arrays::batching::{align_array_batch, array_dimension};
+use crate::arrays::{
+    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionOperation, DimensionType, DimensionValue,
+    DimensionVariable,
+};
+use crate::axes::Axis;
+use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
-use crate::parameters::Parameter;
+use crate::operations::{
+    DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation, TransposeOperation,
+};
+use crate::parameters::{Parameter, Placeholder};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Effects, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    Effect, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, ProjectedValue,
+    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
@@ -28,9 +36,9 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 /// [`DimensionVariable`] and authoritative bounds of the produced dimension. Eager execution rejects negative,
 /// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
 ///
-/// The input may use any signed or unsigned integer element type. It must be rank zero. A mapped scalar cannot pass
-/// through this gateway under batching because that would create a different shape for each batch item and require a
-/// ragged-array representation.
+/// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
+/// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
+/// batch carrier and become ragged geometry only when a shape-consuming batching rule accepts them.
 ///
 /// # Example
 ///
@@ -203,33 +211,69 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 {
 }
 
-/// Batching rejects mapped scalar inputs because converting one scalar per batch item would produce a ragged
-/// collection of first-class dimensions. A replicated scalar is converted once and remains replicated.
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation>>>
-    BatchableOperation<C, ArrayIrBatching> for DimensionFromScalarOperation
+/// Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary packed
+/// integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to
+/// [`ArrayIrType`]. A carry-free scan applies this ordered-assertion gateway to every scalar and converts each checked
+/// dimension back to scalar data for packing, so the gateway's bounds diagnostics remain exact.
+impl<C> BatchableOperation<C, ArrayIrBatching> for DimensionFromScalarOperation
+where
+    C: Context<Type = ArrayIrType>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: crate::operations::Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<DimensionFromScalarOperation>
+        + From<DimensionOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + From<DimensionToScalarOperation>
+        + From<DynamicBroadcastOperation>
+        + From<ScanOperation<C::Constant>>
+        + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
-        <&ArrayType>::try_from(input.unbatched_type())?;
-        if !input.batch_axis().is_replicated() {
-            return Err(BatchingError::MappedDimension {
-                r#type: Box::new(self.result_type().clone()),
-                axis: input.batch_axis(),
-            });
+        let input_type = <&ArrayType>::try_from(input.unbatched_type())?;
+        Self::validate_input_type(input_type)?;
+        if input.batch_axis().is_replicated() {
+            return Ok(context
+                .parent()
+                .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
+                .into_iter()
+                .map(ArrayIrBatch::replicated)
+                .collect::<Vec<_>>()
+                .into());
         }
-        Ok(context
-            .parent()
-            .bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?
-            .into_iter()
-            .map(ArrayIrBatch::replicated)
-            .collect())
+
+        let input = align_array_batch(context, input.clone(), Axis::from(0))?;
+        let scan_extent = array_dimension(context.parent(), input.value(), 0)?;
+        let scan_extent_type = scan_extent.r#type();
+        let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.to_dimension();
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        let scalar = builder.add_input(ArrayIrType::Array(input_type.clone()));
+        let dimension = builder.add_instruction(self.clone(), Vec::new(), vec![scalar])?[0];
+        let scalar = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension])?[0];
+        let body =
+            builder.build::<Vec<C::Constant>, Vec<C::Constant>>(vec![scalar], vec![Placeholder], vec![Placeholder])?;
+
+        let scan = ScanOperation::<C::Constant>::new(0, length.clone());
+        let mut packed_inputs = vec![input.into_value()];
+        if length.variable().is_some() {
+            packed_inputs.push(scan_extent);
+        }
+        let mut outputs = context.parent().bind(scan, vec![body], packed_inputs.as_slice())?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![ArrayIrBatch::mapped_dimension(
+            outputs.remove(0),
+            BatchAxis::from_position(0),
+            self.result_type().clone(),
+        )?]
+        .into())
     }
 }
 

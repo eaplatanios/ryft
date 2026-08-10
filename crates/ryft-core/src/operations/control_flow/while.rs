@@ -19,8 +19,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
-    ProgramBatchingOutputAxesPolicy,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
@@ -944,7 +944,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         // The rule requests all nested-computation work through its region access (region 0 is the condition and
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let state_count = inputs.len();
@@ -1042,14 +1042,15 @@ where
             let batched_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
             let outputs = context.parent().bind(batched_while, vec![batched_condition, batched_body], &state_values)?;
             check_count!("output", outputs, state_count, ProgramError);
-            return outputs
+            return Ok(outputs
                 .into_iter()
                 .zip(state_axes)
                 .map(|(output, axis)| {
                     let batched_type = output.r#type().into_owned();
                     ArrayBatch::new(batched_type, output, axis)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?
+                .into());
         }
 
         // Batch-varying predicate (per-item termination): re-batch the condition with its predicate output
@@ -1072,13 +1073,14 @@ where
         let batched_while = WhileOperation::new().with_iteration_bound(self.iteration_bound())?;
         let outputs = context.parent().bind(batched_while, vec![batched_condition, batched_body], &state_values)?;
         check_count!("output", outputs, state_count, ProgramError);
-        outputs
+        Ok(outputs
             .into_iter()
             .map(|output| {
                 let batched_type = output.r#type().into_owned();
                 ArrayBatch::new(batched_type, output, Some(0))
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -1109,7 +1111,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let condition_region = driver.region(0)?;
         let body_region = driver.region(1)?;
         let state_count = inputs.len();
@@ -1258,7 +1260,12 @@ where
             context.parent().bind(*self, vec![batched_condition, batched_body], packed_inputs.as_slice())?;
         check_count!("output", outputs, state_count + 1, ProgramError);
         outputs.remove(0);
-        outputs.into_iter().zip(state_axes).map(|(output, axis)| ArrayIrBatch::new(output, axis)).collect()
+        Ok(outputs
+            .into_iter()
+            .zip(state_axes)
+            .map(|(output, axis)| ArrayIrBatch::new(output, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -4020,7 +4027,7 @@ mod tests {
         let context = BatchingContext::new(parent, 3);
         let inputs = vec![ArrayBatch::new(packed_type, state, BatchAxis::new(0)).unwrap()];
         let driver = CountingBatchingDriver::new(&countdown_regions);
-        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -4119,7 +4126,7 @@ mod tests {
         ];
         let driver = CountingBatchingDriver::new(&countdown_regions);
         let countdown_operation = WhileOperation::<ArrayIrType>::new();
-        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

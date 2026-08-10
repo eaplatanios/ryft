@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -251,14 +251,15 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(context
             .parent()
             .bind(self.clone(), Vec::new(), &[])?
             .into_iter()
             .map(ArrayBatch::replicated)
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 

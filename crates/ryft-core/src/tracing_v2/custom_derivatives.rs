@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::batching::{
-    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
@@ -230,7 +230,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (_, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let primal_region = driver.region(0)?;
@@ -298,7 +298,12 @@ where
             packed_inputs.as_slice(),
         )?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
+        Ok(outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| P::batch(output, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -748,7 +753,7 @@ where
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let differentiated_axes = differentiated_axes.to_vec();
@@ -846,7 +851,12 @@ where
             packed_inputs.as_slice(),
         )?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        outputs.into_iter().zip(output_axes).map(|(output, axis)| P::batch(output, axis)).collect()
+        Ok(outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| P::batch(output, axis))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -1450,7 +1460,9 @@ mod tests {
         // assuming that all-replicated wrapper inputs imply all-replicated wrapper outputs.
         let outputs = CustomJvpOperation::new()
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(1.0))])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![0u64, 1, 2]));

@@ -13,7 +13,7 @@ use crate::arrays::{
     ArrayType, DimensionOperation, DimensionType, DimensionValue,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy, batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
@@ -858,7 +858,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: "cannot batch a condition operation with no predicate input".to_string(),
@@ -876,12 +876,13 @@ where
             }
             // Batch-varying predicate: batch both branches item-agnostically through the region access and merge
             // their outputs per batch item via `Select`.
-            return batch_condition_with_interpreter(
+            return Ok(batch_condition_with_interpreter(
                 context,
                 predicate_batch,
                 operand_inputs,
                 |index, region_inputs| driver.batch_region(context, index, region_inputs),
-            );
+            )?
+            .into());
         }
 
         // Replicated (abstract) predicate: batch both branches at the operand batch axes with natural output axes to
@@ -939,14 +940,15 @@ where
             &staged_inputs,
         )?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        outputs
+        Ok(outputs
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| {
                 let batched_type = output.r#type().into_owned();
                 ArrayBatch::new(batched_type, output, axis)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
@@ -975,11 +977,9 @@ where
         .into_iter()
         .zip(false_outputs)
         .map(|(true_output, false_output)| -> Result<ArrayBatch<C::Value>, BatchingError> {
-            let mut selected = SelectOperation::<ArrayType>::new().batch(
-                context,
-                &crate::EmptyRegionDriver,
-                &[predicate_batch.clone(), true_output, false_output],
-            )?;
+            let (mut selected, _) = SelectOperation::<ArrayType>::new()
+                .batch(context, &crate::EmptyRegionDriver, &[predicate_batch.clone(), true_output, false_output])?
+                .into_parts();
             check_count!("output", selected, 1, ProgramError);
             Ok(selected.remove(0))
         })
@@ -1017,7 +1017,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((predicate, operands)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: "cannot batch a condition operation with no predicate input".to_string(),
@@ -1075,11 +1075,12 @@ where
                 context.parent().bind(self.clone(), vec![true_branch, false_branch], packed_inputs.as_slice())?;
             check_count!("output", outputs, output_axes.len() + 1, ProgramError);
             outputs.remove(0);
-            return outputs
+            return Ok(outputs
                 .into_iter()
                 .zip(output_axes)
                 .map(|(output, axis)| ArrayIrBatch::new(output, axis))
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?
+                .into());
         }
 
         let true_region = driver.region(0)?;
@@ -1094,17 +1095,18 @@ where
         let true_outputs = driver.batch_region(context, 0, operands.to_vec())?;
         let false_outputs = driver.batch_region(context, 1, operands.to_vec())?;
         check_count!("output", false_outputs, true_outputs.len(), ProgramError);
-        true_outputs
+        Ok(true_outputs
             .into_iter()
             .zip(false_outputs)
             .map(|(true_output, false_output)| match true_output.unbatched_type() {
                 ArrayIrType::Array(_) => {
                     <&ArrayType>::try_from(false_output.unbatched_type())?;
-                    let mut selected = batch_projected_operation(
+                    let (mut selected, _) = batch_projected_operation(
                         context,
                         &SelectOperation::<ArrayType>::new(),
                         &[predicate.clone(), true_output, false_output],
-                    )?;
+                    )?
+                    .into_parts();
                     check_count!("output", selected, 1, ProgramError);
                     Ok(selected.remove(0))
                 }
@@ -1115,7 +1117,8 @@ where
                     Ok(true_output)
                 }
             })
-            .collect()
+            .collect::<Result<Vec<_>, BatchingError>>()?
+            .into())
     }
 }
 
@@ -1933,7 +1936,7 @@ mod tests {
         ];
         let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -1992,7 +1995,7 @@ mod tests {
         ];
         let regions = vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])];
         let driver = CountingBatchingDriver::new(&regions);
-        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap();
+        let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 3);
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

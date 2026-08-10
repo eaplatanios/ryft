@@ -3,7 +3,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType, DimensionType};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
@@ -140,9 +140,9 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 {
 }
 
-/// Batching converts one replicated first-class dimension into one replicated scalar array. Mapped dimension inputs
-/// are rejected by the composite batch carrier before conversion because ordinary array batching has no ragged shape
-/// representation.
+/// Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
+/// stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value
+/// as a mapped scalar array without staging another operation.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>> BatchableOperation<C, ArrayIrBatching>
     for DimensionToScalarOperation
 {
@@ -151,17 +151,21 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
+        if input.mapped_dimension_extents().is_some() {
+            return Ok(vec![ArrayIrBatch::new(input.value().clone(), input.batch_axis())?].into());
+        }
         input.validate_replicated_dimension()?;
         Ok(context
             .parent()
             .bind(*self, Vec::new(), std::slice::from_ref(input.value()))?
             .into_iter()
             .map(ArrayIrBatch::replicated)
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 
