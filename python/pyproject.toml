@@ -5,7 +5,7 @@ description = "Python utilities for inspecting JAX programs and ensuring feature
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax==0.6.1",
+    "jax==0.6.2",
     "numpy",
 ]
 

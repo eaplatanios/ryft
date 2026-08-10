@@ -50,6 +50,7 @@ tempfile.workspace = true
 [features]
 default = []
 program-statistics = []
+differential-testing = []
 performance-benchmarking = []
 ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
@@ -64,6 +65,11 @@ mps = ["ryft-pjrt/mps"]
 name = "program_statistics"
 path = "src/bin/program_statistics.rs"
 required-features = ["program-statistics"]
+
+[[bin]]
+name = "differential_testing"
+path = "src/bin/differential_testing.rs"
+required-features = ["differential-testing"]
 
 [[bin]]
 name = "compilation_benchmark"

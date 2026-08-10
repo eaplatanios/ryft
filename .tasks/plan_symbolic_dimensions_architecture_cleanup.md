@@ -67,9 +67,9 @@ list.
       guard.
 - [x] Static-only dispositions for the homogeneous transpose rules: `gathering.rs`, `slicing.rs` (slice and
       dynamic-slice) now *reject* dynamically shaped operands as part of their public operation contract, with exact
-      per-operation diagnostics, rule rustdoc, and pinned fixtures. `attention.rs` needed no rejection: its own
-      `infer_output_types` already requires static shapes; only the comment's justification was wrong and is
-      corrected.
+      per-operation diagnostics, rule rustdoc, and pinned fixtures. Attention's bounded-dynamic contract is now
+      supported separately by the Phase 5 portable/fused execution proof and does not rely on those homogeneous
+      transpose zero-materialization sites.
 - [x] Close-out decision on the five homogeneous batching zero/one sites: retain `padding.rs`'s mask-input one and
       transpose mask-input zero, `slicing.rs`'s `batch_by_item_expansion` empty-batch zero, and `scan.rs`'s zero-length
       and accumulator-stack zeros as the permanent homogeneous baseline. Their `Context<Type = ArrayType>` contract
@@ -147,7 +147,10 @@ semantic contracts. This is a documented scope correction, not a new baseline: b
       in the combined non-test source of the array-program projection, batching, and differentiation adapters (if
       smaller, stop for architectural review rather than declaring success from passing tests); report and attribute
       the raw whole-tree production total without treating unrelated post-baseline functionality as architecture
-      overhead; zero hidden reconstruction paths; and zero dual semantic operation contracts.
+      overhead; zero hidden reconstruction paths; and zero dual semantic operation contracts. Satisfied at Phase 3
+      close (2,861 pre-test lines, 40.4%); see the owner decision "adapter-budget scope amendment (2026-08-09)" in the
+      Phase 3 closure entry for the like-for-like predicate the later ragged/evidence/carrier work is measured against
+      and for the raw current number.
 - [x] Run `cargo fmt --all -- --check`, `git diff --check`, the core/macro/XLA focused suites, all doctests affected
       by moved public APIs, and the full workspace all-target suite serially.
 - [x] Review the final diff by subsystem and ask whether every remaining changed line is necessary for the target
@@ -170,8 +173,11 @@ eager bounds-checked execution, PE fold/residualize behavior, the mapped-batchin
       established by their producing instruction under the existing structural-closure rules. Cover closure, import,
       alpha-renaming, and repeated splicing.
 - [x] Batching: pin the tier-3 MVP policy with fixtures — a replicated scalar operand produces ordinary replicated
-      dimension authority; a mapped operand keeps its exact typed rejection diagnostic, updated to name Phase 6
-      raggedness as the missing capability.
+      dimension authority; a mapped operand keeps its exact typed rejection diagnostic. Correction (2026-08-09): the
+      diagnostic update named here was never made. Full-history verification found exactly three wordings of the
+      `MappedDimension` message and none of them mentioned raggedness. The item's intent was superseded when Phase 6
+      implemented the capability and replaced the mapped-gateway rejection with the checked extent carrier; the
+      `MappedDimension` rejection survives only for mapped first-class dimension carriers.
 - [x] Control flow: verify the existing carry-type equality checks reject shape-varying loop-carried state with exact
       diagnostics (a fresh per-iteration variable cannot instantiate the declared carry type). Bounds-widened
       loop-carried extents are an explicit non-goal; record the rejection fixture rather than designing widening.
@@ -202,14 +208,17 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
       CPU and CUDA coverage evidence before committing, and fall back to (b) per backend rather than globally.
 - [x] Require a finite upper bound at the gateway for any program that reaches compilation; reject unbounded
       data-derived dimensions at lowering with an exact diagnostic naming the variable and its bounds.
-- [x] Complete the per-operation padding-discipline inventory started in archive Phase 7 and record it here as the
-      authoritative table: padding-oblivious (elementwise, reshape-within-bounds), mask-required (reductions,
-      argmin/argmax, cumulative and windowed operations), or zero-padding-required (contractions, convolutions).
-- [x] Implement the padding rules for the supported operation matrix so padding garbage is unobservable in results.
-      Every unclassified or unsupported operation must reject lowering of data-derived extents with an exact
-      diagnostic naming the operation; silent truncation or garbage propagation is an abort criterion.
-- [x] Run CPU (and CUDA where backend support permits) eager/JIT parity for a data-dependent golden set including the
-      Phase 4 fixtures, proving one compiled specialization serves multiple runtime extents.
+- [x] Complete the per-operation padding-contract inventory started in archive Phase 7 and record it here as the
+      authoritative table. Keep the outer operation-family matches and the nested `ReductionKind`, `SortDirection`,
+      and `ScatterReductionKind` matches exhaustive so additions are compile-forced safety reviews.
+- [x] Admit only the supported operation matrix and make the implementation route honest: ordinary admitted
+      operations propagate logical dimensions or delegate masking/zero-padding to XLA's bounded-dynamic legalizer;
+      scaled dot and attention explicitly materialize operation-specific physical padding in Ryft before their opaque
+      CUDA kernels. Every unclassified, opaque, fused-kernel-unverified, or kind-unverified operation rejects lowering
+      of data-derived extents with an exact operation-named diagnostic.
+- [x] Run CPU and CUDA eager/JIT parity for the admitted data-dependent golden set. The kind-sensitive fixture compares
+      eager execution directly with whole-program JIT on CPU and executes unchanged at two extents on CUDA; it covers
+      every admitted reduction kind, both sort directions, argmin/argmax-style passengers, and dot.
 - [x] Add a dispatch-time bound-bucketing policy for *input-derived* extents as pure retained-JIT policy: round the
       host-observed extent up to a bucket (e.g., logarithmically spaced), compile one specialization per bucketed
       bound, and pad inputs to the bucket, with the bucket participating in cache identity. Bounds padding waste at
@@ -221,17 +230,22 @@ compiled lowering (range check as an ordered assertion, riding the per-class tok
       diagnostics, and the route decision is recorded with its measured evidence. This gate also closes the tier-3
       verification row "every operation without data-dependent lowering support fails with an exact diagnostic".
 
-### Phase 5 padding-discipline inventory
+### Phase 5 padding-contract inventory
 
 The implementation keeps this inventory exhaustive over both `ArrayOperation` and `XlaOperation`; adding a variant to
-either enum now requires an explicit classification before `ryft-xla` compiles.
+either enum now requires an explicit classification before `ryft-xla` compiles. Reduction, sort, and scatter also use
+wildcard-free matches over their nested kind enums. `Masked`/`ZeroPadded` are not enforcement mechanisms: the renamed
+`XlaMasked`/`XlaZeroPadded` cases record explicit delegation to XLA, `RyftMasked` records explicit physical masking in
+Ryft lowering, and `Unsupported` is the enforced rejection.
 
-| Discipline | Operations | Owner |
+| Contract | Operations | Evidence / enforcement |
 | --- | --- | --- |
-| Padding-oblivious | Constructors; elementwise arithmetic, logical, comparison, selection, and conversion operations; shape-preserving and shape-rearranging operations; proven-bounded dynamic shape slices; control flow and pure nested-call carriers; placement metadata | StableHLO/XLA dynamic-dimension propagation; dynamic shape slice uses a Ryft bounded `dynamic_slice` + static stride + `set_dimension_size` fallback because XLA rejects `real_dynamic_slice` |
-| Mask-required | `reduce`, `sort`, and their decomposed higher-level consumers such as argmin/argmax | XLA's bounded-dynamic legalizer inserts identity/sentinel masking |
-| Zero-padding-required | `dot`, `scaled_dot`, and dot-product-attention forward/backward contractions | XLA's bounded-dynamic legalizer prevents physical padding lanes from contributing to contractions |
-| Unsupported/opaque | `custom_call`, `print`, `rng_bit_generator`, and `shard_map` when their boundary references a data-derived identity | Ryft rejects before MLIR construction with an operation-named diagnostic; these boundaries cannot safely infer logical padding semantics |
+| Propagated | Constructors; elementwise arithmetic, logical, comparison, selection, and conversion operations; reviewed shape-preserving/rearranging operations; control flow and pure nested-call carriers; placement metadata | StableHLO/XLA logical dynamic-dimension propagation; existing bounded-input fixtures apply independently of whether the identity originated at the boundary or at `dimension_from_scalar` |
+| XLA-masked delegation | `reduce_{sum,max,min,any,all}`; ascending and descending `sort`; decomposed argmin/argmax passenger permutation | One unchanged two-extent fixture passes direct eager-versus-JIT comparison on CPU and exact execution on CUDA 13; wildcard-free kind matches force review of additions |
+| XLA-zero-padded delegation | `dot` | The same CPU/CUDA two-extent fixture makes contraction padding observable and proves exact results |
+| Ryft-owned physical masking | `scaled_dot`; dot-product-attention forward/backward for matching static heads, no bias, explicit sequence lengths, no built-in mask, no sliding window, and no dropout | One retained bounded program runs at logical extents 2 and 4 under physical bound 4. CPU direct eager and portable JIT bytes agree exactly. CUDA 13 executes `__op$block_scaled_dot` for NVFP4 (`f4e2m1fn`/`f8e4m3fn`) and both MXFP8 element formats (`f8e4m3fn` and `f8e5m2`, each with `f8e8m0fnu` scales), plus `__cudnn$fmhaSoftmax` and `__cudnn$fmhaSoftmaxBackward`, on NVIDIA GB10/cuDNN 9.25 with exact forward and gradient values. Explicit lengths are one smaller than each logical sequence, proving the further-restriction contract; zero extent is rejected exactly by the declared `[1, 5)` gateway bounds. |
+| Ryft-checked dynamic slice | `dynamic_shape_slice` | Finite physical bounds select `dynamic_slice`/static stride/`set_dimension_size`; when type bounds do not prove the logical limit, an ordered runtime assertion reproduces eager checked semantics |
+| Unsupported | `reduce_mean`; every scatter combiner; unproven scaled-dot and attention configurations; `custom_call`; `print`; `rng_bit_generator`; `shard_map` on any bounded-dynamic module | Ryft rejects before MLIR construction with the operation and a specific reason. For attention, residual unsupported configurations include bias, absent explicit lengths, built-in masks, sliding windows, dropout, grouped heads, and dynamic head geometry. Scaled dot retains static contracting/block geometry and exact element/scale identity agreement. There is no `Product` reduction kind today; adding one is compile-forced. |
 
 ### Phase 5 review (2026-08-09)
 
@@ -261,6 +275,31 @@ either enum now requires an explicit classification before `ryft-xla` compiles.
   stream while reusing the CPU validation and diagnostic implementation. The same CUDA test passes extent 8 through
   the compiled gateway, awaits the asynchronous callback failure, and observes the exact actor-, variable-, value-,
   and bounds-named diagnostic. The complete CPU `ryft-xla` library suite remains green (452 passed, one ignored).
+- Adversarial correction: the original `Masked` and `ZeroPadded` labels were inert metadata and the review text
+  overstated delegation as Ryft-owned rewriting. The variants now say `XlaMasked`/`XlaZeroPadded`; kind-level matches
+  are exhaustive; dynamic mean, all scatter kinds, scaled dot, and attention are fail-closed. The CPU fixture now
+  directly compares eager and whole-program JIT at extents 2 and 4 and covers sum/max/min/any/all, both sort
+  directions, argmin/argmax-style passengers, and dot. The exact same program passed on the DGX Spark (NVIDIA GB10,
+  CUDA 13.0, cuDNN 9.25) at both extents.
+- Proved the formerly fail-closed scaled-dot and attention rows. `ScaledDotOperation` now permits bounded dynamic batch
+  and noncontracting dimensions while retaining static contracting/block geometry. Attention permits bounded dynamic
+  batch/query/key-value sequence axes for the exact explicit-length configuration above. Portable CPU execution and
+  fused CUDA execution pass at extents 2 and 4 under one physical bound, with explicit sequence lengths `extent - 1`.
+  Ryft widens each CUDA kernel operand to its physical bound, masks newly exposed lanes with the operation's identity
+  (`0` for elements/QKV/lengths and `1` for block scales), and restores logical result metadata. The CUDA proof ran
+  `__op$block_scaled_dot` for NVFP4 and both MXFP8 element formats, plus `__cudnn$fmhaSoftmax` and
+  `__cudnn$fmhaSoftmaxBackward`, on NVIDIA GB10 with CUDA 13.0 and cuDNN 9.25; forward values and all three gradients
+  were exact, and extent zero retained the exact gateway rejection.
+- The former dynamic-shape-slice proof gate required every admitted start/size combination to fit the *minimum*
+  logical input extent, rejecting the natural independent `m ∈ [1, 5)`, `n ∈ [0, 5)` composition. Lowering now checks
+  that the maximum physical span fits the bound-shaped buffer and emits an ordered runtime assertion for the logical
+  relation when bounds alone cannot prove it. Valid `m=4,n=2` execution matches eager; `m=2,n=4` reports the exact
+  eager limit diagnostic. A lowering-owned axis planner directly pins the finite-size-bound, finite-input-bound,
+  checked-span-overflow, and span-exceeds-physical-input rejection diagnostics, plus both the statically proven and
+  runtime-asserted plans.
+- The `shard_map` guard now applies before device-count branching, so even a single-device bounded-dynamic module
+  cannot silently emit `sdy.manual_computation` with Shardy disabled. Input-bound bucketing now rejects first-class
+  dimension inputs explicitly and rejects multi-device meshes instead of silently changing their Shardy mode.
 
 ## Phase 6: ragged batching for data-dependent extents (archive Phase 14)
 
@@ -268,36 +307,68 @@ either enum now requires an explicit classification before `ryft-xla` compiles.
 Structural advantages to reuse: the recursive batching meta stack composes nested axes already, and the
 relaxed-while-predicate work established consumer-owned masking.
 
-- [ ] Confirm and record the concrete motivating workload before implementation so the supported operation surface is
+The recorded motivating workload maps paired scalar values and scalar integer lengths, checks each length through
+`dimension_from_scalar` against `length ∈ [0, 4)`, broadcasts each value to its own length, reads that length back
+through `dimension_size`, squares the packed values, crosses an identity `linear_call`, and sums the live prefix. It
+must produce `[4, 27]` for values `[2, 3]` and lengths `[1, 3]`, retain the same program under a dynamic outer batch
+extent, and compose as nested `vmap` over a `2 × 2` value/length grid. This deliberately demands the gateway,
+shape-carrying broadcast and shape read, the elementwise blanket, an opaque linear region boundary, masked sum, and
+nested structural batching; other consumers remain unsupported until they own an explicit ragged contract.
+
+- [x] Confirm and record the concrete motivating workload before implementation so the supported operation surface is
       demand-shaped rather than speculative. If the owner explicitly approves deferral instead, record it here and
       re-scope the tier-3 exit criteria; do not defer silently.
-- [ ] Extend `BatchingPolicy` with a ragged mapped-extent representation: a per-element extent vector (dimension SSA
+- [x] Extend `BatchingPolicy` with a ragged mapped-extent representation: a per-element extent vector (dimension SSA
       indexed along the batch axis) plus the declared bound as the packed physical extent, with masks owned by
       consumers. Raggedness lives on the batch carrier only; do not add it to `Type` and do not build a parallel
       batching context/tracer tower.
-- [ ] Batching rule for the gateway: a mapped scalar operand yields a ragged mapped dimension instead of the Phase 4
+- [x] Batching rule for the gateway: a mapped scalar operand yields a ragged mapped dimension instead of the Phase 4
       rejection; replicated behavior is unchanged.
-- [ ] Ragged rules for the elementwise blanket, masked reductions, and the shape-carrying `linear_call` carrier
+- [x] Ragged rules for the elementwise blanket, masked reductions, and the shape-carrying `linear_call` carrier
       (batch both attached regions with replicated residual extents and ragged linear operands, reusing the
       swap-stable P6 batching rule). Every operation without a ragged rule keeps an exact typed diagnostic.
-- [ ] Prove nested `vmap` over ragged extents composes through the recursive batching meta stack.
-- [ ] Control flow: ragged trip counts remain rejected with an exact diagnostic; record the fixture.
-- [ ] Gate: the ragged surface covers the recorded workload end to end with static and dynamic tests, every
+- [x] Prove nested `vmap` over ragged extents composes through the recursive batching meta stack.
+- [x] Control flow: ragged trip counts remain rejected with an exact diagnostic; record the fixture.
+- [x] Gate: the ragged surface covers the recorded workload end to end with static and dynamic tests, every
       unsupported path has an exact diagnostic, and no parallel batching tower or type-level raggedness was
       introduced.
+- [x] Adversarial closure correction: fail closed when any projected or mixed operation discards ragged metadata,
+      when an opaque region cannot recover a physically bounded logical axis, or when a ragged array reaches the
+      public transform boundary. Pin mixed concatenation, opaque-region, and array-output fixtures.
+- [x] Restore scan's nominal runtime-length identity contract and derive the mapped gateway's synthesized scan length
+      from the packed input axis that actually defines it. Pin unrelated-identity rejection.
+- [x] Keep generic reduction batching available to downstream `ArrayBatchingPolicy` implementations; do not place a
+      private trait in its public implementation eligibility. Replace the operation-name allowlist with a typed or
+      carrier-state contract, and execute mapped `dimension_to_scalar` plus mapped gateway bounds failures in tests.
 
 ## Phase 7: JAX differential-testing harness
 
 Split out of the verification matrix as its own multi-week work item; the behavioral-parity matrix row stays open
 until this lands.
 
-- [ ] Build a differential-testing harness against a pinned JAX build covering the frozen behavioral-parity and
+- [x] Build a differential-testing harness against a pinned JAX build covering the frozen behavioral-parity and
       Ryft-exceeds-JAX cases.
-- [ ] Cover the P3k group-aware collective, `pshuffle`, and `pswapaxes` surfaces (behavioral and StableHLO
+- [x] Cover the P3k group-aware collective, `pshuffle`, and `pswapaxes` surfaces (behavioral and StableHLO
       comparisons; closes the P3k comparison tail from Phase 1).
-- [ ] Cover the tier-3 `n = count(mask); take(x, n)` eager/staged comparisons from Phase 4.
-- [ ] Gate: behavioral JAX parity and the Ryft-exceeds-JAX cases are demonstrated by the harness rather than
+- [x] Cover the tier-3 `n = count(mask); take(x, n)` eager/staged comparisons from Phase 4.
+- [x] Gate: behavioral JAX parity and the Ryft-exceeds-JAX cases are demonstrated by the harness rather than
       asserted.
+
+### Phase 7 review (2026-08-09)
+
+The executable harness pins JAX/JAXLIB 0.6.2 and compares versioned observations produced independently by one
+feature-gated Ryft binary and one fresh-process JAX registry. Exact-parity cases compare both values and semantic
+collective StableHLO (operation family, ordered groups, and axis attributes), not brittle whole-module spelling. The
+four-case matrix covers grouped tiled all-gather/psum-scatter/all-to-all, public `pshuffle` plus its canonical
+`ppermute` lowering, public `pswapaxes` plus untiled all-to-all lowering, and the bounded data-dependent prefix case.
+The final case records the intended capability relation directly: equal eager `[10, 20]` and `[]` results, successful
+Ryft staging as `f32[count]`, and pinned JAX concretization rejection. The obsolete standalone JAX-only prefix test is
+deleted, leaving the differential case as its single owner.
+
+The Rust emitter tests pass 2/2, the Python harness tests pass 6/6, the feature-enabled `ryft-xla` all-target check is
+clean, and the complete live harness reports four `PASS` records on four CPU devices. The established pinned-JAX
+parity modules pass 12 tests with only two intentionally current-JAX-only variance cases skipped; both existing live
+program-statistics checks pass under the new pin. File-scoped nightly formatting and diff hygiene are clean.
 
 ## Abort and reassessment criteria
 
@@ -321,6 +392,10 @@ The cleanup (Phases 1–3) is complete only when the archive plan's exit criteri
 the remaining work are: exact behavior, diagnostics, cache identity, ABI, CPU/CUDA execution, and performance gates
 pass (16); production code is materially smaller with the special-purpose adapter modules reduced by at least 40%
 (17); and no hidden reconstruction paths or dual semantic operation contracts remain (15, and Phase 3's gate).
+
+Criterion 17 is satisfied under the amended predicate: see the owner decision "adapter-budget scope amendment
+(2026-08-09)" in the Phase 3 closure entry, which fixes the budget as a like-for-like measure over Phase 0 baseline
+functionality (met at Phase 3 close with a 40.4% reduction) and reports the raw current number alongside it.
 
 Full tier-3 dynamism (Phases 4–6) is additionally complete only when:
 
@@ -631,6 +706,20 @@ larger than Phase 0, but that comparison crosses the independently approved feat
 Phase 3 sizing decision and is not evidence of dimension-architecture overhead. The like-for-like adapter gate passes,
 and all retired expression/reconstruction budgets are zero.
 
+**Owner decision — adapter-budget scope amendment (2026-08-09).** The adapter budget is a like-for-like acceptance
+predicate over the functionality that existed at the Phase 0 baseline. The Phase 3-close measurement above (2,861
+pre-test lines, a 40.4% reduction) is this refactor's verdict on that predicate, and it passed. Phase 6 ragged
+batching, the evidence-validation machinery, and the carrier work are post-baseline capability that the Phase 0
+adapters never contained, so they are excluded from the like-for-like predicate for exactly the reason the Phase 3
+sizing decision above excludes post-baseline features from the whole-tree totals. Nothing is hidden: the raw current
+number is 3,575 pre-test lines (167 in `arrays/ir.rs`, 3,044 in `arrays/batching.rs`, 364 in
+`arrays/differentiation.rs`) as of 2026-08-09, a 25.52% raw reduction including that post-baseline functionality; the
+closure-verification guards added later the same day bring `arrays/batching.rs` to 3,058 and the raw total to 3,589
+(a 25.23% raw reduction). This is a deliberate scope correction recorded as an owner decision, not a silent
+re-baselining. Standing tripwire: transform-layer growth per additional ragged consumer is the metric that triggers
+migrating to the operation-level ragged model (the `pad_contraction_input` / `ragged_dot` path already recorded as a
+TODO on `RaggedArrayBatchingPolicy`).
+
 **Verification and final review.** All 1,207 `ryft-core` unit tests pass; all 53 runnable doctests pass (16 ignored);
 the two projection/region integration suites pass 6/6 each; all 57 `ryft-macros` unit tests pass; both
 `ryft-macros-tests` suites pass 20/20 and 17/17, including all compile-fail fixtures; and `ryft-xla --lib` passes
@@ -649,8 +738,12 @@ artifact, and cache entry. Existing gateway closure/import coverage now explicit
 two repeatedly spliced copies acquire an input identity: each gateway result is a fresh internal identity and each
 imported condition region is alpha-renamed to its corresponding definition. The closed operation-family classifier
 still contains exactly one array-to-dimension gateway. Replicated batching remains ordinary dimension flow; mapped
-batching retains `BatchingError::MappedDimension` and now names Phase 6 ragged batching in its exact diagnostic. The
-existing scan/while carry equality rules reject a fresh per-iteration shape identity exactly, with no widening layer.
+batching retained `BatchingError::MappedDimension` at this phase boundary. Correction (2026-08-09): the diagnostic was
+never updated to name Phase 6 raggedness. Full-history verification found exactly three wordings of the
+`MappedDimension` message and none of them mentioned raggedness, so no such update ever existed. That checklist intent
+was superseded when Phase 6 implemented the capability and replaced the mapped-gateway rejection with the checked
+extent carrier, leaving the `MappedDimension` rejection for mapped first-class dimension carriers only. The existing
+scan/while carry equality rules reject a fresh per-iteration shape identity exactly, with no widening layer.
 
 **Behavioral fixture and documentation.** The Ryft golden converts a Boolean mask to an integer count, reduces it to
 rank-zero scalar SSA, crosses `dimension_from_scalar`, and dynamically slices a prefix using the resulting bounded
@@ -667,3 +760,177 @@ data-dependent output materialization remains Phase 5's explicit scope.
 passes. Nightly formatting and diff hygiene are clean. The implementation adds tests, exact diagnostics, and rustdoc
 only; it introduces no expression representation, side table, ambient environment, compatibility layer, or duplicate
 semantic path. Phase 4 is closed.
+
+### Phase 6 ragged-batching closure (2026-08-09)
+
+**Carrier and supported surface.** `ArrayBatch` and `ArrayIrBatch` now retain the logical per-item type and bounded
+ragged-axis metadata while their parent value remains an ordinary dense packed array. A mapped
+`dimension_from_scalar` stages one checked extent per batch item as an integer array; dynamic broadcast uses the
+declared upper bound for physical storage; `dimension_size` and `dimension_to_scalar` recover the mapped extents; and
+the elementwise blanket propagates the carrier without adding raggedness to `Type`. Sum reductions mask every padded
+suffix before consuming it, and opaque `linear_call` regions reconstruct the same logical carrier at their boundary.
+
+**Composition and diagnostics.** The recorded value/length workload produces `[4, 27]` eagerly and after tracing with
+a dynamic outer batch extent. Applying the recursive batching policy twice produces `[[4, 27], [32, 25]]`, proving
+that nested batching reuses the existing meta stack rather than introducing another context or tracer family. Exact
+fixtures reject reduction kinds without a padding identity, projected array rules that discard ragged metadata,
+dynamic reshape, and ragged while state/trip-count flow. First-class dimensions remain replicated at public transform
+boundaries even though mapped dimension carriers may flow internally.
+
+**Adversarial closure.** Operation-wide carrier validation now covers both projected and mixed rules and accepts a
+disappearing ragged identity only when the rule that consumed it says so; there is no operation-name allowlist. The
+rule returns evidence naming the dimensions it consumed, the driver passes that evidence straight into validation, and
+it is dropped there, so a claim cannot reach the next operation. Mixed concatenation, a direct ragged array result, and
+an opaque linear-region output with no matching extent source all fail exactly. The mapped gateway's scan derives its
+trip-count value from the packed input axis, scan inference still rejects an unrelated dynamic identity while admitting
+an exact concrete refinement, and mapped `dimension_to_scalar` plus per-item gateway bounds failures execute in the
+retained fixtures. Reduction batching uses the public `RaggedArrayBatchingPolicy` extension contract (renamed from the
+`RaggedReductionPolicy` working name recorded here), so downstream array policies are not excluded by an
+unimplementable private bound.
+
+**Verification.** All 1,211 `ryft-core` unit tests and all 53 runnable doctests pass (16 ignored), including the eager,
+dynamic-traced, nested, linear-region, masked-reduction, and unsupported-consumer fixtures. The complete `ryft-xla`
+library suite passes 457 tests with one timing benchmark ignored. The workspace all-target check, nightly formatting,
+and diff hygiene are clean. The all-target pass additionally pins the test-only recursive batching driver delegation
+and confirms that `LinearCallOperation` needs no redundant recursive-policy bound beyond its supplied
+`BatchingDriver`. Phase 6 adds no expression representation, side table, ambient environment,
+parallel batching tower, or type-level ragged variant, and is closed.
+
+### Evidence-based batching validation refactor (2026-08-09)
+
+**Design.** The one-operation ragged-consumption authorization no longer rides on the batch carriers. `BatchingPolicy`
+gains an associated `Evidence: Default` type, and every batching rule returns `BatchedOutputs<C, P>` (the produced
+carriers plus that rule's evidence) instead of a bare `Vec<P::Batch>`. `finalize_operation_outputs` is replaced by
+`validate_operation_outputs(operation_name, inputs, &outputs, &evidence)`, whose immutable `outputs` slice makes the
+"validate, never rewrite" contract a signature rather than prose. The driver threads the evidence from the rule's
+return value straight into that call and drops it there, so a rule's claim cannot reach the next operation by
+construction. `BatchingPolicyProjection::Projected` now pins `Evidence = Self::Evidence` alongside `Extent`, so a
+projected member rule's claim crosses the projection boundary unchanged; `ArrayBatchingPolicy` pins the array family's
+evidence to `Vec<DimensionVariable>` so one shared reduction rule states the claim identically under every array
+policy. `BatchedOutputs` has `From<Vec<P::Batch>>`, which fills `Evidence::default()`, so the ~65 rules that make no
+claim changed by exactly one `.into()`.
+
+**Carrier-state deletion.** `consumed_ragged_dimensions` is gone from both `ArrayBatch` and `ArrayIrBatch`, together
+with `with_consumed_ragged_dimensions`, its participation in `ArrayIrBatch`'s `PartialEq` (where it was a real defect,
+since a transient authorization could make two otherwise identical carriers compare unequal), its manual
+clone-propagation through the projected-rule adapters, and the clearing loop. `ReduceOperation`'s batching rule is the
+only producer of real evidence.
+
+**Diagnostic.** With the claim explicit, the validator names the dimension that was lost:
+`` operation `{name}` neither preserves nor consumes bounded ragged dimension `{variable}` ``, replacing
+`` operation `{name}` does not support bounded ragged array operands ``. The `slice` and `concatenate` fixtures in
+`test_array_ir_ragged_batching_rejects_unsupported_consumers` were updated accordingly; the rule-owned
+`dynamic reshape does not support bounded ragged array operands` message is unchanged.
+
+**Verification.** Workspace all-target check clean with zero warnings; `ryft-core` unit, integration, and doctest
+suites, the `ryft-xla` library suite, and both `ryft-macros` crates pass, with the only failures being two
+`DimensionBounds`-rendering assertions owned by concurrent work in the same tree. One new test,
+`batching::tests::test_operation_evidence_reaches_validation_and_does_not_outlive_its_rule`, pins the lifecycle with a
+fixture policy that accepts an operation only when that operation's own rule attested to it.
+
+### Carrier type-cache removal (2026-08-09)
+
+**Audit gate.** Both derivation invariants were checked before any production change. A temporary probe inside
+`ArrayBatch::new`, `ArrayBatch::with_ragged_axes`, and `ArrayIrBatch::with_ragged_axes` compared the caller-supplied
+packed type against `value.r#type()` and the caller-supplied logical type against the canonical derivation. Across the
+`ryft-core` and `ryft-xla` suites it observed 3,042 constructions, 26 of them with non-empty ragged axes on `ArrayBatch`
+and 19 on `ArrayIrBatch`, with zero divergences on either invariant. A static pass over the 124 `ArrayBatch::new` sites
+and the 8 logical-type sites confirmed the same: every site either reads its type off the value or mints the value from
+that type through an operation whose inference returns it verbatim. `normalized_batch_axis_type` — the one site shaped
+like a deliberate sharding-normalized divergence — rebroadcasts the value through the normalized type before wrapping
+it, so it agrees too. Verdict: go.
+
+**Carriers.** `ArrayBatch` is now `{ value, batch_axis, ragged_axes }`; the cached `r#type` and `unbatched_type` fields
+are gone. `Typed::r#type` forwards to `self.value.r#type()`, which keeps `Cow::Borrowed` for concrete values, so the
+packed type cannot drift. One canonical derivation, the `pub(crate)` `ArrayType::unbatched_type_and_axis(batch_axis,
+ragged_axes)` in `arrays/batching.rs`' `impl ArrayType`, *defines* the logical per-item type: the packed type with the
+mapped dimension removed and every bounded ragged axis's dynamic dimension restored. The constructors validate that derivation once, which is what keeps `unbatched_type()`
+infallible afterwards. `ArrayBatch::new(value, axis)` and `with_ragged_axes(value, axis, ragged_axes)` lost their type
+parameters. `ArrayIrBatch` replaced its `r#type: ArrayIrType` with `mapped_dimension: Option<DimensionType>`, which
+carries only the one per-item type that genuinely cannot be derived (a mapped first-class dimension whose packed value
+is an integer extent array); every other kind derives through the same function. `with_logical_array_type` is deleted,
+`with_ragged_axes` lost its logical-consistency validation (the state it validated no longer exists) and kept its
+range/batch-axis validation, and `unbatched_type()` returns `ArrayIrType` by value. `PartialEq` on both carriers now
+compares only stored truth. `#[derive(Parameter)]` needed no change: `Parameter` is a marker trait, so the derive emits
+only an empty impl.
+
+**Call sites.** 130 constructor calls across 28 files were rewritten mechanically, and 33 local bindings that existed
+only to feed the deleted parameters were removed. The judgment-bearing edits were four: `restore_batch` no longer
+threads the declared per-item type, because the ragged axes it recovers from that type's dynamic dimensions already
+determine it; `align_array_batch`'s two dead type extractions became direct mapped-dimension rejections;
+`ArrayIrBatch::validate_replicated_dimension` kept its explicit replicated-axis check so that carriers built by tests
+that deliberately bypass the constructors still produce the typed `MappedDimension` diagnostic.
+
+**Diagnostics that died with the deleted state.** Three redundant logical-type inferences were removed along with their
+error paths: the elementwise blanket rule's second `infer_output_types` over per-item types (and its `check_count!`),
+`ReduceOperation`'s per-item output inference, and `DynamicBroadcastOperation`'s ragged per-item output inference (and
+its `check_count!`). Each existed only to produce the logical type that is now derived; none is reachable as a distinct
+failure now that the packed value is the single source of truth. Every other message, including the ragged-axis range
+error, is unchanged.
+
+**Verification.** Workspace all-target check clean with zero warnings; `cargo doc -p ryft-core` introduces no new
+warnings. `ryft-core` 1,215 lib + 53 integration + 6 + 6, `ryft-xla` 458 lib (serial), `ryft-macros` 57, and
+`ryft-macros-tests` 20 + 17 all pass at exactly their pre-refactor counts, with zero rendered-fixture changes. The
+pre-existing `arrays::batching::tests::test_array_batch_unbatched_type` was extended to pin the derivation itself:
+dense removal, replicated identity, ragged dynamic substitution, and the surviving ragged-axis validation.
+
+Correction (2026-08-09): the `ryft-core --lib` count recorded above was 1,214 and the count recorded in the Phase 6
+closure entry was 1,211; the reproducible figure for both is 1,215. Commit `e4df45507` was committed non-compiling — a
+test-only `E0308` at `arrays/batching.rs:6490`, fixed by the one-line `Ok(...)` wrap that now lives in the working tree
+— so the counts originally recorded in these two entries predate a build that can actually be reproduced from the
+commit they cite.
+
+### Closure verification fixes (2026-08-09)
+
+**Scan runtime-length soundness.** A composite scan whose declared length is a dynamic variable accepted a runtime
+length operand of an unrelated identity as long as that operand's bounds pinned one exact extent inside the declared
+bounds. Nothing cross-checked that extent against the stacked operands, which are validated against the declared
+`length` independently, so a scan declared over `length ∈ [1, 5)` with stacked `f32[length, extent]` could be driven
+by an operand pinned to 3, over-reading the stacks at `length = 1` and truncating them at `length = 4`. The exact
+refinement now additionally requires every stacked operand's leading dimension to be refined to that same exact
+extent, and the inferred stacked outputs are typed at the concrete extent rather than at the still-symbolic declared
+length. The new sibling diagnostic names both types: ``'scan' runtime length operand has type {operand} but stacked
+input {index} has type {type} whose leading dimension is not refined to extent {extent}``. All three sites share the
+rule: `ArrayIrType::scan_body_input_types`, `ArrayIrType::infer_scan_output_types` (both via the new
+`validate_scan_runtime_length`), and the eager `interpret_scan` mirror in `arrays/operations/control_flow.rs`. The
+mapped gateway's synthesized scan is unaffected: it derives its trip-count value from the packed input axis, so it
+either has a static length or takes the nominal-identity arm. Captures had the same shape of hole (validated only
+against the declared length) and are now validated against the effective scan length: the defaulted
+`ScanTypeSemantics::effective_scan_length` returns the declared length, the `ArrayIrType` override resolves the
+exact-refinement arm to its concrete extent through the shared `validate_scan_runtime_length`, and
+`test_scan_composite_type_contract` pins both the symbolic-capture rejection and the concretely refined acceptance.
+
+**Batching fail-open guards.** `StaticArrayBatchingPolicy::mask_reduction_input` returned its input unchanged for any
+carrier, so a ragged carrier (constructible since `ArrayBatch::with_ragged_axes` is public) would let the reduction
+rule claim consumption evidence for padding nobody masked. It now rejects a non-empty ragged carrier with `static
+array batching cannot mask bounded ragged axes` and keeps the pass-through for the empty case.
+`ArrayBatching::materialize_output` gained the public-boundary ragged guard its `ArrayIrBatching` counterpart already
+had, with the identical `a bounded ragged array cannot cross the batching transform output boundary` message.
+
+**Fixtures.** `test_scan_composite_type_contract` converts the previously accepted unsound case into a pinned
+rejection and adds the admissible refinement (stacked `f32[3, extent]` with an operand pinned to 3, whose stacked
+output is typed `f32[3, extent]`). One new `ryft-core` test, `test_static_array_batching_rejects_ragged_carriers`,
+pins both guards. `test_array_ir_ragged_batching_rejects_unsupported_consumers` gained the missing public-boundary
+fixture for the "first-class dimensions remain replicated at public transform boundaries" claim: a mapped gateway
+output driven through `batch(...)` with a mapped output axis reports the typed `MappedDimension` diagnostic. In
+`ryft-xla`, `test_data_derived_compilation_rejects_unbounded_and_opaque_consumers` gained end-to-end lowering
+rejections for `print`, `rng_bit_generator`, and an add-scatter combiner over a data-derived extent, and the new
+`test_lower_mlir_module_for_program_rejects_unsupported_dynamically_shaped_attention` pins all four previously
+unasserted dynamically shaped attention diagnostics (forward and backward, missing sequence lengths and unsupported
+configuration).
+
+**Ledger corrections.** The Phase 4 checklist item and closure entry no longer claim that the mapped-batching
+diagnostic was updated to name Phase 6 raggedness; that update never existed and the item's intent was superseded by
+Phase 6's capability. The Phase 6 adversarial-closure paragraph is restated in the evidence model's terms and uses
+the shipped `RaggedArrayBatchingPolicy` name. The carrier type-cache entry names the real derivation
+(`ArrayType::unbatched_type_and_axis`) and the real coverage (the extended `test_array_batch_unbatched_type`). The
+recorded `ryft-core --lib` counts are corrected to 1,215 with the non-compiling `e4df45507` noted. The Phase 3
+adapter budget carries a dated owner decision amending it to a like-for-like predicate, with the raw current number
+reported alongside and a standing tripwire on per-consumer transform-layer growth.
+
+**Verification.** `cargo check --workspace --all-targets` clean with zero warnings. `ryft-core --lib` passes
+1,216/1,216 (1,215 baseline plus the one new `test_static_array_batching_rejects_ragged_carriers`; every other
+addition extends an existing test), plus 6 + 6 integration and 53 runnable doctests (16 ignored). `ryft-xla --lib`
+serial passes 459 with one timing benchmark ignored (458 baseline plus the one new attention rejection test).
+`ryft-macros` passes 57 and `ryft-macros-tests` 20 + 17. Per-file `rustfmt --check` is clean on every touched file.
+The only pinned-fixture change is the intentional scan conversion described above.

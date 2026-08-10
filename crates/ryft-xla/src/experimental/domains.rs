@@ -4020,6 +4020,7 @@ mod tests {
 
     use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
     use ryft_core::operations::custom_call::CustomCallOperation;
+    use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
@@ -4029,7 +4030,8 @@ mod tests {
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
         DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation, JittedFunction, MulOperation,
         NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, ScaledDotOperation,
-        SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation, try_jit_with_options,
+        ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
+        SubOperation, WhileOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6621,7 +6623,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = XlaProgramBuilder::new();
-        let size = builder.add_input(size_type.into());
+        let size = builder.add_input(size_type.clone().into());
         let dimension =
             builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
         let input = builder
@@ -6634,10 +6636,103 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
             Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `reduce_mean` cannot consume data-derived dimensions during XLA lowering \
                     because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
+        ));
+
+        // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
+        // become observable.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `print` cannot consume data-derived dimensions during XLA lowering because \
+                    print exposes the physical representation of its operand",
+        ));
+
+        // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
+        // upper-bound element count rather than the logical one.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.clone().into());
+        let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type),
+                Vec::new(),
+                vec![state, dimension],
+            )
+            .unwrap()[1];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
+                    lowering because random generation advances state according to physical rather than logical \
+                    element count",
+        ));
+
+        // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
+        // per kind rather than per operation name.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(1)]));
+        let updates_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let size = builder.add_input(size_type.into());
+        let indices = builder.add_input(indices_type.into());
+        let updates = builder.add_input(updates_type.into());
+        let dimension =
+            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let operand = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0]),
+                    ScatterReductionKind::Add,
+                ),
+                Vec::new(),
+                vec![operand, indices, updates],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `scatter` cannot consume data-derived dimensions during XLA lowering because \
+                    add-scatter padding semantics have not been verified for data-derived dimensions",
         ));
     }
 

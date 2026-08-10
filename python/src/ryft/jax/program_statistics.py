@@ -52,8 +52,8 @@ class RegionStatistics:
 
     input_count: int
     output_count: int
-    instruction_count: int
     constant_count: int
+    instruction_count: int
     operation_counts: dict[str, int]
     maximum_output_dependency_depth: int
     attached_regions: tuple[AttachedRegionStatistics, ...]
@@ -218,11 +218,11 @@ def _parse_region(payload: Any, path: str) -> RegionStatistics:
         output_count=_required_integer(
             _required_field(fields, "output_count", path), _child_path(path, "output_count")
         ),
-        instruction_count=_required_integer(
-            _required_field(fields, "instruction_count", path), _child_path(path, "instruction_count")
-        ),
         constant_count=_required_integer(
             _required_field(fields, "constant_count", path), _child_path(path, "constant_count")
+        ),
+        instruction_count=_required_integer(
+            _required_field(fields, "instruction_count", path), _child_path(path, "instruction_count")
         ),
         operation_counts=_parse_operation_counts(
             _required_field(fields, "operation_counts", path), _child_path(path, "operation_counts")
@@ -474,8 +474,8 @@ def _collect_region(
         RegionStatistics(
             input_count=len(input_variables),
             output_count=len(output_variables),
-            instruction_count=len(equations),
             constant_count=len(constant_variables) + len(literals_by_identity),
+            instruction_count=len(equations),
             operation_counts=dict(sorted(operation_counts.items())),
             maximum_output_dependency_depth=maximum_output_dependency_depth,
             attached_regions=tuple(attached_regions),
@@ -527,6 +527,8 @@ def program_statistics_cases() -> tuple[ProgramStatisticsCase, ...]:
 def selected_cases(case_ids: Sequence[str]) -> tuple[ProgramStatisticsCase, ...]:
     """Returns the selected registry cases in the requested order, or all cases when no ID is requested.
 
+    Each case may be selected at most once.
+
     # Parameters
 
       - `case_ids`: Requested case IDs, possibly empty.
@@ -546,6 +548,18 @@ def selected_cases(case_ids: Sequence[str]) -> tuple[ProgramStatisticsCase, ...]
             + "; available cases: "
             + available_case_ids
         )
+
+    seen_case_ids: set[str] = set()
+    duplicate_case_ids: list[str] = []
+    for case_id in case_ids:
+        if case_id in seen_case_ids and case_id not in duplicate_case_ids:
+            duplicate_case_ids.append(case_id)
+        seen_case_ids.add(case_id)
+    if duplicate_case_ids:
+        raise ValueError(
+            f"program statistics case(s) requested more than once: {', '.join(duplicate_case_ids)}"
+        )
+
     return tuple(cases_by_id[case_id] for case_id in case_ids)
 
 
@@ -761,6 +775,19 @@ def compare_case(
 
     ryft_operation_counts = normalize_operation_counts(ryft_entry.operation_counts)
     jax_operation_counts = normalize_operation_counts(jax_entry.operation_counts)
+    if case.comparable:
+        ryft_unknown_operation_counts = {
+            name: count for name, count in ryft_operation_counts.items() if name.startswith("unknown:")
+        }
+        jax_unknown_operation_counts = {
+            name: count for name, count in jax_operation_counts.items() if name.startswith("unknown:")
+        }
+        if ryft_unknown_operation_counts or jax_unknown_operation_counts:
+            differences.append(
+                "unmapped operation names: "
+                f"ryft {format_operation_counts(ryft_unknown_operation_counts)}; "
+                f"jax {format_operation_counts(jax_unknown_operation_counts)}"
+            )
     if ryft_operation_counts != jax_operation_counts:
         differences.append(
             f"operation_counts: ryft {format_operation_counts(ryft_operation_counts)} "

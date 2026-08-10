@@ -1,0 +1,172 @@
+"""Shared case registry and pinned-JAX emitters for differential testing.
+
+JAX is imported only after `build_jax_observations` configures four host devices. Keep this module free of module-level
+JAX imports so the parent comparison process can safely spawn it after running the Ryft emitter.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from ryft.jax.differential_testing import (
+    PINNED_JAX_VERSION,
+    SCHEMA,
+    DifferentialObservation,
+    StagingObservation,
+)
+
+
+@dataclass(frozen=True)
+class DifferentialCase:
+    """One registered workload and the relationship expected between Ryft and JAX."""
+
+    case_id: str
+    relationship: str
+    build_jax: Callable[[Any, Any, Any], DifferentialObservation]
+
+
+def _configure_jax_devices() -> None:
+    """Configures four host devices before the process imports JAX."""
+
+    flag = "--xla_force_host_platform_device_count=4"
+    existing = [
+        value
+        for value in os.environ.get("XLA_FLAGS", "").split()
+        if not value.startswith("--xla_force_host_platform_device_count=")
+    ]
+    os.environ["XLA_FLAGS"] = " ".join((*existing, flag))
+
+
+def _observation_values(array: Any, numpy: Any) -> tuple[tuple[float, ...], ...]:
+    """Returns one flattened logical output vector per leading device axis."""
+
+    values = numpy.asarray(array)
+    return tuple(
+        tuple(float(value) for value in device_values) for device_values in values.reshape(values.shape[0], -1)
+    )
+
+
+def _build_grouped_collectives(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds grouped tiled all-gather, sum-scatter, and all-to-all observations."""
+
+    groups = [[0, 2], [3, 1]]
+
+    def grouped(input_value: Any) -> tuple[Any, Any, Any]:
+        return (
+            jax.lax.all_gather(input_value, "x", axis=0, tiled=True, axis_index_groups=groups),
+            jax.lax.psum_scatter(input_value, "x", scatter_dimension=0, tiled=True, axis_index_groups=groups),
+            jax.lax.all_to_all(
+                input_value,
+                "x",
+                split_axis=0,
+                concat_axis=0,
+                tiled=True,
+                axis_index_groups=groups,
+            ),
+        )
+
+    function = jax.pmap(grouped, axis_name="x")
+    inputs = jax_numpy.arange(16.0, dtype=jax_numpy.float32).reshape(4, 4)
+    all_gather, psum_scatter, all_to_all = function(inputs)
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="grouped_shape_changing_collectives",
+        observations={
+            "all_gather": _observation_values(all_gather, numpy),
+            "psum_scatter": _observation_values(psum_scatter, numpy),
+            "all_to_all": _observation_values(all_to_all, numpy),
+        },
+        stablehlo=str(function.lower(inputs).compiler_ir("stablehlo")),
+    )
+
+
+def _build_pshuffle(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds `pshuffle` behavior and its `collective_permute` lowering."""
+
+    function = jax.pmap(lambda input_value: jax.lax.pshuffle(input_value, "x", [2, 0, 3, 1]), axis_name="x")
+    inputs = jax_numpy.arange(8.0, dtype=jax_numpy.float32).reshape(4, 2)
+    output = function(inputs)
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="pshuffle",
+        observations={"output": _observation_values(output, numpy)},
+        stablehlo=str(function.lower(inputs).compiler_ir("stablehlo")),
+    )
+
+
+def _build_pswapaxes(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds `pswapaxes` behavior and its untiled all-to-all lowering."""
+
+    function = jax.pmap(lambda input_value: jax.lax.pswapaxes(input_value, "x", 0), axis_name="x")
+    inputs = jax_numpy.arange(32.0, dtype=jax_numpy.float32).reshape(4, 4, 2)
+    output = function(inputs)
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="pswapaxes",
+        observations={"output": _observation_values(output, numpy)},
+        stablehlo=str(function.lower(inputs).compiler_ir("stablehlo")),
+    )
+
+
+def _build_data_dependent_prefix_take(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds eager prefix-take values and records JAX's traced-data staging rejection."""
+
+    def prefix(values: Any, mask: Any) -> Any:
+        count = jax_numpy.count_nonzero(mask)
+        return jax_numpy.take(values, jax_numpy.arange(count))
+
+    values = jax_numpy.array([10.0, 20.0, 30.0, 40.0], dtype=jax_numpy.float32)
+    two_matches = prefix(values, jax_numpy.array([True, False, True, False]))
+    zero_matches = prefix(values, jax_numpy.array([False, False, False, False]))
+    try:
+        jax.make_jaxpr(prefix)(values, jax_numpy.array([True, False, True, False]))
+    except jax.errors.ConcretizationTypeError:
+        staging = StagingObservation(status="rejected", category="concretization")
+    else:
+        staging = StagingObservation(status="supported", output_type="unexpected")
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="data_dependent_prefix_take",
+        observations={
+            "two_matches": (tuple(float(value) for value in numpy.asarray(two_matches)),),
+            "zero_matches": (tuple(float(value) for value in numpy.asarray(zero_matches)),),
+        },
+        staging=staging,
+    )
+
+
+DIFFERENTIAL_CASES = (
+    DifferentialCase("grouped_shape_changing_collectives", "parity", _build_grouped_collectives),
+    DifferentialCase("pshuffle", "parity", _build_pshuffle),
+    DifferentialCase("pswapaxes", "parity", _build_pswapaxes),
+    DifferentialCase("data_dependent_prefix_take", "ryft_exceeds_jax", _build_data_dependent_prefix_take),
+)
+
+
+def build_jax_observations(case_ids: Sequence[str]) -> tuple[DifferentialObservation, ...]:
+    """Builds selected observations against the exact repository-pinned JAX version.
+
+    # Parameters
+
+      - `case_ids`: Exact registry IDs to execute, in desired output order.
+    """
+
+    _configure_jax_devices()
+    import jax
+    import jax.numpy as jax_numpy
+    import numpy
+
+    if jax.__version__ != PINNED_JAX_VERSION:
+        raise RuntimeError(f"differential harness requires jax=={PINNED_JAX_VERSION} but found {jax.__version__}")
+    if len(jax.devices()) != 4:
+        raise RuntimeError(
+            f"differential harness requires exactly four JAX host devices but found {len(jax.devices())}"
+        )
+    by_id = {case.case_id: case for case in DIFFERENTIAL_CASES}
+    return tuple(by_id[case_id].build_jax(jax, jax_numpy, numpy) for case_id in case_ids)
+
+
+__all__ = ["DIFFERENTIAL_CASES", "DifferentialCase", "build_jax_observations"]

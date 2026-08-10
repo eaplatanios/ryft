@@ -7,6 +7,8 @@ from typing import Any
 
 
 _EXPORTS = {
+    "CaseComparison": ("ryft.jax.differential_testing", "CaseComparison"),
+    "DifferentialObservation": ("ryft.jax.differential_testing", "DifferentialObservation"),
     "PROGRAM_STATISTICS_CASES": ("ryft.jax.program_statistics_cases", "PROGRAM_STATISTICS_CASES"),
     "AttachedRegionStatistics": ("ryft.jax.program_statistics", "AttachedRegionStatistics"),
     "JaxprInspection": ("ryft.jax.extraction", "JaxprInspection"),
@@ -17,11 +19,16 @@ _EXPORTS = {
     "ProgramStatisticsCase": ("ryft.jax.program_statistics_cases", "ProgramStatisticsCase"),
     "ProgramStatisticsRecord": ("ryft.jax.program_statistics", "ProgramStatisticsRecord"),
     "RegionStatistics": ("ryft.jax.program_statistics", "RegionStatistics"),
+    "StableHloCollective": ("ryft.jax.differential_testing", "StableHloCollective"),
+    "StagingObservation": ("ryft.jax.differential_testing", "StagingObservation"),
     "collect_program_statistics": ("ryft.jax.program_statistics", "collect_program_statistics"),
+    "compare_differential_case": ("ryft.jax.differential_testing", "compare_case"),
+    "differential_cases": ("ryft.jax.differential_testing", "differential_cases"),
     "extract_jaxpr": ("ryft.jax.extraction", "extract_jaxpr"),
     "inspect_program": ("ryft.jax.extraction", "inspect_program"),
     "lower_to_stablehlo": ("ryft.jax.extraction", "lower_to_stablehlo"),
     "parse_program_statistics_record": ("ryft.jax.program_statistics", "parse_program_statistics_record"),
+    "parse_differential_observation": ("ryft.jax.differential_testing", "parse_observation"),
     "preserved_dump_program_case_by_id": (
         "ryft.jax.preserved_dump_cases",
         "preserved_dump_program_case_by_id",
@@ -29,6 +36,7 @@ _EXPORTS = {
     "preserved_dump_program_cases": ("ryft.jax.preserved_dump_cases", "preserved_dump_program_cases"),
     "program_cases_by_name": ("ryft.jax.examples", "program_cases_by_name"),
     "program_statistics_case_by_id": ("ryft.jax.program_statistics_cases", "program_statistics_case_by_id"),
+    "project_collective_stablehlo": ("ryft.jax.differential_testing", "project_collective_stablehlo"),
     "render_program_inspection": ("ryft.jax.extraction", "render_program_inspection"),
 }
 

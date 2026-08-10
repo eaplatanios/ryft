@@ -21,6 +21,7 @@ from ryft.jax.program_statistics import (
     collect_jax_records,
     collect_program_statistics,
     collect_rust_case_ids,
+    compare_case,
     main,
     normalize_operation_counts,
     parse_arguments,
@@ -54,8 +55,8 @@ SAMPLE_RECORD_PAYLOAD: dict[str, Any] = {
             {
                 "input_count": 1,
                 "output_count": 1,
-                "instruction_count": 1,
                 "constant_count": 0,
+                "instruction_count": 1,
                 "operation_counts": {"sin": 1},
                 "maximum_output_dependency_depth": 1,
                 "attached_regions": [],
@@ -63,8 +64,8 @@ SAMPLE_RECORD_PAYLOAD: dict[str, Any] = {
             {
                 "input_count": 1,
                 "output_count": 1,
-                "instruction_count": 1,
                 "constant_count": 0,
+                "instruction_count": 1,
                 "operation_counts": {"shard_map": 1},
                 "maximum_output_dependency_depth": 1,
                 "attached_regions": [
@@ -132,8 +133,8 @@ def empty_statistics() -> ProgramStatistics:
             RegionStatistics(
                 input_count=1,
                 output_count=1,
-                instruction_count=1,
                 constant_count=0,
+                instruction_count=1,
                 operation_counts={"sin": 1},
                 maximum_output_dependency_depth=1,
                 attached_regions=(),
@@ -180,8 +181,8 @@ class JaxprCollectorTest(unittest.TestCase):
             RegionStatistics(
                 input_count=1,
                 output_count=1,
-                instruction_count=2,
                 constant_count=1,
+                instruction_count=2,
                 operation_counts={"add": 1, "mul": 1},
                 maximum_output_dependency_depth=2,
                 attached_regions=(),
@@ -327,6 +328,40 @@ class OperationNormalizationTest(unittest.TestCase):
 
     def test_normalization_marks_names_outside_the_shared_vocabulary(self) -> None:
         self.assertEqual(normalize_operation_counts({"pvary": 1}), {"unknown:pvary": 1})
+
+    def test_comparable_case_rejects_matching_unmapped_operation_names(self) -> None:
+        case = ProgramStatisticsCase(
+            case_id="unmapped",
+            category="scalar",
+            surface="jit",
+            comparable=True,
+            build=empty_statistics,
+        )
+        statistics = ProgramStatistics(
+            regions=(
+                RegionStatistics(
+                    input_count=1,
+                    output_count=1,
+                    constant_count=0,
+                    instruction_count=1,
+                    operation_counts={"unmapped_operation": 1},
+                    maximum_output_dependency_depth=1,
+                    attached_regions=(),
+                ),
+            )
+        )
+        record = ProgramStatisticsRecord(
+            case_id=case.case_id,
+            category=case.category,
+            surface=case.surface,
+            statistics=statistics,
+        )
+
+        comparison = compare_case(case, record, record)
+
+        self.assertTrue(comparison.failed())
+        self.assertEqual(len(comparison.differences), 1)
+        self.assertIn("unknown:unmapped_operation", comparison.differences[0])
 
 
 class RecordParserTest(unittest.TestCase):
@@ -486,6 +521,13 @@ class CommandLineTest(unittest.TestCase):
         cases = selected_cases(["nested_shard_map", "scalar_bilinear_sin_jit"])
 
         self.assertEqual([case.case_id for case in cases], ["nested_shard_map", "scalar_bilinear_sin_jit"])
+
+    def test_duplicate_case_selection_is_a_hard_error_naming_the_case(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            selected_cases(["scalar_bilinear_sin_jit", "scalar_bilinear_sin_jit"])
+
+        self.assertIn("requested more than once", str(raised.exception))
+        self.assertIn("scalar_bilinear_sin_jit", str(raised.exception))
 
     def test_unknown_case_selection_is_a_hard_error_naming_the_case(self) -> None:
         with self.assertRaises(ValueError) as raised:

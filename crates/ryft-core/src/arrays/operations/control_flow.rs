@@ -193,16 +193,40 @@ where
                     inputs.split_last().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
                 let runtime_length = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(runtime_length)?;
                 let runtime_length_type = runtime_length.r#type();
-                let exact_refinement = runtime_length_type.extent().is_some()
-                    && length.is_refined_by(&Dimension::Static(runtime_length.extent()));
-                if runtime_length_type.variable() != variable && !exact_refinement {
-                    return Err(TypeError::invalid(format!(
-                        "'scan' runtime length operand has type {} but scan length requires {variable}",
-                        runtime_length.r#type().as_ref(),
-                    ))
-                    .into());
+                let extent = runtime_length.extent();
+                if runtime_length_type.variable() != variable {
+                    // An operand of an unrelated identity fixes the trip count to its own exact extent, so every
+                    // stacked operand must be refined to that same extent. Otherwise the loop would read `extent`
+                    // slices out of stacks whose runtime size is independently determined.
+                    if runtime_length_type.extent().is_none() || !length.is_refined_by(&Dimension::Static(extent)) {
+                        return Err(TypeError::invalid(format!(
+                            "'scan' runtime length operand has type {} but scan length requires {variable}",
+                            runtime_length_type.as_ref(),
+                        ))
+                        .into());
+                    }
+                    for (index, input) in inputs[carry_count..].iter().enumerate() {
+                        let input_type = input.r#type();
+                        let leading_extent = match input_type.as_ref() {
+                            ArrayIrType::Array(input_type) if input_type.rank() > 0 => {
+                                let bounds = input_type.dimension(0).bounds();
+                                (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
+                            }
+                            _ => None,
+                        };
+                        if leading_extent != Some(extent) {
+                            return Err(TypeError::invalid(format!(
+                                "'scan' runtime length operand has type {} but stacked input {index} has type {} \
+                                 whose leading dimension is not refined to extent {extent}",
+                                runtime_length_type.as_ref(),
+                                input_type.as_ref(),
+                                index = carry_count + index,
+                            ))
+                            .into());
+                        }
+                    }
                 }
-                (inputs, runtime_length.extent())
+                (inputs, extent)
             }
         };
         let body = driver.region(0)?;

@@ -343,6 +343,21 @@ pub trait ScanTypeSemantics: Type {
         index: usize,
         length: &Dimension,
     ) -> Result<(), TypeError>;
+
+    /// Returns the [`Dimension`] every stacked value of this scan must actually be laid out over. This is the declared
+    /// `length` except under a composite scan's exact-refinement arm, where the runtime length operand pins a concrete
+    /// extent that differs from the still-symbolic declared variable; captures are validated against this effective
+    /// dimension so a concretely refined trip count cannot over-read or truncate a capture stacked over the symbolic
+    /// declared length. The default returns the declared `length` unchanged, which is exact for type families whose
+    /// scan lengths are always static.
+    #[inline]
+    fn effective_scan_length(
+        length: &Dimension,
+        _input_types: &[Self],
+        _carry_count: usize,
+    ) -> Result<Dimension, TypeError> {
+        Ok(length.clone())
+    }
 }
 
 impl ScanTypeSemantics for ArrayType {
@@ -481,6 +496,64 @@ fn composite_scan_boundary_types(
     Ok(boundary_types)
 }
 
+/// Validates the trailing runtime length operand of a dynamic-length composite scan against the declared `length` and
+/// the actual stacked operand types, and returns the concrete trip count when the operand only refines `length`'s
+/// bounds instead of carrying its nominal identity.
+///
+/// An operand that carries `length`'s own [`DimensionVariable`](crate::arrays::DimensionVariable) defines exactly the
+/// runtime extent that every stacked axis typed `length` has, so the scan is consistent by construction and [`None`]
+/// is returned. An operand of an unrelated identity is admissible only when its bounds pin exactly one extent inside
+/// `length`'s bounds. The trip count is then that extent, which agrees with the stacked operands only if each of them
+/// is itself refined to the very same extent: a stacked axis left symbolic would be read `extent` times regardless of
+/// its actual runtime size, over-reading the stacks that turn out shorter and silently truncating the longer ones.
+///
+/// # Parameters
+///   - `length`: Declared scan length.
+///   - `input_types`: All scan input types, whose last entry is the runtime length operand when `length` is dynamic.
+///   - `carry_count`: Number of leading loop-carried inputs, which are not stacked.
+///   - `stacked_input_end`: Exclusive end of the stacked input range, i.e. the index of the runtime length operand.
+fn validate_scan_runtime_length(
+    length: &Dimension,
+    input_types: &[ArrayIrType],
+    carry_count: usize,
+    stacked_input_end: usize,
+) -> Result<Option<usize>, TypeError> {
+    let Some(variable) = length.variable() else {
+        return Ok(None);
+    };
+    let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
+    if runtime_length_type.variable() == variable {
+        return Ok(None);
+    }
+    let extent = runtime_length_type
+        .extent()
+        .filter(|_| DimensionType::new(variable.clone()).is_refined_by(runtime_length_type))
+        .ok_or_else(|| {
+            TypeError::invalid(format!(
+                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
+                 requires {variable}",
+            ))
+        })?;
+    for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
+        let leading_extent = match r#type {
+            ArrayIrType::Array(r#type) if r#type.rank() > 0 => {
+                let bounds = r#type.dimension(0).bounds();
+                (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
+            }
+            _ => None,
+        };
+        if leading_extent != Some(extent) {
+            return Err(TypeError::invalid(format!(
+                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but stacked input \
+                 {index} has type {type} whose leading dimension is not refined to extent {extent}",
+                index = carry_count + index,
+                r#type = r#type,
+            )));
+        }
+    }
+    Ok(Some(extent))
+}
+
 impl ScanTypeSemantics for ArrayIrType {
     fn rename_scan_length(length: &Dimension, renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
         length.rename_type_identities(renaming)
@@ -540,17 +613,7 @@ impl ScanTypeSemantics for ArrayIrType {
             }
             body_input_types.push(Self::Array(slice_type));
         }
-        if let Some(variable) = length.variable() {
-            let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
-            let exact_refinement = runtime_length_type.extent().is_some()
-                && DimensionType::new(variable.clone()).is_refined_by(runtime_length_type);
-            if runtime_length_type.variable() != variable && !exact_refinement {
-                return Err(TypeError::invalid(format!(
-                    "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
-                     requires {variable}",
-                )));
-            }
-        }
+        validate_scan_runtime_length(length, input_types, carry_count, body_input_count)?;
         Ok(body_input_types)
     }
 
@@ -578,18 +641,15 @@ impl ScanTypeSemantics for ArrayIrType {
                 )));
             }
         }
-        if let Some(variable) = length.variable() {
-            let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
-            let exact_refinement = runtime_length_type.extent().is_some()
-                && DimensionType::new(variable.clone()).is_refined_by(runtime_length_type);
-            if runtime_length_type.variable() != variable && !exact_refinement {
-                return Err(TypeError::invalid(format!(
-                    "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
-                     requires {variable}",
-                )));
+        // A runtime operand that only refines the declared bounds fixes the trip count to one exact extent, so the
+        // stacked boundary axes are inferred at that extent instead of at the still-symbolic declared length. Leaving
+        // them symbolic would type a concretely sized result as an independent runtime extent.
+        match validate_scan_runtime_length(length, input_types, carry_count, expected_input_types.len())? {
+            Some(extent) => {
+                composite_scan_boundary_types("output", body_output_types, carry_count, &Dimension::Static(extent))
             }
+            None => Ok(output_types),
         }
-        Ok(output_types)
     }
 
     fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
@@ -616,6 +676,20 @@ impl ScanTypeSemantics for ArrayIrType {
             )));
         }
         Ok(())
+    }
+
+    fn effective_scan_length(
+        length: &Dimension,
+        input_types: &[Self],
+        carry_count: usize,
+    ) -> Result<Dimension, TypeError> {
+        // The trailing input is the runtime length operand whenever the declared length is dynamic, so the stacked
+        // inputs end one before it.
+        let stacked_input_end = input_types.len() - usize::from(length.variable().is_some());
+        Ok(match validate_scan_runtime_length(length, input_types, carry_count, stacked_input_end)? {
+            Some(extent) => Dimension::Static(extent),
+            None => length.clone(),
+        })
     }
 }
 
@@ -698,8 +772,9 @@ where
             &self.length,
             input_types,
         )?;
+        let effective_length = T::effective_scan_length(&self.length, input_types, self.carry_count)?;
         for (index, capture) in self.captures.iter().enumerate() {
-            T::validate_scan_capture(capture, index, &self.length)?;
+            T::validate_scan_capture(capture, index, &effective_length)?;
         }
         Ok(output_types)
     }
@@ -2854,7 +2929,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(input_types.as_slice(), std::slice::from_ref(&body_interface)),
-            Ok(vec![dimension_type.clone(), stacked_type]),
+            Ok(vec![dimension_type.clone(), stacked_type.clone()]),
         );
 
         let captured_dimension = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, 3)
@@ -2897,10 +2972,14 @@ mod tests {
         );
 
         // A dynamic runtime-length operand must carry the scan length's nominal identity. An unrelated dynamic
-        // identity with compatible bounds cannot redefine the stacked axis, while an exact concrete refinement is
-        // accepted during eager execution.
+        // identity with compatible bounds cannot redefine the stacked axis. An operand whose bounds pin one exact
+        // extent fixes the trip count to that extent and is admissible only when every stacked operand is refined to
+        // the same extent; a stacked axis left symbolic would otherwise be read a fixed number of times regardless of
+        // its independently determined runtime size. The accepted refinement also types the stacked outputs at the
+        // concrete extent instead of at the still-symbolic declared length.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(5)).unwrap());
         let unrelated = DimensionVariable::new("unrelated", DimensionBounds::positive(Some(5)).unwrap());
+        let three = DimensionType::new(DimensionVariable::new("three", DimensionBounds::new(3, Some(4)).unwrap()));
         let dynamic_stacked_type = ArrayIrType::Array(ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(length.clone()), Dimension::Dynamic(extent)]),
@@ -2908,7 +2987,7 @@ mod tests {
         let dynamic_scan = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, Dimension::Dynamic(length.clone()));
         assert_eq!(
             dynamic_scan.infer_output_types(
-                &[dimension_type.clone(), dynamic_stacked_type.clone(), DimensionType::new(unrelated).into(),],
+                &[dimension_type.clone(), dynamic_stacked_type.clone(), DimensionType::new(unrelated).into()],
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
@@ -2918,15 +2997,43 @@ mod tests {
         );
         assert_eq!(
             dynamic_scan.infer_output_types(
-                &[
-                    dimension_type.clone(),
-                    dynamic_stacked_type.clone(),
-                    DimensionType::new(DimensionVariable::new("three", DimensionBounds::new(3, Some(4)).unwrap(),))
-                        .into(),
-                ],
-                &[body_interface],
+                &[dimension_type.clone(), dynamic_stacked_type.clone(), three.clone().into()],
+                std::slice::from_ref(&body_interface),
             ),
-            Ok(vec![dimension_type, dynamic_stacked_type]),
+            Err(TypeError::invalid(
+                "'scan' runtime length operand has type dimension<3> but stacked input 1 has type f32[length, extent] \
+                 whose leading dimension is not refined to extent 3"
+                    .to_string(),
+            )),
+        );
+        // The same consistency requirement applies to captures: a capture stacked over the still-symbolic declared
+        // length cannot be driven by a concretely refined trip count, while a capture refined to the exact extent is
+        // admissible.
+        let captured_symbolic =
+            ScanOperation::<CaptureReference<ArrayIrType>>::new(1, Dimension::Dynamic(length.clone()))
+                .with_captures(vec![CaptureReference::new(0, dynamic_stacked_type.clone())]);
+        assert_eq!(
+            captured_symbolic.infer_output_types(
+                &[dimension_type.clone(), stacked_type.clone(), three.clone().into()],
+                std::slice::from_ref(&body_interface),
+            ),
+            Err(TypeError::invalid(
+                "scan capture 0 must have leading dimension 3 but has type f32[length, extent]".to_string(),
+            )),
+        );
+        let captured_refined = ScanOperation::<CaptureReference<ArrayIrType>>::new(1, Dimension::Dynamic(length))
+            .with_captures(vec![CaptureReference::new(0, stacked_type.clone())]);
+        assert_eq!(
+            captured_refined.infer_output_types(
+                &[dimension_type.clone(), stacked_type.clone(), three.clone().into()],
+                std::slice::from_ref(&body_interface),
+            ),
+            Ok(vec![dimension_type.clone(), stacked_type.clone()]),
+        );
+        assert_eq!(
+            dynamic_scan
+                .infer_output_types(&[dimension_type.clone(), stacked_type.clone(), three.into()], &[body_interface]),
+            Ok(vec![dimension_type, stacked_type]),
         );
     }
 

@@ -33,6 +33,17 @@ Run the following command to compare the MLIR emitted by JAX against the MLIR em
 XLA_FLAGS=--xla_force_host_platform_device_count=4 uv run python scripts/compare_reshape_mlir_with_jax.py
 ```
 
+Run the behavioral and StableHLO differential suite against the repository-pinned JAX build with:
+
+```bash
+uv run python scripts/compare_behavior_with_jax.py
+```
+
+The harness runs matched Ryft and JAX workloads, compares exact values, and compares the semantic collective subset of
+their StableHLO (collective family, ordered groups, and axis attributes). It also pins intentional capability
+differences: the bounded data-dependent prefix case must execute eagerly in both frameworks, stage in Ryft, and fail
+JAX staging with concretization. Use `--list` to show the case registry and repeat `--case CASE_ID` to run a subset.
+
 Run the following command to compare backend-neutral structural program statistics between Ryft and JAX for the
 shared traced workload registry:
 
@@ -92,5 +103,6 @@ instead of mirroring the old raw artifact tree.
 
 The reusable helpers that back the program statistics workflow live under `ryft.jax.program_statistics` and
 `ryft.jax.program_statistics_cases`, the preserved historical dump registry lives under
-`ryft.jax.preserved_dump_cases`, and the runtime transform benchmark helpers live under
+`ryft.jax.preserved_dump_cases`, the differential-testing workflow lives under `ryft.jax.differential_testing` and
+`ryft.jax.differential_testing_cases`, and the runtime transform benchmark helpers live under
 `ryft.jax.transform_performance`.

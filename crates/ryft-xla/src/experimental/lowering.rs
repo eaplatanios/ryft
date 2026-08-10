@@ -13177,6 +13177,126 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_mlir_module_for_program_rejects_unsupported_dynamically_shaped_attention() {
+        // A dynamically shaped attention operand reaches the physical kernels as a padded buffer, so its logical
+        // extents must arrive as explicit sequence lengths and the rest of the configuration must be one the masked
+        // composition reproduces exactly: matching head counts, no bias, no sliding window, and no dropout.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
+        let operand_type = |heads: usize| {
+            ArrayType::new(
+                DataType::BF16,
+                Shape::new(vec![
+                    Dimension::Dynamic(batch.clone()),
+                    Dimension::Static(4),
+                    Dimension::Static(heads),
+                    Dimension::Static(8),
+                ]),
+            )
+        };
+        let activation_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(2), Dimension::Static(4)]),
+        );
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
+        let build_forward = |key_value_heads: usize,
+                             sequence_lengths: bool,
+                             operation: DotProductAttentionOperation| {
+            let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
+            if sequence_lengths {
+                input_types.push(lengths_type.clone());
+                input_types.push(lengths_type.clone());
+            }
+            let mut builder = XlaProgramBuilder::new();
+            let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
+            let outputs = builder.add_instruction(operation, Vec::new(), inputs).unwrap().to_vec();
+            let output_count = outputs.len();
+            let output_types = builder_output_types(&builder, outputs.as_slice());
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    outputs,
+                    vec![Placeholder; input_types.len()],
+                    vec![Placeholder; output_count],
+                )
+                .unwrap();
+            (unproject_plain_program(program), input_types, output_types)
+        };
+        let build_backward = |key_value_heads: usize,
+                              sequence_lengths: bool,
+                              operation: DotProductAttentionBackwardOperation| {
+            let mut input_types = vec![operand_type(2), operand_type(key_value_heads), operand_type(key_value_heads)];
+            input_types.extend([operand_type(2), activation_type.clone(), operand_type(2)]);
+            if sequence_lengths {
+                input_types.push(lengths_type.clone());
+                input_types.push(lengths_type.clone());
+            }
+            let mut builder = XlaProgramBuilder::new();
+            let inputs = input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
+            let outputs = builder.add_instruction(operation, Vec::new(), inputs).unwrap().to_vec();
+            let output_count = outputs.len();
+            let output_types = builder_output_types(&builder, outputs.as_slice());
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    outputs,
+                    vec![Placeholder; input_types.len()],
+                    vec![Placeholder; output_count],
+                )
+                .unwrap();
+            (unproject_plain_program(program), input_types, output_types)
+        };
+
+        // Without explicit sequence lengths there is nothing that separates the logical rows from the padding.
+        let (program, input_types, output_types) =
+            build_forward(2, false, DotProductAttentionOperation::new(0.125, AttentionMask::None));
+        assert!(matches!(
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None),
+            Err(error) if error.to_string().contains(
+                "dynamically shaped dot_product_attention requires explicit query and key/value sequence lengths",
+            ),
+        ));
+
+        // A sliding window and a mismatched head count both fall outside the supported dynamic configuration. A
+        // sliding window is only well-typed together with the causal mask, so that case exercises the same clause
+        // through two of its disjuncts at once.
+        for (key_value_heads, operation) in [
+            (2, DotProductAttentionOperation::new(0.125, AttentionMask::Causal).with_sliding_window(2)),
+            (1, DotProductAttentionOperation::new(0.125, AttentionMask::None)),
+        ] {
+            let (program, input_types, output_types) = build_forward(key_value_heads, true, operation);
+            assert!(matches!(
+                lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None),
+                Err(error) if error.to_string().contains(
+                    "dynamically shaped dot_product_attention currently supports matching query/key-value heads, no \
+                     bias, only explicit sequence-length masking, no sliding window, and no dropout",
+                ),
+            ));
+        }
+
+        // The backward operation states the same two contracts with its own diagnostics.
+        let (program, input_types, output_types) =
+            build_backward(2, false, DotProductAttentionBackwardOperation::new(0.125, AttentionMask::None));
+        assert!(matches!(
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None),
+            Err(error) if error.to_string().contains(
+                "dynamically shaped dot_product_attention_backward requires explicit query and key/value sequence \
+                 lengths",
+            ),
+        ));
+
+        let (program, input_types, output_types) = build_backward(
+            2,
+            true,
+            DotProductAttentionBackwardOperation::new(0.125, AttentionMask::Causal).with_sliding_window(2),
+        );
+        assert!(matches!(
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, None),
+            Err(error) if error.to_string().contains(
+                "dynamically shaped dot_product_attention_backward currently supports matching query/key-value \
+                 heads, no bias, only explicit sequence-length masking, no sliding window, and no dropout",
+            ),
+        ));
+    }
+
+    #[test]
     fn test_lower_mlir_module_for_program_never_emits_fmha_for_f8_attention() {
         // F8 attention is a validated NO-GO on the pinned cuDNN (the fused kernels reject F8 I/O at compile time),
         // so `f8` operands never qualify for the fMHA fast path and take the ordinary composition route even on

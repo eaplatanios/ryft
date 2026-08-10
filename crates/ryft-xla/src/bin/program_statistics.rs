@@ -473,8 +473,8 @@ mod tests {
                     {
                         "input_count": 2,
                         "output_count": 1,
-                        "instruction_count": 3,
                         "constant_count": 0,
+                        "instruction_count": 3,
                         "operation_counts": { "add": 1, "mul": 1, "sin": 1 },
                         "maximum_output_dependency_depth": 2,
                         "attached_regions": [],
@@ -489,8 +489,8 @@ mod tests {
                     {
                         "input_count": 4,
                         "output_count": 2,
-                        "instruction_count": 4,
                         "constant_count": 0,
+                        "instruction_count": 4,
                         "operation_counts": { "add": 1, "mul": 3 },
                         "maximum_output_dependency_depth": 2,
                         "attached_regions": [],
@@ -505,8 +505,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 15,
                         "constant_count": 0,
+                        "instruction_count": 15,
                         "operation_counts": { "add": 4, "cos": 1, "mul": 9, "one": 1 },
                         "maximum_output_dependency_depth": 7,
                         "attached_regions": [],
@@ -521,8 +521,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 2,
-                        "instruction_count": 18,
                         "constant_count": 0,
+                        "instruction_count": 18,
                         "operation_counts": { "add": 5, "cos": 1, "mul": 10, "one": 1, "sin": 1 },
                         "maximum_output_dependency_depth": 7,
                         "attached_regions": [],
@@ -537,8 +537,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 11,
                         "constant_count": 4,
+                        "instruction_count": 11,
                         "operation_counts": { "add": 4, "mul": 7 },
                         "maximum_output_dependency_depth": 7,
                         "attached_regions": [],
@@ -562,8 +562,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "sin": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [],
@@ -571,8 +571,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "shard_map": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [
@@ -595,8 +595,8 @@ mod tests {
                     {
                         "input_count": 2,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "dot": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [],
@@ -604,8 +604,8 @@ mod tests {
                     {
                         "input_count": 2,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "shard_map": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [
@@ -628,8 +628,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "add": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [],
@@ -637,8 +637,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 2,
                         "constant_count": 0,
+                        "instruction_count": 2,
                         "operation_counts": { "add": 1, "shard_map": 1 },
                         "maximum_output_dependency_depth": 2,
                         "attached_regions": [
@@ -654,8 +654,8 @@ mod tests {
                     {
                         "input_count": 1,
                         "output_count": 1,
-                        "instruction_count": 1,
                         "constant_count": 0,
+                        "instruction_count": 1,
                         "operation_counts": { "shard_map": 1 },
                         "maximum_output_dependency_depth": 1,
                         "attached_regions": [
@@ -689,8 +689,8 @@ mod tests {
                         {
                             "input_count": 2,
                             "output_count": 1,
-                            "instruction_count": 3,
                             "constant_count": 0,
+                            "instruction_count": 3,
                             "operation_counts": { "add": 1, "mul": 1, "sin": 1 },
                             "maximum_output_dependency_depth": 2,
                             "attached_regions": [],

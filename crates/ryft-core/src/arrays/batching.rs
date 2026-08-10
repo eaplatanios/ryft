@@ -964,6 +964,16 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
         _reduced_axes: &[usize],
         _kind: ReductionKind,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        // Static array batching never creates bounded ragged axes. Its mapped extent is one host `usize` and every
+        // alignment materializes a rectangular carrier, so masking is the identity. A ragged carrier can still reach
+        // this hook because `ArrayBatch::with_ragged_axes` is public, and it is rejected rather than passed through,
+        // because returning it unchanged would let the consuming reduction claim consumption evidence for padding it
+        // never neutralized.
+        if !input.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "static array batching cannot mask bounded ragged axes".to_string(),
+            });
+        }
         Ok(input.clone())
     }
 }
@@ -1148,6 +1158,11 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypo
         output: Self::Batch,
         output_batch_axis: BatchAxis,
     ) -> Result<C::Value, BatchingError> {
+        if !output.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
+            });
+        }
         Ok(output
             .align_axis(output_batch_axis, *context.axis_extent(), context.axis_sharding().clone())?
             .into_value())
@@ -3447,6 +3462,35 @@ mod tests {
         assert_eq!(
             r#type.unbatched_type(BatchAxis::new(-1)),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
+        );
+    }
+
+    #[test]
+    fn test_static_array_batching_rejects_ragged_carriers() {
+        let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let packed = Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged = ArrayBatch::new(packed, Some(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1.0, 3.0]), variable, vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+
+        // Static array batching never creates ragged carriers and cannot neutralize padding, so it rejects a ragged
+        // input instead of returning it unchanged and letting the reduction claim consumption evidence for it.
+        assert_eq!(
+            StaticArrayBatchingPolicy::mask_reduction_input(&context, &ragged, &[1], ReductionKind::Sum),
+            Err(BatchingError::UnsupportedOperation {
+                message: "static array batching cannot mask bounded ragged axes".to_string(),
+            }),
+        );
+
+        // A ragged carrier cannot leave the transform either, matching the composite policy's boundary guard.
+        assert_eq!(
+            ArrayBatching::materialize_output(&context, ragged, BatchAxis::from_position(0)),
+            Err(BatchingError::UnsupportedOperation {
+                message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
+            }),
         );
     }
 
@@ -6487,7 +6531,7 @@ mod tests {
 
         // Converting the mapped dimension back to scalar data exposes the checked per-item extent vector directly.
         let extents: ArrayIrValue<Array> = batch(
-            |extent| extent.to_dimension(variable.clone())?.to_scalar()?,
+            |extent| Ok(extent.to_dimension(variable.clone())?.to_scalar()?),
             ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -6727,6 +6771,24 @@ mod tests {
         assert_eq!(
             gateway.unwrap_err().to_string(),
             "input dimension `length` = 4 is outside its declared bounds [0, 4)",
+        );
+
+        // A mapped extent carrier may flow between rules inside the transform, but a first-class dimension leaving it
+        // must be replicated. There is no packed axis to align one per-item extent along, so the public boundary
+        // reports the typed mapped-dimension diagnostic instead of materializing the extents as ordinary data.
+        let mapped_dimension_output: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |extent| extent.to_dimension(variable.clone()),
+            ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(
+            mapped_dimension_output,
+            Err(BatchingError::MappedDimension {
+                r#type: Box::new(DimensionType::new(variable.clone())),
+                axis: BatchAxis::new(0),
+            }),
         );
 
         // An opaque region may only recover a physically bounded logical axis from an input that carries that exact
