@@ -12,7 +12,7 @@ use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionTransformCache};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
@@ -682,16 +682,14 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let verbatim = shape.is_verbatim_rebuild(&atom_id_mapping, new_atoms.len(), new_instructions.len());
-                let mut rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
-                if verbatim {
-                    rebuilt.adopt_transform_cache(region.transform_cache().clone());
-                }
-                Ok((rebuilt, verbatim))
+                let rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
+                let source_cache =
+                    shape.is_identity_rebuild(&atom_id_mapping, &rebuilt).then(|| region.transform_cache().clone());
+                Ok((rebuilt, source_cache))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut regions, verbatim): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
-        retain_verbatim_transform_caches(regions.as_mut_slice(), verbatim.as_slice());
+        let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
+        adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
         let (regions, entry) = compact_regions(regions, self.entry);
         Self::new(self.input_structure.clone(), self.output_structure.clone(), regions, entry)
     }
@@ -731,7 +729,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Vec<_>>();
         let Self { regions, input_structure, output_structure, entry, .. } = self;
-
         let regions = regions
             .into_regions()
             .into_iter()
@@ -739,8 +736,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .map(|(region, effectful_instructions)| {
                 let instruction_by_output = region.instruction_by_output();
                 let shape = RegionSimplificationShape::of(&region);
-                let transform_cache = region.transform_cache().clone();
-                let Region { atoms, input_ids, output_ids, instructions, .. } = region;
+                let Region { atoms, input_ids, output_ids, instructions, transform_cache } = region;
                 let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
                 let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
                 let mut new_atoms = Vec::with_capacity(atoms.len());
@@ -824,16 +820,13 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                let verbatim = shape.is_verbatim_rebuild(&atom_id_mapping, new_atoms.len(), new_instructions.len());
-                let mut rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
-                if verbatim {
-                    rebuilt.adopt_transform_cache(transform_cache);
-                }
-                Ok((rebuilt, verbatim))
+                let rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
+                let source_cache = shape.is_identity_rebuild(&atom_id_mapping, &rebuilt).then_some(transform_cache);
+                Ok((rebuilt, source_cache))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (mut regions, verbatim): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
-        retain_verbatim_transform_caches(regions.as_mut_slice(), verbatim.as_slice());
+        let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
+        adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
         let (regions, entry) = compact_regions(regions, entry);
         Self::new(input_structure, output_structure, regions, entry)
     }
@@ -1482,88 +1475,108 @@ struct ProgramLivenessAnalysis {
     effectful_instruction_indices: Vec<usize>,
 }
 
-// TODO(eaplatanios): Review this.
-/// Contents shape of one source [`Region`], captured before simplification rebuilds it so that the rebuild can be
-/// recognized as the identity on that region's contents.
-///
-/// This type exists to keep [`Region`] transform caches alive across simplification. Every content-changing region
-/// construction must mint a fresh [`RegionTransformCache`](super::regions::RegionTransformCache), because that cache
-/// retains pure functions of the region's contents. Simplification, however, runs on essentially every built
-/// [`Program`] (the standard pipeline is `ProgramBuilder::build(..)` followed by [`Program::into_simplified`]), and it
-/// usually rebuilds regions *without changing them*. If those identity rebuilds also minted fresh caches, transform
-/// caching would be severed at the one pipeline every program flows through, and a callee's retained linearization or
-/// transposition could never be shared with any program that imports it. Simplification therefore captures this
-/// shape before rebuilding a region and asks [`Self::is_verbatim_rebuild`] afterwards whether the rebuild was the
-/// identity: if so, the rebuilt region adopts the source region's cache, and otherwise it keeps its fresh one.
-///
-/// The recognition is deliberately conservative. A false negative merely misses a cache share and costs repeated
-/// transform work; a false positive would share cached transforms across regions with different contents and produce
-/// wrong programs. Every field and check below is therefore chosen so that recognition can only fail toward the safe
-/// side.
+/// Contents shape of a [`Region`], captured before [`Program`] simplification rebuilds it so that the rebuild can be
+/// recognized as the identity on that region's contents. This type exists to keep [`Region`] transform caches alive
+/// across simplification. Every content-changing region construction must mint a fresh [`RegionTransformCache`],
+/// because that cache retains pure functions of the region's contents. Simplification, however, runs on essentially
+/// every built [`Program`] (i.e., the standard pipeline is [`ProgramBuilder::build`](crate::ProgramBuilder::build)
+/// followed by [`Program::into_simplified`]), and it usually rebuilds regions _without changing them_. If those
+/// identity rebuilds also minted fresh caches, transform caching would be severed at the one pipeline every program
+/// flows through, and a callee's retained linearization or transposition could never be shared with any program that
+/// imports it. Simplification therefore captures this shape before rebuilding a region and asks
+/// [`Self::is_identity_rebuild`] afterward whether the rebuild was the identity. If so, the rebuilt region adopts the
+/// source region's cache, and otherwise it keeps its fresh one. Note that the recognition is deliberately conservative.
+/// A false negative merely misses a cache share and costs repeated transform work. A false positive would share cached
+/// transforms across regions with different contents and produce wrong programs. Every field and check below is
+/// therefore chosen so that recognition can only fail toward the safe side.
 struct RegionSimplificationShape {
-    /// Number of [`Atom`]s in the source region.
+    /// Number of [`Atom`]s in the source [`Region`].
     atom_count: usize,
 
-    /// Number of [`Instruction`]s in the source region.
+    /// Number of [`Instruction`]s in the source [`Region`].
     instruction_count: usize,
 
-    /// Whether every source [`Instruction`] is pinned to its position by at least one output [`Atom`].
-    ///
-    /// The only per-instruction evidence [`Self::is_verbatim_rebuild`] receives is the source-to-rebuilt [`Atom`]
-    /// identifier mapping, so an instruction can be proven preserved only *through the atoms it produces*: an
-    /// identity mapping over every source atom pins the producing instruction of each atom to its original position.
-    /// An instruction with no outputs (a purely effectful one, such as a print) is invisible to that evidence — the
-    /// mapping cannot show whether it survived or where it ended up — so when this is `false`, verbatim recognition
-    /// is refused outright rather than risking a cache share that no atom can attest to.
+    /// Boolean indicating whether every source [`Instruction`] is pinned to its position by at least one output
+    /// [`Atom`]. The only per-instruction evidence [`Self::is_identity_rebuild`] receives is the source-to-rebuilt
+    /// [`Atom`] identifier mapping, so an instruction can be proven preserved only _through the atoms it produces_:
+    /// an identity mapping over every source atom pins the producing instruction of each atom to its original position.
+    /// An instruction with no outputs (i.e., a purely effectful one, such as a print) is invisible to that evidence
+    /// (i.e., the mapping cannot show whether it survived or where it ended up) so when this is `false`, identity
+    /// recognition is refused outright rather than risking a cache share that no atom can attest to.
     atoms_pin_every_instruction: bool,
+
+    /// Boolean indicating whether the source [`Instruction`]s' first output [`Atom`] identifiers strictly increase
+    /// with instruction order. Atom evidence pins each instruction to the atoms it produces, but the rebuild emits
+    /// instructions in the order in which their outputs are reached, not in source instruction order. Those two
+    /// orders agree exactly when the source [`Region`] numbers its atoms in instruction order, which every
+    /// [`ProgramBuilder`](crate::ProgramBuilder) region does because each instruction appends its outputs to the
+    /// atom table as it is added. A hand-built region that numbers its atoms against its instruction order can instead
+    /// be rebuilt with a permuted, data-independent, instruction sequence that the mapping alone cannot distinguish
+    /// from the identity, so when this is `false`, identity recognition is refused.
+    atoms_are_instruction_ordered: bool,
 }
 
-// TODO(eaplatanios): Review this.
 impl RegionSimplificationShape {
-    /// Captures the contents shape of `region`.
+    /// Captures the [`RegionSimplificationShape`] of `region`.
     fn of<V: Typed + Parameter, O>(region: &Region<V, O>) -> Self {
+        let mut atoms_pin_every_instruction = true;
+        let mut atoms_are_instruction_ordered = true;
+        let mut previous_first_output = None;
+        for instruction in region.instructions() {
+            let Some(first_output) = instruction.outputs().first().copied() else {
+                atoms_pin_every_instruction = false;
+                continue;
+            };
+            if previous_first_output.is_some_and(|previous| first_output <= previous) {
+                atoms_are_instruction_ordered = false;
+            }
+            previous_first_output = Some(first_output);
+        }
         Self {
             atom_count: region.atoms().len(),
             instruction_count: region.instructions().len(),
-            atoms_pin_every_instruction: region
-                .instructions()
-                .iter()
-                .all(|instruction| !instruction.outputs().is_empty()),
+            atoms_pin_every_instruction,
+            atoms_are_instruction_ordered,
         }
     }
 
-    /// Returns whether simplification rebuilt this region with exactly its original contents, which is the
-    /// precondition for the rebuilt region to share the source region's
-    /// [`RegionTransformCache`](super::regions::RegionTransformCache).
-    ///
-    /// Simplification copies surviving [`Atom`]s and [`Instruction`]s verbatim and only renumbers atom identifiers,
-    /// so the rebuild is the identity exactly when no atom was dropped, none was renumbered, and no instruction was
-    /// dropped. Equal atom and instruction counts together with an identity mapping over every source atom establish
-    /// all three — provided every instruction is pinned by an output atom ([`Self::atoms_pin_every_instruction`]),
-    /// since an output-free instruction's survival and position are invisible to the mapping.
+    /// Returns whether simplification rebuilt this region with exactly its original contents, which is the precondition
+    /// for `rebuilt` to share the source region's [`RegionTransformCache`]. [`Program`] simplification copies surviving
+    /// [`Atom`]s and [`Instruction`]s unchanged and only renumbers atom identifiers, so the rebuild is the identity
+    /// exactly when no atom was dropped, none was renumbered, and no instruction was dropped or reordered. Equal atom
+    /// and instruction counts together with an identity mapping over every source atom establish all of that, provided
+    /// both shape flags hold: (1) an output-free instruction's survival and position are invisible to the mapping
+    /// (i.e., [`Self::atoms_pin_every_instruction`]), and (2) atom evidence pins instruction order only when the source
+    /// numbers its atoms in instruction order (i.e., [`Self::atoms_are_instruction_ordered`]). The rebuilt region's
+    /// instructions may still have their attached [`RegionId`] operands renumbered afterward by [`compact_regions`],
+    /// so the recognized identity is an identity _up to region-identifier renumbering_. That is sound for cache sharing
+    /// for the same reason [`RegionArena::append`] keeps derived metadata valid: renumbering preserves the complete
+    /// reachable region graph's topology and changes no region boundary, [`Operation`], or [`Atom`].
     ///
     /// # Parameters
+    ///
     ///   - `atom_id_mapping`: Source-to-rebuilt [`AtomId`] mapping accumulated while rebuilding the region.
-    ///   - `new_atom_count`: Number of atoms in the rebuilt region.
-    ///   - `new_instruction_count`: Number of instructions in the rebuilt region.
-    fn is_verbatim_rebuild(
+    ///   - `rebuilt`: [`Region`] that simplification rebuilt from this shape's source region.
+    fn is_identity_rebuild<V: Typed + Parameter, O>(
         &self,
         atom_id_mapping: &HashMap<AtomId, AtomId>,
-        new_atom_count: usize,
-        new_instruction_count: usize,
+        rebuilt: &Region<V, O>,
     ) -> bool {
         self.atoms_pin_every_instruction
-            && new_atom_count == self.atom_count
-            && new_instruction_count == self.instruction_count
+            && self.atoms_are_instruction_ordered
+            && rebuilt.instructions().len() == self.instruction_count
             && atom_id_mapping.len() == self.atom_count
-            && atom_id_mapping.iter().all(|(source, rebuilt)| source == rebuilt)
+            // Te rebuild pairs every emitted atom with one mapping entry, so an equal mapping length already implies
+            // an equal atom count, but that pairing is spread across the whole rebuild.
+            && rebuilt.atoms().len() == self.atom_count
+            && atom_id_mapping.iter().all(|(source, mapped)| source == mapped)
     }
 }
 
 /// Copies the [`Atom`] that corresponds to `atom_id` in `region` (and its transitive producers) into `new_atoms` and
 /// `new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already present in the
 /// mapping (e.g., rebuilt region inputs) are reused, [`Atom::Constant`]s are cloned directly, and [`Atom::Variable`]s
-/// are reconstructed from their producing [`Instruction`], whose attached-region references are preserved verbatim
+/// are reconstructed from their producing [`Instruction`], whose attached-region references are carried over unchanged
 /// (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterward). A reachable variable
 /// that is neither mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
 ///
@@ -1571,7 +1584,9 @@ impl RegionSimplificationShape {
 /// (i.e., a _use_) points back at the [`Instruction`] that produces it (i.e., its _definition_) — so an instruction's
 /// inputs are cloned left-to-right before the instruction itself is emitted. The walk is driven by an explicit worklist
 /// rather than recursion, because its depth grows with the length of the longest instruction chain and recursing would
-/// overflow the stack for programs with a few hundred chained instructions.
+/// overflow the stack for programs with a few hundred chained instructions. Sealing a [`Region`] does not reject a
+/// cyclic use-def graph, so the walk tracks the instructions it scheduled and reports a
+/// [`ProgramError::MalformedProgram`] instead of looping forever when it reaches one twice.
 fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
@@ -1592,6 +1607,7 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     }
 
     let mut pending = vec![Step::Visit(atom_id)];
+    let mut scheduled = vec![false; region.instructions.len()];
     while let Some(step) = pending.pop() {
         match step {
             Step::Visit(atom_id) if atom_id_mapping.contains_key(&atom_id) => continue,
@@ -1607,6 +1623,16 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
                         let instruction_index = instruction_by_output.get(atom_id.index()).copied().flatten().ok_or(
                             ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
                         )?;
+
+                        // Emission maps every output of an instruction before any sibling branch of the walk is
+                        // explored, so a well-formed region schedules each instruction at most once and reaching one
+                        // twice means the use-def graph is cyclic.
+                        if std::mem::replace(&mut scheduled[instruction_index], true) {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "instruction {instruction_index} was scheduled twice, \
+                                 which indicates a cyclic use-def graph",
+                            )));
+                        }
 
                         // The emit step runs after the input visits pushed on top of it, and those visits map every
                         // input (or fail) before it pops, preserving the recursive post-order emission.
@@ -1662,14 +1688,15 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
 /// Moves the [`Atom`] that corresponds to `atom_id` (and its transitive producers) out of `atoms`/`instructions` into
 /// `new_atoms`/`new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. This is the
 /// move-based counterpart of [`clone_atom_subgraph_into_region`]: it relocates owned [`Atom`]s and [`Instruction`]s
-/// (including their attached-region references, verbatim) instead of cloning them, so each is taken from its slot at
+/// (including their attached-region references, unchanged) instead of cloning them, so each is taken from its slot at
 /// most once. Atoms already present in the mapping are reused, and a reachable variable that is neither mapped nor
 /// produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
 ///
 /// Like [`clone_atom_subgraph_into_region`], the post-order walk of the use-def graph (i.e., each consumed [`Atom`]'s
 /// edge back to its producing [`Instruction`]) is driven by an explicit worklist rather than recursion, because the
 /// depth of the walk grows with the length of the longest instruction chain and recursing would overflow the stack for
-/// programs with a few hundred chained instructions.
+/// programs with a few hundred chained instructions, and it tracks the instructions it scheduled so that a cyclic
+/// use-def graph is reported as a [`ProgramError::MalformedProgram`] instead of looping forever.
 fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
@@ -1680,59 +1707,66 @@ fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
     new_instructions: &mut Vec<Instruction<O>>,
 ) -> Result<AtomId, ProgramError> {
     /// One pending step of the worklist. Visiting an [`Atom`] schedules its producing [`Instruction`]'s inputs, and
-    /// emitting an [`Instruction`] (already taken out of its slot by the visit that scheduled it) relocates it once
-    /// every one of its inputs has been mapped.
-    enum Step<O> {
+    /// emitting an [`Instruction`] (identified by its index in the source [`Region`]) relocates it once every one of
+    /// its inputs has been mapped.
+    enum Step {
         /// Ensures the [`Atom`] with this [`AtomId`] is present in the mapping, scheduling its producer if needed.
         Visit(AtomId),
 
-        /// Relocates this [`Instruction`] after all of its inputs have been visited.
-        Emit(Instruction<O>),
+        /// Relocates the [`Instruction`] at this index after all of its inputs have been visited.
+        Emit(usize),
     }
 
     let mut pending_steps = vec![Step::Visit(atom_id)];
+    let mut scheduled = vec![false; instructions.len()];
     while let Some(step) = pending_steps.pop() {
         match step {
             Step::Visit(atom_id) if atom_id_mapping.contains_key(&atom_id) => continue,
             Step::Visit(atom_id) => {
-                let is_constant = match atoms.get(atom_id.index()) {
-                    Some(Some(Atom::Constant(_))) => true,
-                    Some(Some(Atom::Variable(_))) => false,
-                    Some(None) => {
+                let atom = atoms.get_mut(atom_id.index()).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+                match atom {
+                    None => {
                         return Err(ProgramError::MalformedProgram(format!(
                             "atom {atom_id} was already moved while rebuilding program",
                         )));
                     }
-                    None => return Err(ProgramError::UnboundAtomId { id: atom_id }),
-                };
+                    Some(Atom::Constant(_)) => {
+                        let Some(Atom::Constant(value)) = atom.take() else {
+                            unreachable!("constant atom kind was checked immediately above");
+                        };
+                        let new_atom = AtomId::new(new_atoms.len());
+                        new_atoms.push(Atom::Constant(value));
+                        atom_id_mapping.insert(atom_id, new_atom);
+                    }
+                    Some(Atom::Variable(_)) => {
+                        let instruction_index = instruction_by_output.get(atom_id.index()).copied().flatten().ok_or(
+                            ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                        )?;
 
-                if is_constant {
-                    let Some(Atom::Constant(value)) = atoms[atom_id.index()].take() else {
-                        unreachable!("constant atom kind was checked before moving the atom");
-                    };
-                    let new_atom = AtomId::new(new_atoms.len());
-                    new_atoms.push(Atom::Constant(value));
-                    atom_id_mapping.insert(atom_id, new_atom);
-                    continue;
+                        // Emission maps every output of an instruction before any sibling branch of the walk is
+                        // explored, so a well-formed region schedules each instruction at most once and reaching one
+                        // twice means the use-def graph is cyclic.
+                        if std::mem::replace(&mut scheduled[instruction_index], true) {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "instruction {instruction_index} was scheduled twice, \
+                                 which indicates a cyclic use-def graph",
+                            )));
+                        }
+
+                        // The emit step runs after the input visits pushed on top of it, and those visits map every
+                        // input (or fail) before it pops, preserving the recursive post-order emission.
+                        let instruction = instructions[instruction_index]
+                            .as_ref()
+                            .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
+                        pending_steps.push(Step::Emit(instruction_index));
+                        pending_steps.extend(instruction.inputs.iter().rev().copied().map(Step::Visit));
+                    }
                 }
-
-                let instruction_index = instruction_by_output
-                    .get(atom_id.index())
-                    .copied()
-                    .flatten()
-                    .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-
+            }
+            Step::Emit(instruction_index) => {
                 let instruction = instructions[instruction_index]
                     .take()
                     .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
-
-                // The emit step runs after the input visits pushed on top of it, and those visits map every input
-                // (or fail) before it pops, preserving the recursive post-order emission.
-                let inputs = instruction.inputs.clone();
-                pending_steps.push(Step::Emit(instruction));
-                pending_steps.extend(inputs.into_iter().rev().map(Step::Visit));
-            }
-            Step::Emit(instruction) => {
                 let inputs = instruction
                     .inputs
                     .iter()
@@ -1771,30 +1805,38 @@ fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
         .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
 }
 
-/// Detaches every simplified [`Region`] whose own rebuild was verbatim but that reaches a region whose rebuild was
-/// not, so that only regions whose _complete reachable contents_ are unchanged keep sharing their source region's
-/// [`RegionTransformCache`]. Transforms of a region consume its attached descendants too, so a parent whose nested
-/// computation lost dead work no longer has the contents its retained transforms were derived from. Regions precede
-/// the regions that reference them, which makes one ascending pass enough to propagate that.
+/// Makes every simplified [`Region`] whose _complete reachable contents_ are unchanged share its source region's
+/// [`RegionTransformCache`], and leaves every other region with the fresh cell that [`Region::new`] minted for it.
+/// A region qualifies when its own rebuild was the identity _and_ every region it reaches also qualifies: transforms
+/// of a region consume its attached descendants too, so a parent whose nested computation lost dead work no longer has
+/// the contents its retained transforms were derived from. Regions precede the regions that reference them, which
+/// makes one ascending pass enough to decide this for the whole arena.
 ///
 /// # Parameters
+///
 ///   - `regions`: Simplified regions in [`RegionId`] order, before compaction renumbers them.
-///   - `verbatim`: Whether each region's own rebuild was verbatim, in the same order.
-fn retain_verbatim_transform_caches<V: Typed + Parameter, O>(regions: &mut [Region<V, O>], verbatim: &[bool]) {
-    let mut retained = verbatim.to_vec();
+///   - `source_caches`: Each region's source [`RegionTransformCache`] when its own rebuild was the identity, and
+///     [`None`] otherwise, in the same order.
+fn adopt_transform_caches_for_identity_rebuilds<V: Typed + Parameter, O>(
+    regions: &mut [Region<V, O>],
+    mut source_caches: Vec<Option<RegionTransformCache<V, O>>>,
+) {
     for index in 0..regions.len() {
-        if !retained[index] {
+        // Adopting shares the cell rather than moving it out, so the entry stays populated and a later parent can
+        // still see that this descendant kept its contents.
+        let Some(source_cache) = source_caches[index].clone() else {
             continue;
-        }
+        };
         if regions[index]
             .instructions()
             .iter()
             .flat_map(|instruction| instruction.regions())
-            .any(|attached| !retained.get(attached.index()).copied().unwrap_or(false))
+            .any(|attached| source_caches.get(attached.index()).is_none_or(Option::is_none))
         {
-            retained[index] = false;
-            regions[index].invalidate_transform_cache();
+            source_caches[index] = None;
+            continue;
         }
+        regions[index].adopt_transform_cache(source_cache);
     }
 }
 
@@ -1846,6 +1888,7 @@ mod tests {
     use std::cell::Cell;
     use std::fmt::Display;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2609,6 +2652,141 @@ mod tests {
     }
 
     #[test]
+    fn test_program_simplified_multi_region() {
+        // We use two sealed regions: a pure one (^0) referenced only by a dead instruction, and an effectful one (^1)
+        // referenced by another dead instruction. Simplification drops the pure dead instruction together with its
+        // region, keeps the effectful dead instruction alive (its attached region's effects are observable), and
+        // compacts the surviving region identifiers (the effectful region moves from ^1 to ^0).
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let mut pure_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let pure_input = pure_builder.add_input(ArrayType::scalar(DataType::F64));
+        let pure_program = pure_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![pure_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pure_region = builder.import_region(pure_program.entry_region_ref());
+        let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
+        let effectful_output = effectful_builder
+            .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![effectful_input])
+            .unwrap()[0];
+        let effectful_program = effectful_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let effectful_region = builder.import_region(effectful_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![pure_region],
+                vec![input],
+            )
+            .unwrap();
+        builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![effectful_region],
+                vec![input],
+            )
+            .unwrap();
+        let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(program.regions().len(), 3);
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.regions().len(), 2);
+        assert_eq!(simplified.instructions().len(), 2);
+        assert_eq!(
+            simplified.instructions()[0].operation(),
+            &TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+        );
+        assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
+        assert_eq!(simplified.instructions()[1].operation(), &TestRegionOperation::Add);
+        assert!(!simplified.region(RegionId::new(0)).unwrap().instructions()[0].operation().effects().is_pure());
+        let simplified = program.into_simplified().unwrap();
+        assert_eq!(simplified.regions().len(), 2);
+        assert_eq!(simplified.instructions().len(), 2);
+        assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
+    }
+
+    #[test]
+    fn test_program_simplified_invalidates_transform_caches_transitively() {
+        // A region's transforms consume its attached descendants too, so a parent whose own rebuild was the identity
+        // must still lose its retained transforms when a descendant was rewritten. Here the entry region is untouched
+        // by simplification while its shared branch region loses dead work.
+        let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let branch_input = branch_builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch_output =
+            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input]).unwrap()[0];
+        branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_output]).unwrap();
+        let branch = branch_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![branch_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let operand = builder.add_input(ArrayType::scalar(DataType::F64));
+        let branch_region = builder.import_program(branch);
+        let output = builder
+            .add_instruction(
+                ConditionOperation::<Array>::new(),
+                vec![branch_region, branch_region],
+                vec![predicate, operand],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.atoms().len(), program.atoms().len());
+        assert_eq!(simplified.instructions().len(), program.instructions().len());
+        assert_eq!(simplified.regions()[0].instructions().len(), 1);
+        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        assert!(!Arc::ptr_eq(&after.0, &before.0));
+        assert!(!Arc::ptr_eq(&after.1, &before.1));
+    }
+
+    #[test]
+    fn test_program_simplified_refuses_cache_adoption_for_reordered_instructions() {
+        // Atom evidence pins instruction order only when the source numbers its atoms in instruction order. This
+        // hand-built region numbers them against it (the first instruction produces atom 2 and the second produces
+        // atom 1), so the rebuild (which follows output order) emits the two data-independent instructions in the
+        // opposite order under an identity atom mapping. That rebuild is not the identity and must not adopt.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1), AtomId::new(2)],
+            vec![
+                Instruction::new(NegOperation::new().into(), vec![AtomId::new(0)], vec![AtomId::new(2)], Vec::new()),
+                Instruction::new(
+                    AddOperation::new().into(),
+                    vec![AtomId::new(0), AtomId::new(0)],
+                    vec![AtomId::new(1)],
+                    Vec::new(),
+                ),
+            ],
+        );
+        let shape = RegionSimplificationShape::of(&region);
+        assert!(!shape.atoms_are_instruction_ordered);
+
+        let program = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            vec![Placeholder],
+            vec![Placeholder, Placeholder],
+            vec![region],
+            RegionId::new(0),
+        )
+        .unwrap();
+        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.instructions()[0].outputs(), [AtomId::new(1)]);
+        assert_eq!(simplified.instructions()[1].outputs(), [AtomId::new(2)]);
+        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        assert!(!Arc::ptr_eq(&after.0, &before.0));
+    }
+
+    #[test]
     fn test_program_into_simplified() {
         #[derive(Debug, Parameter)]
         struct CloneCountingValue {
@@ -2706,6 +2884,46 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_program_into_simplified_retains_transform_caches_for_identity_rebuilds() {
+        // The move-based rebuild recognizes the identity exactly like the cloning one, which matters because the
+        // standard pipeline builds a program and immediately consumes it with `into_simplified`.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let simplified = program.into_simplified().unwrap();
+        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        assert!(Arc::ptr_eq(&after.0, &before.0));
+        assert!(Arc::ptr_eq(&after.1, &before.1));
+    }
+
+    #[test]
+    fn test_region_simplification_shape_refuses_output_free_instructions() {
+        // An instruction with no outputs produces no atom, so the source-to-rebuilt atom mapping cannot attest to its
+        // survival or its position. Even the strongest possible evidence (i.e., the region rebuilt as itself under an
+        // identity mapping) must therefore be refused.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region: Region<Array, ArrayOperation<Array>> = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1)],
+            vec![
+                Instruction::new(NegOperation::new().into(), vec![AtomId::new(0)], vec![AtomId::new(1)], Vec::new()),
+                Instruction::new(PrintOperation::new("effect").into(), vec![AtomId::new(0)], Vec::new(), Vec::new()),
+            ],
+        );
+        let identity_mapping = (0..region.atoms().len())
+            .map(|index| (AtomId::new(index), AtomId::new(index)))
+            .collect::<HashMap<_, _>>();
+        let shape = RegionSimplificationShape::of(&region);
+        assert!(!shape.atoms_pin_every_instruction);
+        assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
     }
 
     #[test]
@@ -2865,6 +3083,48 @@ mod tests {
     }
 
     #[test]
+    fn test_program_rebuilds_reject_cyclic_use_def_graphs() {
+        // Sealing a region checks neither definition-before-use nor acyclicity, so a hand-built region may contain a
+        // use-def cycle. Both rebuild walks must report it instead of scheduling its instructions forever.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1)],
+            vec![
+                Instruction::new(
+                    AddOperation::new().into(),
+                    vec![AtomId::new(0), AtomId::new(2)],
+                    vec![AtomId::new(1)],
+                    Vec::new(),
+                ),
+                Instruction::new(NegOperation::new().into(), vec![AtomId::new(1)], vec![AtomId::new(2)], Vec::new()),
+            ],
+        );
+        let cyclic = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            vec![Placeholder],
+            vec![Placeholder],
+            vec![region],
+            RegionId::new(0),
+        )
+        .unwrap();
+
+        let expected = "instruction 0 was scheduled twice, which indicates a cyclic use-def graph";
+        assert!(matches!(
+            cyclic.simplified(),
+            Err(ProgramError::MalformedProgram(message)) if message == expected,
+        ));
+        assert!(matches!(
+            cyclic.clone().into_filtered(&[AtomId::new(0)], &[AtomId::new(1)], &[]),
+            Err(ProgramError::MalformedProgram(message)) if message == expected,
+        ));
+        assert!(matches!(
+            cyclic.into_simplified(),
+            Err(ProgramError::MalformedProgram(message)) if message == expected,
+        ));
+    }
+
+    #[test]
     fn test_program_render_multi_region() {
         // A shared region renders its body once (labeled with its identifier, at its first reference) and later
         // references render as that identifier alone, while a singly referenced region renders nested inline.
@@ -2968,62 +3228,5 @@ mod tests {
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::PURE);
-    }
-
-    #[test]
-    fn test_program_simplified_multi_region() {
-        // We use two sealed regions: a pure one (^0) referenced only by a dead instruction, and an effectful one (^1)
-        // referenced by another dead instruction. Simplification drops the pure dead instruction together with its
-        // region, keeps the effectful dead instruction alive (its attached region's effects are observable), and
-        // compacts the surviving region identifiers (the effectful region moves from ^1 to ^0).
-        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let mut pure_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let pure_input = pure_builder.add_input(ArrayType::scalar(DataType::F64));
-        let pure_program = pure_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![pure_input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let pure_region = builder.import_region(pure_program.entry_region_ref());
-        let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
-        let effectful_output = effectful_builder
-            .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![effectful_input])
-            .unwrap()[0];
-        let effectful_program = effectful_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let effectful_region = builder.import_region(effectful_program.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder
-            .add_instruction(
-                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
-                vec![pure_region],
-                vec![input],
-            )
-            .unwrap();
-        builder
-            .add_instruction(
-                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
-                vec![effectful_region],
-                vec![input],
-            )
-            .unwrap();
-        let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        assert_eq!(program.regions().len(), 3);
-        let simplified = program.simplified().unwrap();
-        assert_eq!(simplified.regions().len(), 2);
-        assert_eq!(simplified.instructions().len(), 2);
-        assert_eq!(
-            simplified.instructions()[0].operation(),
-            &TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
-        );
-        assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
-        assert_eq!(simplified.instructions()[1].operation(), &TestRegionOperation::Add);
-        assert!(!simplified.region(RegionId::new(0)).unwrap().instructions()[0].operation().effects().is_pure());
-        let simplified = program.into_simplified().unwrap();
-        assert_eq!(simplified.regions().len(), 2);
-        assert_eq!(simplified.instructions().len(), 2);
-        assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
     }
 }
