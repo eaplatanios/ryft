@@ -2987,6 +2987,7 @@ where
         + From<LinearCallOperation<ArrayIrType>>
         + From<PSumScatterOperation>
         + From<DynamicReshapeOperation>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
@@ -3023,6 +3024,7 @@ where
         + From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<PSumScatterOperation>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>>(
@@ -3054,6 +3056,7 @@ where
     C::Operation: From<AllToAllOperation>
         + From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
     fn jvp_in_parent<D: DifferentiationDriver<C>>(

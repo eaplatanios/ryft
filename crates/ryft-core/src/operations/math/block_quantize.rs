@@ -181,6 +181,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Shape};
+    use crate::contexts::StagingContext;
     use crate::operations::math::dot::{Dot, DotDimensionNumbers, ScaledDot};
     use crate::programs::Typed;
     use crate::tracing::TracingContext;

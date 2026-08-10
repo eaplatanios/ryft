@@ -1014,8 +1014,10 @@ configurations, each with an exact `'dot'`-named diagnostic: a ragged axis on a 
 two operands would have to agree on per-item extents along paired batch dimensions, which nothing establishes here); a
 ragged axis on a *replicated* operand (the broadcast that materializes its batch axis carries no per-item extents); and
 a contraction that would consume an axis carrying another ragged axis's per-item extents. The pre-existing requirement
-that the mapped batch extent be statically known (the rule derives the singleton batch axis it materializes for a
-replicated operand from the common batch size) is unchanged and now pinned as `BatchingError::DynamicBatchAxis`.
+that the mapped batch extent be statically known (the rule derived the singleton batch axis it materializes for a
+replicated operand from the common batch size) was left unchanged here and pinned as
+`BatchingError::DynamicBatchAxis`. **That constraint was flagged in review and has since been removed**; refer to
+_Dynamic mapped extents for dot batching (2026-08-09)_ below.
 
 **Evidence flow.** Unchanged from the reduction discipline: the rule returns the consumed dimensions in its
 `BatchedOutputs` evidence, the driver hands that straight to `validate_operation_outputs`, and the validator's
@@ -1027,7 +1029,8 @@ consumed. A dot that dropped a ragged input without claiming it would therefore 
 workload through the public `batch(...)` entrypoint over the composite family (gateway to a checked per-item extent,
 dynamic broadcast to that extent, then `dot(x, x)`): values `[2, 3]` with lengths `[1, 3]` produce `[4, 27]` eagerly —
 the recorded Phase 6 numbers, obtained through the contraction discipline instead of square-then-masked-sum — and a
-dynamic mapped extent is rejected exactly. `operations::math::dot::tests::test_dot_batching_propagates_free_ragged_axes`
+dynamic mapped extent was rejected exactly (that rejection is now a success case; see the 2026-08-09 entry below).
+`operations::math::dot::tests::test_dot_batching_propagates_free_ragged_axes`
 contracts a ragged `[length, 2]` matrix's dense trailing axis against a `[2]` vector and pins that the ragged axis
 lands at output axis 1 with its extents, dimension identity, and `extent_axes` intact, that the per-item type is
 `f32[length]`, and that the rule claims no evidence.
@@ -1042,3 +1045,62 @@ unchanged. Per-file `rustfmt --check` is clean on both touched files, and no exi
 
 **Stage 2 is not started.** The operation-model migration (`padded_reduce` plus a native `ragged_dot`, extents as
 explicit operands) remains pending owner review.
+
+### Dynamic mapped extents for dot batching (2026-08-09)
+
+**What was wrong.** `DotOperation`'s batching rule opened with `ArrayBatch::common_batch_size(inputs)?` and
+materialized a replicated operand's batch axis with `ArrayBatch::broadcast(0, <host usize>, ...)`. Both derive the
+mapped extent as a static host size, so batching any dot under a dynamic mapped extent failed with
+`BatchingError::DynamicBatchAxis` even when the rule needed nothing more than to move or broadcast arrays — exactly
+the situation `ArrayBatchingPolicy::axis_size`'s documentation tells rules to avoid by using `match_axis` and
+`broadcast_input` instead.
+
+**The rewrite.** The rule no longer consults any host extent. Alignment of the mixed batched/replicated pair is
+delegated to `P::match_axis(context, input, Axis::from(0))`, which keeps the JAX `matchaxis(0)` convention while
+letting the active policy own materialization: `StaticArrayBatchingPolicy` broadcasts with the context's `usize`
+extent, and `DynamicArrayBatchingPolicy` stages the mixed dynamic broadcast grounded by the transform's first-class
+extent value. The both-mapped and both-replicated arms are unchanged. The rule's `C::Value: Broadcast` bound is
+dropped, because the rule no longer calls `ArrayBatch::broadcast` itself.
+
+**Dense staging is byte-identical.** For a replicated operand `StaticArrayBatchingPolicy::match_axis` reduces to
+`batch.match_axis(axis, *context.axis_extent(), context.axis_sharding().clone())`, and `ArrayBatch::match_axis`
+dispatches a replicated carrier straight to `ArrayBatch::broadcast(axis, axis_size, axis_sharding)` — the exact call
+the old code made, with `*context.axis_extent()` in place of `common_batch_size(inputs).unwrap()`. Those two extents
+are the same number: `ArrayBatching::prepare_inputs` reconciles the context extent against `common_batch_size` and
+rejects any disagreement, and program-level batching inserts the mapped axis as `Dimension::Static(axis_size)` from
+that same context extent. Empirically, every existing rendered fixture and every existing dot batching test is
+unchanged (`ryft-core --lib` was green with zero fixture edits outside the one intentional conversion below).
+
+**Batch-extent validation.** The dropped `common_batch_size` call also carried the mismatch check, which is now stated
+directly over the two operands' mapped `Dimension`s. Two static-and-different extents still produce the same
+`BatchingError::MismatchedBatchSizes { expected, actual }`. Two dynamic extents are accepted exactly when they are the
+same `DimensionVariable` (`Dimension`'s `PartialEq` compares dynamic dimensions by `Arc::ptr_eq` identity), and two
+different dynamic extents — or one static against one dynamic — are rejected exactly as ``'dot' operands map different
+batch extents `batch` and `other` ``. A replicated operand contributes no extent and is unconstrained, as before.
+
+**Inference verdict.** No type-model change was needed. `dot_abstract` compares paired batching and contracting
+dimensions with `Dimension` equality and copies the LHS batching dimension straight into the output shape, so a
+dynamic batching dimension is admitted whenever both operands name the same variable and rejected otherwise. That is
+precisely the semantics the rewritten rule relies on.
+
+**No corner kept as a rejection.** `dot` is `XlaZeroPadded` in the Phase 5 padding-contract inventory, and its
+lowering (`stablehlo.dot_general` through `lower_tensor_type`) is shape-agnostic, so a bounded-dynamic batching
+dimension delegates to XLA exactly like the already-proven bounded-dynamic contracting dimension. Nothing in the dot
+batching path now requires a statically known mapped extent.
+
+**Fixtures.** One intentional rejection-to-success conversion:
+`arrays::batching::tests::test_array_ir_ragged_contraction_batching`'s traced leg (dynamic `f32[batch]` values and
+lengths inputs, gateway to a checked per-item extent, dynamic broadcast, then `dot(x, x)`) previously asserted
+`DynamicBatchAxis`; it now builds the staged program and interprets it at extent 2 to `[4, 27]`, the same numbers the
+eager leg produces. One new fixture,
+`arrays::batching::tests::test_array_ir_dense_dot_batching_under_a_dynamic_mapped_extent`, covers the plain
+(non-ragged) case: a mapped `f32[batch, 3]` contracted against a replicated `f32[3]`, pinning the staged rendering
+(`dimension_size` on the mapped axis, an exact dimension constant, the mixed dynamic broadcast of the replicated
+operand, and the lifted dot under a dynamic batching dimension) and interpreting it to `[3210, 6540]`. One new
+fixture, `operations::math::dot::tests::test_dot_batching_validates_mapped_extents`, pins all three validation
+outcomes described above.
+
+**Gates.** `cargo check --workspace --all-targets` clean with zero warnings. `ryft-core --lib` 1,221/0 (1,219
+baseline plus the two new tests; the converted fixture stayed one test), plus `cargo test -p ryft-core` integration
+suites (6 + 6) and doctests (53 passed, 16 ignored). `ryft-xla --lib` serial 459 passed with 1 ignored.
+`ryft-macros-tests` 20 + 17 passed. Per-file `rustfmt --check` clean on both touched files.

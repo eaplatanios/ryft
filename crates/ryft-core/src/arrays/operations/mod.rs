@@ -397,6 +397,7 @@ where
                            + From<DimensionToScalarOperation>
                            + From<LinearCallOperation<ArrayIrType>>
                            + From<ZeroOperation<ArrayType>>
+                           + From<ConstantOperation<DimensionValue>>
                            + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
                            + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         > + Zero<C::Value>,

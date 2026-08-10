@@ -411,6 +411,18 @@ where
     }
 }
 
+// Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
+// can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
+impl<C> From<ConstantOperation<DimensionValue>> for XlaOperation<C>
+where
+    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        Self::Dimension(DimensionOperation::Constant(operation))
+    }
+}
+
 macro_rules! impl_composite_operation_conversion {
     // Generates the composite-operation conversions the derive cannot generate directly: the canonical constructors
     // whose lift selects between the homogeneous member carrier and the mixed dimension-operand carrier, and the

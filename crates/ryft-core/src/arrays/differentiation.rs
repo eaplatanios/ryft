@@ -1,7 +1,7 @@
 use crate::arrays::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching};
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::dimensions::{Dimension, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::BatchingError;
@@ -32,12 +32,12 @@ use crate::tracing::{Tracer, TracingContext};
 /// rebuild an exact shape from the retained residuals.
 ///
 /// Dynamic dimension definitions are deduplicated by identity. Retaining a dimension-typed value whose
-/// [`DimensionType`] carries no concrete extent reuses the slot of any previously retained residual with the same
-/// [`DimensionVariable`], because a variable that appears several times (across axes, or as both an axis and an
-/// explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more importantly,
-/// preserves the type-level equality between axes when shapes are reconstructed inside the attached regions. All
-/// other values (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are purely positional:
-/// every retention appends a new slot, and the values themselves are never inspected.
+/// [`DimensionType`](crate::DimensionType) carries no concrete extent reuses the slot of any previously retained
+/// residual with the same [`DimensionVariable`], because a variable that appears several times (across axes, or as both
+/// an axis and an explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more
+/// importantly, preserves the type-level equality between axes when shapes are reconstructed inside the attached
+/// regions. All other values (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
+/// purely positional: every retention appends a new slot, and the values themselves are never inspected.
 #[derive(Clone, Debug)]
 pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
     /// Retained residual [`Value`]s, in the trailing-operand order of the staged linear call. Indices returned by the
@@ -67,11 +67,12 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
 
     /// Retains `value` and returns the residual slot index that will address it inside the attached
     /// [`Region`](crate::Region)s. When `value` is a dynamic dimension definition (i.e., its type is
-    /// [`ArrayIrType::Dimension`] and that [`DimensionType`] has no concrete extent), retention deduplicates by
-    /// identity: if a residual with the same [`DimensionVariable`] was already retained, its existing slot index is
-    /// returned and `value` is dropped, since both values denote the same runtime extent. Every other value (i.e.,
-    /// ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry no identity worth sharing)
-    /// is appended to a fresh slot unconditionally, even when it compares equal to an already-retained value.
+    /// [`ArrayIrType::Dimension`] and that [`DimensionType`](crate::DimensionType) has no concrete extent), retention
+    /// deduplicates by identity: if a residual with the same [`DimensionVariable`] was already retained, its existing
+    /// slot index is returned and `value` is dropped, since both values denote the same runtime extent. Every other
+    /// value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry no identity
+    /// worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an already-retained
+    /// value.
     pub fn retain(&mut self, value: V) -> usize {
         if let ArrayIrType::Dimension(r#type) = value.r#type().as_ref()
             && r#type.extent().is_none()
@@ -360,7 +361,7 @@ mod tests {
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::types::data::DataType;
-    use crate::arrays::types::dimensions::DimensionBounds;
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionType};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiableType;
     use crate::programs::{MaybeZero, TypeError};
