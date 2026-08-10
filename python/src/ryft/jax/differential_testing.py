@@ -18,12 +18,17 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+
+if TYPE_CHECKING:
+    from ryft.jax.differential_testing_cases import DifferentialCase
 
 
 SCHEMA = "ryft-jax-differential-v1"
 PINNED_JAX_VERSION = "0.6.2"
-SUBPROCESS_TIMEOUT_SECONDS = 300
+BUILD_HINT = "cargo build -p ryft-xla --features differential-testing --bin differential_testing"
+SUBPROCESS_TIMEOUT_SECONDS = 1800
 
 
 @dataclass(frozen=True)
@@ -207,7 +212,7 @@ def project_collective_stablehlo(module: str) -> tuple[StableHloCollective, ...]
     return tuple(collectives)
 
 
-def differential_cases():
+def differential_cases() -> tuple[DifferentialCase, ...]:
     """Returns the shared case registry without importing JAX eagerly."""
 
     from ryft.jax.differential_testing_cases import DIFFERENTIAL_CASES
@@ -215,8 +220,39 @@ def differential_cases():
     return DIFFERENTIAL_CASES
 
 
+def _compare_projection(
+    side: str,
+    module: str,
+    collectives: tuple[StableHloCollective, ...],
+) -> str | None:
+    """Compares one framework's projected collectives against the registry expectation.
+
+    Anchoring both frameworks to a declared expectation is what keeps the parity gate honest: two modules that no
+    longer contain any recognizable collective project to the same empty tuple and would otherwise agree vacuously.
+
+    # Parameters
+
+      - `side`: Framework name used in the returned difference.
+      - `module`: Textual StableHLO module emitted by that framework.
+      - `collectives`: Expected projection declared by the registry entry.
+    """
+
+    projection = project_collective_stablehlo(module)
+    missing = [
+        operation
+        for operation in dict.fromkeys(collective.operation for collective in collectives)
+        if all(projected.operation != operation for projected in projection)
+    ]
+    if missing:
+        return f"StableHLO collectives: {side} module is missing expected collective families {', '.join(missing)}"
+    if projection != collectives:
+        return f"StableHLO collectives: {side} {projection!r} != expected {collectives!r}"
+    return None
+
+
 def compare_case(
     relationship: str,
+    collectives: tuple[StableHloCollective, ...],
     ryft: DifferentialObservation,
     jax: DifferentialObservation,
 ) -> CaseComparison:
@@ -225,6 +261,7 @@ def compare_case(
     # Parameters
 
       - `relationship`: Either `parity` or `ryft_exceeds_jax`.
+      - `collectives`: Collective projection the registry entry expects from both frameworks.
       - `ryft`: Ryft-side observation.
       - `jax`: JAX-side observation.
     """
@@ -237,27 +274,32 @@ def compare_case(
     if relationship == "parity":
         if ryft.staging != jax.staging:
             differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
+        if not collectives:
+            differences.append("StableHLO collectives: exact-parity case must declare its expected projection")
         if ryft.stablehlo is None or jax.stablehlo is None:
             differences.append("StableHLO: exact-parity case requires modules from both frameworks")
-        elif project_collective_stablehlo(ryft.stablehlo) != project_collective_stablehlo(jax.stablehlo):
-            differences.append(
-                "StableHLO collectives: "
-                f"ryft {project_collective_stablehlo(ryft.stablehlo)!r} != "
-                f"jax {project_collective_stablehlo(jax.stablehlo)!r}"
+        else:
+            differences.extend(
+                difference
+                for difference in (
+                    _compare_projection("ryft", ryft.stablehlo, collectives),
+                    _compare_projection("jax", jax.stablehlo, collectives),
+                )
+                if difference is not None
             )
     elif relationship == "ryft_exceeds_jax":
         if ryft.staging != StagingObservation(status="supported", output_type="f32[count]"):
             differences.append(f"Ryft staging: expected bounded symbolic support but got {ryft.staging!r}")
         if jax.staging != StagingObservation(status="rejected", category="concretization"):
             differences.append(f"JAX staging: expected concretization rejection but got {jax.staging!r}")
-        if ryft.stablehlo is not None or jax.stablehlo is not None:
+        if collectives or ryft.stablehlo is not None or jax.stablehlo is not None:
             differences.append("StableHLO: the staging-rejected capability case must not claim a module comparison")
     else:
         raise ValueError(f"unknown differential relationship '{relationship}'")
     return CaseComparison(case_id=ryft.case_id, differences=tuple(differences))
 
 
-def _selected_cases(case_ids: Sequence[str]):
+def _selected_cases(case_ids: Sequence[str]) -> tuple[DifferentialCase, ...]:
     """Returns registry entries selected by exact case ID, preserving registry order."""
 
     cases = differential_cases()
@@ -298,6 +340,11 @@ def collect_ryft_observations(root: Path, case_ids: Sequence[str]) -> tuple[Diff
         )
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"Ryft differential emitter failed:\n{error.stderr.strip()}") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Ryft differential emitter timed out after {SUBPROCESS_TIMEOUT_SECONDS} seconds. A cold compile of the "
+            f"emitter can exceed that budget; pre-build it with '{BUILD_HINT}' and rerun."
+        ) from None
     payload = json.loads(result.stdout)
     if not isinstance(payload, list):
         raise ValueError("Ryft differential emitter must return a JSON array")
@@ -321,6 +368,10 @@ def collect_jax_observations(root: Path, case_ids: Sequence[str]) -> tuple[Diffe
         )
     except subprocess.CalledProcessError as error:
         raise RuntimeError(f"JAX differential emitter failed:\n{error.stderr.strip()}") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"JAX differential emitter timed out after {SUBPROCESS_TIMEOUT_SECONDS} seconds"
+        ) from None
     payload = json.loads(result.stdout)
     if not isinstance(payload, list):
         raise ValueError("JAX differential emitter must return a JSON array")
@@ -349,7 +400,9 @@ def run_comparison(root: Path, case_ids: Sequence[str]) -> tuple[CaseComparison,
         raise ValueError(f"Ryft case set {sorted(ryft)} does not match selected cases {sorted(selected_ids)}")
     if set(jax) != set(selected_ids):
         raise ValueError(f"JAX case set {sorted(jax)} does not match selected cases {sorted(selected_ids)}")
-    return tuple(compare_case(case.relationship, ryft[case.case_id], jax[case.case_id]) for case in cases)
+    return tuple(
+        compare_case(case.relationship, case.collectives, ryft[case.case_id], jax[case.case_id]) for case in cases
+    )
 
 
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
@@ -366,7 +419,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     """Runs the CLI and returns its process exit code."""
 
     parsed = parse_arguments(arguments)
-    cases = _selected_cases(parsed.case)
+    try:
+        cases = _selected_cases(parsed.case)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
     if parsed.list:
         if parsed.emit_jax:
             raise ValueError("--list cannot be combined with --emit-jax")

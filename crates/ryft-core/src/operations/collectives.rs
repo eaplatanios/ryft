@@ -2748,6 +2748,15 @@ where
     }
 }
 
+impl<V> Pshuffle for ProjectedValue<ArrayType, V>
+where
+    V: Pshuffle + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn pshuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
+        self.value().pshuffle(axis_name, permutation)?.into_projected().map_err(Into::into)
+    }
+}
+
 /// Convenience untiled all-to-all that exchanges one ranked array axis with a named axis.
 pub trait PSwapAxes: AllToAll {
     /// Swaps `axis` with `axis_name` over the full named axis.

@@ -20,7 +20,7 @@ use crate::contexts::EagerContext;
 use crate::interpretation::InterpretationDriver;
 use crate::macros::check_count;
 use crate::operations::control_flow::scan::{
-    ScanInterpretation, read_scan_iteration, stacked_scan_type, write_scan_iteration,
+    ScanInterpretation, read_scan_iteration, stacked_scan_type, validate_scan_runtime_length, write_scan_iteration,
 };
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
@@ -188,45 +188,15 @@ where
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
         let (inputs, length) = match length {
             Dimension::Static(length) => (inputs, *length),
-            Dimension::Dynamic(variable) => {
-                let (runtime_length, inputs) =
+            Dimension::Dynamic(_) => {
+                let (runtime_length, stacked_inputs) =
                     inputs.split_last().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+                // The runtime-length safety rule is defined once, in the types space. Applying it to the actual
+                // operand types keeps eager interpretation and staged type inference exactly in step.
+                let input_types = inputs.iter().map(|input| input.r#type()).collect::<Vec<_>>();
+                validate_scan_runtime_length(length, input_types.as_slice(), carry_count, stacked_inputs.len())?;
                 let runtime_length = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(runtime_length)?;
-                let runtime_length_type = runtime_length.r#type();
-                let extent = runtime_length.extent();
-                if runtime_length_type.variable() != variable {
-                    // An operand of an unrelated identity fixes the trip count to its own exact extent, so every
-                    // stacked operand must be refined to that same extent. Otherwise the loop would read `extent`
-                    // slices out of stacks whose runtime size is independently determined.
-                    if runtime_length_type.extent().is_none() || !length.is_refined_by(&Dimension::Static(extent)) {
-                        return Err(TypeError::invalid(format!(
-                            "'scan' runtime length operand has type {} but scan length requires {variable}",
-                            runtime_length_type.as_ref(),
-                        ))
-                        .into());
-                    }
-                    for (index, input) in inputs[carry_count..].iter().enumerate() {
-                        let input_type = input.r#type();
-                        let leading_extent = match input_type.as_ref() {
-                            ArrayIrType::Array(input_type) if input_type.rank() > 0 => {
-                                let bounds = input_type.dimension(0).bounds();
-                                (bounds.lower().checked_add(1) == bounds.upper()).then_some(bounds.lower())
-                            }
-                            _ => None,
-                        };
-                        if leading_extent != Some(extent) {
-                            return Err(TypeError::invalid(format!(
-                                "'scan' runtime length operand has type {} but stacked input {index} has type {} \
-                                 whose leading dimension is not refined to extent {extent}",
-                                runtime_length_type.as_ref(),
-                                input_type.as_ref(),
-                                index = carry_count + index,
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                (inputs, extent)
+                (stacked_inputs, runtime_length.extent())
             }
         };
         let body = driver.region(0)?;

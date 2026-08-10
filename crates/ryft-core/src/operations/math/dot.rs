@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType, Shape,
-    Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType,
+    RaggedArrayBatchingPolicy, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -639,8 +639,27 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for DotOperation
+/// Batching rule for [`DotOperation`]: the operands are aligned onto one common mapped axis, the dimension numbers are
+/// lifted past it with [`lift_dot_dimensions`], and the lifted contraction is re-interpreted over the packed values.
+///
+/// A contraction is also a zero-padding-discipline consumer of bounded ragged axes. Every ragged axis of an operand is
+/// either contracted or free:
+///
+///   - A **contracted** ragged axis is consumed. [`RaggedArrayBatchingPolicy::pad_contraction_input`] zeroes that
+///     operand's padded elements first, which removes their products from the contraction's sums, and the rule reports
+///     each consumed [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence so the
+///     carrier-invariant validation boundary can tell a deliberate consumption apart from a silently dropped extent.
+///     Each operand is zeroed along its own contracted ragged axes only, because zeroing either factor of a contracted
+///     pair already neutralizes that product.
+///   - A **free** ragged axis survives into the result and propagates onto the output carrier, relocated through the
+///     dot's output layout (i.e., the batching dimensions, then the LHS free axes, then the RHS free axes).
+///
+/// A ragged axis on a *batching* dimension of the dot is rejected: the two operands would have to agree on per-item
+/// extents along paired batch dimensions, which no dimension identity established here can guarantee. A ragged axis on
+/// a *replicated* operand is rejected as well, because materializing a batch axis on it is a broadcast with no per-item
+/// extents to relocate. Operands without any ragged axis take the dense path unchanged.
+impl<C: Context<Type = ArrayType, Value: Broadcast>, P: RaggedArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
@@ -652,6 +671,20 @@ where
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
+        // A replicated ragged operand is rejected before alignment, because the broadcast that materializes its batch
+        // axis carries no per-item extents and would drop the metadata that records them.
+        for (input, batch_axis) in inputs.iter().zip(batch_axes.iter()) {
+            if batch_axis.is_none()
+                && let Some(ragged_axis) = input.ragged_axes().first()
+            {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "'{DOT_OPERATION_NAME}' does not support bounded ragged dimension `{}` on a replicated operand",
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
+        }
         // Validate the common batch size across both operands (catching mismatched batched operands) before the
         // mixed arms consult it; a mixed operand pair always has at least one mapped operand.
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
@@ -677,9 +710,95 @@ where
         let lifted_op = DotOperation::new(lifted_dimensions)
             .with_accumulation_type(self.accumulation_type)
             .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, axis_sharding)?);
-        Ok(lifted_op
-            .interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+        let output_batch_axes = [BatchAxis::from_optional_position(output_axis)];
+        if aligned_inputs.iter().all(|input| input.ragged_axes().is_empty()) {
+            return Ok(lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &output_batch_axes)?.into());
+        }
+
+        // A generalized dot lays its result out as the batching dimensions, then the LHS free axes, then the RHS free
+        // axes, so each operand axis either lands at a known result axis or is contracted away.
+        let dimensions = lifted_op.dimensions();
+        let batching_count = dimensions.lhs_batching_dimensions().len();
+        let lhs_result = lhs_result_axes(dimensions, aligned_inputs[0].r#type().rank());
+        let rhs_result = rhs_result_axes(dimensions, aligned_inputs[1].r#type().rank());
+        let operand_output_axes = |rank: usize, batching: &[usize], result: &[usize], offset: usize| {
+            (0..rank)
+                .map(|axis| {
+                    batching.iter().position(|batching_axis| *batching_axis == axis).or_else(|| {
+                        result
+                            .iter()
+                            .position(|result_axis| *result_axis == axis)
+                            .map(|index| batching_count + offset + index)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let output_axes = [
+            operand_output_axes(
+                aligned_inputs[0].r#type().rank(),
+                dimensions.lhs_batching_dimensions(),
+                lhs_result.as_slice(),
+                0,
+            ),
+            operand_output_axes(
+                aligned_inputs[1].r#type().rank(),
+                dimensions.rhs_batching_dimensions(),
+                rhs_result.as_slice(),
+                lhs_result.len(),
+            ),
+        ];
+
+        let contracting_axes = [dimensions.lhs_contracting_dimensions(), dimensions.rhs_contracting_dimensions()];
+        let batching_axes = [dimensions.lhs_batching_dimensions(), dimensions.rhs_batching_dimensions()];
+        let mut contracted_dimensions = Vec::new();
+        let mut output_ragged_axes = Vec::new();
+        let mut contraction_inputs = Vec::with_capacity(aligned_inputs.len());
+        for (index, input) in aligned_inputs.iter().enumerate() {
+            if let Some(ragged_axis) =
+                input.ragged_axes().iter().find(|ragged_axis| batching_axes[index].contains(&ragged_axis.axis()))
+            {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "'{DOT_OPERATION_NAME}' does not support bounded ragged dimension `{}` on a batching dimension",
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
+            let contracted = input
+                .ragged_axes()
+                .iter()
+                .filter(|ragged_axis| contracting_axes[index].contains(&ragged_axis.axis()))
+                .map(|ragged_axis| ragged_axis.dimension().clone())
+                .collect::<Vec<_>>();
+            for ragged_axis in input.ragged_axes() {
+                // A contracted ragged axis is consumed by the zeroing below and reported as evidence; every other one
+                // must reach the result together with the axes its per-item extents index.
+                if output_axes[index][ragged_axis.axis()].is_none() {
+                    continue;
+                }
+                output_ragged_axes.push(ragged_axis.clone().relocated(output_axes[index].as_slice()).ok_or_else(
+                    || BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "'{DOT_OPERATION_NAME}' contracts an axis carrying the per-item extents of bounded ragged \
+                             dimension `{}`",
+                            ragged_axis.dimension(),
+                        ),
+                    },
+                )?);
+            }
+            contraction_inputs.push(if contracted.is_empty() {
+                input.clone()
+            } else {
+                P::pad_contraction_input(context, input, contracting_axes[index])?
+            });
+            contracted_dimensions.extend(contracted);
+        }
+
+        let mut outputs = lifted_op.interpret_with_batch_axes(context, &contraction_inputs, &output_batch_axes)?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axes[0])?
+            .with_ragged_axes(output_ragged_axes)?;
+        Ok(BatchedOutputs::new(vec![output], contracted_dimensions))
     }
 }
 
@@ -1859,7 +1978,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
@@ -3372,6 +3491,103 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![3210.0, 6540.0]);
+    }
+
+    #[test]
+    fn test_dot_batching_propagates_free_ragged_axes() {
+        // Per item, a ragged `[length, 2]` matrix contracts its dense trailing axis against a `[2]` vector, so the
+        // ragged axis is a free axis of the contraction and survives into the `[length]` per-item result. The lifted
+        // dot lays its result out as the batching dimension followed by the LHS free axes, so the ragged axis moves
+        // from packed axis 1 to output axis 1 and the mapped axis its extents index stays at output axis 0.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let extents = Array::vector(vec![1_i32, 3]);
+        let lhs = ArrayBatch::new(
+            Array::from_f64s(plain_array(&[2, 3, 2]), (1..=12).map(f64::from).collect()),
+            BatchAxis::new(0),
+        )
+        .unwrap()
+        .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+        .unwrap();
+        let rhs = ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 10.0, 100.0, 1000.0]), BatchAxis::new(0)).unwrap();
+        let (outputs, evidence) = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()))
+            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].r#type().into_owned(), plain_array(&[2, 3]));
+        assert_eq!(outputs[0].ragged_axes(), &[RaggedAxis::new(1, extents, variable.clone(), vec![0])]);
+        assert_eq!(
+            outputs[0].unbatched_type(),
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)])),
+        );
+        // Nothing was contracted away, so the rule claims no consumption evidence and the padded rows keep whatever
+        // the dense contraction produced for them.
+        assert!(evidence.is_empty());
+        assert_eq!(outputs[0].value().to_f64s(), vec![21.0, 43.0, 65.0, 8700.0, 10900.0, 13100.0]);
+    }
+
+    #[test]
+    fn test_dot_batching_rejects_unsupported_ragged_configurations() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let extents = Array::vector(vec![1_i32, 3]);
+        let ragged_matrix = || {
+            ArrayBatch::new(
+                Array::from_f64s(plain_array(&[2, 3, 2]), (1..=12).map(f64::from).collect()),
+                BatchAxis::new(0),
+            )
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+            .unwrap()
+        };
+        let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
+
+        // Contracting the ragged axis requires zeroing its padding, which static array batching cannot stage.
+        assert_eq!(
+            DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
+                .batch(&context, &crate::EmptyRegionDriver, &[ragged_matrix(), ragged_matrix()])
+                .map(|outputs| outputs.into_parts().0)
+                .unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "static array batching cannot zero-pad bounded ragged axes".to_string(),
+            },
+        );
+
+        // A ragged axis declared as a batching dimension of the dot itself would require both operands to agree on
+        // per-item extents along paired batch dimensions, which nothing here establishes.
+        assert_eq!(
+            DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]))
+                .batch(&context, &crate::EmptyRegionDriver, &[ragged_matrix(), ragged_matrix()])
+                .map(|outputs| outputs.into_parts().0)
+                .unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "'dot' does not support bounded ragged dimension `length` on a batching dimension".to_string(),
+            },
+        );
+
+        // A replicated ragged operand gains its batch axis through a broadcast that carries no per-item extents.
+        let replicated =
+            ArrayBatch::replicated(Array::from_f64s(plain_array(&[3, 2]), (1..=6).map(f64::from).collect()))
+                .with_ragged_axes(vec![RaggedAxis::new(0, extents, variable, vec![])])
+                .unwrap();
+        assert_eq!(
+            DotOperation::matmul()
+                .batch(
+                    &context,
+                    &crate::EmptyRegionDriver,
+                    &[
+                        ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]), BatchAxis::new(0))
+                            .unwrap(),
+                        replicated,
+                    ],
+                )
+                .map(|outputs| outputs.into_parts().0)
+                .unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: "'dot' does not support bounded ragged dimension `length` on a replicated operand".to_string(),
+            },
+        );
     }
 
     #[test]

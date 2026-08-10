@@ -156,6 +156,22 @@ impl<V> RaggedAxis<V> {
         });
         Some(self)
     }
+
+    /// Returns this [`RaggedAxis`] relocated onto the result axes of an operation that keeps only some of its operand's
+    /// axes and reorders the survivors (e.g., a contraction such as `dot`), or [`None`] when any stored packed-axis
+    /// position does not survive. `output_axes` maps each operand axis to the result axis it becomes, indexed by
+    /// operand axis, with [`None`] marking an axis the operation consumes, which makes it the partial counterpart of
+    /// [`broadcasted`](Self::broadcasted)'s total mapping. Both [`axis`](Self::axis) and every entry of
+    /// [`extent_axes`](Self::extent_axes) are remapped through that table, and losing either kind of position means
+    /// the result can no longer describe this ragged axis, so the whole relocation fails instead of silently dropping
+    /// metadata that references a vanished axis.
+    pub(crate) fn relocated(mut self, output_axes: &[Option<usize>]) -> Option<Self> {
+        self.axis = output_axes[self.axis]?;
+        for extent_axis in &mut self.extent_axes {
+            *extent_axis = output_axes[*extent_axis]?;
+        }
+        Some(self)
+    }
 }
 
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
@@ -842,7 +858,8 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
 /// separate from [`ArrayBatchingPolicy`] so unrelated array rules do not inherit the constructor, comparison, and
 /// selection bounds needed only by ragged masking.
 pub trait RaggedArrayBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatchingPolicy<C> {
-    /// Replaces padding along the ragged axes in `reduced_axes` with `kind`'s reduction identity.
+    /// Replaces padding along the ragged axes in `reduced_axes` with `kind`'s reduction identity. This is the
+    /// identity-masking consumption discipline, owned by reductions.
     fn mask_reduction_input(
         context: &BatchingContext<C, ArrayBatching<Self>>,
         input: &ArrayBatch<C::Value>,
@@ -850,10 +867,18 @@ pub trait RaggedArrayBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatching
         kind: ReductionKind,
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 
-    // TODO(eaplatanios): When a zero-padding-discipline consumer (i.e., a contraction such as `dot`, `scaled_dot`, or
-    //  dot-product attention) gains a ragged batching rule, add a `pad_contraction_input` hook here that zeroes the
-    //  padded lanes of ragged contraction operands so that padding cannot contribute to contracted results. Follow the
-    //  `ragged_dot` model: extents stay explicit operands and each hook owns exactly one consumption discipline.
+    /// Replaces padding along the ragged axes in `contracted_axes` with zero. This is the zero-padding consumption
+    /// discipline, owned by contractions (e.g., `dot`), and it is the companion of the identity-masking discipline
+    /// that [`Self::mask_reduction_input`] owns for reductions. Zero is the contraction identity (a padded element
+    /// enters a contraction only as a factor of a product that is then summed, so zeroing it removes its product from
+    /// the sum). Consumers zero every ragged operand along its own contracted ragged axes, which is sufficient because
+    /// zeroing either factor of a contracted pair already neutralizes that product, and it requires no agreement
+    /// between the two operands about which of them is ragged.
+    fn pad_contraction_input(
+        context: &BatchingContext<C, ArrayBatching<Self>>,
+        input: &ArrayBatch<C::Value>,
+        contracted_axes: &[usize],
+    ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
 /// [`ArrayBatchingPolicy`] for ordinary homogeneous array batching with a static host extent. This is the default
@@ -972,6 +997,25 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
         if !input.ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
                 message: "static array batching cannot mask bounded ragged axes".to_string(),
+            });
+        }
+        Ok(input.clone())
+    }
+
+    #[inline]
+    fn pad_contraction_input(
+        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        input: &ArrayBatch<C::Value>,
+        _contracted_axes: &[usize],
+    ) -> Result<ArrayBatch<C::Value>, BatchingError> {
+        // Zeroing padding requires the same comparison and selection machinery that masking does, and static array
+        // batching has neither the per-item extents nor a reason to (it never creates bounded ragged axes). A ragged
+        // carrier reaching this hook through the public `ArrayBatch::with_ragged_axes` is therefore rejected rather
+        // than passed through, because returning it unchanged would let the consuming contraction claim consumption
+        // evidence for padding that still contributes to its result.
+        if !input.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "static array batching cannot zero-pad bounded ragged axes".to_string(),
             });
         }
         Ok(input.clone())
@@ -2538,86 +2582,126 @@ where
         reduced_axes: &[usize],
         kind: ReductionKind,
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        let consumed = input
-            .ragged_axes()
-            .iter()
-            .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
-            .collect::<Vec<_>>();
-        if consumed.is_empty() {
-            return Ok(input.clone());
-        }
-        if kind != ReductionKind::Sum {
+        // Zero is the identity of a sum and nothing else, so a reduction that actually reduces a ragged axis under any
+        // other kind would observe the padding this policy can only zero.
+        if kind != ReductionKind::Sum
+            && input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
+        {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("ragged reduction kind {kind} is not supported; use reduce_sum"),
             });
         }
-
-        let outer_context = context.parent().parent();
-        let array_context = context.parent();
-        let input_value = input.value().clone();
-        let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
-        let packed_type = input.r#type().into_owned();
-        let output_dimensions = (0..packed_type.rank())
-            .map(|axis| folded_array_dimension(outer_context, &lifted_input_value, axis))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut mask = None;
-        for ragged_axis in consumed {
-            let extent_value = ragged_axis.extents().clone();
-            let extent_value_type = extent_value.r#type();
-            let extent_type = extent_value_type.as_ref();
-            let physical_extent = packed_type.shape()[ragged_axis.axis()].value().unwrap();
-            let iota_type =
-                ArrayType::new(extent_type.data_type(), Shape::new(vec![Dimension::Static(physical_extent)]));
-            let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
-            check_count!("output", iota, 1, ProgramError);
-            let iota = broadcast_array(
-                outer_context,
-                <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0)),
-                output_dimensions.clone(),
-                vec![ragged_axis.axis()],
-                None,
-            )?;
-            let broadcasted_extent = broadcast_array(
-                outer_context,
-                <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value),
-                output_dimensions.clone(),
-                ragged_axis.extent_axes().to_vec(),
-                None,
-            )?;
-            let mut current = array_context.bind(
-                CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
-                Vec::new(),
-                &[
-                    <C::Value as ValueProjection<ArrayType>>::into_projected(iota)?,
-                    <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_extent)?,
-                ],
-            )?;
-            check_count!("output", current, 1, ProgramError);
-            mask = Some(match mask {
-                None => current.remove(0),
-                Some(mask) => {
-                    let mut combined =
-                        array_context.bind(AndOperation::<ArrayType>::new(), Vec::new(), &[mask, current.remove(0)])?;
-                    check_count!("output", combined, 1, ProgramError);
-                    combined.remove(0)
-                }
-            });
-        }
-
-        let mut zero = array_context.bind(
-            ZeroLikeOperation::<ArrayType>::new(),
-            Vec::new(),
-            std::slice::from_ref(&input_value),
-        )?;
-        check_count!("output", zero, 1, ProgramError);
-        let mut masked = array_context.bind(
-            SelectOperation::<ArrayType>::new(),
-            Vec::new(),
-            &[mask.unwrap(), input_value, zero.remove(0)],
-        )?;
-        check_count!("output", masked, 1, ProgramError);
-        ArrayBatch::new(masked.remove(0), input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
+        zero_ragged_padding(context, input, reduced_axes)
     }
+
+    #[inline]
+    fn pad_contraction_input(
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        contracted_axes: &[usize],
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        zero_ragged_padding(context, input, contracted_axes)
+    }
+}
+
+/// Stages the zero-masking shared by the dynamic policy's ragged consumption disciplines: every ragged axis of `input`
+/// named in `consumed_axes` contributes an `iota < extents` predicate over the packed shape, the predicates are
+/// combined, and the padded elements are selected away in favor of a zero of the operand. Zero is both the identity of
+/// the one reduction kind whose padding this policy neutralizes and the identity of a contraction, so
+/// [`RaggedArrayBatchingPolicy::mask_reduction_input`] and [`RaggedArrayBatchingPolicy::pad_contraction_input`] differ
+/// only in which axes they declare consumed and in the discipline-specific validation they perform first. Input with no
+/// consumed ragged axis is returned unchanged, so nothing is staged for an operand this discipline does not touch.
+fn zero_ragged_padding<C>(
+    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+    input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+    consumed_axes: &[usize],
+) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError>
+where
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<DynamicBroadcastOperation>
+                           + From<DimensionOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AndOperation<ArrayType>>
+        + From<CompareOperation<ArrayType>>
+        + From<IotaOperation<ArrayType>>
+        + From<SelectOperation<ArrayType>>
+        + From<ZeroLikeOperation<ArrayType>>,
+{
+    let consumed = input
+        .ragged_axes()
+        .iter()
+        .filter(|ragged_axis| consumed_axes.contains(&ragged_axis.axis()))
+        .collect::<Vec<_>>();
+    if consumed.is_empty() {
+        return Ok(input.clone());
+    }
+
+    let outer_context = context.parent().parent();
+    let array_context = context.parent();
+    let input_value = input.value().clone();
+    let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
+    let packed_type = input.r#type().into_owned();
+    let output_dimensions = (0..packed_type.rank())
+        .map(|axis| folded_array_dimension(outer_context, &lifted_input_value, axis))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut mask = None;
+    for ragged_axis in consumed {
+        let extent_value = ragged_axis.extents().clone();
+        let extent_value_type = extent_value.r#type();
+        let extent_type = extent_value_type.as_ref();
+        let physical_extent = packed_type.shape()[ragged_axis.axis()].value().unwrap();
+        let iota_type = ArrayType::new(extent_type.data_type(), Shape::new(vec![Dimension::Static(physical_extent)]));
+        let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
+        check_count!("output", iota, 1, ProgramError);
+        let iota = broadcast_array(
+            outer_context,
+            <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0)),
+            output_dimensions.clone(),
+            vec![ragged_axis.axis()],
+            None,
+        )?;
+        let broadcasted_extent = broadcast_array(
+            outer_context,
+            <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value),
+            output_dimensions.clone(),
+            ragged_axis.extent_axes().to_vec(),
+            None,
+        )?;
+        let mut current = array_context.bind(
+            CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
+            Vec::new(),
+            &[
+                <C::Value as ValueProjection<ArrayType>>::into_projected(iota)?,
+                <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_extent)?,
+            ],
+        )?;
+        check_count!("output", current, 1, ProgramError);
+        mask = Some(match mask {
+            None => current.remove(0),
+            Some(mask) => {
+                let mut combined =
+                    array_context.bind(AndOperation::<ArrayType>::new(), Vec::new(), &[mask, current.remove(0)])?;
+                check_count!("output", combined, 1, ProgramError);
+                combined.remove(0)
+            }
+        });
+    }
+
+    let mut zero =
+        array_context.bind(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), std::slice::from_ref(&input_value))?;
+    check_count!("output", zero, 1, ProgramError);
+    let mut masked = array_context.bind(
+        SelectOperation::<ArrayType>::new(),
+        Vec::new(),
+        &[mask.unwrap(), input_value, zero.remove(0)],
+    )?;
+    check_count!("output", masked, 1, ProgramError);
+    ArrayBatch::new(masked.remove(0), input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
 }
 
 /// Aligns one composite array batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
@@ -3088,9 +3172,10 @@ mod tests {
     use crate::operations::{
         AddOperation, CollectiveKind, CollectiveOperation, CompareOperation, ComparisonDirection, ConcatenateOperation,
         ConditionOperation, DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
-        DimensionToScalar, DimensionToScalarOperation, DynamicBroadcast, DynamicReshapeOperation, IotaOperation,
-        NegOperation, OneLike, OneOperation, PadOperation, Reduce, ReduceOperation, ReductionKind, ReshardOperation,
-        ScanOperation, SelectOperation, Slice, WhileOperation, ZeroOperation,
+        DimensionToScalar, DimensionToScalarOperation, DotDimensionNumbers, DotOperation, DynamicBroadcast,
+        DynamicReshapeOperation, IotaOperation, NegOperation, OneLike, OneOperation, PadOperation, Reduce,
+        ReduceOperation, ReductionKind, ReshardOperation, ScanOperation, SelectOperation, Slice, WhileOperation,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -3482,6 +3567,14 @@ mod tests {
             StaticArrayBatchingPolicy::mask_reduction_input(&context, &ragged, &[1], ReductionKind::Sum),
             Err(BatchingError::UnsupportedOperation {
                 message: "static array batching cannot mask bounded ragged axes".to_string(),
+            }),
+        );
+
+        // The zero-padding discipline of a contraction needs the same per-item extents and is rejected identically.
+        assert_eq!(
+            StaticArrayBatchingPolicy::pad_contraction_input(&context, &ragged, &[1]),
+            Err(BatchingError::UnsupportedOperation {
+                message: "static array batching cannot zero-pad bounded ragged axes".to_string(),
             }),
         );
 
@@ -6632,6 +6725,68 @@ mod tests {
         assert!(matches!(&outputs[0], ArrayIrValue::Dimension(value) if value.extent() == 2));
         assert!(matches!(&outputs[1], ArrayIrValue::Dimension(value) if value.extent() == 2));
         assert_eq!(outputs[2], ArrayIrValue::Array(Array::matrix(2, 2, vec![4.0_f32, 27.0, 32.0, 25.0])));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_ragged_contraction_batching() -> Result<(), ProgramError> {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+
+        // Each item broadcasts to its own checked length and then contracts that ragged vector with itself. Zeroing
+        // the padded elements of the contraction's operands removes their products from its sums, so each item's
+        // result is the inner product over its live prefix, computed through the contraction discipline rather than
+        // through a square followed by a masked reduction.
+        let output: ArrayIrValue<Array> = batch(
+            |(value, extent)| {
+                let extent = extent.to_dimension(variable.clone())?;
+                let repeated = value.dynamic_broadcast_to(&[extent])?;
+                let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
+                let mut outputs = repeated.dispatch_domain().bind(
+                    DotOperation::new(DotDimensionNumbers::inner_product()),
+                    Vec::new(),
+                    &[repeated.clone(), repeated],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
+            ),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0])));
+
+        // The mapped batch extent must stay statically known, because the dot rule derives the singleton batch axis it
+        // materializes for a replicated operand from the common batch size. A genuinely dynamic mapped extent is
+        // therefore reported exactly instead of being specialized.
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let trace = TraceContext::new();
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
+        let values = trace
+            .input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable.clone())])).into());
+        let extents =
+            trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch_variable)])).into());
+        let dynamic_extent: Result<Tracer<TraceContext>, BatchingError> = batch(
+            |(value, extent)| {
+                let extent = extent.to_dimension(variable.clone())?;
+                let repeated = value.dynamic_broadcast_to(&[extent])?;
+                let repeated = ValueProjection::<ArrayType>::into_projected(repeated)?;
+                let mut outputs = repeated.dispatch_domain().bind(
+                    DotOperation::new(DotDimensionNumbers::inner_product()),
+                    Vec::new(),
+                    &[repeated.clone(), repeated],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (values, extents),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        );
+        assert!(matches!(dynamic_extent, Err(BatchingError::DynamicBatchAxis { .. })));
 
         Ok(())
     }

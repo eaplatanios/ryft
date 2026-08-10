@@ -507,21 +507,24 @@ fn composite_scan_boundary_types(
 /// is itself refined to the very same extent: a stacked axis left symbolic would be read `extent` times regardless of
 /// its actual runtime size, over-reading the stacks that turn out shorter and silently truncating the longer ones.
 ///
+/// This is the single definition of the runtime-length safety rule. The values space calls it with the types of the
+/// scan's actual operands, so both spaces produce identical diagnostics.
+///
 /// # Parameters
 ///   - `length`: Declared scan length.
 ///   - `input_types`: All scan input types, whose last entry is the runtime length operand when `length` is dynamic.
 ///   - `carry_count`: Number of leading loop-carried inputs, which are not stacked.
 ///   - `stacked_input_end`: Exclusive end of the stacked input range, i.e. the index of the runtime length operand.
-fn validate_scan_runtime_length(
+pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
     length: &Dimension,
-    input_types: &[ArrayIrType],
+    input_types: &[T],
     carry_count: usize,
     stacked_input_end: usize,
 ) -> Result<Option<usize>, TypeError> {
     let Some(variable) = length.variable() else {
         return Ok(None);
     };
-    let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap())?;
+    let runtime_length_type = <&DimensionType>::try_from(input_types.last().unwrap().borrow())?;
     if runtime_length_type.variable() == variable {
         return Ok(None);
     }
@@ -535,6 +538,7 @@ fn validate_scan_runtime_length(
             ))
         })?;
     for (index, r#type) in input_types[carry_count..stacked_input_end].iter().enumerate() {
+        let r#type = r#type.borrow();
         let leading_extent = match r#type {
             ArrayIrType::Array(r#type) if r#type.rank() > 0 => {
                 let bounds = r#type.dimension(0).bounds();

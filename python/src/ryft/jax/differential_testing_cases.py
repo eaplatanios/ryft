@@ -15,17 +15,25 @@ from ryft.jax.differential_testing import (
     PINNED_JAX_VERSION,
     SCHEMA,
     DifferentialObservation,
+    StableHloCollective,
     StagingObservation,
 )
 
 
 @dataclass(frozen=True)
 class DifferentialCase:
-    """One registered workload and the relationship expected between Ryft and JAX."""
+    """One registered workload and the relationship expected between Ryft and JAX.
+
+    `collectives` is the collective projection both frameworks must produce, in module order. An exact-parity case
+    must declare a non-empty expectation, because comparing the two projections against each other alone would pass
+    vacuously if a printer or lowering regression emptied both of them symmetrically. Capability cases that compare
+    no module declare no collectives.
+    """
 
     case_id: str
     relationship: str
     build_jax: Callable[[Any, Any, Any], DifferentialObservation]
+    collectives: tuple[StableHloCollective, ...] = ()
 
 
 def _configure_jax_devices() -> None:
@@ -138,10 +146,43 @@ def _build_data_dependent_prefix_take(jax: Any, jax_numpy: Any, numpy: Any) -> D
     )
 
 
+# Ordered participant groups both frameworks emit for the `[[0, 2], [3, 1]]` grouping of the grouped collectives.
+_GROUPED_COLLECTIVE_GROUPS = ((0, 2), (3, 1))
+
+
 DIFFERENTIAL_CASES = (
-    DifferentialCase("grouped_shape_changing_collectives", "parity", _build_grouped_collectives),
-    DifferentialCase("pshuffle", "parity", _build_pshuffle),
-    DifferentialCase("pswapaxes", "parity", _build_pswapaxes),
+    DifferentialCase(
+        "grouped_shape_changing_collectives",
+        "parity",
+        _build_grouped_collectives,
+        (
+            StableHloCollective("all_gather", _GROUPED_COLLECTIVE_GROUPS, (("all_gather_dim", 0),)),
+            StableHloCollective("reduce_scatter", _GROUPED_COLLECTIVE_GROUPS, (("scatter_dimension", 0),)),
+            StableHloCollective(
+                "all_to_all",
+                _GROUPED_COLLECTIVE_GROUPS,
+                (("concat_dimension", 0), ("split_count", 2), ("split_dimension", 0)),
+            ),
+        ),
+    ),
+    DifferentialCase(
+        "pshuffle",
+        "parity",
+        _build_pshuffle,
+        (StableHloCollective("collective_permute", ((2, 0), (0, 1), (3, 2), (1, 3)), ()),),
+    ),
+    DifferentialCase(
+        "pswapaxes",
+        "parity",
+        _build_pswapaxes,
+        (
+            StableHloCollective(
+                "all_to_all",
+                ((0, 1, 2, 3),),
+                (("concat_dimension", 0), ("split_count", 4), ("split_dimension", 0)),
+            ),
+        ),
+    ),
     DifferentialCase("data_dependent_prefix_take", "ryft_exceeds_jax", _build_data_dependent_prefix_take),
 )
 

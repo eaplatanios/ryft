@@ -367,8 +367,44 @@ deleted, leaving the differential case as its single owner.
 
 The Rust emitter tests pass 2/2, the Python harness tests pass 6/6, the feature-enabled `ryft-xla` all-target check is
 clean, and the complete live harness reports four `PASS` records on four CPU devices. The established pinned-JAX
-parity modules pass 12 tests with only two intentionally current-JAX-only variance cases skipped; both existing live
-program-statistics checks pass under the new pin. File-scoped nightly formatting and diff hygiene are clean.
+parity modules report 12 collected, 10 passed, and 2 intentionally skipped (the current-JAX-only variance cases);
+both existing live program-statistics checks pass under the new pin. The same commit also hardened the neighbouring
+program-statistics harness that this one is modelled on: duplicate requested and emitted case IDs are now rejected,
+operation names outside the shared vocabulary are surfaced with an explicit `unknown:` prefix instead of being
+silently dropped, and record fields were reordered into a stable comparison order. File-scoped nightly formatting and
+diff hygiene are clean.
+
+### Phase 7 review fixes (2026-08-09)
+
+The review found one real hole in the parity gate and several smaller weaknesses; all are closed.
+
+- The parity arm compared only `project_collective_stablehlo(ryft)` against `(jax)`, so a printer or lowering
+  regression that stopped emitting recognizable collectives emptied both projections symmetrically and the gate
+  silently passed. Every parity registry entry now declares the exact projection it expects (families, ordered
+  groups, and axis attributes), the comparator checks both frameworks against that expectation, and a projection
+  missing an expected family fails while naming the missing families. The declared expectations are the projections
+  the two frameworks actually produce today: `all_gather`/`reduce_scatter`/`all_to_all` over groups `((0, 2), (3, 1))`
+  for the grouped case, `collective_permute` over `((2, 0), (0, 1), (3, 2), (1, 3))` for `pshuffle`, and untiled
+  `all_to_all` over `((0, 1, 2, 3),)` with `split_count = 4` for `pswapaxes`.
+- The staged bounded prefix case hard-coded `f32[count]` as its staging observation. It now renders the staged
+  program's actual first output type, and the Rust unit test asserts that the rendered value is `f32[count]`, which
+  turns a restatement into a real check against the staged program.
+- `Pshuffle` gained the `ProjectedValue<ArrayType, V>` forwarder its `AllGather`, `PSumScatter`, and `AllToAll`
+  siblings already had, so the `pshuffle` case's staged leg now calls the public `pshuffle` capability on
+  `ShardMapTracer` instead of hand-writing the equivalent `ppermute` pairs. The staged module is byte-identical and
+  the eager-value triangulation against the lowered execution is unchanged.
+- The scan runtime-length safety rule had two independent implementations. `validate_scan_runtime_length` in
+  `crates/ryft-core/src/operations/control_flow/scan.rs` is now the single definition, generic over anything that
+  borrows an `ArrayIrType`, and the eager values-space path in `crates/ryft-core/src/arrays/operations/control_flow.rs`
+  delegates to it with the operand types. Behavior and both pinned diagnostic strings are unchanged.
+- Harness ergonomics: the subprocess budget is 1800 seconds and a timeout now reports a clean message pointing at the
+  pre-build command instead of raising `subprocess.TimeoutExpired`; an unknown `--case` exits cleanly; and the Rust
+  binary accepts `--list` anywhere while rejecting `--list` combined with `--case`.
+
+The Python harness tests are now 8/8 (two added negative controls: a differing-groups pair must fail, and an
+empty-projection module against a non-empty expectation must fail naming the missing families). The Rust emitter
+tests pass 2/2, `cargo check -p ryft-xla --features differential-testing --all-targets` is clean, `ryft-xla --lib`
+is 459 passed / 1 ignored, and the live harness still reports four `PASS` records on four CPU devices.
 
 ## Abort and reassessment criteria
 
@@ -717,8 +753,10 @@ number is 3,575 pre-test lines (167 in `arrays/ir.rs`, 3,044 in `arrays/batching
 closure-verification guards added later the same day bring `arrays/batching.rs` to 3,058 and the raw total to 3,589
 (a 25.23% raw reduction). This is a deliberate scope correction recorded as an owner decision, not a silent
 re-baselining. Standing tripwire: transform-layer growth per additional ragged consumer is the metric that triggers
-migrating to the operation-level ragged model (the `pad_contraction_input` / `ragged_dot` path already recorded as a
-TODO on `RaggedArrayBatchingPolicy`).
+migrating to the operation-level ragged model. Update (2026-08-09): stage 1 of that path landed, owner-directed — the
+`pad_contraction_input` hook is implemented on `RaggedArrayBatchingPolicy` and `dot` has a ragged batching rule, so
+the hook is no longer a TODO. The tripwire itself stands unchanged, and stage 2 (the operation-model migration:
+`padded_reduce` plus a native `ragged_dot`) remains pending owner review rather than scheduled.
 
 **Verification and final review.** All 1,207 `ryft-core` unit tests pass; all 53 runnable doctests pass (16 ignored);
 the two projection/region integration suites pass 6/6 each; all 57 `ryft-macros` unit tests pass; both
@@ -947,3 +985,60 @@ the checkout on that machine:
 `git worktree add <dir> <commit> && cd <dir> && CARGO_INCREMENTAL=0 cargo test -p ryft-xla --lib --features cuda-13
 -- --test-threads=1 test_cuda`. Result: `3 passed; 0 failed` in 1.96s of test time. This closes the
 recorded-evidence-only caveat on exit criterion 16's CUDA rows.
+
+### Ragged contraction stage 1: pad_contraction_input (2026-08-09)
+
+**Design.** `RaggedArrayBatchingPolicy` gains its second consumption-discipline hook, `pad_contraction_input(context,
+input, contracted_axes)`, replacing the TODO that reserved the slot. Zero is the contraction identity — a padded
+element reaches a contraction only as a factor of a product that is then summed — so the hook zeroes the padded
+elements of a ragged operand along the contraction's own contracted axes. Each operand is zeroed along its own
+contracted ragged axes only, because zeroing either factor of a contracted pair already neutralizes that product; no
+agreement between the two operands about which of them is ragged is required. `StaticArrayBatchingPolicy` rejects a
+non-empty ragged carrier with `static array batching cannot zero-pad bounded ragged axes`, mirroring its masking
+guard. `DynamicArrayBatchingPolicy` stages the real masking, and because that staging is byte-for-byte the masking the
+reduction discipline already used (both select against a zero of the operand under an `iota < extents` predicate
+aligned through `extent_axes`), it now lives in one private `zero_ragged_padding` function that both hooks call; the
+discipline-specific part of `mask_reduction_input` is only its non-`Sum` rejection, which keeps firing exactly when a
+ragged axis is actually reduced.
+
+**Dot rule.** `DotOperation`'s batching rule is rebound from `P: ArrayBatchingPolicy<C>` to `P:
+RaggedArrayBatchingPolicy<C>`, exactly as the reduction rule is. Operands with no ragged axis take the previous path
+unchanged (a fast path before any ragged work, so dense staging is untouched and no rendered fixture moved). For ragged
+operands, each ragged axis is classified against the lifted dimension numbers: a **contracted** one is consumed (the
+hook zeroes that operand, and the axis's `DimensionVariable` is returned as `BatchedOutputs` evidence), and a **free**
+one propagates onto the output carrier through the new `RaggedAxis::relocated(&[Option<usize>])`, the partial
+counterpart of `broadcasted` whose `None` entries mark axes the operation consumes. The relocation table is built from
+the dot's own output layout (batching dimensions, then LHS free axes, then RHS free axes) and remaps both the ragged
+axis and every extent axis, failing rather than silently dropping metadata that references a vanished axis. Rejected
+configurations, each with an exact `'dot'`-named diagnostic: a ragged axis on a *batching* dimension of the dot (the
+two operands would have to agree on per-item extents along paired batch dimensions, which nothing establishes here); a
+ragged axis on a *replicated* operand (the broadcast that materializes its batch axis carries no per-item extents); and
+a contraction that would consume an axis carrying another ragged axis's per-item extents. The pre-existing requirement
+that the mapped batch extent be statically known (the rule derives the singleton batch axis it materializes for a
+replicated operand from the common batch size) is unchanged and now pinned as `BatchingError::DynamicBatchAxis`.
+
+**Evidence flow.** Unchanged from the reduction discipline: the rule returns the consumed dimensions in its
+`BatchedOutputs` evidence, the driver hands that straight to `validate_operation_outputs`, and the validator's
+catch-all still rejects any bounded ragged dimension that is neither preserved on an output carrier nor claimed as
+consumed. A dot that dropped a ragged input without claiming it would therefore fail with the existing ``operation
+`dot` neither preserves nor consumes bounded ragged dimension `length` `` message.
+
+**Fixtures.** Three new tests. `arrays::batching::tests::test_array_ir_ragged_contraction_batching` drives the natural
+workload through the public `batch(...)` entrypoint over the composite family (gateway to a checked per-item extent,
+dynamic broadcast to that extent, then `dot(x, x)`): values `[2, 3]` with lengths `[1, 3]` produce `[4, 27]` eagerly —
+the recorded Phase 6 numbers, obtained through the contraction discipline instead of square-then-masked-sum — and a
+dynamic mapped extent is rejected exactly. `operations::math::dot::tests::test_dot_batching_propagates_free_ragged_axes`
+contracts a ragged `[length, 2]` matrix's dense trailing axis against a `[2]` vector and pins that the ragged axis
+lands at output axis 1 with its extents, dimension identity, and `extent_axes` intact, that the per-item type is
+`f32[length]`, and that the rule claims no evidence.
+`operations::math::dot::tests::test_dot_batching_rejects_unsupported_ragged_configurations` pins the static-policy
+zero-pad guard, the ragged-batching-dimension rejection, and the replicated-ragged-operand rejection.
+`test_static_array_batching_rejects_ragged_carriers` gained the direct `pad_contraction_input` guard assertion.
+
+**Gates.** `cargo check --workspace --all-targets` clean with zero warnings. `ryft-core --lib` passes 1,219/1,219
+(1,216 baseline plus the three new tests; every other addition extends an existing test), plus the integration suites
+and doctests. `ryft-xla --lib` serial passes 459 with one timing benchmark ignored, and `ryft-macros-tests` is
+unchanged. Per-file `rustfmt --check` is clean on both touched files, and no existing rendered fixture changed.
+
+**Stage 2 is not started.** The operation-model migration (`padded_reduce` plus a native `ragged_dot`, extents as
+explicit operands) remains pending owner review.

@@ -8,20 +8,22 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
 
+use serde::Serialize;
+
 use ryft_core::operations::collectives::{
-    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, PSumScatter, PSwapAxes, Ppermute, Pshuffle,
+    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, PSumScatter, PSwapAxes, Pshuffle,
 };
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
-    BatchAxis, BatchingContext, BatchingTracer, DataType, Device, DeviceMesh, Dimension, DimensionBounds,
-    DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicShapeSliceOperation, EagerContext,
-    LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder, ProgramError, Shape, Sharding, ShardingDimension,
+    BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
+    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicShapeSliceOperation,
+    EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder, ProgramError, ReduceOperation,
+    ReductionKind, Shape, Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 use ryft_xla::experimental::{ShardMapTracer, TracedXlaProgram, shard_map, trace};
 use ryft_xla::{Array, FromPjrt};
-use serde::Serialize;
 
 /// Schema version emitted by this binary and accepted by the Python comparison harness.
 const SCHEMA: &str = "ryft-jax-differential-v1";
@@ -30,8 +32,8 @@ const SCHEMA: &str = "ryft-jax-differential-v1";
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum StagingObservation {
-    /// The program staged successfully with the provided result-type description.
-    Supported { output_type: &'static str },
+    /// The program staged successfully with the rendered type of its first result.
+    Supported { output_type: String },
 }
 
 /// One Ryft-side case record consumed by the Python comparison harness.
@@ -87,6 +89,9 @@ fn registry() -> Vec<DifferentialCase> {
 fn values_to_bytes<V: Copy>(values: &[V]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(size_of_val(values));
     for value in values {
+        // SAFETY: `value` points at one live, properly aligned `V` owned by `values`. This private helper is only
+        // used with `f32`, whose object representation is plain old data with no padding, so all `size_of::<V>()`
+        // bytes are initialized. The byte slice is copied by `extend_from_slice` and never retained.
         let value_bytes = unsafe { std::slice::from_raw_parts(value as *const V as *const u8, size_of::<V>()) };
         bytes.extend_from_slice(value_bytes);
     }
@@ -262,11 +267,7 @@ fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
             let sharding = sharding.clone();
             move |input: ShardMapTracer| {
                 shard_map::<_, _, ArrayType, _>(
-                    // `pshuffle([2, 0, 3, 1])` is the public convenience composition that validates the
-                    // output-to-input permutation and stages these canonical `(source, target)` pairs.
-                    |local_input: ShardMapTracer| {
-                        local_input.ppermute("x", vec![(2, 0), (0, 1), (3, 2), (1, 3)]).unwrap()
-                    },
+                    |local_input: ShardMapTracer| local_input.pshuffle("x", &[2, 0, 3, 1]).unwrap(),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -380,23 +381,18 @@ fn data_dependent_prefix_program() -> Result<
     let mask = builder.add_input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(4)])).into());
     let values = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into());
     let mask = builder.add_instruction(
-        ArrayIrOperation::Array(ArrayOperation::from(ryft_core::ConvertElementTypeOperation::<ArrayType>::new(
-            DataType::I64,
-        ))),
+        ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64))),
         Vec::new(),
         vec![mask],
     )?[0];
     let count = builder.add_instruction(
-        ArrayIrOperation::Array(ArrayOperation::from(ryft_core::ReduceOperation::new(
-            vec![0],
-            ryft_core::ReductionKind::Sum,
-        ))),
+        ArrayIrOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
         Vec::new(),
         vec![mask],
     )?[0];
     let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5))?);
     let count = builder.add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count])?[0];
-    let start = builder.add_constant(ArrayIrValue::Dimension(ryft_core::DimensionValue::constant(0)?));
+    let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
     let output =
         builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])?[0];
     builder.build::<Vec<ArrayIrValue<CpuArray>>, Vec<ArrayIrValue<CpuArray>>>(
@@ -429,7 +425,7 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
             ("two_matches", execute(vec![true, false, true, false])?),
             ("zero_matches", execute(vec![false, false, false, false])?),
         ]),
-        staging: Some(StagingObservation::Supported { output_type: "f32[count]" }),
+        staging: Some(StagingObservation::Supported { output_type: program.output_types()[0].to_string() }),
         stablehlo: None,
     })
 }
@@ -437,20 +433,30 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
 /// Parses selected case IDs, emits deterministic JSON records, and returns an error for an unknown case.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let cases = registry();
-    if arguments == ["--list"] {
+    let mut requested = Vec::new();
+    let mut list = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--list" => {
+                list = true;
+                index += 1;
+            }
+            "--case" if index + 1 < arguments.len() => {
+                requested.push(arguments[index + 1].as_str());
+                index += 2;
+            }
+            argument => return Err(format!("expected '--list' or '--case CASE_ID' but got '{argument}'").into()),
+        }
+    }
+    if list {
+        if !requested.is_empty() {
+            return Err("'--list' cannot be combined with '--case'".into());
+        }
         for case in cases {
             println!("{}", case.case_id);
         }
         return Ok(());
-    }
-    let mut requested = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        if arguments[index] != "--case" || index + 1 == arguments.len() {
-            return Err(format!("expected '--case CASE_ID' but got '{}'", arguments[index]).into());
-        }
-        requested.push(arguments[index + 1].as_str());
-        index += 2;
     }
     let selected = if requested.is_empty() {
         cases
@@ -503,7 +509,7 @@ mod tests {
                 observations: BTreeMap::from(
                     [("two_matches", vec![vec![10.0, 20.0]]), ("zero_matches", vec![vec![]]),]
                 ),
-                staging: Some(StagingObservation::Supported { output_type: "f32[count]" }),
+                staging: Some(StagingObservation::Supported { output_type: "f32[count]".to_string() }),
                 stablehlo: None,
             },
         );

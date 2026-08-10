@@ -33,6 +33,19 @@ GROUPED_STABLEHLO = "\n".join(
 )
 
 
+GROUPED_COLLECTIVES = (
+    StableHloCollective("all_gather", ((0, 2), (3, 1)), (("all_gather_dim", 0),)),
+    StableHloCollective("reduce_scatter", ((0, 2), (3, 1)), (("scatter_dimension", 0),)),
+    StableHloCollective(
+        "all_to_all",
+        ((0, 2), (3, 1)),
+        (("concat_dimension", 0), ("split_count", 2), ("split_dimension", 0)),
+    ),
+)
+
+MISSING_ALL_FAMILIES = "all_gather, reduce_scatter, all_to_all"
+
+
 def grouped_observation() -> DifferentialObservation:
     """Returns one minimal exact-parity grouped-collective observation."""
 
@@ -51,12 +64,12 @@ class DifferentialTestingTest(unittest.TestCase):
 
     def test_registry(self) -> None:
         self.assertEqual(
-            [(case.case_id, case.relationship) for case in differential_cases()],
+            [(case.case_id, case.relationship, bool(case.collectives)) for case in differential_cases()],
             [
-                ("grouped_shape_changing_collectives", "parity"),
-                ("pshuffle", "parity"),
-                ("pswapaxes", "parity"),
-                ("data_dependent_prefix_take", "ryft_exceeds_jax"),
+                ("grouped_shape_changing_collectives", "parity", True),
+                ("pshuffle", "parity", True),
+                ("pswapaxes", "parity", True),
+                ("data_dependent_prefix_take", "ryft_exceeds_jax", False),
             ],
         )
 
@@ -95,24 +108,13 @@ class DifferentialTestingTest(unittest.TestCase):
             )
 
     def test_collective_stablehlo_projection(self) -> None:
-        self.assertEqual(
-            project_collective_stablehlo(GROUPED_STABLEHLO),
-            (
-                StableHloCollective("all_gather", ((0, 2), (3, 1)), (("all_gather_dim", 0),)),
-                StableHloCollective("reduce_scatter", ((0, 2), (3, 1)), (("scatter_dimension", 0),)),
-                StableHloCollective(
-                    "all_to_all",
-                    ((0, 2), (3, 1)),
-                    (("concat_dimension", 0), ("split_count", 2), ("split_dimension", 0)),
-                ),
-            ),
-        )
+        self.assertEqual(project_collective_stablehlo(GROUPED_STABLEHLO), GROUPED_COLLECTIVES)
         with self.assertRaisesRegex(ValueError, "stablehlo.all_gather is missing replica/source-target groups"):
             project_collective_stablehlo('"stablehlo.all_gather"(%0) <{all_gather_dim = 0 : i64}>')
 
     def test_exact_parity_comparison(self) -> None:
         observation = grouped_observation()
-        self.assertTrue(compare_case("parity", observation, observation).passed())
+        self.assertTrue(compare_case("parity", GROUPED_COLLECTIVES, observation, observation).passed())
 
         changed = DifferentialObservation(
             schema=SCHEMA,
@@ -120,9 +122,39 @@ class DifferentialTestingTest(unittest.TestCase):
             observations={"all_gather": ((0.0, 2.0),)},
             stablehlo=observation.stablehlo,
         )
-        comparison = compare_case("parity", observation, changed)
+        comparison = compare_case("parity", GROUPED_COLLECTIVES, observation, changed)
         self.assertEqual(len(comparison.differences), 1)
         self.assertTrue(comparison.differences[0].startswith("observations:"))
+
+    def test_exact_parity_comparison_rejects_differing_groups(self) -> None:
+        observation = grouped_observation()
+        regrouped = DifferentialObservation(
+            schema=SCHEMA,
+            case_id=observation.case_id,
+            observations=observation.observations,
+            stablehlo=GROUPED_STABLEHLO.replace("[[0, 2], [3, 1]]", "[[0, 1], [2, 3]]"),
+        )
+        comparison = compare_case("parity", GROUPED_COLLECTIVES, observation, regrouped)
+        self.assertEqual(len(comparison.differences), 1)
+        self.assertTrue(comparison.differences[0].startswith("StableHLO collectives: jax "))
+        self.assertIn("!= expected", comparison.differences[0])
+
+    def test_exact_parity_comparison_rejects_empty_projection(self) -> None:
+        # A printer or lowering regression that stops emitting recognizable collectives empties both projections
+        # symmetrically. The declared expectation is what turns that silent agreement into a named failure.
+        empty = DifferentialObservation(
+            schema=SCHEMA,
+            case_id="grouped_shape_changing_collectives",
+            observations={"all_gather": ((0.0, 1.0), (2.0, 3.0))},
+            stablehlo="func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {\n  return %arg0 : tensor<4xf32>\n}",
+        )
+        self.assertEqual(
+            compare_case("parity", GROUPED_COLLECTIVES, empty, empty).differences,
+            (
+                f"StableHLO collectives: ryft module is missing expected collective families {MISSING_ALL_FAMILIES}",
+                f"StableHLO collectives: jax module is missing expected collective families {MISSING_ALL_FAMILIES}",
+            ),
+        )
 
     def test_ryft_exceeds_jax_comparison(self) -> None:
         observations = {"two_matches": ((10.0, 20.0),), "zero_matches": ((),)}
@@ -138,7 +170,7 @@ class DifferentialTestingTest(unittest.TestCase):
             observations=observations,
             staging=StagingObservation(status="rejected", category="concretization"),
         )
-        self.assertTrue(compare_case("ryft_exceeds_jax", ryft, jax).passed())
+        self.assertTrue(compare_case("ryft_exceeds_jax", (), ryft, jax).passed())
 
         jax_supported = DifferentialObservation(
             schema=SCHEMA,
@@ -147,7 +179,7 @@ class DifferentialTestingTest(unittest.TestCase):
             staging=StagingObservation(status="supported", output_type="unexpected"),
         )
         self.assertEqual(
-            compare_case("ryft_exceeds_jax", ryft, jax_supported).differences,
+            compare_case("ryft_exceeds_jax", (), ryft, jax_supported).differences,
             ("JAX staging: expected concretization rejection but got StagingObservation(status='supported', "
              "output_type='unexpected', category=None)",),
         )
