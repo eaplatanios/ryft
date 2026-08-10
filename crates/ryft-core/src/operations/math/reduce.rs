@@ -2,11 +2,12 @@ use std::fmt::Display;
 use std::ops::{Div, Mul};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation,
-    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, StaticShape,
+    ArrayBatch, ArrayBatching, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType,
+    DimensionValue, LinearResiduals, RaggedArrayBatchingPolicy, Shape, Sharding, StaticShape,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
@@ -392,7 +393,13 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOp
 /// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
 /// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
 /// output batch axis position (mirroring the dot batching rule).
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+///
+/// Reducing a bounded ragged axis away is the one array rule that legitimately consumes an operand's per-item extents:
+/// [`RaggedArrayBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the reduction's
+/// identity, so the result no longer depends on those extents. The rule reports each such
+/// [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence, which is how the
+/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent.
+impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<C>,
@@ -402,12 +409,10 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        // Validates that a mapped batch axis has a static size before lifting.
-        ArrayBatch::common_batch_size(inputs)?;
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let (lifted_axes, output_axis) = lift_reduce_axes(self.axes.as_slice(), batch_axis);
         // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
@@ -421,7 +426,29 @@ where
             None => None,
         };
         let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(output_axis)])
+        let consumed_ragged_dimensions = inputs[0]
+            .ragged_axes()
+            .iter()
+            .filter(|axis| lifted_op.axes().contains(&axis.axis()))
+            .map(|axis| axis.dimension().clone())
+            .collect::<Vec<_>>();
+        let input = P::mask_reduction_input(context, &inputs[0], lifted_op.axes(), self.kind)?;
+        let remaining_ragged_axes = input
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .filter_map(|ragged_axis| ragged_axis.reduced(lifted_op.axes()))
+            .collect::<Vec<_>>();
+        let mut outputs = lifted_op.interpret_with_batch_axes(
+            context,
+            std::slice::from_ref(&input),
+            &[BatchAxis::from_position(output_axis)],
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        let output = outputs.remove(0);
+        let output = ArrayBatch::new(output.into_value(), BatchAxis::from_position(output_axis))?
+            .with_ragged_axes(remaining_ragged_axes)?;
+        Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
     }
 }
 

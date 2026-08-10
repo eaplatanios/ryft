@@ -16,7 +16,7 @@ use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, ProjectedContext};
 use crate::operations::dimensions::checked_power;
 use crate::operations::{
@@ -44,8 +44,9 @@ where
         context: &BatchingContext<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>,
         _driver: &D,
         inputs: &[<C::Value as ValueProjection<DimensionType>>::Projected],
-    ) -> Result<Vec<<C::Value as ValueProjection<DimensionType>>::Projected>, BatchingError> {
-        context.parent().bind(self.clone(), Vec::new(), inputs).map_err(Into::into)
+    ) -> Result<BatchedOutputs<ProjectedContext<C, DimensionType>, ReplicatedDimensionBatchingPolicy>, BatchingError>
+    {
+        Ok(context.parent().bind(self.clone(), Vec::new(), inputs)?.into())
     }
 }
 

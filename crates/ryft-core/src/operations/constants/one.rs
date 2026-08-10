@@ -153,7 +153,7 @@ impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBa
 {
     #[inline]
     fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
-        let batch = ArrayBatch::new(r#type.clone(), self.parent().one(r#type)?, BatchAxis::replicated())?;
+        let batch = ArrayBatch::new(self.parent().one(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }

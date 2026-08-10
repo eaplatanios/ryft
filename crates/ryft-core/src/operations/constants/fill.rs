@@ -94,7 +94,7 @@ impl<S, C: Context<Type = ArrayType> + Fill<S, C::Value>> Fill<S, BatchingTracer
 {
     #[inline]
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
-        let batch = ArrayBatch::new(r#type.clone(), self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
+        let batch = ArrayBatch::new(self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }

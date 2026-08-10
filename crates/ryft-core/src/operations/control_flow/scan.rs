@@ -1696,10 +1696,7 @@ where
             return Ok(outputs
                 .into_iter()
                 .zip(output_axes)
-                .map(|(output, axis)| {
-                    let batched_type = output.r#type().into_owned();
-                    ArrayBatch::new(batched_type, output, axis)
-                })
+                .map(|(output, axis)| ArrayBatch::new(output, axis))
                 .collect::<Result<Vec<_>, _>>()?
                 .into());
         }
@@ -1747,7 +1744,7 @@ where
                     None => BatchAxis::replicated(),
                 };
                 let stacked_value = context.parent().zero(&stacked_type)?;
-                outputs.push(ArrayBatch::new(stacked_type, stacked_value, stacked_axis)?);
+                outputs.push(ArrayBatch::new(stacked_value, stacked_axis)?);
             }
             return Ok(outputs.into());
         }
@@ -1847,9 +1844,7 @@ where
     for (accumulator, y_slice_type) in accumulators.into_iter().zip(y_slice_types.iter()) {
         match accumulator {
             Some(ScanOutputAccumulator { accumulator, batch_axis }) => {
-                let stacked_type = accumulator.r#type().into_owned();
                 outputs.push(ArrayBatch::new(
-                    stacked_type,
                     accumulator,
                     BatchAxis::from_optional_position(batch_axis.map(|axis| axis + 1)),
                 )?);
@@ -1919,8 +1914,7 @@ where
         .map(|(_, &dimension)| Dimension::Static(dimension))
         .collect::<Vec<_>>();
     let iteration_value = iteration_value.reshape(Shape::new(iteration_dimensions))?;
-    let iteration_type = iteration_value.r#type().into_owned();
-    ArrayBatch::new(iteration_type, iteration_value, scan_iteration_batch_axis(stack.batch_axis()))
+    ArrayBatch::new(iteration_value, scan_iteration_batch_axis(stack.batch_axis()))
 }
 
 /// Maps a stacked scan input's packed batch axis to the corresponding per-iteration batch axis after removing the
@@ -1994,7 +1988,7 @@ where
             .iter()
             .cloned()
             .map(|input| {
-                <&ArrayType>::try_from(input.unbatched_type())?;
+                <&ArrayType>::try_from(&input.unbatched_type())?;
                 if input.batch_axis_position() == Some(0) {
                     align_array_batch(context, input, Axis::from(1))
                 } else {
@@ -2024,7 +2018,7 @@ where
                 if carry_axis.is_replicated() && !output_axis.is_replicated() {
                     if matches!(scan_inputs[index].unbatched_type(), ArrayIrType::Dimension(_)) {
                         return Err(BatchingError::MappedDimension {
-                            r#type: Box::new(<&DimensionType>::try_from(scan_inputs[index].unbatched_type())?.clone()),
+                            r#type: Box::new(<&DimensionType>::try_from(&scan_inputs[index].unbatched_type())?.clone()),
                             axis: *output_axis,
                         });
                     }
@@ -4257,7 +4251,7 @@ mod tests {
         let context = BatchingContext::new(TestEagerContext::new(), 3);
         let carries = {
             let value = Array::vector(vec![1.0, 2.0, 3.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let stacked_inputs = ArrayBatch::replicated(Array::vector(vec![2.0, 3.0, 4.0]));
@@ -4279,7 +4273,7 @@ mod tests {
         let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
             let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
@@ -4296,7 +4290,7 @@ mod tests {
         let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
             let value = Array::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
+            ArrayBatch::new(value, Some(1))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
@@ -4313,12 +4307,12 @@ mod tests {
         let context = BatchingContext::new(TestEagerContext::new(), 2);
         let carries = {
             let value = Array::vector(vec![1.0, 10.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let stacked_inputs = {
             let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
@@ -4339,7 +4333,7 @@ mod tests {
         let carries = ArrayBatch::replicated(Array::scalar(1.0));
         let stacked_inputs = {
             let value = Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = batch_scan(&context, scan, scan_body, vec![carries, stacked_inputs]);
@@ -4359,9 +4353,7 @@ mod tests {
                 .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
-            let carries =
-                ArrayBatch::new(carry_type.clone(), Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
-                    .unwrap();
+            let carries = ArrayBatch::new(Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0)).unwrap();
             let stack_type = f64_type(&[3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, vec![2.0, 3.0, 4.0]));
             let context =
@@ -4458,10 +4450,8 @@ mod tests {
         let carry = parent.tracer(carry_atom, None);
         let xs = parent.tracer(xs_atom, None);
         let context = BatchingContext::new(parent, 2);
-        let inputs = vec![
-            ArrayBatch::new(f64_type(&[2]), carry, BatchAxis::new(0)).unwrap(),
-            ArrayBatch::new(f64_type(&[3, 2]), xs, BatchAxis::new(1)).unwrap(),
-        ];
+        let inputs =
+            vec![ArrayBatch::new(carry, BatchAxis::new(0)).unwrap(), ArrayBatch::new(xs, BatchAxis::new(1)).unwrap()];
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 1);
@@ -4508,8 +4498,7 @@ mod tests {
         let carry = parent.tracer(carry_atom, None);
         let xs = parent.tracer(xs_atom, None);
         let context = BatchingContext::new(parent, 2);
-        let inputs =
-            vec![ArrayBatch::replicated(carry), ArrayBatch::new(f64_type(&[2, 3]), xs, BatchAxis::new(0)).unwrap()];
+        let inputs = vec![ArrayBatch::replicated(carry), ArrayBatch::new(xs, BatchAxis::new(0)).unwrap()];
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = TestScanOperation::new(1, 3).batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);
@@ -4529,9 +4518,7 @@ mod tests {
                 .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                 .unwrap();
             let carry_type = f64_type(&[2]).with_sharding(carry_sharding.clone()).unwrap();
-            let carries =
-                ArrayBatch::new(carry_type.clone(), Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0))
-                    .unwrap();
+            let carries = ArrayBatch::new(Array::from_f64s(carry_type, vec![1.0, 2.0]), BatchAxis::new(0)).unwrap();
             let stack_type = f64_type(&[0]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(Array::from_f64s(stack_type, Vec::new()));
             let context =
@@ -4582,7 +4569,7 @@ mod tests {
             let carry_atom = builder.borrow_mut().add_input(carry_type.clone());
             let stack_atom = builder.borrow_mut().add_input(stack_type.clone());
             let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
-            let carries = ArrayBatch::new(carry_type, parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
+            let carries = ArrayBatch::new(parent.tracer(carry_atom, None), BatchAxis::new(0)).unwrap();
             let stacked_inputs = ArrayBatch::replicated(parent.tracer(stack_atom, None));
             // The body's boundary types derive from the carry's unbatched per-item type (like a traced-over-inputs
             // body would), so its metadata — including any varying-manual-axes marker — matches the actual carries.

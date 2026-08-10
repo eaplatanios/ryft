@@ -12,7 +12,7 @@ use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    TypeIdentityRenaming, Value, ValueProjection,
 };
 use crate::tracing::Tracer;
 
@@ -189,8 +189,7 @@ impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
 {
     fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let value = self.parent().constant(value)?;
-        let r#type = value.r#type().into_owned();
-        let batch = ArrayBatch::new(r#type, value, BatchAxis::replicated())?;
+        let batch = ArrayBatch::new(value, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }

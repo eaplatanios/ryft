@@ -206,21 +206,12 @@ where
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        <&ArrayType>::try_from(input.unbatched_type())?;
+        <&ArrayType>::try_from(&input.unbatched_type())?;
         let ragged_extents = output_extents
             .iter()
             .enumerate()
             .filter_map(|(axis, extent)| extent.mapped_dimension_extents().map(|extents| (axis, extent, extents)))
             .collect::<Vec<_>>();
-        let has_ragged_axes = !ragged_extents.is_empty() || !input.ragged_axes().is_empty();
-        let logical_output_type = if has_ragged_axes {
-            let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
-            let mut logical_output_types = self.infer_output_types(logical_input_types.as_slice(), &[])?;
-            check_count!("output", logical_output_types, 1, ProgramError);
-            Some(<&ArrayType>::try_from(&logical_output_types.remove(0))?.clone())
-        } else {
-            None
-        };
         for extent in output_extents {
             if extent.mapped_dimension_extents().is_none() {
                 extent.validate_replicated_dimension()?;
@@ -255,7 +246,8 @@ where
         lifted_inputs.push(context.axis_extent().clone());
         for extent in output_extents {
             if extent.mapped_dimension_extents().is_some() {
-                let extent_type = <&DimensionType>::try_from(extent.unbatched_type())?;
+                let unbatched_type = extent.unbatched_type();
+                let extent_type = <&DimensionType>::try_from(&unbatched_type)?;
                 let physical_extent =
                     extent_type.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
                         BatchingError::InvalidBatchMetadata {
@@ -291,16 +283,13 @@ where
             ragged_extents
                 .into_iter()
                 .map(|(axis, extent, extents)| -> Result<_, BatchingError> {
-                    let extent_type = <&DimensionType>::try_from(extent.unbatched_type())?;
+                    let unbatched_type = extent.unbatched_type();
+                    let extent_type = <&DimensionType>::try_from(&unbatched_type)?;
                     Ok(RaggedAxis::new(axis + 1, extents.clone(), extent_type.variable().clone(), vec![0]))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let output = ArrayIrBatch::new(outputs.remove(0), BatchAxis::from_position(0))?;
-        let output = match logical_output_type {
-            Some(logical_output_type) => output.with_logical_array_type(logical_output_type)?,
-            None => output,
-        };
         Ok(vec![output.with_ragged_axes(ragged_axes)?].into())
     }
 }
@@ -737,7 +726,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayBatchingPolicy<C>> 
                     );
                 }
                 let output_value = inputs[0].value().broadcast(output_type.clone(), output_axes.as_slice())?;
-                Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::from_position(batch_axis))?].into())
+                Ok(vec![ArrayBatch::new(output_value, BatchAxis::from_position(batch_axis))?].into())
             }
         }
     }
@@ -1563,12 +1552,9 @@ mod tests {
             let input_type = ArrayType::new(DataType::F64, Shape::new(input_dimensions))
                 .with_sharding(Sharding::new(mesh.clone(), input_sharding).unwrap())
                 .unwrap();
-            let input = ArrayBatch::new(
-                input_type.clone(),
-                Array::from_f64s(input_type, vec![0.0; 12]),
-                BatchAxis::from_position(batch_axis),
-            )
-            .unwrap();
+            let input =
+                ArrayBatch::new(Array::from_f64s(input_type, vec![0.0; 12]), BatchAxis::from_position(batch_axis))
+                    .unwrap();
 
             let output = BroadcastOperation::new(
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])),

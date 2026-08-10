@@ -127,8 +127,7 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayBatchingPoli
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination);
-        let physical_type = value.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, value, inputs[0].batch_axis())?].into())
+        Ok(vec![ArrayBatch::new(value, inputs[0].batch_axis())?].into())
     }
 }
 
@@ -291,7 +290,7 @@ mod tests {
         // destination — exactly like interpretation — and preserves the batch axis.
         let input = {
             let value = Array::matrix(2, 3, vec![1.0; 6]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));

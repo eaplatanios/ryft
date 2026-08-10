@@ -192,7 +192,10 @@ where
                 let (runtime_length, inputs) =
                     inputs.split_last().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
                 let runtime_length = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(runtime_length)?;
-                if runtime_length.r#type().variable() != variable {
+                let runtime_length_type = runtime_length.r#type();
+                let exact_refinement = runtime_length_type.extent().is_some()
+                    && length.is_refined_by(&Dimension::Static(runtime_length.extent()));
+                if runtime_length_type.variable() != variable && !exact_refinement {
                     return Err(TypeError::invalid(format!(
                         "'scan' runtime length operand has type {} but scan length requires {variable}",
                         runtime_length.r#type().as_ref(),

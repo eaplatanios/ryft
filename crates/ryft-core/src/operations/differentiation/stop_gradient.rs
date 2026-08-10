@@ -8,7 +8,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
+use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
 
 // TODO(eaplatanios): Review this.
 
@@ -130,7 +130,7 @@ where
         let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
         check_count!("output", outputs, 1, ProgramError);
         let output = outputs.remove(0);
-        Ok(vec![ArrayBatch::new(output.r#type().into_owned(), output, input.batch_axis())?].into())
+        Ok(vec![ArrayBatch::new(output, input.batch_axis())?].into())
     }
 }
 

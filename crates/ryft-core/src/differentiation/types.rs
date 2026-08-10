@@ -395,7 +395,7 @@ where
             ))
             .into());
         }
-        Ok(ArrayBatch::new(expected_type, value, Some(0)).map_err(ProgramError::from)?)
+        Ok(ArrayBatch::new(value, Some(0)).map_err(ProgramError::from)?)
     }
 
     #[inline]
@@ -948,9 +948,7 @@ mod tests {
         // extractors, whose expected per-item type is the widened `f32` differential representation.
         let narrow_type = ArrayType::scalar(F8E8M0FNU);
         let physical_type = ArrayType::new(F8E8M0FNU, Shape::new(vec![Dimension::Static(1)]));
-        let packed =
-            ArrayBatch::new(physical_type.clone(), Array::from_f64s(physical_type, vec![2.0]), BatchAxis::new(0))
-                .unwrap();
+        let packed = ArrayBatch::new(Array::from_f64s(physical_type, vec![2.0]), BatchAxis::new(0)).unwrap();
         assert_eq!(
             <ArrayType as DenseDifferentiableType<
                 EagerContext<Array, ArrayOperation<Array>>,

@@ -1076,8 +1076,7 @@ where
                 restored_dimensions.insert(1, 1);
                 split_value = summed.reshape(static_shape(restored_dimensions.as_slice()))?;
             }
-            let split_type = split_value.r#type().into_owned();
-            Ok(ArrayBatch::new(split_type, split_value, BatchAxis::new(0))?)
+            Ok(ArrayBatch::new(split_value, BatchAxis::new(0))?)
         })
         .collect()
 }
@@ -3232,7 +3231,7 @@ mod tests {
         let stack = |first: &[f64], second: &[f64]| {
             let values = first.iter().chain(second.iter()).copied().collect::<Vec<_>>();
             let value = Array::from_f64s(stacked_type.clone(), values);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+            ArrayBatch::new(value, Some(0)).unwrap()
         };
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
 
@@ -3415,7 +3414,7 @@ mod tests {
             let stacked_type = attention_type(first.r#type().data_type(), &stacked_dimensions);
             let values = first.to_f64s().into_iter().chain(second.to_f64s()).collect::<Vec<_>>();
             let value = Array::from_f64s(stacked_type, values);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+            ArrayBatch::new(value, Some(0)).unwrap()
         };
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         let operation = DotProductAttentionBackwardOperation::new(scale, mask);
@@ -3731,7 +3730,7 @@ mod tests {
             let stacked_type = attention_type(first.r#type().data_type(), &stacked_dimensions);
             let values = first.to_f64s().into_iter().chain(second.to_f64s()).collect::<Vec<_>>();
             let value = Array::from_f64s(stacked_type, values);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+            ArrayBatch::new(value, Some(0)).unwrap()
         };
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
 

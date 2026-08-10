@@ -417,11 +417,7 @@ where
         check_count!("output", outputs, 2, ProgramError);
         let bits = outputs.remove(1);
         let advanced_states = outputs.remove(0);
-        Ok(vec![
-            ArrayBatch::new(advanced_states.r#type().into_owned(), advanced_states, Some(0))?,
-            ArrayBatch::new(bits.r#type().into_owned(), bits, Some(0))?,
-        ]
-        .into())
+        Ok(vec![ArrayBatch::new(advanced_states, Some(0))?, ArrayBatch::new(bits, Some(0))?].into())
     }
 }
 
@@ -1103,7 +1099,7 @@ mod tests {
             &[42u64, 3, 7, 11],
         )
         .unwrap();
-        let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(1)).unwrap();
+        let input = ArrayBatch::new(states, Some(1)).unwrap();
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
         let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 2);
@@ -1130,7 +1126,7 @@ mod tests {
             &[42u64, 7, 9, 3, 11, 0],
         )
         .unwrap();
-        let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(0)).unwrap();
+        let input = ArrayBatch::new(states, Some(0)).unwrap();
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::Philox, bits_type(5));
         let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 2);
@@ -1253,7 +1249,7 @@ mod tests {
         assert_eq!(outputs[1].batch().batch_axis(), BatchAxis::new(0));
         assert_eq!(
             outputs[1].batch().unbatched_type(),
-            &ArrayIrType::Array(ArrayType::new(
+            ArrayIrType::Array(ArrayType::new(
                 DataType::U32,
                 Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns.clone())]),
             )),

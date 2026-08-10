@@ -1414,7 +1414,7 @@ where
         let output_type = output.r#type().into_owned();
         let broadcast_global_scale = global_scale.value().broadcast(output_type.clone(), &[0])?;
         let scaled_value = output.value().mul(&broadcast_global_scale)?;
-        Ok(vec![ArrayBatch::new(output_type, scaled_value, BatchAxis::new(0))?].into())
+        Ok(vec![ArrayBatch::new(scaled_value, BatchAxis::new(0))?].into())
     }
 }
 
@@ -2246,7 +2246,7 @@ mod tests {
             let values = first.iter().chain(second.iter()).copied().collect::<Vec<_>>();
             let r#type = if element_values { stacked_element_type.clone() } else { stacked_scale_type.clone() };
             let value = Array::from_f64s(r#type, values);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+            ArrayBatch::new(value, Some(0)).unwrap()
         };
         let operation = ScaledDotOperation::new(2, DataType::F32);
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
@@ -2272,7 +2272,7 @@ mod tests {
 
         // Mixed mapped/replicated operands: the replicated right-hand pair is broadcast into per-item copies, so
         // every batch item multiplies against the same right-hand side.
-        let replicated = |value: Array| ArrayBatch::new(value.r#type().into_owned(), value, BatchAxis::replicated());
+        let replicated = |value: Array| ArrayBatch::new(value, BatchAxis::replicated());
         let outputs = operation
             .batch(
                 &context,
@@ -2327,7 +2327,7 @@ mod tests {
                     stack(false, &item_lhs_scales, &item_rhs_scales),
                     stack(true, &item_rhs, &item_lhs),
                     stack(false, &item_rhs_scales, &item_lhs_scales),
-                    ArrayBatch::new(mapped_global_scales.r#type().into_owned(), mapped_global_scales, Some(0)).unwrap(),
+                    ArrayBatch::new(mapped_global_scales, Some(0)).unwrap(),
                 ],
             )
             .unwrap()
@@ -2350,7 +2350,7 @@ mod tests {
                 ArrayType::new(r#type.data_type(), Shape::new(dimensions)),
                 values.iter().chain(values.iter()).copied().collect(),
             );
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+            ArrayBatch::new(value, Some(0)).unwrap()
         };
         let rank_3_element_type = ArrayType::new(
             DataType::F4E2M1FN,
@@ -3249,12 +3249,12 @@ mod tests {
         let batching_context = BatchingContext::new(context.clone(), 2);
         let lhs = {
             let value = context.tracer(lhs_atom, None);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let rhs = {
             let value = context.tracer(rhs_atom, None);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs =
@@ -3308,7 +3308,7 @@ mod tests {
             let builder = parent.builder().clone();
             let lhs_atom = builder.borrow_mut().add_input(lhs_type.clone());
             let rhs_atom = builder.borrow_mut().add_input(rhs_type);
-            let lhs = ArrayBatch::new(lhs_type, parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
+            let lhs = ArrayBatch::new(parent.tracer(lhs_atom, None), BatchAxis::new(0)).unwrap();
             let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
             let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -3362,7 +3362,7 @@ mod tests {
         // A replicated operand is broadcast across the mapped operand's batch axis before the dot dimensions are
         // lifted. Each row therefore contracts against the same right-hand vector.
         let lhs = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let lhs = ArrayBatch::new(lhs.r#type().into_owned(), lhs, BatchAxis::new(0)).unwrap();
+        let lhs = ArrayBatch::new(lhs, BatchAxis::new(0)).unwrap();
         let rhs = ArrayBatch::replicated(Array::vector(vec![10.0, 100.0, 1000.0]));
         let outputs = DotOperation::new(DotDimensionNumbers::inner_product())
             .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])

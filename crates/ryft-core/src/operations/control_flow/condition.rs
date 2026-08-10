@@ -943,10 +943,7 @@ where
         Ok(outputs
             .into_iter()
             .zip(output_axes)
-            .map(|(output, axis)| {
-                let batched_type = output.r#type().into_owned();
-                ArrayBatch::new(batched_type, output, axis)
-            })
+            .map(|(output, axis)| ArrayBatch::new(output, axis))
             .collect::<Result<Vec<_>, _>>()?
             .into())
     }
@@ -1023,7 +1020,7 @@ where
                 message: "cannot batch a condition operation with no predicate input".to_string(),
             });
         };
-        <&ArrayType>::try_from(predicate.unbatched_type())?;
+        <&ArrayType>::try_from(&predicate.unbatched_type())?;
 
         if predicate.batch_axis().is_replicated() {
             let operand_axes = operands.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
@@ -1100,7 +1097,7 @@ where
             .zip(false_outputs)
             .map(|(true_output, false_output)| match true_output.unbatched_type() {
                 ArrayIrType::Array(_) => {
-                    <&ArrayType>::try_from(false_output.unbatched_type())?;
+                    <&ArrayType>::try_from(&false_output.unbatched_type())?;
                     let (mut selected, _) = batch_projected_operation(
                         context,
                         &SelectOperation::<ArrayType>::new(),
@@ -1445,15 +1442,8 @@ mod tests {
         );
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
         let predicate_values = (0..batch_size).map(|index| if index == 0 { 1.0 } else { 0.0 }).collect();
-        let predicate = ArrayBatch::new(
-            predicate_type.clone(),
-            Array::from_f64s(predicate_type, predicate_values),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        let operand =
-            ArrayBatch::new(batched_type.clone(), Array::from_f64s(batched_type, input_values), BatchAxis::new(0))
-                .unwrap();
+        let predicate = ArrayBatch::new(Array::from_f64s(predicate_type, predicate_values), BatchAxis::new(0)).unwrap();
+        let operand = ArrayBatch::new(Array::from_f64s(batched_type, input_values), BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
         let mut outputs = context
             .bind(
@@ -1835,7 +1825,6 @@ mod tests {
                     .with_sharding(batched_sharding)
                     .unwrap();
             let operand = ArrayBatch::new(
-                batched_type.clone(),
                 Array::from_f64s(batched_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
                 BatchAxis::new(0),
             )
@@ -1930,10 +1919,7 @@ mod tests {
         let predicate = parent.tracer(predicate_atom, None);
         let operand = parent.tracer(operand_atom, None);
         let context = BatchingContext::new(parent, 2);
-        let inputs = vec![
-            ArrayBatch::replicated(predicate),
-            ArrayBatch::new(packed_type.clone(), operand, BatchAxis::new(0)).unwrap(),
-        ];
+        let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(operand, BatchAxis::new(0)).unwrap()];
         let regions = vec![vector_scale_branch(3, 2.0), vector_scale_branch(3, 3.0)];
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
@@ -1989,10 +1975,7 @@ mod tests {
         let predicate = parent.tracer(predicate_atom, None);
         let operand = parent.tracer(operand_atom, None);
         let context = BatchingContext::new(parent, 2);
-        let inputs = vec![
-            ArrayBatch::replicated(predicate),
-            ArrayBatch::new(packed_type.clone(), operand, BatchAxis::new(0)).unwrap(),
-        ];
+        let inputs = vec![ArrayBatch::replicated(predicate), ArrayBatch::new(operand, BatchAxis::new(0)).unwrap()];
         let regions = vec![vector_scale_branch(3, 2.0), constant_vector_branch(vec![10.0, 20.0, 30.0])];
         let driver = CountingBatchingDriver::new(&regions);
         let outputs = ConditionOperation::new().batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
@@ -2113,14 +2096,9 @@ mod tests {
         let batch_size = 2;
         let item_size = 3;
         let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(batch_size)]));
-        let predicate = ArrayBatch::new(
-            predicate_type.clone(),
-            Array::from_f64s(predicate_type, vec![1.0, 0.0]),
-            BatchAxis::new(0),
-        )
-        .unwrap();
+        let predicate = ArrayBatch::new(Array::from_f64s(predicate_type, vec![1.0, 0.0]), BatchAxis::new(0)).unwrap();
         let operand = Array::matrix(batch_size, item_size, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let operand = ArrayBatch::new(operand.r#type().into_owned(), operand, BatchAxis::new(0)).unwrap();
+        let operand = ArrayBatch::new(operand, BatchAxis::new(0)).unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), batch_size);
 
         let outputs = context

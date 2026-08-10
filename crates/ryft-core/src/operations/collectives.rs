@@ -466,10 +466,7 @@ where
     parent_outputs
         .into_iter()
         .zip(inputs.iter())
-        .map(|(parent_value, input_batch)| {
-            let physical_type = parent_value.r#type().into_owned();
-            ArrayBatch::new(physical_type, parent_value, input_batch.batch_axis())
-        })
+        .map(|(parent_value, input_batch)| ArrayBatch::new(parent_value, input_batch.batch_axis()))
         .collect()
 }
 
@@ -501,8 +498,7 @@ where
         let factor_type = pmean_factor_type(output_value.r#type().data_type());
         output_value = make_pmean_factor(factor_type, inverse_axis_size)? * output_value;
     }
-    let output_type = output_value.r#type().into_owned();
-    Ok(vec![ArrayBatch::new(output_type, output_value, BatchAxis::replicated())?])
+    Ok(vec![ArrayBatch::new(output_value, BatchAxis::replicated())?])
 }
 
 /// Returns the static batch size for a `PMean` over the mapped batch axis of `input`, erroring when
@@ -1408,12 +1404,7 @@ where
             output_axes,
             output_sharding,
         )?;
-        let r#type = <&ArrayType>::try_from(value.r#type().as_ref())?.clone();
-        ArrayBatch::new(
-            r#type,
-            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
-            BatchAxis::from_position(0),
-        )
+        ArrayBatch::new(<C::Value as ValueProjection<ArrayType>>::into_projected(value)?, BatchAxis::from_position(0))
     }
 
     fn reshape_collective(
@@ -1492,9 +1483,8 @@ where
     let mut outputs = context.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
     check_count!("output", outputs, 1, ProgramError);
     let output = outputs.remove(0);
-    let output_type = output.r#type().into_owned();
     let output_batch_axis = output_batch_axis.map_or_else(BatchAxis::replicated, BatchAxis::from_position);
-    Ok(vec![ArrayBatch::new(output_type, output, output_batch_axis)?])
+    Ok(vec![ArrayBatch::new(output, output_batch_axis)?])
 }
 
 /// Applies the matching-axis all-gather batching semantics over the policy-selected extent representation.
@@ -1616,7 +1606,7 @@ where
         .transpose()?;
     let output =
         P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
-    ArrayBatch::new(output.r#type().into_owned(), output, BatchAxis::from_position(0))
+    ArrayBatch::new(output, BatchAxis::from_position(0))
 }
 
 /// Applies the matching-axis all-to-all batching semantics over the policy-selected extent representation.
@@ -1697,7 +1687,7 @@ where
         .transpose()?;
     let output =
         P::reshape_collective(context, received, physical_output_extents.as_slice(), physical_output_sharding)?;
-    ArrayBatch::new(output.r#type().into_owned(), output, BatchAxis::from_position(0))
+    ArrayBatch::new(output, BatchAxis::from_position(0))
 }
 
 /// Implements the shared structure of the shape-changing collectives: the operation struct with its accessors, the
@@ -3278,8 +3268,7 @@ where
             }
         }
         let permuted = Concatenate::concatenate(&items, 0)?;
-        let physical_type = permuted.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, permuted, Some(0))?].into())
+        Ok(vec![ArrayBatch::new(permuted, Some(0))?].into())
     }
 }
 
@@ -3351,7 +3340,7 @@ fn explicit_collective_inputs<V: Value<Type = ArrayIrType>>(
     let Some((array, output_extents)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
-    <&ArrayType>::try_from(array.unbatched_type())?;
+    <&ArrayType>::try_from(&array.unbatched_type())?;
     for output_extent in output_extents {
         output_extent.validate_replicated_dimension()?;
     }
@@ -3440,9 +3429,7 @@ where
             .into());
         }
 
-        let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
         let array = ArrayBatch::new(
-            array_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
         )?;
@@ -3524,9 +3511,7 @@ where
             .into());
         }
 
-        let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
         let array = ArrayBatch::new(
-            array_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
         )?;
@@ -3613,9 +3598,7 @@ where
             .into());
         }
 
-        let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
         let array = ArrayBatch::new(
-            array_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
             array.batch_axis(),
         )?;
@@ -3821,7 +3804,7 @@ mod tests {
         // replicated scalar holding the total.
         let input = {
             let value = Array::vector(vec![1.0, 2.0, 3.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
@@ -3838,7 +3821,7 @@ mod tests {
     fn test_collective_pmax_reduces_along_the_batch_axis() {
         let input = {
             let value = Array::vector(vec![1.0, 4.0, 2.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax)
@@ -3859,7 +3842,7 @@ mod tests {
         // default.
         let input = {
             let value = Array::vector(vec![2.0, 4.0, 6.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
@@ -4621,14 +4604,7 @@ mod tests {
     fn test_untiled_collectives_over_batched_axis_materialize_rank_changes() {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
             .with_axis_name("x".to_string());
-        let mapped_matrix = || {
-            ArrayBatch::new(
-                Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]).r#type().into_owned(),
-                Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]),
-                Some(0),
-            )
-            .unwrap()
-        };
+        let mapped_matrix = || ArrayBatch::new(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
         let gathered = AllGatherOperation::new(
             "x".to_string(),

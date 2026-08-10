@@ -698,7 +698,7 @@ mod tests {
             Shape::new(vec![2.into(), Dimension::Dynamic(batch.clone()), 3.into(), 4.into()]),
         );
         let symbolic_input = context.input(symbolic_input_type.clone());
-        let symbolic_input = ArrayBatch::new(symbolic_input_type, symbolic_input, BatchAxis::new(1)).unwrap();
+        let symbolic_input = ArrayBatch::new(symbolic_input, BatchAxis::new(1)).unwrap();
         let symbolic_output = TransposeOperation::new([2, 0, 1])
             .batch(&BatchingContext::new(context.clone(), 2), &EmptyRegionDriver, &[symbolic_input])
             .unwrap()

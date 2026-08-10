@@ -2180,8 +2180,8 @@ mod tests {
         // output as an `ArrayBatch` carrying the requested output batch axis. Here two batched length-3 inputs are
         // added elementwise, yielding a single batched sum mapped on axis 0.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
-        let right = ArrayBatch::new(vector_type.clone(), Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
         let outputs = AddOperation::new()
             .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
@@ -2192,8 +2192,8 @@ mod tests {
         assert_eq!(outputs[0].value(), &Array::vector(vec![11.0, 22.0, 33.0]));
 
         // An `output_batch_axes` length that disagrees with the number of produced outputs is rejected.
-        let left = ArrayBatch::new(vector_type.clone(), Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
-        let right = ArrayBatch::new(vector_type, Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+        let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         assert!(matches!(
             AddOperation::new().interpret_with_batch_axes(&context, &[left, right], &[]),
             Err(BatchingError::Program(_)),

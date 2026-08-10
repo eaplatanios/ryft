@@ -283,7 +283,7 @@ where
                 }
                 let output_axes = (1..physical_type.rank()).collect::<Vec<_>>();
                 let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
-                ArrayBatch::new(physical_type, broadcasted, 0)
+                ArrayBatch::new(broadcasted, 0)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let lifted = SortOperation { axis: self.axis + 1, ..*self };

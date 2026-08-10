@@ -187,7 +187,7 @@ impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C, Array
 {
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
-        let batch = ArrayBatch::new(r#type.clone(), self.parent().zero(r#type)?, BatchAxis::replicated())?;
+        let batch = ArrayBatch::new(self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }

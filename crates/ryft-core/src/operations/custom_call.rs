@@ -869,7 +869,7 @@ where
                 outputs.drain(..carry_inputs.len());
                 Ok(outputs
                     .into_iter()
-                    .map(|value| ArrayBatch::new(value.r#type().into_owned(), value, Some(0)))
+                    .map(|value| ArrayBatch::new(value, Some(0)))
                     .collect::<Result<Vec<_>, _>>()?
                     .into())
             }
@@ -889,7 +889,7 @@ where
                 let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
                 Ok(outputs
                     .into_iter()
-                    .map(|value| ArrayBatch::new(value.r#type().into_owned(), value, Some(0)))
+                    .map(|value| ArrayBatch::new(value, Some(0)))
                     .collect::<Result<Vec<_>, _>>()?
                     .into())
             }

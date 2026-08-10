@@ -356,7 +356,8 @@ where
         let Some((input, bounds)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_type = <&ArrayType>::try_from(input.unbatched_type())?;
+        let unbatched_type = input.unbatched_type();
+        let input_type = <&ArrayType>::try_from(&unbatched_type)?;
         check_count!("input", inputs, 1 + 2 * input_type.rank(), ProgramError);
         for bound in bounds {
             bound.validate_replicated_dimension()?;
@@ -2459,8 +2460,7 @@ where
         }
         _ => accumulator,
     };
-    let stacked_type = accumulator.r#type().into_owned();
-    ArrayBatch::new(stacked_type, accumulator, Some(0))
+    ArrayBatch::new(accumulator, Some(0))
 }
 
 /// Applies a single-output `operation` independently per batch item and restacks the results along a fresh leading
@@ -2512,7 +2512,7 @@ where
             // mapped placement once on the completed output accumulator.
             let replicated = replace_sharding_dimension(sharding, 0, ShardingDimension::Replicated)?;
             let value = aligned.value().reshard(&replicated);
-            ArrayBatch::new(value.r#type().into_owned(), value, BatchAxis::new(0))
+            ArrayBatch::new(value, BatchAxis::new(0))
         })
         .collect::<Result<Vec<_>, BatchingError>>()?;
     let stacked = stack_expansion_items(operation_name, axis_size, context.axis_sharding().clone(), |item| {
@@ -2575,7 +2575,7 @@ mod tests {
         let length = values.len();
         let value =
             Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(length)])), values);
-        ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap()
+        ArrayBatch::new(value, Some(0)).unwrap()
     }
 
     #[test]
@@ -3907,7 +3907,6 @@ mod tests {
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
             let make_input = || {
                 ArrayBatch::new(
-                    input_type.clone(),
                     Array::from_f64s(input_type.clone(), vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
                     BatchAxis::new(0),
                 )
@@ -3961,7 +3960,7 @@ mod tests {
         // clamped to 2 so the extracted block stays in bounds.
         let input = {
             let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
@@ -3980,7 +3979,7 @@ mod tests {
         // `[4, 2]` operand carries per-item vectors `[0, 1, 2, 3]` and `[4, 5, 6, 7]` along axis 1.
         let trailing = {
             let value = Array::matrix(4, 2, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
+            ArrayBatch::new(value, Some(1))
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
@@ -4003,7 +4002,7 @@ mod tests {
         let uniform_input = ArrayBatch::replicated(Array::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let update = {
             let value = Array::matrix(2, 2, vec![9.0, 9.0, 8.0, 8.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
@@ -4023,7 +4022,7 @@ mod tests {
         // A batched input with a replicated update writes the same block at each batch item's own offset.
         let input = {
             let value = Array::matrix(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+            ArrayBatch::new(value, Some(0))
         }
         .unwrap();
         let uniform_update = ArrayBatch::replicated(Array::vector(vec![9.0, 9.0]));

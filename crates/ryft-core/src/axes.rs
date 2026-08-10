@@ -525,7 +525,7 @@ impl<
             let operation = IotaOperation::new(r#type.clone(), 0)?;
             let mut index = context.parent().bind(operation, Vec::new(), &[])?;
             check_count!("output", index, 1, ProgramError);
-            Ok(vec![ArrayBatch::new(r#type, index.remove(0), Some(0))?].into())
+            Ok(vec![ArrayBatch::new(index.remove(0), Some(0))?].into())
         } else {
             // The axis is bound by an outer `batch` level or a device mesh. Re-bind into the parent, which repeats the
             // resolution and present the forwarded index as replicated across this level.

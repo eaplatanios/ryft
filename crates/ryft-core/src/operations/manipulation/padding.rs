@@ -996,8 +996,7 @@ where
         )?;
         let broadcasted_padding = inputs[1].value().broadcast(padded.r#type().into_owned(), &[batch_axis])?;
         let output = C::Value::select(&mask, &padded, &broadcasted_padding)?;
-        let output_type = output.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(output_type, output, BatchAxis::from_position(batch_axis))?].into())
+        Ok(vec![ArrayBatch::new(output, BatchAxis::from_position(batch_axis))?].into())
     }
 }
 
@@ -1029,20 +1028,16 @@ where
         let [operand, padding_value] = array_inputs else {
             unreachable!();
         };
-        <&ArrayType>::try_from(operand.unbatched_type())?;
-        <&ArrayType>::try_from(padding_value.unbatched_type())?;
+        <&ArrayType>::try_from(&operand.unbatched_type())?;
+        <&ArrayType>::try_from(&padding_value.unbatched_type())?;
         for extent in output_extents {
             extent.validate_replicated_dimension()?;
         }
-        let operand_type = <&ArrayType>::try_from(operand.value().r#type().as_ref())?.clone();
-        let padding_value_type = <&ArrayType>::try_from(padding_value.value().r#type().as_ref())?.clone();
         let operand_batch = ArrayBatch::new(
-            operand_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(operand.value().clone())?,
             operand.batch_axis(),
         )?;
         let padding_value_batch = ArrayBatch::new(
-            padding_value_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(padding_value.value().clone())?,
             padding_value.batch_axis(),
         )?;
@@ -1065,7 +1060,6 @@ where
 
         let operand_batch = align_array_batch(context, operand.clone(), Axis::from(batch_axis))?;
         let operand_batch = ArrayBatch::new(
-            <&ArrayType>::try_from(operand_batch.value().r#type().as_ref())?.clone(),
             <C::Value as ValueProjection<ArrayType>>::into_projected(operand_batch.into_value())?,
             BatchAxis::from_position(batch_axis),
         )?;
@@ -2263,12 +2257,8 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
                     .with_sharding(physical_sharding)
                     .unwrap();
-            let input = ArrayBatch::new(
-                input_type.clone(),
-                Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]),
-                BatchAxis::new(0),
-            )
-            .unwrap();
+            let input =
+                ArrayBatch::new(Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0]), BatchAxis::new(0)).unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2277,12 +2267,7 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let padding = ArrayBatch::new(
-                padding_type.clone(),
-                Array::from_f64s(padding_type, vec![8.0, 9.0]),
-                BatchAxis::new(0),
-            )
-            .unwrap();
+            let padding = ArrayBatch::new(Array::from_f64s(padding_type, vec![8.0, 9.0]), BatchAxis::new(0)).unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 2)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 
@@ -2314,9 +2299,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0), Dimension::Static(2)]))
                     .with_sharding(physical_sharding.clone())
                     .unwrap();
-            let input =
-                ArrayBatch::new(input_type.clone(), Array::from_f64s(input_type, Vec::new()), BatchAxis::new(0))
-                    .unwrap();
+            let input = ArrayBatch::new(Array::from_f64s(input_type, Vec::new()), BatchAxis::new(0)).unwrap();
             let padding_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(0)]))
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])])
@@ -2325,9 +2308,7 @@ mod tests {
                         .unwrap(),
                 )
                 .unwrap();
-            let padding =
-                ArrayBatch::new(padding_type.clone(), Array::from_f64s(padding_type, Vec::new()), BatchAxis::new(0))
-                    .unwrap();
+            let padding = ArrayBatch::new(Array::from_f64s(padding_type, Vec::new()), BatchAxis::new(0)).unwrap();
             let context = BatchingContext::new(EagerContext::<Array>::new(), 0)
                 .with_axis_sharding(ShardingDimension::sharded(["x"]));
 

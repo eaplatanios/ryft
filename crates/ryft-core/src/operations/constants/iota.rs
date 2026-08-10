@@ -204,7 +204,7 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, Array
 {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
-        let batch = ArrayBatch::new(r#type.clone(), self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
+        let batch = ArrayBatch::new(self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }

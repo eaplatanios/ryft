@@ -27,7 +27,7 @@ pub use arrays::{
     BroadcastingError, Complex, DataType, DataTypeError, Device, DeviceId, DeviceMesh, Dimension, DimensionBounds,
     DimensionError, DimensionOperation, DimensionSource, DimensionTracingContext, DimensionType, DimensionValue,
     DimensionVariable, ExactShape, ExactShapeDimension, Layout, LayoutError, LinearResiduals, LogicalMesh,
-    MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, RaggedReductionPolicy,
+    MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, RaggedArrayBatchingPolicy, RaggedAxis,
     ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization,
     StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements,
     decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,

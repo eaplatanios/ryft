@@ -1045,10 +1045,7 @@ where
             return Ok(outputs
                 .into_iter()
                 .zip(state_axes)
-                .map(|(output, axis)| {
-                    let batched_type = output.r#type().into_owned();
-                    ArrayBatch::new(batched_type, output, axis)
-                })
+                .map(|(output, axis)| ArrayBatch::new(output, axis))
                 .collect::<Result<Vec<_>, _>>()?
                 .into());
         }
@@ -1075,10 +1072,7 @@ where
         check_count!("output", outputs, state_count, ProgramError);
         Ok(outputs
             .into_iter()
-            .map(|output| {
-                let batched_type = output.r#type().into_owned();
-                ArrayBatch::new(batched_type, output, Some(0))
-            })
+            .map(|output| ArrayBatch::new(output, Some(0)))
             .collect::<Result<Vec<_>, _>>()?
             .into())
     }
@@ -1151,7 +1145,7 @@ where
                 if state_axis.is_replicated() && !body_axis.is_replicated() {
                     if matches!(inputs[index].unbatched_type(), ArrayIrType::Dimension(_)) {
                         return Err(BatchingError::MappedDimension {
-                            r#type: Box::new(<&DimensionType>::try_from(inputs[index].unbatched_type())?.clone()),
+                            r#type: Box::new(<&DimensionType>::try_from(&inputs[index].unbatched_type())?.clone()),
                             axis: *body_axis,
                         });
                     }
@@ -4025,7 +4019,7 @@ mod tests {
         let state_atom = builder.borrow_mut().add_input(packed_type.clone());
         let state = parent.tracer(state_atom, None);
         let context = BatchingContext::new(parent, 3);
-        let inputs = vec![ArrayBatch::new(packed_type, state, BatchAxis::new(0)).unwrap()];
+        let inputs = vec![ArrayBatch::new(state, BatchAxis::new(0)).unwrap()];
         let driver = CountingBatchingDriver::new(&countdown_regions);
         let outputs = countdown_operation.batch(&context, &driver, inputs.as_slice()).unwrap().into_parts().0;
         assert_eq!(driver.batch_program_calls(), 2);

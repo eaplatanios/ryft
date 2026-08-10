@@ -218,7 +218,7 @@ where
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        <&ArrayType>::try_from(input.unbatched_type())?;
+        <&ArrayType>::try_from(&input.unbatched_type())?;
         if !input.ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
                 message: "dynamic reshape does not support bounded ragged array operands".to_string(),
@@ -238,9 +238,7 @@ where
                 .into());
         }
 
-        let batched_type = <&ArrayType>::try_from(input.value().r#type().as_ref())?.clone();
         let moved_input = ArrayBatch::new(
-            batched_type,
             <C::Value as ValueProjection<ArrayType>>::into_projected(input.value().clone())?,
             input.batch_axis(),
         )?

@@ -238,8 +238,9 @@ where
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
-        let input_type = <&ArrayType>::try_from(input.unbatched_type())?;
-        Self::validate_input_type(input_type)?;
+        let unbatched_type = input.unbatched_type();
+        let input_type = <&ArrayType>::try_from(&unbatched_type)?.clone();
+        Self::validate_input_type(&input_type)?;
         if input.batch_axis().is_replicated() {
             return Ok(context
                 .parent()
