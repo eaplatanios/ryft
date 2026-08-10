@@ -1,15 +1,12 @@
 //! Contains backend-neutral structural statistics for [`Program`]s.
 //!
 //! [`Program::statistics`] is the structural-inspection entry point for programs. It reports stored program structure
-//! rather than an execution trace: dormant rule regions are included, dead instructions count toward instruction and
-//! operation counts, and no simplification is applied. The result is a [`ProgramStatistics`] value holding one
-//! [`RegionStatistics`] node per region-arena entry, in ascending [`RegionId`](crate::programs::regions::RegionId)
-//! order, together with [`AttachedRegionStatistics`] edges that record which instructions attach which regions. A
-//! region shared by several instructions (or by several slots of one instruction) therefore appears exactly once as a
-//! node and once per use as an edge, so the region graph is never expanded into a tree and no count is inflated by
-//! sharing.
-
-// TODO(eaplatanios): Review this module.
+//! rather than an execution trace (i.e., dormant rule regions are included, dead instructions count toward instruction
+//! and operation counts, and no simplification is applied). The result is a [`ProgramStatistics`] value holding one
+//! [`RegionStatistics`] node per region-arena entry, in ascending [`RegionId`](crate::RegionId), order, together with
+//! [`AttachedRegionStatistics`] edges that record which instructions attach which regions. A region shared by several
+//! instructions (or by several slots of one instruction) therefore appears exactly once as a node and once per use as
+//! an edge, so the region graph is never expanded into a tree and no count is inflated by sharing.
 
 use std::collections::BTreeMap;
 
@@ -21,67 +18,59 @@ use crate::programs::programs::Program;
 use crate::programs::regions::RegionRole;
 use crate::programs::values::Value;
 
-/// Structural statistics of one [`Program`], as computed by [`Program::statistics`].
+/// Structural statistics of a [`Program`], as computed by [`Program::statistics`].
 ///
-/// The `regions` graph mirrors the program's validated region arena exactly: statistics appear in ascending
-/// [`RegionId`](crate::programs::regions::RegionId) order, descendant regions always precede the regions that attach
-/// them, and the final entry is always the program's entry region. Shared regions appear once in `regions` while
-/// appearing in multiple [`AttachedRegionStatistics`] edge lists, and edges reference their target nodes by index
-/// into `regions`.
+/// The `regions` graph mirrors the program's validated region arena exactly. Statistics appear in ascending
+/// [`RegionId`](crate::RegionId) order, descendant regions always precede the regions that attach them, and the final
+/// entry is always the program's entry region. Shared regions appear once in `regions` while appearing in multiple
+/// [`AttachedRegionStatistics`] edge lists, and edges reference their target nodes by index into `regions`.
 ///
-/// Aggregate accessors such as [`total_instruction_count`](Self::total_instruction_count) are derived on demand and
-/// are not part of the serialized form. The serialized JSON contains exactly one field, `regions`, and consumers
-/// recover the entry region as the last element of that array.
+/// Aggregate accessors such as [`total_instruction_count`](Self::total_instruction_count) are derived on demand and are
+/// not part of the serialized form. The serialized JSON contains exactly one field, `regions`, and consumers recover
+/// the entry region as the last element of that array.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProgramStatistics {
-    /// Per-region statistics in ascending region-arena order, with the entry region last.
+    /// Per-[`Region`](crate::Region) [`RegionStatistics`] in ascending region-arena order, with the entry region last.
     regions: Vec<RegionStatistics>,
 }
 
 impl ProgramStatistics {
-    /// Returns the per-region statistics in ascending region-arena order, with the entry region last.
+    /// Returns the per-[`Region`](crate::Region) [`RegionStatistics`] in ascending region-arena order,
+    /// with the entry region last.
     #[inline]
     pub fn regions(&self) -> &[RegionStatistics] {
         &self.regions
     }
 
-    /// Returns the number of unique regions in the program's region arena.
+    /// Returns the number of unique [`Region`](crate::Region)s in the program's region arena.
     #[inline]
     pub fn region_count(&self) -> usize {
         self.regions.len()
     }
 
-    /// Returns the index of the entry region inside [`regions`](Self::regions). [`Program`] validation guarantees
-    /// that the entry region is the final region-arena entry, so this is always `region_count() - 1`.
+    /// Returns the [`RegionStatistics`] of the program's entry [`Region`](crate::Region).
     #[inline]
-    pub fn entry_region_index(&self) -> usize {
-        self.regions.len() - 1
-    }
-
-    /// Returns the statistics of the program's entry region. A valid [`Program`] always contains at least its entry
-    /// region, so this cannot panic.
-    #[inline]
-    pub fn entry(&self) -> &RegionStatistics {
+    pub fn entry_region_statistics(&self) -> &RegionStatistics {
         self.regions.last().unwrap()
     }
 
-    /// Returns the total number of instructions across all regions. A shared region contributes its instructions
-    /// once, regardless of how many times it is attached.
-    #[inline]
-    pub fn total_instruction_count(&self) -> usize {
-        self.regions.iter().map(RegionStatistics::instruction_count).sum()
-    }
-
-    /// Returns the total number of constant atoms across all regions. A shared region contributes its constants
-    /// once, regardless of how many times it is attached.
+    /// Returns the total number of constant [`Atom`](crate::Atom)s across all [`Region`](crate::Region)s.
+    /// A shared region contributes its constants once, regardless of how many times it is attached.
     #[inline]
     pub fn total_constant_count(&self) -> usize {
         self.regions.iter().map(RegionStatistics::constant_count).sum()
     }
 
-    /// Returns the per-operation instruction counts merged across all regions, keyed by exact
-    /// [`Operation::name`] strings. A shared region contributes its instructions once, regardless of how many times
-    /// it is attached.
+    /// Returns the total number of [`Instruction`](crate::Instruction)s across all [`Region`](crate::Region)s.
+    /// A shared region contributes its instructions once, regardless of how many times it is attached.
+    #[inline]
+    pub fn total_instruction_count(&self) -> usize {
+        self.regions.iter().map(RegionStatistics::instruction_count).sum()
+    }
+
+    /// Returns the per-[`Operation`] [`Instruction`](crate::Instruction) counts merged across all
+    /// [`Region`](crate::Region)s, keyed by [`Operation::name`]. A shared region contributes its instructions once,
+    /// regardless of how many times it is attached.
     pub fn total_operation_counts(&self) -> BTreeMap<&'static str, usize> {
         let mut totals = BTreeMap::new();
         for region in &self.regions {
@@ -93,21 +82,26 @@ impl ProgramStatistics {
     }
 }
 
-/// Structural statistics of one region in a [`Program`]'s region arena. All statistics are region-local: instructions
-/// and constants of attached regions are reported by those regions' own [`RegionStatistics`] nodes, and attached
-/// regions contribute nothing to [`maximum_output_dependency_depth`](Self::maximum_output_dependency_depth).
+// TODO(eaplatanios): Review from here onwards.
+
+/// Structural statistics of one [`Region`](crate::Region) in a [`Program`]'s region arena. All statistics are
+/// local to a region: instructions and constants of attached regions are reported as part of those regions' own
+/// [`RegionStatistics`], and attached regions do not contribute to
+/// [`maximum_output_dependency_depth`](Self::maximum_output_dependency_depth).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RegionStatistics {
-    /// Number of input atoms in the region's boundary.
+    /// Number of input [`Atom`](crate::Atom)s in the [`Region`](crate::Region)'s boundary.
     input_count: usize,
 
-    /// Number of output atoms in the region's boundary.
+    /// Number of output [`Atom`](crate::Atom)s in the [`Region`](crate::Region)'s boundary.
     output_count: usize,
 
-    /// Number of instructions in the region, including instructions whose outputs reach no region output.
+    /// Number of [`Instruction`](crate::Instruction)s in the [`Region`](crate::Region), including instructions whose
+    /// outputs reach no region output.
     instruction_count: usize,
 
-    /// Number of constant atoms stored in the region's atom table.
+    // TODO(eaplatanios): Move before `instruction_count` here and in all constructor calls.
+    /// Number of constant [`Atom`](crate::Atom)s stored in the [`Region`](crate::Region)'s atom table.
     constant_count: usize,
 
     /// Per-operation instruction counts, keyed by exact [`Operation::name`] strings.
@@ -332,9 +326,8 @@ mod tests {
 
         let statistics = program.statistics();
         assert_eq!(statistics.region_count(), 1);
-        assert_eq!(statistics.entry_region_index(), 0);
         assert_eq!(
-            statistics.entry(),
+            statistics.entry_region_statistics(),
             &RegionStatistics {
                 input_count: 1,
                 output_count: 1,
@@ -357,11 +350,11 @@ mod tests {
             builder.build(vec![input, constant], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().input_count(), 1);
-        assert_eq!(statistics.entry().output_count(), 2);
-        assert_eq!(statistics.entry().instruction_count(), 0);
-        assert_eq!(statistics.entry().constant_count(), 1);
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 0);
+        assert_eq!(statistics.entry_region_statistics().input_count(), 1);
+        assert_eq!(statistics.entry_region_statistics().output_count(), 2);
+        assert_eq!(statistics.entry_region_statistics().instruction_count(), 0);
+        assert_eq!(statistics.entry_region_statistics().constant_count(), 1);
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 0);
     }
 
     /// Verifies that the outputs of a used zero-input instruction have depth one.
@@ -373,8 +366,8 @@ mod tests {
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().instruction_count(), 1);
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 1);
+        assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
     /// Verifies that a region without outputs has depth zero.
@@ -387,9 +380,9 @@ mod tests {
             builder.build(vec![], vec![Placeholder], vec![]).unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().output_count(), 0);
-        assert_eq!(statistics.entry().instruction_count(), 1);
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 0);
+        assert_eq!(statistics.entry_region_statistics().output_count(), 0);
+        assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 0);
     }
 
     /// Verifies that dead work deeper than every live output is excluded from the depth while still being counted in
@@ -405,9 +398,9 @@ mod tests {
             builder.build(vec![live], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().instruction_count(), 3);
-        assert_eq!(statistics.entry().operation_counts(), &BTreeMap::from([("add", 3usize)]));
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 1);
+        assert_eq!(statistics.entry_region_statistics().instruction_count(), 3);
+        assert_eq!(statistics.entry_region_statistics().operation_counts(), &BTreeMap::from([("add", 3usize)]));
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
     /// Verifies that duplicated region outputs affect only the output count and not the other statistics.
@@ -425,10 +418,10 @@ mod tests {
             .unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().output_count(), 2);
-        assert_eq!(statistics.entry().instruction_count(), 1);
-        assert_eq!(statistics.entry().operation_counts(), &BTreeMap::from([("sin", 1usize)]));
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 1);
+        assert_eq!(statistics.entry_region_statistics().output_count(), 2);
+        assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
+        assert_eq!(statistics.entry_region_statistics().operation_counts(), &BTreeMap::from([("sin", 1usize)]));
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
     /// Verifies that a multi-output instruction assigns the same depth to every output.
@@ -458,8 +451,8 @@ mod tests {
             builder.build(outputs, vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
 
         let statistics = program.statistics();
-        assert_eq!(statistics.entry().output_count(), 2);
-        assert_eq!(statistics.entry().maximum_output_dependency_depth(), 1);
+        assert_eq!(statistics.entry_region_statistics().output_count(), 2);
+        assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
     /// Verifies deterministic arena ordering and exact attachment edges for a nested region graph.
@@ -497,7 +490,6 @@ mod tests {
         // region attaching it is region 1, and the entry attaching the middle region is region 2.
         let statistics = program.statistics();
         assert_eq!(statistics.region_count(), 3);
-        assert_eq!(statistics.entry_region_index(), 2);
         assert_eq!(statistics.regions()[0].attached_regions(), &[]);
         assert_eq!(
             statistics.regions()[1].attached_regions(),
@@ -510,7 +502,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            statistics.entry().attached_regions(),
+            statistics.entry_region_statistics().attached_regions(),
             &[AttachedRegionStatistics {
                 instruction_index: 0,
                 operation: "with_regions",
@@ -519,7 +511,7 @@ mod tests {
                 region_index: 1,
             }],
         );
-        assert_eq!(statistics.entry().attached_regions()[0].label(), "with_regions.rule");
+        assert_eq!(statistics.entry_region_statistics().attached_regions()[0].label(), "with_regions.rule");
     }
 
     /// Verifies that a region attached through two slots of one instruction yields one node and two edges.
@@ -545,7 +537,7 @@ mod tests {
         let statistics = program.statistics();
         assert_eq!(statistics.region_count(), 2);
         assert_eq!(
-            statistics.entry().attached_regions(),
+            statistics.entry_region_statistics().attached_regions(),
             &[
                 AttachedRegionStatistics {
                     instruction_index: 0,

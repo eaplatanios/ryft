@@ -5023,7 +5023,6 @@ mod tests {
 
         let statistics = traced.statistics();
         assert_eq!(statistics.region_count(), 2);
-        assert_eq!(statistics.entry_region_index(), 1);
 
         let body = &statistics.regions()[0];
         assert_eq!(body.input_count(), 1);
@@ -5034,7 +5033,7 @@ mod tests {
         assert_eq!(body.maximum_output_dependency_depth(), 1);
         assert_eq!(body.attached_regions(), &[]);
 
-        let entry = statistics.entry();
+        let entry = statistics.entry_region_statistics();
         assert_eq!(entry.input_count(), 1);
         assert_eq!(entry.output_count(), 1);
         assert_eq!(entry.instruction_count(), 1);
