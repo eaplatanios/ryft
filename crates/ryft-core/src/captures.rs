@@ -384,10 +384,20 @@ impl<
         // Rewrite every capture-referencing constant atom in place, across every region, to carry its capture's new
         // index. The program structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved
         // exactly. The `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every
-        // capture referenced by any constant atom.
+        // capture referenced by any constant atom. Note that renumbering a capture reference changes what the region's
+        // constants denote, so every region whose atoms are rewritten also detaches from the transforms derived from
+        // its previous contents. Nothing is renumbered when every capture survives in place, which is the common case
+        // and keeps those transforms reusable.
         let Program { input_structure, output_structure, regions, entry, .. } = program;
         let mut regions = regions.into_regions();
+        let renumbers_captures = capture_index_map
+            .iter()
+            .enumerate()
+            .any(|(source_index, destination_index)| *destination_index != Some(source_index));
         for region in &mut regions {
+            if renumbers_captures {
+                region.invalidate_transform_cache();
+            }
             for atom in &mut region.atoms {
                 if let Atom::Constant(constant) = atom {
                     *constant = constant.map_capture_index(|index| capture_index_map[index].unwrap());

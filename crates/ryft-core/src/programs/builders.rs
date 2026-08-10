@@ -331,6 +331,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         if let Some(mapped) = remapping.get(&region.id()) {
             return *mapped;
         }
+
         let source_id = region.id();
         let mut imported = region.region().clone();
         for instruction in &mut imported.instructions {
@@ -339,6 +340,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 *attached = self.import_region_with_remapping(nested, remapping);
             }
         }
+
+        // Cloning the source region carries its retained transforms along, which is sound because the import copies the
+        // source body verbatim and renumbers its attached references onto faithful copies of the very same descendants.
+        // That sharing is what lets one shared callee program be linearized or transposed once across every program
+        // that interns it.
         let id = self.regions.push(imported).unwrap();
         remapping.insert(source_id, id);
         id
@@ -503,12 +509,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // to previously sealed regions. The same checks keep the entry region unreferenced, since its identifier is
         // assigned last.
         let mut regions = self.regions;
-        regions.push(Region {
-            atoms: self.atoms,
-            input_ids: self.input_ids,
-            output_ids,
-            instructions: self.instructions,
-        })?;
+        regions.push(Region::new(self.atoms, self.input_ids, output_ids, self.instructions))?;
         let mut reachable = vec![false; regions.len()];
         let mut pending = vec![entry];
         while let Some(current) = pending.pop() {

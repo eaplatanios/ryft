@@ -461,11 +461,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             self.regions
                 .iter()
                 .map(|region| {
-                    Ok(Region {
-                        atoms: region.atoms.clone(),
-                        input_ids: region.input_ids.clone(),
-                        output_ids: region.output_ids.clone(),
-                        instructions: region
+                    Ok(Region::new(
+                        region.atoms.clone(),
+                        region.input_ids.clone(),
+                        region.output_ids.clone(),
+                        region
                             .instructions
                             .iter()
                             .map(|instruction| {
@@ -477,7 +477,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                 ))
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?,
-                    })
+                    ))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?,
             self.entry,
@@ -554,27 +554,29 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         let regions = regions
             .into_regions()
             .into_iter()
-            .map(|region| Region {
-                atoms: region
-                    .atoms
-                    .into_iter()
-                    .map(|atom| match atom {
-                        Atom::Constant(value) => {
-                            Atom::Constant(<UnprojectedValue as ValueProjection<V::Type>>::from_projected(value))
-                        }
-                        Atom::Variable(r#type) => Atom::Variable(r#type.into()),
-                    })
-                    .collect(),
-                input_ids: region.input_ids,
-                output_ids: region.output_ids,
-                instructions: region
-                    .instructions
-                    .into_iter()
-                    .map(|instruction| {
-                        let (operation, inputs, outputs, regions) = instruction.into_parts();
-                        Instruction::new(operation.into(), inputs, outputs, regions)
-                    })
-                    .collect(),
+            .map(|region| {
+                Region::new(
+                    region
+                        .atoms
+                        .into_iter()
+                        .map(|atom| match atom {
+                            Atom::Constant(value) => {
+                                Atom::Constant(<UnprojectedValue as ValueProjection<V::Type>>::from_projected(value))
+                            }
+                            Atom::Variable(r#type) => Atom::Variable(r#type.into()),
+                        })
+                        .collect(),
+                    region.input_ids,
+                    region.output_ids,
+                    region
+                        .instructions
+                        .into_iter()
+                        .map(|instruction| {
+                            let (operation, inputs, outputs, regions) = instruction.into_parts();
+                            Instruction::new(operation.into(), inputs, outputs, regions)
+                        })
+                        .collect(),
+                )
             })
             .collect();
         Program::new(input_structure, output_structure, regions, entry)
@@ -599,6 +601,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .enumerate()
             .map(|(region_index, region)| {
                 let instruction_by_output = region.instruction_by_output();
+                let shape = RegionSimplificationShape::of(region);
                 let mut new_atoms = Vec::with_capacity(region.atoms.len());
                 let mut new_input_ids = Vec::with_capacity(region.input_ids.len());
                 let mut new_instructions = Vec::with_capacity(region.instructions.len());
@@ -679,9 +682,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                Ok(Region { atoms: new_atoms, input_ids: new_input_ids, output_ids, instructions: new_instructions })
+                let verbatim = shape.is_verbatim_rebuild(&atom_id_mapping, new_atoms.len(), new_instructions.len());
+                let mut rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
+                if verbatim {
+                    rebuilt.adopt_transform_cache(region.transform_cache().clone());
+                }
+                Ok((rebuilt, verbatim))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let (mut regions, verbatim): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
+        retain_verbatim_transform_caches(regions.as_mut_slice(), verbatim.as_slice());
         let (regions, entry) = compact_regions(regions, self.entry);
         Self::new(self.input_structure.clone(), self.output_structure.clone(), regions, entry)
     }
@@ -721,13 +731,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Vec<_>>();
         let Self { regions, input_structure, output_structure, entry, .. } = self;
+
         let regions = regions
             .into_regions()
             .into_iter()
             .zip(effectful_instructions)
             .map(|(region, effectful_instructions)| {
                 let instruction_by_output = region.instruction_by_output();
-                let Region { atoms, input_ids, output_ids, instructions } = region;
+                let shape = RegionSimplificationShape::of(&region);
+                let transform_cache = region.transform_cache().clone();
+                let Region { atoms, input_ids, output_ids, instructions, .. } = region;
                 let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
                 let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
                 let mut new_atoms = Vec::with_capacity(atoms.len());
@@ -811,9 +824,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                Ok(Region { atoms: new_atoms, input_ids: new_input_ids, output_ids, instructions: new_instructions })
+                let verbatim = shape.is_verbatim_rebuild(&atom_id_mapping, new_atoms.len(), new_instructions.len());
+                let mut rebuilt = Region::new(new_atoms, new_input_ids, output_ids, new_instructions);
+                if verbatim {
+                    rebuilt.adopt_transform_cache(transform_cache);
+                }
+                Ok((rebuilt, verbatim))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let (mut regions, verbatim): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
+        retain_verbatim_transform_caches(regions.as_mut_slice(), verbatim.as_slice());
         let (regions, entry) = compact_regions(regions, entry);
         Self::new(input_structure, output_structure, regions, entry)
     }
@@ -945,7 +965,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         // Nested regions of retained instructions pass through unchanged (filtering is an entry-boundary projection);
         // regions that lost their last reference are dropped and the surviving references are rewritten.
         let mut regions = self.regions.iter().take(self.entry.index()).cloned().collect::<Vec<_>>();
-        regions.push(Region { atoms: new_atoms, input_ids: new_input_ids, output_ids, instructions: new_instructions });
+        regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
         let (regions, entry) = compact_regions(regions, self.entry);
         let program = Program::new(
             vec![Placeholder; live_input_indices.len()],
@@ -1080,12 +1100,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
         // Nested regions of retained instructions pass through unchanged (filtering is an entry-boundary projection).
         // Regions that lost their last reference are dropped, and the surviving references are rewritten.
-        nested_regions.push(Region {
-            atoms: new_atoms,
-            input_ids: new_input_ids,
-            output_ids,
-            instructions: new_instructions,
-        });
+        nested_regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
 
         let (regions, entry) = compact_regions(nested_regions, entry);
         Ok((
@@ -1467,12 +1482,96 @@ struct ProgramLivenessAnalysis {
     effectful_instruction_indices: Vec<usize>,
 }
 
+// TODO(eaplatanios): Review this.
+/// Contents shape of one source [`Region`], captured before simplification rebuilds it so that the rebuild can be
+/// recognized as the identity on that region's contents.
+///
+/// This type exists to keep [`Region`] transform caches alive across simplification. Every content-changing region
+/// construction must mint a fresh [`RegionTransformCache`](super::regions::RegionTransformCache), because that cache
+/// retains pure functions of the region's contents. Simplification, however, runs on essentially every built
+/// [`Program`] (the standard pipeline is `ProgramBuilder::build(..)` followed by [`Program::into_simplified`]), and it
+/// usually rebuilds regions *without changing them*. If those identity rebuilds also minted fresh caches, transform
+/// caching would be severed at the one pipeline every program flows through, and a callee's retained linearization or
+/// transposition could never be shared with any program that imports it. Simplification therefore captures this
+/// shape before rebuilding a region and asks [`Self::is_verbatim_rebuild`] afterwards whether the rebuild was the
+/// identity: if so, the rebuilt region adopts the source region's cache, and otherwise it keeps its fresh one.
+///
+/// The recognition is deliberately conservative. A false negative merely misses a cache share and costs repeated
+/// transform work; a false positive would share cached transforms across regions with different contents and produce
+/// wrong programs. Every field and check below is therefore chosen so that recognition can only fail toward the safe
+/// side.
+struct RegionSimplificationShape {
+    /// Number of [`Atom`]s in the source region.
+    atom_count: usize,
+
+    /// Number of [`Instruction`]s in the source region.
+    instruction_count: usize,
+
+    /// Whether every source [`Instruction`] is pinned to its position by at least one output [`Atom`].
+    ///
+    /// The only per-instruction evidence [`Self::is_verbatim_rebuild`] receives is the source-to-rebuilt [`Atom`]
+    /// identifier mapping, so an instruction can be proven preserved only *through the atoms it produces*: an
+    /// identity mapping over every source atom pins the producing instruction of each atom to its original position.
+    /// An instruction with no outputs (a purely effectful one, such as a print) is invisible to that evidence — the
+    /// mapping cannot show whether it survived or where it ended up — so when this is `false`, verbatim recognition
+    /// is refused outright rather than risking a cache share that no atom can attest to.
+    atoms_pin_every_instruction: bool,
+}
+
+// TODO(eaplatanios): Review this.
+impl RegionSimplificationShape {
+    /// Captures the contents shape of `region`.
+    fn of<V: Typed + Parameter, O>(region: &Region<V, O>) -> Self {
+        Self {
+            atom_count: region.atoms().len(),
+            instruction_count: region.instructions().len(),
+            atoms_pin_every_instruction: region
+                .instructions()
+                .iter()
+                .all(|instruction| !instruction.outputs().is_empty()),
+        }
+    }
+
+    /// Returns whether simplification rebuilt this region with exactly its original contents, which is the
+    /// precondition for the rebuilt region to share the source region's
+    /// [`RegionTransformCache`](super::regions::RegionTransformCache).
+    ///
+    /// Simplification copies surviving [`Atom`]s and [`Instruction`]s verbatim and only renumbers atom identifiers,
+    /// so the rebuild is the identity exactly when no atom was dropped, none was renumbered, and no instruction was
+    /// dropped. Equal atom and instruction counts together with an identity mapping over every source atom establish
+    /// all three — provided every instruction is pinned by an output atom ([`Self::atoms_pin_every_instruction`]),
+    /// since an output-free instruction's survival and position are invisible to the mapping.
+    ///
+    /// # Parameters
+    ///   - `atom_id_mapping`: Source-to-rebuilt [`AtomId`] mapping accumulated while rebuilding the region.
+    ///   - `new_atom_count`: Number of atoms in the rebuilt region.
+    ///   - `new_instruction_count`: Number of instructions in the rebuilt region.
+    fn is_verbatim_rebuild(
+        &self,
+        atom_id_mapping: &HashMap<AtomId, AtomId>,
+        new_atom_count: usize,
+        new_instruction_count: usize,
+    ) -> bool {
+        self.atoms_pin_every_instruction
+            && new_atom_count == self.atom_count
+            && new_instruction_count == self.instruction_count
+            && atom_id_mapping.len() == self.atom_count
+            && atom_id_mapping.iter().all(|(source, rebuilt)| source == rebuilt)
+    }
+}
+
 /// Copies the [`Atom`] that corresponds to `atom_id` in `region` (and its transitive producers) into `new_atoms` and
 /// `new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. Atoms already present in the
 /// mapping (e.g., rebuilt region inputs) are reused, [`Atom::Constant`]s are cloned directly, and [`Atom::Variable`]s
 /// are reconstructed from their producing [`Instruction`], whose attached-region references are preserved verbatim
 /// (unreferenced regions are dropped and identifiers rewritten by [`compact_regions`] afterward). A reachable variable
 /// that is neither mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
+///
+/// The traversal is a post-order walk of the use-def graph — the standard dataflow view in which each consumed [`Atom`]
+/// (i.e., a _use_) points back at the [`Instruction`] that produces it (i.e., its _definition_) — so an instruction's
+/// inputs are cloned left-to-right before the instruction itself is emitted. The walk is driven by an explicit worklist
+/// rather than recursion, because its depth grows with the length of the longest instruction chain and recursing would
+/// overflow the stack for programs with a few hundred chained instructions.
 fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
@@ -1481,65 +1580,222 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
     new_atoms: &mut Vec<Atom<V>>,
     new_instructions: &mut Vec<Instruction<O>>,
 ) -> Result<AtomId, ProgramError> {
-    if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
-        return Ok(*mapped_atom);
+    /// One pending step of the worklist. Visiting an [`Atom`] schedules its producing [`Instruction`]'s inputs, and
+    /// emitting an [`Instruction`] (identified by its index in the source [`Region`]) clones it once every one of its
+    /// inputs has been mapped.
+    enum Step {
+        /// Ensures the [`Atom`] with this [`AtomId`] is present in the mapping, scheduling its producer if needed.
+        Visit(AtomId),
+
+        /// Clones the [`Instruction`] at this index after all of its inputs have been visited.
+        Emit(usize),
     }
-    let atom = region.atoms.get(atom_id.index()).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
-    let atom = match atom {
-        Atom::Constant(value) => {
-            let new_atom = AtomId::new(new_atoms.len());
-            new_atoms.push(Atom::Constant(value.clone()));
-            Ok(new_atom)
-        }
-        Atom::Variable(_) => {
-            let instruction_index = instruction_by_output
-                .get(atom_id.index())
-                .copied()
-                .flatten()
-                .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-            let instruction = &region.instructions[instruction_index];
-            let inputs = instruction
-                .inputs
-                .iter()
-                .copied()
-                .map(|input| {
-                    clone_atom_subgraph_into_region(
-                        atom_id_mapping,
-                        input,
-                        region,
-                        instruction_by_output,
-                        new_atoms,
-                        new_instructions,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut outputs = Vec::with_capacity(instruction.outputs.len());
-            for output in instruction.outputs.iter().copied() {
-                let output_atom = region.atoms.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
-                let Atom::Variable(output_type) = output_atom else {
-                    return Err(ProgramError::MalformedProgram(
-                        "instruction output atom was not a variable".to_string(),
-                    ));
-                };
-                let new_output = AtomId::new(new_atoms.len());
-                new_atoms.push(Atom::Variable(output_type.clone()));
-                atom_id_mapping.insert(output, new_output);
-                outputs.push(new_output);
+
+    let mut pending = vec![Step::Visit(atom_id)];
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Visit(atom_id) if atom_id_mapping.contains_key(&atom_id) => continue,
+            Step::Visit(atom_id) => {
+                let atom = region.atoms.get(atom_id.index()).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+                match atom {
+                    Atom::Constant(value) => {
+                        let new_atom = AtomId::new(new_atoms.len());
+                        new_atoms.push(Atom::Constant(value.clone()));
+                        atom_id_mapping.insert(atom_id, new_atom);
+                    }
+                    Atom::Variable(_) => {
+                        let instruction_index = instruction_by_output.get(atom_id.index()).copied().flatten().ok_or(
+                            ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()),
+                        )?;
+
+                        // The emit step runs after the input visits pushed on top of it, and those visits map every
+                        // input (or fail) before it pops, preserving the recursive post-order emission.
+                        pending.push(Step::Emit(instruction_index));
+                        let instruction = &region.instructions[instruction_index];
+                        pending.extend(instruction.inputs.iter().rev().copied().map(Step::Visit));
+                    }
+                }
             }
-            new_instructions.push(Instruction::new(
-                instruction.operation.clone(),
-                inputs,
-                outputs,
-                instruction.regions.clone(),
-            ));
-            atom_id_mapping
-                .get(&atom_id)
-                .copied()
-                .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
+            Step::Emit(instruction_index) => {
+                let instruction = &region.instructions[instruction_index];
+                let inputs = instruction
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        atom_id_mapping.get(input).copied().ok_or(ProgramError::MalformedProgram(
+                            "cloned instruction input was missing from the mapping".to_string(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let mut outputs = Vec::with_capacity(instruction.outputs.len());
+                for output in instruction.outputs.iter().copied() {
+                    let output_atom =
+                        region.atoms.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
+                    let Atom::Variable(output_type) = output_atom else {
+                        return Err(ProgramError::MalformedProgram(
+                            "instruction output atom was not a variable".to_string(),
+                        ));
+                    };
+                    let new_output = AtomId::new(new_atoms.len());
+                    new_atoms.push(Atom::Variable(output_type.clone()));
+                    atom_id_mapping.insert(output, new_output);
+                    outputs.push(new_output);
+                }
+
+                new_instructions.push(Instruction::new(
+                    instruction.operation.clone(),
+                    inputs,
+                    outputs,
+                    instruction.regions.clone(),
+                ));
+            }
         }
-    }?;
-    atom_id_mapping.insert(atom_id, atom);
-    Ok(atom)
+    }
+
+    atom_id_mapping
+        .get(&atom_id)
+        .copied()
+        .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
+}
+
+/// Moves the [`Atom`] that corresponds to `atom_id` (and its transitive producers) out of `atoms`/`instructions` into
+/// `new_atoms`/`new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. This is the
+/// move-based counterpart of [`clone_atom_subgraph_into_region`]: it relocates owned [`Atom`]s and [`Instruction`]s
+/// (including their attached-region references, verbatim) instead of cloning them, so each is taken from its slot at
+/// most once. Atoms already present in the mapping are reused, and a reachable variable that is neither mapped nor
+/// produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
+///
+/// Like [`clone_atom_subgraph_into_region`], the post-order walk of the use-def graph (i.e., each consumed [`Atom`]'s
+/// edge back to its producing [`Instruction`]) is driven by an explicit worklist rather than recursion, because the
+/// depth of the walk grows with the length of the longest instruction chain and recursing would overflow the stack for
+/// programs with a few hundred chained instructions.
+fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
+    atom_id_mapping: &mut HashMap<AtomId, AtomId>,
+    atom_id: AtomId,
+    atoms: &mut [Option<Atom<V>>],
+    instructions: &mut [Option<Instruction<O>>],
+    instruction_by_output: &[Option<usize>],
+    new_atoms: &mut Vec<Atom<V>>,
+    new_instructions: &mut Vec<Instruction<O>>,
+) -> Result<AtomId, ProgramError> {
+    /// One pending step of the worklist. Visiting an [`Atom`] schedules its producing [`Instruction`]'s inputs, and
+    /// emitting an [`Instruction`] (already taken out of its slot by the visit that scheduled it) relocates it once
+    /// every one of its inputs has been mapped.
+    enum Step<O> {
+        /// Ensures the [`Atom`] with this [`AtomId`] is present in the mapping, scheduling its producer if needed.
+        Visit(AtomId),
+
+        /// Relocates this [`Instruction`] after all of its inputs have been visited.
+        Emit(Instruction<O>),
+    }
+
+    let mut pending_steps = vec![Step::Visit(atom_id)];
+    while let Some(step) = pending_steps.pop() {
+        match step {
+            Step::Visit(atom_id) if atom_id_mapping.contains_key(&atom_id) => continue,
+            Step::Visit(atom_id) => {
+                let is_constant = match atoms.get(atom_id.index()) {
+                    Some(Some(Atom::Constant(_))) => true,
+                    Some(Some(Atom::Variable(_))) => false,
+                    Some(None) => {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "atom {atom_id} was already moved while rebuilding program",
+                        )));
+                    }
+                    None => return Err(ProgramError::UnboundAtomId { id: atom_id }),
+                };
+
+                if is_constant {
+                    let Some(Atom::Constant(value)) = atoms[atom_id.index()].take() else {
+                        unreachable!("constant atom kind was checked before moving the atom");
+                    };
+                    let new_atom = AtomId::new(new_atoms.len());
+                    new_atoms.push(Atom::Constant(value));
+                    atom_id_mapping.insert(atom_id, new_atom);
+                    continue;
+                }
+
+                let instruction_index = instruction_by_output
+                    .get(atom_id.index())
+                    .copied()
+                    .flatten()
+                    .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
+
+                let instruction = instructions[instruction_index]
+                    .take()
+                    .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
+
+                // The emit step runs after the input visits pushed on top of it, and those visits map every input
+                // (or fail) before it pops, preserving the recursive post-order emission.
+                let inputs = instruction.inputs.clone();
+                pending_steps.push(Step::Emit(instruction));
+                pending_steps.extend(inputs.into_iter().rev().map(Step::Visit));
+            }
+            Step::Emit(instruction) => {
+                let inputs = instruction
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        atom_id_mapping.get(input).copied().ok_or(ProgramError::MalformedProgram(
+                            "moved instruction input was missing from the mapping".to_string(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let mut outputs = Vec::with_capacity(instruction.outputs.len());
+                for output in instruction.outputs.iter().copied() {
+                    let output_atom =
+                        atoms.get_mut(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?.take().ok_or(
+                            ProgramError::MalformedProgram("instruction output atom was already moved".to_string()),
+                        )?;
+                    let Atom::Variable(output_type) = output_atom else {
+                        return Err(ProgramError::MalformedProgram(
+                            "instruction output atom was not a variable".to_string(),
+                        ));
+                    };
+                    let new_output = AtomId::new(new_atoms.len());
+                    new_atoms.push(Atom::Variable(output_type));
+                    atom_id_mapping.insert(output, new_output);
+                    outputs.push(new_output);
+                }
+
+                new_instructions.push(Instruction::new(instruction.operation, inputs, outputs, instruction.regions));
+            }
+        }
+    }
+
+    atom_id_mapping
+        .get(&atom_id)
+        .copied()
+        .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
+}
+
+/// Detaches every simplified [`Region`] whose own rebuild was verbatim but that reaches a region whose rebuild was
+/// not, so that only regions whose _complete reachable contents_ are unchanged keep sharing their source region's
+/// [`RegionTransformCache`]. Transforms of a region consume its attached descendants too, so a parent whose nested
+/// computation lost dead work no longer has the contents its retained transforms were derived from. Regions precede
+/// the regions that reference them, which makes one ascending pass enough to propagate that.
+///
+/// # Parameters
+///   - `regions`: Simplified regions in [`RegionId`] order, before compaction renumbers them.
+///   - `verbatim`: Whether each region's own rebuild was verbatim, in the same order.
+fn retain_verbatim_transform_caches<V: Typed + Parameter, O>(regions: &mut [Region<V, O>], verbatim: &[bool]) {
+    let mut retained = verbatim.to_vec();
+    for index in 0..regions.len() {
+        if !retained[index] {
+            continue;
+        }
+        if regions[index]
+            .instructions()
+            .iter()
+            .flat_map(|instruction| instruction.regions())
+            .any(|attached| !retained.get(attached.index()).copied().unwrap_or(false))
+        {
+            retained[index] = false;
+            regions[index].invalidate_transform_cache();
+        }
+    }
 }
 
 /// Drops the [`Region`]s in `regions` that are not reachable from `entry` (following [`Instruction`] attached-region
@@ -1547,7 +1803,10 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
 /// surviving instruction's references accordingly. Returns the compacted arena together with the remapped entry
 /// [`RegionId`]. Order preservation keeps the sealed-before-referenced invariant intact, so the compacted arena
 /// remains valid for ascending-order recursive metadata derivation by [`RegionArena`].
-fn compact_regions<V: Typed, O>(regions: Vec<Region<V, O>>, entry: RegionId) -> (Vec<Region<V, O>>, RegionId) {
+fn compact_regions<V: Typed + Parameter, O>(
+    regions: Vec<Region<V, O>>,
+    entry: RegionId,
+) -> (Vec<Region<V, O>>, RegionId) {
     let mut reachable = vec![false; regions.len()];
     let mut pending = vec![entry];
     while let Some(current) = pending.pop() {
@@ -1581,88 +1840,6 @@ fn compact_regions<V: Typed, O>(regions: Vec<Region<V, O>>, entry: RegionId) -> 
     (compacted, remapping[entry.index()].unwrap())
 }
 
-/// Moves the [`Atom`] that corresponds to `atom_id` (and its transitive producers) out of `atoms`/`instructions` into
-/// `new_atoms`/`new_instructions`, memoizing the old-to-new [`AtomId`] mapping in `atom_id_mapping`. This is the
-/// move-based counterpart of [`clone_atom_subgraph_into_region`]: it relocates owned [`Atom`]s and [`Instruction`]s
-/// (including their attached-region references, verbatim) instead of cloning them, so each is taken from its slot at
-/// most once. Atoms already present in the mapping are reused, and a reachable variable that is neither mapped nor
-/// produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
-fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
-    atom_id_mapping: &mut HashMap<AtomId, AtomId>,
-    atom_id: AtomId,
-    atoms: &mut [Option<Atom<V>>],
-    instructions: &mut [Option<Instruction<O>>],
-    instruction_by_output: &[Option<usize>],
-    new_atoms: &mut Vec<Atom<V>>,
-    new_instructions: &mut Vec<Instruction<O>>,
-) -> Result<AtomId, ProgramError> {
-    if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
-        return Ok(*mapped_atom);
-    }
-    let is_constant = match atoms.get(atom_id.index()) {
-        Some(Some(Atom::Constant(_))) => true,
-        Some(Some(Atom::Variable(_))) => false,
-        Some(None) => {
-            return Err(ProgramError::MalformedProgram(format!(
-                "atom {atom_id} was already moved while rebuilding program",
-            )));
-        }
-        None => return Err(ProgramError::UnboundAtomId { id: atom_id }),
-    };
-    if is_constant {
-        let Some(Atom::Constant(value)) = atoms[atom_id.index()].take() else {
-            unreachable!("constant atom kind was checked before moving the atom");
-        };
-        let new_atom = AtomId::new(new_atoms.len());
-        new_atoms.push(Atom::Constant(value));
-        atom_id_mapping.insert(atom_id, new_atom);
-        return Ok(new_atom);
-    }
-    let instruction_index = instruction_by_output
-        .get(atom_id.index())
-        .copied()
-        .flatten()
-        .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-    let instruction = instructions[instruction_index]
-        .take()
-        .ok_or(ProgramError::MalformedProgram("instruction was already moved".to_string()))?;
-    let inputs = instruction
-        .inputs
-        .iter()
-        .copied()
-        .map(|input| {
-            move_atom_to_program(
-                atom_id_mapping,
-                input,
-                atoms,
-                instructions,
-                instruction_by_output,
-                new_atoms,
-                new_instructions,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut outputs = Vec::with_capacity(instruction.outputs.len());
-    for output in instruction.outputs.iter().copied() {
-        let output_atom = atoms
-            .get_mut(output.index())
-            .ok_or(ProgramError::UnboundAtomId { id: output })?
-            .take()
-            .ok_or(ProgramError::MalformedProgram("instruction output atom was already moved".to_string()))?;
-        let Atom::Variable(output_type) = output_atom else {
-            return Err(ProgramError::MalformedProgram("instruction output atom was not a variable".to_string()));
-        };
-        let new_output = AtomId::new(new_atoms.len());
-        new_atoms.push(Atom::Variable(output_type));
-        atom_id_mapping.insert(output, new_output);
-        outputs.push(new_output);
-    }
-    new_instructions.push(Instruction::new(instruction.operation, inputs, outputs, instruction.regions));
-    atom_id_mapping
-        .get(&atom_id)
-        .copied()
-        .ok_or(ProgramError::MalformedProgram("remapped instruction output was missing".to_string()))
-}
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1672,6 +1849,7 @@ mod tests {
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
+
     use ryft_macros::Parameter;
 
     use crate::arrays::{
@@ -2649,6 +2827,41 @@ mod tests {
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_rebuilds_handle_deep_instruction_chains() {
+        // Program rebuilds walk use-def chains whose depth grows with the longest instruction chain. That walk used
+        // to recurse once per producer instruction, so rebuilding a program with a few hundred chained instructions
+        // overflowed the default `libtest` thread stack in debug builds. The worklist-driven rebuild must survive a
+        // chain an order of magnitude past that threshold on a default-size test thread.
+        const CHAIN_LENGTH: usize = 4000;
+        let build = || {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let mut value = input;
+            for _ in 0..CHAIN_LENGTH {
+                value = builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, input]).unwrap()[0];
+            }
+            let program = builder.build::<Array, Array>(vec![value], Placeholder, Placeholder).unwrap();
+            (program, input, value)
+        };
+
+        // The borrowing variants exercise the clone-based rebuild and the consuming variants exercise the move-based
+        // rebuild. The interpretation checks pin the chain's data flow (each step adds the original input once).
+        let (program, _, _) = build();
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.instructions().len(), CHAIN_LENGTH);
+        assert_eq!(simplified.interpret(Array::scalar(1.0f64)), Ok(Array::scalar(1.0 + CHAIN_LENGTH as f64)));
+        assert_eq!(build().0.into_simplified().unwrap().instructions().len(), CHAIN_LENGTH);
+        let (program, input, output) = build();
+        let (filtered, live) = program.filtered(&[input], &[output], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.instructions().len(), CHAIN_LENGTH);
+        let (program, input, output) = build();
+        let (filtered, live) = program.into_filtered(&[input], &[output], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.interpret(vec![Array::scalar(1.0f64)]), Ok(vec![Array::scalar(1.0 + CHAIN_LENGTH as f64)]));
     }
 
     #[test]
