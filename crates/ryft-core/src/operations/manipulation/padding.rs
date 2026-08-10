@@ -976,7 +976,7 @@ where
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<OneOperation<ArrayType>>
         + From<PadOperation<ArrayType>>

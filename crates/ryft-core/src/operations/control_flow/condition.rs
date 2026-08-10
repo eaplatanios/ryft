@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use crate::arrays::batching::require_equal_dimensions;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
-    ArrayType, DimensionOperation, DimensionType, DimensionValue,
+    ArrayType, DimensionType, DimensionValue,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -23,6 +23,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
@@ -996,7 +997,7 @@ where
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConditionOperation<ArrayIrValue<A>>>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>
                            + OperationProjection<DimensionType>,

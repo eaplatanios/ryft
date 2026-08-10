@@ -13,7 +13,6 @@ use ryft_macros::Parameter;
 
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
-use crate::arrays::operations::DimensionOperation;
 use crate::arrays::sharding::ShardingError;
 use crate::arrays::sharding::meshes::MeshAxisType;
 use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
@@ -2355,7 +2354,7 @@ where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
         + From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
@@ -2404,10 +2403,10 @@ pub(crate) fn array_dimension<C: Context<Type = ArrayIrType, Operation: From<Dim
 /// Stages one exact first-class dimension constant carrying `extent` in `context`.
 pub(crate) fn dimension_constant<C>(context: &C, extent: usize) -> Result<C::Value, BatchingError>
 where
-    C: Context<Type = ArrayIrType, Operation: From<DimensionOperation<DimensionValue>>>,
+    C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>,
 {
     let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-    let mut outputs = context.bind(DimensionOperation::Constant(ConstantOperation::new(value)), Vec::new(), &[])?;
+    let mut outputs = context.bind(ConstantOperation::new(value), Vec::new(), &[])?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -2418,7 +2417,7 @@ where
 pub(crate) fn folded_array_dimension<C>(context: &C, value: &C::Value, axis: usize) -> Result<C::Value, BatchingError>
 where
     C: Context<Type = ArrayIrType>,
-    C::Operation: From<DimensionOperation<DimensionValue>> + From<DimensionSizeOperation>,
+    C::Operation: From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
 {
     let value_type = value.r#type();
     let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
@@ -2467,7 +2466,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
         >,
@@ -2564,7 +2563,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
         >,
@@ -2620,7 +2619,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
         >,
@@ -2715,7 +2714,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>,
         >,
@@ -2775,7 +2774,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + OperationProjection<ArrayType>
                            + OperationProjection<DimensionType>,
@@ -2896,7 +2895,7 @@ where
     C::Operation: BatchableOperation<C, ArrayIrBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
         + From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
@@ -3119,7 +3118,7 @@ where
     C::Operation: BatchableOperation<C, ArrayIrBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
         + From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
@@ -3152,7 +3151,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;

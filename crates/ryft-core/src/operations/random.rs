@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+    Dimension, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -12,6 +12,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::scan::ScanOperation;
@@ -376,7 +377,7 @@ where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<RngBitGeneratorOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>

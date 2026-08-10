@@ -1321,7 +1321,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
@@ -1351,11 +1351,7 @@ where
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-        let mut outputs = context.parent().parent().bind(
-            DimensionOperation::Constant(ConstantOperation::new(value)),
-            Vec::new(),
-            &[],
-        )?;
+        let mut outputs = context.parent().parent().bind(ConstantOperation::new(value), Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(outputs.remove(0))?)
     }
@@ -3396,7 +3392,7 @@ where
             Type = ArrayIrType,
             Operation: From<AllGatherOperation>
                            + From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
@@ -3479,7 +3475,7 @@ where
             Type = ArrayIrType,
             Operation: From<PSumScatterOperation>
                            + From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
@@ -3561,7 +3557,7 @@ where
             Type = ArrayIrType,
             Operation: From<AllToAllOperation>
                            + From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,

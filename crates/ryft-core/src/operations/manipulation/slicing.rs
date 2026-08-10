@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding,
+    DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding,
     ShardingDimension,
 };
 use crate::axes::Axis;
@@ -344,7 +344,7 @@ impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicShapeSliceOperation
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<DynamicShapeSliceOperation> + From<DimensionOperation<DimensionValue>>,
+            Operation: From<DynamicShapeSliceOperation> + From<ConstantOperation<DimensionValue>>,
         >,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
@@ -375,8 +375,7 @@ where
         let batch_axis = input.batch_axis_position().unwrap();
         let (starts, sizes) = bounds.split_at(input_type.rank());
         let zero = DimensionValue::constant(0).map_err(ProgramError::from)?;
-        let mut zero =
-            context.parent().bind(DimensionOperation::Constant(ConstantOperation::new(zero)), Vec::new(), &[])?;
+        let mut zero = context.parent().bind(ConstantOperation::new(zero), Vec::new(), &[])?;
         check_count!("output", zero, 1, ProgramError);
         let mut packed_inputs = Vec::with_capacity(inputs.len() + 2);
         packed_inputs.push(input.value().clone());

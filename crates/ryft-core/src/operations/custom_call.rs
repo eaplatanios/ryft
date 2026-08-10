@@ -7,7 +7,7 @@ use std::marker::PhantomData;
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout, ShardingDimension, TiledLayout,
+    DimensionType, DimensionValue, DimensionVariable, Layout, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -17,6 +17,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
@@ -864,7 +865,7 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: From<CustomCallOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<ScanOperation<C::Constant>>
         + OperationProjection<ArrayType>,

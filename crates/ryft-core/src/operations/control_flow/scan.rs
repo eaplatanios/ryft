@@ -11,7 +11,7 @@ use std::fmt::{Debug, Display};
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
-    ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, Shape,
+    ArrayType, Dimension, DimensionType, DimensionValue, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -25,6 +25,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
@@ -2018,7 +2019,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<ScanOperation<ArrayIrValue<A>>>
                            + OperationProjection<ArrayType>,

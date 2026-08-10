@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::arrays::batching::{RaggedAxis, align_array_batch, dimension_constant};
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -193,7 +193,7 @@ where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,

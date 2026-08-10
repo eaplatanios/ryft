@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    DimensionOperation, DimensionType, DimensionValue,
+    DimensionType, DimensionValue,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -30,6 +30,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::OneOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation, ZeroOperationProvider};
 use crate::operations::control_flow::condition::ConditionOperation;
@@ -1091,7 +1092,7 @@ where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
-                           + From<DimensionOperation<DimensionValue>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
                            + From<WhileOperation<ArrayIrType>>
                            + OperationProjection<ArrayType>,

@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::batching::{align_array_batch, array_dimension};
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionOperation, DimensionType, DimensionValue,
+    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionValue,
     DimensionVariable,
 };
 use crate::axes::Axis;
@@ -18,7 +18,8 @@ use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
 use crate::operations::{
-    DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation, TransposeOperation,
+    ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation,
+    TransposeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -221,7 +222,7 @@ where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: crate::operations::Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DimensionFromScalarOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<DynamicBroadcastOperation>

@@ -529,7 +529,7 @@ where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType>
         + OperationProjection<ArrayType>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>,
     <O as OperationProjection<ArrayType>>::Projected: From<ConcatenateOperation<ArrayType>>
@@ -610,9 +610,9 @@ where
                 // non-concatenated axis, which is an exact constant for a static axis and a single `dimension_size`
                 // read of the live cotangent for a dynamic one. The concatenated axis is filled in per operand below.
                 let zero = context
-                    .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                    .stage_nullary_operation(ConstantOperation::new(
                         DimensionValue::constant(0).map_err(ProgramError::from)?,
-                    )))?
+                    ))?
                     .remove(0);
                 let mut extents = Vec::with_capacity(rank);
                 for (other_axis, dimension) in cotangent_type.shape().dimensions().iter().enumerate() {
@@ -620,9 +620,9 @@ where
                         _ if other_axis == axis => None,
                         Dimension::Static(extent) => Some(
                             context
-                                .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                                .stage_nullary_operation(ConstantOperation::new(
                                     DimensionValue::constant(*extent).map_err(ProgramError::from)?,
-                                )))?
+                                ))?
                                 .remove(0),
                         ),
                         Dimension::Dynamic(_) => Some(
@@ -649,15 +649,15 @@ where
                         zero.clone()
                     } else {
                         context
-                            .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                            .stage_nullary_operation(ConstantOperation::new(
                                 DimensionValue::constant(offset).map_err(ProgramError::from)?,
-                            )))?
+                            ))?
                             .remove(0)
                     };
                     let size = context
-                        .stage_nullary_operation(DimensionOperation::from(ConstantOperation::new(
+                        .stage_nullary_operation(ConstantOperation::new(
                             DimensionValue::constant(input_axis_size).map_err(ProgramError::from)?,
-                        )))?
+                        ))?
                         .remove(0);
                     let mut slice_inputs = Vec::with_capacity(1 + 2 * rank);
                     slice_inputs.push(cotangent.clone());
@@ -726,7 +726,7 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<ConcatenateOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
-        + From<DimensionOperation<DimensionValue>>
+        + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
 {
