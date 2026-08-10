@@ -43,10 +43,10 @@ impl ArrayIrType {
     ///
     /// # Parameters
     ///
-    ///   - `types`: Extent operand types, in operand order. The [`Borrow`] item bound lets type slices, owned type
-    ///     iterators, and borrowed [`Typed::r#type`](crate::Typed::type) results all be projected in place, so
-    ///     value-level callers need no intermediate type collection.
-    pub(crate) fn extents(types: impl IntoIterator<Item: Borrow<Self>>) -> Result<Vec<Dimension>, TypeError> {
+    ///   - `types`: Extent operand types, in operand order. The [`Borrow`] item bound lets type slices, owned [`Type`]
+    ///     iterators, and borrowed [`Type`]s all be projected in place, so value-level callers need no intermediate
+    ///     type collection.
+    pub(crate) fn extents<T: IntoIterator<Item: Borrow<Self>>>(types: T) -> Result<Vec<Dimension>, TypeError> {
         types
             .into_iter()
             .map(|r#type| <&DimensionType>::try_from(r#type.borrow()).map(DimensionType::to_dimension))

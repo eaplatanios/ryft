@@ -934,3 +934,16 @@ addition extends an existing test), plus 6 + 6 integration and 53 runnable docte
 serial passes 459 with one timing benchmark ignored (458 baseline plus the one new attention rejection test).
 `ryft-macros` passes 57 and `ryft-macros-tests` 20 + 17. Per-file `rustfmt --check` is clean on every touched file.
 The only pinned-fixture change is the intentional scan conversion described above.
+
+### Independent CUDA verification (2026-08-09)
+
+The Phase 5 CUDA evidence rows previously rested on owner-recorded DGX runs. They are now independently reproduced:
+all three GPU-execution tests (`test_cuda_13_plugin_executes_bounded_dynamic_program_at_two_sizes`,
+`test_cuda_data_derived_padding_disciplines_execute_without_observable_padding`, and
+`test_cuda_data_derived_scaled_dot_and_attention_execute_fused_without_observable_padding`) pass on the DGX Spark
+(NVIDIA GB10, driver 580.173.02, CUDA 13.0 V13.0.88, cuDNN 9.25.0) at the pushed tip `ad3ee4925`, run in an isolated
+`git worktree` (removed afterwards; the machine's unrelated working tree was untouched). Reproduction protocol, from
+the checkout on that machine:
+`git worktree add <dir> <commit> && cd <dir> && CARGO_INCREMENTAL=0 cargo test -p ryft-xla --lib --features cuda-13
+-- --test-threads=1 test_cuda`. Result: `3 passed; 0 failed` in 1.96s of test time. This closes the
+recorded-evidence-only caveat on exit criterion 16's CUDA rows.
