@@ -227,28 +227,23 @@ impl AttachedRegionStatistics {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<V, O, Input, Output>
 {
-    /// Returns backend-neutral structural statistics for this [`Program`]. This is the structural-inspection entry
-    /// point for programs: it reports stored program structure — including dormant rule regions and instructions
-    /// whose outputs reach no region output — rather than an execution trace, and applies no simplification.
-    ///
-    /// The computation is infallible because [`Program`] construction already validated every atom and region
-    /// reference. Refer to the documentation of [`ProgramStatistics`] and [`RegionStatistics`] for the precise
-    /// semantics of the reported statistics.
+    /// Returns [`ProgramStatistics`] for this [`Program`]. This is the main structural inspection entry point
+    /// for programs. It reports stored program structure, including dormant rule [`Region`](crate::Region)s and
+    /// [`Instruction`](crate::Instruction)s whose outputs reach no region output, rather than an execution trace,
+    /// and applies no simplification.
     pub fn statistics(&self) -> ProgramStatistics {
         let regions = self
             .regions()
             .iter()
             .map(|region| {
+                // Inputs and constants keep the initial depth of zero. Only instruction outputs get a depth. The
+                // single forward pass below relies on the validated topological instruction order that `ProgramBuilder`
+                // establishes (i.e., producers precede consumers).
                 let mut operation_counts = BTreeMap::new();
                 let mut attached_regions = Vec::new();
-                // Inputs and constants keep the initial depth of zero; only instruction outputs are ever written.
-                // The single forward pass relies on the validated topological instruction order that
-                // `ProgramBuilder` establishes (i.e., producers precede consumers).
                 let mut depth_by_atom = vec![0usize; region.atoms().len()];
                 for (instruction_index, instruction) in region.instructions().iter().enumerate() {
                     *operation_counts.entry(instruction.operation().name()).or_insert(0) += 1;
@@ -257,7 +252,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     for output in instruction.outputs().iter().copied() {
                         depth_by_atom[output.index()] = input_depth + 1;
                     }
-                    // Region sealing guarantees one declared slot per attached region, so index directly.
+                    // Region sealing guarantees one declared slot per attached region, so we index directly.
                     let region_slots = instruction.operation().region_slots();
                     for (slot, attached) in instruction.regions().iter().copied().enumerate() {
                         attached_regions.push(AttachedRegionStatistics {
@@ -294,8 +289,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::DataType::F64;
-    use crate::arrays::{Array, ArrayOperation, ArrayType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::constants::ConstantOperation;
     use crate::operations::{ADD_OPERATION_NAME, Sin};
@@ -309,11 +303,10 @@ mod tests {
     /// Builds a sealed single-input identity region and returns its program for importing into test builders.
     fn identity_region_program() -> Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Verifies exact entry-region statistics for a small traced scalar program.
     #[test]
     fn test_statistics_scalar_program_counts_and_depth() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -343,15 +336,13 @@ mod tests {
         );
     }
 
-    /// Verifies that region outputs that are input or constant atoms have depth zero.
     #[test]
     fn test_statistics_input_and_constant_outputs_have_depth_zero() {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(1.0));
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![input, constant], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().input_count(), 1);
         assert_eq!(statistics.entry_region_statistics().output_count(), 2);
@@ -360,53 +351,45 @@ mod tests {
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 0);
     }
 
-    /// Verifies that the outputs of a used zero-input instruction have depth one.
     #[test]
     fn test_statistics_zero_input_instruction_output_has_depth_one() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let produced = builder.add_instruction(ConstantOperation::new(Array::scalar(1.0)), vec![], vec![]).unwrap()[0];
         let program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> =
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
-    /// Verifies that a region without outputs has depth zero.
     #[test]
     fn test_statistics_zero_output_region_has_depth_zero() {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.add_instruction(TestRegionOperation::Effectful, vec![], vec![input]).unwrap();
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![], vec![Placeholder], vec![]).unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().output_count(), 0);
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 0);
     }
 
-    /// Verifies that dead work deeper than every live output is excluded from the depth while still being counted in
-    /// the instruction and operation counts.
     #[test]
     fn test_statistics_dead_work_is_excluded_from_depth_but_counted() {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let live = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, input]).unwrap()[0];
         let dead = builder.add_instruction(TestRegionOperation::Add, vec![], vec![live, live]).unwrap()[0];
         builder.add_instruction(TestRegionOperation::Add, vec![], vec![dead, dead]).unwrap();
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![live], vec![Placeholder], vec![Placeholder]).unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 3);
         assert_eq!(statistics.entry_region_statistics().operation_counts(), &BTreeMap::from([("add", 3usize)]));
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
-    /// Verifies that duplicated region outputs affect only the output count and not the other statistics.
     #[test]
     fn test_statistics_duplicate_outputs_only_affect_output_count() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -419,7 +402,6 @@ mod tests {
                 Array::scalar(2.0),
             )
             .unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().output_count(), 2);
         assert_eq!(statistics.entry_region_statistics().instruction_count(), 1);
@@ -427,20 +409,18 @@ mod tests {
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
-    /// Verifies that a multi-output instruction assigns the same depth to every output.
     #[test]
     fn test_statistics_multi_output_instruction_outputs_share_depth() {
-        // `TestRegionOperation::WithRegions` infers its outputs from the first attached region's output types, so a
-        // two-output region yields a two-output instruction.
+        // `TestRegionOperation::WithRegions` infers its outputs from the first attached region's output types,
+        // so a two-output region yields a two-output instruction.
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(ArrayType::scalar(F64));
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> = region_builder
             .build(vec![region_input, region_input], vec![Placeholder], vec![Placeholder, Placeholder])
             .unwrap();
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let outputs = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -452,20 +432,17 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(outputs, vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
-
         let statistics = program.statistics();
         assert_eq!(statistics.entry_region_statistics().output_count(), 2);
         assert_eq!(statistics.entry_region_statistics().maximum_output_dependency_depth(), 1);
     }
 
-    /// Verifies deterministic arena ordering and exact attachment edges for a nested region graph.
     #[test]
     fn test_statistics_nested_region_graph_order_and_edges() {
         let leaf = identity_region_program();
-
         let mut middle_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let nested = middle_builder.import_region(leaf.entry_region_ref());
-        let middle_input = middle_builder.add_input(ArrayType::scalar(F64));
+        let middle_input = middle_builder.add_input(ArrayType::scalar(DataType::F64));
         let middle_output = middle_builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -475,10 +452,9 @@ mod tests {
             .unwrap()[0];
         let middle: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             middle_builder.build(vec![middle_output], vec![Placeholder], vec![Placeholder]).unwrap();
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let imported = builder.import_region(middle.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::rule("rule")] }),
@@ -517,14 +493,12 @@ mod tests {
         assert_eq!(statistics.entry_region_statistics().attached_regions()[0].label(), "with_regions.rule");
     }
 
-    /// Verifies that a region attached through two slots of one instruction yields one node and two edges.
     #[test]
     fn test_statistics_shared_region_yields_one_node_and_two_edges() {
         let leaf = identity_region_program();
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let shared = builder.import_region(leaf.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(
@@ -558,15 +532,15 @@ mod tests {
                 },
             ],
         );
+
         // The shared region contributes its (zero) instructions once, so the totals count only the entry.
         assert_eq!(statistics.total_instruction_count(), 1);
     }
 
-    /// Verifies the derived aggregate accessors on a multi-region program.
     #[test]
     fn test_statistics_aggregates_count_shared_regions_once() {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let region_input = region_builder.add_input(ArrayType::scalar(F64));
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_constant = region_builder.add_constant(Array::scalar(1.0));
         let region_output = region_builder
             .add_instruction(TestRegionOperation::Add, vec![], vec![region_input, region_constant])
@@ -576,7 +550,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let shared = builder.import_region(region_program.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let first = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
@@ -603,16 +577,15 @@ mod tests {
         assert_eq!(statistics.total_operation_counts(), BTreeMap::from([("add", 2usize), ("with_regions", 2usize)]));
     }
 
-    /// Verifies the exact serialized form, including field names, arena ordering, index-based edge references, and
-    /// deterministic operation-count key order. Derived values such as region counts, entry indexes, labels, and
-    /// totals must not appear in the serialized form.
     #[test]
     fn test_statistics_serialization() {
+        // This test verifies the exact serialized form, including field names, arena ordering, index-based edge
+        // references, and deterministic operation-count key order. Derived values such as region counts, entry indexes,
+        // labels, and totals must not appear in the serialized form.
         let leaf = identity_region_program();
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body = builder.import_region(leaf.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(F64));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(1.0));
         let added = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, constant]).unwrap()[0];
         let output = builder
@@ -624,7 +597,6 @@ mod tests {
             .unwrap()[0];
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
         let serialized = serde_json::to_string_pretty(&program.statistics()).unwrap();
         assert_eq!(
             serialized,
