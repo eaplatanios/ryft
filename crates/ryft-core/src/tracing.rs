@@ -94,7 +94,7 @@ use ryft_macros::Parameter;
 
 use crate::axes::NamedAxis;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
-use crate::macros::check_builders;
+use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Type, TypeError,
@@ -862,6 +862,57 @@ pub fn infer_output_type<
     V::ExecutionDomain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
 }
 
+impl<
+    T: Type,
+    V: Value<Type = T>,
+    O: Clone + Operation<Type = T>,
+    Input: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<V, Family: ParameterizedFamily<Tracer<TracingContext<V, O>>>>,
+> Program<V, O, Input, Output>
+{
+    /// Specializes this [`Program`] to the provided refined input types by replaying every
+    /// [`Instruction`](crate::Instruction) into a fresh trace, so that type inference propagates the refinements
+    /// through the entire body and the rebuilt program's boundary and instruction output types are exactly as if it had
+    /// been traced at the refined types. The program is returned unchanged when the provided types equal its declared
+    /// input types, and each provided type must refine the corresponding declared type (refer to the documentation of
+    /// [`Type::is_refined_by`] for more information on refinement requirements). Anything else is rejected before the
+    /// replay begins.
+    ///
+    /// Replay refines the boundary and every inferred instruction output type, but never rewrites stored operation
+    /// payloads. An operation whose payload itself stores a type referencing a refined identity re-runs its own
+    /// inference against the refined operands and surfaces its own diagnostic, while payloads that carry geometry
+    /// as explicit operands specialize cleanly.
+    pub fn specialize(self, input_types: &[T]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, self.input_count(), ProgramError);
+        let declared_input_types = self.input_types();
+        if declared_input_types == input_types {
+            return Ok(self);
+        }
+        for (declared, actual) in declared_input_types.iter().zip(input_types) {
+            if !declared.is_refined_by(actual) {
+                return Err(TypeError::invalid(format!(
+                    "specialized input type {actual} does not refine declared input type {declared}",
+                ))
+                .into());
+            }
+        }
+        let (builder, output_ids) = {
+            let context = TracingContext::<V, O>::new();
+            let builder = context.builder().clone();
+            let inputs = Input::To::<Tracer<TracingContext<V, O>>>::from_parameters(
+                self.input_structure().clone(),
+                input_types.iter().cloned().map(|r#type| context.input(r#type)),
+            )
+            .map_err(ProgramError::from)?;
+            let outputs = self.interpret_in_context(&context, inputs)?;
+            let output_ids = outputs.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+            (builder, output_ids)
+        };
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        builder.build(output_ids, self.input_structure.clone(), self.output_structure.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -871,7 +922,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+    };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
@@ -1492,5 +1545,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(3.0)]));
+    }
+
+    #[test]
+    fn test_program_specialize() {
+        let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let (_, program) =
+            EagerContext::<Array, ArrayOperation<Array>>::trace(|x| Ok(x.clone() * x), dynamic_type.clone()).unwrap();
+
+        // Equal input types take the fast path and return the program unchanged.
+        let unchanged = program.clone().specialize(std::slice::from_ref(&dynamic_type)).unwrap();
+        assert_eq!(unchanged.to_string(), program.to_string());
+
+        // Refined input types replay the program so inference propagates the refinement through the entire body.
+        let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let specialized = program.clone().specialize(std::slice::from_ref(&static_type)).unwrap();
+        assert_eq!(specialized.input_types(), vec![static_type.clone()]);
+        assert_eq!(specialized.output_types(), vec![static_type.clone()]);
+        assert_eq!(specialized.interpret(Array::vector(vec![2.0, 3.0, 4.0])), Ok(Array::vector(vec![4.0, 9.0, 16.0])));
+
+        // Non-refining input types are rejected before the replay begins.
+        let unrelated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(7)]));
+        let error = program.specialize(std::slice::from_ref(&unrelated_type)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("specialized input type {unrelated_type} does not refine declared input type {dynamic_type}"),
+        );
     }
 }

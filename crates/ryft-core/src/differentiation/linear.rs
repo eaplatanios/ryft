@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::ops::Range;
 
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
@@ -49,10 +49,10 @@ use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 ///      a static type).
 ///   2. **Capture:** While the primal value is still in scope, linearization records those residuals from it.
 ///      [`Self::capture_zero_residuals`] stages the reads into the program being built (i.e., the program-level
-///      [`Program::linearize`](crate::Program::linearize) path), and [`Self::capture_zero_residual_values`] is its
-///      value-level counterpart for reusable derivative callables that close over concrete or tracer values. Program
-///      transposition appends captured residuals to its ordinary trailing residual suffix. Reusable callables retain
-///      boundary-reconstruction residuals beside that executable program.
+///      [`Program::linearize`] path), and [`Self::capture_zero_residual_values`] is its value-level counterpart for
+///      reusable derivative callables that close over concrete or tracer values. Program transposition appends captured
+///      residuals to its ordinary trailing residual suffix. Reusable callables retain boundary-reconstruction residuals
+///      beside that executable program.
 ///   3. **Spend:** [`Self::zero_operation_with_residuals`] assembles the zero operation and its operands from the
 ///      captured residuals. Callers then stage that operation inside a pullback program or bind it in the originating
 ///      [`Context`] of a reusable value-level derivative callable.
@@ -676,7 +676,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     ///   - `forward`: Function that builds the forward map `v = Lᵣ(u)` from `(residuals, linear_inputs)`.
     ///   - `transpose`: Function that builds the transpose map `ū = Lᵣᵀ(v̄)` from `(residuals, output_cotangents)`.
     pub(crate) fn stage<
-        C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+        C: Context<Type = T, Operation: Clone + From<LinearCallOperation<T>>>,
         ForwardFn: FnOnce(
             &[Tracer<NestedTracingContext<C>>],
             &[Tracer<NestedTracingContext<C>>],
@@ -827,21 +827,41 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("output", transpose_output_axes, linear_axes.len(), ProgramError);
         check_count!("output", transpose.output_ids(), linear_axes.len(), ProgramError);
 
+        // Rebinding the call must reconcile type views that agree only for dense batches. For example, a ragged mapped
+        // operand is packed at its declared bound, so its physical type strictly refines the logical boundary retained
+        // by the structurally batched regions, while `linear_call` inference requires its regions' boundaries to match
+        // the operand types exactly. Both regions are therefore specialized to the packed operand types (which is a
+        // no-op whenever the boundaries already agree, which is true for every dense batch), and the transpose's
+        // cotangent inputs derive from the specialized forward's physical outputs for the same reason. The bound call's
+        // results are plain values that cannot carry batch metadata, so each output carrier is restored through the
+        // driver from the source region's per-item logical output type and the input carriers; wrapping them as bare
+        // `P::batch` carriers would present bound padding as live data.
         let boundary_operands = P::boundary_operands(context.axis_extent());
         let mut packed_inputs = Vec::with_capacity(boundary_operands.len() + input_values.len());
         let boundary_operand_count = boundary_operands.len();
         packed_inputs.extend(boundary_operands);
         packed_inputs.extend(input_values);
-        context
-            .parent()
-            .bind(
-                LinearCallOperation::new(self.residual_count + boundary_operand_count),
-                vec![forward, transpose],
-                packed_inputs.as_slice(),
-            )?
+        let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let forward_output_types = driver.region(0)?.output_types();
+        let forward = forward.specialize(forward_input_types.as_slice())?;
+        let physical_output_types = forward.output_types();
+        let transpose_input_types = packed_inputs[..boundary_operand_count + self.residual_count]
+            .iter()
+            .map(|input| input.r#type().into_owned())
+            .chain(physical_output_types.iter().map(DifferentiableType::cotangent))
+            .collect::<Vec<_>>();
+        let transpose = transpose.specialize(transpose_input_types.as_slice())?;
+        let outputs = context.parent().bind(
+            LinearCallOperation::new(self.residual_count + boundary_operand_count),
+            vec![forward, transpose],
+            packed_inputs.as_slice(),
+        )?;
+        check_count!("output", outputs, output_axes.len(), ProgramError);
+        check_count!("output", forward_output_types, outputs.len(), ProgramError);
+        outputs
             .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| P::batch(output, axis))
+            .zip(output_axes.into_iter().zip(forward_output_types))
+            .map(|(output, (axis, logical_type))| driver.restore_batch(output, axis, &logical_type, inputs))
             .collect()
     }
 }
@@ -1026,7 +1046,7 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 
 impl<
     T: DifferentiableType,
-    C: Context<Type = T, Operation: From<LinearCallOperation<T>>>,
+    C: Context<Type = T, Operation: Clone + From<LinearCallOperation<T>>>,
     P: CotangentBatchingPolicy<C>,
 > BatchableOperation<C, P> for LinearCallOperation<T>
 {
@@ -1035,9 +1055,9 @@ impl<
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
-        self.batch_regions(context, driver, inputs, input_axes)
+        Ok(self.batch_regions(context, driver, inputs, input_axes)?.into())
     }
 }
 
@@ -1915,7 +1935,9 @@ mod tests {
         // "`axis_index` for the device mesh axis 'items' has no eager value").
         let outputs = LinearCallOperation::new(0)
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0))])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]));
@@ -1985,7 +2007,9 @@ mod tests {
                 &driver,
                 &[ArrayBatch::replicated(Array::scalar(2.0)), ArrayBatch::replicated(Array::scalar(4.0))],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &Array::scalar(8.0));
