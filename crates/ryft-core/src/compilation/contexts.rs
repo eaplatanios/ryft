@@ -57,11 +57,16 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// Most domains return the input types unchanged and use them as the key. Backends may instead apply a
     /// semantics-preserving dispatch policy such as bounded-shape bucketing. The returned key must compare equal
     /// exactly when the returned effective types are interchangeable for tracing, lowering, compilation, and calls.
+    ///
+    /// The effective types are returned as a shared slice so that key construction on the retained-dispatch hot path
+    /// never deep-clones the type vector: domains whose key embeds the effective types (e.g., exact dispatch) share
+    /// one allocation between the key and the returned signature, and the caller clones individual types only on a
+    /// specialization miss, when it prepares the staging request.
     fn dispatch_signature(
         &self,
         input_types: Vec<Self::Type>,
         options: &Self::Options,
-    ) -> Result<(Self::DispatchKey, Vec<Self::Type>), Self::Error>;
+    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
 
     /// Traces a fallible function with explicit runtime captures and their symbolic references.
     ///
@@ -1270,7 +1275,7 @@ mod tests {
     }
 
     impl CompilationDomain for TestDomain {
-        type DispatchKey = Vec<ArrayType>;
+        type DispatchKey = Arc<[ArrayType]>;
         type LoweredProgram = Vec<ArrayType>;
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
@@ -1280,7 +1285,8 @@ mod tests {
             &self,
             input_types: Vec<ArrayType>,
             _options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Vec<ArrayType>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+            let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
         }
 

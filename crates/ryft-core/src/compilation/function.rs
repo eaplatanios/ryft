@@ -1,21 +1,18 @@
-use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
-
-use lru::LruCache;
 
 use crate::captures::{CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
-use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, Typed, Value};
+use crate::specialization::{FunctionSpecializationKey, SpecializationCache, SpecializationCacheLookup};
 use crate::tracing::{DomainTracingContext, Tracer};
 
 use super::contexts::CompilationDomain;
@@ -107,7 +104,7 @@ pub trait LoweringRequest<D: CompilationDomain>: Sized {
     fn staged(&self) -> &StagedFunction<D, Self::Input, Self::Output>;
 
     /// Opens runtime captures as leading flat inputs.
-    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>;
+    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError>;
 
     /// Assembles the backend-established lowering.
     fn into_lowered(
@@ -237,15 +234,6 @@ where
     }
 }
 
-/// Host value that participates in retained JIT trace specialization.
-///
-/// Static parameters are ordinary Rust values available to the traced closure. Equal values reuse one specialization;
-/// unequal values trace independently. Runtime arrays and other backend values should remain dynamic inputs rather
-/// than implementing this trait merely because they provide identity equality.
-pub trait Specialization: Clone + Debug + Eq + Hash {}
-
-impl<S: Clone + Debug + Eq + Hash> Specialization for S {}
-
 /// Snapshot of one retained [`JittedFunction`]'s dispatch activity.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct JitCacheStatistics {
@@ -264,13 +252,7 @@ pub struct JitCacheStatistics {
     /// Requests made to the domain compilation context after lowering.
     pub compilation_requests: u64,
 
-    /// Dispatch misses served by a retained trace without rerunning the Rust closure.
-    pub trace_hits: u64,
-
-    /// Dispatch misses served by a retained lowering without rerunning backend lowering.
-    pub lowering_hits: u64,
-
-    /// Total host nanoseconds spent flattening inputs and preparing their abstract types.
+    /// Total host nanoseconds spent flattening inputs and deriving their dispatch signature.
     pub input_abstractification_duration_ns: u64,
 
     /// Total host nanoseconds spent looking up retained specializations.
@@ -284,112 +266,76 @@ pub struct JitCacheStatistics {
 }
 
 struct JitCacheStatisticsState {
-    dispatch_hits: Cell<u64>,
-    dispatch_misses: Cell<u64>,
-    traces: Cell<u64>,
-    lowerings: Cell<u64>,
-    compilation_requests: Cell<u64>,
-    trace_hits: Cell<u64>,
-    lowering_hits: Cell<u64>,
-    input_abstractification_duration_ns: Cell<u64>,
-    dispatch_duration_ns: Cell<u64>,
-    tracing_duration_ns: Cell<u64>,
-    lowering_duration_ns: Cell<u64>,
+    dispatch_hits: AtomicU64,
+    dispatch_misses: AtomicU64,
+    traces: AtomicU64,
+    lowerings: AtomicU64,
+    compilation_requests: AtomicU64,
+    input_abstractification_duration_ns: AtomicU64,
+    dispatch_duration_ns: AtomicU64,
+    tracing_duration_ns: AtomicU64,
+    lowering_duration_ns: AtomicU64,
 }
 
 impl JitCacheStatisticsState {
     fn new() -> Self {
         Self {
-            dispatch_hits: Cell::new(0),
-            dispatch_misses: Cell::new(0),
-            traces: Cell::new(0),
-            lowerings: Cell::new(0),
-            compilation_requests: Cell::new(0),
-            trace_hits: Cell::new(0),
-            lowering_hits: Cell::new(0),
-            input_abstractification_duration_ns: Cell::new(0),
-            dispatch_duration_ns: Cell::new(0),
-            tracing_duration_ns: Cell::new(0),
-            lowering_duration_ns: Cell::new(0),
+            dispatch_hits: AtomicU64::new(0),
+            dispatch_misses: AtomicU64::new(0),
+            traces: AtomicU64::new(0),
+            lowerings: AtomicU64::new(0),
+            compilation_requests: AtomicU64::new(0),
+            input_abstractification_duration_ns: AtomicU64::new(0),
+            dispatch_duration_ns: AtomicU64::new(0),
+            tracing_duration_ns: AtomicU64::new(0),
+            lowering_duration_ns: AtomicU64::new(0),
         }
     }
 
     fn snapshot(&self) -> JitCacheStatistics {
         JitCacheStatistics {
-            dispatch_hits: self.dispatch_hits.get(),
-            dispatch_misses: self.dispatch_misses.get(),
-            traces: self.traces.get(),
-            lowerings: self.lowerings.get(),
-            compilation_requests: self.compilation_requests.get(),
-            trace_hits: self.trace_hits.get(),
-            lowering_hits: self.lowering_hits.get(),
-            input_abstractification_duration_ns: self.input_abstractification_duration_ns.get(),
-            dispatch_duration_ns: self.dispatch_duration_ns.get(),
-            tracing_duration_ns: self.tracing_duration_ns.get(),
-            lowering_duration_ns: self.lowering_duration_ns.get(),
+            dispatch_hits: self.dispatch_hits.load(Ordering::Relaxed),
+            dispatch_misses: self.dispatch_misses.load(Ordering::Relaxed),
+            traces: self.traces.load(Ordering::Relaxed),
+            lowerings: self.lowerings.load(Ordering::Relaxed),
+            compilation_requests: self.compilation_requests.load(Ordering::Relaxed),
+            input_abstractification_duration_ns: self.input_abstractification_duration_ns.load(Ordering::Relaxed),
+            dispatch_duration_ns: self.dispatch_duration_ns.load(Ordering::Relaxed),
+            tracing_duration_ns: self.tracing_duration_ns.load(Ordering::Relaxed),
+            lowering_duration_ns: self.lowering_duration_ns.load(Ordering::Relaxed),
         }
     }
 
     fn clear(&self) {
-        self.dispatch_hits.set(0);
-        self.dispatch_misses.set(0);
-        self.traces.set(0);
-        self.lowerings.set(0);
-        self.compilation_requests.set(0);
-        self.trace_hits.set(0);
-        self.lowering_hits.set(0);
-        self.input_abstractification_duration_ns.set(0);
-        self.dispatch_duration_ns.set(0);
-        self.tracing_duration_ns.set(0);
-        self.lowering_duration_ns.set(0);
+        self.dispatch_hits.store(0, Ordering::Relaxed);
+        self.dispatch_misses.store(0, Ordering::Relaxed);
+        self.traces.store(0, Ordering::Relaxed);
+        self.lowerings.store(0, Ordering::Relaxed);
+        self.compilation_requests.store(0, Ordering::Relaxed);
+        self.input_abstractification_duration_ns.store(0, Ordering::Relaxed);
+        self.dispatch_duration_ns.store(0, Ordering::Relaxed);
+        self.tracing_duration_ns.store(0, Ordering::Relaxed);
+        self.lowering_duration_ns.store(0, Ordering::Relaxed);
     }
 
-    fn add_duration(counter: &Cell<u64>, duration: Duration) {
+    fn increment(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_duration(counter: &AtomicU64, duration: Duration) {
         let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
-        counter.set(counter.get().saturating_add(nanoseconds));
+        counter.fetch_add(nanoseconds, Ordering::Relaxed);
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct JitCacheKey<Dispatch, Static> {
-    static_parameters: Static,
-    input_paths: Vec<ParameterPath>,
-    dispatch: Dispatch,
 }
 
 /// Default number of compiled specializations retained by one [`JittedFunction`].
 const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 
-/// Independent retained-JIT cache capacities.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct JitCacheCapacities {
-    /// Number of traced specializations retained.
-    pub traces: usize,
-    /// Number of backend lowerings retained.
-    pub lowerings: usize,
-    /// Number of compiled direct-dispatch entries retained.
-    pub dispatches: usize,
-}
-
-impl JitCacheCapacities {
-    /// Uses `capacity` for every lifecycle cache.
-    #[inline]
-    pub const fn uniform(capacity: usize) -> Self {
-        Self { traces: capacity, lowerings: capacity, dispatches: capacity }
-    }
-}
-
-impl Default for JitCacheCapacities {
-    fn default() -> Self {
-        Self::uniform(DEFAULT_JIT_CACHE_CAPACITY)
-    }
-}
-
 /// Operation-family capability for representing a call to a staged program.
 ///
 /// The call operation is metadata-only: the callee is a flat program (whose captures have been lifted into leading
 /// inputs) composed into the region driver passed to [`Context::bind`], which interns it as a shared callee root
-/// region by [`Rc`] identity. The concrete operation family decides how that boundary lowers and how batching,
+/// region by [`Arc`] identity. The concrete operation family decides how that boundary lowers and how batching,
 /// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
 /// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
 pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Type> + Sized {
@@ -409,7 +355,7 @@ pub struct StagedFunction<
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
     /// Shared immutable staging metadata. Staged-handle clones are therefore constant-time even for large programs.
-    state: Rc<StagedFunctionState<D, Input, Output>>,
+    state: Arc<StagedFunctionState<D, Input, Output>>,
 }
 
 struct StagedFunctionState<
@@ -433,7 +379,7 @@ struct StagedFunctionState<
     options: Arc<D::Options>,
 
     /// Memoized source program with captures lifted into leading flat inputs.
-    lifted_program: std::cell::OnceCell<Rc<FlatCompilationProgram<D>>>,
+    lifted_program: OnceLock<Arc<FlatCompilationProgram<D>>>,
 }
 
 impl<D, Input, Output> Clone for StagedFunction<D, Input, Output>
@@ -623,11 +569,11 @@ where
 
     /// Returns the source program with runtime captures lifted into leading flat inputs.
     #[doc(hidden)]
-    pub fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError> {
+    pub fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError> {
         if let Some(program) = self.state.lifted_program.get() {
             return Ok(program.clone());
         }
-        let program = Rc::new(self.state.source_program.to_program_with_lifted_captures()?);
+        let program = Arc::new(self.state.source_program.to_program_with_lifted_captures()?);
         Ok(self.state.lifted_program.get_or_init(|| program).clone())
     }
 }
@@ -647,7 +593,7 @@ where
         self
     }
 
-    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError> {
+    fn lifted_program(&self) -> Result<Arc<FlatCompilationProgram<D>>, ProgramError> {
         StagedFunction::lifted_program(self)
     }
 
@@ -1010,9 +956,10 @@ where
 ///
 /// Unlike [`CompiledFunction`], which represents one already-specialized executable, a `JittedFunction` accepts
 /// explicit host-side static parameters and runtime dynamic inputs. Its first call for a specialization traces,
-/// lowers, and requests compilation; later calls with the same static values, parameter paths, and runtime-derived
-/// abstract input types dispatch directly to the retained compiled function. Domain staging may normalize distinct
-/// runtime signatures to the same staged signature, which can produce harmless duplicate dispatch specializations.
+/// lowers, and requests compilation; later calls with the same static values, input parameter structure, and
+/// runtime-derived dispatch signature dispatch directly to the retained executable. Domain staging may normalize
+/// distinct runtime signatures to the same staged signature, which can produce harmless duplicate dispatch
+/// specializations.
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
 /// once per retained specialization, not once per runtime call; observable per-call work must be represented by staged
@@ -1023,39 +970,51 @@ where
 /// programs, executable correctness and reuse still depend on
 /// [`CompilationCacheDomain::compilation_key`](super::contexts::CompilationCacheDomain::compilation_key), which
 /// receives the complete lowering.
+///
+/// Cloned handles share one specialization cache, and the dispatcher is usable from multiple threads whenever the
+/// domain, closure, static parameters, and domain artifact types are thread-safe: `Send`/`Sync` derive structurally
+/// from those field types. Recursive same-thread dispatch of the specialization currently being produced is rejected
+/// with an error, while concurrent cold misses for one specialization on different threads deliberately produce
+/// duplicate frontend work (tracing and lowering are cheap and inserts are idempotent); the domain's shared
+/// [`CompilationContext`](super::contexts::CompilationContext) still coordinates the expensive backend compilation.
 pub struct JittedFunction<
     D: CompilationDomain<Type: Eq + Hash>,
     F,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> {
-    state: Rc<JittedFunctionState<D, F, Static, Input, Output>>,
+> where
+    Input::ParameterStructure: Eq + Hash,
+{
+    state: Arc<JittedFunctionState<D, F, Static, Input, Output>>,
 }
 
 struct JittedFunctionState<
     D: CompilationDomain<Type: Eq + Hash>,
     F,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-> {
+> where
+    Input::ParameterStructure: Eq + Hash,
+{
     domain: D,
     function: F,
     options: D::Options,
-    traces: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, StagedFunction<D, Input, Output>>>,
-    lowerings: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, LoweredFunction<D, Input, Output>>>,
-    specializations: RefCell<LruCache<JitCacheKey<D::DispatchKey, Static>, CompiledFunction<D, Input, Output>>>,
-    in_flight: RefCell<HashSet<JitCacheKey<D::DispatchKey, Static>>>,
+    specializations: SpecializationCache<
+        FunctionSpecializationKey<Input::ParameterStructure, D::DispatchKey, Static>,
+        ExecutableProgram<D, Input, Output>,
+    >,
     statistics: JitCacheStatisticsState,
 }
 
-impl<D, F, Static: Specialization, Input, Output> Clone for JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone for JittedFunction<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant>,
 {
@@ -1064,50 +1023,23 @@ where
     }
 }
 
-struct JitProducerGuard<'a, Key: Eq + Hash> {
-    in_flight: &'a RefCell<HashSet<Key>>,
-    key: Option<Key>,
-}
-
-impl<'a, Key: Eq + Hash> JitProducerGuard<'a, Key> {
-    fn new(in_flight: &'a RefCell<HashSet<Key>>, key: Key) -> Self {
-        Self { in_flight, key: Some(key) }
-    }
-}
-
-impl<Key: Eq + Hash> Drop for JitProducerGuard<'_, Key> {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.in_flight.borrow_mut().remove(&key);
-        }
-    }
-}
-
-impl<D, F, Static: Specialization, Input, Output> JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> JittedFunction<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant>,
 {
-    fn new(domain: &D, function: F, options: D::Options, capacities: JitCacheCapacities) -> Self {
-        let trace_capacity =
-            NonZeroUsize::new(capacities.traces.max(1)).expect("JIT trace cache capacity is clamped to at least one");
-        let lowering_capacity = NonZeroUsize::new(capacities.lowerings.max(1))
-            .expect("JIT lowering cache capacity is clamped to at least one");
-        let dispatch_capacity = NonZeroUsize::new(capacities.dispatches.max(1))
-            .expect("JIT dispatch cache capacity is clamped to at least one");
+    fn new(domain: &D, function: F, options: D::Options, capacity: usize) -> Self {
         Self {
-            state: Rc::new(JittedFunctionState {
+            state: Arc::new(JittedFunctionState {
                 domain: domain.clone(),
                 function,
                 options,
-                traces: RefCell::new(LruCache::new(trace_capacity)),
-                lowerings: RefCell::new(LruCache::new(lowering_capacity)),
-                specializations: RefCell::new(LruCache::new(dispatch_capacity)),
-                in_flight: RefCell::new(HashSet::new()),
+                specializations: SpecializationCache::new(capacity),
                 statistics: JitCacheStatisticsState::new(),
             }),
         }
@@ -1128,22 +1060,13 @@ where
     /// Returns the number of compiled specializations currently retained by this dispatcher.
     #[inline]
     pub fn specialization_count(&self) -> usize {
-        self.state.specializations.borrow().len()
+        self.state.specializations.len()
     }
 
     /// Returns the maximum number of compiled specializations retained by this dispatcher.
     #[inline]
     pub fn cache_capacity(&self) -> usize {
-        self.state.specializations.borrow().cap().get()
-    }
-
-    /// Returns the independent trace, lowering, and dispatch cache capacities.
-    pub fn cache_capacities(&self) -> JitCacheCapacities {
-        JitCacheCapacities {
-            traces: self.state.traces.borrow().cap().get(),
-            lowerings: self.state.lowerings.borrow().cap().get(),
-            dispatches: self.state.specializations.borrow().cap().get(),
-        }
+        self.state.specializations.capacity()
     }
 
     /// Returns a snapshot of this dispatcher's cache activity.
@@ -1161,38 +1084,12 @@ where
     /// Clears every retained specialization without changing statistics.
     #[inline]
     pub fn clear_cache(&self) {
-        self.state.traces.borrow_mut().clear();
-        self.state.lowerings.borrow_mut().clear();
-        self.state.specializations.borrow_mut().clear();
+        self.state.specializations.clear();
     }
 
     /// Invalidates every retained specialization for `static_parameters` and returns the number removed.
     pub fn invalidate_static(&self, static_parameters: &Static) -> usize {
-        let mut keys = HashSet::new();
-        for key in self.state.traces.borrow().iter().map(|(key, _)| key) {
-            if &key.static_parameters == static_parameters {
-                keys.insert(key.clone());
-            }
-        }
-        for key in self.state.lowerings.borrow().iter().map(|(key, _)| key) {
-            if &key.static_parameters == static_parameters {
-                keys.insert(key.clone());
-            }
-        }
-        for key in self.state.specializations.borrow().iter().map(|(key, _)| key) {
-            if &key.static_parameters == static_parameters {
-                keys.insert(key.clone());
-            }
-        }
-        let mut traces = self.state.traces.borrow_mut();
-        let mut lowerings = self.state.lowerings.borrow_mut();
-        let mut specializations = self.state.specializations.borrow_mut();
-        for key in &keys {
-            traces.pop(key);
-            lowerings.pop(key);
-            specializations.pop(key);
-        }
-        keys.len()
+        self.state.specializations.invalidate_where(|key| key.static_parameters() == static_parameters)
     }
 
     /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
@@ -1214,95 +1111,77 @@ where
             Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
     {
         let abstractification_start = Instant::now();
-        let input_paths = inputs.parameter_paths().collect::<Vec<_>>();
         let input_structure = inputs.parameter_structure();
         let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let (dispatch, input_types) = self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
-        let input_types = Input::from_parameters(input_structure, input_types)
-            .map_err(|error| D::Error::from(ProgramError::from(error)))?;
-        let abstractification_duration = abstractification_start.elapsed();
+        let (dispatch, effective_input_types) =
+            self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
         JitCacheStatisticsState::add_duration(
             &self.state.statistics.input_abstractification_duration_ns,
-            abstractification_duration,
+            abstractification_start.elapsed(),
         );
-        let key = JitCacheKey { static_parameters: static_parameters.clone(), input_paths, dispatch };
+        let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch);
 
         let dispatch_start = Instant::now();
-        if let Some(compiled) = self.state.specializations.borrow_mut().get(&key).cloned() {
-            let dispatch_duration = dispatch_start.elapsed();
-            JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_duration);
-            self.state.statistics.dispatch_hits.set(self.state.statistics.dispatch_hits.get().saturating_add(1));
-            return call_function(&self.state.domain, compiled.executable_program(), inputs);
-        }
-
-        let dispatch_duration = dispatch_start.elapsed();
-        JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_duration);
-        self.state
-            .statistics
-            .dispatch_misses
-            .set(self.state.statistics.dispatch_misses.get().saturating_add(1));
-        if !self.state.in_flight.borrow_mut().insert(key.clone()) {
-            return Err(ProgramError::InvalidArgument {
-                message: "recursive JIT dispatch requested a specialization that is already being produced".into(),
+        let lookup = self.state.specializations.lookup(key);
+        JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_start.elapsed());
+        let producer = match lookup {
+            Ok(SpecializationCacheLookup::Hit(executable)) => {
+                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_hits);
+                return call_function(&self.state.domain, &executable, inputs);
             }
-            .into());
-        }
-        let _producer_guard = JitProducerGuard::new(&self.state.in_flight, key.clone());
-
-        let lowered = if let Some(lowered) = self.state.lowerings.borrow_mut().get(&key).cloned() {
-            self.state.statistics.lowering_hits.set(self.state.statistics.lowering_hits.get().saturating_add(1));
-            lowered
-        } else {
-            let staged = if let Some(staged) = self.state.traces.borrow_mut().get(&key).cloned() {
-                self.state.statistics.trace_hits.set(self.state.statistics.trace_hits.get().saturating_add(1));
-                staged
-            } else {
-                self.state.statistics.traces.set(self.state.statistics.traces.get().saturating_add(1));
-                let tracing_start = Instant::now();
-                let staged = match self.state.domain.stage(CompilationStagingRequest::new(
-                    |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
-                    Vec::new(),
-                    input_types,
-                    self.state.options.clone(),
-                )) {
-                    Ok(staged) => {
-                        let duration = tracing_start.elapsed();
-                        JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
-                        staged
-                    }
-                    Err(error) => {
-                        let duration = tracing_start.elapsed();
-                        JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
-                        return Err(error);
-                    }
-                };
-                self.state.traces.borrow_mut().put(key.clone(), staged.clone());
-                staged
-            };
-            self.state.statistics.lowerings.set(self.state.statistics.lowerings.get().saturating_add(1));
-            let lowering_start = Instant::now();
-            let lowered = match self.state.domain.lower(staged) {
-                Ok(lowered) => {
-                    let duration = lowering_start.elapsed();
-                    JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
-                    lowered
+            Ok(SpecializationCacheLookup::Miss(producer)) => {
+                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
+                producer
+            }
+            Err(_) => {
+                JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
+                return Err(ProgramError::InvalidArgument {
+                    message: "recursive JIT dispatch requested a specialization that is already being produced".into(),
                 }
-                Err(error) => {
-                    let duration = lowering_start.elapsed();
-                    JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
-                    return Err(error);
-                }
-            };
-            self.state.lowerings.borrow_mut().put(key.clone(), lowered.clone());
-            lowered
+                .into());
+            }
         };
-        self.state
-            .statistics
-            .compilation_requests
-            .set(self.state.statistics.compilation_requests.get().saturating_add(1));
+
+        let input_types =
+            Input::from_parameters(producer.key().input_structure().clone(), effective_input_types.iter().cloned())
+                .map_err(|error| D::Error::from(ProgramError::from(error)))?;
+        JitCacheStatisticsState::increment(&self.state.statistics.traces);
+        let tracing_start = Instant::now();
+        let staged = match self.state.domain.stage(CompilationStagingRequest::new(
+            |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
+            Vec::new(),
+            input_types,
+            self.state.options.clone(),
+        )) {
+            Ok(staged) => {
+                let duration = tracing_start.elapsed();
+                JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
+                staged
+            }
+            Err(error) => {
+                let duration = tracing_start.elapsed();
+                JitCacheStatisticsState::add_duration(&self.state.statistics.tracing_duration_ns, duration);
+                return Err(error);
+            }
+        };
+        JitCacheStatisticsState::increment(&self.state.statistics.lowerings);
+        let lowering_start = Instant::now();
+        let lowered = match self.state.domain.lower(staged) {
+            Ok(lowered) => {
+                let duration = lowering_start.elapsed();
+                JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
+                lowered
+            }
+            Err(error) => {
+                let duration = lowering_start.elapsed();
+                JitCacheStatisticsState::add_duration(&self.state.statistics.lowering_duration_ns, duration);
+                return Err(error);
+            }
+        };
+        JitCacheStatisticsState::increment(&self.state.statistics.compilation_requests);
         let compiled = self.state.domain.compile(lowered)?;
-        self.state.specializations.borrow_mut().put(key, compiled.clone());
-        call_function(&self.state.domain, compiled.executable_program(), inputs)
+        let executable = producer.insert(compiled.into_executable_program());
+        call_function(&self.state.domain, &executable, inputs)
     }
 }
 
@@ -1316,28 +1195,12 @@ pub fn try_jit_with_options_and_capacity<D, F, Static, Input, Output>(
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
-    try_jit_with_options_and_capacities(domain, function, options, JitCacheCapacities::uniform(capacity))
-}
-
-/// Constructs a retained dispatcher for a fallible closure using explicit options and lifecycle capacities.
-pub fn try_jit_with_options_and_capacities<D, F, Static, Input, Output>(
-    domain: &D,
-    function: F,
-    options: D::Options,
-    capacities: JitCacheCapacities,
-) -> JittedFunction<D, F, Static, Input, Output>
-where
-    D: CompilationDomain,
-    D::Type: Eq + Hash,
-    Static: Specialization,
-    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
-{
-    JittedFunction::new(domain, function, options, capacities)
+    JittedFunction::new(domain, function, options, capacity)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using explicit options.
@@ -1350,11 +1213,12 @@ pub fn try_jit_with_options<D, F, Static, Input, Output>(
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
-    try_jit_with_options_and_capacities(domain, function, options, JitCacheCapacities::default())
+    try_jit_with_options_and_capacity(domain, function, options, DEFAULT_JIT_CACHE_CAPACITY)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using default options.
@@ -1363,8 +1227,9 @@ pub fn try_jit<D, F, Static, Input, Output>(domain: &D, function: F) -> JittedFu
 where
     D: CompilationDomain<Options: Default>,
     D::Type: Eq + Hash,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
     try_jit_with_options(domain, function, D::Options::default())
@@ -1386,9 +1251,10 @@ where
     D: CompilationDomain,
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
 {
@@ -1411,9 +1277,10 @@ where
     D: CompilationDomain<Options: Default>,
     D::Type: Eq + Hash,
     F: Fn(Static, Input::To<CompilationTracer<D>>) -> Output::To<CompilationTracer<D>>,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     Input: Parameterized<D::Type>,
     Input::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+    Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type>,
     Output::Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
 {
@@ -1510,19 +1377,21 @@ where
     let source_program = ClosedProgram::new(program, captures)?;
     let source_program = source_program.without_unused_captures()?;
     Ok(StagedFunction {
-        state: Rc::new(StagedFunctionState {
+        state: Arc::new(StagedFunctionState {
             source_program,
             input_types: input_type_values,
             output_types,
             output_structure,
             options: Arc::new(options),
-            lifted_program: std::cell::OnceCell::new(),
+            lifted_program: OnceLock::new(),
         }),
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1601,7 +1470,7 @@ mod tests {
     }
 
     impl CompilationDomain for TestDomain {
-        type DispatchKey = Vec<ArrayType>;
+        type DispatchKey = Arc<[ArrayType]>;
         type LoweredProgram = TestLoweredProgram;
         type CompiledProgram = TestCompiledProgram;
         type Options = TestOptions;
@@ -1611,7 +1480,8 @@ mod tests {
             &self,
             input_types: Vec<ArrayType>,
             _options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Vec<ArrayType>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayType]>), Self::Error> {
+            let input_types: Arc<[ArrayType]> = input_types.into();
             Ok((input_types.clone(), input_types))
         }
 
@@ -2032,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_parameter_paths_partition_structures() {
+    fn test_jitted_function_input_structures_partition_specializations() {
         let domain = TestDomain::new();
         let function: JittedFunction<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
             try_jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
@@ -2042,6 +1912,31 @@ mod tests {
         assert_eq!(function.call((), vec![Array::scalar(2.0)]).unwrap(), Array::scalar(2.0));
         assert_eq!(function.call((), vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap(), Array::scalar(2.0),);
         assert_eq!(function.specialization_count(), 2);
+    }
+
+    #[test]
+    fn test_jitted_function_distinguishes_inputs_differing_only_in_empty_substructure() {
+        // Both calls flatten to zero leaves, so they share static parameters and an empty dispatch signature. Only
+        // the input parameter structure distinguishes them, while the traced closure branches on the observed
+        // container arity. Key reuse across these calls would therefore silently return the first call's staged
+        // behavior for the second call's structurally different input.
+        let domain = TestDomain::new();
+        let function: JittedFunction<TestDomain, _, (), Vec<Vec<ArrayType>>, Vec<ArrayType>> =
+            try_jit(&domain, |(), inputs: Vec<Vec<CompilationTracer<TestDomain>>>| {
+                if inputs.len() == 1 {
+                    Ok(inputs.into_iter().next().unwrap())
+                } else {
+                    Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() })
+                }
+            });
+
+        assert_eq!(function.call((), vec![Vec::new()]).unwrap(), Vec::new());
+        assert!(matches!(
+            function.call((), Vec::new()),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().traces, 2);
     }
 
     #[test]
@@ -2110,26 +2005,171 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_independent_caches_reuse_lowering_after_dispatch_eviction() {
+    fn test_jitted_function_map_inputs_flatten_deterministically() {
+        // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
+        // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = try_jit_with_options_and_capacities(
+        let function: JittedFunction<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
+            try_jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
+                inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
+            });
+
+        let first = BTreeMap::from([("a", Array::scalar(1.0)), ("b", Array::scalar(2.0))]);
+        let second = BTreeMap::from([("b", Array::scalar(4.0)), ("a", Array::scalar(3.0))]);
+        assert_eq!(function.call((), first).unwrap(), Array::scalar(1.0));
+        assert_eq!(function.call((), second).unwrap(), Array::scalar(3.0));
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_jitted_function_rejects_same_key_recursive_dispatch() {
+        let domain = TestDomain::new();
+        let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
+        let closure_recursive = recursive.clone();
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
+            try_jit(&domain, move |_, input: CompilationTracer<TestDomain>| {
+                if let Some(call) = closure_recursive.borrow().as_ref() {
+                    call()?;
+                }
+                Ok(input)
+            });
+        let function_clone = function.clone();
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(true, Array::scalar(1.0))));
+
+        assert!(matches!(
+            function.call(true, Array::scalar(1.0)),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "recursive JIT dispatch requested a specialization that is already being produced",
+        ));
+        assert_eq!(function.specialization_count(), 0);
+        assert_eq!(function.statistics().dispatch_misses, 2);
+    }
+
+    #[test]
+    fn test_jitted_function_allows_different_key_recursive_dispatch() {
+        let domain = TestDomain::new();
+        let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
+        let closure_recursive = recursive.clone();
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
+            try_jit(&domain, move |nested, input: CompilationTracer<TestDomain>| {
+                if nested {
+                    if let Some(call) = closure_recursive.borrow().as_ref() {
+                        call()?;
+                    }
+                }
+                Ok(input)
+            });
+        let function_clone = function.clone();
+        *recursive.borrow_mut() = Some(Box::new(move || function_clone.call(false, Array::scalar(1.0))));
+
+        assert_eq!(function.call(true, Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(function.specialization_count(), 2);
+        assert_eq!(function.statistics().traces, 2);
+    }
+
+    #[test]
+    fn test_jitted_function_retains_specialization_after_runtime_execution_failure() {
+        let domain = TestDomain::new();
+        let options =
+            TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
+        let function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
+
+        for _ in 0..2 {
+            assert!(matches!(
+                function.call((), Array::scalar(2.0)),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == "runtime input type f64[] does not refine declared type i64[]",
+            ));
+        }
+
+        // The compiled entry is inserted before runtime execution, so an execution failure does not evict it and the
+        // second call dispatches directly to the retained specialization.
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().traces, 1);
+        assert_eq!(function.statistics().dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_jitted_and_staged_functions_are_send_and_sync_for_thread_safe_state() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+        fn assert_dispatcher_send_and_sync<F: Send + Sync>(
+            _function: &JittedFunction<TestDomain, F, bool, ArrayType, ArrayType>,
+        ) {
+            assert_send_and_sync::<JittedFunction<TestDomain, F, bool, ArrayType, ArrayType>>();
+        }
+
+        assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
+        assert_send_and_sync::<LoweredFunction<TestDomain, ArrayType, ArrayType>>();
+        assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
+
+        let domain = TestDomain::new();
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                Ok(if negate { input.unary(NegateOperation) } else { input })
+                if negate { input.unary(NegateOperation) } else { input }
             },
-            TestOptions::default(),
-            JitCacheCapacities { traces: 2, lowerings: 2, dispatches: 1 },
+        );
+        assert_dispatcher_send_and_sync(&function);
+    }
+
+    #[test]
+    fn test_jitted_function_serves_concurrent_warm_calls() {
+        let domain = TestDomain::new();
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+            &domain,
+            |negate, input: CompilationTracer<TestDomain>| {
+                if negate { input.unary(NegateOperation) } else { input }
+            },
+        );
+        function.call(true, Array::scalar(1.0)).unwrap();
+
+        std::thread::scope(|scope| {
+            for index in 0..4 {
+                let function = function.clone();
+                scope.spawn(move || {
+                    let value = f64::from(index);
+                    assert_eq!(function.call(true, Array::scalar(value)).unwrap(), Array::scalar(-value));
+                });
+            }
+        });
+
+        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.statistics().dispatch_hits, 4);
+        assert_eq!(function.statistics().traces, 1);
+    }
+
+    #[test]
+    fn test_jitted_function_concurrent_cold_misses_produce_duplicates_and_one_entry() {
+        let domain = TestDomain::new();
+        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+            &domain,
+            |negate, input: CompilationTracer<TestDomain>| {
+                if negate { input.unary(NegateOperation) } else { input }
+            },
         );
 
-        function.call(false, Array::scalar(1.0)).unwrap();
-        function.call(true, Array::scalar(1.0)).unwrap();
-        function.call(false, Array::scalar(1.0)).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let function = function.clone();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(function.call(true, Array::scalar(3.0)).unwrap(), Array::scalar(-3.0));
+                });
+            }
+        });
 
-        assert_eq!(function.cache_capacities(), JitCacheCapacities { traces: 2, lowerings: 2, dispatches: 1 });
-        assert_eq!(function.statistics().dispatch_misses, 3);
-        assert_eq!(function.statistics().traces, 2);
-        assert_eq!(function.statistics().lowerings, 2);
-        assert_eq!(function.statistics().lowering_hits, 1);
-        assert_eq!(domain.compilation_count(), 2);
+        // Cross-thread same-key cold misses deliberately race and may duplicate frontend production; both inserts are
+        // idempotent and exactly one retained entry remains, while the shared compilation context deduplicates the
+        // backend compilation itself.
+        assert_eq!(function.specialization_count(), 1);
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits + statistics.dispatch_misses, 2);
+        assert!(statistics.traces >= 1 && statistics.traces <= 2);
+        assert_eq!(statistics.traces, statistics.dispatch_misses);
+        assert_eq!(domain.compilation_count(), 1);
     }
 }

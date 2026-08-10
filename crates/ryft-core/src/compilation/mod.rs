@@ -8,24 +8,24 @@
 //! follows the same lifecycle. The following diagram illustrates that lifecycle:
 //!
 //! ```text
-//!                                                  Per-Jitted-Function Caches
-//!                        specialization key = static parameters + input paths + runtime-derived abstract types
+//!                                                Per-Jitted-Function Cache
+//!               specialization key = static parameters + input structure + runtime-derived dispatch signature
 //!
 //! ┌──────────────────────────────┐
 //! │         Rust Closure         │
 //! └──────────────┬───────────────┘
-//!                │ trace
+//!                │ trace on a specialization miss
 //!                ▼
-//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
-//! │ Program                      │ ◀────── store / reuse ───▶ │ Trace Cache                  │
-//! │ Staged Function handle       │                           │ retains Programs             │
-//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//! ┌──────────────────────────────┐
+//! │ Program                      │
+//! │ Staged Function handle       │
+//! └──────────────┬───────────────┘
 //!                │ lower
 //!                ▼
-//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
-//! │ Lowered Program              │ ◀────── store / reuse ───▶ │ Lowering Cache               │
-//! │ Lowered Function handle      │                           │ retains Lowered Programs     │
-//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//! ┌──────────────────────────────┐
+//! │ Lowered Program              │
+//! │ Lowered Function handle      │
+//! └──────────────┬───────────────┘
 //!                │ derive the domain cache key
 //!                ▼
 //! ┌──────────────────────────────┐
@@ -34,21 +34,20 @@
 //! └──────────────┬───────────────┘
 //!                │ restore or compile, then attach metadata
 //!                ▼
-//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
-//! │ Compiled Program             │ ◀────── store / reuse ───▶ │ Dispatch Cache               │
-//! │ Compiled Function handle     │                           │ retains Compiled Programs    │
-//! │ shared through an Arc        │                           │                              │
-//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
+//! │ Executable Program           │ ◀────── store / reuse ───▶ │ Specialization Cache         │
+//! │ shared through an Arc        │                            │ retains Executable Programs  │
+//! └──────────────┬───────────────┘                            └──────────────────────────────┘
 //!                │ call
 //!                ▼
 //! ┌──────────────────────────────┐
 //! │ Runtime Values               │
 //! └──────────────────────────────┘
 //!
-//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
 //! │ Program                      │ ─── embed in outer trace ▶ │ Nested Call Operation        │
-//! │ Staged Function handle       │                           │                              │
-//! └──────────────────────────────┘                           └──────────────────────────────┘
+//! │ Staged Function handle       │                            │                              │
+//! └──────────────────────────────┘                            └──────────────────────────────┘
 //!
 //! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
 //! │ Compiled Program             │ ── discard metadata ────▶ │ Executable Program           │
@@ -98,12 +97,15 @@
 //!
 //! # Specialization and Caching
 //!
-//! [`JittedFunction`] has separate bounded LRU caches for traced, lowered, and compiled specializations. This
-//! frontend cache avoids repeating lifecycle stages for one closure. [`CompilationContext`] is the backend-artifact
-//! cache below it and is shared by every compilation using the same domain handle. A JIT call checks the dispatch
-//! cache first, then the lowering cache, and finally the trace cache; a hit resumes the lifecycle from the retained
-//! artifact shown above, while a miss produces and inserts that artifact. The shared context then resolves the
-//! domain's [`CompilationCacheDomain::CacheKey`] through these tiers:
+//! [`JittedFunction`] keeps one bounded LRU cache of compiled specializations, built on the general
+//! [`SpecializationCache`](crate::specialization::SpecializationCache) primitive and keyed by the static parameters,
+//! the input parameter structure, and the domain's dispatch signature. A hit dispatches directly to the retained
+//! executable; a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
+//! resulting executable. Tracing and lowering are cheap relative to backend compilation, so there are no intermediate
+//! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
+//! [`CompilationContext`] below still deduplicates the expensive backend compile. That context is the
+//! backend-artifact cache shared by every compilation using the same domain handle, and it resolves the domain's
+//! [`CompilationCacheDomain::CacheKey`] through these tiers:
 //!
 //! ```text
 //! Compilation Context lookup (keyed by CompilationCacheDomain::CacheKey)
@@ -178,8 +180,7 @@ pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics,
-    JittedFunction, LoweredFunction, LoweringRequest, Specialization, StageRequest, StagedFunction, call_function, jit,
-    jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacities,
-    try_jit_with_options_and_capacity,
+    CompiledFunction, ExecutableProgram, FlatCompilationProgram, JitCacheStatistics, JittedFunction, LoweredFunction,
+    LoweringRequest, StageRequest, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
+    try_jit_with_options, try_jit_with_options_and_capacity,
 };
