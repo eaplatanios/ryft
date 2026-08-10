@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
@@ -21,7 +21,7 @@ use crate::programs::values::Value;
 /// an optional [`ProgramError`] that can be used to signal a failure during program construction. Non-entry regions
 /// enter a builder only in sealed form: [`import_region`](Self::import_region) copies complete reachable closures
 /// out of immutable regions, [`import_program`](Self::import_program) moves complete owned programs, and
-/// [`intern_callee`](Self::intern_callee) reuses imports by [`Rc`] identity. A region can therefore never
+/// [`intern_callee`](Self::intern_callee) reuses imports by [`Arc`] identity. A region can therefore never
 /// change after an instruction attaches it.
 #[derive(Clone, Debug, Default)]
 pub struct ProgramBuilder<V: Typed + Parameter, O> {
@@ -39,11 +39,11 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// [`Instruction`]s reference them by [`RegionId`].
     pub(crate) regions: RegionArena<V, O>,
 
-    /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Rc`] identity
-    /// (i.e., [`Rc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
-    /// equal but independently built programs remain distinct. Storing the [`Rc`] itself both provides the identity
+    /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Arc`] identity
+    /// (i.e., [`Arc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
+    /// equal but independently built programs remain distinct. Storing the [`Arc`] itself both provides the identity
     /// key and keeps the source alive, so a key can never be reused by a later allocation.
-    pub(crate) callees: Vec<(Rc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
+    pub(crate) callees: Vec<(Arc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
 
     /// [`TypeIdentity`](crate::TypeIdentity)-instantiated shared callees cached by source and caller input [`Type`]s.
     pub(crate) callee_instantiations: Vec<CalleeInstantiation<V, O>>,
@@ -358,7 +358,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     }
 
     /// Interns `callee`, optionally after instantiating its formal [`TypeIdentity`](crate::TypeIdentity)s for
-    /// `input_types`. Without `input_types`, callees are identified by [`Rc`] identity, not structural equality, so
+    /// `input_types`. Without `input_types`, callees are identified by [`Arc`] identity, not structural equality, so
     /// structurally equal but independently built [`Program`]s remain distinct. With `input_types`, repeated exact
     /// instantiations share one imported root. Semantically identical types carrying separately created live identities
     /// remain distinct because those identities are retained by the imported region's boundary and no per-attachment
@@ -366,7 +366,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// callee root.
     pub fn intern_callee(
         &mut self,
-        callee: &Rc<Program<V, O, Vec<V>, Vec<V>>>,
+        callee: &Arc<Program<V, O, Vec<V>, Vec<V>>>,
         input_types: Option<&[V::Type]>,
     ) -> Result<RegionId, ProgramError>
     where
@@ -376,7 +376,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // separate from the plain-callee cache below because the caller input types are part of this cache key.
         let cached_region = input_types.and_then(|input_types| {
             self.callee_instantiations.iter().find_map(|instantiation| {
-                let same_callee = Rc::ptr_eq(&instantiation.callee, callee);
+                let same_callee = Arc::ptr_eq(&instantiation.callee, callee);
                 let same_input_types = instantiation.input_types == input_types;
                 (same_callee && same_input_types).then_some(instantiation.region)
             })
@@ -396,9 +396,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             // A non-identity renaming is embedded in the imported region's types, so it requires its own root.
             self.import_program(callee.rename_type_identities(renaming)?)
         } else {
-            // No renaming, or an identity renaming, can reuse the one plain root interned for this exact `Rc` callee.
+            // No renaming, or an identity renaming, can reuse the one plain root interned for this exact `Arc` callee.
             let existing_region = self.callees.iter().find_map(|(interned, region)| {
-                let same_callee = Rc::ptr_eq(interned, callee);
+                let same_callee = Arc::ptr_eq(interned, callee);
                 same_callee.then_some(*region)
             });
             if let Some(region) = existing_region {
@@ -531,12 +531,12 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 }
 
 /// [`ProgramBuilder`]-private cache record for one imported [`TypeIdentity`](crate::TypeIdentity) instantiation of a
-/// shared callee. The source [`Rc`] supplies a stable identity key and keeps its allocation alive, `input_types`
+/// shared callee. The source [`Arc`] supplies a stable identity key and keeps its allocation alive, `input_types`
 /// identifies the exact instantiated boundary, and `region` points at the corresponding imported root.
 #[derive(Clone, Debug)]
 pub(crate) struct CalleeInstantiation<V: Typed + Parameter, O> {
     /// Shared source callee.
-    pub(crate) callee: Rc<Program<V, O, Vec<V>, Vec<V>>>,
+    pub(crate) callee: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Complete caller input [`Type`]s. An imported [`Region`] carries these exact live identities in its boundary
     /// types, so only another invocation with the same types can reuse it.
@@ -548,7 +548,7 @@ pub(crate) struct CalleeInstantiation<V: Typed + Parameter, O> {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
 
@@ -750,10 +750,10 @@ mod tests {
         assert_eq!(imported.instructions()[0].regions().len(), 1);
         assert_ne!(imported.instructions()[0].regions()[0], first);
 
-        // Callee imports intern by live `Rc` identity: one shared root per live source, while structurally equal
-        // but independently built programs remain distinct.
-        let flat = Rc::new(source.to_flat_program());
-        let equal_but_distinct = Rc::new(flat.as_ref().clone());
+        // Callee imports intern by live `Arc` identity (one shared root per live source, while structurally equal
+        // but independently built programs remain distinct).
+        let flat = Arc::new(source.to_flat_program());
+        let equal_but_distinct = Arc::new(flat.as_ref().clone());
         let mut destination = ProgramBuilder::<Array, TestRegionOperation>::new();
         let first = destination.intern_callee(&flat, None).unwrap();
         let second = destination.intern_callee(&flat, None).unwrap();
@@ -804,7 +804,7 @@ mod tests {
         let mut callee_builder = ProgramBuilder::<ArrayType, ArrayIdentityOperation>::new();
         let first_input = callee_builder.add_input(array_type(formal_first.clone()));
         let second_input = callee_builder.add_input(array_type(formal_second.clone()));
-        let callee = Rc::new(
+        let callee = Arc::new(
             callee_builder
                 .build::<Vec<ArrayType>, Vec<ArrayType>>(
                     vec![first_input, second_input],

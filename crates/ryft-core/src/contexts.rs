@@ -719,6 +719,7 @@ impl<V> ValueResolution<V> {
 pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::Display;
+    use std::sync::Arc;
 
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
@@ -1219,7 +1220,7 @@ pub(crate) mod tests {
         assert_eq!(
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
-                CalleeRegionDriver::new(&[Rc::new(condition), Rc::new(body)]),
+                CalleeRegionDriver::new(&[Arc::new(condition), Arc::new(body)]),
                 &[Array::scalar(1.0)],
             ),
             Ok(vec![Array::scalar(8.0)]),

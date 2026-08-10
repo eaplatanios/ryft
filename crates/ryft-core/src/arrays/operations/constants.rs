@@ -514,6 +514,8 @@ impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> f
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
@@ -576,7 +578,7 @@ mod tests {
     }
 
     impl CompilationDomain for RetainedJitDomain {
-        type DispatchKey = Vec<ArrayIrType>;
+        type DispatchKey = Arc<[ArrayIrType]>;
         type LoweredProgram = FlatCompilationProgram<Self>;
         type CompiledProgram = FlatCompilationProgram<Self>;
         type Options = RetainedJitOptions;
@@ -586,7 +588,8 @@ mod tests {
             &self,
             input_types: Vec<ArrayIrType>,
             _options: &Self::Options,
-        ) -> Result<(Self::DispatchKey, Vec<ArrayIrType>), Self::Error> {
+        ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+            let input_types: Arc<[ArrayIrType]> = input_types.into();
             Ok((input_types.clone(), input_types))
         }
 

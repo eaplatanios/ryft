@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::ops::Index;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -899,18 +900,18 @@ impl<
 }
 
 /// [`BindingRegionDriver`] for shared callee [`Program`]s attached to one [`Context::bind`](crate::Context::bind)
-/// [`Operation`] application. Callees are exposed in the order provided at construction and are interned by [`Rc`]
+/// [`Operation`] application. Callees are exposed in the order provided at construction and are interned by [`Arc`]
 /// identity when imported into a [`StagingContext`](crate::StagingContext), preserving sharing between repeated
 /// references to the same program.
 pub struct CalleeRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Shared callee [`Program`]s in [`Operation`]-defined region order.
-    callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>],
+    callees: &'r [Arc<Program<V, O, Vec<V>, Vec<V>>>],
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> CalleeRegionDriver<'r, V, O> {
     /// Creates a new [`CalleeRegionDriver`].
     #[inline]
-    pub fn new(callees: &'r [Rc<Program<V, O, Vec<V>, Vec<V>>>]) -> Self {
+    pub fn new(callees: &'r [Arc<Program<V, O, Vec<V>, Vec<V>>>]) -> Self {
         Self { callees }
     }
 }
@@ -1741,8 +1742,8 @@ mod tests {
 
     #[test]
     fn test_callee_region_driver() {
-        let callee = Rc::new(identity_program(ArrayType::scalar(DataType::F64)));
-        let callees = [Rc::clone(&callee), callee];
+        let callee = Arc::new(identity_program(ArrayType::scalar(DataType::F64)));
+        let callees = [Arc::clone(&callee), callee];
         let driver = CalleeRegionDriver::new(&callees);
         assert_eq!(
             driver.regions().map(|region| region.input_types()[0].clone()).collect::<Vec<_>>(),
