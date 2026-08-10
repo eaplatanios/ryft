@@ -2798,7 +2798,7 @@ where
         + From<Adjoint>
         + From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        + From<ConstantOperation<DimensionValue>>,
     Forward: Clone + Operation<Type = ArrayType>,
     Adjoint: Operation<Type = ArrayType>,
 {
@@ -2856,6 +2856,7 @@ where
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<DynamicReshapeOperation>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,

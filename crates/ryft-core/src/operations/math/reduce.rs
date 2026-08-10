@@ -567,6 +567,7 @@ where
         + From<DimensionSizeOperation>
         + From<DimensionToScalarOperation>
         + From<LinearCallOperation<ArrayIrType>>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>

@@ -375,6 +375,15 @@ impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOper
     }
 }
 
+// Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
+// can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
+impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        Self::Dimension(DimensionOperation::Constant(operation))
+    }
+}
+
 impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
     A: Value<Type = ArrayType>,

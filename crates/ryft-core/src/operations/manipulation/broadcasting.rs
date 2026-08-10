@@ -15,6 +15,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
@@ -469,8 +470,8 @@ where
         + From<LinearCallOperation<ArrayIrType>>
         + From<DynamicReshapeOperation>
         + From<ZeroOperation<ArrayType>>
-        + OperationProjection<ArrayType, Projected: From<ReduceOperation> + From<TransposeOperation>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<ArrayType, Projected: From<ReduceOperation> + From<TransposeOperation>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,

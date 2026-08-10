@@ -565,6 +565,7 @@ where
         + From<LinearCallOperation<ArrayIrType>>
         + From<PadOperation<ArrayIrType>>
         + From<ZeroOperation<ArrayType>>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<
             ArrayType,
             Projected: From<OneOperation<ArrayType>>

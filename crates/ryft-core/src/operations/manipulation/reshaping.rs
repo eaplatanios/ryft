@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -16,6 +16,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
+use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
 use crate::partial::{
@@ -524,8 +525,8 @@ where
     C::Operation: From<DimensionSizeOperation>
         + From<LinearCallOperation<ArrayIrType>>
         + From<DynamicReshapeOperation>
-        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
         &self,

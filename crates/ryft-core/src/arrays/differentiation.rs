@@ -1,6 +1,5 @@
 use crate::arrays::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching};
 use crate::arrays::dimensions::DimensionValue;
-use crate::arrays::operations::DimensionOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable, Shape};
 use crate::arrays::types::ir::ArrayIrType;
@@ -206,21 +205,16 @@ impl ExactShape {
     }
 
     /// Materializes one first-class dimension value per axis of this shape in `context` (typically an attached region
-    /// body). Static axes stage a [`DimensionOperation`] constant, while dynamic axes clone the residual value their
-    /// slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by operations
-    /// that take one dimension operand per output axis.
+    /// body). Static axes stage a [`DimensionValue`] [`ConstantOperation`], while dynamic axes clone the residual
+    /// value their slot refers to. The result has exactly one value per axis, in axis order, ready to be consumed by
+    /// operations that take one dimension operand per output axis.
     ///
     /// # Parameters
     ///
     ///   - `context`: [`Context`] in which static extents are staged as dimension constants.
     ///   - `residuals`: Residual values owned by `context`, indexed by this plan's residual slots (i.e., the region's
     ///     view of the [`LinearResiduals`] list this shape was built against).
-    pub fn dimensions<
-        C: Context<
-                Type = ArrayIrType,
-                Operation: OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-            >,
-    >(
+    pub fn dimensions<C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>>(
         &self,
         context: &C,
         residuals: &[C::Value],
@@ -229,11 +223,7 @@ impl ExactShape {
             .iter()
             .map(|dimension| match dimension {
                 ExactShapeDimension::Static(extent) => Ok(context
-                    .bind(
-                        DimensionOperation::from(ConstantOperation::new(DimensionValue::constant(*extent)?)),
-                        Vec::new(),
-                        &[],
-                    )?
+                    .bind(ConstantOperation::new(DimensionValue::constant(*extent)?), Vec::new(), &[])?
                     .remove(0)),
                 ExactShapeDimension::Residual(index) => Ok(residuals[*index].clone()),
             })
@@ -368,7 +358,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::DimensionBounds;
     use crate::contexts::{EagerContext, StagingContext};

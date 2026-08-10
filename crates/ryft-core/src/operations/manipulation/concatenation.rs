@@ -383,6 +383,7 @@ where
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>
         + From<LinearCallOperation<ArrayIrType>>
+        + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
