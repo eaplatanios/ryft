@@ -5,6 +5,7 @@ use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType,
     RaggedArrayBatchingPolicy, Shape, Sharding, ShardingDimension,
 };
+use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -642,6 +643,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// Batching rule for [`DotOperation`]: the operands are aligned onto one common mapped axis, the dimension numbers are
 /// lifted past it with [`lift_dot_dimensions`], and the lifted contraction is re-interpreted over the packed values.
 ///
+/// Alignment is delegated to [`ArrayBatchingPolicy::match_axis`], so this rule never needs a statically known mapped
+/// extent: under a dimension-valued policy the batch axis materialized on a replicated operand is grounded by the
+/// transform's first-class extent value, and the staged contraction simply carries that possibly-dynamic mapped
+/// [`Dimension`] on its batching dimension. Two mapped operands must still describe the same mapped extent, which for
+/// dynamic extents means the same [`DimensionVariable`](crate::arrays::DimensionVariable).
+///
 /// A contraction is also a zero-padding-discipline consumer of bounded ragged axes. Every ragged axis of an operand is
 /// either contracted or free:
 ///
@@ -658,8 +665,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// extents along paired batch dimensions, which no dimension identity established here can guarantee. A ragged axis on
 /// a *replicated* operand is rejected as well, because materializing a batch axis on it is a broadcast with no per-item
 /// extents to relocate. Operands without any ragged axis take the dense path unchanged.
-impl<C: Context<Type = ArrayType, Value: Broadcast>, P: RaggedArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for DotOperation
+impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
@@ -685,21 +692,34 @@ where
                 });
             }
         }
-        // Validate the common batch size across both operands (catching mismatched batched operands) before the
-        // mixed arms consult it; a mixed operand pair always has at least one mapped operand.
-        let axis_size = ArrayBatch::common_batch_size(inputs)?;
-        // Mixed batched/unbatched: broadcast the replicated operand to gain a singleton batch
-        // axis at position 0 (JAX's `matchaxis(0)` convention), then fall through to the
-        // both-batched arm of `lift_dot_dimensions`.
-        let mixed_axis_size = || axis_size.expect("a mapped input pins the batch size");
+        // Two mapped operands must describe the same mapped extent. Comparing the mapped [`Dimension`]s validates
+        // static extents exactly as `ArrayBatch::common_batch_size` does, and it additionally admits a dynamic mapped
+        // extent, which two operands share exactly when it is the same dimension variable.
+        let mapped_dimensions = inputs
+            .iter()
+            .zip(batch_axes.iter())
+            .map(|(input, batch_axis)| batch_axis.map(|axis| input.r#type().dimension(axis)))
+            .collect::<Vec<_>>();
+        if let (Some(left), Some(right)) = (&mapped_dimensions[0], &mapped_dimensions[1])
+            && left != right
+        {
+            return Err(match (left.value(), right.value()) {
+                (Some(expected), Some(actual)) => BatchingError::MismatchedBatchSizes { expected, actual },
+                _ => BatchingError::MisalignedBatchAxes {
+                    message: format!(
+                        "'{DOT_OPERATION_NAME}' operands map different batch extents {left} and {right}",
+                    ),
+                },
+            });
+        }
+        // Mixed batched/unbatched: materialize a batch axis on the replicated operand at position 0 (JAX's
+        // `matchaxis(0)` convention), then fall through to the both-batched arm of `lift_dot_dimensions`. The active
+        // policy owns that materialization, so the mapped extent never has to be a statically known host size: under a
+        // dimension-valued policy it stays a first-class extent value grounding the staged broadcast.
         let aligned_inputs: Vec<ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
-            (Some(_), None) => {
-                vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size(), context.axis_sharding().clone())?]
-            }
-            (None, Some(_)) => {
-                vec![inputs[0].broadcast(0, mixed_axis_size(), context.axis_sharding().clone())?, inputs[1].clone()]
-            }
+            (Some(_), None) => vec![inputs[0].clone(), P::match_axis(context, &inputs[1], Axis::from(0))?],
+            (None, Some(_)) => vec![P::match_axis(context, &inputs[0], Axis::from(0))?, inputs[1].clone()],
         };
         let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])

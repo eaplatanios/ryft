@@ -15,21 +15,59 @@ use crate::arrays::arrays::Array;
 use crate::arrays::encoding::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
+use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::operations::math::{ElementAdd, ElementExtremum, ElementMul};
 use crate::arrays::sharding::shardings::Sharding;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape, StaticShape};
+use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::Axis;
 use crate::contexts::EagerContext;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::macros::check_count;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::{
     Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad,
-    Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose,
-    UpdateSlice, Zero,
+    DynamicBroadcastOperation, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode,
+    PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation,
+    ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
+
+impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
+    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for PadOperation<ArrayIrType>
+{
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
+        &self,
+        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
+        driver: &D,
+        inputs: &[ArrayIrValue<A>],
+    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        let expected_input_count = 2 + self.edge_padding_low().len();
+        check_count!("input", inputs, expected_input_count, ProgramError);
+        let input = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+        let padding_value = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[1])?;
+        let output =
+            input.pad(padding_value, self.edge_padding_low(), self.edge_padding_high(), self.interior_padding())?;
+        for (axis, extent) in inputs[2..].iter().enumerate() {
+            let expected_extent = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent();
+            let actual_extent = output.dimension_size(axis)?;
+            if actual_extent != expected_extent {
+                return Err(ProgramError::InvalidArgument {
+                    message: format!(
+                        "'{PAD_OPERATION_NAME}' output axis {axis} has extent {actual_extent}, but its explicit \
+                         extent operand is {expected_extent}",
+                    ),
+                });
+            }
+        }
+        Ok(vec![ArrayIrValue::Array(output)])
+    }
+}
 
 impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroadcast for ArrayIrValue<A> {
     fn dynamic_broadcast_with_output_sharding(

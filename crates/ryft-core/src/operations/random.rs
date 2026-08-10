@@ -3,20 +3,19 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
-    Shape, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
+    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation};
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::scan::ScanOperation;
-use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversion::ConvertElementType;
@@ -280,58 +279,6 @@ impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation
         check_count!("input", inputs, 1, ProgramError);
         let (state, bits) = inputs[0].rng_bit_generator(self.algorithm, &self.output_type)?;
         Ok(vec![state, bits])
-    }
-}
-
-impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>
-    for RngBitGeneratorOperation<ArrayIrType>
-{
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
-        &self,
-        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
-        inputs: &[ArrayIrValue<A>],
-    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
-        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let state = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
-        let mut output_extents = inputs[1..].iter();
-        let concrete_output_dimensions = self
-            .output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| match dimension {
-                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-                Dimension::Dynamic(_) => {
-                    let extent = output_extents.next().unwrap();
-                    Ok(Dimension::Static(
-                        <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent(),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-        let concrete_output_type = self.output_type.clone().with_shape(Shape::new(concrete_output_dimensions));
-        let (advanced_state, bits) = state.rng_bit_generator(self.algorithm, &concrete_output_type)?;
-        for (axis, dimension) in self.output_type.shape().dimensions().iter().enumerate() {
-            if matches!(dimension, Dimension::Dynamic(_)) {
-                let expected_extent =
-                    concrete_output_type.shape().dimensions()[axis].value().expect("the concrete output is static");
-                let actual_extent = bits.dimension_size(axis)?;
-                if actual_extent != expected_extent {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!(
-                            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' bits output axis {axis} has extent {actual_extent}, \
-                             but its explicit extent operand is {expected_extent}",
-                        ),
-                    });
-                }
-            }
-        }
-        Ok(vec![ArrayIrValue::Array(advanced_state), ArrayIrValue::Array(bits)])
     }
 }
 

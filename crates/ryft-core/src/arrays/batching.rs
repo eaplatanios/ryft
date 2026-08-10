@@ -6759,9 +6759,9 @@ mod tests {
         )?;
         assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0])));
 
-        // The mapped batch extent must stay statically known, because the dot rule derives the singleton batch axis it
-        // materializes for a replicated operand from the common batch size. A genuinely dynamic mapped extent is
-        // therefore reported exactly instead of being specialized.
+        // The same composition remains symbolic when the mapped batch extent itself is read from a dynamic input axis.
+        // The contraction aligns its operands through the policy rather than through a host batch size, so the staged
+        // dot simply carries the dynamic mapped dimension on its batching dimension.
         type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let trace = TraceContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
@@ -6769,7 +6769,7 @@ mod tests {
             .input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable.clone())])).into());
         let extents =
             trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch_variable)])).into());
-        let dynamic_extent: Result<Tracer<TraceContext>, BatchingError> = batch(
+        let output = batch(
             |(value, extent)| {
                 let extent = extent.to_dimension(variable.clone())?;
                 let repeated = value.dynamic_broadcast_to(&[extent])?;
@@ -6785,8 +6785,81 @@ mod tests {
             (BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
             None,
+        )?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
+            vec![output.atom_id()?],
+            vec![Placeholder, Placeholder],
+            Placeholder,
+        )?;
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
+            ])?,
+            ArrayIrValue::Array(Array::vector(vec![4.0_f32, 27.0])),
         );
-        assert!(matches!(dynamic_extent, Err(BatchingError::DynamicBatchAxis { .. })));
+
+        Ok(())
+    }
+
+    // TODO(eaplatanios): Move (?) to `ryft_core::arrays::operations::...` where `dot` for arrays is implemented.
+    #[test]
+    fn test_array_ir_dense_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError> {
+        // A plain dense contraction is batched under a dynamic mapped extent as well. The mapped operand keeps the
+        // dynamic batch dimension it already carries, and the replicated right-hand vector gains one through the
+        // policy's dynamic broadcast, whose inserted axis is grounded by the transform's first-class extent value.
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let trace = TraceContext::new();
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
+        let rows = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]),
+            )
+            .into(),
+        );
+        let vector = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+        let output = batch(
+            |(row, vector)| {
+                let row = ValueProjection::<ArrayType>::into_projected(row)?;
+                let vector = ValueProjection::<ArrayType>::into_projected(vector)?;
+                let mut outputs = row.dispatch_domain().bind(
+                    DotOperation::new(DotDimensionNumbers::inner_product()),
+                    Vec::new(),
+                    &[row, vector],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (rows, vector),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            None,
+        )?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
+            vec![output.atom_id()?],
+            vec![Placeholder, Placeholder],
+            Placeholder,
+        )?;
+        // The replicated operand is materialized by a dynamic broadcast against the mapped extent read off the mapped
+        // operand's own axis, and the lifted dot then contracts the trailing axis under a dynamic batching dimension.
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                program(%0: f32[batch, 3], %1: f32[3]) -> f32[batch] {
+                  %2 = dimension_size[axis=0](%0)
+                  %3 = dimension[value=3]()
+                  %4 = dynamic_broadcast[output_axes=[1]](%1, %2, %3)
+                  %5 = dot[dimensions=([1], [1], [0], [0])](%0, %4)
+                  return %5
+                }"},
+        );
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                ArrayIrValue::Array(Array::vector(vec![10.0_f32, 100.0, 1000.0])),
+            ])?,
+            ArrayIrValue::Array(Array::vector(vec![3210.0_f32, 6540.0])),
+        );
 
         Ok(())
     }

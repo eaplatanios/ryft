@@ -3,16 +3,16 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::{align_array_batch, array_dimension};
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    LinearResiduals, Shape, Sharding, materialize_array_tangent,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
+    Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
+    materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
 };
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     ElementwiseDerivativeAlignment, LinearCallOperation, ResidualZeroProvider, TransposableOperation,
@@ -28,7 +28,7 @@ use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
-use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
@@ -361,40 +361,6 @@ impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadO
             self.edge_padding_high.as_slice(),
             self.interior_padding.as_slice(),
         )?])
-    }
-}
-
-impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for PadOperation<ArrayIrType>
-{
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
-        &self,
-        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
-        inputs: &[ArrayIrValue<A>],
-    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
-        let expected_input_count = 2 + self.edge_padding_low.len();
-        check_count!("input", inputs, expected_input_count, ProgramError);
-        let input = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
-        let padding_value = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[1])?;
-        let output =
-            input.pad(padding_value, self.edge_padding_low(), self.edge_padding_high(), self.interior_padding())?;
-        for (axis, extent) in inputs[2..].iter().enumerate() {
-            let expected_extent = <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent();
-            let actual_extent = output.dimension_size(axis)?;
-            if actual_extent != expected_extent {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "'{PAD_OPERATION_NAME}' output axis {axis} has extent {actual_extent}, but its explicit \
-                         extent operand is {expected_extent}",
-                    ),
-                });
-            }
-        }
-        Ok(vec![ArrayIrValue::Array(output)])
     }
 }
 

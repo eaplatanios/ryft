@@ -5,14 +5,74 @@
 //! declared physical layouts are preserved.
 
 use crate::arrays::arrays::Array;
+use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::operations::ArrayIrOperation;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
+use crate::arrays::types::ir::ArrayIrType;
+use crate::contexts::EagerContext;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::random::{
-    RandomAlgorithm, RngBitGenerator, philox_u32_words, philox_u64_words, threefry_u32_words, threefry_u64_words,
+    RNG_BIT_GENERATOR_OPERATION_NAME, RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, philox_u32_words,
+    philox_u64_words, threefry_u32_words, threefry_u64_words,
 };
-use crate::programs::{ProgramError, TypeError, Typed};
+use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review this.
+
+impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
+    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>
+    for RngBitGeneratorOperation<ArrayIrType>
+{
+    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
+        &self,
+        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
+        driver: &D,
+        inputs: &[ArrayIrValue<A>],
+    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
+        if driver.region_count() != 0 {
+            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
+        }
+        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
+        let state = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
+        let mut output_extents = inputs[1..].iter();
+        let concrete_output_dimensions = self
+            .output_type()
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| match dimension {
+                Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
+                Dimension::Dynamic(_) => {
+                    let extent = output_extents.next().unwrap();
+                    Ok(Dimension::Static(
+                        <ArrayIrValue<A> as ValueProjection<DimensionType>>::projected(extent)?.extent(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, TypeError>>()?;
+        let concrete_output_type = self.output_type().clone().with_shape(Shape::new(concrete_output_dimensions));
+        let (advanced_state, bits) = state.rng_bit_generator(self.algorithm(), &concrete_output_type)?;
+        for (axis, dimension) in self.output_type().shape().dimensions().iter().enumerate() {
+            if matches!(dimension, Dimension::Dynamic(_)) {
+                let expected_extent =
+                    concrete_output_type.shape().dimensions()[axis].value().expect("the concrete output is static");
+                let actual_extent = bits.dimension_size(axis)?;
+                if actual_extent != expected_extent {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' bits output axis {axis} has extent {actual_extent}, \
+                             but its explicit extent operand is {expected_extent}",
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(vec![ArrayIrValue::Array(advanced_state), ArrayIrValue::Array(bits)])
+    }
+}
 
 impl RngBitGenerator for Array {
     fn rng_bit_generator(

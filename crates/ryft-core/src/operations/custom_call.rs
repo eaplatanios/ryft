@@ -6,20 +6,19 @@ use std::marker::PhantomData;
 // TODO(eaplatanios): Why this import?
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
-    ArrayIrValue, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout,
-    ShardingDimension, TiledLayout,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Layout, ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     batch_projected_operation,
 };
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::control_flow::scan::ScanOperation;
-use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
@@ -683,58 +682,6 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
     }
 }
 
-impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
-    InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for CustomCallOperation<ArrayIrType>
-{
-    fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
-        &self,
-        _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
-        inputs: &[ArrayIrValue<A>],
-    ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
-        self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
-        let dynamic_output_dimension_count = self
-            .output_types
-            .iter()
-            .flat_map(|output_type| output_type.shape().dimensions())
-            .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-            .count();
-        let array_input_count = inputs.len() - dynamic_output_dimension_count;
-        let array_inputs = inputs[..array_input_count]
-            .iter()
-            .map(<ArrayIrValue<A> as ValueProjection<ArrayType>>::projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_extents = inputs[array_input_count..]
-            .iter()
-            .map(<ArrayIrValue<A> as ValueProjection<DimensionType>>::projected)
-            .collect::<Result<Vec<_>, _>>()?;
-        let kernel_operation = CustomCallOperation::<ArrayType>::from(self.clone());
-        let outputs = A::custom_call(&kernel_operation, array_inputs.iter().copied())?;
-        check_count!("output", outputs, self.output_types.len(), ProgramError);
-        let mut output_extents = output_extents.into_iter();
-        for (output_index, (output, output_type)) in outputs.iter().zip(&self.output_types).enumerate() {
-            for (axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
-                if matches!(dimension, Dimension::Dynamic(_)) {
-                    let expected_extent = output_extents.next().unwrap().extent();
-                    let actual_extent = output.dimension_size(axis)?;
-                    if actual_extent != expected_extent {
-                        return Err(ProgramError::InvalidArgument {
-                            message: format!(
-                                "'{CUSTOM_CALL_OPERATION_NAME}' output {output_index} axis {axis} has extent \
-                                 {actual_extent}, but its explicit extent operand is {expected_extent}",
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-        Ok(outputs.into_iter().map(ArrayIrValue::Array).collect())
-    }
-}
-
 // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`. An all-known
 // custom call folds into the known side (executing there only if the known-side context can run foreign kernels), and a
 // side-effecting residual call survives dead-code elimination because `Operation::effects` is not `Effects::PURE`.
@@ -1105,8 +1052,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatching, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Shape, ShardingDimension, StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension, StridedLayout,
     };
     use crate::batching::{
         BatchAxis, BatchedProgram, BatchingContext, BatchingTracer, ProgramBatchingOutputAxesPolicy,
