@@ -1249,22 +1249,25 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver};
+    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
     use crate::contexts::tests::{
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::DifferentiationError;
     use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::operations::{AddOperation, ConvertElementTypeOperation, MulOperation, ZeroLikeOperation};
+    use crate::operations::{
+        AddOperation, ConvertElementTypeOperation, DimensionFromScalar, DynamicBroadcast, MulOperation, Reduce,
+        ReductionKind, ZeroLikeOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        Effects, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot,
+        Effects, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot, ValueProjection,
     };
     use crate::tracing::TracingContext;
 
@@ -2013,6 +2016,79 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &Array::scalar(8.0));
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_specializes_ragged_region_boundaries() -> Result<(), ProgramError> {
+        // A mapped `dimension_from_scalar` gives each batch item its own extent, so the value entering the linear
+        // call is packed at the declared bound while the structurally batched regions retain the logical dynamic
+        // boundary. Batching must specialize both attached regions to the packed operand types and restore a ragged
+        // carrier for the call's output.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4))?);
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let values = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2)])).into());
+        let output = batch(
+            |(value, extent)| {
+                let extent = extent.to_dimension(variable.clone())?;
+                let repeated = value.dynamic_broadcast_to(&[extent])?;
+                let mut repeated = LinearCallOperation::stage(
+                    repeated.context(),
+                    Vec::new(),
+                    vec![repeated.clone()],
+                    |_, inputs| Ok(inputs.to_vec()),
+                    |_, cotangents| Ok(cotangents.to_vec()),
+                )?;
+                let repeated = ValueProjection::<ArrayType>::into_projected(repeated.remove(0))?;
+                Ok(repeated.reduce(&[0], ReductionKind::Sum).into_value())
+            },
+            (values, extents),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
+            vec![output.atom_id()?],
+            vec![Placeholder, Placeholder],
+            Placeholder,
+        )?;
+
+        // Both attached regions were specialized to the packed operand types. Every array-member boundary type is
+        // the physical bound-shaped storage, with no logical dynamic dimension remaining.
+        let instruction = program
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == "linear_call")
+            .unwrap();
+        for region in instruction.regions() {
+            let region = program.region_ref(*region).unwrap();
+            for r#type in region.input_types().iter().chain(region.output_types().iter()) {
+                if let ArrayIrType::Array(array_type) = r#type {
+                    assert!(array_type.static_shape().is_some(), "{array_type}");
+                }
+            }
+        }
+
+        // The rebuilt transpose is the identity over the physical cotangent, taking the relayed batch extent first.
+        let transpose = program.region_ref(instruction.regions()[1]).unwrap().to_program();
+        let cotangent = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            transpose.interpret(vec![
+                ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+                ArrayIrValue::Array(cotangent.clone()),
+            ])?,
+            vec![ArrayIrValue::Array(cotangent)],
+        );
+
+        // End to end, the masked sums match the per-item logical extents rather than the packed bound.
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])),
+                ArrayIrValue::Array(Array::vector(vec![1_i32, 3])),
+            ])?,
+            ArrayIrValue::Array(Array::vector(vec![2.0_f32, 9.0])),
+        );
+        Ok(())
     }
 
     #[test]
