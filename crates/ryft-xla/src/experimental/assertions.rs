@@ -41,6 +41,9 @@ pub(crate) const ASSERT_BOUNDS_KIND: &str = "bounds";
 /// Formatting kind used for a dynamic concatenation result-extent check.
 pub(crate) const ASSERT_CONCATENATE_KIND: &str = "concatenate";
 
+/// Formatting kind used for a dynamic-shape-slice runtime bounds check.
+pub(crate) const ASSERT_DYNAMIC_SHAPE_SLICE_KIND: &str = "dynamic_shape_slice";
+
 /// Formatting kind used for checked dimension addition.
 pub(crate) const ASSERT_ADD_KIND: &str = "add";
 
@@ -246,6 +249,34 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         let axis = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
         return validate_concatenate(actor, axis, actual, input_extents.as_slice()).map_err(FfiError::invalid_argument);
     }
+    if kind == ASSERT_DYNAMIC_SHAPE_SLICE_KIND {
+        if buffers.len() != 4 {
+            return Err(FfiError::invalid_argument(format!(
+                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice assertion to receive the input \
+                 extent, start, and size"
+            )));
+        }
+        let detail = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
+        let (axis, stride) = detail.split_once(':').ok_or_else(|| {
+            FfiError::invalid_argument(format!(
+                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice detail to contain 'axis:stride'"
+            ))
+        })?;
+        let axis = axis.parse::<usize>().map_err(|_| {
+            FfiError::invalid_argument(format!(
+                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice axis to be an unsigned integer"
+            ))
+        })?;
+        let stride = stride.parse::<usize>().map_err(|_| {
+            FfiError::invalid_argument(format!(
+                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice stride to be an unsigned integer"
+            ))
+        })?;
+        let input_size = scalar_i64(&buffers[1], memory)?;
+        let start = scalar_i64(&buffers[2], memory)?;
+        let size = scalar_i64(&buffers[3], memory)?;
+        return validate_dynamic_shape_slice(axis, stride, input_size, start, size).map_err(FfiError::invalid_argument);
+    }
 
     let arithmetic = matches!(
         kind,
@@ -374,6 +405,33 @@ fn validate_concatenate(actor: &str, axis: &str, actual: i64, input_extents: &[i
              {actual}",
         ))
     }
+}
+
+/// Validates one runtime dynamic-shape-slice axis using the same checked limit calculation as eager execution.
+fn validate_dynamic_shape_slice(
+    axis: usize,
+    stride: usize,
+    input_size: i64,
+    start: i64,
+    size: i64,
+) -> Result<(), String> {
+    let stride = i64::try_from(stride)
+        .map_err(|_| format!("'dynamic_shape_slice' stride is outside the portable dimension range on axis {axis}"))?;
+    let span = if size == 0 {
+        0
+    } else {
+        size.checked_sub(1)
+            .and_then(|size| size.checked_mul(stride))
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| format!("'dynamic_shape_slice' span overflows usize on axis {axis}"))?
+    };
+    let limit = start
+        .checked_add(span)
+        .ok_or_else(|| format!("'dynamic_shape_slice' limit overflows usize on axis {axis}"))?;
+    if limit > input_size {
+        return Err(format!("'dynamic_shape_slice' limit {limit} exceeds input axis {axis} extent {input_size}",));
+    }
+    Ok(())
 }
 
 /// Returns one required string attribute from `call_frame`.
@@ -533,6 +591,28 @@ mod tests {
         assert_eq!(
             validate_concatenate("concatenate", "1", 0, &[i64::MAX, 1]),
             Err("'concatenate' input axis 1 extent sum overflows the portable dimension range".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_validate_dynamic_shape_slice() {
+        assert_eq!(validate_dynamic_shape_slice(1, 2, 8, 1, 3), Ok(()));
+        assert_eq!(validate_dynamic_shape_slice(1, 2, 8, 8, 0), Ok(()));
+        assert_eq!(
+            validate_dynamic_shape_slice(1, 2, 8, 3, 4),
+            Err("'dynamic_shape_slice' limit 10 exceeds input axis 1 extent 8".to_string()),
+        );
+        assert_eq!(
+            validate_dynamic_shape_slice(1, usize::MAX, 8, 0, 2),
+            Err("'dynamic_shape_slice' stride is outside the portable dimension range on axis 1".to_string()),
+        );
+        assert_eq!(
+            validate_dynamic_shape_slice(1, i64::MAX as usize, i64::MAX, 0, 3),
+            Err("'dynamic_shape_slice' span overflows usize on axis 1".to_string()),
+        );
+        assert_eq!(
+            validate_dynamic_shape_slice(1, 1, i64::MAX, i64::MAX, 1),
+            Err("'dynamic_shape_slice' limit overflows usize on axis 1".to_string()),
         );
     }
 }

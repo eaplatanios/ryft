@@ -17,25 +17,25 @@ use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
     ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
-    BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver,
-    CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
-    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
-    CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation, DimensionOperation,
-    DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
-    DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation,
-    DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation, ExpOperation, FloorOperation,
-    GatherOperation, IotaOperation, LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
-    PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, RegionInterface, RegionSlot, RemOperation,
-    ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
-    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver,
-    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
-    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
+    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation,
+    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
+    ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation,
+    DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
+    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, LogOperation, LogisticOperation,
+    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    Operation, OrOperation, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, RegionInterface,
+    RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
 use ryft_macros::Parameter;
 
@@ -797,7 +797,7 @@ where
         context: &BatchingContext<C, ArrayBatching>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
         // all-replicated call binds its original callee unchanged.
@@ -828,11 +828,12 @@ where
             context
                 .parent()
                 .bind(*self, CalleeRegionDriver::new(&[Rc::new(batched_callee)]), &physical_inputs)?;
-        outputs
+        Ok(outputs
             .into_iter()
             .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
-            .collect()
+            .map(|(output, axis)| ArrayBatch::new(output, batch_axis_from_position(axis)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
     }
 }
 
