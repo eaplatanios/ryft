@@ -1278,7 +1278,7 @@ impl OperationEnum {
                     driver: &__D,
                     inputs: &[#batch_type],
                 ) -> ::std::result::Result<
-                    ::std::vec::Vec<#batch_type>,
+                    #ryft::BatchedOutputs<__ParentContext, #batching_policy>,
                     #ryft::BatchingError,
                 > {
                     match self {

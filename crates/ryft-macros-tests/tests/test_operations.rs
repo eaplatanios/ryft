@@ -2365,6 +2365,25 @@ impl<V> ArrayBatch<V> {
     }
 }
 
+/// Stand-in for `ryft_core::BatchedOutputs`. These fixtures observe payload dispatch only, so the stand-in carries a
+/// rule's batches without the real type's operation-local validation evidence.
+struct BatchedOutputs<C: Context, P: BatchingPolicy<C>> {
+    batches: Vec<P::Batch>,
+    marker: PhantomData<fn() -> C>,
+}
+
+impl<C: Context, P: BatchingPolicy<C>> BatchedOutputs<C, P> {
+    fn into_batches(self) -> Vec<P::Batch> {
+        self.batches
+    }
+}
+
+impl<C: Context, P: BatchingPolicy<C>> From<Vec<P::Batch>> for BatchedOutputs<C, P> {
+    fn from(batches: Vec<P::Batch>) -> Self {
+        Self { batches, marker: PhantomData }
+    }
+}
+
 /// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] and its optional
 /// instruction-scoped [`BatchingDriver`] while physical values remain owned by the parent context `C`.
 trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::Type> {
@@ -2373,7 +2392,7 @@ trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::
         context: &BatchingContext<C, P>,
         driver: &D,
         inputs: &[P::Batch],
-    ) -> Result<Vec<P::Batch>, BatchingError>;
+    ) -> Result<BatchedOutputs<C, P>, BatchingError>;
 }
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
@@ -2494,10 +2513,10 @@ impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation
         context: &BatchingContext<C, ArrayBatching<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
         // Ordinary rules execute their lifted work through the parent context.
         let _ = context.parent();
-        Ok(vec![ArrayBatch::labeled("zero")])
+        Ok(vec![ArrayBatch::labeled("zero")].into())
     }
 }
 
@@ -2509,8 +2528,8 @@ impl<Constant: Clone, C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> B
         _context: &BatchingContext<C, ArrayBatching<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("constant")])
+    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("constant")].into())
     }
 }
 
@@ -2525,8 +2544,8 @@ where
         _context: &BatchingContext<C, ArrayBatching<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("dot")])
+    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("dot")].into())
     }
 }
 
@@ -2575,13 +2594,14 @@ impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation
         context: &BatchingContext<C, ArrayBatching<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
         // The rule observes the active frame's axis metadata directly.
         Ok(vec![ArrayBatch::labeled(if context.axis_name().is_some() {
             "collective_like_named"
         } else {
             "collective_like_unnamed"
-        })])
+        })]
+        .into())
     }
 }
 
@@ -2639,8 +2659,8 @@ where
         _context: &BatchingContext<C, ArrayBatching<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("batch_recursive")])
+    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("batch_recursive")].into())
     }
 }
 
@@ -2668,23 +2688,26 @@ fn test_batchable_operation_dispatches_batching_to_payloads() {
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
+    assert_eq!(
+        zero.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        vec![ArrayBatch::labeled("zero")]
+    );
 
     // The `Dot` rule requires `SpecialBatchValue` on the flowing value, transported to this use site by the
     // generated per-variant `BatchableOperation` predicate.
     let dot = Operation::from(DotOperation);
-    assert_eq!(dot.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("dot")]);
+    assert_eq!(dot.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(), vec![ArrayBatch::labeled("dot")]);
 
     // The collective-like rule observes the active frame's axis metadata without any variant-level marker.
     let collective = Operation::from(CollectiveLikeOperation);
     assert_eq!(
-        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
         vec![ArrayBatch::labeled("collective_like_named")],
     );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
     assert_eq!(
-        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
         vec![ArrayBatch::labeled("batch_recursive")],
     );
 }
@@ -2702,17 +2725,20 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    assert_eq!(zero.batch(&context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
+    assert_eq!(
+        zero.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        vec![ArrayBatch::labeled("zero")]
+    );
 
     let collective = Operation::from(CollectiveLikeOperation);
     assert_eq!(
-        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        collective.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
         vec![ArrayBatch::labeled("collective_like_unnamed")],
     );
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
     assert_eq!(
-        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap(),
+        recursive.batch(&context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
         vec![ArrayBatch::labeled("batch_recursive")],
     );
 }
@@ -2737,7 +2763,10 @@ fn test_operation_generates_all_selected_dispatchers() {
         axis_name: None,
         policy: PhantomData,
     };
-    assert_eq!(operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap(), vec![ArrayBatch::labeled("zero")],);
+    assert_eq!(
+        operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
+        vec![ArrayBatch::labeled("zero")],
+    );
 
     let differentiated = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
     assert_eq!(differentiated.len(), 1);
