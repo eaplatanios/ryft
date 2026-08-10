@@ -11,7 +11,7 @@ use std::fmt::Display;
 use half::{bf16, f16};
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -124,11 +124,11 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayBatchingPoli
         _context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination);
         let physical_type = value.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, value, inputs[0].batch_axis())?])
+        Ok(vec![ArrayBatch::new(physical_type, value, inputs[0].batch_axis())?].into())
     }
 }
 
@@ -296,7 +296,11 @@ mod tests {
         .unwrap();
         let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let outputs = operation.batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input)).unwrap();
+        let outputs = operation
+            .batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));

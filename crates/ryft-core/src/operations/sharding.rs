@@ -34,7 +34,8 @@ use std::fmt::Display;
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Sharding, ShardingDimension};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -269,7 +270,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
@@ -285,7 +286,9 @@ where
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ReshardOperation::new(lifted_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
+        Ok(lifted_op
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
     }
 }
 
@@ -478,7 +481,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
@@ -493,7 +496,9 @@ where
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ShardingConstraintOperation::new(lifted_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
+        Ok(lifted_op
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
     }
 }
 

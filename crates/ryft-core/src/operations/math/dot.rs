@@ -6,7 +6,8 @@ use crate::arrays::{
     Sharding, ShardingDimension,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
@@ -648,7 +649,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         // Validate the common batch size across both operands (catching mismatched batched operands) before the
@@ -676,7 +677,9 @@ where
         let lifted_op = DotOperation::new(lifted_dimensions)
             .with_accumulation_type(self.accumulation_type)
             .with_output_sharding(lift_output_sharding(self.output_sharding.as_ref(), output_axis, axis_sharding)?);
-        lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])
+        Ok(lifted_op
+            .interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
     }
 }
 
@@ -1050,10 +1053,10 @@ impl Operation for ScaledDotOperation {
                 input_types.len(),
             )));
         }
-        let lhs = static_scaled_dot_dimensions("'scaled_dot' left operand", &input_types[0])?;
-        let lhs_scales = static_scaled_dot_dimensions("'scaled_dot' left scales", &input_types[1])?;
-        let rhs = static_scaled_dot_dimensions("'scaled_dot' right operand", &input_types[2])?;
-        let rhs_scales = static_scaled_dot_dimensions("'scaled_dot' right scales", &input_types[3])?;
+        let lhs = scaled_dot_dimensions("'scaled_dot' left operand", &input_types[0])?;
+        let lhs_scales = scaled_dot_dimensions("'scaled_dot' left scales", &input_types[1])?;
+        let rhs = scaled_dot_dimensions("'scaled_dot' right operand", &input_types[2])?;
+        let rhs_scales = scaled_dot_dimensions("'scaled_dot' right scales", &input_types[3])?;
         let rank = lhs.len();
         for (descriptor, dimensions) in
             [("left scales", &lhs_scales), ("right operand", &rhs), ("right scales", &rhs_scales)]
@@ -1079,18 +1082,26 @@ impl Operation for ScaledDotOperation {
                 lhs[contracting], rhs[contracting],
             )));
         }
-        if self.block_size == 0 || lhs[contracting] % self.block_size != 0 {
+        let Dimension::Static(contracting_size) = &lhs[contracting] else {
+            return Err(TypeError::invalid(format!(
+                "'scaled_dot' contracting dimension must be static but got {}",
+                lhs[contracting],
+            )));
+        };
+        if self.block_size == 0 || contracting_size % self.block_size != 0 {
             return Err(TypeError::invalid(format!(
                 "'scaled_dot' contracting dimension size {} is not divisible by block size {}",
-                lhs[contracting], self.block_size,
+                contracting_size, self.block_size,
             )));
         }
         for (descriptor, elements, scales) in [("left", &lhs, &lhs_scales), ("right", &rhs, &rhs_scales)] {
             let mut expected = elements.clone();
-            expected[contracting] = elements[contracting] / self.block_size;
+            expected[contracting] = Dimension::Static(contracting_size / self.block_size);
             if *scales != expected {
                 return Err(TypeError::invalid(format!(
-                    "'scaled_dot' {descriptor} scales must have shape {expected:?} but got {scales:?}"
+                    "'scaled_dot' {descriptor} scales must have shape {} but got {}",
+                    Shape::new(expected),
+                    Shape::new(scales.clone()),
                 )));
             }
         }
@@ -1123,10 +1134,10 @@ impl Operation for ScaledDotOperation {
         }
         let mut output_dimensions = Vec::with_capacity(rank);
         if rank == 3 {
-            output_dimensions.push(Dimension::Static(lhs[0]));
+            output_dimensions.push(lhs[0].clone());
         }
-        output_dimensions.push(Dimension::Static(lhs[rank - 2]));
-        output_dimensions.push(Dimension::Static(rhs[rank - 2]));
+        output_dimensions.push(lhs[rank - 2].clone());
+        output_dimensions.push(rhs[rank - 2].clone());
         Ok(vec![ArrayType::new(self.accumulation_type, Shape::new(output_dimensions))])
     }
 
@@ -1363,13 +1374,13 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if inputs.len() != 4 && inputs.len() != 5 {
             return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() }.into());
         }
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             // Every operand is replicated: the lifted operation is the unbatched operation itself.
-            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
         };
         let lhs_primal_rank = inputs[0].r#type().rank() - usize::from(inputs[0].batch_axis_position().is_some());
         if lhs_primal_rank != 2 {
@@ -1395,7 +1406,7 @@ where
         };
         let mut outputs = self.interpret_with_batch_axes(context, aligned_inputs.as_slice(), &[BatchAxis::new(0)])?;
         let Some(global_scale) = mapped_global_scale else {
-            return Ok(outputs);
+            return Ok(outputs.into());
         };
         // A mapped global scale is a per-item `[b]` factor of the `[b, m, n]` result: broadcast it along the batch
         // axis and multiply it into the lifted output.
@@ -1403,7 +1414,7 @@ where
         let output_type = output.r#type().into_owned();
         let broadcast_global_scale = global_scale.value().broadcast(output_type.clone(), &[0])?;
         let scaled_value = output.value().mul(&broadcast_global_scale)?;
-        Ok(vec![ArrayBatch::new(output_type, scaled_value, BatchAxis::new(0))?])
+        Ok(vec![ArrayBatch::new(output_type, scaled_value, BatchAxis::new(0))?].into())
     }
 }
 
@@ -1577,13 +1588,10 @@ where
     elements.convert_element_type(accumulation_type)?.mul(&expanded_scales)
 }
 
-/// Returns the static dimensions of a [`ScaledDot`] operand type, rejecting dynamic shapes and any rank other than
-/// 2 or 3 (the rank-3 form carries one leading batch dimension shared by all operands).
-fn static_scaled_dot_dimensions(descriptor: &str, value_type: &ArrayType) -> Result<Vec<usize>, TypeError> {
-    let Some(shape) = value_type.static_shape() else {
-        return Err(TypeError::invalid(format!("{descriptor} must have a static shape")));
-    };
-    match shape.dimensions() {
+/// Returns the dimensions of a [`ScaledDot`] operand type, rejecting any rank other than 2 or 3. The rank-3 form
+/// carries one leading batch dimension shared by all operands.
+fn scaled_dot_dimensions(descriptor: &str, value_type: &ArrayType) -> Result<Vec<Dimension>, TypeError> {
+    match value_type.shape().dimensions() {
         dimensions @ (&[_, _] | &[_, _, _]) => Ok(dimensions.to_vec()),
         dimensions => Err(TypeError::invalid(format!(
             "{descriptor} must have rank 2 or rank 3 but got rank {}",
@@ -1926,6 +1934,56 @@ mod tests {
             Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))]),
         );
 
+        // Bounded dynamic non-contracting dimensions propagate to the result and must be shared exactly by the
+        // corresponding scale operands. The contracting dimension remains static because its scale relationship is
+        // defined by the block size.
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(7)).unwrap());
+        let dynamic_lhs_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(4)]),
+        );
+        let dynamic_lhs_scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(2)]),
+        );
+        let dynamic_rhs_type = ArrayType::new(
+            DataType::F4E2M1FN,
+            Shape::new(vec![Dimension::Dynamic(columns.clone()), Dimension::Static(4)]),
+        );
+        let dynamic_rhs_scale_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Dynamic(columns.clone()), Dimension::Static(2)]),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[dynamic_lhs_type.clone(), dynamic_lhs_scale_type, dynamic_rhs_type, dynamic_rhs_scale_type,],
+                &[],
+            ),
+            Ok(vec![ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns)]),
+            )]),
+        );
+        let other_rows = DimensionVariable::new("other_rows", rows.bounds().clone());
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    dynamic_lhs_type.clone(),
+                    ArrayType::new(
+                        DataType::F8E4M3FN,
+                        Shape::new(vec![Dimension::Dynamic(other_rows), Dimension::Static(2)]),
+                    ),
+                    rhs_type.clone(),
+                    scale_type.clone(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'scaled_dot' left scales must have shape [rows, 2] but got [other_rows, 2]".to_string(),
+            )),
+        );
+
         // Contract violations report clear errors through type inference.
         assert_eq!(
             ScaledDotOperation::new(3, DataType::F32).infer_output_types(
@@ -1949,6 +2007,30 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid("'scaled_dot' right operand must have rank 2 or rank 3 but got rank 1".to_string())),
+        );
+        let contracting = DimensionVariable::new("contracting", DimensionBounds::non_negative(Some(5)).unwrap());
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    ArrayType::new(
+                        DataType::F4E2M1FN,
+                        Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(contracting.clone())]),
+                    ),
+                    ArrayType::new(
+                        DataType::F8E4M3FN,
+                        Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]),
+                    ),
+                    ArrayType::new(
+                        DataType::F4E2M1FN,
+                        Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(contracting)]),
+                    ),
+                    scale_type.clone(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'scaled_dot' contracting dimension must be static but got contracting".to_string(),
+            )),
         );
 
         // Batching lifts the rank-2 form to the operation's own rank-3 batched form, so the batched program stays a
@@ -2181,7 +2263,9 @@ mod tests {
                     stack(false, &item_rhs_scales, &item_lhs_scales),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), expected);
@@ -2200,7 +2284,9 @@ mod tests {
                     replicated(scales(&item_rhs_scales)).unwrap(),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected_item_1_shared_rhs = element(&item_rhs)
             .scaled_dot(&scales(&item_rhs_scales), &element(&item_rhs), &scales(&item_rhs_scales), 2, DataType::F32)
             .unwrap();
@@ -2222,7 +2308,9 @@ mod tests {
                     replicated(Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])).unwrap(),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), expected.iter().map(|value| value * 2.0).collect::<Vec<_>>());
 
@@ -2242,7 +2330,9 @@ mod tests {
                     ArrayBatch::new(mapped_global_scales.r#type().into_owned(), mapped_global_scales, Some(0)).unwrap(),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected_per_item_scales: Vec<f64> = expected_item_0
             .to_f64s()
             .into_iter()
@@ -3167,7 +3257,8 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = operation.batch(&batching_context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
+        let outputs =
+            operation.batch(&batching_context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap().into_parts().0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         let output_atom = outputs[0].value().atom_id().unwrap();
         drop(outputs);
@@ -3221,7 +3312,11 @@ mod tests {
             let rhs = ArrayBatch::replicated(parent.tracer(rhs_atom, None));
             let context = BatchingContext::new(parent.clone(), 2).with_axis_sharding(ShardingDimension::sharded(["x"]));
 
-            let outputs = DotOperation::matmul().batch(&context, &crate::EmptyRegionDriver, &[lhs, rhs]).unwrap();
+            let outputs = DotOperation::matmul()
+                .batch(&context, &crate::EmptyRegionDriver, &[lhs, rhs])
+                .unwrap()
+                .into_parts()
+                .0;
 
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -3271,7 +3366,9 @@ mod tests {
         let rhs = ArrayBatch::replicated(Array::vector(vec![10.0, 100.0, 1000.0]));
         let outputs = DotOperation::new(DotDimensionNumbers::inner_product())
             .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &crate::EmptyRegionDriver, &[lhs, rhs])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().to_f64s(), vec![3210.0, 6540.0]);

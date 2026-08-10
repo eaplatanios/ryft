@@ -4,7 +4,8 @@ use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape, ShardingDimension,
 };
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
@@ -258,9 +259,11 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()]);
+            return Ok(self
+                .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?
+                .into());
         };
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let batched_inputs = inputs
@@ -284,11 +287,13 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let lifted = SortOperation { axis: self.axis + 1, ..*self };
-        lifted.interpret_with_batch_axes(
-            context,
-            batched_inputs.as_slice(),
-            &vec![BatchAxis::from_position(0); inputs.len()],
-        )
+        Ok(lifted
+            .interpret_with_batch_axes(
+                context,
+                batched_inputs.as_slice(),
+                &vec![BatchAxis::from_position(0); inputs.len()],
+            )?
+            .into())
     }
 }
 

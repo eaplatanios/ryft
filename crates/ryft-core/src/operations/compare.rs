@@ -2,7 +2,7 @@ use std::fmt::Display;
 use std::marker::PhantomData;
 
 use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType};
-use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -202,7 +202,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let [left, right] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
@@ -213,7 +213,8 @@ where
             .bind(self.clone(), Vec::new(), &[left.value().clone(), right.value().clone()])?
             .into_iter()
             .map(ArrayIrBatch::replicated)
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 

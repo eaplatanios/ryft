@@ -8,7 +8,7 @@ use crate::arrays::{
     Shape, ShardingDimension,
 };
 use crate::axes::Axis;
-use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
+use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -385,7 +385,7 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         if inputs[0].batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
@@ -420,7 +420,8 @@ where
         Ok(vec![
             ArrayBatch::new(advanced_states.r#type().into_owned(), advanced_states, Some(0))?,
             ArrayBatch::new(bits.r#type().into_owned(), bits, Some(0))?,
-        ])
+        ]
+        .into())
     }
 }
 
@@ -444,7 +445,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((state, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -489,7 +490,8 @@ where
         outputs.drain(..output_extents.len());
         let bits = outputs.remove(1);
         let advanced_states = outputs.remove(0);
-        Ok(vec![ArrayIrBatch::new(advanced_states, BatchAxis::new(0))?, ArrayIrBatch::new(bits, BatchAxis::new(0))?])
+        Ok(vec![ArrayIrBatch::new(advanced_states, BatchAxis::new(0))?, ArrayIrBatch::new(bits, BatchAxis::new(0))?]
+            .into())
     }
 }
 
@@ -1103,7 +1105,7 @@ mod tests {
         .unwrap();
         let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(1)).unwrap();
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
-        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap();
+        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));
@@ -1130,7 +1132,7 @@ mod tests {
         .unwrap();
         let input = ArrayBatch::new(states.r#type().into_owned(), states, Some(0)).unwrap();
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::Philox, bits_type(5));
-        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap();
+        let outputs = operation.batch(&batching_context(2), &EmptyRegionDriver, &[input]).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));

@@ -21,7 +21,8 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, AxisIndexOperation, NamedAxes, NamedAxis};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    MemberBatchableOperation,
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
@@ -420,10 +421,10 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let parent_operation = C::Operation::from(self.clone());
-            return forward_collective_to_parent(context, parent_operation, inputs);
+            return Ok(forward_collective_to_parent(context, parent_operation, inputs)?.into());
         }
         if self.axis_index_groups.is_some() {
             return Err(BatchingError::UnsupportedOperation {
@@ -433,11 +434,12 @@ where
                 ),
             });
         }
-        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
+        Ok(collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
             // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
             // parent, staged into the enclosing trace under a staging parent.
             context.parent().fill(&factor_type, inverse_axis_size)
-        })
+        })?
+        .into())
     }
 }
 
@@ -3091,13 +3093,13 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
             };
             let (concat_axis, output_batch_axis) =
                 forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);
@@ -3108,12 +3110,13 @@ where
                 self.options.clone(),
                 self.output_variance,
             );
-            return forward_shape_changing_collective(
+            return Ok(forward_shape_changing_collective(
                 context,
                 C::Operation::from(operation),
                 input,
                 Some(output_batch_axis),
-            );
+            )?
+            .into());
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3134,7 +3137,8 @@ where
             input_type.rank(),
             output_extents,
             output_type.sharding().cloned(),
-        )?])
+        )?]
+        .into())
     }
 }
 
@@ -3154,23 +3158,24 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
             };
             let (scatter_axis, output_batch_axis) =
                 forwarded_psum_scatter_axes(self.options.mode, self.scatter_axis, batch_axis);
             let operation = Self::new(self.axis_name.clone(), self.axis_size, scatter_axis, self.options.clone());
-            return forward_shape_changing_collective(
+            return Ok(forward_shape_changing_collective(
                 context,
                 C::Operation::from(operation),
                 input,
                 Some(output_batch_axis),
-            );
+            )?
+            .into());
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3191,7 +3196,8 @@ where
             input_type.rank(),
             output_extents,
             output_type.sharding().cloned(),
-        )?])
+        )?]
+        .into())
     }
 }
 
@@ -3210,9 +3216,9 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
-            return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+            return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3273,7 +3279,7 @@ where
         }
         let permuted = Concatenate::concatenate(&items, 0)?;
         let physical_type = permuted.r#type().into_owned();
-        Ok(vec![ArrayBatch::new(physical_type, permuted, Some(0))?])
+        Ok(vec![ArrayBatch::new(physical_type, permuted, Some(0))?].into())
     }
 }
 
@@ -3294,24 +3300,25 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
             };
             let Some(batch_axis) = input.batch_axis_position() else {
-                return forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs);
+                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
             };
             let (split_axis, concat_axis, output_batch_axis) =
                 forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
             let operation =
                 Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
-            return forward_shape_changing_collective(
+            return Ok(forward_shape_changing_collective(
                 context,
                 C::Operation::from(operation),
                 input,
                 Some(output_batch_axis),
-            );
+            )?
+            .into());
         }
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3332,7 +3339,8 @@ where
             input_type.rank(),
             output_extents,
             output_type.sharding().cloned(),
-        )?])
+        )?]
+        .into())
     }
 }
 
@@ -3402,7 +3410,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
@@ -3410,7 +3418,7 @@ where
 
         if context.axis_name() != Some(self.axis_name()) {
             if array.batch_axis().is_replicated() {
-                return forward_explicit_collective(self.clone(), context, array, output_extents, None);
+                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_concat_axis, output_batch_axis) =
@@ -3422,7 +3430,14 @@ where
                 self.options().clone(),
                 self.output_variance(),
             );
-            return forward_explicit_collective(operation, context, array, output_extents, Some(output_batch_axis));
+            return Ok(forward_explicit_collective(
+                operation,
+                context,
+                array,
+                output_extents,
+                Some(output_batch_axis),
+            )?
+            .into());
         }
 
         let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
@@ -3451,7 +3466,8 @@ where
         )?;
         Ok(vec![ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(
             output.into_value(),
-        ))])
+        ))]
+        .into())
     }
 }
 
@@ -3479,7 +3495,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_psum_scatter_output_types(self, logical_input_types.as_slice())?;
@@ -3487,7 +3503,7 @@ where
 
         if context.axis_name() != Some(self.axis_name()) {
             if array.batch_axis().is_replicated() {
-                return forward_explicit_collective(self.clone(), context, array, output_extents, None);
+                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_scatter_axis, output_batch_axis) =
@@ -3498,7 +3514,14 @@ where
                 physical_scatter_axis,
                 self.options().clone(),
             );
-            return forward_explicit_collective(operation, context, array, output_extents, Some(output_batch_axis));
+            return Ok(forward_explicit_collective(
+                operation,
+                context,
+                array,
+                output_extents,
+                Some(output_batch_axis),
+            )?
+            .into());
         }
 
         let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
@@ -3526,8 +3549,9 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         let batch_axis = output.batch_axis();
-        ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
-            .map(|output| vec![output])
+        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])?
+            .into())
     }
 }
 
@@ -3555,7 +3579,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
@@ -3563,7 +3587,7 @@ where
 
         if context.axis_name() != Some(self.axis_name()) {
             if array.batch_axis().is_replicated() {
-                return forward_explicit_collective(self.clone(), context, array, output_extents, None);
+                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
             }
             let input_batch_axis = array.batch_axis_position().unwrap();
             let (physical_split_axis, physical_concat_axis, output_batch_axis) = forwarded_all_to_all_axes(
@@ -3579,7 +3603,14 @@ where
                 physical_concat_axis,
                 self.options().clone(),
             );
-            return forward_explicit_collective(operation, context, array, output_extents, Some(output_batch_axis));
+            return Ok(forward_explicit_collective(
+                operation,
+                context,
+                array,
+                output_extents,
+                Some(output_batch_axis),
+            )?
+            .into());
         }
 
         let array_type = <&ArrayType>::try_from(array.value().r#type().as_ref())?.clone();
@@ -3607,8 +3638,9 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         let batch_axis = output.batch_axis();
-        ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
-            .map(|output| vec![output])
+        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])?
+            .into())
     }
 }
 
@@ -3794,7 +3826,9 @@ mod tests {
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
             .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().to_f64s(), vec![6.0]);
@@ -3809,7 +3843,9 @@ mod tests {
         .unwrap();
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax)
             .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().to_f64s(), vec![4.0]);
@@ -3830,7 +3866,9 @@ mod tests {
             .with_axis_name("data".to_string());
         let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
             .batch(&context, &crate::EmptyRegionDriver, &[input])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         let values = outputs[0].value().to_f64s();
@@ -3844,7 +3882,9 @@ mod tests {
         let input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
         let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
             .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 3.0]);
@@ -4569,7 +4609,9 @@ mod tests {
             AllGatherOutputVariance::Varying,
         )
         .batch(&context, &crate::EmptyRegionDriver, &[ArrayBatch::replicated(Array::vector(vec![1.0, 2.0]))])
-        .unwrap();
+        .unwrap()
+        .into_parts()
+        .0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0, 2.0, 1.0, 2.0]);
@@ -4596,20 +4638,26 @@ mod tests {
             AllGatherOutputVariance::Varying,
         )
         .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
-        .unwrap();
+        .unwrap()
+        .into_parts()
+        .0;
         assert_eq!(gathered[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(gathered[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
 
         let scattered = PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default())
             .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(scattered[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(scattered[0].value(), &Array::vector(vec![4.0_f32, 6.0]));
         assert_eq!(scattered[0].unbatched_type(), ArrayType::scalar(DataType::F32));
 
         let exchanged = AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::default())
             .batch(&context, &crate::EmptyRegionDriver, &[mapped_matrix()])
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(exchanged[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(exchanged[0].value(), &Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0]),);
     }

@@ -2,7 +2,8 @@ use std::fmt::Display;
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape, Sharding};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, InterpretableBatchableOperation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
@@ -238,7 +239,7 @@ impl Operation for DotProductAttentionOperation {
                 DOT_PRODUCT_ATTENTION_OPERATION_NAME,
                 &input_types[input_types.len() - 2],
                 &input_types[input_types.len() - 1],
-                dimensions.batch,
+                &dimensions.batch,
             )?;
         }
         validated_dropout(DOT_PRODUCT_ATTENTION_OPERATION_NAME, self.dropout)?;
@@ -411,7 +412,7 @@ impl Operation for DotProductAttentionBackwardOperation {
                 DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
                 &input_types[input_types.len() - 2],
                 &input_types[input_types.len() - 1],
-                dimensions.batch,
+                &dimensions.batch,
             )?;
         }
         validated_dropout(DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, self.dropout)?;
@@ -471,38 +472,37 @@ impl Operation for DotProductAttentionBackwardOperation {
     }
 }
 
-/// Returns the static `[batch, sequence, heads, head_dim]` dimensions of an attention operand type, rejecting
-/// dynamic shapes and any rank other than 4.
-fn static_attention_dimensions(
+/// Returns the `[batch, sequence, heads, head_dim]` dimensions of an attention operand type, rejecting any rank other
+/// than 4.
+fn attention_dimensions(
     operation_name: &str,
     descriptor: &str,
     value_type: &ArrayType,
-) -> Result<[usize; 4], TypeError> {
-    let Some(shape) = value_type.static_shape() else {
-        return Err(TypeError::invalid(format!("'{operation_name}' {descriptor} must have a static shape")));
-    };
-    match *shape.dimensions() {
-        [batch, sequence, heads, head_dimension] => Ok([batch, sequence, heads, head_dimension]),
-        ref dimensions => Err(TypeError::invalid(format!(
+) -> Result<[Dimension; 4], TypeError> {
+    match value_type.shape().dimensions() {
+        [batch, sequence, heads, head_dimension] => {
+            Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
+        }
+        dimensions => Err(TypeError::invalid(format!(
             "'{operation_name}' {descriptor} must have rank 4 but got rank {}",
             dimensions.len(),
         ))),
     }
 }
 
-/// Validated static dimensions shared by the attention operations' operand contracts.
+/// Validated dimensions shared by the attention operations' operand contracts.
 struct AttentionDimensions {
     /// Shared batch dimension of every operand.
-    batch: usize,
+    batch: Dimension,
 
     /// Query sequence length.
-    query_sequence: usize,
+    query_sequence: Dimension,
 
     /// Number of query heads.
     query_heads: usize,
 
     /// Key/value sequence length.
-    key_value_sequence: usize,
+    key_value_sequence: Dimension,
 
     /// Number of key/value heads; divides `query_heads`, with grouped-query attention when strictly smaller.
     key_value_heads: usize,
@@ -512,6 +512,48 @@ struct AttentionDimensions {
 
     /// Shared floating-point operand data type.
     data_type: DataType,
+}
+
+/// Static dimensions used by the eager attention compositions after their concrete operands refine the staged
+/// signature.
+struct StaticAttentionDimensions {
+    /// Shared batch dimension of every operand.
+    batch: usize,
+
+    /// Number of query heads.
+    query_heads: usize,
+
+    /// Key/value sequence length.
+    key_value_sequence: usize,
+
+    /// Number of key/value heads.
+    key_value_heads: usize,
+
+    /// Head dimension of every operand.
+    head_dimension: usize,
+
+    /// Shared operand data type.
+    data_type: DataType,
+}
+
+impl AttentionDimensions {
+    /// Converts these dimensions to their concrete eager form, rejecting a dynamic dimension if one unexpectedly
+    /// survives concrete value binding.
+    fn into_static(self, operation_name: &str) -> Result<StaticAttentionDimensions, TypeError> {
+        let static_extent = |descriptor: &str, dimension: Dimension| {
+            dimension.value().ok_or_else(|| {
+                TypeError::invalid(format!("'{operation_name}' {descriptor} remained dynamic during eager execution"))
+            })
+        };
+        Ok(StaticAttentionDimensions {
+            batch: static_extent("batch dimension", self.batch)?,
+            query_heads: self.query_heads,
+            key_value_sequence: static_extent("key/value sequence dimension", self.key_value_sequence)?,
+            key_value_heads: self.key_value_heads,
+            head_dimension: self.head_dimension,
+            data_type: self.data_type,
+        })
+    }
 }
 
 /// Validates the shared operand contract of the attention operations — the `BTNH` query/key/value shapes and data
@@ -527,9 +569,9 @@ fn validated_attention_operands(
     mask: AttentionMask,
     sliding_window: Option<usize>,
 ) -> Result<AttentionDimensions, TypeError> {
-    let query = static_attention_dimensions(operation_name, "query", query_type)?;
-    let key = static_attention_dimensions(operation_name, "key", key_type)?;
-    let value = static_attention_dimensions(operation_name, "value", value_type)?;
+    let query = attention_dimensions(operation_name, "query", query_type)?;
+    let key = attention_dimensions(operation_name, "key", key_type)?;
+    let value = attention_dimensions(operation_name, "value", value_type)?;
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
@@ -570,20 +612,35 @@ fn validated_attention_operands(
             value[2], key[2],
         )));
     }
-    if key[2] == 0 || query[2] % key[2] != 0 {
+    let Dimension::Static(query_heads) = &query[2] else {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' query heads dimension must be static but got {}",
+            query[2],
+        )));
+    };
+    let Dimension::Static(key_value_heads) = &key[2] else {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' key/value heads dimension must be static but got {}",
+            key[2],
+        )));
+    };
+    let Dimension::Static(head_dimension) = &query[3] else {
+        return Err(TypeError::invalid(format!(
+            "'{operation_name}' head dimension must be static but got {}",
+            query[3],
+        )));
+    };
+    if *key_value_heads == 0 || *query_heads % *key_value_heads != 0 {
         return Err(TypeError::invalid(format!(
             "'{operation_name}' key/value heads dimension ({}) must divide the query heads dimension ({})",
-            key[2], query[2],
+            key_value_heads, query_heads,
         )));
     }
     if let Some(bias_type) = bias_type {
-        let Some(bias_shape) = bias_type.static_shape() else {
-            return Err(TypeError::invalid(format!("'{operation_name}' bias must have a static shape")));
-        };
-        let [bias_batch, bias_heads, bias_rows, bias_columns] = *bias_shape.dimensions() else {
+        let [bias_batch, bias_heads, bias_rows, bias_columns] = bias_type.shape().dimensions() else {
             return Err(TypeError::invalid(format!(
                 "'{operation_name}' bias must have rank 4 but got rank {}",
-                bias_shape.dimensions().len(),
+                bias_type.rank(),
             )));
         };
         if bias_type.data_type() != data_type {
@@ -592,28 +649,28 @@ fn validated_attention_operands(
                 bias_type.data_type(),
             )));
         }
-        if bias_batch != 1 && bias_batch != query[0] {
+        if bias_batch != &Dimension::Static(1) && bias_batch != &query[0] {
             return Err(TypeError::invalid(format!(
                 "'{operation_name}' bias batch dimension ({bias_batch}) must be 1 or match the query batch \
                      dimension ({})",
                 query[0],
             )));
         }
-        if bias_heads != 1 && bias_heads != query[2] {
+        if bias_heads != &Dimension::Static(1) && bias_heads != &query[2] {
             return Err(TypeError::invalid(format!(
                 "'{operation_name}' bias heads dimension ({bias_heads}) must be 1 or match the query heads \
                      dimension ({})",
                 query[2],
             )));
         }
-        if bias_rows != query[1] {
+        if bias_rows != &query[1] {
             return Err(TypeError::invalid(format!(
                 "'{operation_name}' bias query-sequence dimension ({bias_rows}) does not match the query \
                      sequence dimension ({})",
                 query[1],
             )));
         }
-        if bias_columns != key[1] {
+        if bias_columns != &key[1] {
             return Err(TypeError::invalid(format!(
                 "'{operation_name}' bias key/value-sequence dimension ({bias_columns}) does not match the key \
                      sequence dimension ({})",
@@ -631,24 +688,24 @@ fn validated_attention_operands(
         _ => {}
     }
     Ok(AttentionDimensions {
-        batch: query[0],
-        query_sequence: query[1],
-        query_heads: query[2],
-        key_value_sequence: key[1],
-        key_value_heads: key[2],
-        head_dimension: query[3],
+        batch: query[0].clone(),
+        query_sequence: query[1].clone(),
+        query_heads: *query_heads,
+        key_value_sequence: key[1].clone(),
+        key_value_heads: *key_value_heads,
+        head_dimension: *head_dimension,
         data_type,
     })
 }
 
 /// Validates the optional trailing pair of `i32[batch]` sequence-length operands shared by the attention
-/// operations: each operand must be a statically shaped rank-1 `i32` vector whose size matches the shared batch
-/// dimension. Refer to the documentation of [`DotProductAttentionOperation`] for the padding semantics.
+/// operations: each operand must be a rank-1 `i32` vector whose dimension exactly matches the shared batch dimension.
+/// Refer to the documentation of [`DotProductAttentionOperation`] for the padding semantics.
 fn validated_sequence_length_operands(
     operation_name: &str,
     query_lengths_type: &ArrayType,
     key_value_lengths_type: &ArrayType,
-    batch: usize,
+    batch: &Dimension,
 ) -> Result<(), TypeError> {
     for (descriptor, value_type) in
         [("query sequence lengths", query_lengths_type), ("key/value sequence lengths", key_value_lengths_type)]
@@ -659,10 +716,7 @@ fn validated_sequence_length_operands(
                 value_type.data_type(),
             )));
         }
-        let Some(shape) = value_type.static_shape() else {
-            return Err(TypeError::invalid(format!("'{operation_name}' {descriptor} must have a static shape")));
-        };
-        match *shape.dimensions() {
+        match value_type.shape().dimensions() {
             [size] if size == batch => {}
             [size] => {
                 return Err(TypeError::invalid(format!(
@@ -702,7 +756,12 @@ fn static_shape(dimensions: &[usize]) -> Shape {
 fn attention_output_type(dimensions: &AttentionDimensions) -> ArrayType {
     ArrayType::new(
         dimensions.data_type,
-        static_shape(&[dimensions.batch, dimensions.query_sequence, dimensions.query_heads, dimensions.head_dimension]),
+        Shape::new(vec![
+            dimensions.batch.clone(),
+            dimensions.query_sequence.clone(),
+            Dimension::Static(dimensions.query_heads),
+            Dimension::Static(dimensions.head_dimension),
+        ]),
     )
 }
 
@@ -712,7 +771,11 @@ fn attention_output_type(dimensions: &AttentionDimensions) -> ArrayType {
 fn attention_activation_type(dimensions: &AttentionDimensions, query_type: &ArrayType) -> Result<ArrayType, TypeError> {
     let activation_type = ArrayType::new(
         DataType::F32,
-        static_shape(&[dimensions.batch, dimensions.query_heads, dimensions.query_sequence]),
+        Shape::new(vec![
+            dimensions.batch.clone(),
+            Dimension::Static(dimensions.query_heads),
+            dimensions.query_sequence.clone(),
+        ]),
     );
     let Some(query_sharding) = query_type.sharding() else {
         return Ok(activation_type);
@@ -1031,9 +1094,9 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let bias_index = matches!(inputs.len(), 4 | 6).then_some(3);
-        batch_attention_merge_reshape(self, context, inputs, bias_index, None)
+        Ok(batch_attention_merge_reshape(self, context, inputs, bias_index, None)?.into())
     }
 }
 
@@ -1050,9 +1113,9 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let bias_index = matches!(inputs.len(), 7 | 9).then_some(3);
-        batch_attention_merge_reshape(self, context, inputs, bias_index, bias_index)
+        Ok(batch_attention_merge_reshape(self, context, inputs, bias_index, bias_index)?.into())
     }
 }
 
@@ -1419,7 +1482,7 @@ where
 /// `group = heads / kv_heads`) and reshapes to `[batch, kv_seq, heads, head_dim]`, so each key/value head is
 /// repeated `group` times consecutively and query head `i` attends key/value head `i / group`. Operands that
 /// already carry one key/value head per query head are returned unchanged.
-fn expand_key_value_heads<V>(operand: &V, dimensions: &AttentionDimensions) -> Result<V, ProgramError>
+fn expand_key_value_heads<V>(operand: &V, dimensions: &StaticAttentionDimensions) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayType> + Broadcast + Reshape,
 {
@@ -1646,7 +1709,8 @@ where
         bias_type.as_ref(),
         mask,
         sliding_window,
-    )?;
+    )?
+    .into_static(DOT_PRODUCT_ATTENTION_OPERATION_NAME)?;
     let data_type = dimensions.data_type;
     let expanded_key = expand_key_value_heads(key, &dimensions)?;
     let expanded_value = expand_key_value_heads(value, &dimensions)?;
@@ -1778,7 +1842,8 @@ where
         bias_type.as_ref(),
         mask,
         sliding_window,
-    )?;
+    )?
+    .into_static(DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME)?;
     let data_type = dimensions.data_type;
     let softmax_type = attention_softmax_data_type(data_type);
     let expanded_key = expand_key_value_heads(key, &dimensions)?;
@@ -1870,8 +1935,8 @@ where
         // The bias enters the logits unscaled, so its cotangent is `dS` summed over the bias's broadcast leading
         // dimensions and reshaped back to the bias shape.
         let bias_type = bias.r#type().into_owned();
-        let bias_dimensions =
-            static_attention_dimensions(DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, "bias", &bias_type)?;
+        let bias_dimensions = attention_dimensions(DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME, "bias", &bias_type)?
+            .map(|dimension| dimension.value().unwrap());
         let logit_dimensions = [dimensions.batch, dimensions.query_heads];
         let reduce_axes =
             (0..2).filter(|&axis| bias_dimensions[axis] == 1 && logit_dimensions[axis] != 1).collect::<Vec<_>>();
@@ -2163,12 +2228,10 @@ where
                 )?;
             // The sequence lengths are non-differentiated `i32` inputs, so their cotangents are structural zeros of
             // the first-class zero-space cotangent type that non-differentiable types carry. The nullary zero is the
-            // only available construction and is sufficient here because a dynamically shaped lengths vector cannot
-            // reach this point: `DotProductAttentionOperation::infer_output_types` rejects every non-static operand
-            // shape (refer to `validated_sequence_length_operands` and `static_attention_dimensions`), so the
-            // static-shape requirement is part of the attention operations' own public contract rather than an
-            // assumption of this rule. A future dynamically shaped attention would have to read those extents
-            // explicitly through a mixed entry point.
+            // only available construction and is sufficient here because the sequence-length vectors share the
+            // attention batch dimension. Dynamically shaped lengths therefore require the same first-class batch
+            // extent as the query, which a future mixed differentiation entry point must retain explicitly; the
+            // homogeneous rule cannot synthesize that extent from an array-only boundary.
             let zero_cotangent = |lengths: &DomainTracer<D>| lengths.context().zero(&lengths.r#type().cotangent());
             let query_lengths_cotangent = zero_cotangent(&query_lengths)?;
             let key_value_lengths_cotangent = zero_cotangent(&key_value_lengths)?;
@@ -2380,6 +2443,71 @@ mod tests {
         assert_eq!(
             backward.with_sliding_window(2).to_string(),
             "dot_product_attention_backward [scale=0.5, mask=causal, sliding_window=2]",
+        );
+
+        // Bounded dynamic sequence dimensions propagate through both forward results while head counts and the head
+        // dimension remain static. Sequence-length operands share the batch dimension but do not need a wholly
+        // static shape.
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(4)).unwrap());
+        let query_sequence = DimensionVariable::new("query_sequence", DimensionBounds::non_negative(Some(5)).unwrap());
+        let key_value_sequence =
+            DimensionVariable::new("key_value_sequence", DimensionBounds::non_negative(Some(7)).unwrap());
+        let query_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(batch.clone()),
+                Dimension::Dynamic(query_sequence.clone()),
+                Dimension::Static(2),
+                Dimension::Static(8),
+            ]),
+        );
+        let key_value_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(batch.clone()),
+                Dimension::Dynamic(key_value_sequence),
+                Dimension::Static(2),
+                Dimension::Static(8),
+            ]),
+        );
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch.clone())]));
+        let training = DotProductAttentionOperation::new(scale, AttentionMask::None).with_activation_output();
+        let activation_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(batch),
+                Dimension::Static(2),
+                Dimension::Dynamic(query_sequence.clone()),
+            ]),
+        );
+        assert_eq!(
+            training.infer_output_types(
+                &[
+                    query_type.clone(),
+                    key_value_type.clone(),
+                    key_value_type.clone(),
+                    lengths_type.clone(),
+                    lengths_type.clone(),
+                ],
+                &[],
+            ),
+            Ok(vec![query_type.clone(), activation_type.clone(),]),
+        );
+        assert_eq!(
+            DotProductAttentionBackwardOperation::new(scale, AttentionMask::None).infer_output_types(
+                &[
+                    query_type.clone(),
+                    key_value_type.clone(),
+                    key_value_type.clone(),
+                    query_type.clone(),
+                    activation_type,
+                    query_type.clone(),
+                    lengths_type.clone(),
+                    lengths_type,
+                ],
+                &[],
+            ),
+            Ok(vec![query_type, key_value_type.clone(), key_value_type]),
         );
     }
 
@@ -2620,6 +2748,25 @@ mod tests {
         let operation = DotProductAttentionOperation::new(0.5, AttentionMask::None);
         let query = attention_type(DataType::F32, &[2, 4, 2, 3]);
         let key_value = attention_type(DataType::F32, &[2, 5, 2, 3]);
+        let heads = DimensionVariable::new("heads", DimensionBounds::unbounded());
+        let dynamic_query_heads = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(4),
+                Dimension::Dynamic(heads.clone()),
+                Dimension::Static(3),
+            ]),
+        );
+        let dynamic_key_value_heads = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Static(2),
+                Dimension::Static(5),
+                Dimension::Dynamic(heads),
+                Dimension::Static(3),
+            ]),
+        );
         check_operation_type_inference!(
             operation = operation,
             cases = [
@@ -2805,19 +2952,11 @@ mod tests {
                 },
                 {
                     input_types = [
-                        ArrayType::new(
-                            DataType::F32,
-                            Shape::new(vec![
-                                Dimension::Static(2),
-                                Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),
-                                Dimension::Static(2),
-                                Dimension::Static(3),
-                            ]),
-                        ),
-                        key_value.clone(),
-                        key_value.clone(),
+                        dynamic_query_heads.clone(),
+                        dynamic_key_value_heads.clone(),
+                        dynamic_key_value_heads.clone(),
                     ],
-                    error = "'dot_product_attention' query must have a static shape",
+                    error = "'dot_product_attention' query heads dimension must be static but got heads",
                 },
             ],
         );
@@ -3108,7 +3247,9 @@ mod tests {
                     stack(&item_0_value, &item_1_value),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected: Vec<f64> = attend(&item_0_query, &item_0_key, &item_0_value)
             .to_f64s()
             .into_iter()
@@ -3127,7 +3268,9 @@ mod tests {
                 &EmptyRegionDriver,
                 &[stack(&item_0_query, &item_1_query), replicated(&item_0_key), replicated(&item_0_value)],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected_shared: Vec<f64> = attend(&item_0_query, &item_0_key, &item_0_value)
             .to_f64s()
             .into_iter()
@@ -3143,7 +3286,9 @@ mod tests {
                 &EmptyRegionDriver,
                 &[replicated(&item_0_query), replicated(&item_0_key), replicated(&item_0_value)],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().to_f64s(), attend(&item_0_query, &item_0_key, &item_0_value).to_f64s());
 
@@ -3159,7 +3304,9 @@ mod tests {
                     stack(&item_0_value, &item_1_value),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let attend_with_activation = |query: &[f64], key: &[f64], value: &[f64]| {
             item(query)
                 .dot_product_attention_with_activation(
@@ -3285,7 +3432,9 @@ mod tests {
                     stack(&item(&item_0_cotangent), &item(&item_1_cotangent)),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 3);
         let (item_0_dq, item_0_dk, item_0_dv) = backward(&item_0_query, &item_0_key, &item_0_value, &item_0_cotangent);
         let (item_1_dq, item_1_dk, item_1_dv) = backward(&item_1_query, &item_1_key, &item_1_value, &item_1_cotangent);
@@ -3362,7 +3511,9 @@ mod tests {
                     stack(&wide(&item_0_wide_cotangent), &wide(&item_1_wide_cotangent)),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         assert_eq!(outputs.len(), 4);
         let item_0_expected =
             wide_backward(&item_0_wide_query, &item_0_wide_key, &item_0_wide_value, &item_0_wide_cotangent);
@@ -3597,7 +3748,9 @@ mod tests {
                     stack(&lengths(&[1.0]), &lengths(&[2.0])),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected: Vec<f64> = attend(&item_0_query, &item_0_key, &item_0_value, 2.0, 1.0)
             .to_f64s()
             .into_iter()
@@ -3620,7 +3773,9 @@ mod tests {
                     ArrayBatch::replicated(lengths(&[2.0])),
                 ],
             )
-            .unwrap();
+            .unwrap()
+            .into_parts()
+            .0;
         let expected: Vec<f64> = attend(&item_0_query, &item_0_key, &item_0_value, 1.0, 2.0)
             .to_f64s()
             .into_iter()

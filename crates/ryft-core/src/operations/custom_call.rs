@@ -12,7 +12,8 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, batch_projected_operation,
+    BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
+    batch_projected_operation,
 };
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -804,12 +805,12 @@ where
         context: &BatchingContext<C, ArrayBatching<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let Some((index, mapped)) = inputs.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
             let values = inputs.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
             let outputs = context.parent().bind(self.clone(), Vec::new(), values.as_slice())?;
-            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect());
+            return Ok(outputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>().into());
         };
 
         match self.batching {
@@ -866,10 +867,11 @@ where
                 let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
                 check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
                 outputs.drain(..carry_inputs.len());
-                outputs
+                Ok(outputs
                     .into_iter()
                     .map(|value| ArrayBatch::new(value.r#type().into_owned(), value, Some(0)))
-                    .collect()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into())
             }
             CustomCallBatching::BroadcastAll => {
                 let aligned = inputs
@@ -885,10 +887,11 @@ where
                 let values = aligned.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
                 let operation = Self { output_types, ..self.clone() };
                 let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
-                outputs
+                Ok(outputs
                     .into_iter()
                     .map(|value| ArrayBatch::new(value.r#type().into_owned(), value, Some(0)))
-                    .collect()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into())
             }
         }
     }
@@ -927,7 +930,7 @@ where
         context: &BatchingContext<C, ArrayIrBatching>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let extent_count = self.dynamic_output_dimension_count();
         let Some(array_input_count) = inputs.len().checked_sub(extent_count) else {
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
@@ -945,7 +948,7 @@ where
         else {
             let values = inputs.iter().map(ArrayIrBatch::value).cloned().collect::<Vec<_>>();
             let outputs = context.parent().bind(self.clone(), Vec::new(), values.as_slice())?;
-            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect());
+            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>().into());
         };
 
         match self.batching {
@@ -1005,7 +1008,11 @@ where
                 let mut outputs = context.parent().bind(scan, vec![body], packed.as_slice())?;
                 check_count!("output", outputs, carry_inputs.len() + self.output_types.len(), ProgramError);
                 outputs.drain(..carry_inputs.len());
-                outputs.into_iter().map(|value| ArrayIrBatch::new(value, BatchAxis::new(0))).collect()
+                Ok(outputs
+                    .into_iter()
+                    .map(|value| ArrayIrBatch::new(value, BatchAxis::new(0)))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into())
             }
             CustomCallBatching::BroadcastAll => {
                 let aligned = arrays
@@ -1038,7 +1045,11 @@ where
                     }
                 }
                 let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
-                outputs.into_iter().map(|value| ArrayIrBatch::new(value, BatchAxis::new(0))).collect()
+                Ok(outputs
+                    .into_iter()
+                    .map(|value| ArrayIrBatch::new(value, BatchAxis::new(0)))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into())
             }
         }
     }

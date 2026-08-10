@@ -2444,7 +2444,7 @@ mod tests {
         assert_eq!(
             BatchingError::from(silent),
             BatchingError::UnsupportedOperation {
-                message: "operation `neg` supplied no batching evidence".to_string(),
+                message: "operation 'neg' supplied no batching evidence".to_string(),
             },
         );
     }
