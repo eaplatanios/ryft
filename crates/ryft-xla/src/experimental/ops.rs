@@ -1092,7 +1092,7 @@ pub fn transpose_primal_jit_call<
     // Transpose the callee with respect to its linear inputs, through the region's retained transform cache so that a
     // callee shared by several outer programs is transposed once per linearity mask. The transposed callee maps
     // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in callee-input order.
-    let transposed_callee = driver.transpose_program_shared(callee, operand_linear.as_slice())?;
+    let transposed_callee = driver.transpose_program(callee, operand_linear.as_slice())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., known_input_values...]`. Its outputs are the
@@ -1189,8 +1189,8 @@ mod tests {
             &self,
             _region: RegionRef<'_, XlaConstant, XlaOperation>,
             _input_linearity: &[bool],
-        ) -> Result<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>, DifferentiationError> {
-            Ok(self.transposed.clone())
+        ) -> Result<Arc<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError> {
+            Ok(Arc::new(self.transposed.clone()))
         }
     }
 

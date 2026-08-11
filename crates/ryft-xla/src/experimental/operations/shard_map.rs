@@ -1,14 +1,15 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, Concretizable, Context, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation, OperationFormatter,
-    Parameterized, ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Program, ProgramError, ProjectedValue,
-    RegionInterface, RegionRef, RegionSlot, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
-    TransposableOperation, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero,
+    ArrayIrType, ArrayType, CalleeRegionDriver, Concretizable, Context, DifferentiableOperation, DifferentiableType,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation,
+    OperationFormatter, Parameterized, ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationInput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Program, ProgramError,
+    ProjectedValue, RegionInterface, RegionRef, RegionSlot, Sharding, ShardingDimension, StagingContext, Tracer,
+    TracingContext, TransposableOperation, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero,
 };
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
@@ -687,13 +688,14 @@ where
 ///
 ///   1. Reads the runtime value of every known operand from `operand_values`, in body-input order, to feed the
 ///      transposed body's known inputs.
-///   2. Transposes the tangent body's flat program with [`TranspositionDriver::transpose_program`] with respect
-///      to the same linear operands,
-///      so the transposed body maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`,
-///      in body-input order on each side. It re-wraps the transposed program in a fresh [`FlatTracedShardMap`] whose
-///      boundary shardings are permuted and dualized to match — its inputs carry the cotangent duals of the original
-///      output shardings followed by the known operands' input shardings, and its outputs carry the cotangent duals of
-///      the linear operands' input shardings.
+///   2. Transposes the tangent body's flat program with [`TranspositionDriver::transpose_program`] with respect to the
+///      same linear operands — through the body region's retained transform cache, so that a body shared by several
+///      programs is transposed once per linearity mask — and re-attaches the shared handle it returns directly, which
+///      lets repeated binds of one transposed body intern by [`Arc`] identity. The transposed body maps `[outputs...,
+///      known_input_values...]` to `[linear_input_cotangents...]`, in body-input order on each side. It re-wraps the
+///      transposed program in a fresh [`FlatTracedShardMap`] whose boundary shardings are permuted and dualized to
+///      match — its inputs carry the cotangent duals of the original output shardings followed by the known operands'
+///      input shardings, and its outputs carry the cotangent duals of the linear operands' input shardings.
 ///   3. Re-wraps the transposed body in a fresh [`ShardMapOperation`] and stages it over
 ///      `[outputs..., known_input_values...]`, keeping the manual region intact so both forward and reverse
 ///      mode over a `shard_map` stay manual rather than inlined.
@@ -739,8 +741,9 @@ pub fn transpose_primal_shard_map<
         .map(|input| input.as_known().expect("dispatch guarantees a known operand carries its pullback value").clone())
         .collect::<Vec<_>>();
 
-    // Transpose the tangent body's flat program under the same per-operand linearity mask. The transposed program maps
-    // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in body-input order on each
+    // Transpose the tangent body's flat program under the same per-operand linearity mask, through the body region's
+    // retained transform cache so that a body shared by several programs is transposed once per mask. The transposed
+    // program maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in body-input order on each
     // side; re-wrap it as a transposed shard-map boundary whose shardings are permuted to match.
     let (transposed_operation, transposed_body_program) =
         transpose_shard_map_body(operation, driver, operand_linear.as_slice())?;
@@ -757,8 +760,14 @@ pub fn transpose_primal_shard_map<
     }
     operands.extend(known_values);
     let transposed_operation = XlaOperation::ShardMap(Box::new(transposed_operation));
-    let input_cotangents =
-        context.stage_operation(transposed_operation, vec![transposed_body_program], operands.as_slice())?;
+
+    // The transposed body is attached as the shared handle the driver returned, so repeated binds of one transposed
+    // body intern by `Arc` identity instead of copying the program into the trace again.
+    let input_cotangents = context.stage_operation(
+        transposed_operation,
+        CalleeRegionDriver::new(&[transposed_body_program]),
+        operands.as_slice(),
+    )?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -800,7 +809,7 @@ where
 /// [`transpose_primal_shard_map`].
 ///
 /// The tangent body's flat program is transposed with [`TranspositionDriver::transpose_program`] under
-/// `input_linearity`, producing a program mapping `[outputs..., known_input_values...]` to
+/// `input_linearity`, producing a shared program mapping `[outputs..., known_input_values...]` to
 /// `[linear_input_cotangents...]`. The transposed boundary permutes and dualizes the original one to match: its global
 /// inputs are the cotangent descriptors of the original global outputs followed by the known operands' original
 /// global inputs, and its global outputs are the cotangent descriptors of the linear operands' original global inputs.
@@ -819,7 +828,7 @@ fn transpose_shard_map_body<
     operation: &ShardMapOperation<V>,
     driver: &D,
     input_linearity: &[bool],
-) -> Result<(ShardMapOperation<V>, Program<V, XlaOperation<V>, Vec<V>, Vec<V>>), ProgramError> {
+) -> Result<(ShardMapOperation<V>, Arc<Program<V, XlaOperation<V>, Vec<V>, Vec<V>>>), ProgramError> {
     let transposed_program = driver.transpose_program(driver.region(0)?, input_linearity)?;
 
     let in_shardings = operation
@@ -1089,6 +1098,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::ops::{Deref, DerefMut};
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1170,9 +1180,9 @@ mod tests {
             &self,
             _region: RegionRef<'_, XlaConstant, XlaOperation>,
             _input_linearity: &[bool],
-        ) -> Result<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>, DifferentiationError>
+        ) -> Result<Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError>
         {
-            Ok(self.transposed.clone())
+            Ok(Arc::new(self.transposed.clone()))
         }
     }
 

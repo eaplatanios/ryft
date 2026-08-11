@@ -36,8 +36,8 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    Concretizable, MaybeZero, Operation, OperationProjection, OutputRegionProvenance, Program, ProgramBuilder,
-    ProgramError, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationProjection, OutputRegionProvenance, Program,
+    ProgramBuilder, ProgramError, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -425,7 +425,9 @@ where
     let output_count = true_branch.output_types().len();
 
     // Partition each branch through its own fresh known-side context, requested through the driver so that this rule
-    // carries no fresh-trace semantic bounds of its own.
+    // carries no fresh-trace semantic bounds of its own. Unlike the branches' derived forward-mode and transposed
+    // programs, a partition is not retained by the branch region's transform cache: it carries known outputs that are
+    // values of the live parent context, so the branch and the known-ness mask alone do not determine it.
     let true_partition = driver.partition_program(true_branch, input_known.as_slice())?;
     let false_partition = driver.partition_program(false_branch, input_known.as_slice())?;
 
@@ -1158,10 +1160,11 @@ where
         let output_count = output_types.len();
         let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
-        // Build both fused jvp branches and stage one fused conditional over the predicate primal followed by the
-        // operand primals and tangents.
-        let fused_true = driver.jvp_program(true_branch)?;
-        let fused_false = driver.jvp_program(driver.region(1)?)?;
+        // Build both fused jvp branches — through each branch region's retained transform cache, so that a branch
+        // shared by several programs is differentiated once — and stage one fused conditional over the predicate
+        // primal followed by the operand primals and tangents. The shared branch handles are attached directly, so
+        // repeated binds of one derived branch intern by `Arc` identity instead of copying it again.
+        let fused_branches = [driver.jvp_program(true_branch)?, driver.jvp_program(driver.region(1)?)?];
         let fused_condition = ConditionOperation::new();
         let mut condition_operands = Vec::with_capacity(2 * operands.len() + 1);
         condition_operands.push(predicate_primal);
@@ -1177,7 +1180,7 @@ where
                 )?);
             }
         }
-        let outputs = context.bind(fused_condition, vec![fused_true, fused_false], &condition_operands)?;
+        let outputs = context.bind(fused_condition, CalleeRegionDriver::new(&fused_branches), &condition_operands)?;
         check_count!("output", outputs, output_count + tangent_output_count, ProgramError);
 
         // The fused conditional's outputs are the primal outputs followed by only the live tangent outputs. Restore
@@ -1302,12 +1305,16 @@ where
     let predicate = read_known(0)?;
     let residuals = (1 + branch_tangent_count..inputs.len()).map(read_known).collect::<Result<Vec<_>, _>>()?;
 
-    // Transpose each branch with the branch tangents marked linear and the residual inputs marked known. Each
-    // transposed branch maps `[branch_output_cotangents..., residuals...]` to `[branch_tangent_cotangents...]`.
+    // Transpose each branch with the branch tangents marked linear and the residual inputs marked known, through each
+    // branch region's retained transform cache so that a branch shared by several programs is transposed once per
+    // linearity mask. Each transposed branch maps `[branch_output_cotangents..., residuals...]` to
+    // `[branch_tangent_cotangents...]`.
     let mut branch_linear = vec![true; branch_tangent_count];
     branch_linear.extend(std::iter::repeat(false).take(residual_count));
-    let transposed_true = driver.transpose_program(driver.region(0)?, branch_linear.as_slice())?;
-    let transposed_false = driver.transpose_program(driver.region(1)?, branch_linear.as_slice())?;
+    let transposed_branches = [
+        driver.transpose_program(driver.region(0)?, branch_linear.as_slice())?,
+        driver.transpose_program(driver.region(1)?, branch_linear.as_slice())?,
+    ];
     let transposed_condition = ConditionOperation::new();
 
     // Stage the transposed condition over `[predicate, outputs..., residuals...]`. Its outputs are the
@@ -1328,8 +1335,13 @@ where
         )?);
     }
     operands.extend(residuals);
-    let branch_cotangents =
-        context.bind(O::from(transposed_condition), vec![transposed_true, transposed_false], operands.as_slice())?;
+    // The shared transposed-branch handles are attached directly, so repeated binds of one transposed branch intern
+    // by `Arc` identity instead of copying it again.
+    let branch_cotangents = context.bind(
+        O::from(transposed_condition),
+        CalleeRegionDriver::new(&transposed_branches),
+        operands.as_slice(),
+    )?;
     check_count!("output", branch_cotangents, branch_tangent_count, ProgramError);
 
     // Reassemble one cotangent per operand: the predicate and residuals carry structural zeros, while the branch
@@ -1356,6 +1368,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
@@ -1943,14 +1957,14 @@ mod tests {
                 let %2:f64[2, 3] = condition %0 %1 [
                     true={
                         lambda %0:f64[2, 3] .
-                        let %1:f64[] = const
+                        let %1:f64[] = const 2.0
                             %2:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[]] %1
                             %3:f64[2, 3] = mul %0 %2
                         in (%3)
                     },
                     false={
                         lambda %0:f64[2, 3] .
-                        let %1:f64[] = const
+                        let %1:f64[] = const 3.0
                             %2:f64[2, 3] = broadcast [output_type=f64[2, 3], output_axes=[]] %1
                             %3:f64[2, 3] = mul %0 %2
                         in (%3)
@@ -2261,5 +2275,196 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![12.0]);
         assert!(cotangents.0.storage_bytes().is_empty());
         assert_eq!(cotangents.1.to_f64s(), vec![15.0]);
+    }
+
+    /// The `condition` differentiation rules reach their branches through the per-[`Region`](crate::Region) transform
+    /// cache, so several programs attaching one shared pair of branches derive each branch's fused forward-mode
+    /// program once and each branch's transposition once per linearity mask, while staging exactly the programs the
+    /// uncached path stages from independently built copies of the same branches.
+    #[test]
+    fn test_condition_differentiation_reuses_shared_branch_transforms() {
+        /// Builds a program that applies a condition over the provided branches followed by `epilogue` sines, so that
+        /// programs sharing one pair of branches still have distinct derived programs.
+        fn conditional_program(
+            true_branch: &Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+            false_branch: &Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+            epilogue: usize,
+        ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+            let operand = builder.add_input(ArrayType::scalar(DataType::F64));
+            let regions = vec![
+                builder.intern_callee(true_branch, None).unwrap(),
+                builder.intern_callee(false_branch, None).unwrap(),
+            ];
+            let mut value = builder
+                .add_instruction(
+                    ArrayOperation::Condition(ConditionOperation::new()),
+                    regions,
+                    vec![predicate, operand],
+                )
+                .unwrap()[0];
+            for _ in 0..epilogue {
+                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+            }
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        }
+
+        let true_branch = Arc::new(scalar_scale_branch(2.0));
+        let false_branch = Arc::new(scalar_scale_branch(3.0));
+        let first = conditional_program(&true_branch, &false_branch, 1).linearize().unwrap();
+        let second = conditional_program(&true_branch, &false_branch, 2).linearize().unwrap();
+        assert_ne!(first.tangent().to_string(), second.tangent().to_string());
+
+        // Each branch's fused forward-mode program is derived by the first program and served to the second.
+        for branch in [&true_branch, &false_branch] {
+            let statistics = branch.entry_region().transform_cache().jvp_program_cache().statistics();
+            assert_eq!((statistics.productions, statistics.hits), (1, 1));
+        }
+
+        // Independently built copies of the same branches share no retained transforms, so they exercise the uncached
+        // path and pin that caching changed nothing about what is staged.
+        let uncached = conditional_program(&Arc::new(scalar_scale_branch(2.0)), &Arc::new(scalar_scale_branch(3.0)), 1)
+            .linearize()
+            .unwrap();
+        assert_eq!(first.primal().to_string(), uncached.primal().to_string());
+        assert_eq!(first.tangent().to_string(), uncached.tangent().to_string());
+        assert_eq!(first.residual_count(), uncached.residual_count());
+
+        // Transposing the tangent program twice transposes its condition's branches once: the second pass is served
+        // from the branch regions' retained transpositions and produces the identical pullback.
+        let pullback = first.tangent().transpose_with_trailing_residuals(first.residual_count()).unwrap();
+        let repeated = first.tangent().transpose_with_trailing_residuals(first.residual_count()).unwrap();
+        assert_eq!(pullback.to_string(), repeated.to_string());
+        let tangent_condition = first
+            .tangent()
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayOperation::Condition(_)))
+            .unwrap();
+        for region in tangent_condition.regions() {
+            let statistics =
+                first.tangent().region_ref(*region).unwrap().transform_cache().transposition_cache().statistics();
+            assert_eq!((statistics.productions, statistics.hits), (1, 1));
+        }
+        assert_eq!(
+            pullback.to_string(),
+            uncached.tangent().transpose_with_trailing_residuals(uncached.residual_count()).unwrap().to_string(),
+        );
+    }
+
+    /// Gate measurement for extending the per-[`Region`](crate::Region) transform cache to the `condition`
+    /// differentiation rules. Several distinct outer programs attach *one shared* pair of branch regions, which is
+    /// exactly the sharing a region-keyed cache can serve, and each outer program is then linearized and transposed
+    /// from cold. The printed table reports the frontend cost of each transform per outer program and how it scales
+    /// with the branch instruction count, which is the input to deciding whether retaining the branches' derived
+    /// programs is worth its complexity.
+    #[test]
+    #[ignore = "region transform cache gate measurement"]
+    fn test_baseline_repeated_condition_branch_transformation() {
+        /// Per-branch instruction counts swept by the measurement.
+        const BRANCH_OPERATION_COUNTS: [usize; 2] = [2, 200];
+
+        /// Number of distinct outer programs that attach the one shared pair of branch regions.
+        const OUTER_SPECIALIZATIONS: usize = 4;
+
+        /// Builds a branch that scales its scalar input by `factor` and then applies a chain of sines.
+        fn chained_branch(
+            factor: f64,
+            operation_count: usize,
+        ) -> Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>> {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let factor = builder.add_constant(Array::scalar(factor));
+            let mut value = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
+            for _ in 1..operation_count {
+                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+            }
+            Arc::new(
+                builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap(),
+            )
+        }
+
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut measurements = Vec::new();
+        for branch_operations in BRANCH_OPERATION_COUNTS {
+            let true_branch = chained_branch(2.0, branch_operations);
+            let false_branch = chained_branch(3.0, branch_operations);
+
+            // Each outer program interns that one pair of branches and differs only in the length of its sine
+            // epilogue, so their derived programs are genuinely distinct while the branch regions are shared.
+            let outers = (0..OUTER_SPECIALIZATIONS)
+                .map(|index| {
+                    let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+                    let predicate = builder.add_input(predicate_type.clone());
+                    let operand = builder.add_input(scalar_type.clone());
+                    let regions = vec![
+                        builder.intern_callee(&true_branch, None).unwrap(),
+                        builder.intern_callee(&false_branch, None).unwrap(),
+                    ];
+                    let mut value = builder
+                        .add_instruction(
+                            ArrayOperation::Condition(ConditionOperation::new()),
+                            regions,
+                            vec![predicate, operand],
+                        )
+                        .unwrap()[0];
+                    for _ in 0..=index {
+                        value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                    }
+                    builder
+                        .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            let mut rows = Vec::with_capacity(OUTER_SPECIALIZATIONS);
+            for outer in &outers {
+                let start = Instant::now();
+                let linearization = outer.linearize().unwrap();
+                let linearized = start.elapsed();
+                let start = Instant::now();
+                linearization.tangent().transpose_with_trailing_residuals(linearization.residual_count()).unwrap();
+                rows.push((linearized, start.elapsed()));
+            }
+            measurements.push((branch_operations, rows));
+        }
+
+        println!("condition branch transform gate: one shared branch pair, {OUTER_SPECIALIZATIONS} outer programs");
+        for (branch_operations, rows) in &measurements {
+            println!("  branches with {branch_operations} operations each (all times in milliseconds):");
+            println!("    outer |    linearize |    transpose |        total");
+            for (index, (linearized, transposed)) in rows.iter().enumerate() {
+                println!(
+                    "    {index:>5} | {:>12.3} | {:>12.3} | {:>12.3}",
+                    linearized.as_secs_f64() * 1e3,
+                    transposed.as_secs_f64() * 1e3,
+                    (*linearized + *transposed).as_secs_f64() * 1e3,
+                );
+            }
+        }
+
+        // Repeated-outer cost is the mean over the outer programs after the first, which is what retained branch
+        // transforms could serve; the per-operation column reports how much of it is branch-proportional.
+        let repeated_mean = |rows: &[(Duration, Duration)]| {
+            rows[1..]
+                .iter()
+                .map(|(linearized, transposed)| (*linearized + *transposed).as_secs_f64() * 1e3)
+                .sum::<f64>()
+                / (rows.len() - 1) as f64
+        };
+        let (small_operations, small_rows) = &measurements[0];
+        let (large_operations, large_rows) = &measurements[1];
+        let small_mean = repeated_mean(small_rows);
+        let large_mean = repeated_mean(large_rows);
+        println!(
+            "  repeated-outer summary (mean over outers 1..{}, milliseconds): {small_operations}-op branches \
+             {small_mean:.3}, {large_operations}-op branches {large_mean:.3}, per branch operation {:.4}",
+            OUTER_SPECIALIZATIONS,
+            (large_mean - small_mean) / (large_operations - small_operations) as f64,
+        );
     }
 }

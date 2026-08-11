@@ -11,6 +11,7 @@
 
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
@@ -50,8 +51,9 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    AtomId, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection, Program, ProgramBuilder,
-    ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection, Program,
+    ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1940,6 +1942,8 @@ where
     check_count!("input", element_has_tangent, state_count, ProgramError);
     let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
     let fused_state_count = state_count + tangent_state_count;
+    // The body is differentiated through its region's retained transform cache, so a body shared by several programs
+    // is differentiated once and repeated attachments of the result intern by `Arc` identity.
     let fused_body = driver.jvp_program(driver.region(1)?)?;
     let fused_state_types = fused_body.input_types();
     check_count!("input", fused_state_types, fused_state_count, ProgramError);
@@ -1974,7 +1978,8 @@ where
             )?);
         }
     }
-    let outputs = context.bind(C::Operation::from(fused_while), vec![fused_condition, fused_body], &operands)?;
+    let fused_regions = [Arc::new(fused_condition), fused_body];
+    let outputs = context.bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &operands)?;
     check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
     let mut tangent_outputs = tangent_outputs.iter().cloned();
@@ -2004,6 +2009,10 @@ where
 /// [JAX's `jvp` through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) — while a
 /// semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching
 /// the bounded-`while` truncation semantics. Each body effect executes exactly once per loop iteration.
+///
+/// This rule derives no program from the body region and therefore consults no per-region transform cache: it
+/// interprets the body once per iteration at the concrete duals reached by the loop, so its work is a function of the
+/// runtime values rather than of the region's contents alone.
 fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
     operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -3421,7 +3430,7 @@ mod tests {
                     },
                     body={
                         lambda %0:f64[] .
-                        let %1:f64[] = const
+                        let %1:f64[] = const 1
                             %2:f64[] = sub %0 %1
                         in (%2)
                     },

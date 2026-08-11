@@ -2576,7 +2576,7 @@ mod tests {
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
         assert!(
-            message.starts_with(
+            message.contains(
                 "nondeterministic transform rule detected: re-deriving the fused forward-mode program of this region \
                  produced a different program than the artifact retained in its transform cache",
             ),

@@ -7,6 +7,7 @@
 //! [StableHLO `while`](https://openxla.org/stablehlo/spec#while) loop with counter-indexed slice reads and writes.
 
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
@@ -39,9 +40,9 @@ use crate::partial::{
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    AtomId, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance, Program,
-    ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
+    Program, ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
+    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1261,6 +1262,9 @@ where
     let input_known = body_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
 
     // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging context.
+    // Unlike the body's derived forward-mode and transposed programs, a partition is not retained by the body region's
+    // transform cache: it carries known outputs that are values of the live parent context, so the body and the
+    // known-ness mask alone do not determine it.
     let mut partition_body = |carry_known: &[bool]| -> Result<PartitionedProgram<V, O>, ProgramError> {
         let body_known = (0..body_input_types.len())
             .map(|index| if index < carry_count { carry_known[index] } else { input_known[index] })
@@ -2217,7 +2221,10 @@ where
         let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
         // The fused jvp body is over `[primal_body_inputs..., live(tangent_body_inputs)...]`; permute its compact
-        // signature into scan order (carries lead scanned inputs on both the primal and live tangent sides).
+        // signature into scan order (carries lead scanned inputs on both the primal and live tangent sides). The
+        // unpermuted program comes from the body region's retained transform cache, so a body shared by several
+        // programs is differentiated once; the permutation into scan order is a boundary convention of this rule
+        // rather than a property of the body, so it is reapplied per use instead of being retained against the body.
         let fused_body = driver.jvp_program(driver.region(0)?)?;
         check_count!(
             "input",
@@ -2225,7 +2232,7 @@ where
             body_input_count + input_has_tangent.iter().filter(|&&live| live).count(),
             ProgramError,
         );
-        let fused_body = permute_live_scan_body(fused_body, &input_has_tangent, &output_has_tangent, carry_count)?;
+        let fused_body = permute_live_scan_body(&fused_body, &input_has_tangent, &output_has_tangent, carry_count)?;
 
         // Stage the fused scan over
         // `[primal_carry_inits..., live(tangent_carry_inits)..., primal_stacks..., live(tangent_stacks)...]`.
@@ -2295,7 +2302,7 @@ where
 /// Rebuilds a fused JVP scan body so its compact boundary uses scan order instead of JVP order. The liveness masks
 /// mark which primal boundary entries carry a tangent entry in the compact fused signature.
 fn permute_live_scan_body<V, O>(
-    program: Program<V, O, Vec<V>, Vec<V>>,
+    program: &Program<V, O, Vec<V>, Vec<V>>,
     input_has_tangent: &[bool],
     output_has_tangent: &[bool],
     carry_count: usize,
@@ -2341,7 +2348,7 @@ fn live_scan_signature_permutation(has_tangent: &[bool], carry_count: usize) -> 
 /// Rebuilds `program` with a new public boundary order. `input_order` and `output_order` list old boundary positions
 /// in the desired new order.
 fn reorder_program_boundary<V, O>(
-    program: Program<V, O, Vec<V>, Vec<V>>,
+    program: &Program<V, O, Vec<V>, Vec<V>>,
     input_order: &[usize],
     output_order: &[usize],
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
@@ -2391,7 +2398,7 @@ where
     let mut builder = ProgramBuilder::new();
     let inputs = reordered_input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
     let original_inputs = inverse_input_order.iter().map(|&new_position| inputs[new_position]).collect::<Vec<_>>();
-    let outputs = builder.splice_program(&program, original_inputs.as_slice())?;
+    let outputs = builder.splice_program(program, original_inputs.as_slice())?;
     let reordered_outputs = output_order.iter().map(|&index| outputs[index]).collect::<Vec<_>>();
     builder.build(reordered_outputs, vec![Placeholder; input_order.len()], vec![Placeholder; output_order.len()])
 }
@@ -2509,6 +2516,8 @@ where
     let runtime_length_count = usize::from(operation.length().variable().is_some());
     check_count!("input", inputs, body.input_types().len() + runtime_length_count, ProgramError);
     let (body_inputs, runtime_length_inputs) = inputs.split_at(body.input_types().len());
+    // The body is transposed through its region's retained transform cache, so a body shared by several programs is
+    // transposed once per linearity mask and repeated attachments of the result intern by `Arc` identity.
     let transposed_body = driver.transpose_program(body, &vec![true; body.input_ids().len()])?;
     let transposed = ScanOperation::<F>::new(operation.carry_count(), operation.length())
         .with_reverse(!operation.reverse())
@@ -2536,8 +2545,11 @@ where
             ProgramError::MalformedProgram(format!("scan transpose runtime length operand {index} is not known"))
         })?);
     }
-    let cotangents =
-        context.stage_operation(Target::from(transposed), vec![transposed_body], materialized.as_slice())?;
+    let cotangents = context.stage_operation(
+        Target::from(transposed),
+        CalleeRegionDriver::new(std::slice::from_ref(&transposed_body)),
+        materialized.as_slice(),
+    )?;
     check_count!("output", cotangents, body_inputs.len(), ProgramError);
     let mut cotangents = cotangents.into_iter().map(MaybeZero::Value).collect::<Vec<_>>();
     cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
@@ -2633,6 +2645,8 @@ where
     // followed by every known body input's runtime value to the cotangent of every *linear* body input only:
     // `[carry_output_cotangent..., y_slice_cotangent..., known_input_value...] -> [linear_input_cotangent...]`, in body
     // order on each side.
+    // The body is transposed through its region's retained transform cache, so a body shared by several programs is
+    // transposed once per linearity mask and repeated attachments of the result intern by `Arc` identity.
     let mut transposed_body =
         driver.transpose_program(body, operand_linear.as_slice()).map_err(|error| match error {
             crate::differentiation::DifferentiationError::Program(error) => error,
@@ -2643,14 +2657,16 @@ where
     // slot and pass it through as the matching body output. Linear carries retain their cotangent slots, while known
     // scanned inputs remain trailing per-iteration slices. This avoids fabricating a zero stack for a known carry and
     // lets first-class dimension carries define the identities referenced by dynamic tangent-array carries.
+    // Threading is a per-attachment rewrite of the retained transposition rather than a property of the body, so the
+    // shared artifact is rebuilt here instead of being retained in its threaded form.
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     if linear_carry_count != carry_count {
-        transposed_body = thread_known_carries(
-            transposed_body,
+        transposed_body = Arc::new(thread_known_carries(
+            transposed_body.as_ref().clone(),
             body.output_types().as_slice(),
             operand_linear.as_slice(),
             carry_count,
-        )?;
+        )?);
     }
 
     let transposed = ScanOperation::<F>::new(carry_count, length)
@@ -2724,7 +2740,11 @@ where
     // The reversed scan outputs one carry cotangent per carry and one stacked scanned-output cotangent per *linear*
     // scanned input.
     let linear_scanned_count = operand_linear[carry_count..].iter().filter(|&&linear| linear).count();
-    let scan_cotangents = context.stage_operation(O::from(transposed), vec![transposed_body], operands.as_slice())?;
+    let scan_cotangents = context.stage_operation(
+        O::from(transposed),
+        CalleeRegionDriver::new(std::slice::from_ref(&transposed_body)),
+        operands.as_slice(),
+    )?;
     check_count!("output", scan_cotangents, carry_count + linear_scanned_count, ProgramError);
 
     // Reassemble one cotangent per operand. The reversed scan outputs `[carry_cotangent..., scanned_input_cotangent...]`,
@@ -2843,6 +2863,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
         DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
@@ -2858,6 +2881,7 @@ mod tests {
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::div::DivOperation;
     use crate::operations::math::mul::MulOperation;
+    use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Effects, Program, ProgramBuilder};
     use crate::tests::CountingBatchingDriver;
@@ -3997,7 +4021,7 @@ mod tests {
         let second = builder.add_constant(Array::scalar(2.0));
         let program = builder.build(vec![first, second], Vec::new(), vec![Placeholder, Placeholder]).unwrap();
 
-        let reordered = reorder_program_boundary(program, &[], &[1, 0]).unwrap();
+        let reordered = reorder_program_boundary(&program, &[], &[1, 0]).unwrap();
 
         assert_eq!(reordered.input_count(), 0);
         assert_eq!(
@@ -4724,5 +4748,188 @@ mod tests {
             assert_eq!(output_types[2].shape().dimensions(), &[Dimension::Static(0)]);
             assert_eq!(output_types[2].sharding(), None);
         }
+    }
+
+    /// The `scan` differentiation rules reach their body through the per-[`Region`](crate::Region) transform cache,
+    /// so several programs attaching one shared body derive its fused forward-mode program once and its transposition
+    /// once per linearity mask, while staging exactly the programs the uncached path stages from independently built
+    /// copies of the same body.
+    #[test]
+    fn test_scan_differentiation_reuses_the_shared_body_transforms() {
+        /// Builds a program that scans the provided body over three slices and then applies `epilogue` sines to the
+        /// final carry, so that programs sharing one body still have distinct derived programs.
+        fn scanning_program(
+            body: &Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+            epilogue: usize,
+        ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let initial = builder.add_input(ArrayType::scalar(DataType::F64));
+            let values = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
+            let body_region = builder.intern_callee(body, None).unwrap();
+            let mut value = builder
+                .add_instruction(
+                    ArrayOperation::Scan(ScanOperation::new(1, 3)),
+                    vec![body_region],
+                    vec![initial, values],
+                )
+                .unwrap()[0];
+            for _ in 0..epilogue {
+                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+            }
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        }
+
+        let body = Arc::new(product_body());
+        let first = scanning_program(&body, 1).linearize().unwrap();
+        let second = scanning_program(&body, 2).linearize().unwrap();
+        assert_ne!(first.tangent().to_string(), second.tangent().to_string());
+
+        // The body's fused forward-mode program is derived by the first program and served to the second.
+        let statistics = body.entry_region().transform_cache().jvp_program_cache().statistics();
+        assert_eq!((statistics.productions, statistics.hits), (1, 1));
+
+        // An independently built copy of the same body shares no retained transforms, so it exercises the uncached
+        // path and pins that caching changed nothing about what is staged.
+        let uncached = scanning_program(&Arc::new(product_body()), 1).linearize().unwrap();
+        assert_eq!(first.primal().to_string(), uncached.primal().to_string());
+        assert_eq!(first.tangent().to_string(), uncached.tangent().to_string());
+        assert_eq!(first.residual_count(), uncached.residual_count());
+
+        // Transposing the tangent program twice transposes its scan body once: the second pass is served from the
+        // body region's retained transposition and produces the identical pullback.
+        let pullback = first.tangent().transpose_with_trailing_residuals(first.residual_count()).unwrap();
+        let repeated = first.tangent().transpose_with_trailing_residuals(first.residual_count()).unwrap();
+        assert_eq!(pullback.to_string(), repeated.to_string());
+        let tangent_scan = first
+            .tangent()
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayOperation::Scan(_)))
+            .unwrap();
+        let statistics = first
+            .tangent()
+            .region_ref(tangent_scan.regions()[0])
+            .unwrap()
+            .transform_cache()
+            .transposition_cache()
+            .statistics();
+        assert_eq!((statistics.productions, statistics.hits), (1, 1));
+        assert_eq!(
+            pullback.to_string(),
+            uncached.tangent().transpose_with_trailing_residuals(uncached.residual_count()).unwrap().to_string(),
+        );
+    }
+
+    /// Gate measurement for extending the per-[`Region`](crate::Region) transform cache to the `scan`
+    /// differentiation rules. Several distinct outer programs attach *one shared* body region, which is exactly the
+    /// sharing a region-keyed cache can serve, and each outer program is then linearized and transposed from cold.
+    /// The printed table reports the frontend cost of each transform per outer program and how it scales with the
+    /// body's instruction count, which is the input to deciding whether retaining the body's derived programs is
+    /// worth its complexity.
+    #[test]
+    #[ignore = "region transform cache gate measurement"]
+    fn test_baseline_repeated_scan_body_transformation() {
+        /// Body instruction counts swept by the measurement.
+        const BODY_OPERATION_COUNTS: [usize; 2] = [2, 200];
+
+        /// Number of distinct outer programs that attach the one shared body region.
+        const OUTER_SPECIALIZATIONS: usize = 4;
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut measurements = Vec::new();
+        for body_operations in BODY_OPERATION_COUNTS {
+            // One shared body that maps `[carry, slice]` through a product followed by a chain of sines.
+            let body = {
+                let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+                let carry = builder.add_input(scalar_type.clone());
+                let slice = builder.add_input(scalar_type.clone());
+                let mut value =
+                    builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, slice]).unwrap()[0];
+                for _ in 1..body_operations {
+                    value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                }
+                Arc::new(
+                    builder
+                        .build::<Vec<Array>, Vec<Array>>(
+                            vec![value, value],
+                            vec![Placeholder, Placeholder],
+                            vec![Placeholder, Placeholder],
+                        )
+                        .unwrap(),
+                )
+            };
+
+            // Each outer program interns that one body and differs only in the length of its sine epilogue, so their
+            // derived programs are genuinely distinct while the scanned body region is shared.
+            let outers = (0..OUTER_SPECIALIZATIONS)
+                .map(|index| {
+                    let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+                    let initial = builder.add_input(scalar_type.clone());
+                    let values = builder.add_input(stacked_type.clone());
+                    let body_region = builder.intern_callee(&body, None).unwrap();
+                    let mut value = builder
+                        .add_instruction(
+                            ArrayOperation::Scan(ScanOperation::new(1, 3)),
+                            vec![body_region],
+                            vec![initial, values],
+                        )
+                        .unwrap()[0];
+                    for _ in 0..=index {
+                        value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                    }
+                    builder
+                        .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+
+            let mut rows = Vec::with_capacity(OUTER_SPECIALIZATIONS);
+            for outer in &outers {
+                let start = Instant::now();
+                let linearization = outer.linearize().unwrap();
+                let linearized = start.elapsed();
+                let start = Instant::now();
+                linearization.tangent().transpose_with_trailing_residuals(linearization.residual_count()).unwrap();
+                rows.push((linearized, start.elapsed()));
+            }
+            measurements.push((body_operations, rows));
+        }
+
+        println!("scan body transform gate: one shared body region, {OUTER_SPECIALIZATIONS} outer programs");
+        for (body_operations, rows) in &measurements {
+            println!("  body with {body_operations} operations (all times in milliseconds):");
+            println!("    outer |    linearize |    transpose |        total");
+            for (index, (linearized, transposed)) in rows.iter().enumerate() {
+                println!(
+                    "    {index:>5} | {:>12.3} | {:>12.3} | {:>12.3}",
+                    linearized.as_secs_f64() * 1e3,
+                    transposed.as_secs_f64() * 1e3,
+                    (*linearized + *transposed).as_secs_f64() * 1e3,
+                );
+            }
+        }
+
+        // Repeated-outer cost is the mean over the outer programs after the first, which is what a retained body
+        // transform could serve; the per-body-operation column reports how much of it is body-proportional.
+        let repeated_mean = |rows: &[(Duration, Duration)]| {
+            rows[1..]
+                .iter()
+                .map(|(linearized, transposed)| (*linearized + *transposed).as_secs_f64() * 1e3)
+                .sum::<f64>()
+                / (rows.len() - 1) as f64
+        };
+        let (small_operations, small_rows) = &measurements[0];
+        let (large_operations, large_rows) = &measurements[1];
+        let small_mean = repeated_mean(small_rows);
+        let large_mean = repeated_mean(large_rows);
+        println!(
+            "  repeated-outer summary (mean over outers 1..{}, milliseconds): {small_operations}-op body \
+             {small_mean:.3}, {large_operations}-op body {large_mean:.3}, per body operation {:.4}",
+            OUTER_SPECIALIZATIONS,
+            (large_mean - small_mean) / (large_operations - small_operations) as f64,
+        );
     }
 }
