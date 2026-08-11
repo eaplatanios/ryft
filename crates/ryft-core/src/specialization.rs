@@ -12,8 +12,8 @@
 //! [`SpecializationCacheEntry`] and [`SpecializationCacheProducer`] model the entry-production protocol, while
 //! [`SpecializationCacheStatistics`] is an ordinary value snapshot of the live counters. Refer to the
 //! [`SpecializationCache`] documentation for more information on these relationships. [`FunctionSpecializationKey`]
-//! is the standard key for retained callables, but [`Program`](crate::Program)-level transform caches may use simpler
-//! or transform-specific keys.
+//! is the standard key for retained callables. [`TransformCache`](crate::programs::transforms::TransformCache) lets a
+//! typed transform descriptor select this same cache without wrapping or changing its entry protocol.
 //!
 //! # Reuse Contract
 //!
@@ -98,33 +98,31 @@ pub enum SpecializationCacheError<E: Debug + Display> {
 #[error("recursive request for a specialization that is already being produced on this thread")]
 pub struct ReentrantSpecializationError;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Cache key identifying one specialization of a retained function.
+/// Cache key identifying one specialization of a retained function. Two function calls are considered interchangeable
+/// (i.e., they stage the same [`Program`](crate::Program) should thus have the same [`FunctionSpecializationKey`])
+/// exactly when all three of the following components agree:
 ///
-/// Two calls are interchangeable — that is, they stage the same program — exactly when all three components agree:
-///
-///   - `static_parameters`: the host values the traced closure may branch on, read, or embed as literals. Unequal
+///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
 ///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
-///     parameters must be `Clone + Debug + Eq + Hash`; runtime arrays and other backend values should remain dynamic
-///     inputs rather than becoming static parameters merely because they provide identity equality.
-///   - `input_structure`: the parameter-structure shape of the dynamic input, that is, its
-///     [`Parameterized::ParameterStructure`](crate::parameters::Parameterized::ParameterStructure). Tracing rebuilds
-///     the closure's argument from this structure, so a closure may legitimately branch on container arity. Keying on
-///     the structure rather than on the flattened leaves also distinguishes inputs that differ only in *empty*
-///     substructure, which flat leaf paths and flat leaf types cannot see.
-///   - `dispatch`: the domain-normalized abstract signature of the flattened dynamic input, such as element data
-///     types and shapes. Programs are staged against abstract types, so unequal signatures stage unequal programs.
+///     parameters must be `Clone + Debug + Eq + Hash`. Runtime arrays and other backend values should be represented
+///     as dynamic inputs rather than static parameters.
+///   - **Input Structure:** The [`Parameterized::ParameterStructure`](crate::Parameterized::ParameterStructure) shape
+///     of the dynamic function input. Tracing rebuilds the function's argument from this structure, so a function may
+///     legitimately branch on container arity. Keying on the structure rather than on the flattened leaves also
+///     distinguishes inputs that differ only in _empty_ substructure, which flat leaf paths and flat leaf types
+///     cannot see.
+///   - **Dispatch:** The [`Domain`](crate::Domain)-normalized abstract signature of the flattened dynamic input, such
+///     as element data types and shapes, for example. Programs are staged against abstract types, so unequal signatures
+///     stage unequal programs.
 ///
-/// Everything else that affects staging — the closure itself, its captures, the domain, and fixed options — is
-/// implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
-/// carries no fragile function-pointer identity. All three components are call-level, that is, function-level,
-/// concepts, since a bare program has neither static parameters nor a structured input; that is what separates
-/// function-level specialization caching from program-level transform caching such as the
-/// per-[`Region`](crate::programs::Region) transform cache.
+/// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
+/// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
+/// carries no fragile function-pointer identity. All three components are call-level (i.e., function-level) concepts,
+/// since a bare program has neither static parameters nor a structured input. That is what separates function-level
+/// specialization caching from structural region transformation through [`Transform`](crate::Transform).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch> {
-    /// Host values declared static for this specialization, such as an axis number, mode enum, or boolean option.
+    /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
     static_parameters: StaticParameters,
 
     /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
@@ -133,6 +131,8 @@ pub struct FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch>
     /// Domain-normalized abstract signature of the flattened dynamic input, typically its array types and shapes.
     dispatch: Dispatch,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<StaticParameters, InputStructure, Dispatch> FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch> {
     /// Creates a specialization key from its three components.
