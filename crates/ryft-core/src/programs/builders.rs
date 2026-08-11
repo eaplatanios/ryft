@@ -341,11 +341,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             }
         }
 
-        // Cloning the source region carries its retained transforms along, which is sound because the import copies the
-        // source body verbatim and renumbers its attached references onto faithful copies of the very same descendants.
-        // That sharing is what lets one shared callee program be linearized or transposed once across every program
-        // that interns it.
-        let id = self.regions.push(imported).unwrap();
+        // Cloning the source region carries its retained transforms along, and sealing preserves them here, which is
+        // sound because the import copies the source body verbatim and renumbers its attached references onto faithful
+        // copies of the very same descendants. That sharing is what lets one shared callee program be linearized or
+        // transposed once across every program that interns it.
+        let id = self.regions.push_preserving_transform_cache(imported).unwrap();
         remapping.insert(source_id, id);
         id
     }

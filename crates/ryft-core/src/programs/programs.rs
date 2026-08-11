@@ -45,8 +45,10 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
 impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<V, O, Input, Output>
 {
-    /// Creates a new [`Program`] containing the provided [`Region`]s after validating them
-    /// and their structural ordering.
+    /// Creates a new [`Program`] containing the provided [`Region`]s after validating them and their structural
+    /// ordering. Note that sealing regions into a fresh arena gives their attached [`RegionId`]s new meaning, so a
+    /// region that attaches descendants starts over with no derived transforms retained against its previous arena.
+    #[inline]
     pub fn new(
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
@@ -56,8 +58,36 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         // Seal regions in arena order first. Sealing validates atom and attached-region references while deriving the
         // immutable recursive metadata used by effect analysis and type-identity instantiation. Because a region may
         // reference only previously sealed regions, this also establishes the arena's descendant-before-parent order.
-        let regions = RegionArena::from_regions(regions)?;
+        Self::from_sealed_regions(input_structure, output_structure, RegionArena::from_regions(regions)?, entry)
+    }
 
+    /// Creates a new [`Program`] exactly like [`Self::new`], except that every sealed region keeps the cached
+    /// transforms that have already been derived from its contents. Callers must be faithful whole-arena rebuilds.
+    /// Refer to [`Region::adopt_transform_cache`] for information on the precondition.
+    #[inline]
+    pub(crate) fn new_preserving_transform_caches(
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
+        regions: Vec<Region<V, O>>,
+        entry: RegionId,
+    ) -> Result<Self, ProgramError> {
+        Self::from_sealed_regions(
+            input_structure,
+            output_structure,
+            RegionArena::from_regions_preserving_transform_caches(regions)?,
+            entry,
+        )
+    }
+
+    /// Validates the provided already-sealed [`RegionArena`] and its `entry` [`RegionId`] against the provided
+    /// parameter structures and constructs a new [`Program`]. This is the shared tail of every [`Program`]
+    /// construction path.
+    fn from_sealed_regions(
+        input_structure: Input::ParameterStructure,
+        output_structure: Output::ParameterStructure,
+        regions: RegionArena<V, O>,
+        entry: RegionId,
+    ) -> Result<Self, ProgramError> {
         // The entry identifier is supplied separately from the arena, so validate it before using the entry boundary
         // to establish the structured program signature.
         let Some(entry_region) = regions.get(entry) else {
@@ -690,8 +720,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .collect::<Result<Vec<_>, _>>()?;
         let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
         adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
+
+        // Compaction drops unreferenced regions and renumbers the survivors while preserving the reachable graph's
+        // topology, so re-sealing keeps whatever the adoption pass above decided each region may retain.
         let (regions, entry) = compact_regions(regions, self.entry);
-        Self::new(self.input_structure.clone(), self.output_structure.clone(), regions, entry)
+        Self::new_preserving_transform_caches(
+            self.input_structure.clone(),
+            self.output_structure.clone(),
+            regions,
+            entry,
+        )
     }
 
     /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
@@ -827,8 +865,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .collect::<Result<Vec<_>, _>>()?;
         let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
         adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
+
+        // Compaction drops unreferenced regions and renumbers the survivors while preserving the reachable graph's
+        // topology, so re-sealing keeps whatever the adoption pass above decided each region may retain.
         let (regions, entry) = compact_regions(regions, entry);
-        Self::new(input_structure, output_structure, regions, entry)
+        Self::new_preserving_transform_caches(input_structure, output_structure, regions, entry)
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
@@ -956,11 +997,13 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .collect::<Result<Vec<_>, _>>()?;
 
         // Nested regions of retained instructions pass through unchanged (filtering is an entry-boundary projection);
-        // regions that lost their last reference are dropped and the surviving references are rewritten.
+        // regions that lost their last reference are dropped and the surviving references are rewritten. Carrying the
+        // descendant closure over verbatim is also why re-sealing keeps the transforms derived from those descendants,
+        // while the rebuilt entry region starts over with none.
         let mut regions = self.regions.iter().take(self.entry.index()).cloned().collect::<Vec<_>>();
         regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
         let (regions, entry) = compact_regions(regions, self.entry);
-        let program = Program::new(
+        let program = Program::new_preserving_transform_caches(
             vec![Placeholder; live_input_indices.len()],
             vec![Placeholder; outputs.len()],
             regions,
@@ -1092,12 +1135,18 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         let output_structure = vec![Placeholder; output_ids.len()];
 
         // Nested regions of retained instructions pass through unchanged (filtering is an entry-boundary projection).
-        // Regions that lost their last reference are dropped, and the surviving references are rewritten.
+        // Regions that lost their last reference are dropped, and the surviving references are rewritten. Moving the
+        // descendant closure over verbatim is also why re-sealing keeps the transforms derived from those descendants,
+        // while the rebuilt entry region starts over with none.
         nested_regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
-
         let (regions, entry) = compact_regions(nested_regions, entry);
         Ok((
-            Program::<V, O, Vec<V>, Vec<V>>::new(input_structure, output_structure, regions, entry)?,
+            Program::<V, O, Vec<V>, Vec<V>>::new_preserving_transform_caches(
+                input_structure,
+                output_structure,
+                regions,
+                entry,
+            )?,
             live_input_indices,
         ))
     }
