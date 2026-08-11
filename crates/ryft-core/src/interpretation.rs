@@ -1,46 +1,78 @@
-//! Contains machinery for _interpreting_ (i.e., _replaying_) staged [`Program`]s through chosen value semantics.
+//! Replays staged [`Program`]s through chosen value semantics.
 //!
-//! Interpretation walks a [`Program`] in [`Instruction`] order, lifts its stored constants into the active value
-//! domain, and sends every operation through [`Context::bind`]. The supplied context determines what replay means:
-//! an [`EagerContext`] computes concrete values, a [`StagingContext`](crate::StagingContext) records the replayed
-//! work in another program, and a transform context applies batching, differentiation, or partial-evaluation rules.
+//! Interpretation is the [`Program`] walk shared by eager execution, restaging, and transforms. It validates the
+//! program boundary, seeds a flat environment with input values, lifts live constants, visits [`Instruction`]s in
+//! order, and routes every operation through [`Context::bind`]. The supplied context determines what each bind means:
+//! an [`EagerContext`] executes an eager rule, a [`StagingContext`](crate::StagingContext) records an equivalent
+//! instruction, and a transform context applies its operation-owned rewrite. After replay, interpretation validates
+//! output refinements and rebuilds the declared output structure. Refer to [`InterpretationDriver`] for a rendered
+//! diagram of this pipeline and its nested-region path.
 //!
-//! # Entry Points
+//! # Choosing an Entry Point
 //!
-//! [`Program::interpret`] is the ordinary eager entry point. It instantiates replay with the program's
-//! [`EagerContext`], checks the structured input contract, evaluates every instruction, and reconstructs the
-//! declared output structure.
+//!   - [`Program::interpret`] is the ordinary eager entry point. It constructs the program's [`EagerContext`], checks
+//!     the structured input contract, executes every instruction, and reconstructs the structured result.
+//!   - [`Program::interpret_in_context`] replays through an explicit compatible [`Context`]. Use it to stage a program
+//!     into an active trace, apply a transform, or use backend-owned value semantics while preserving the same program
+//!     traversal and boundary validation.
+//!   - [`Program::interpret_with`] is the low-level flat replay fold. Infrastructure supplies constant-lifting and
+//!     instruction-dispatch closures directly; it is responsible only for atom availability, instruction order,
+//!     last-use value transfer, output counts, and flat output gathering.
 //!
-//! [`Program::interpret_in_context`] replays the same program through an explicitly supplied [`Context`]. Use it to
-//! inline a program into an active trace or to run it through a transform context. [`Program::interpret_with`] is the
-//! lower-level fold interface for callers that need custom input feeding or result handling around the same
-//! instruction walk.
+//! [`RegionRef`] provides corresponding context-driven and low-level methods that replay a borrowed sealed region
+//! directly from its source arena.
 //!
-//! # Operation Interpretation Rules
+//! # Replay Environment and Boundaries
 //!
-//! [`InterpretableOperation`] defines eager semantics for one [`Operation`] over a chosen value type and interpretation
-//! context. Operand-driven operations may ignore the context. Nullary construction and captured constants request only
-//! the narrow context capabilities they actually use. The context parameter `C` is deliberately unbounded on the trait
-//! itself. Adding `C: Context` there would make [`EagerContext`]'s `Context` implementation recursively require the
-//! very [`InterpretableOperation`] implementation being proven, which can overflow the trait solver. Implementations
-//! must therefore place only their actual capability requirements on `C`, such as zero construction or constant
-//! materialization, and must not add a blanket [`Context`] bound.
+//! [`Program::interpret_in_context`] first checks the input [`Parameterized`] structure and the complete input type
+//! signature. Refinements are established across the whole signature so repeated dynamic type identities cannot receive
+//! contradictory concrete bindings. Structured inputs are then flattened into an atom-indexed environment. Only live
+//! constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its results in
+//! that environment.
 //!
-//! # Division of Responsibilities
+//! Values are moved from the environment on their final use and cloned only when another consumer remains. Once all
+//! instructions have run, output types are validated against the input refinement environment and the program's closed
+//! type-identity signature. Flat outputs are finally reparameterized into the program's declared output structure.
+//! Malformed atom identifiers, boundary mismatches, refinement conflicts, bind failures, and wrong operation-result
+//! counts remain structured [`ProgramError`]s.
 //!
-//! Interpretation owns the program walk, [`Context`] owns each bind's semantics, and operation payloads own their
-//! primitive or higher-order execution rules. This division is what makes replay reusable. Replaying through an
-//! [`EagerContext`] evaluates, replaying through a [`StagingContext`](crate::StagingContext) records equivalent
-//! instructions in another builder, and replaying through a transform context invokes that transform's per-operation
-//! rules, which may evaluate, stage, or residualize different portions of the program.
+//! # Context Semantics and Operation Rules
+//!
+//! Interpretation owns traversal and value liveness. [`Context`] owns the semantics of lifting and binding.
+//! [`InterpretableOperation`] owns eager primitive or higher-order execution for one operation payload. This division
+//! lets the same replay evaluate through an [`EagerContext`], append instructions through a staging context, or invoke
+//! batching, differentiation, and partial-evaluation rules through transform contexts.
+//!
+//! Eager rules should request only the context capabilities they consume. Operand-driven rules often need only their
+//! input values, while nullary constructors and captured constants may require focused capabilities such as zero
+//! construction or constant materialization. The generic context parameter on [`InterpretableOperation`] is therefore
+//! deliberately bounded by [`Domain`] rather than by [`Context`]. The trait's type-compatibility caveat is documented
+//! on the trait itself.
+//!
+//! # Nested Regions
+//!
+//! Every [`Context::bind`] receives one instruction-scoped [`BindingRegionDriver`](crate::BindingRegionDriver). Eager
+//! binding adapts that driver into an [`InterpretationDriver`] for the operation's eager rule. Region-free applications
+//! use an empty driver. Higher-order eager rules select attached regions by index and recursively replay them through
+//! the same active context. Borrowed regions remain in the source arena, and shared replay mappings preserve repeated
+//! roots and descendants when another active context stages them into a destination arena. No standalone program is
+//! materialized for recursive eager interpretation.
+//!
+//! # Composite and Projected Operations
+//!
+//! [`InterpretableOperation`] describes eager semantics in an operation's native value universe.
+//! [`MemberInterpretableOperation`] handles a payload whose enclosing instruction consumes or produces several member
+//! kinds. [`interpret_projected_operation`] adapts a region-free native member rule to a composite domain by projecting
+//! operands, executing once through the member's eager context, and lifting results back into the composite value
+//! family. Region-carrying and genuinely mixed operations remain composite-native because their region contracts may
+//! span several member kinds.
 //!
 //! # Extending Interpretation
 //!
-//! Implement [`InterpretableOperation`] on operation payloads using the narrowest context capabilities required by the
-//! body. Higher-order operations request nested replay through the instruction-scoped [`InterpretationDriver`]. Wrapper
-//! operation enums should dispatch to payload implementations rather than duplicate their execution loops. New replay
-//! modes normally do not require a second interpreter. Implement a new [`Context`] whose `bind` method supplies the
-//! desired semantics and call [`Program::interpret_in_context`].
+//! Add eager semantics by implementing [`InterpretableOperation`] on operation payloads and dispatching
+//! wrapper operation families to those implementations. Higher-order rules recurse through their supplied
+//! [`InterpretationDriver`]. A new replay meaning normally requires no second interpreter: define a [`Context`]
+//! whose [`Context::bind`] implements that meaning and call [`Program::interpret_in_context`].
 
 use std::fmt::Debug;
 
@@ -52,11 +84,41 @@ use crate::programs::{
     RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value, ValueProjection,
 };
 
-/// Provides access to attached [`Region`](crate::Region)s during interpretation, scoped to one [`Operation`]
-/// application. During [`Program`] replay that application is exactly one [`Instruction`]. Direct rule invocation
-/// supplies an equivalent [`RegionDriver`] for that one call. Region-free applications supply a driver with no regions,
-/// while region-carrying applications expose their borrowed regions through the same contract. Implementations re-enter
-/// the active interpreter directly over borrowed regions, without materializing standalone programs.
+/// Provides instruction-scoped access to the attached [`Region`](crate::Region)s of one interpreted [`Operation`]
+/// application. During [`Program`] replay, the application is exactly one [`Instruction`]. Direct rule invocation
+/// supplies an equivalent [`RegionDriver`] for that call. Region-free applications use an empty driver, while
+/// higher-order rules select borrowed attached regions and re-enter the active interpreter without materializing
+/// standalone programs.
+///
+/// # Replay Pipeline
+///
+/// ```mermaid
+/// flowchart TD
+///   inputs["Structured Inputs"] --> environment["Flat Atom Environment"]
+///   constants["Live Program Constants"] -->|"lift through active context"| environment
+///   environment --> instruction["Next Instruction in Program Order"]
+///   regions["Instruction Attached Regions"] --> binding_driver["Application-Scoped Binding Region Driver"]
+///   instruction --> bind["Context Bind"]
+///   binding_driver --> bind
+///   bind --> eager["Eager Context"]
+///   bind --> staging["Staging Context"]
+///   bind --> transform["Transform Context"]
+///   eager --> driver["Adapt Attached Regions as Interpretation Driver"]
+///   driver --> rule["InterpretableOperation Rule"]
+///   staging --> staged["Import Regions and Append Equivalent Instruction"]
+///   transform --> transformed["Apply Transform Rule"]
+///   rule -->|"higher-order rule requests a region"| recurse["Replay Borrowed Region Through Same Eager Context"]
+///   rule --> results["Instruction Results"]
+///   staged --> results
+///   transformed --> results
+///   recurse --> results
+///   results --> environment
+///   environment -->|"after final instruction"| outputs["Validate Flat Outputs and Reconstruct Declared Structure"]
+/// ```
+///
+/// The driver is application-scoped rather than stored in the operation payload, so the same operation can receive
+/// owned, borrowed, replayed, or shared attached computations through one ordered region contract.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait InterpretationDriver<C: Domain>: RegionDriver<C::Value, C::Operation> {
     /// Interprets the [`Region`](crate::Region) at `index` over the provided input values, re-entering the active
     /// program interpreter, and returns the region's output values.
@@ -121,19 +183,20 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
 }
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
-//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context
-//  type is built from `Self` (E0284), and a per-method `where Self: Operation<Type = C::Type>` clause reproduces the
-//  same failure for the composite eager dispatcher for `ArrayIrOperation`.
-/// Represents [`Operation`]s that can be interpreted (i.e., executed) over a chosen value semantics. The interpretation
-/// [`Domain`] `C` is the single source of truth for the type, value, and operation families participating in
-/// interpretation. The contract deliberately requires only [`Domain`] and not [`Context`] as [`EagerContext`]'s
-/// [`Context`] implementation requires `O: InterpretableOperation<Self>`, and making [`Context`] itself reachable from
-/// this trait would make that obligation self-referential and overflow the trait solver. Implementations therefore add
-/// only the context capabilities they actually consume (e.g., `C: Zero<C::Value>` for nullary construction).
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
+//  context type is built from `Self` (E0284), and a per-method `where Self: Operation<Type = C::Type>` clause
+//  reproduces the same failure for the composite eager dispatcher for `ArrayIrOperation`.
+/// Eager execution rule for an [`Operation`] over a chosen value semantics. The interpretation [`Domain`] `C` is the
+/// source of the input, output, and attached-region value families. Implementations add only the capabilities they
+/// actually consume, such as zero construction for a nullary rule. The contract requires [`Domain`] rather than
+/// [`Context`] because [`EagerContext`]'s [`Context`] implementation itself requires `O: InterpretableOperation<Self>`;
+/// reaching [`Context`] through this trait would make that obligation recursive.
 ///
-/// Unlike other operation traits, this contract does not enforce `Self::Type == C::Type`. The super-trait is plain
-/// [`Operation`], no method restates the equality, and an implementation written for a context whose `C::Type`
-/// disagrees with [`Operation::Type`] therefore compiles. The relaxation is forced rather than chosen. The current
+/// # Type Compatibility
+///
+/// Unlike other operation traits, this contract cannot currently enforce `Self::Type == C::Type`.
+/// Its plain [`Operation`] super-trait does not restate the equality, so an implementation for a context whose
+/// `C::Type` disagrees with [`Operation::Type`] compiles. The relaxation is forced rather than chosen. The current
 /// trait solver cannot discharge that projection equality at implementation heads whose interpretation domain is
 /// itself built from `Self`, which is exactly the shape of every eager operation-family dispatcher, and the per-method
 /// `where Self: Operation<Type = C::Type>` clause that [`BatchableOperation`](crate::BatchableOperation) and
