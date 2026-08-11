@@ -23,11 +23,23 @@
 //!
 //! In-flight markers are tracked per `(ThreadId, Key)` pair, which gives exactly three behaviors:
 //!
-//! - **Same Thread, Same Key:** Rejected immediately with [`ReentrantSpecializationError`]. Recursive production
-//!   of the specialization currently being produced cannot terminate, so it is an error rather than a wait.
-//! - **Same Thread, Different Key:** Proceeds. Nested production of a _different_ specialization is legitimate.
-//! - **Different Thread, Same Key:** Proceeds. Both threads produce, and both inserts are idempotent with the last
-//!   one winning.
+//!   - **Same Thread, Same Key:** Rejected immediately with [`ReentrantSpecializationError`]. Recursive production
+//!     of the specialization currently being produced cannot terminate, so it is an error rather than a wait.
+//!   - **Same Thread, Different Key:** Proceeds. Nested production of a _different_ specialization is legitimate.
+//!   - **Different Thread, Same Key:** Proceeds. Both threads produce, and both inserts are idempotent with the last
+//!     one winning.
+//!
+//! Because that marker names the thread that performed the lookup, a [`SpecializationCacheProducer`] is deliberately
+//! neither `Send` nor `Sync`: production must complete on the thread that started it, and the compiler enforces that
+//! instead of a runtime check.
+//!
+//! Caller-supplied code never runs while a cache lock is held. Production runs after [`SpecializationCache::lookup`]
+//! returns, [`SpecializationCache::invalidate_where`] evaluates its predicate against a snapshot of the retained keys,
+//! and keys and artifacts removed by insertion, invalidation, or [`SpecializationCache::clear`] are dropped after the
+//! lock is released, so a predicate or a destructor may reenter the cache freely. The sole exceptions are the `Key`
+//! and `Artifact` operations the cache itself performs under a lock: `Key::clone` and `Artifact::clone` while a hit is
+//! being served or a key snapshot is taken, and `Key::hash` and `Key::eq` on every retained-map consultation and every
+//! in-flight marker registration and release. None of those four may reenter the cache.
 //!
 //! Cross-thread duplicate production is deliberate. Front-end work (i.e., tracing and lowering) is cheap relative
 //! to backend compilation, duplicate results are interchangeable by construction because the key defines
@@ -40,15 +52,16 @@
 //! # Thread Safety
 //!
 //! Thread safety is conditional and structural. The retained map and the in-flight set are behind [`Mutex`], and the
-//! statistics are [`AtomicU64`] counters, so [`SpecializationCache`] is `Send` and `Sync` exactly when `Key` and `A`
-//! are, with no `unsafe impl` anywhere. Thread-confined consumers whose artifacts are not `Send` still work
-//! single-threaded; they simply do not get `Send`.
+//! statistics are [`AtomicU64`] counters, so [`SpecializationCache`] is `Send` and `Sync` exactly when `Key` and
+//! `Artifact` are, with no `unsafe impl` anywhere. Thread-confined consumers whose artifacts are not `Send` still
+//! work single-threaded; they simply do not get `Send`.
 
 // TODO(eaplatanios): Review from here onwards.
 
 use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,7 +111,10 @@ pub enum SpecializationCacheError<E: Debug + Display> {
 ///
 /// Everything else that affects staging — the closure itself, its captures, the domain, and fixed options — is
 /// implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
-/// carries no fragile function-pointer identity.
+/// carries no fragile function-pointer identity. All three components are call-level, that is, function-level,
+/// concepts, since a bare program has neither static parameters nor a structured input; that is what separates
+/// function-level specialization caching from program-level transform caching such as the
+/// per-[`Region`](crate::programs::Region) transform cache.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionSpecializationKey<Structure, Dispatch, Static> {
     /// Host values declared static for this specialization.
@@ -146,8 +162,8 @@ impl<Structure, Dispatch, Static> FunctionSpecializationKey<Structure, Dispatch,
 /// [`SpecializationCache::clear_statistics`] call.
 ///
 /// Every counter saturates rather than wrapping. Note that `misses` counts lookups that found no retained artifact,
-/// including lookups subsequently rejected with [`ReentrantSpecializationError`], and that `productions + failures` need
-/// not equal `misses` while producers are still in flight.
+/// including lookups subsequently rejected with [`ReentrantSpecializationError`], and that `productions + failures`
+/// need not equal `misses` while producers are still in flight.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpecializationCacheStatistics {
     /// Lookups served by a retained artifact.
@@ -223,47 +239,69 @@ impl SpecializationCacheStatisticsState {
 /// Bounded, process-local cache mapping one specialization key to one retained artifact.
 ///
 /// Refer to the [module documentation](self) for the reuse, production, reentrancy, and thread-safety contracts.
-#[derive(Debug)]
-pub struct SpecializationCache<K: Clone + Eq + Hash, A: Clone> {
+pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
     /// Retained artifacts in least-recently-used order.
-    entries: Mutex<LruCache<K, A>>,
+    entries: Mutex<LruCache<Key, Artifact>>,
 
     /// Keys currently being produced, paired with the thread that is producing them.
-    in_flight: Mutex<HashSet<(ThreadId, K)>>,
+    in_flight: Mutex<HashSet<(ThreadId, Key)>>,
 
     /// Diagnostic counters.
     statistics: SpecializationCacheStatisticsState,
 }
 
+// `Debug` is implemented manually so that formatting never invokes `Key::fmt` or `Artifact::fmt`, which are not part
+// of the caller-controlled operations the module documentation permits to run while a cache lock is held.
+impl<Key: Clone + Eq + Hash, Artifact: Clone> Debug for SpecializationCache<Key, Artifact> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpecializationCache")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .field("statistics", &self.statistics.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Outcome of a [`SpecializationCache::lookup`].
 #[derive(Debug)]
-pub enum SpecializationCacheLookup<'a, K: Clone + Eq + Hash, A: Clone> {
+pub enum SpecializationCacheLookup<'a, Key: Clone + Eq + Hash, Artifact: Clone> {
     /// A retained artifact was found and its recency was refreshed.
-    Hit(A),
+    Hit(Artifact),
 
     /// No artifact was retained. The producer guard holds the in-flight marker until it inserts or is dropped.
-    Miss(SpecializationCacheProducer<'a, K, A>),
+    Miss(SpecializationCacheProducer<'a, Key, Artifact>),
 }
 
 /// RAII guard authorizing production of one specialization.
 ///
-/// The guard holds the `(ThreadId, K)` in-flight marker for its key. Calling [`Self::insert`] publishes an artifact
+/// The guard holds the `(ThreadId, Key)` in-flight marker for its key. Calling [`Self::insert`] publishes an artifact
 /// and releases the marker; dropping the guard without inserting releases the marker, counts a failure, and caches
 /// nothing. Because the guard borrows the cache rather than holding a lock, production runs with the cache fully
 /// available to other threads.
+///
+/// A producer is thread-affine and therefore neither `Send` nor `Sync`, which the [`PhantomData`] marker below
+/// enforces at compile time. The in-flight marker is keyed by the thread that performed the lookup, so production must
+/// complete on that thread: were a producer moved elsewhere, the originating thread would remain barred from the key
+/// it is no longer producing, while the receiving thread could register the same key a second time and recursively
+/// produce it — the nonterminating recursion that [`ReentrantSpecializationError`] exists to reject.
 #[derive(Debug)]
-pub struct SpecializationCacheProducer<'a, K: Clone + Eq + Hash, A: Clone> {
+pub struct SpecializationCacheProducer<'a, Key: Clone + Eq + Hash, Artifact: Clone> {
     /// Cache this producer publishes to.
-    cache: &'a SpecializationCache<K, A>,
+    cache: &'a SpecializationCache<Key, Artifact>,
 
     /// Thread that registered the in-flight marker, so the marker is released with the key it was registered under.
     thread: ThreadId,
 
     /// Key being produced. Taken by [`Self::insert`] so that [`Drop`] does not double-release the marker.
-    key: Option<K>,
+    key: Option<Key>,
+
+    /// [`PhantomData`] marker pinning this guard to the thread that registered the in-flight marker. A raw pointer is
+    /// neither `Send` nor `Sync`, and so neither is this guard.
+    marker: PhantomData<*mut ()>,
 }
 
-impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
+impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact> {
     /// Creates an empty cache retaining at most `capacity` artifacts. A `capacity` of zero is clamped to one, because
     /// a cache that can retain nothing would turn every producer into wasted work.
     pub fn new(capacity: usize) -> Self {
@@ -283,7 +321,10 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
     ///
     /// # Parameters
     ///   - `key`: Specialization to look up. It is consumed because a miss retains it as the producer's key.
-    pub fn lookup(&self, key: K) -> Result<SpecializationCacheLookup<'_, K, A>, ReentrantSpecializationError> {
+    pub fn lookup(
+        &self,
+        key: Key,
+    ) -> Result<SpecializationCacheLookup<'_, Key, Artifact>, ReentrantSpecializationError> {
         if let Some(artifact) = self.entries.lock().expect("specialization cache mutex is poisoned").get(&key).cloned()
         {
             SpecializationCacheStatisticsState::increment(&self.statistics.hits);
@@ -291,12 +332,23 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
         }
         SpecializationCacheStatisticsState::increment(&self.statistics.misses);
         let thread = std::thread::current().id();
-        let registered =
-            self.in_flight.lock().expect("specialization cache mutex is poisoned").insert((thread, key.clone()));
-        if !registered {
+
+        // Registering with `replace` rather than `insert` hands the equal marker that is already in flight back out of
+        // the guard, so a rejected duplicate registration drops its `Key` after the lock is released instead of under
+        // it. The two markers are interchangeable by definition, since they compare equal.
+        let already_in_flight = {
+            let mut in_flight = self.in_flight.lock().expect("specialization cache mutex is poisoned");
+            in_flight.replace((thread, key.clone()))
+        };
+        if already_in_flight.is_some() {
             return Err(ReentrantSpecializationError);
         }
-        Ok(SpecializationCacheLookup::Miss(SpecializationCacheProducer { cache: self, thread, key: Some(key) }))
+        Ok(SpecializationCacheLookup::Miss(SpecializationCacheProducer {
+            cache: self,
+            thread,
+            key: Some(key),
+            marker: PhantomData,
+        }))
     }
 
     /// Returns the artifact retained for `key`, producing and retaining one with `produce` on a miss.
@@ -308,10 +360,10 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
     /// # Parameters
     ///   - `key`: Specialization to look up.
     ///   - `produce`: Runs on a miss, outside every cache lock, to build the artifact.
-    pub fn get_or_try_insert_with<E, F>(&self, key: K, produce: F) -> Result<A, SpecializationCacheError<E>>
+    pub fn get_or_try_insert_with<E, F>(&self, key: Key, produce: F) -> Result<Artifact, SpecializationCacheError<E>>
     where
         E: Debug + Display,
-        F: FnOnce() -> Result<A, E>,
+        F: FnOnce() -> Result<Artifact, E>,
     {
         match self.lookup(key)? {
             SpecializationCacheLookup::Hit(artifact) => Ok(artifact),
@@ -338,7 +390,7 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
     }
 
     /// Returns the retained keys from most to least recently used.
-    pub fn keys(&self) -> Vec<K> {
+    pub fn keys(&self) -> Vec<Key> {
         self.entries
             .lock()
             .expect("specialization cache mutex is poisoned")
@@ -353,23 +405,37 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
     /// inserts its artifact, because it was authorized before the clear and its key still identifies an
     /// interchangeable specialization.
     pub fn clear(&self) {
-        self.entries.lock().expect("specialization cache mutex is poisoned").clear();
+        // Swapping an empty map of the same capacity in under the lock, and dropping the removed one afterwards, keeps
+        // every key and artifact destructor outside the lock so that a destructor may reenter the cache.
+        let removed = {
+            let mut entries = self.entries.lock().expect("specialization cache mutex is poisoned");
+            let capacity = entries.cap();
+            std::mem::replace(&mut *entries, LruCache::new(capacity))
+        };
+        drop(removed);
     }
 
     /// Removes every retained artifact whose key satisfies `predicate`, returning how many were removed.
     ///
-    /// Like [`Self::clear`], this does not cancel producers that are already in flight.
+    /// The predicate runs outside every cache lock, against a snapshot of the keys retained when this call started,
+    /// and so it may reenter the cache and a panic inside it poisons nothing. Consequently, keys retained after the
+    /// snapshot are not offered to the predicate, and a snapshot key that another thread removed in the meantime is
+    /// not counted as removed here. Like [`Self::clear`], this does not cancel producers that are already in flight.
     ///
     /// # Parameters
-    ///   - `predicate`: Selects the keys to remove. It is called once per retained key, from most to least recently
+    ///   - `predicate`: Selects the keys to remove. It is called once per snapshot key, from most to least recently
     ///     used.
-    pub fn invalidate_where(&self, mut predicate: impl FnMut(&K) -> bool) -> usize {
-        let mut entries = self.entries.lock().expect("specialization cache mutex is poisoned");
-        let removed = entries.iter().map(|(key, _)| key).filter(|key| predicate(key)).cloned().collect::<Vec<_>>();
-        for key in &removed {
-            entries.pop(key);
-        }
-        removed.len()
+    pub fn invalidate_where(&self, mut predicate: impl FnMut(&Key) -> bool) -> usize {
+        let selected = self.keys().into_iter().filter(|key| predicate(key)).collect::<Vec<_>>();
+        let removed = {
+            let mut entries = self.entries.lock().expect("specialization cache mutex is poisoned");
+            selected.iter().filter_map(|key| entries.pop_entry(key)).collect::<Vec<_>>()
+        };
+
+        // The removed pairs are dropped after the guard above is released, and so their destructors may reenter.
+        let count = removed.len();
+        drop(removed);
+        count
     }
 
     /// Returns a snapshot of this cache's activity counters.
@@ -383,10 +449,10 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCache<K, A> {
     }
 }
 
-impl<K: Clone + Eq + Hash, A: Clone> SpecializationCacheProducer<'_, K, A> {
+impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Key, Artifact> {
     /// Returns the key this producer is authorized to produce.
     #[inline]
-    pub fn key(&self) -> &K {
+    pub fn key(&self) -> &Key {
         self.key.as_ref().unwrap()
     }
 
@@ -394,37 +460,58 @@ impl<K: Clone + Eq + Hash, A: Clone> SpecializationCacheProducer<'_, K, A> {
     ///
     /// Inserting is idempotent: if another thread produced the same key concurrently, the later insert replaces the
     /// earlier one. Both artifacts are interchangeable by the cache's reuse contract, so last-one-wins is safe.
-    pub fn insert(mut self, artifact: A) -> A {
+    ///
+    /// The entry this insertion displaces, if any, is dropped only after the artifact is published, the counters are
+    /// updated, and the in-flight marker is released, so a displaced destructor that panics leaves the cache exactly
+    /// as a successful insertion would.
+    pub fn insert(mut self, artifact: Artifact) -> Artifact {
         let key = self.key.take().unwrap();
-        {
+
+        // The displaced pair is bound here so that it outlives the guard below and its destructors run unlocked, which
+        // is what lets an artifact reenter the cache while being dropped. It is deliberately dropped last, after the
+        // counters are updated and the in-flight marker is released, so that a destructor that panics can neither
+        // strand the marker (which would reject every later lookup of this key on this thread as reentrant) nor skip a
+        // counter update.
+        let displaced = {
             let mut entries = self.cache.entries.lock().expect("specialization cache mutex is poisoned");
-            if let Some((replaced_key, _)) = entries.push(key.clone(), artifact.clone())
-                && replaced_key != key
-            {
-                SpecializationCacheStatisticsState::increment(&self.cache.statistics.evictions);
-            }
+            entries.push(key.clone(), artifact.clone())
+        };
+        if let Some((displaced_key, _)) = &displaced
+            && *displaced_key != key
+        {
+            SpecializationCacheStatisticsState::increment(&self.cache.statistics.evictions);
         }
         SpecializationCacheStatisticsState::increment(&self.cache.statistics.productions);
-        self.cache
-            .in_flight
-            .lock()
-            .expect("specialization cache mutex is poisoned")
-            .remove(&(self.thread, key));
+
+        // Both the marker offered for removal and the one recovered from the set are bound outside the guard, so that
+        // a `Key` destructor may reenter the cache as well.
+        let marker = (self.thread, key);
+        let removed = {
+            let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
+            in_flight.take(&marker)
+        };
+        drop(removed);
+        drop(marker);
+        drop(displaced);
         artifact
     }
 }
 
-impl<K: Clone + Eq + Hash, A: Clone> Drop for SpecializationCacheProducer<'_, K, A> {
+impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProducer<'_, Key, Artifact> {
     fn drop(&mut self) {
         // `insert` takes the key, so this only runs when production failed or unwound. Releasing the marker here is
         // what makes failed and panicking production retryable instead of permanently reentrant.
         if let Some(key) = self.key.take() {
-            self.cache
-                .in_flight
-                .lock()
-                .expect("specialization cache mutex is poisoned")
-                .remove(&(self.thread, key));
+            // Both the marker offered for removal and the one recovered from the set are bound outside the guard, so
+            // that a `Key` destructor may reenter the cache.
+            let marker = (self.thread, key);
+            let removed = {
+                let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
+                in_flight.take(&marker)
+            };
             SpecializationCacheStatisticsState::increment(&self.cache.statistics.failures);
+            drop(removed);
+            drop(marker);
         }
     }
 }
@@ -433,7 +520,8 @@ impl<K: Clone + Eq + Hash, A: Clone> Drop for SpecializationCacheProducer<'_, K,
 mod tests {
     use std::hash::Hasher;
     use std::panic::AssertUnwindSafe;
-    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Barrier, OnceLock};
     use std::thread;
 
     use pretty_assertions::assert_eq;
@@ -441,9 +529,9 @@ mod tests {
     use super::*;
 
     /// Extracts the producer from a lookup that is expected to miss.
-    fn expect_producer<K: Clone + Eq + Hash, A: Clone>(
-        lookup: Result<SpecializationCacheLookup<'_, K, A>, ReentrantSpecializationError>,
-    ) -> SpecializationCacheProducer<'_, K, A> {
+    fn expect_producer<Key: Clone + Eq + Hash, Artifact: Clone>(
+        lookup: Result<SpecializationCacheLookup<'_, Key, Artifact>, ReentrantSpecializationError>,
+    ) -> SpecializationCacheProducer<'_, Key, Artifact> {
         match lookup {
             Ok(SpecializationCacheLookup::Miss(producer)) => producer,
             Ok(SpecializationCacheLookup::Hit(_)) => panic!("expected a miss but the lookup hit"),
@@ -452,9 +540,9 @@ mod tests {
     }
 
     /// Extracts the artifact from a lookup that is expected to hit.
-    fn expect_hit<K: Clone + Eq + Hash, A: Clone>(
-        lookup: Result<SpecializationCacheLookup<'_, K, A>, ReentrantSpecializationError>,
-    ) -> A {
+    fn expect_hit<Key: Clone + Eq + Hash, Artifact: Clone>(
+        lookup: Result<SpecializationCacheLookup<'_, Key, Artifact>, ReentrantSpecializationError>,
+    ) -> Artifact {
         match lookup {
             Ok(SpecializationCacheLookup::Hit(artifact)) => artifact,
             Ok(SpecializationCacheLookup::Miss(_)) => panic!("expected a hit but the lookup missed"),
@@ -632,6 +720,159 @@ mod tests {
         assert_send_and_sync::<SpecializationCache<u32, &'static str>>();
         assert_send_and_sync::<SpecializationCacheStatistics>();
         assert_send_and_sync::<ReentrantSpecializationError>();
+
+        // `SpecializationCacheProducer` is deliberately *not* `Send` or `Sync`, because its in-flight marker is keyed
+        // by the thread that looked the key up. That negative bound is enforced by the guard's `PhantomData<*mut ()>`
+        // marker and can only be observed as a compilation failure, which needs a compile-fail harness this crate
+        // intentionally does not depend on, and so it is pinned here as documentation rather than as an assertion.
+    }
+
+    #[test]
+    fn test_invalidation_predicate_runs_outside_the_locks() {
+        let cache = SpecializationCache::<u32, &'static str>::new(8);
+        expect_producer(cache.lookup(1)).insert("one");
+        expect_producer(cache.lookup(2)).insert("two");
+        expect_producer(cache.lookup(3)).insert("three");
+
+        // The predicate observes the full snapshot while it runs, which pins that removal happens afterwards, and it
+        // reenters the cache without deadlocking because no lock is held while it runs.
+        assert_eq!(cache.invalidate_where(|key| cache.len() == 3 && key % 2 == 1), 2);
+        assert_eq!(cache.keys(), vec![2]);
+
+        // A panicking predicate poisons nothing, because the panic unwinds with no cache lock held.
+        let panicked =
+            std::panic::catch_unwind(AssertUnwindSafe(|| cache.invalidate_where(|_| panic!("predicate panicked"))));
+        assert!(panicked.is_err());
+        assert_eq!(cache.keys(), vec![2]);
+        expect_producer(cache.lookup(4)).insert("four");
+        assert_eq!(expect_hit(cache.lookup(2)), "two");
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_removed_artifacts_are_dropped_outside_the_locks() {
+        /// Artifact whose destructor reads the cache holding it, which deadlocks unless every removal drops its
+        /// artifact after releasing the retained map's lock.
+        #[derive(Clone)]
+        struct ReenteringArtifact(&'static SpecializationCache<u32, ReenteringArtifact>);
+
+        impl Drop for ReenteringArtifact {
+            fn drop(&mut self) {
+                DROPS.fetch_add(self.0.len() as u64 + 1, Ordering::Relaxed);
+            }
+        }
+
+        /// Counts destructor runs, weighted so that a destructor that failed to observe the cache is visible.
+        static DROPS: AtomicU64 = AtomicU64::new(0);
+
+        // The cache is leaked so that artifacts can name it for their whole lifetime, which is what lets a destructor
+        // reenter it at all.
+        let cache: &'static SpecializationCache<u32, ReenteringArtifact> =
+            Box::leak(Box::new(SpecializationCache::new(1)));
+
+        // Eviction replaces a retained artifact, invalidation removes selected ones, and clearing removes all of them.
+        expect_producer(cache.lookup(1)).insert(ReenteringArtifact(cache));
+        expect_producer(cache.lookup(2)).insert(ReenteringArtifact(cache));
+        assert_eq!(cache.statistics().evictions, 1);
+        assert_eq!(cache.invalidate_where(|key| *key == 2), 1);
+        assert!(cache.is_empty());
+        expect_producer(cache.lookup(3)).insert(ReenteringArtifact(cache));
+        cache.clear();
+        assert!(cache.is_empty());
+
+        // Every removal path ran at least one destructor that read the cache and observed a consistent length.
+        assert!(DROPS.load(Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn test_insertion_publishes_and_releases_before_dropping_the_displaced_artifact() {
+        /// Artifact whose destructor panics exactly once, after it has been armed. Arming it only once the artifact
+        /// is retained keeps every other copy's destructor harmless, and disarming inside the destructor keeps the
+        /// panic from firing again while the stack unwinds (which would abort the process).
+        #[derive(Clone)]
+        struct PanickingArtifact;
+
+        impl Drop for PanickingArtifact {
+            fn drop(&mut self) {
+                if ARMED.swap(false, Ordering::Relaxed) {
+                    panic!("displaced artifact destructor panicked");
+                }
+            }
+        }
+
+        /// Whether the next destructor run must panic.
+        static ARMED: AtomicBool = AtomicBool::new(false);
+
+        let cache = SpecializationCache::<u32, PanickingArtifact>::new(1);
+        expect_producer(cache.lookup(1)).insert(PanickingArtifact);
+        ARMED.store(true, Ordering::Relaxed);
+
+        // Inserting a second key displaces the armed artifact, whose destructor unwinds out of the insertion.
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            expect_producer(cache.lookup(2)).insert(PanickingArtifact);
+        }));
+        assert!(panicked.is_err());
+
+        // Publication, the counter updates, and the marker release all happened before that destructor ran, so the
+        // artifact is retained, the same thread may look its key up again instead of being rejected as reentrant, and
+        // both the production and the eviction were counted.
+        assert_eq!(cache.keys(), vec![2]);
+        assert!(matches!(cache.lookup(2), Ok(SpecializationCacheLookup::Hit(_))));
+        assert_eq!(
+            cache.statistics(),
+            SpecializationCacheStatistics { hits: 1, misses: 2, productions: 2, failures: 0, evictions: 1 },
+        );
+    }
+
+    #[test]
+    fn test_removed_keys_are_dropped_outside_the_locks() {
+        /// Key whose destructor reenters the cache holding it, which deadlocks unless every owned key is dropped
+        /// after the guard that reached it has been released.
+        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+        struct ReenteringKey(u32);
+
+        impl Drop for ReenteringKey {
+            fn drop(&mut self) {
+                // The reentry below itself drops keys, so it is performed once per destructor chain rather than
+                // recursing forever.
+                if REENTERED.swap(true, Ordering::Relaxed) {
+                    return;
+                }
+
+                // `len` reenters the retained map's lock and the nested lookup additionally reenters the in-flight
+                // lock, so a key dropped under either guard deadlocks here. The count is weighted so that a
+                // destructor that failed to observe the cache is visible.
+                let cache = CACHE.get().unwrap();
+                DROPS.fetch_add(cache.len() as u64 + 1, Ordering::Relaxed);
+                drop(expect_producer(cache.lookup(ReenteringKey(u32::MAX))));
+                REENTERED.store(false, Ordering::Relaxed);
+            }
+        }
+
+        /// Cache the destructors above reenter. It is leaked so that keys can name it for their whole lifetime.
+        static CACHE: OnceLock<&'static SpecializationCache<ReenteringKey, &'static str>> = OnceLock::new();
+
+        /// Whether a destructor chain is already reentering the cache.
+        static REENTERED: AtomicBool = AtomicBool::new(false);
+
+        /// Counts destructor runs, weighted by the cache length each one observed.
+        static DROPS: AtomicU64 = AtomicU64::new(0);
+
+        let cache: &'static SpecializationCache<ReenteringKey, &'static str> =
+            Box::leak(Box::new(SpecializationCache::new(4)));
+        CACHE.set(cache).unwrap();
+
+        // A rejected duplicate registration drops the offered key, a successful insertion drops both the released
+        // marker and the key it was offered under, and a producer dropped without inserting drops the marker it
+        // releases.
+        let producer = expect_producer(cache.lookup(ReenteringKey(1)));
+        assert!(matches!(cache.lookup(ReenteringKey(1)), Err(ReentrantSpecializationError)));
+        producer.insert("one");
+        drop(expect_producer(cache.lookup(ReenteringKey(2))));
+
+        // Every path above ran at least one destructor that read the cache and observed a consistent length.
+        assert!(DROPS.load(Ordering::Relaxed) >= 3);
+        assert_eq!(cache.keys(), vec![ReenteringKey(1)]);
     }
 
     #[test]
