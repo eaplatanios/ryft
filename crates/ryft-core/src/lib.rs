@@ -16,7 +16,6 @@ pub mod operations;
 pub mod parameters;
 pub mod partial;
 pub mod programs;
-#[cfg_attr(doc, aquamarine::aquamarine)]
 pub mod specialization;
 pub mod tracing;
 pub mod tracing_v2;
