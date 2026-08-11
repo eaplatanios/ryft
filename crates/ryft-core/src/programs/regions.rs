@@ -503,28 +503,28 @@ impl<V: Typed + Parameter, O> Region<V, O> {
     }
 
     // TODO(eaplatanios): Should this be `pub`?
-    /// Returns the structural transforms already derived from this [`Region`]'s contents.
+    /// Returns the [`RegionTransformCache`] that contains the structural transforms already derived
+    /// from this [`Region`]'s contents.
     #[inline]
     pub(crate) fn transform_cache(&self) -> &RegionTransformCache<V, O> {
         &self.transform_cache
     }
 
     // TODO(eaplatanios): Should this be `pub`?
-    /// Makes this [`Region`] share `transform_cache` instead of its own cell.
-    ///
-    /// Callers must guarantee that this region has exactly the contents of the region that owns `transform_cache`,
-    /// including the contents of every region reachable from it. Refer to [`RegionTransformCache`] for why that is the
-    /// complete precondition. Attached [`RegionId`]s may be renumbered as long as the renumbering preserves the
-    /// complete reachable region graph's topology, for the same reason [`RegionArena::append`] keeps derived metadata
-    /// valid: a retained transform depends on the reachable bodies, not on the identifiers they are filed under.
+    /// Makes this [`Region`] adopt (i.e., share) the provided [`RegionTransformCache`] instead of its own. Callers
+    /// must guarantee that this region has exactly the contents of the region that owns `transform_cache`, including
+    /// the contents of every region reachable from it. Refer to [`RegionTransformCache`] for why that is the complete
+    /// precondition. Attached [`RegionId`]s may be renumbered as long as the renumbering preserves the complete
+    /// reachable region graph's topology, for the same reason [`RegionArena::append`] keeps derived metadata valid:
+    /// a retained transform depends on the reachable bodies, not on the identifiers they are filed under.
     #[inline]
     pub(crate) fn adopt_transform_cache(&mut self, transform_cache: RegionTransformCache<V, O>) {
         self.transform_cache = transform_cache;
     }
 
     // TODO(eaplatanios): Should this be `pub`?
-    /// Detaches this [`Region`] from the transforms derived from its previous contents, which every in-place rewrite
-    /// of a region's contents must do.
+    /// Detaches this [`Region`] from the cached transforms that were derived from its previous contents, which every
+    /// in-place rewrite of a region's contents must do.
     #[inline]
     pub(crate) fn invalidate_transform_cache(&mut self) {
         self.transform_cache = RegionTransformCache::new();
@@ -546,24 +546,10 @@ pub struct RegionWithMetadata<V: Typed + Parameter, O> {
     type_identity_signature: TypeIdentitySignature<<V::Type as Type>::Identity>,
 }
 
-// TODO(eaplatanios): Review this.
-/// Whether a sealing path keeps the transforms already derived from a [`Region`]'s contents. Refer to the
-/// _Rewrites And Re-Sealing_ section of [`RegionTransformCache`] for why sealing is where this choice must be made.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum TransformCachePolicy {
-    /// Mint a fresh [`RegionTransformCache`] for a region that attaches at least one descendant, because the sealing
-    /// arena is not known to file the same descendant bodies under the identifiers the region attaches.
-    Mint,
-
-    /// Keep the region's existing [`RegionTransformCache`]. The caller must guarantee that the sealing arena preserves
-    /// the region's complete reachable closure, up to a topology-preserving renumbering of attached identifiers.
-    Preserve,
-}
-
 impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
     /// Creates a new [`RegionWithMetadata`] by _sealing_ the provided `region` after deriving its metadata against
     /// `sealed_regions`, which must contain every region it references. A sealed region that attaches descendants
-    /// starts over with no derived transforms, because the identifiers it attaches acquire their meaning here.
+    /// starts over with no derived transforms because the identifiers it attaches acquire their meaning here.
     #[inline]
     pub fn new(region: Region<V, O>, sealed_regions: &[Self]) -> Result<Self, ProgramError> {
         Self::seal(region, sealed_regions, TransformCachePolicy::Mint)
@@ -643,6 +629,20 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
         let type_identity_signature = region.type_identity_signature()?;
         Ok(Self { region, effects, type_identity_signature })
     }
+}
+
+/// Represents whether a [`Region`] sealing path should keep the transforms already derived from a [`Region`]'s
+/// contents. Refer to the _Rewrites And Re-Sealing_ section of [`RegionTransformCache`] for why sealing is where
+/// this choice must be made.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TransformCachePolicy {
+    /// Mint a fresh [`RegionTransformCache`] for a region that attaches at least one descendant, because the sealing
+    /// arena is not known to file the same descendant bodies under the identifiers the region attaches.
+    Mint,
+
+    /// Keep the region's existing [`RegionTransformCache`]. The caller must guarantee that the sealing arena preserves
+    /// the region's complete reachable closure, up to a topology-preserving renumbering of attached identifiers.
+    Preserve,
 }
 
 /// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes into
