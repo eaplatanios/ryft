@@ -127,13 +127,14 @@ pub trait Domain: Sized {
 /// # Context Model
 ///
 /// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
 ///   domain["Domain"] --> families["Type, Value, Constant, and Operation Families"]
 ///   domain --> context["Context"]
-///   context --> lift["lift: Stored Constant to Flowing Value"]
-///   context --> bind["bind: Apply Operation with Attached Regions"]
-///   context --> resolve["resolve: Constant, Staged, or Opaque"]
-///   context --> eager_query["is_eager: Innermost Execution Semantics"]
+///   context --> lift["&lt;code&gt;lift&lt;/code&gt;: Stored Constant to Flowing Value"]
+///   context --> bind["&lt;code&gt;bind&lt;/code&gt;: Apply Operation with Attached Regions"]
+///   context --> resolve["&lt;code&gt;resolve&lt;/code&gt;: Constant, Staged, or Opaque"]
+///   context --> eager_query["&lt;code&gt;is_eager&lt;/code&gt;: Innermost Execution Semantics"]
 ///   bind --> eager["Eager Binding"]
 ///   bind --> staging["Staging Binding"]
 ///   bind --> transform["Transform Binding"]

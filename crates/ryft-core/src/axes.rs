@@ -1,3 +1,47 @@
+//! Defines positional array axes and dynamically scoped named axes used by array operations and program transforms.
+//!
+//! Positional [`Axis`] values identify dimensions within one concrete array rank. Named axes instead identify logical
+//! transform dimensions—such as a vectorized batch or device-mesh axis—through the active [`Context`] stack. The two
+//! forms meet inside operation-owned rules: a named binding supplies value-free scope metadata, while the rule
+//! supplies the physical dimension of each participating value when one exists. Refer to [`NamedAxes`] for a rendered
+//! diagram of named-axis lookup and consumption.
+//!
+//! # Positional Axes
+//!
+//! [`Axis`] stores a signed index and delays normalization until an array rank is known. Nonnegative indices count
+//! from the leading dimension. Negative indices count backward, so `-1` denotes the trailing dimension. Normalization
+//! accepts exactly `[-rank, rank)` and returns a nonnegative position. [`Axes`] preserves an ordered collection of
+//! these values and rejects duplicates after normalization, including aliases such as `0` and `-rank`.
+//!
+//! Positional axes are array-boundary descriptors. They differ from [`BatchAxis`](crate::BatchAxis), which additionally
+//! represents replication and records whether one physical dimension of a packed value carries the mapped batch.
+//!
+//! # Named Axes and Dynamic Scope
+//!
+//! [`NamedAxis`] records the kind of logical binding and any statically known size. [`NamedAxes`] resolves names
+//! innermost-first through the context stack: a batching level may bind its mapped axis, a tracing context may be
+//! seeded with device-mesh axes, and nested tracing may introduce nearer bindings that shadow outer ones. Projection,
+//! partial evaluation, differentiation, and other transparent wrappers delegate unresolved names to their parent.
+//!
+//! A binding deliberately does not identify a dimension of every value. A replicated operand has no mapped dimension
+//! even when a collective over the enclosing logical axis is meaningful. The operation rule that consumes the name
+//! combines the binding with its transform-specific per-value metadata.
+//!
+//! # Axis Values
+//!
+//! [`NamedAxes`] answers whether a name is in scope and what it denotes; it does not produce a runtime value.
+//! [`AxisIndex`] is the value-producing counterpart. It validates the binding, then returns a `u64` scalar containing
+//! the current batch-item index or mesh-coordinate index according to the binder kind. The resulting
+//! [`AxisIndexOperation`] remains an ordinary operation and therefore composes with interpretation, tracing, batching,
+//! differentiation, and partial evaluation through their normal rule contracts.
+//!
+//! # Errors and Extension Points
+//!
+//! [`AxisError`] distinguishes an out-of-range positional axis, a duplicate normalized position, and an unbound name.
+//! New context wrappers that introduce a named axis should resolve their local binding first and delegate every other
+//! name to the parent. Transparent wrappers should delegate all names unchanged. New named-axis operations should use
+//! [`NamedAxes`] for scope validation and leave per-value dimension handling to the transform that owns that metadata.
+
 use std::fmt::Display;
 use std::ops::Deref;
 
@@ -230,14 +274,33 @@ pub enum NamedAxis {
     },
 }
 
-/// Capability for resolving named axes visible at a trace level. Named axes are dynamically scoped binders introduced
-/// by transforms (e.g., a batching level names the axis it introduces, and a manual sharding region names its mesh
-/// axes) and read by named-axis primitives such as collective operations. Resolution walks the enclosing context stack
-/// innermost-first, and so a nearer binder shadows a farther one. This capability answers only whether a name is
-/// currently bound and, if so, what kind of axis it is and any statically known size: the "is this name in scope"
-/// lookup used for bind-time validation and scalar queries. It is deliberately *not* the evaluator. Specifying how a
-/// use site consumes the axis (and against which dimension of a given operand) is the owning transform's per-operation
-/// rule's responsibility, which already receives that per-value position at dispatch time.
+/// Capability for resolving named axes visible at one context-stack level. Named axes are dynamically scoped binders
+/// introduced by transforms and manual sharding regions, then consumed by named-axis operations such as collectives.
+/// Resolution is innermost-first, so a nearer binder shadows a farther one. The returned [`NamedAxis`] carries only
+/// value-free kind and size facts; the owning operation rule remains responsible for how a use consumes that logical
+/// axis and which physical dimension of each value carries it.
+///
+/// # Dynamic-Scope Lookup
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   request["Operation Requests an Axis Name"] --> current["Current Context"]
+///   current --> local["Check Local Named-Axis Bindings"]
+///   local -->|"nearest local binding"| binding["Named Axis: Batched or Mesh"]
+///   local -->|"not bound locally"| parent["Delegate to Parent Context"]
+///   parent --> lookup["Repeat Innermost-First Lookup"]
+///   lookup -->|"binding found"| binding
+///   lookup -->|"no enclosing binding"| unbound["Unbound Axis Error"]
+///   binding --> facts["Value-Free Kind and Optional Static Size"]
+///   facts --> rule["Operation-Owned Rule"]
+///   per_value["Per-Value Mapped-Axis Metadata"] --> rule
+///   facts --> axis_index["&lt;code&gt;AxisIndex&lt;/code&gt; Capability"]
+///   axis_index --> value["Current Index Value"]
+/// ```
+///
+/// Implementations introduce only their local bindings. Every miss delegates outward unless the context is a leaf.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.

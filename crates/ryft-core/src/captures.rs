@@ -1,12 +1,60 @@
-//! Contains machinery for representing runtime _captures_ for staged [`Program`]s.
+//! Represents runtime values captured by staged [`Program`]s without embedding those values in reusable intermediate
+//! representation.
 //!
-//! Runtime values closed over by a traced closure (e.g., the device buffers a just-in-time-compiled function reads) are
-//! not embedded in staged programs as literal constants. Instead, a [`ClosedProgram`] keeps them in a side table while
-//! the program's constant atoms store lifetime-free, typed [`CaptureReference`] indices into that table. This keeps the
-//! IR compact, preserves device-resident buffers, and lets compilation depend only on capture *types* rather than
-//! concrete data, so one compiled executable serves any captured value of a given type.
+//! A captured program has two coordinated parts. Constant atoms in the staged program carry lifetime-free, typed
+//! [`CaptureReference`] indices, while the concrete values they name live in a side table owned by [`ClosedProgram`].
+//! The program therefore depends on capture types and positions rather than concrete data. Large arrays stay out of the
+//! Intermediate Representation (IR), device buffers remain device-resident, and compiled executables can be reused with
+//! different captured values of compatible types. Refer to [`ClosedProgram`] for a rendered diagram of this
+//! representation and its compilation boundary. The compilation lifecycle built on these types lives in
+//! the [`compilation`](crate::compilation) module.
 //!
-//! The compilation lifecycle built on top of these types lives in [`crate::compilation`].
+//! # Capturing During Tracing
+//!
+//! [`CapturingContext::capture`] registers one closed-over runtime value in the capture-owning trace and returns the
+//! staged constant payload that refers to its new table slot. [`TracingContext`] owns the table. Nested tracing,
+//! batching, differentiation, partial evaluation, and projected contexts delegate registration through their parent,
+//! so a nested transform does not create a competing capture scope or embed a backend value as a literal.
+//!
+//! Multiple program atoms may refer to the same slot, and references may appear in any region of the program. The table
+//! order is registration order and becomes the capture-argument order used by compilation.
+//!
+//! # Constant Families
+//!
+//! [`CaptureReference`] is the canonical constant representation for a purely capture-backed program.
+//! [`CaptureConstant`] also supports sum-like backend constant families that can hold either a capture reference or an
+//! immediate host-sized payload. Immediate constants return no capture index, carry their own data, and bypass capture
+//! validation, pruning, and lifting. Every such family can still be constructed from a plain capture reference, which
+//! is the payload returned when a runtime value is registered.
+//!
+//! # Closed-Program Invariant
+//!
+//! [`ClosedProgram::new`] is the sole construction boundary. It walks every region in the program arena and verifies
+//! that each capture-referencing constant names an existing table entry with exactly the declared type. The program and
+//! table are immutable afterward, so interpretation and transformation can rely on this invariant without rechecking
+//! individual references.
+//!
+//! # Pruning and Transform Identity
+//!
+//! [`ClosedProgram::without_unused_captures`] removes table entries that no constant atom references and renumbers
+//! surviving references into a contiguous table while preserving their relative order. A renumbered constant changes
+//! the contents of its region, so that region and every transitive attaching ancestor discard retained program
+//! transform artifacts. Unchanged siblings and descendants retain theirs. Removing only unused trailing captures
+//! rewrites no reference and therefore preserves all region transform caches.
+//!
+//! # Lifting Captures for Compilation
+//!
+//! [`ClosedProgram::to_program_with_lifted_captures`] derives an open program whose leading inputs correspond to the
+//! capture table and whose remaining inputs are the original public inputs. Every reference to one capture is rewritten
+//! to the same leading input, while immediate constants remain constants. Compilation supplies arguments in
+//! `[captures..., public inputs...]` order. The original closed program remains unchanged.
+//!
+//! # Extending Capture Support
+//!
+//! A new staged constant family implements [`CaptureConstant`] by exposing and rewriting only its reference-bearing
+//! variants. A new capture-owning trace implements [`CapturingContext`] by storing concrete values and returning typed
+//! staged references. Context wrappers should delegate capture registration to their parent unless they intentionally
+//! establish a new closed-program boundary.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -272,12 +320,33 @@ where
     }
 }
 
-/// A [`Program`] paired with the concrete runtime values referenced by its captured constants. The [`Program`] remains
-/// independent of the concrete capture data: values of type `V` live only in [`captures`](Self::captures), while its
-/// constant atoms carry lifetime-free [`CaptureConstant`] payloads — [`CaptureReference`]s into that table, plus any
-/// immediate payloads the backend's constant family also admits. [`new`](Self::new), the sole construction path,
-/// validates that every reference names an existing capture with the same type, and so every [`ClosedProgram`] upholds
-/// the capture-table invariant before it can be interpreted or transformed.
+/// A [`Program`] paired with the concrete runtime values referenced by its captured constants. Concrete values live
+/// only in [`captures`](Self::captures). Program constant atoms carry lifetime-free [`CaptureConstant`] payloads,
+/// including [`CaptureReference`] indices and any immediate variants admitted by the backend's constant family.
+/// [`new`](Self::new) validates every reference across the complete region arena before constructing the pair.
+///
+/// # Capture Representation
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   runtime["Closed-Over Runtime Value"] -->|"&lt;code&gt;capture&lt;/code&gt;"| context["Capturing Context"]
+///   context --> table["Append Concrete Value to Runtime Capture Table"]
+///   context --> reference["Return Typed Capture Reference"]
+///   reference --> atom["Program Constant Atom"]
+///   immediate["Immediate Host-Sized Constant"] --> atom
+///   atom --> program["Staged Program with Complete Region Arena"]
+///   table --> validate["&lt;code&gt;ClosedProgram::new&lt;/code&gt; Validates Every Reference"]
+///   program --> validate
+///   validate --> closed["Validated Closed Program"]
+///   closed --> reusable["Reusable Staged IR plus Concrete Capture Environment"]
+///   closed -->|"&lt;code&gt;to_program_with_lifted_captures&lt;/code&gt;"| lifted["Leading Capture Inputs then Public Inputs"]
+///   lifted --> compilation["Compilation Boundary"]
+/// ```
+///
+/// One capture table scopes the entry region and every attached region. Immediate constants participate in the program
+/// but not in the table, while repeated capture references continue to name one table slot and one lifted input.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct ClosedProgram<
     C: Value,
     V: CaptureConstant<Type = C::Type>,
