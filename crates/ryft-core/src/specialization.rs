@@ -112,9 +112,11 @@ pub struct ReentrantSpecializationError;
 ///     legitimately branch on container arity. Keying on the structure rather than on the flattened leaves also
 ///     distinguishes inputs that differ only in _empty_ substructure, which flat leaf paths and flat leaf types
 ///     cannot see.
-///   - **Dispatch:** The [`Domain`](crate::Domain)-normalized abstract signature of the flattened dynamic input, such
-///     as element data types and shapes, for example. Programs are staged against abstract types, so unequal signatures
-///     stage unequal programs.
+///   - **Dispatch Key:** An owner-defined key used to select an interchangeable retained specialization for the dynamic
+///     inputs. It may be an exact abstract input signature or a normalized equivalence-class key such as a shape
+///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call as unequal
+///     keys conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
+///     [`CompilationDomain::DispatchKey`](crate::CompilationDomain::DispatchKey), for example.
 ///
 /// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
 /// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
@@ -122,41 +124,40 @@ pub struct ReentrantSpecializationError;
 /// since a bare program has neither static parameters nor a structured input. That is what separates function-level
 /// specialization caching from structural region transformation through [`Transform`](crate::Transform).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch> {
+pub struct FunctionSpecializationKey<P, I, D> {
     /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
-    static_parameters: StaticParameters,
+    static_parameters: P,
 
     /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
-    input_structure: InputStructure,
+    input_structure: I,
 
-    /// Domain-normalized abstract signature of the flattened dynamic input, typically its array types and shapes.
-    dispatch: Dispatch,
+    /// Owner-defined cache key for the dynamic input, such as an exact abstract signature or normalized shape bucket.
+    dispatch_key: D,
 }
 
-impl<StaticParameters, InputStructure, Dispatch> FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch> {
+impl<P, I, D> FunctionSpecializationKey<P, I, D> {
     /// Creates a new [`FunctionSpecializationKey`].
     #[inline]
-    pub fn new(static_parameters: StaticParameters, input_structure: InputStructure, dispatch: Dispatch) -> Self {
-        Self { static_parameters, input_structure, dispatch }
+    pub fn new(static_parameters: P, input_structure: I, dispatch_key: D) -> Self {
+        Self { static_parameters, input_structure, dispatch_key }
     }
 
     /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
     #[inline]
-    pub fn static_parameters(&self) -> &StaticParameters {
+    pub fn static_parameters(&self) -> &P {
         &self.static_parameters
     }
 
     /// Returns the parameter structure of the dynamic input for the keyed specialization.
     #[inline]
-    pub fn input_structure(&self) -> &InputStructure {
+    pub fn input_structure(&self) -> &I {
         &self.input_structure
     }
 
-    /// Returns the domain-normalized abstract dispatch signature of the flattened dynamic input
-    /// for the keyed specialization.
+    /// Returns the owner-defined dispatch key for the dynamic input.
     #[inline]
-    pub fn dispatch(&self) -> &Dispatch {
-        &self.dispatch
+    pub fn dispatch_key(&self) -> &D {
+        &self.dispatch_key
     }
 }
 
@@ -981,7 +982,7 @@ mod tests {
             FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
         assert_eq!(key.static_parameters(), &("training", 4));
         assert_eq!(key.input_structure(), &vec![(), ()]);
-        assert_eq!(key.dispatch(), &"f32[2,3]");
+        assert_eq!(key.dispatch_key(), &"f32[2,3]");
 
         // Every component participates in equality, and equal keys reuse one cache entry.
         assert_eq!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
