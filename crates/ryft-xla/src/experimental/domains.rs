@@ -1005,20 +1005,91 @@ pub enum XlaInputBoundBucketing {
 
 /// Opaque retained-JIT specialization key derived by [`XlaDomain`].
 ///
-/// Exact dispatch preserves nominal [`DimensionVariable`] identity. Dispatch with input-bound bucketing instead uses
-/// an alpha-normalized physical-bound signature so calls routed to the same bucket share one staged and compiled
-/// specialization.
+/// Exact dispatch preserves nominal [`DimensionVariable`] identity and shares its type slice with the effective staged
+/// signature, so keying a call costs no deep type clone. Dispatch with input-bound bucketing instead uses a structural,
+/// alpha-normalized physical-bound signature so calls routed to the same bucket share one staged and compiled
+/// specialization. Bucketed keys index dimension variables by first occurrence and exclude their diagnostic names,
+/// which survive only in the effective staged types.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaDispatchKey(XlaDispatchKeyKind);
 
 /// Internal representation of [`XlaDispatchKey`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum XlaDispatchKeyKind {
-    /// Exact runtime abstract signature used when bucketing is disabled.
-    Exact(Vec<ArrayIrType>),
+    /// Exact runtime abstract signature used when bucketing is disabled, shared with the effective staged types.
+    Exact(Arc<[ArrayIrType]>),
 
-    /// Canonical serialized bounded signature used when bucketing is enabled.
-    Bucketed(Vec<u8>),
+    /// Alpha-normalized bounded signature used when bucketing is enabled.
+    Bucketed(BucketedDispatchSignature),
+}
+
+/// Alpha-normalized bounded input signature used as the bucketed retained-dispatch key.
+///
+/// Dimension variables are numbered by first occurrence across the whole input signature under
+/// [`DimensionVariable`] identity, and only their bounds are retained. Two bucketed signatures are therefore equal
+/// exactly when they agree on every input's data type, layout, sharding, memory space, rank, per-axis static extents,
+/// and per-axis variable-sharing pattern with matching bounds, regardless of how the variables are named.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BucketedDispatchSignature {
+    /// `(lower, upper)` bounds of each distinct dimension variable, in first-occurrence order.
+    variables: Vec<(usize, Option<usize>)>,
+
+    /// Bucketed input array types with their shapes rewritten into variable-index patterns.
+    input_types: Vec<BucketedArrayTypeKey>,
+}
+
+/// One bucketed input array type split into a shape-free carrier and its alpha-normalized shape pattern.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BucketedArrayTypeKey {
+    /// Array type with an empty shape, retaining data type, layout, sharding, and memory identity.
+    carrier: ArrayType,
+
+    /// Per-axis alpha-normalized dimensions, which also fix the array's rank.
+    dimensions: Vec<BucketedDimensionKey>,
+}
+
+/// One alpha-normalized axis of a [`BucketedArrayTypeKey`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum BucketedDimensionKey {
+    /// Statically known extent. Bucketing rewrites every static input axis into a bounded dynamic axis, so this
+    /// variant is unreachable for signatures produced today; it is retained so the normalization stays total over
+    /// [`Dimension`].
+    Static(usize),
+
+    /// Index of the axis' dimension variable in [`BucketedDispatchSignature::variables`].
+    Variable(usize),
+}
+
+impl BucketedDispatchSignature {
+    /// Alpha-normalizes the already bucketed `input_types` into a name-free dispatch key.
+    fn new(input_types: &[ArrayType]) -> Self {
+        let mut variables = Vec::<DimensionVariable>::new();
+        let input_types = input_types
+            .iter()
+            .map(|array_type| BucketedArrayTypeKey {
+                carrier: array_type.clone().with_shape(Shape::new(Vec::new())),
+                dimensions: array_type
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        Dimension::Static(extent) => BucketedDimensionKey::Static(*extent),
+                        Dimension::Dynamic(variable) => {
+                            let index =
+                                variables.iter().position(|existing| existing == variable).unwrap_or_else(|| {
+                                    variables.push(variable.clone());
+                                    variables.len() - 1
+                                });
+                            BucketedDimensionKey::Variable(index)
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let variables =
+            variables.iter().map(|variable| (variable.bounds().lower(), variable.bounds().upper())).collect();
+        Self { variables, input_types }
+    }
 }
 
 /// Backend-specific per-call options for the [`CompilationDomain`] implementation on
@@ -2212,8 +2283,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         &self,
         input_types: Vec<ArrayIrType>,
         options: &Self::Options,
-    ) -> Result<(Self::DispatchKey, Vec<ArrayIrType>), Self::Error> {
+    ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
         let Some(bucketing) = options.input_bound_bucketing else {
+            let input_types: Arc<[ArrayIrType]> = input_types.into();
             return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
         };
         if options.mesh.devices().len() > 1 {
@@ -2262,12 +2334,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             bucketed_array_types.push(array_type.clone().with_shape(Shape::new(dimensions)));
         }
-        let input_types = bucketed_array_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>();
-        let canonical = PersistentArraySignatureV3::encode(bucketed_array_types.as_slice(), &[]).into_canonical();
-        let key = serde_json::to_vec(&canonical).map_err(|error| ProgramError::InvalidArgument {
-            message: format!("failed to encode the XLA retained-dispatch signature: {error}"),
-        })?;
-        Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types))
+        let key = BucketedDispatchSignature::new(bucketed_array_types.as_slice());
+        let input_types = bucketed_array_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>();
+        Ok((XlaDispatchKey(XlaDispatchKeyKind::Bucketed(key)), input_types.into()))
     }
 
     fn stage<Request>(
@@ -2784,9 +2853,9 @@ impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
 
     fn analyze<Input: Parameterized<ArrayIrType>, Output: Parameterized<ArrayIrType>>(
         &self,
-        executable_program: &ryft_core::compilation::ExecutableProgram<Self, Input, Output>,
+        executable_function: &ryft_core::compilation::ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error> {
-        let program = executable_program.compiled_program();
+        let program = executable_function.compiled_program();
         program
             .analysis
             .get_or_init(|| analyze_xla_program(program).map_err(|error| error.to_string()))
@@ -5090,10 +5159,9 @@ mod tests {
         // dimension graph with a static input axis; this changes only dimension-size lowering from a runtime read to
         // its exact scalar constant and still exercises dimension SSA arithmetic and both mixed shape operations.
         let static_vector_type = replicated_vector_type(&mesh, 3);
-        let executable_program = build_program(&static_vector_type, 1);
-        let executable_lowering =
-            domain.lower_xla_program(&executable_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_xla_program(&executable_lowering).unwrap();
+        let static_program = build_program(&static_vector_type, 1);
+        let static_lowering = domain.lower_xla_program(&static_program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&static_lowering).unwrap();
         let vector = Array::from_host_buffer(
             &client,
             static_vector_type,
@@ -5170,7 +5238,7 @@ mod tests {
                 // accidentally specialize or recompile the program for the concrete logical size.
                 let output = ryft_core::compilation::call_function(
                     &domain,
-                    compiled.executable_program(),
+                    compiled.executable_function(),
                     ArrayIrValue::Array(input.clone()),
                 )
                 .unwrap();
@@ -5303,7 +5371,7 @@ mod tests {
         )
         .unwrap();
         let array =
-            ryft_core::compilation::call_function(&engine, compiled.executable_program(), ArrayIrValue::Array(source))
+            ryft_core::compilation::call_function(&engine, compiled.executable_function(), ArrayIrValue::Array(source))
                 .unwrap();
         let ArrayIrValue::Array(array) = array else {
             panic!("array-only compiled function returned a first-class dimension");
@@ -5403,7 +5471,7 @@ mod tests {
 
         let input = Array::from_host_buffer(&client, input_type, mesh, []).unwrap();
         let output =
-            ryft_core::compilation::call_function(&domain, compiled.executable_program(), ArrayIrValue::Array(input))
+            ryft_core::compilation::call_function(&domain, compiled.executable_function(), ArrayIrValue::Array(input))
                 .unwrap();
         let ArrayIrValue::Array(output) = output else {
             panic!("array-only compiled function returned a first-class dimension");
@@ -5452,7 +5520,7 @@ mod tests {
 
         let (zero_output, value_output) = ryft_core::compilation::call_function(
             &domain,
-            compiled.executable_program(),
+            compiled.executable_function(),
             (ArrayIrValue::Array(value), ArrayIrValue::Array(zero)),
         )
         .unwrap();
@@ -5851,7 +5919,7 @@ mod tests {
             .unwrap();
             let output = ryft_core::compilation::call_function(
                 &domain,
-                compiled.executable_program(),
+                compiled.executable_function(),
                 ArrayIrValue::Array(input),
             )
             .unwrap();
@@ -6818,6 +6886,58 @@ mod tests {
     }
 
     #[test]
+    fn test_input_bound_bucketing_alpha_normalizes_dispatch_keys() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let options = XlaOptions::new(mesh).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo);
+        let bounds = DimensionBounds::new(0, Some(5)).unwrap();
+        let vector_type =
+            |dimension: Dimension| ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![dimension])));
+        let key = |input_types: Vec<ArrayIrType>| domain.dispatch_signature(input_types, &options).unwrap().0;
+
+        // Two runtime signatures landing in the same power-of-two bucket share one key, and the effective staged
+        // types carry the generated per-axis variable names that the key itself excludes.
+        let (three_key, three_types) =
+            domain.dispatch_signature(vec![vector_type(Dimension::Static(3))], &options).unwrap();
+        assert_eq!(three_key, key(vec![vector_type(Dimension::Static(4))]));
+        assert_ne!(three_key, key(vec![vector_type(Dimension::Static(5))]));
+        let [ArrayIrType::Array(three_type)] = three_types.as_ref() else {
+            panic!("bucketing must stage exactly one array input type");
+        };
+        let [Dimension::Dynamic(variable)] = three_type.shape().dimensions() else {
+            panic!("bucketing must stage a rank-one bounded dynamic axis");
+        };
+        assert_eq!(variable.name(), "input_0_axis_0");
+        assert_eq!(variable.bounds(), bounds);
+
+        // Dimension variables are keyed by their bounds and first-occurrence sharing pattern, not by their names, so
+        // renaming a variable preserves the key while resharing it across inputs does not.
+        let first = DimensionVariable::new("first", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let renamed = DimensionVariable::new("renamed", bounds);
+        assert_eq!(
+            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
+            key(vec![vector_type(renamed.clone().into()), vector_type(renamed.into())]),
+        );
+        assert_ne!(
+            key(vec![vector_type(first.clone().into()), vector_type(first.clone().into())]),
+            key(vec![vector_type(first.clone().into()), vector_type(second.into())]),
+        );
+
+        // Everything the shape-free carrier retains still discriminates: element data type, and here the rank too.
+        assert_ne!(
+            key(vec![vector_type(first.clone().into())]),
+            key(vec![ArrayType::new(DataType::F64, Shape::new(vec![first.clone().into()])).into()]),
+        );
+        assert_ne!(
+            key(vec![vector_type(first.clone().into())]),
+            key(vec![ArrayType::new(DataType::F32, Shape::new(vec![first.clone().into(), first.into()])).into()]),
+        );
+    }
+
+    #[test]
     fn test_bounded_dynamic_programs_reject_shard_map_regions_before_device_count_matters() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -7091,8 +7211,8 @@ mod tests {
             )
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
-        let compiled_analysis = domain.analyze(compiled.executable_program()).unwrap();
-        assert_eq!(domain.analyze(compiled.executable_program()).unwrap(), compiled_analysis);
+        let compiled_analysis = domain.analyze(compiled.executable_function()).unwrap();
+        assert_eq!(domain.analyze(compiled.executable_function()).unwrap(), compiled_analysis);
 
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();
@@ -7753,7 +7873,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_executes_jit_call_and_reuses_cached_executable() {
-        use std::rc::Rc;
+        use std::sync::Arc;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -7772,7 +7892,7 @@ mod tests {
                 .unwrap()
         };
         let operation = XlaOperation::JitCall(JitCallOperation::new());
-        let callee = Rc::new(callee);
+        let callee = Arc::new(callee);
 
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain

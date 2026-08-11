@@ -121,8 +121,6 @@ fn jit_statistics(statistics: JitCacheStatistics) -> Value {
         "traces": statistics.traces,
         "lowerings": statistics.lowerings,
         "compilation_requests": statistics.compilation_requests,
-        "trace_hits": statistics.trace_hits,
-        "lowering_hits": statistics.lowering_hits,
         "input_abstractification_duration_ns": statistics.input_abstractification_duration_ns,
         "dispatch_duration_ns": statistics.dispatch_duration_ns,
         "tracing_duration_ns": statistics.tracing_duration_ns,
@@ -190,7 +188,7 @@ fn call_workload<'c>(
     compiled: &BenchmarkCompiledFunction<'c>,
     input: Array<'c>,
 ) -> Result<Array<'c>, Box<dyn std::error::Error>> {
-    match ryft_core::compilation::call_function(domain, compiled.executable_program(), ArrayIrValue::Array(input))? {
+    match ryft_core::compilation::call_function(domain, compiled.executable_function(), ArrayIrValue::Array(input))? {
         ArrayIrValue::Array(output) => Ok(output),
         ArrayIrValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
     }

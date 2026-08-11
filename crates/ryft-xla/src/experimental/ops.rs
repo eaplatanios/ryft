@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
@@ -641,7 +641,7 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
 /// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
-/// operation (the single `["callee"]` slot), interned by [`Rc`] identity when the call is staged through the
+/// operation (the single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
 /// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
 /// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 /// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
@@ -813,6 +813,16 @@ where
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
         // all-replicated call binds its original callee unchanged.
+        //
+        // Unlike the forward-mode and transpose rules below, this rebatching is deliberately not served from the
+        // callee region's retained transform cache: the batched program depends on live `BatchingContext` state (the
+        // batch extent, the axis name, and the surrounding nesting) whose complete key surface is not yet explicit,
+        // so caching it against the callee region and its input axes alone would risk exactly the unsound key reuse
+        // that cache is designed to avoid. The decided follow-up is to specify that key material when composite
+        // batching lands behind the `CompiledXlaFunction::batch` stub, which has to define it anyway: batching then
+        // joins the region transform cache behind a gate measurement, through a batching-policy hook returning
+        // `Option<key>` where `None` keeps a policy uncached, so soundness stays opt-in per policy. See
+        // `.tasks/plan_general_transform_caching_analysis.md`.
         let (batched_callee, output_axes) = match ArrayBatch::common_batch_size(inputs)? {
             Some(_) => {
                 let input_batch_axes = inputs
@@ -839,7 +849,7 @@ where
         let outputs =
             context
                 .parent()
-                .bind(*self, CalleeRegionDriver::new(&[Rc::new(batched_callee)]), &physical_inputs)?;
+                .bind(*self, CalleeRegionDriver::new(&[Arc::new(batched_callee)]), &physical_inputs)?;
         Ok(outputs
             .into_iter()
             .zip(output_axes)
@@ -903,17 +913,20 @@ where
         let output_count = output_types.len();
         check_count!("input", inputs, input_types.len(), ProgramError);
 
-        // Linearize the callee capture-free. The primal sub-program produces `[outputs..., residuals...]` and the
-        // tangent sub-program consumes `[input_tangents..., residuals...]`; the residual count is the number of
-        // trailing outputs of the primal sub-program beyond the original callee outputs.
-        let (primal_program, tangent_program, _) = callee.linearize()?.into_parts();
+        // Linearize the callee capture-free, through the callee region's retained transform cache so that a callee
+        // shared by several outer programs is linearized once. The primal sub-program produces
+        // `[outputs..., residuals...]` and the tangent sub-program consumes `[input_tangents..., residuals...]`; the
+        // residual count is the number of trailing outputs of the primal sub-program beyond the original callee
+        // outputs.
+        let (primal_program, tangent_program, _) = callee.linearize_shared()?;
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
-        // primal outputs followed by the residual values.
+        // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
+        // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_call = XlaOperation::JitCall(JitCallOperation::new());
         let mut primal_call_outputs =
-            context.bind(primal_call, CalleeRegionDriver::new(&[Rc::new(primal_program)]), &primal_operands)?;
+            context.bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -936,7 +949,7 @@ where
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
         let tangent_outputs =
-            context.bind(tangent_call, CalleeRegionDriver::new(&[Rc::new(tangent_program)]), &tangent_operands)?;
+            context.bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
         let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
@@ -1076,9 +1089,10 @@ pub fn transpose_primal_jit_call<
         .map(|input| input.as_known().expect("dispatch guarantees a known operand carries its pullback value").clone())
         .collect::<Vec<_>>();
 
-    // Transpose the callee with respect to its linear inputs. The transposed callee maps
+    // Transpose the callee with respect to its linear inputs, through the region's retained transform cache so that a
+    // callee shared by several outer programs is transposed once per linearity mask. The transposed callee maps
     // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in callee-input order.
-    let transposed_callee = driver.transpose_program(callee, operand_linear.as_slice())?;
+    let transposed_callee = driver.transpose_program_shared(callee, operand_linear.as_slice())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., known_input_values...]`. Its outputs are the
@@ -1092,7 +1106,7 @@ pub fn transpose_primal_jit_call<
     operands.extend(known_values);
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
     let input_cotangents =
-        context.bind(transposed_call, CalleeRegionDriver::new(&[Rc::new(transposed_callee)]), operands.as_slice())?;
+        context.bind(transposed_call, CalleeRegionDriver::new(&[transposed_callee]), operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
     check_count!("output", input_cotangents, linear_count, ProgramError);
 
@@ -1132,7 +1146,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
@@ -1719,7 +1733,7 @@ mod tests {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
-        let callee_region = builder.intern_callee(&Rc::new(callee), None).unwrap();
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let call = XlaOperation::JitCall(JitCallOperation::new());
         let outputs = builder
             .add_instruction(call, vec![callee_region], vec![known_input, runtime_input])

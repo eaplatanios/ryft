@@ -15,7 +15,7 @@ use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 use crate::experimental::XlaDomainError;
 use crate::experimental::domains::XlaLoweredProgram;
 use crate::experimental::ops::XlaConstant;
-use crate::{Array, ExecutableXlaProgram, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions};
+use crate::{Array, ExecutableXlaFunction, XlaDomain, XlaFeedbackDirectedProfile, XlaOptions};
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -373,8 +373,8 @@ where
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     domain: XlaDomain<'c>,
-    baseline: ExecutableXlaProgram<'c, In, Out>,
-    active: RwLock<ExecutableXlaProgram<'c, In, Out>>,
+    baseline: ExecutableXlaFunction<'c, In, Out>,
+    active: RwLock<ExecutableXlaFunction<'c, In, Out>>,
     lowered_program: XlaLoweredProgram,
     options: AdaptiveProfileGuidedOptions,
     profile_sidecar_key: Option<Vec<u8>>,
@@ -401,7 +401,7 @@ where
 {
     pub(crate) fn new(
         domain: XlaDomain<'c>,
-        baseline: ExecutableXlaProgram<'c, In, Out>,
+        baseline: ExecutableXlaFunction<'c, In, Out>,
         lowered_program: XlaLoweredProgram,
         compilation_options: XlaOptions,
         options: AdaptiveProfileGuidedOptions,
@@ -498,7 +498,7 @@ where
 
     fn profile_baseline(
         &self,
-        executable: ExecutableXlaProgram<'c, In, Out>,
+        executable: ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
@@ -582,7 +582,7 @@ where
             .profile_failed(reason, self.inner.options);
     }
 
-    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaProgram<'c, In, Out>, XlaDomainError> {
+    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaFunction<'c, In, Out>, XlaDomainError> {
         let profile = XlaFeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile);
         let domain = &self.inner.domain;

@@ -6531,10 +6531,9 @@ struct JitCallProgramKey {
 /// Returns whether `program` may be deduplicated by structural identity.
 ///
 /// A program is eligible only when the canonical rendering captures the full semantics needed to safely share a
-/// private function. Constant atom payloads intentionally render only as `const`, so programs with constants are
-/// ineligible; otherwise two callees that differ only by capture reference or literal payload could merge incorrectly.
-/// `shard_map` is also ineligible because its operation payload still owns additional body metadata that is not fully
-/// represented by the rendered instruction line.
+/// private function. Although immediate constant payloads are rendered, a [`CaptureReference`] identifies a slot and
+/// type rather than the runtime value in the surrounding capture table, so programs with constants remain ineligible.
+/// `shard_map` also remains outside this deduplication path because its lowering owns a separate outlined boundary.
 fn supports_structural_dedup(program: &FlatXlaProgram) -> bool {
     program.regions().iter().all(|region| {
         region.atoms().iter().all(|atom| !atom.is_constant())
@@ -9810,15 +9809,15 @@ mod tests {
 
     /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
     /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
-    fn xla_add_self_callee(input_type: ArrayType) -> std::rc::Rc<FlatXlaProgram> {
+    fn xla_add_self_callee(input_type: ArrayType) -> Arc<FlatXlaProgram> {
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(input_type);
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
-        std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+        Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
     /// Builds a nullary callee that materializes one scalar leaf's fragment of a packed coordinate basis.
-    fn xla_coordinate_basis_callee(coordinate_offset: usize) -> std::rc::Rc<FlatXlaProgram> {
+    fn xla_coordinate_basis_callee(coordinate_offset: usize) -> Arc<FlatXlaProgram> {
         let mut builder = CompositeXlaProgramBuilder::new();
         let output = builder
             .add_instruction(
@@ -9827,13 +9826,13 @@ mod tests {
                 Vec::new(),
             )
             .unwrap()[0];
-        std::rc::Rc::new(builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap())
+        Arc::new(builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap())
     }
 
     /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
     fn add_xla_jit_call(
         builder: &mut CompositeXlaProgramBuilder,
-        callee: &std::rc::Rc<FlatXlaProgram>,
+        callee: &Arc<FlatXlaProgram>,
         inputs: Vec<AtomId>,
     ) -> AtomId {
         let callee_region = builder.intern_callee(callee, None).unwrap();
@@ -9848,7 +9847,7 @@ mod tests {
 
     /// Lowers an outer program that calls `callees` (one `jit_call` each) and sums the results, returning the
     /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
-    fn lower_two_jit_call_module(callees: Vec<std::rc::Rc<FlatXlaProgram>>) -> String {
+    fn lower_two_jit_call_module(callees: Vec<Arc<FlatXlaProgram>>) -> String {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
@@ -10291,7 +10290,7 @@ mod tests {
     /// Builds a flat callee whose body contains a `condition` instruction (`f(p, x) = if p { -x } else { x }`),
     /// making it ineligible for structural `jit_call` deduplication because its nested branch bodies do not render
     /// into the callee's canonical program text.
-    fn xla_condition_callee() -> std::rc::Rc<FlatXlaProgram> {
+    fn xla_condition_callee() -> Arc<FlatXlaProgram> {
         let vector_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
@@ -10305,7 +10304,7 @@ mod tests {
                 vec![predicate, input],
             )
             .unwrap()[0];
-        std::rc::Rc::new(builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap())
+        Arc::new(builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap())
     }
 
     #[test]
@@ -12521,7 +12520,7 @@ mod tests {
         let callee_output = callee_builder
             .add_instruction(ScaledDotOperation::new(16, DataType::F32), Vec::new(), callee_inputs)
             .unwrap()[0];
-        let callee = std::rc::Rc::new(unproject_plain_program(
+        let callee = Arc::new(unproject_plain_program(
             callee_builder.build(vec![callee_output], vec![Placeholder; 4], vec![Placeholder]).unwrap(),
         ));
 
@@ -13764,7 +13763,7 @@ mod tests {
             .unwrap()[0];
         let callee_output =
             callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![printed, printed]).unwrap()[0];
-        let callee = std::rc::Rc::new(unproject_plain_program(
+        let callee = Arc::new(unproject_plain_program(
             callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap(),
         ));
         let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
@@ -13827,7 +13826,7 @@ mod tests {
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
                 .unwrap();
         let (output, lines) =
-            with_captured_prints(|| engine.interpret(&compiled.executable_program(), source).unwrap());
+            with_captured_prints(|| engine.interpret(&compiled.executable_function(), source).unwrap());
 
         // Both prints fire in program order, and the printed values are the forwarded operands.
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);

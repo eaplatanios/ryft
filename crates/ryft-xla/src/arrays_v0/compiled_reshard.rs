@@ -143,7 +143,7 @@ fn try_same_mesh<'o>(
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("compilation failed: {other}") },
     })?;
-    engine.interpret(&compiled.executable_program(), source.clone()).map_err(|error| match error {
+    engine.interpret(&compiled.executable_function(), source.clone()).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
     })

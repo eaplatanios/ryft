@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayType, Concretizable, Context, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation, Parameterized,
-    ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
+    DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation, OperationFormatter,
+    Parameterized, ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Program, ProgramError, ProjectedValue,
     RegionInterface, RegionRef, RegionSlot, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
     TransposableOperation, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero,
@@ -16,6 +16,9 @@ use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTraceError, ShardMapTracer, TracedShardMap,
 };
+
+/// Canonical operation name for [`ShardMapOperation`].
+pub(crate) const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 
 /// Canonical higher-order shard-map op used for staged tracing, differentiation, and lowering. The local body
 /// program is not part of this payload: it is the operation's one attached `body` region, so this payload carries
@@ -90,11 +93,65 @@ impl<V> ShardMapOperation<V> {
         self.output_types = global_output_types;
         Ok(self)
     }
+
+    /// Renders this operation's name followed by its complete manual SPMD boundary metadata, shared by [`Display`]
+    /// and [`Operation::render`].
+    ///
+    /// Every field a consumer can observe is rendered, because [`Operation::render`] is the metadata fingerprint that
+    /// the debug transform-cache diagnostic compares programs by: a field this rendering drops is a field whose
+    /// corruption that diagnostic cannot see. All of `mesh`, `in_shardings`, `out_shardings`, `manual_axes`, and
+    /// `check_vma` steer differentiation, transposition, and `sdy.manual_computation` lowering while being invisible
+    /// to the instruction's rendered atom types, and so do the global boundary types: an operand type only has to
+    /// match [`global_input_types`](Self::global_input_types) up to its dimension shardings, and a result type is the
+    /// caller-ambient re-embedding of [`global_output_types`](Self::global_output_types) (see
+    /// [`adapt_traced_shard_map_output_type`]) rather than those types themselves. The only elided state is the
+    /// [`PhantomData`] replay marker, which carries no semantics. Every field is sequence- or scalar-valued, so the
+    /// rendering is deterministic without any ordering normalization, and every mesh axis name goes through
+    /// [`render_axis_name`] so that distinct name lists always render distinctly.
+    fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let mesh_axes = self
+            .shard_map
+            .mesh()
+            .axes()
+            .iter()
+            .map(|axis| format!("{}={}:{}", render_axis_name(axis.name()), axis.size(), axis.r#type()));
+        let manual_axes = self.shard_map.manual_axes().iter().map(|axis| render_axis_name(axis.as_str()));
+        OperationFormatter::new(formatter, indentation, SHARD_MAP_OPERATION_NAME)?.bracketed(|operation| {
+            // The mesh is redundant with any rendered sharding, which embeds it, but a boundary may have no
+            // shardings at all, so it is rendered unconditionally.
+            operation.field("mesh", render_sequence(mesh_axes))?;
+            operation.field("in_shardings", render_sequence(self.shard_map.in_shardings()))?;
+            operation.field("out_shardings", render_sequence(self.shard_map.out_shardings()))?;
+            operation.field("manual_axes", render_sequence(manual_axes))?;
+            operation.field("check_vma", self.shard_map.check_vma())?;
+            operation.field("global_input_types", render_sequence(self.input_types.as_slice()))?;
+            operation.field("global_output_types", render_sequence(self.output_types.as_slice()))
+        })
+    }
+}
+
+/// Renders one mesh axis name as a single-quoted literal whose body uses Rust's canonical character escape codes
+/// (see [`char::escape_debug`]), escaping single and double quotes, backslashes, and control characters.
+///
+/// Mesh axis names are arbitrary nonempty strings, so rendering them verbatim is not injective: the two-name list
+/// `["a", "b"]` and the one-name list `["a', 'b"]` would both render as `['a', 'b']`. Because
+/// [`ShardMapOperation::render_operation`] is the metadata fingerprint that the debug transform-cache diagnostic
+/// compares programs by, such a collision would hide a genuinely different manual SPMD boundary. Escaped names
+/// contain neither an unescaped quote nor an unescaped backslash, so no name can imitate the surrounding quoting or
+/// the `, ` separator that [`render_sequence`] joins items with, and distinct name lists always render distinctly.
+fn render_axis_name(name: &str) -> String {
+    format!("'{}'", name.chars().flat_map(char::escape_debug).collect::<String>())
+}
+
+/// Renders one shard-map metadata sequence as a bracketed, comma-separated list. Items that embed mesh axis names
+/// must render those names through [`render_axis_name`] for the result to remain injective.
+fn render_sequence<I: IntoIterator<Item: Display>>(items: I) -> String {
+    format!("[{}]", items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>().join(", "))
 }
 
 impl<V> Display for ShardMapOperation<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("shard_map")
+        self.render_operation(formatter, 0)
     }
 }
 
@@ -196,12 +253,17 @@ impl<V: Clone> Operation for ShardMapOperation<V> {
 
     #[inline]
     fn name(&self) -> &'static str {
-        "shard_map"
+        SHARD_MAP_OPERATION_NAME
     }
 
     #[inline]
     fn region_slots(&self) -> &'static [RegionSlot] {
         const { &[RegionSlot::computation("body")] }
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        self.render_operation(formatter, indentation)
     }
 
     fn infer_output_types(
@@ -1028,6 +1090,8 @@ where
 mod tests {
     use std::ops::{Deref, DerefMut};
 
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayType, CaptureReference, Context, DataType, DifferentiableType,
         DifferentiationError, Dimension, DimensionBounds, DimensionType, DimensionVariable, DomainTracingContext,
@@ -1125,6 +1189,154 @@ mod tests {
             vec!["x".to_string()],
             true,
         )
+    }
+
+    /// Builds a one-instruction program staging an identity `shard_map` over a two-manual-axis mesh, whose boundary
+    /// differs from another such program only in the provided manual-axis selection and `check_vma` flag.
+    fn metadata_fingerprint_program(
+        manual_axes: Vec<String>,
+        check_vma: bool,
+    ) -> XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>> {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let array_type = test_array_type();
+        let shard_map = ShardMap::from_shardings(
+            mesh.clone(),
+            vec![Sharding::replicated(mesh.clone(), 0)],
+            vec![Sharding::replicated(mesh, 0)],
+            manual_axes,
+            check_vma,
+        );
+        let operation = ShardMapOperation::<XlaConstant>::from_boundary(
+            shard_map,
+            vec![array_type.clone()],
+            vec![array_type.clone()],
+        );
+
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(array_type.clone());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type);
+        let body_region = builder.import_program(body);
+        let output = builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![input])
+            .unwrap()[0];
+        builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Pins the metadata-fingerprint contract of [`Operation::render`] for `shard_map`. The manual SPMD boundary
+    /// metadata steers differentiation, transposition, and `sdy.manual_computation` lowering, yet none of it is
+    /// visible in the instruction's rendered atom types. Rendered *inequality* is exactly what the
+    /// debug transform-cache diagnostic consumes: it compares a retained transform artifact against a freshly derived
+    /// one purely by rendering, so two boundaries that differ semantically must never render alike.
+    #[test]
+    fn test_shard_map_render_fingerprints_boundary_metadata() {
+        let baseline = metadata_fingerprint_program(vec!["x".to_string()], true);
+
+        // The complete boundary metadata renders as deterministic operation fields beside the attached body region.
+        assert_eq!(
+            baseline.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    in_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    out_shardings=[{mesh<['x'=2:manual, 'y'=2:manual]>, []}],
+                    manual_axes=['x'],
+                    check_vma=true,
+                    global_input_types=[f32[]],
+                    global_output_types=[f32[]],
+                ] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+
+        // Two boundaries differing only in `check_vma`, and two differing only in the active manual-axis subset,
+        // must render differently even though their types and bodies are identical.
+        assert_ne!(baseline.to_string(), metadata_fingerprint_program(vec!["x".to_string()], false).to_string());
+        assert_ne!(
+            baseline.to_string(),
+            metadata_fingerprint_program(vec!["x".to_string(), "y".to_string()], true).to_string(),
+        );
+
+        // Equal metadata still renders equally, so the inequalities above isolate the metadata itself.
+        assert_eq!(baseline.to_string(), metadata_fingerprint_program(vec!["x".to_string()], true).to_string());
+    }
+
+    /// Nothing restricts the characters of a mesh axis name: [`MeshAxis::new`] only rejects empty names. Rendering
+    /// names verbatim would therefore break the fingerprint contract pinned above, because one axis named `a', 'b`
+    /// renders exactly like the two axes `a` and `b`, letting the debug recheck accept a corrupted boundary.
+    #[test]
+    fn test_shard_map_render_escapes_axis_names() {
+        // Boundaries over one fixed mesh that owns every adversarial name, so only `manual_axes` varies below.
+        fn rendered_manual_axes(manual_axes: Vec<&str>) -> String {
+            let mesh = LogicalMesh::new(
+                ["a", "b", "a', 'b", "a\\", "a\\', 'b", "a\nb", "a\\nb"]
+                    .into_iter()
+                    .map(|name| MeshAxis::new(name, 2, MeshAxisType::Manual).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+            let array_type = test_array_type();
+            let shard_map = ShardMap::from_shardings(
+                mesh.clone(),
+                vec![Sharding::replicated(mesh.clone(), 0)],
+                vec![Sharding::replicated(mesh, 0)],
+                manual_axes.into_iter().map(str::to_string).collect(),
+                true,
+            );
+            ShardMapOperation::<XlaConstant>::from_boundary(shard_map, vec![array_type.clone()], vec![array_type])
+                .to_string()
+        }
+
+        // Boundaries with no shardings and no boundary types, so only the `mesh` field carries axis names.
+        fn rendered_mesh(axis_names: Vec<&str>) -> String {
+            let mesh = LogicalMesh::new(
+                axis_names.into_iter().map(|name| MeshAxis::new(name, 2, MeshAxisType::Manual).unwrap()).collect(),
+            )
+            .unwrap();
+            let shard_map = ShardMap::from_shardings(mesh, Vec::new(), Vec::new(), Vec::new(), true);
+            ShardMapOperation::<XlaConstant>::from_boundary(shard_map, Vec::new(), Vec::new()).to_string()
+        }
+
+        // A quote inside a name must not be able to imitate the separator between two rendered names, in either the
+        // manual-axis list or the mesh, where the name is additionally followed by its size and type.
+        assert_ne!(rendered_manual_axes(vec!["a", "b"]), rendered_manual_axes(vec!["a', 'b"]));
+        assert_ne!(rendered_mesh(vec!["a", "b"]), rendered_mesh(vec!["a'=2:manual, 'b"]));
+
+        // Backslashes are escaped as well, so a name ending in one cannot turn the quote that closes it into an
+        // escaped quote, and control characters are escaped so that they cannot imitate their own escape codes.
+        assert_ne!(rendered_manual_axes(vec!["a\\", "b"]), rendered_manual_axes(vec!["a\\', 'b"]));
+        assert_ne!(rendered_manual_axes(vec!["a\nb"]), rendered_manual_axes(vec!["a\\nb"]));
+
+        // The escaped form itself is Rust's canonical character escaping, inside the surrounding single quotes.
+        assert_eq!(
+            rendered_mesh(vec!["a'b", "c\\d", "e\nf"]),
+            indoc! {r#"
+                shard_map [
+                    mesh=['a\'b'=2:manual, 'c\\d'=2:manual, 'e\nf'=2:manual],
+                    in_shardings=[],
+                    out_shardings=[],
+                    manual_axes=[],
+                    check_vma=true,
+                    global_input_types=[],
+                    global_output_types=[],
+                ]"#},
+        );
     }
 
     #[test]

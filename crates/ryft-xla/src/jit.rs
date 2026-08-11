@@ -9,13 +9,17 @@
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
+
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, CapturingContext, ClosedProgram, CompilationDomain,
     CompilationStagingRequest, CompiledFunction, Constant, Context, DeviceMesh, DifferentiableType,
-    DomainTracingContext, ExecutableProgram, ForwardModeDifferentiate, JitCacheStatistics,
+    DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics,
     JittedFunction as CoreJittedFunction, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
-    ProjectedValue, ReverseModeDifferentiate, Specialization, StagedFunction, Tracer, Typed, Value, ValueProjection,
-    call_function, try_jit_with_options as core_try_jit_with_options,
+    ProjectedValue, ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection, call_function,
+    try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_pjrt::Execution;
 
@@ -119,8 +123,14 @@ where
 /// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
 /// traces, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
 /// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
-pub struct JittedXlaFunction<'c, F, Static: Specialization, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
-where
+pub struct JittedXlaFunction<
+    'c,
+    F,
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<ArrayType>,
+    Out: Parameterized<ArrayType>,
+> where
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
@@ -130,8 +140,9 @@ where
 
 impl<'c, F, Static, In, Out> Clone for JittedXlaFunction<'c, F, Static, In, Out>
 where
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
@@ -145,8 +156,9 @@ where
 
 impl<'c, F, Static, In, Out> JittedXlaFunction<'c, F, Static, In, Out>
 where
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<Array<'c>>
@@ -209,8 +221,9 @@ pub fn try_jitted_with_options<'c, F, Static, In, Out>(
 >
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
@@ -245,8 +258,9 @@ pub fn jitted_with_options<'c, F, Static, In, Out>(
 >
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
@@ -278,8 +292,9 @@ pub fn jitted<'c, F, Static, In, Out>(
 >
 where
     F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
-    Static: Specialization,
+    Static: Clone + Debug + Eq + Hash,
     In: Parameterized<ArrayType>,
+    In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>
@@ -404,18 +419,18 @@ where
 
 /// Runtime-only XLA executable handle.
 ///
-/// Unlike [`CompiledXlaFunction`], this type does not retain the `Rc`-backed staged program or lowering metadata used
+/// Unlike [`CompiledXlaFunction`], this type does not retain the `Arc`-backed staged program or lowering metadata used
 /// by transforms. It can only execute and inspect its runtime signature. Its thread-safety is derived from its
 /// backend state; no unsafe blanket implementation is used.
-pub struct ExecutableXlaProgram<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
+pub struct ExecutableXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
-    function: ExecutableProgram<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+    function: ExecutableFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableXlaProgram<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableXlaFunction<'c, In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
@@ -426,7 +441,7 @@ where
     }
 }
 
-impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableXlaProgram<'c, In, Out>
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableXlaFunction<'c, In, Out>
 where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
@@ -460,14 +475,14 @@ impl<'c> XlaDomain<'c> {
     {
         let lowered = self.lower(staged.function)?;
         let function = self.compile(lowered)?;
-        Ok(CompiledXlaFunction { function })
+        Ok(CompiledXlaFunction { function, derived: Arc::new(DerivedFunctionSlots::new()) })
     }
 
     /// Executes an XLA runtime program on concrete [`Array`] inputs.
     #[inline]
     pub fn interpret<In, Out>(
         &self,
-        executable: &ExecutableXlaProgram<'c, In, Out>,
+        executable: &ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
@@ -495,7 +510,7 @@ impl<'c> XlaDomain<'c> {
     /// Enqueues an XLA runtime program and retains whole-execution completion, including for zero-output calls.
     pub fn interpret_async<In, Out>(
         &self,
-        executable: &ExecutableXlaProgram<'c, In, Out>,
+        executable: &ExecutableXlaFunction<'c, In, Out>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Execution<Out::To<Array<'c>>>, XlaDomainError>
     where
@@ -548,9 +563,9 @@ impl<'c> XlaDomain<'c> {
     /// Replaces an executable program while preserving and validating its runtime signature.
     pub(crate) fn replace_executable_xla_program<In, Out>(
         &self,
-        executable: &ExecutableXlaProgram<'c, In, Out>,
+        executable: &ExecutableXlaFunction<'c, In, Out>,
         program: std::sync::Arc<XlaCompiledProgram<'c>>,
-    ) -> Result<ExecutableXlaProgram<'c, In, Out>, XlaDomainError>
+    ) -> Result<ExecutableXlaFunction<'c, In, Out>, XlaDomainError>
     where
         In: Parameterized<ArrayType>,
         In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
@@ -558,7 +573,7 @@ impl<'c> XlaDomain<'c> {
         Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     {
         self.validate_xla_replacement(executable.function.compiled_program(), &program)?;
-        Ok(ExecutableXlaProgram {
+        Ok(ExecutableXlaFunction {
             function: executable.function.with_compiled_program(
                 program.clone(),
                 program.output_types().iter().cloned().map(Into::into).collect(),
@@ -586,7 +601,7 @@ impl<'c> XlaDomain<'c> {
     {
         AdaptiveProfileGuidedXlaFunction::new(
             self.clone(),
-            function.executable_program(),
+            function.executable_function(),
             function.function.lowered().lowered_program().clone(),
             function.function.lowered().options().clone(),
             options,
@@ -613,6 +628,10 @@ where
     /// Backend-neutral compiled function backed by an XLA executable. Retains the staged source function,
     /// captured runtime buffers, output structure, and compilation options through its lowered metadata.
     function: CompiledFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+
+    /// Derived transformed functions retained by [`Self::gradient`] and [`Self::jvp`]. Shared across clones so a
+    /// wrapper's clones reuse one retained derivative per transform.
+    derived: Arc<DerivedXlaFunctions<'c, In, Out>>,
 }
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for CompiledXlaFunction<'c, In, Out>
@@ -621,7 +640,74 @@ where
     Out::Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     fn clone(&self) -> Self {
-        Self { function: self.function.clone() }
+        Self { function: self.function.clone(), derived: Arc::clone(&self.derived) }
+    }
+}
+
+/// Retention slots for the derived functions of one [`CompiledXlaFunction`]: the reverse-mode gradient and the
+/// forward-mode JVP compiled from its retained source program.
+type DerivedXlaFunctions<'c, In, Out> = DerivedFunctionSlots<
+    'c,
+    CompiledFunction<XlaDomain<'c>, XlaProgramParameters<In>, XlaProgramParameters<In>>,
+    CompiledFunction<XlaDomain<'c>, XlaProgramParameters<(In, In)>, XlaProgramParameters<(Out, Out)>>,
+>;
+
+/// One-entry retention slots for functions derived from a [`CompiledXlaFunction`].
+///
+/// [`CompiledXlaFunction::gradient`] and [`CompiledXlaFunction::jvp`] take no per-call transform configuration, so
+/// each derived function has exactly one valid form per domain identity: the slot retains the most recently produced
+/// artifact together with a witness of the domain that produced it. A later call with a matching domain reuses the
+/// retained artifact and skips source reconstruction, structural differentiation, staging, and lowering entirely; a
+/// call with a different domain identity produces a fresh artifact and replaces the slot. Failed productions are
+/// never stored, so they retry naturally.
+///
+/// A slot is a retention slot and not a single-flight barrier: its lock is released before the artifact is derived, so
+/// concurrent cold calls may each derive their own copy and the last insert wins. That is sound because the copies are
+/// interchangeable derivations of the same source program, and it is deliberate because waiting single-flight belongs
+/// exclusively to the shared [`CompilationContext`](ryft_core::compilation::CompilationContext), which still
+/// deduplicates the backend compilation those duplicate derivations request.
+struct DerivedFunctionSlots<'c, Gradient, Jvp> {
+    /// Retained reverse-mode gradient function, if any.
+    gradient: Mutex<Option<(XlaDomainWitness<'c>, Gradient)>>,
+
+    /// Retained forward-mode JVP function, if any.
+    jvp: Mutex<Option<(XlaDomainWitness<'c>, Jvp)>>,
+}
+
+impl<'c, Gradient, Jvp> DerivedFunctionSlots<'c, Gradient, Jvp> {
+    /// Creates empty retention slots.
+    fn new() -> Self {
+        Self { gradient: Mutex::new(None), jvp: Mutex::new(None) }
+    }
+}
+
+/// Identity of the [`XlaDomain`] that produced a retained derived function.
+///
+/// [`XlaDomain`] handles are cheap clones of shared state, so two handles denote interchangeable compilation
+/// pipelines exactly when they share one compilation context, one client, equal compilation-option templates, and an
+/// equal mesh. The witness stores a full domain clone, which both provides those comparisons and keeps the shared
+/// compilation context alive so its address can never be reused by a later allocation.
+struct XlaDomainWitness<'c> {
+    /// Domain handle captured when the retained artifact was produced.
+    domain: XlaDomain<'c>,
+}
+
+impl<'c> XlaDomainWitness<'c> {
+    /// Captures the identity of `domain`.
+    fn new(domain: &XlaDomain<'c>) -> Self {
+        Self { domain: domain.clone() }
+    }
+
+    /// Returns whether `domain` is interchangeable with the domain that produced the retained artifact.
+    fn matches(&self, domain: &XlaDomain<'c>) -> bool {
+        std::ptr::eq(self.domain.compilation_context(), domain.compilation_context())
+            && match (self.domain.client().ok(), domain.client().ok()) {
+                (Some(retained), Some(current)) => std::ptr::eq(retained, current),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.domain.compilation_options() == domain.compilation_options()
+            && self.domain.mesh().ok() == domain.mesh().ok()
     }
 }
 
@@ -638,14 +724,14 @@ where
 
     /// Returns a runtime-only handle that omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_program(&self) -> ExecutableXlaProgram<'c, In, Out> {
-        ExecutableXlaProgram { function: self.function.executable_program().clone() }
+    pub fn executable_function(&self) -> ExecutableXlaFunction<'c, In, Out> {
+        ExecutableXlaFunction { function: self.function.executable_function().clone() }
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
-    pub fn into_executable_program(self) -> ExecutableXlaProgram<'c, In, Out> {
-        ExecutableXlaProgram { function: self.function.into_executable_program() }
+    pub fn into_executable_function(self) -> ExecutableXlaFunction<'c, In, Out> {
+        ExecutableXlaFunction { function: self.function.into_executable_function() }
     }
 
     /// Returns the staged function this executable was compiled from.
@@ -706,7 +792,7 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+    In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
     /// respect to its input. Mirrors `jax.grad(jax.jit(f))`.
@@ -714,6 +800,15 @@ where
     /// `self` must produce a single rank-0 scalar output (encoded by the `Out = ArrayType`
     /// impl-block constraint above). The returned compiled function has the same input shape
     /// and produces an output whose leaves carry the partial derivative at each input leaf.
+    ///
+    /// The derived function is retained on this wrapper (shared across its clones): repeated calls with an
+    /// interchangeable `domain` return the retained compiled function without repeating source reconstruction,
+    /// structural differentiation, staging, or lowering, while a call with a different domain identity produces a
+    /// fresh derivative and replaces the retained one. The retained artifact is a compiled program whose residuals
+    /// are runtime values, so reuse across calls with different runtime inputs is sound by construction. Retention is
+    /// not single-flight: concurrent cold calls may each derive a gradient, and because those derivations are
+    /// interchangeable the inserts are idempotent and the last one wins, while the shared
+    /// [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates their backend compilation.
     #[track_caller]
     pub fn gradient<'domain>(
         &'domain self,
@@ -735,6 +830,17 @@ where
                 To<XlaConstant> = XlaProgramConstants<In>,
             >,
     {
+        {
+            let slot = self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned");
+            if let Some((witness, artifact)) = slot.as_ref() {
+                if witness.matches(domain) {
+                    return Ok(CompiledXlaFunction {
+                        function: artifact.clone(),
+                        derived: Arc::new(DerivedFunctionSlots::new()),
+                    });
+                }
+            }
+        }
         let staged = self.function.staged();
         let input_structure = staged.source_program().program().input_structure().clone();
         let input_signature = In::from_parameters(
@@ -754,7 +860,7 @@ where
             .cloned()
             .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        compile_with_flat_captures(
+        let compiled = compile_with_flat_captures(
             move |capture_references, _, primals| {
                 let primals = primals.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
                 let context = primals
@@ -788,7 +894,10 @@ where
             input_signature,
             domain,
             XlaOptions::new(mesh),
-        )
+        )?;
+        *self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned") =
+            Some((XlaDomainWitness::new(domain), compiled.function.clone()));
+        Ok(compiled)
     }
 }
 
@@ -800,7 +909,7 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::fmt::Debug + std::hash::Hash + PartialEq,
+    In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -813,6 +922,14 @@ where
     /// The implementation stages a composite `jit_call` operation and lets its ordinary JVP rule build the tangent
     /// call boundary. Public array tracers are projected only at this facade boundary; the transform itself runs over
     /// the production composite program.
+    ///
+    /// The derived function is retained on this wrapper (shared across its clones): repeated calls with an
+    /// interchangeable `domain` return the retained compiled function without repeating source reconstruction,
+    /// structural differentiation, staging, or lowering, while a call with a different domain identity produces a
+    /// fresh derivative and replaces the retained one. Retention is not single-flight: concurrent cold calls may each
+    /// derive a JVP, and because those derivations are interchangeable the inserts are idempotent and the last one
+    /// wins, while the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) still deduplicates
+    /// their backend compilation.
     #[track_caller]
     pub fn jvp<'domain>(
         &'domain self,
@@ -837,6 +954,17 @@ where
                 To<XlaConstant> = XlaProgramConstants<Out>,
             >,
     {
+        {
+            let slot = self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned");
+            if let Some((witness, artifact)) = slot.as_ref() {
+                if witness.matches(domain) {
+                    return Ok(CompiledXlaFunction {
+                        function: artifact.clone(),
+                        derived: Arc::new(DerivedFunctionSlots::new()),
+                    });
+                }
+            }
+        }
         let staged = self.function.staged();
         let input_signature = In::from_parameters(
             staged.source_program().program().input_structure().clone(),
@@ -857,7 +985,7 @@ where
             .cloned()
             .map(|value| ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from))
             .collect::<Result<Vec<_>, _>>()?;
-        compile_with_flat_captures(
+        let compiled = compile_with_flat_captures(
             move |capture_references, _, (primals, tangents)| {
                 let output_structure = staged.output_structure().clone();
                 let primals = primals.into_parameters().map(ProjectedValue::into_value).collect::<Vec<_>>();
@@ -890,7 +1018,10 @@ where
             (input_signature, tangent_signature),
             domain,
             XlaOptions::new(mesh),
-        )
+        )?;
+        *self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned") =
+            Some((XlaDomainWitness::new(domain), compiled.function.clone()));
+        Ok(compiled)
     }
 
     /// Returns a new compiled function that runs `self` in parallel over `axis_size` batch items
@@ -901,6 +1032,13 @@ where
     ///
     /// Composite-region batching is assigned to Phase 5. Until that support lands, this method returns a precise
     /// unsupported-operation diagnostic instead of reinterpreting projected batching values.
+    ///
+    /// That implementation must also define the key material for caching batching in the per-`Region` transform
+    /// cache, from which batching is excluded today because a batched program depends on live batching-context state:
+    /// the batch extent identity (or, for a dynamic extent, its type and identity contract), the axis name, the
+    /// mapped-axis sharding, the input axes, the output-axes policy, and the nesting level. Once that material is
+    /// explicit, the region transform cache is extended to cover batching behind a gate measurement, through a
+    /// batching-policy hook returning `Option<key>` whose `None` keeps a policy uncached.
     ///
     /// # Limitation
     ///
@@ -949,7 +1087,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -986,7 +1124,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1025,7 +1163,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1061,7 +1199,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1100,7 +1238,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1137,7 +1275,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1179,7 +1317,7 @@ where
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<XlaProgramTracer<'c>>,
-    In::ParameterStructure: std::hash::Hash,
+    In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
@@ -1269,6 +1407,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
@@ -1278,15 +1418,15 @@ mod tests {
         DifferentiableType, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, HessianDifferentiate, Iota,
         Jacobian, JacobianDifferentiate, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ProjectedValue, Reduce, ReductionKind, Reshape, ReverseModeDifferentiate, Select, Shape, Sharding,
+        ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::XlaDomainError;
     use crate::experimental::ops::XlaOperation;
     use crate::jit::{
-        CompiledXlaFunction, ExecutableXlaProgram, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
+        CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
         compile_with_captures, compile_with_options, infer_output_types, jitted, stage, stage_with_captures,
     };
     use crate::tests::{values_from_bytes, values_to_bytes};
@@ -1362,7 +1502,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -1469,14 +1609,14 @@ mod tests {
             )
             .unwrap();
             let jacobian: Jacobian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-                domain.interpret(&compiled.executable_program(), input).unwrap();
+                domain.interpret(&compiled.executable_function(), input).unwrap();
             assert_eq!(read_f32_array(&client, jacobian.iter_blocks().next().unwrap().value()), vec![expected]);
         }
 
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let hessian: Hessian<ArrayType, Array<'_>, ArrayType, ArrayType> =
-            domain.interpret(&second.executable_program(), input).unwrap();
+            domain.interpret(&second.executable_function(), input).unwrap();
         assert_eq!(read_f32_array(&client, hessian.iter_blocks().next().unwrap().value()), vec![2.0]);
     }
 
@@ -1518,7 +1658,7 @@ mod tests {
             Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f64>(&[1.0, 4.0]).as_slice())
                 .unwrap();
         let jacobian: Jacobian<ArrayType, Array<'_>, (ArrayType, ArrayType), ArrayType> =
-            domain.interpret(&forward.executable_program(), (scalar, vector)).unwrap();
+            domain.interpret(&forward.executable_function(), (scalar, vector)).unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         for (actual, expected) in read_f64_array(&client, blocks[0].value()).into_iter().zip([0.2, 0.2]) {
@@ -1539,10 +1679,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_program();
+                .into_executable_function();
         let input =
             Array::from_host_buffer(&client, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
                 .unwrap();
@@ -1565,17 +1705,17 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_program();
+                .into_executable_function();
         let other_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(other_mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let other_executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+        let other_executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), other_input_type, &other_domain, other_mesh)
                 .unwrap()
-                .into_executable_program();
+                .into_executable_function();
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
@@ -1604,8 +1744,14 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_and_staged_xla_functions_are_send_and_sync() {
+        assert_send_sync::<CompiledXlaFunction<'static, ArrayType, ArrayType>>();
+        assert_send_sync::<StagedXlaFunction<'static, ArrayType, ArrayType>>();
+    }
+
+    #[test]
     fn test_executable_xla_program_executes_across_threads() {
-        assert_send_sync::<ExecutableXlaProgram<'static, ArrayType, ArrayType>>();
+        assert_send_sync::<ExecutableXlaFunction<'static, ArrayType, ArrayType>>();
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1614,10 +1760,10 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
             compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
                 .unwrap()
-                .into_executable_program();
+                .into_executable_function();
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
 
@@ -1695,7 +1841,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -1753,7 +1899,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -1814,7 +1960,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
 
-        let execution = engine.interpret_async(&compiled.executable_program(), input).unwrap();
+        let execution = engine.interpret_async(&compiled.executable_function(), input).unwrap();
         assert_eq!(execution.output(), &());
         execution.fence().block_until_ready().unwrap();
         assert_eq!(execution.block_until_ready(), Ok(()));
@@ -1874,7 +2020,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_program(), source).unwrap();
+        let output = engine.interpret(&outer.executable_function(), source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -1930,7 +2076,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), input).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![3.0, 4.0, 5.0, 6.0]);
     }
@@ -1955,7 +2101,7 @@ mod tests {
         .unwrap();
         let input = Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0])).unwrap();
 
-        let output = engine.interpret(&compiled.executable_program(), input).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), input).unwrap();
 
         assert_eq!(output.r#type().as_ref(), &zero_type);
         assert!(output.addressable_shards().next().unwrap().buffer().is_none());
@@ -1999,7 +2145,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_program(), input).unwrap();
+        let output = engine.interpret(&outer.executable_function(), input).unwrap();
         let observed = read_f32_array(&client, &output);
         for (got, expected) in observed.iter().zip([3.0f32.sin(), 4.0f32.sin(), 5.0f32.sin(), 6.0f32.sin()]) {
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -2063,7 +2209,7 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let output = engine.interpret(&outer.executable_program(), input).unwrap();
+        let output = engine.interpret(&outer.executable_function(), input).unwrap();
         let observed = read_f32_array(&client, &output);
         for (got, expected) in observed.iter().zip([14.0, 16.0, 18.0, 20.0]) {
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
@@ -2110,7 +2256,7 @@ mod tests {
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
-            engine.interpret(&jvp_compiled.executable_program(), (primal, tangent)).unwrap();
+            engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
 
         assert_eq!(read_f32_array(&client, &primal_output), vec![5.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
@@ -2146,9 +2292,150 @@ mod tests {
 
         let input =
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
-        let output = engine.interpret(&gradient.executable_program(), input).unwrap();
+        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
 
         assert_eq!(read_f32_array(&client, &output), vec![2.0]);
+    }
+
+    #[test]
+    fn test_deep_jit_call_callee_chain_transforms_on_default_stack() {
+        // Transforming and compiling a function whose `jit_call` callee contains a long elementwise chain used to
+        // overflow the default libtest thread stack in debug builds (around 150 chained operations aborted), because
+        // linearization and transposition rebuilt programs by recursing along use-def chains. The rebuilds are
+        // worklist-driven now, so deriving `jvp` and `gradient` functions across a callee chain well past that
+        // threshold must succeed on a default-size test thread.
+        const CALLEE_OPERATIONS: usize = 600;
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+        let callee: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |x| {
+                let mut value = x;
+                for index in 0..CALLEE_OPERATIONS {
+                    value = if index % 2 == 0 { value.sin().unwrap() } else { value.cos().unwrap() };
+                }
+                value
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(move |x| callee.call(x).unwrap().sin().unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
+
+        let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
+        assert_eq!(jvp.output_types().len(), 2);
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
+        assert_eq!(gradient.output_types().len(), 1);
+
+        // A reference chain evaluated in `f64` pins the gradient's value: each step contributes its local derivative
+        // at the pre-step value, and the appended outer `sin` contributes the final `cos` factor.
+        let (mut expected_value, mut expected_gradient) = (0.5f64, 1.0f64);
+        for index in 0..CALLEE_OPERATIONS {
+            let (next, derivative) = if index % 2 == 0 {
+                (expected_value.sin(), expected_value.cos())
+            } else {
+                (expected_value.cos(), -expected_value.sin())
+            };
+            expected_value = next;
+            expected_gradient *= derivative;
+        }
+        expected_gradient *= expected_value.cos();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+        let output = engine.interpret(&gradient.executable_function(), input).unwrap();
+        assert!((read_f32_array(&client, &output)[0] as f64 - expected_gradient).abs() < 1e-3);
+    }
+
+    /// For `f = |x| x * x`, repeated `f.gradient(&domain)` calls with one domain must reuse the retained derived
+    /// function (no frontend re-derivation and no compilation-context traffic), while different runtime inputs to the
+    /// shared derived function must still produce their own correct value-dependent gradients.
+    #[test]
+    fn test_gradient_method_retains_derived_function_per_domain() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
+
+        let first: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
+        let statistics = engine.compilation_context().statistics();
+        let second = compiled.gradient(&engine).unwrap();
+
+        // The warm call reuses the retained executable and never reaches the shared compilation context.
+        assert!(std::ptr::eq(first.function.compiled_program(), second.function.compiled_program()));
+        assert_eq!(engine.compilation_context().statistics(), statistics);
+
+        // The retained derived function keeps residuals as runtime values: different primals through the shared
+        // executable produce different, correct value-dependent gradients (`d(x*x)/dx = 2x`).
+        for point in [3.0f32, -5.0f32] {
+            let input = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([point].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = engine.interpret(&second.executable_function(), input).unwrap();
+            assert_eq!(read_f32_array(&client, &output), vec![2.0 * point]);
+        }
+
+        // A different domain identity misses, produces a fresh derivative, and replaces the retained slot.
+        let other_engine = XlaDomain::new(&client);
+        let third = compiled.gradient(&other_engine).unwrap();
+        assert!(!std::ptr::eq(first.function.compiled_program(), third.function.compiled_program()));
+        let other_statistics = other_engine.compilation_context().statistics();
+        let fourth = compiled.gradient(&other_engine).unwrap();
+        assert!(std::ptr::eq(third.function.compiled_program(), fourth.function.compiled_program()));
+        assert_eq!(other_engine.compilation_context().statistics(), other_statistics);
+    }
+
+    /// Mirrors [`test_gradient_method_retains_derived_function_per_domain`] for the forward-mode
+    /// [`CompiledXlaFunction::jvp`] path.
+    #[test]
+    fn test_jvp_method_retains_derived_function_per_domain() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.clone() * x, input_type.clone(), &engine, mesh.clone()).unwrap();
+
+        let first: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+            compiled.jvp(&engine).unwrap();
+        let statistics = engine.compilation_context().statistics();
+        let second = compiled.jvp(&engine).unwrap();
+
+        assert!(std::ptr::eq(first.function.compiled_program(), second.function.compiled_program()));
+        assert_eq!(engine.compilation_context().statistics(), statistics);
+
+        // The retained JVP computes `(x * x, 2 * x * t)` for runtime `(x, t)` supplied per call.
+        let primal = Array::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[3.0]).as_slice(),
+        )
+        .unwrap();
+        let tangent =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[4.0]).as_slice()).unwrap();
+        let (primal_output, tangent_output) =
+            engine.interpret(&second.executable_function(), (primal, tangent)).unwrap();
+        assert_eq!(read_f32_array(&client, &primal_output), vec![9.0]);
+        assert_eq!(read_f32_array(&client, &tangent_output), vec![24.0]);
     }
 
     #[test]
@@ -2215,14 +2502,14 @@ mod tests {
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&[4.0]).as_slice())
                 .unwrap();
         let (primal_output, tangent_output) =
-            engine.interpret(&jvp_compiled.executable_program(), (primal, tangent)).unwrap();
+            engine.interpret(&jvp_compiled.executable_function(), (primal, tangent)).unwrap();
 
         assert_eq!(read_f32_array(&client, &primal_output), vec![5.0]);
         assert_eq!(read_f32_array(&client, &tangent_output), vec![4.0]);
     }
 
     /// Outer-transform smoke test: applying `grad` to a `CompiledXlaFunction` produces a new compiled function that
-    /// For `f = |x| x.sin()`, `f.jvp()` produces a compiled function for which interpreting its executable program at
+    /// For `f = |x| x.sin()`, `f.jvp()` produces a compiled function for which interpreting its executable function at
     /// `(primal, tangent)` returns `(sin(primal), cos(primal) * tangent)` within `1e-5`.
     #[test]
     fn test_jvp_method_returns_primal_and_tangent() {
@@ -2271,7 +2558,7 @@ mod tests {
             )
             .unwrap();
             let (primal_out, tangent_out) =
-                engine.interpret(&jvp_compiled.executable_program(), (primal_array, tangent_array)).unwrap();
+                engine.interpret(&jvp_compiled.executable_function(), (primal_array, tangent_array)).unwrap();
             let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
             let primal_observed = {
                 let shard_bytes = primal_out
@@ -2329,13 +2616,13 @@ mod tests {
         let primal_input = Array::from_host_buffer(&client, primal_type.clone(), mesh.clone(), [1u8]).unwrap();
         let tangent_input = Array::from_host_buffer(&client, tangent_type.clone(), mesh, []).unwrap();
         let (primal_output, tangent_output) =
-            engine.interpret(&jvp.executable_program(), (primal_input, tangent_input)).unwrap();
+            engine.interpret(&jvp.executable_function(), (primal_input, tangent_input)).unwrap();
 
         assert_eq!(primal_output.r#type().as_ref(), &primal_type);
         assert_eq!(tangent_output.r#type().as_ref(), &tangent_type);
         assert!(tangent_output.addressable_shards().next().unwrap().buffer().is_none());
 
-        let chained_tangent = engine.interpret(&zero_identity.executable_program(), tangent_output).unwrap();
+        let chained_tangent = engine.interpret(&zero_identity.executable_function(), tangent_output).unwrap();
         assert_eq!(chained_tangent.r#type().as_ref(), &tangent_type);
         assert!(chained_tangent.addressable_shards().next().unwrap().buffer().is_none());
     }
@@ -2352,7 +2639,7 @@ mod tests {
     /// `(sin(x), cos(x) * dx)` — within `1e-5`.
     #[test]
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
-        use std::rc::Rc;
+        use std::sync::Arc;
 
         use ryft_core::StagingContext;
 
@@ -2436,7 +2723,7 @@ mod tests {
         // structure the value-level reroute will stage and exercises the real XLA lowering and execution of both
         // jit_call boundaries.
         let (primal_half, tangent_half, residual_count) = linearization.into_parts();
-        let (primal_half, tangent_half) = (Rc::new(primal_half), Rc::new(tangent_half));
+        let (primal_half, tangent_half) = (Arc::new(primal_half), Arc::new(tangent_half));
         let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.value().context().clone();
@@ -2489,7 +2776,7 @@ mod tests {
             )
             .unwrap();
             let (jvp_primal, jvp_tangent) = engine
-                .interpret(&jvp_compiled.executable_program(), (primal_array.clone(), tangent_array.clone()))
+                .interpret(&jvp_compiled.executable_function(), (primal_array.clone(), tangent_array.clone()))
                 .unwrap();
             let jvp_primal_value = read_f32_array(&client, &jvp_primal)[0];
             let jvp_tangent_value = read_f32_array(&client, &jvp_tangent)[0];
@@ -2555,7 +2842,7 @@ mod tests {
         let b =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&b_values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), (a, b)).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), (a, b)).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = output
@@ -2626,7 +2913,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         // The output remains independently readable after the donating call returns. Donation
         // is opaque from the host side — PJRT may reuse the input's device buffer for the
@@ -2724,7 +3011,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         // Reassemble values from both shards in device order.
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -2788,7 +3075,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -2837,7 +3124,7 @@ mod tests {
         .unwrap();
         // Calling with a replicated source against a sharded-expecting executable would error
         // without implicit reshard. With reshard it should succeed and produce correct output.
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -2926,7 +3213,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
         assert_eq!(output.sharding(), &sharded);
 
         let mut observed: Vec<f32> = Vec::with_capacity(values.len());
@@ -3000,7 +3287,7 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
                 .unwrap();
-        let output = engine.interpret(&compiled.executable_program(), source).unwrap();
+        let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         // Final output is replicated (last constraint) — every device sees the full vector.
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -3053,9 +3340,9 @@ mod tests {
             .unwrap()
         };
         let staged_output =
-            read_f32_array(&client, &engine.interpret(&staged_compiled.executable_program(), make_input()).unwrap());
+            read_f32_array(&client, &engine.interpret(&staged_compiled.executable_function(), make_input()).unwrap());
         let direct_output =
-            read_f32_array(&client, &engine.interpret(&direct.executable_program(), make_input()).unwrap());
+            read_f32_array(&client, &engine.interpret(&direct.executable_function(), make_input()).unwrap());
         assert_eq!(staged_output, direct_output);
         assert!((staged_output[0] - input_value.sin()).abs() < 1e-6);
     }
@@ -3101,7 +3388,7 @@ mod tests {
             values_to_bytes::<f32>([input_value].as_slice()).as_slice(),
         )
         .unwrap();
-        let observed = read_f32_array(&client, &engine.interpret(&outer.executable_program(), input).unwrap());
+        let observed = read_f32_array(&client, &engine.interpret(&outer.executable_function(), input).unwrap());
         assert_eq!(observed.len(), 1);
         let expected = (input_value + 0.25).sin().cos();
         assert!((observed[0] - expected).abs() < 1e-5, "expected cos(sin(x + bias)) = {expected}, got {}", observed[0]);
@@ -3159,11 +3446,373 @@ mod tests {
                 values_to_bytes::<f32>([point].as_slice()).as_slice(),
             )
             .unwrap();
-            let observed = read_f32_array(&client, &engine.interpret(&outer.executable_program(), input).unwrap());
+            let observed = read_f32_array(&client, &engine.interpret(&outer.executable_function(), input).unwrap());
             assert_eq!(observed.len(), 1);
             let expected = 2.0 * point.sin();
             assert!((observed[0] - expected).abs() < 1e-5, "expected 2*sin({point}) = {expected}, got {}", observed[0]);
         }
+    }
+
+    /// Number of repeated derived-function constructions and warm dispatches performed by the Phase 0 transform
+    /// caching baselines below.
+    const BASELINE_REPETITIONS: usize = 5;
+
+    /// Prints one Phase 0 baseline timing table: the cold (first) call, every warm call, and the warm mean.
+    fn print_baseline_durations(label: &str, durations: &[Duration]) {
+        println!("phase 0 baseline: {label} ({} calls)", durations.len());
+        for (index, duration) in durations.iter().enumerate() {
+            let tier = if index == 0 { "cold" } else { "warm" };
+            println!("  call {index} ({tier}): {:.3} ms", duration.as_secs_f64() * 1e3);
+        }
+        let warm = &durations[1..];
+        let warm_mean = warm.iter().map(Duration::as_secs_f64).sum::<f64>() / warm.len().max(1) as f64 * 1e3;
+        println!("  warm mean: {warm_mean:.3} ms");
+    }
+
+    /// Prints the domain compilation-cache counters observed across a Phase 0 baseline workload.
+    fn print_baseline_compilation_statistics(domain: &XlaDomain<'_>) {
+        let statistics = domain.compilation_context().statistics();
+        println!(
+            "  compilation cache: memory_hits={} persistent_hits={} misses={} compilations={} waits={}",
+            statistics.memory_hits,
+            statistics.persistent_hits,
+            statistics.misses,
+            statistics.compilations,
+            statistics.waits,
+        );
+        println!(
+            "  compilation cache: retained_entries={} lookup_ms={:.3} compilation_ms={:.3}",
+            domain.cache_size(),
+            statistics.memory_lookup_duration_ns as f64 / 1e6,
+            statistics.compilation_duration_ns as f64 / 1e6,
+        );
+    }
+
+    /// Caching-plan measurement for repeated [`CompiledXlaFunction::jvp`] construction.
+    ///
+    /// Originally captured as the Phase 0 baseline, where every call reconstructed, re-traced, and re-lowered the
+    /// derived forward-mode function with only backend compilation deduplicated through the shared
+    /// [`CompilationContext`](ryft_core::compilation::CompilationContext). Since the Phase 4 retention landed, warm
+    /// calls reuse the derived function retained on the wrapper, so this now measures the improvement against that
+    /// recorded baseline. The printed table records the cold call, the warm calls, and the compilation-cache
+    /// counters.
+    #[test]
+    #[ignore = "phase 0 baseline measurement"]
+    fn test_baseline_repeated_compiled_function_jvp() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin().unwrap().cos().unwrap(), input_type, &domain, mesh).unwrap();
+
+        domain.compilation_context().clear_statistics();
+        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
+        for _ in 0..BASELINE_REPETITIONS {
+            let start = Instant::now();
+            let derived: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+                compiled.jvp(&domain).unwrap();
+            durations.push(start.elapsed());
+            assert_eq!(derived.output_types().len(), 2);
+        }
+
+        print_baseline_durations("repeated CompiledXlaFunction::jvp", &durations);
+        print_baseline_compilation_statistics(&domain);
+    }
+
+    /// Caching-plan measurement for repeated [`CompiledXlaFunction::gradient`] construction. Mirrors
+    /// [`test_baseline_repeated_compiled_function_jvp`] for the reverse-mode path.
+    #[test]
+    #[ignore = "phase 0 baseline measurement"]
+    fn test_baseline_repeated_compiled_function_gradient() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum), input_type, &domain, mesh).unwrap();
+
+        domain.compilation_context().clear_statistics();
+        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
+        for _ in 0..BASELINE_REPETITIONS {
+            let start = Instant::now();
+            let derived: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&domain).unwrap();
+            durations.push(start.elapsed());
+            assert_eq!(derived.output_types().len(), 1);
+        }
+
+        print_baseline_durations("repeated CompiledXlaFunction::gradient", &durations);
+        print_baseline_compilation_statistics(&domain);
+    }
+
+    /// Phase 0 caching-plan composition baseline: a jitted closure that internally runs an eager reverse-mode
+    /// gradient. The JIT boundary stages the eager transform exactly once per specialization, so repeated calls with
+    /// same-shaped inputs are served entirely by retained dispatch. The recorded counters are the reference point the
+    /// caching redesign must preserve, and they also show whether the current trace and lowering fallback tiers ever
+    /// hit under this workload.
+    #[test]
+    #[ignore = "phase 0 baseline measurement"]
+    fn test_baseline_jit_composition_caches_eager_transforms() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let function: JittedXlaFunction<'_, _, (), ArrayType, ArrayType> = jitted(
+            |_, input: XlaCompileTracer<'_>| {
+                input
+                    .dispatch_domain()
+                    .gradient(|value| Mul::mul(&value, &value), input)
+                    .expect("the eager gradient should stage inside the jit boundary")
+            },
+            &domain,
+            mesh.clone(),
+        );
+
+        domain.compilation_context().clear_statistics();
+        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
+        for index in 0..BASELINE_REPETITIONS {
+            let input = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[index as f32]).as_slice(),
+            )
+            .unwrap();
+            let start = Instant::now();
+            let output = function.call((), input).unwrap();
+            durations.push(start.elapsed());
+            assert_eq!(read_f32_array(&client, &output), vec![2.0 * index as f32]);
+        }
+
+        // The JIT boundary is the whole-function cache: one trace, one lowering, one compilation request, and every
+        // later same-shaped call served by a retained specialization without touching the fallback tiers.
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, (BASELINE_REPETITIONS - 1) as u64);
+        assert_eq!(statistics.traces, 1);
+        assert_eq!(statistics.lowerings, 1);
+        assert_eq!(statistics.compilation_requests, 1);
+
+        print_baseline_durations("jit(eager gradient) repeated dispatch", &durations);
+        println!(
+            "  jit cache: dispatch_hits={} dispatch_misses={} traces={} lowerings={} compilation_requests={}",
+            statistics.dispatch_hits,
+            statistics.dispatch_misses,
+            statistics.traces,
+            statistics.lowerings,
+            statistics.compilation_requests,
+        );
+        println!(
+            "  jit cache: abstractification_ms={:.3} dispatch_ms={:.3} tracing_ms={:.3} lowering_ms={:.3}",
+            statistics.input_abstractification_duration_ns as f64 / 1e6,
+            statistics.dispatch_duration_ns as f64 / 1e6,
+            statistics.tracing_duration_ns as f64 / 1e6,
+            statistics.lowering_duration_ns as f64 / 1e6,
+        );
+        print_baseline_compilation_statistics(&domain);
+    }
+
+    /// Number of distinct outer specializations that stage a `jit_call` of one shared callee in the Phase 5 gate
+    /// measurement below.
+    const CALLEE_OUTER_SPECIALIZATIONS: usize = 4;
+
+    /// Callee chain lengths compared by the Phase 5 gate measurement below.
+    const CALLEE_OPERATION_COUNTS: [usize; 2] = [2, 200];
+
+    /// Prints one Phase 5 gate row group: per-outer total construction time, the backend compilation time charged to
+    /// the shared [`CompilationContext`](ryft_core::compilation::CompilationContext) during it, and the frontend
+    /// remainder that callee transformation lives in.
+    fn print_callee_transformation_rows(transform: &str, totals: &[Duration], backends: &[Duration]) {
+        for (index, (total, backend)) in totals.iter().zip(backends.iter()).enumerate() {
+            println!(
+                "    {transform:<9} | {index:>5} | {:>8.3} | {:>10.3} | {:>11.3}",
+                total.as_secs_f64() * 1e3,
+                backend.as_secs_f64() * 1e3,
+                (*total - *backend).as_secs_f64() * 1e3,
+            );
+        }
+    }
+
+    /// Returns the mean of `totals - backends` in milliseconds: the frontend-only cost per derived-function
+    /// construction, excluding backend compilation served by the shared compilation context.
+    fn mean_frontend_milliseconds(totals: &[Duration], backends: &[Duration]) -> f64 {
+        let sum: f64 =
+            totals.iter().zip(backends.iter()).map(|(total, backend)| (*total - *backend).as_secs_f64()).sum();
+        sum / totals.len() as f64 * 1e3
+    }
+
+    /// Caching-plan measurement for transforming one *shared* `jit_call` callee across distinct outer
+    /// specializations.
+    ///
+    /// Every outer function stages a `jit_call` of the same inner compiled function and appends a trivially
+    /// different `sin` epilogue, so the outers are genuinely distinct specializations that cannot share a Phase 4
+    /// retention slot. Each `jvp`/`gradient` on an outer runs the `JitCallOperation` rules over the attached callee
+    /// program — `jvp` exercises the forward-mode rule, `gradient` exercises both the forward-mode and the transpose
+    /// rule. Scaling the callee from a two-operation chain to a two-hundred-operation chain isolates the
+    /// callee-proportional part of that cost.
+    ///
+    /// Originally captured as the Phase 5 gate baseline, where every outer re-derived the shared callee's transforms
+    /// from scratch, so that the per-call delta between the two callee sizes was exactly the repeated work a
+    /// callee-keyed transform cache could remove and that delta times the number of outers was the total repeated
+    /// work in this workload. Since the per-`Region` transform cache landed, the callee's linearizations and
+    /// transpositions are derived once and served warm to every later outer, so this now measures the improvement
+    /// against that recorded baseline: what remains callee-proportional is the work outside the retained artifacts,
+    /// such as replaying the derived programs into each outer.
+    ///
+    /// Backend compilation is timed separately and subtracted, because the derived programs differ per outer and are
+    /// therefore genuinely distinct compilations that no frontend cache can remove.
+    #[test]
+    #[ignore = "phase 5 gate measurement"]
+    fn test_baseline_repeated_jit_call_callee_transformation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        println!(
+            "phase 5 gate: shared jit_call callee transformed for {CALLEE_OUTER_SPECIALIZATIONS} outer \
+             specializations, warm transforms served by the region transform cache",
+        );
+        println!("  compilation cache before:");
+        print_baseline_compilation_statistics(&domain);
+        domain.compilation_context().clear_statistics();
+
+        // Per callee size: every outer's cold forward-mode and reverse-mode construction, split into the
+        // total elapsed time and the backend compilation time charged inside it.
+        let mut measurements: Vec<(usize, [Vec<Duration>; 2], [Vec<Duration>; 2])> = Vec::new();
+        for callee_operations in CALLEE_OPERATION_COUNTS {
+            let callee: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+                move |x| {
+                    let mut value = x;
+                    for index in 0..callee_operations {
+                        value = if index % 2 == 0 { value.sin().unwrap() } else { value.cos().unwrap() };
+                    }
+                    value
+                },
+                input_type.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+
+            let mut outers = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+            for index in 0..CALLEE_OUTER_SPECIALIZATIONS {
+                let callee = callee.clone();
+                let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+                    move |x| {
+                        let mut value = callee.call(x).unwrap();
+                        for _ in 0..=index {
+                            value = value.sin().unwrap();
+                        }
+                        value
+                    },
+                    input_type.clone(),
+                    &domain,
+                    mesh.clone(),
+                )
+                .unwrap();
+
+                // The callee stays behind a `jit_call` boundary: the outer program holds exactly one
+                // `jit_call` and none of the callee's `cos` operations, which the `sin`-only epilogue could
+                // never have produced itself.
+                let instructions = outer.source_program().program().instructions();
+                let jit_call_count = instructions
+                    .iter()
+                    .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+                    .count();
+                let inlined_cosine_count = instructions
+                    .iter()
+                    .filter(|instruction| {
+                        matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Cos(_)))
+                    })
+                    .count();
+                assert_eq!(jit_call_count, 1, "each outer specialization should stage one jit_call boundary");
+                assert_eq!(inlined_cosine_count, 0, "the outer program should not inline the callee body");
+                outers.push(outer);
+            }
+
+            let mut jvp_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+            let mut jvp_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+            for outer in &outers {
+                let before = domain.compilation_context().statistics().compilation_duration_ns;
+                let start = Instant::now();
+                let derived: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
+                    outer.jvp(&domain).unwrap();
+                jvp_totals.push(start.elapsed());
+                let after = domain.compilation_context().statistics().compilation_duration_ns;
+                jvp_backends.push(Duration::from_nanos(after - before));
+                assert_eq!(derived.output_types().len(), 2);
+            }
+
+            let mut gradient_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+            let mut gradient_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+            for outer in &outers {
+                let before = domain.compilation_context().statistics().compilation_duration_ns;
+                let start = Instant::now();
+                let derived: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient(&domain).unwrap();
+                gradient_totals.push(start.elapsed());
+                let after = domain.compilation_context().statistics().compilation_duration_ns;
+                gradient_backends.push(Duration::from_nanos(after - before));
+                assert_eq!(derived.output_types().len(), 1);
+            }
+
+            measurements.push((callee_operations, [jvp_totals, jvp_backends], [gradient_totals, gradient_backends]));
+        }
+
+        for (callee_operations, jvp, gradient) in &measurements {
+            println!("  callee with {callee_operations} operations (all times in milliseconds):");
+            println!("    transform | outer |    total |    backend |    frontend");
+            print_callee_transformation_rows("jvp", &jvp[0], &jvp[1]);
+            print_callee_transformation_rows("gradient", &gradient[0], &gradient[1]);
+        }
+
+        let (small_operations, small_jvp, small_gradient) = &measurements[0];
+        let (large_operations, large_jvp, large_gradient) = &measurements[1];
+        let small_jvp_mean = mean_frontend_milliseconds(&small_jvp[0], &small_jvp[1]);
+        let large_jvp_mean = mean_frontend_milliseconds(&large_jvp[0], &large_jvp[1]);
+        let small_gradient_mean = mean_frontend_milliseconds(&small_gradient[0], &small_gradient[1]);
+        let large_gradient_mean = mean_frontend_milliseconds(&large_gradient[0], &large_gradient[1]);
+        let added_operations = (large_operations - small_operations) as f64;
+        println!(
+            "  frontend-only summary (mean over {CALLEE_OUTER_SPECIALIZATIONS} distinct outer \
+             specializations, milliseconds):",
+        );
+        println!(
+            "    transform | {small_operations:>3}-op callee | {large_operations:>3}-op callee | \
+             delta/call | delta*outers | per callee op",
+        );
+        println!(
+            "    jvp       | {small_jvp_mean:>13.3} | {large_jvp_mean:>13.3} | {:>10.3} | {:>12.3} | \
+             {:>13.4}",
+            large_jvp_mean - small_jvp_mean,
+            (large_jvp_mean - small_jvp_mean) * CALLEE_OUTER_SPECIALIZATIONS as f64,
+            (large_jvp_mean - small_jvp_mean) / added_operations,
+        );
+        println!(
+            "    gradient  | {small_gradient_mean:>13.3} | {large_gradient_mean:>13.3} | {:>10.3} | \
+             {:>12.3} | {:>13.4}",
+            large_gradient_mean - small_gradient_mean,
+            (large_gradient_mean - small_gradient_mean) * CALLEE_OUTER_SPECIALIZATIONS as f64,
+            (large_gradient_mean - small_gradient_mean) / added_operations,
+        );
+        println!("  compilation cache after:");
+        print_baseline_compilation_statistics(&domain);
     }
 
     /// Tracing context that stages the decode-loop demo's `While` condition and body region programs in the XLA
@@ -3649,7 +4298,7 @@ mod tests {
         ];
         device_inputs
             .extend(weights.iter().enumerate().map(|(index, values)| device_input(index + 6, values_to_bytes(values))));
-        let outputs = engine.interpret(&compiled.executable_program(), device_inputs).unwrap();
+        let outputs = engine.interpret(&compiled.executable_function(), device_inputs).unwrap();
         assert_eq!(outputs.len(), 3);
         let device_tokens = read_i32_array(&client, &outputs[0]);
         let device_cache_keys = read_f32_array(&client, &outputs[1]);
