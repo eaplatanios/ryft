@@ -502,7 +502,6 @@ impl<V: Typed + Parameter, O> Region<V, O> {
         Ok(TypeIdentitySignature::new(identities, input_count))
     }
 
-    // TODO(eaplatanios): Should this be `pub`?
     /// Returns the [`RegionTransformCache`] that contains the structural transforms already derived
     /// from this [`Region`]'s contents.
     #[inline]
@@ -510,7 +509,6 @@ impl<V: Typed + Parameter, O> Region<V, O> {
         &self.transform_cache
     }
 
-    // TODO(eaplatanios): Should this be `pub`?
     /// Makes this [`Region`] adopt (i.e., share) the provided [`RegionTransformCache`] instead of its own. Callers
     /// must guarantee that this region has exactly the contents of the region that owns `transform_cache`, including
     /// the contents of every region reachable from it. Refer to [`RegionTransformCache`] for why that is the complete
@@ -522,7 +520,6 @@ impl<V: Typed + Parameter, O> Region<V, O> {
         self.transform_cache = transform_cache;
     }
 
-    // TODO(eaplatanios): Should this be `pub`?
     /// Detaches this [`Region`] from the cached transforms that were derived from its previous contents, which every
     /// in-place rewrite of a region's contents must do.
     #[inline]
@@ -671,7 +668,6 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         })
     }
 
-    // TODO(eaplatanios): Review this.
     /// Creates a new [`RegionArena`] exactly like [`Self::from_regions`], except that every sealed region keeps the
     /// transforms already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the
     /// closure-preservation precondition every caller must guarantee, which a faithful whole-arena rebuild satisfies
@@ -720,14 +716,12 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         self.regions.get(id.index()).map(|region| &region.type_identity_signature)
     }
 
-    // TODO(eaplatanios): Review this.
     /// Returns the [`RegionTransformCache`] of the [`Region`] with the provided [`RegionId`] in this [`RegionArena`].
     #[inline]
     pub(crate) fn transform_cache(&self, id: RegionId) -> Option<&RegionTransformCache<V, O>> {
         self.get(id).map(Region::transform_cache)
     }
 
-    // TODO(eaplatanios): Review this.
     /// Makes the [`Region`] with the provided [`RegionId`] share `transform_cache`. Refer to
     /// [`Region::adopt_transform_cache`] for the contents-equality precondition every caller must guarantee.
     #[inline]
@@ -753,7 +747,6 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         Ok(id)
     }
 
-    // TODO(eaplatanios): Review this.
     /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
     /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
     /// precondition every caller must guarantee.
@@ -976,10 +969,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.type_identity_signature(self.id).unwrap()
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns the structural transforms already derived from this [`Region`]'s contents. The cell is shared with
-    /// every content-preserving copy of the sealed region this view points at, which is what lets a shared callee
-    /// program be linearized or transposed once instead of once per program that interned it.
+    /// Returns the [`RegionTransformCache`] that contains the structural transforms already derived from this
+    /// [`Region`]'s contents. The cache is shared with every content-preserving copy of the sealed region this view
+    /// points at, which is what lets a shared callee program be linearized or transposed once instead of once per
+    /// program that interned it.
     #[inline]
     pub(crate) fn transform_cache(self) -> &'r RegionTransformCache<V, O> {
         self.arena.transform_cache(self.id).unwrap()
