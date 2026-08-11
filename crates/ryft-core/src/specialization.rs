@@ -1,7 +1,7 @@
 //! Backend-neutral, process-local caching primitive for retained _specializations_.
 //!
-//! A specialization is the artifact a front end produces for one exact configuration of a retained callable: a traced
-//! [`Program`](crate::Program), a lowered program, a compiled function, or a transformed program.
+//! A specialization is the artifact a front end produces for one exact configuration of a retained callable:
+//! a traced [`Program`](crate::Program), a lowered program, a compiled function, or a transformed program.
 //! [`SpecializationCache`] retains those artifacts under a **single level** contract, mapping one key to one artifact.
 //! It deliberately has no tiers, no fallback lifecycles, and no timing policy. Consumers keep their own phase-specific
 //! statistics and decide what a key and an artifact means.
@@ -77,30 +77,28 @@ use std::thread::ThreadId;
 use lru::LruCache;
 use thiserror::Error;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Error returned when a thread requests production of a specialization key that the *same* thread is already
-/// producing.
-///
-/// Recursive production of the specialization currently in flight cannot terminate, so [`SpecializationCache`]
-/// rejects it immediately instead of waiting. Producing a different key from within an active producer is allowed,
-/// and so is producing the same key concurrently from a different thread.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Error)]
-#[error("recursive request for a specialization that is already being produced on this thread")]
-pub struct ReentrantSpecializationError;
-
 /// Error returned by the convenience [`SpecializationCache::get_or_try_insert_with`] entry point, layering a
 /// caller-defined production error `E` over the cache's own [`ReentrantSpecializationError`] rejection.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum SpecializationCacheError<E: Debug + Display> {
-    /// The same thread is already producing this key.
+    /// Error returned if the same thread is already producing this key.
     #[error(transparent)]
     Reentrant(#[from] ReentrantSpecializationError),
 
-    /// The caller's production closure failed. Nothing was cached and the next call retries.
+    /// Error returned if the caller's production closure failed. Nothing was cached and the next call retries.
     #[error("{0}")]
     Production(E),
 }
+
+/// Error returned when a thread requests production of a specialization key that the _same_ thread is
+/// already producing. Recursive production of the specialization currently in flight cannot terminate, and so
+/// [`SpecializationCache`] rejects it immediately instead of waiting. Producing a different key from within an active
+/// producer is allowed, and so is producing the same key concurrently from a different thread.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Error)]
+#[error("recursive request for a specialization that is already being produced on this thread")]
+pub struct ReentrantSpecializationError;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Cache key identifying one specialization of a retained function.
 ///
