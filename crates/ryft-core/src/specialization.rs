@@ -98,9 +98,10 @@ pub enum SpecializationCacheError<E: Debug + Display> {
 #[error("recursive request for a specialization that is already being produced on this thread")]
 pub struct ReentrantSpecializationError;
 
-/// Cache key identifying one specialization of a retained function. Two function calls are considered interchangeable
-/// (i.e., they stage the same [`Program`](crate::Program) should thus have the same [`FunctionSpecializationKey`])
-/// exactly when all three of the following components agree:
+/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when
+/// all three components below agree. Equal keys must identify calls that can safely share the same staged
+/// [`Program`](crate::Program). Unequal keys remain separate even if they happen to stage structurally equivalent
+/// programs.
 ///
 ///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
 ///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
@@ -132,38 +133,34 @@ pub struct FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch>
     dispatch: Dispatch,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<StaticParameters, InputStructure, Dispatch> FunctionSpecializationKey<StaticParameters, InputStructure, Dispatch> {
-    /// Creates a specialization key from its three components.
-    ///
-    /// # Parameters
-    ///   - `static_parameters`: Host values declared static for this specialization.
-    ///   - `input_structure`: Parameter structure of the dynamic input.
-    ///   - `dispatch`: Domain-normalized abstract dispatch signature of the flattened dynamic input.
+    /// Creates a new [`FunctionSpecializationKey`].
     #[inline]
     pub fn new(static_parameters: StaticParameters, input_structure: InputStructure, dispatch: Dispatch) -> Self {
         Self { static_parameters, input_structure, dispatch }
     }
 
-    /// Returns the host values declared static for this specialization.
+    /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
     #[inline]
     pub fn static_parameters(&self) -> &StaticParameters {
         &self.static_parameters
     }
 
-    /// Returns the parameter structure of the dynamic input.
+    /// Returns the parameter structure of the dynamic input for the keyed specialization.
     #[inline]
     pub fn input_structure(&self) -> &InputStructure {
         &self.input_structure
     }
 
-    /// Returns the domain-normalized abstract dispatch signature of the flattened dynamic input.
+    /// Returns the domain-normalized abstract dispatch signature of the flattened dynamic input
+    /// for the keyed specialization.
     #[inline]
     pub fn dispatch(&self) -> &Dispatch {
         &self.dispatch
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Snapshot of one [`SpecializationCache`]'s activity since construction or since the last
 /// [`SpecializationCache::clear_statistics`] call.
