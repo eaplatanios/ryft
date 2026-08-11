@@ -25,11 +25,11 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::ops::Index;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 
-use crate::parameters::Placeholder;
+use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
@@ -40,6 +40,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::programs::values::Value;
+use crate::specialization::SpecializationCache;
 
 /// Unique identifier for a [`Region`] within a [`Program`]. [`RegionId`]s are stable indexes into a [`Program`]'s
 /// region arena. Like [`AtomId`]s, they are meaningful only against the [`Program`] they were derived from.
@@ -70,12 +71,190 @@ impl Display for RegionId {
     }
 }
 
+/// Number of transposed [`Program`]s retained per sealed [`Region`]. One region is normally transposed under a small
+/// number of linearity masks (i.e., typically exactly one per differentiated call site), so a small bound retains the
+/// masks a workload actually repeats without letting a long-lived callee accumulate unbounded derived programs.
+const REGION_TRANSPOSITION_CACHE_CAPACITY: usize = 8;
+
+/// Retained linearization of a sealed [`Region`] that consists of its capture-free primal sub-[`Program`], its tangent
+/// sub-[`Program`], and the residual count relating the two, in
+/// [`Linearization::into_parts`](crate::Linearization::into_parts) order.
+pub(crate) type RegionLinearization<V, O> =
+    (Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize);
+
+/// Cache key identifying one transposition of a sealed [`Region`]. It holds the complete argument list of the shared
+/// region transposition entry point (i.e., the selected linear input indices, and the per-selected-input residual index
+/// mappings that supply the runtime geometry of a disconnected input's cotangent which is empty for ordinary
+/// transposition). Both arguments change the transposed [`Program`], so both must separate cache entries.
+pub(crate) type RegionTranspositionKey = (Vec<usize>, Vec<Vec<usize>>);
+
+/// Shared state of a [`RegionTransformCache`]. Each transform's cache is initialized on first use so that sealing
+/// a [`Region`] that is never transformed costs one small allocation rather than one cache per transform.
+struct RegionTransformCacheState<V: Typed + Parameter, O> {
+    /// Retained fused Jacobian-Vector Product (JVP) [`Program`] of the owning [`Region`]. Building it takes no
+    /// arguments beyond the region itself, so this cache holds at most one entry under the unit key.
+    jvp_program_cache: OnceLock<SpecializationCache<(), Arc<Program<V, O, Vec<V>, Vec<V>>>>>,
+
+    /// Retained [`RegionLinearization`] of the owning [`Region`]. Linearization takes no arguments beyond the region
+    /// itself, so this cache holds at most one entry under the unit key.
+    linearization_cache: OnceLock<SpecializationCache<(), RegionLinearization<V, O>>>,
+
+    /// Retained transposed [`Program`]s of the owning [`Region`], keyed by the complete transposition argument list.
+    transposition_cache: OnceLock<SpecializationCache<RegionTranspositionKey, Arc<Program<V, O, Vec<V>, Vec<V>>>>>,
+}
+
+/// Lazily initialized cache of the structural transform artifacts derived from one [`Region`]'s contents, shared by
+/// every copy of that region.
+///
+/// # What Is Cached And Why That Is Sound
+///
+/// Structural [`Program`] transforms of a region are pure functions of its reachable contents. Building a region's
+/// fused forward-mode program, linearizing it, or transposing it with respect to a fixed set of inputs replays the
+/// region's [`Atom`]s, [`Instruction`]s, and attached descendants into a fresh trace and consults nothing else (i.e.,
+/// no live transform context, no concrete value, and no caller state). Their results are therefore interchangeable for
+/// every application to the same contents, which is exactly the reuse contract of [`SpecializationCache`]. Transforms
+/// that _do_ depend on live context state are deliberately absent, because they have no complete key here and must not
+/// be cached against a region alone. This includes:
+///
+///   - _batching_, whose result depends on the active batch extent, axis name, and nesting, and
+///   - _partial evaluation_, whose result depends on the known-side context as the partition carries known outputs that
+///     are values of the live parent context (i.e., concrete constants under an eager parent and tracers staged into
+///     the parent's trace under a staging one), so the same region and known-ness mask do not determine one artifact.
+///     This is what keeps the `condition`, `scan`, and `while` known-ness splits out of the cache, for example.
+///
+/// Soundness additionally rests on each transform being _deterministic_, which is why the per-operation rules the
+/// transforms replay are contractually required to be structural functions of their inputs. For examples, refer to
+/// [`DifferentiableOperation::jvp`](crate::DifferentiableOperation::jvp) and
+/// [`TransposableOperation::transpose`](crate::TransposableOperation::transpose). When the `debug_assertions` feature
+/// is enabled, every cache hit diagnoses that requirement by re-deriving the transform from the region's contents and
+/// panicking if the freshly derived programs differ from the retained ones.
+///
+/// The diagnostic is rendering-based, so what it can see is exactly what rendering carries. A program's [`Display`]
+/// rendering includes its structure, types, boundaries, operation metadata, and constant payloads. It is complete for
+/// every [`Value`] that honors the deterministic constant-rendering contract of [`Display`] and every operation that
+/// honors the [`Operation::render`] contract of rendering its semantics-bearing payload fields. A difference that
+/// renders is always caught whereas one that renders identically is not visible here. The recheck roughly doubles the
+/// cost of a cached transform, so builds without debug assertions compile it out.
+///
+/// # Sharing
+///
+/// The cache is minted by [`Region::new`] and is carried by every copy of that region, so it survives the ways a region
+/// travels between arenas without its contents changing:
+///
+///   - cloning a [`Region`], a [`RegionArena`], or a [`Program`], none of which re-seals anything;
+///   - rebasing region identifiers through [`RegionArena::append`], which renumbers attached references without
+///     changing any region body or re-sealing any entry;
+///   - importing a region's complete reachable closure into another [`ProgramBuilder`] (i.e., using
+///     [`ProgramBuilder::import_region`] and the callee interning built on it), which copies every reachable body
+///     unchanged; and
+///   - moving regions through [`RegionArena::into_regions`] and back, which every whole-arena rebuild does.
+///
+/// Sharing across copies is what makes the cache useful. One shared region (e.g., a callee [`Program`], a `condition`
+/// branch, or a `scan` body) interned into many outer programs, each of which is later differentiated, is transformed
+/// once per transform instead of once per outer program. Because the cell rides the region value, its lifetime is
+/// scoped to the programs that hold that region. There is no global registry, no weak map, and no minted identity to
+/// keep consistent.
+///
+/// # Rewrites And Re-Sealing
+///
+/// The load-bearing invariant is that a cell must never outlive the _complete reachable contents_ it was derived from.
+/// Three rules keep it:
+///
+///   - every construction of a region with rewritten contents goes through [`Region::new`], which mints a fresh cell
+///     (i.e., type-identity renaming, operation mapping, value un-projection, boundary rebuilds, and program
+///     simplification all reach it);
+///   - every in-place rewrite of a region's contents calls [`Region::invalidate_transform_cache`] (i.e., capture-index
+///     renumbering in [`ClosedProgram::without_unused_captures`](crate::ClosedProgram::without_unused_captures)); and
+///   - sealing a region into an arena mints a fresh cell whenever that region attaches at least one descendant, because
+///     an attached [`RegionId`] means nothing until an arena files a body under it. A region carried into a different
+///     arena would otherwise keep transforms derived from whatever descendants its previous arena happened to hold at
+///     those identifiers, which is a wrong derived program rather than a missed reuse opportunity. A region that
+///     attaches nothing has no such dependency and keeps its cell, which is what preserves the common leaf-callee
+///     sharing.
+///
+/// The last rule is deliberately conservative, so the internal paths that re-seal a region while provably
+/// preserving its complete reachable closure opt out of it. Those are the closure-copying imports (i.e.,
+/// [`ProgramBuilder::import_region`] and the callee interning built on it), the faithful whole-arena
+/// rebuilds in [`ClosedProgram::without_unused_captures`](crate::ClosedProgram::without_unused_captures) and
+/// [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures), the
+/// entry-boundary projections [`Program::filtered`] and [`Program::into_filtered`], which carry the descendant closure
+/// over verbatim, and program simplification, which additionally re-adopts each source cell in the one case where the
+/// rebuild is provably the identity on the region's contents. [`RegionRef::to_program`] re-adopts the promoted entry's
+/// cell the same way. Renumbering attached identifiers is always tolerated as long as the renumbering preserves the
+/// complete reachable graph's topology, which is why importing and compaction keep retained transforms valid.
+///
+/// # Concurrency
+///
+/// Each retained transform is a [`SpecializationCache`], so lookups never block, production runs outside every lock,
+/// and failed production caches nothing. Same-thread recursive production of the same key is rejected rather than
+/// awaited; callers respond by producing that one artifact without the cache, which keeps recursive transformation
+/// of a self-referential region behaving exactly as it did before the cache existed.
+pub(crate) struct RegionTransformCache<V: Typed + Parameter, O> {
+    /// [`RegionTransformCacheState`] shared by every copy of the sealed region that owns this cell.
+    state: Arc<RegionTransformCacheState<V, O>>,
+}
+
+impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
+    /// Creates an empty [`RegionTransformCache`] whose per-transform caches are going to be initialized on first use.
+    fn new() -> Self {
+        Self {
+            state: Arc::new(RegionTransformCacheState {
+                jvp_program_cache: OnceLock::new(),
+                linearization_cache: OnceLock::new(),
+                transposition_cache: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Returns the retained fused Jacobian-Vector Product (JVP) [`Program`] cache of the owning [`Region`],
+    /// initializing it on first use.
+    pub(crate) fn jvp_program_cache(&self) -> &SpecializationCache<(), Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.state.jvp_program_cache.get_or_init(|| SpecializationCache::new(1))
+    }
+
+    /// Returns the retained [`RegionLinearization`] cache of the owning [`Region`], initializing it on first use.
+    pub(crate) fn linearization_cache(&self) -> &SpecializationCache<(), RegionLinearization<V, O>> {
+        self.state.linearization_cache.get_or_init(|| SpecializationCache::new(1))
+    }
+
+    /// Returns the retained transposition [`Program`] cache of the owning [`Region`], initializing it on first use.
+    pub(crate) fn transposition_cache(
+        &self,
+    ) -> &SpecializationCache<RegionTranspositionKey, Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.state
+            .transposition_cache
+            .get_or_init(|| SpecializationCache::new(REGION_TRANSPOSITION_CACHE_CAPACITY))
+    }
+}
+
+impl<V: Typed + Parameter, O> Clone for RegionTransformCache<V, O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Cloning shares the cell rather than copying its artifacts, which is what lets copies of one sealed region
+        // reuse each other's transforms.
+        Self { state: self.state.clone() }
+    }
+}
+
+impl<V: Typed + Parameter, O> std::fmt::Debug for RegionTransformCache<V, O> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Renders the retained artifact counts instead of the artifacts themselves, so that the debugging rendering of
+        // a `Program` does not include its derived programs (which are unrelated to the region's own contents).
+        formatter
+            .debug_struct("RegionTransformCache")
+            .field("jvp_program_cache", &self.state.jvp_program_cache.get().map_or(0, SpecializationCache::len))
+            .field("linearization_cache", &self.state.linearization_cache.get().map_or(0, SpecializationCache::len))
+            .field("transposition_cache", &self.state.transposition_cache.get().map_or(0, SpecializationCache::len))
+            .finish()
+    }
+}
+
 /// Computation region inside a [`Program`]'s region arena. Every region owns its own [`Atom`] table, [`Instruction`]
 /// sequence, and input/output boundary. The public program entry point and every nested computation are [`Region`]s in
 /// the same arena. [`Instruction`]s reference them by [`RegionId`], and regions may be shared. Furthermore, regions are
 /// _sealed_ meaning that a region referenced by an instruction can never change after that instruction is built.
 #[derive(Clone, Debug)]
-pub struct Region<V: Typed, O> {
+pub struct Region<V: Typed + Parameter, O> {
     /// [`Atom`]s contained in this [`Region`], in the order in which they will be evaluated.
     pub(crate) atoms: Vec<Atom<V>>,
 
@@ -87,9 +266,25 @@ pub struct Region<V: Typed, O> {
 
     /// Ordered sequence of [`Instruction`]s that make up the computational graph of this [`Region`].
     pub(crate) instructions: Vec<Instruction<O>>,
+
+    /// [`RegionTransformCache`] that contains structural transforms already derived from this [`Region`]'s contents,
+    /// shared with every copy of it. Refer to the documentation of [`RegionTransformCache`] for the sharing and
+    /// soundness contract, which every construction and in-place rewrite must respect.
+    pub(crate) transform_cache: RegionTransformCache<V, O>,
 }
 
-impl<V: Typed, O> Region<V, O> {
+impl<V: Typed + Parameter, O> Region<V, O> {
+    /// Creates a new [`Region`].
+    #[inline]
+    pub fn new(
+        atoms: Vec<Atom<V>>,
+        input_ids: Vec<AtomId>,
+        output_ids: Vec<AtomId>,
+        instructions: Vec<Instruction<O>>,
+    ) -> Self {
+        Self { atoms, input_ids, output_ids, instructions, transform_cache: RegionTransformCache::new() }
+    }
+
     /// Returns the [`Atom`]s contained in this [`Region`], in the order in which they will be evaluated.
     #[inline]
     pub fn atoms(&self) -> &[Atom<V>] {
@@ -170,7 +365,7 @@ impl<V: Typed, O> Region<V, O> {
                 ))
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        Ok(Self { atoms, input_ids: self.input_ids.clone(), output_ids: self.output_ids.clone(), instructions })
+        Ok(Self::new(atoms, self.input_ids.clone(), self.output_ids.clone(), instructions))
     }
 
     /// Derives this [`Region`]'s closed [`TypeIdentitySignature`]. A definition-position constant establishes one
@@ -306,13 +501,41 @@ impl<V: Typed, O> Region<V, O> {
         // its prefix and identities established within the region occupy its suffix).
         Ok(TypeIdentitySignature::new(identities, input_count))
     }
+
+    // TODO(eaplatanios): Should this be `pub`?
+    /// Returns the structural transforms already derived from this [`Region`]'s contents.
+    #[inline]
+    pub(crate) fn transform_cache(&self) -> &RegionTransformCache<V, O> {
+        &self.transform_cache
+    }
+
+    // TODO(eaplatanios): Should this be `pub`?
+    /// Makes this [`Region`] share `transform_cache` instead of its own cell.
+    ///
+    /// Callers must guarantee that this region has exactly the contents of the region that owns `transform_cache`,
+    /// including the contents of every region reachable from it. Refer to [`RegionTransformCache`] for why that is the
+    /// complete precondition. Attached [`RegionId`]s may be renumbered as long as the renumbering preserves the
+    /// complete reachable region graph's topology, for the same reason [`RegionArena::append`] keeps derived metadata
+    /// valid: a retained transform depends on the reachable bodies, not on the identifiers they are filed under.
+    #[inline]
+    pub(crate) fn adopt_transform_cache(&mut self, transform_cache: RegionTransformCache<V, O>) {
+        self.transform_cache = transform_cache;
+    }
+
+    // TODO(eaplatanios): Should this be `pub`?
+    /// Detaches this [`Region`] from the transforms derived from its previous contents, which every in-place rewrite
+    /// of a region's contents must do.
+    #[inline]
+    pub(crate) fn invalidate_transform_cache(&mut self) {
+        self.transform_cache = RegionTransformCache::new();
+    }
 }
 
 /// Sealed [`Region`] stored together with metadata derived from its immutable contents and already-sealed descendants.
 /// Keeping the metadata in the same arena entry makes it impossible for a published [`RegionArena`] to pair a region
 /// with stale [`Effects`] or with a [`TypeIdentitySignature`] derived from a different region.
 #[derive(Clone, Debug)]
-pub struct RegionWithMetadata<V: Typed, O> {
+pub struct RegionWithMetadata<V: Typed + Parameter, O> {
     /// Immutable computation [`Region`].
     region: Region<V, O>,
 
@@ -323,10 +546,54 @@ pub struct RegionWithMetadata<V: Typed, O> {
     type_identity_signature: TypeIdentitySignature<<V::Type as Type>::Identity>,
 }
 
+// TODO(eaplatanios): Review this.
+/// Whether a sealing path keeps the transforms already derived from a [`Region`]'s contents. Refer to the
+/// _Rewrites And Re-Sealing_ section of [`RegionTransformCache`] for why sealing is where this choice must be made.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TransformCachePolicy {
+    /// Mint a fresh [`RegionTransformCache`] for a region that attaches at least one descendant, because the sealing
+    /// arena is not known to file the same descendant bodies under the identifiers the region attaches.
+    Mint,
+
+    /// Keep the region's existing [`RegionTransformCache`]. The caller must guarantee that the sealing arena preserves
+    /// the region's complete reachable closure, up to a topology-preserving renumbering of attached identifiers.
+    Preserve,
+}
+
 impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
     /// Creates a new [`RegionWithMetadata`] by _sealing_ the provided `region` after deriving its metadata against
-    /// `sealed_regions`, which must contain every region it references.
+    /// `sealed_regions`, which must contain every region it references. A sealed region that attaches descendants
+    /// starts over with no derived transforms, because the identifiers it attaches acquire their meaning here.
+    #[inline]
     pub fn new(region: Region<V, O>, sealed_regions: &[Self]) -> Result<Self, ProgramError> {
+        Self::seal(region, sealed_regions, TransformCachePolicy::Mint)
+    }
+
+    /// Creates a new [`RegionWithMetadata`] exactly like [`Self::new`], except that `region` keeps the transforms
+    /// already derived from its contents. Refer to [`TransformCachePolicy::Preserve`] for the closure-preservation
+    /// precondition every caller must guarantee.
+    #[inline]
+    pub(crate) fn new_preserving_transform_cache(
+        region: Region<V, O>,
+        sealed_regions: &[Self],
+    ) -> Result<Self, ProgramError> {
+        Self::seal(region, sealed_regions, TransformCachePolicy::Preserve)
+    }
+
+    /// Seals `region` against `sealed_regions` under the provided [`TransformCachePolicy`].
+    fn seal(
+        mut region: Region<V, O>,
+        sealed_regions: &[Self],
+        transform_cache_policy: TransformCachePolicy,
+    ) -> Result<Self, ProgramError> {
+        // Sealing is the point at which the region's attached identifiers acquire meaning, so it is also the point at
+        // which transforms derived against a different arena's descendants must be dropped. A region that attaches
+        // nothing depends only on contents it carries itself and therefore keeps them.
+        if transform_cache_policy == TransformCachePolicy::Mint
+            && region.instructions.iter().any(|instruction| !instruction.regions().is_empty())
+        {
+            region.invalidate_transform_cache();
+        }
         region
             .input_ids
             .iter()
@@ -383,7 +650,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
 /// recursive metadata like [`Effects`] and [`TypeIdentitySignature`]s in one ascending pass. Built [`Program`]s retain
 /// this arena without exposing mutable access to either regions or metadata.
 #[derive(Clone, Debug)]
-pub struct RegionArena<V: Typed, O> {
+pub struct RegionArena<V: Typed + Parameter, O> {
     /// Sealed [`Region`]s and their derived metadata, in [`RegionId`] order.
     regions: Vec<RegionWithMetadata<V, O>>,
 }
@@ -400,6 +667,19 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     pub fn from_regions(regions: Vec<Region<V, O>>) -> Result<Self, ProgramError> {
         regions.into_iter().try_fold(Self::new(), |mut arena, region| {
             arena.push(region)?;
+            Ok(arena)
+        })
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Creates a new [`RegionArena`] exactly like [`Self::from_regions`], except that every sealed region keeps the
+    /// transforms already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the
+    /// closure-preservation precondition every caller must guarantee, which a faithful whole-arena rebuild satisfies
+    /// because it re-seals every source region in its original order.
+    #[inline]
+    pub(crate) fn from_regions_preserving_transform_caches(regions: Vec<Region<V, O>>) -> Result<Self, ProgramError> {
+        regions.into_iter().try_fold(Self::new(), |mut arena, region| {
+            arena.push_preserving_transform_cache(region)?;
             Ok(arena)
         })
     }
@@ -440,16 +720,48 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         self.regions.get(id.index()).map(|region| &region.type_identity_signature)
     }
 
+    // TODO(eaplatanios): Review this.
+    /// Returns the [`RegionTransformCache`] of the [`Region`] with the provided [`RegionId`] in this [`RegionArena`].
+    #[inline]
+    pub(crate) fn transform_cache(&self, id: RegionId) -> Option<&RegionTransformCache<V, O>> {
+        self.get(id).map(Region::transform_cache)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Makes the [`Region`] with the provided [`RegionId`] share `transform_cache`. Refer to
+    /// [`Region::adopt_transform_cache`] for the contents-equality precondition every caller must guarantee.
+    #[inline]
+    pub(crate) fn adopt_transform_cache(&mut self, id: RegionId, transform_cache: RegionTransformCache<V, O>) {
+        if let Some(region) = self.regions.get_mut(id.index()) {
+            region.region.adopt_transform_cache(transform_cache);
+        }
+    }
+
     /// Consumes this arena and returns its [`Region`]s in [`RegionId`] order.
     #[inline]
     pub fn into_regions(self) -> Vec<Region<V, O>> {
         self.regions.into_iter().map(|region| region.region).collect()
     }
 
-    /// Seals and appends the provided [`Region`] to this [`RegionArena`], returning its stable identifier.
+    /// Seals and appends the provided [`Region`] to this [`RegionArena`], returning its stable identifier. A region
+    /// that attaches descendants starts over with no cached derived transforms, because sealing is where the
+    /// identifiers it attaches acquire their meaning.
+    #[inline]
     pub fn push(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
         let id = RegionId::new(self.regions.len());
         self.regions.push(RegionWithMetadata::new(region, self.regions.as_slice())?);
+        Ok(id)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
+    /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
+    /// precondition every caller must guarantee.
+    #[inline]
+    pub(crate) fn push_preserving_transform_cache(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
+        let id = RegionId::new(self.regions.len());
+        self.regions
+            .push(RegionWithMetadata::new_preserving_transform_cache(region, self.regions.as_slice())?);
         Ok(id)
     }
 
@@ -477,7 +789,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     }
 }
 
-impl<V: Typed, O> Default for RegionArena<V, O> {
+impl<V: Typed + Parameter, O> Default for RegionArena<V, O> {
     #[inline]
     fn default() -> Self {
         Self { regions: Vec::new() }
@@ -493,7 +805,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Index<usize> for RegionArena<V, O> 
     }
 }
 
-impl<'r, V: Typed, O> IntoIterator for &'r RegionArena<V, O> {
+impl<'r, V: Typed + Parameter, O> IntoIterator for &'r RegionArena<V, O> {
     type Item = &'r Region<V, O>;
     type IntoIter = RegionArenaIterator<'r, V, O>;
 
@@ -504,12 +816,12 @@ impl<'r, V: Typed, O> IntoIterator for &'r RegionArena<V, O> {
 }
 
 /// Borrowing [`Iterator`] over the [`Region`]s in a [`RegionArena`], in [`RegionId`] order.
-pub struct RegionArenaIterator<'r, V: Typed, O> {
+pub struct RegionArenaIterator<'r, V: Typed + Parameter, O> {
     /// [`Iterator`] over the [`RegionArena`]'s sealed [`Region`] entries.
     regions: std::slice::Iter<'r, RegionWithMetadata<V, O>>,
 }
 
-impl<'r, V: Typed, O> Iterator for RegionArenaIterator<'r, V, O> {
+impl<'r, V: Typed + Parameter, O> Iterator for RegionArenaIterator<'r, V, O> {
     type Item = &'r Region<V, O>;
 
     #[inline]
@@ -518,7 +830,7 @@ impl<'r, V: Typed, O> Iterator for RegionArenaIterator<'r, V, O> {
     }
 }
 
-impl<V: Typed, O> ExactSizeIterator for RegionArenaIterator<'_, V, O> {
+impl<V: Typed + Parameter, O> ExactSizeIterator for RegionArenaIterator<'_, V, O> {
     #[inline]
     fn len(&self) -> usize {
         self.regions.len()
@@ -664,6 +976,15 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.type_identity_signature(self.id).unwrap()
     }
 
+    // TODO(eaplatanios): Review this.
+    /// Returns the structural transforms already derived from this [`Region`]'s contents. The cell is shared with
+    /// every content-preserving copy of the sealed region this view points at, which is what lets a shared callee
+    /// program be linearized or transposed once instead of once per program that interned it.
+    #[inline]
+    pub(crate) fn transform_cache(self) -> &'r RegionTransformCache<V, O> {
+        self.arena.transform_cache(self.id).unwrap()
+    }
+
     /// Materializes this borrowed [`Region`] and its complete reachable region closure as a [`Program`]. Descendant
     /// sharing is preserved within the resulting [`Program`], meaning that if several [`Instruction`]s in the reachable
     /// closure point at the same source [`RegionId`], the resulting program contains one copied descendant and all
@@ -675,14 +996,22 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         // descendant arena in place, and `build` assigns the promoted entry the same identifier the imported root had.
         let mut builder = ProgramBuilder::<V, O>::new();
         let root = builder.import_region(self);
-        let Region { atoms, input_ids, output_ids, instructions } = builder.regions.pop().unwrap();
+        let Region { atoms, input_ids, output_ids, instructions, transform_cache } = builder.regions.pop().unwrap();
         debug_assert_eq!(root.index(), builder.regions.len());
         let input_count = input_ids.len();
         let output_count = output_ids.len();
         builder.atoms = atoms;
         builder.input_ids = input_ids;
         builder.instructions = instructions;
-        builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
+        let mut program =
+            builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap();
+
+        // The promoted entry is this region's body with its descendants copied faithfully beneath it, so the
+        // materialized program's entry keeps the transforms already derived from these exact contents. Importing
+        // rebases the copied descendants' identifiers, which is exactly the renumbering that adoption tolerates.
+        let entry = program.entry();
+        program.regions.adopt_transform_cache(entry, transform_cache);
+        program
     }
 }
 
@@ -1171,6 +1500,7 @@ mod tests {
     use crate::programs::effects::Effect;
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
+    use crate::specialization::SpecializationCacheEntry;
     use crate::tests::TestRegionOperation;
 
     use super::*;
@@ -1362,7 +1692,7 @@ mod tests {
                 Vec::new(),
             ));
         }
-        Region { atoms, input_ids, output_ids, instructions }
+        Region::new(atoms, input_ids, output_ids, instructions)
     }
 
     /// Test fixture containing two distinct root regions that share one descendant.
@@ -1474,27 +1804,27 @@ mod tests {
         // A constant value is also a Single Static Assignment (SSA) definition and may therefore establish
         // its own fresh identity.
         let constant_identity = StructuralIdentity::new("constant");
-        let constant: Region<StructuralType, StructuralOperation> = Region {
-            atoms: vec![Atom::Constant(StructuralType::definition(constant_identity.clone()))],
-            input_ids: Vec::new(),
-            output_ids: vec![AtomId::new(0)],
-            instructions: Vec::new(),
-        };
+        let constant: Region<StructuralType, StructuralOperation> = Region::new(
+            vec![Atom::Constant(StructuralType::definition(constant_identity.clone()))],
+            Vec::new(),
+            vec![AtomId::new(0)],
+            Vec::new(),
+        );
         let signature = constant.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
         assert_eq!(signature.internal_identities(), &[constant_identity.clone()]);
 
         // Constant references may precede their definition in the atom table because constants have no execution
         // order and are all available before the first instruction.
-        let constant_reference: Region<StructuralType, StructuralOperation> = Region {
-            atoms: vec![
+        let constant_reference: Region<StructuralType, StructuralOperation> = Region::new(
+            vec![
                 Atom::Constant(StructuralType::reference(constant_identity.clone())),
                 Atom::Constant(StructuralType::definition(constant_identity.clone())),
             ],
-            input_ids: Vec::new(),
-            output_ids: vec![AtomId::new(0)],
-            instructions: Vec::new(),
-        };
+            Vec::new(),
+            vec![AtomId::new(0)],
+            Vec::new(),
+        );
         let signature = constant_reference.type_identity_signature().unwrap();
         assert_eq!(signature.input_identities(), &[]);
         assert_eq!(signature.internal_identities(), &[constant_identity]);
@@ -1565,30 +1895,27 @@ mod tests {
                     == "operation `structural` output type references identity fresh without consuming or defining it",
         ));
 
-        let duplicate_constant_definition: Region<StructuralType, StructuralOperation> = Region {
-            atoms: vec![
+        let duplicate_constant_definition: Region<StructuralType, StructuralOperation> = Region::new(
+            vec![
                 Atom::Constant(StructuralType::definition(fresh.clone())),
                 Atom::Constant(StructuralType::definition(fresh.clone())),
             ],
-            input_ids: Vec::new(),
-            output_ids: Vec::new(),
-            instructions: Vec::new(),
-        };
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(matches!(
             duplicate_constant_definition.type_identity_signature(),
             Err(TypeError::Invalid { message })
                 if message == "constant type defines identity fresh more than once in this region",
         ));
 
-        let constant_reference: Region<StructuralType, StructuralOperation> = Region {
-            atoms: vec![
-                Atom::Variable(StructuralType::reference(boundary)),
-                Atom::Constant(StructuralType::reference(fresh)),
-            ],
-            input_ids: vec![AtomId::new(0)],
-            output_ids: Vec::new(),
-            instructions: Vec::new(),
-        };
+        let constant_reference: Region<StructuralType, StructuralOperation> = Region::new(
+            vec![Atom::Variable(StructuralType::reference(boundary)), Atom::Constant(StructuralType::reference(fresh))],
+            vec![AtomId::new(0)],
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(matches!(
             constant_reference.type_identity_signature(),
             Err(TypeError::Invalid { message })
@@ -1650,19 +1977,67 @@ mod tests {
     }
 
     #[test]
+    fn test_region_arena_sealing_retains_transform_caches_only_for_identity_rebuilds() {
+        let program = program_with_reused_region();
+        let root = program.entry_region().clone();
+        let leaf = program.regions().get(RegionId::new(0)).unwrap().clone();
+        let leaf_artifact = Arc::new(program_with_reused_region());
+        match leaf.transform_cache().jvp_program_cache().try_entry(()) {
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                producer.insert(leaf_artifact.clone());
+            }
+            _ => panic!("a freshly built leaf region must have an empty fused forward-mode cache"),
+        }
+        let root_artifact = Arc::new(program_with_reused_region());
+        match root.transform_cache().jvp_program_cache().try_entry(()) {
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                producer.insert(root_artifact.clone());
+            }
+            _ => panic!("a freshly built root region must have an empty fused forward-mode cache"),
+        }
+
+        // Sealing a region that attaches nothing keeps its retained artifacts, because its transforms depend only on
+        // contents it carries itself. That is what preserves sharing for the leaf callees that are shared in practice.
+        let mut arena = RegionArena::new();
+        let leaf_id = arena.push(leaf.clone()).unwrap();
+        match arena.transform_cache(leaf_id).unwrap().jvp_program_cache().try_entry(()) {
+            Ok(SpecializationCacheEntry::Occupied(artifact)) => assert!(Arc::ptr_eq(&artifact, &leaf_artifact)),
+            _ => panic!("sealing a leaf region must preserve its retained fused forward-mode program"),
+        }
+
+        // Sealing a region that attaches a descendant starts with no retained artifacts, because the sealing arena is
+        // what decides which body each attached identifier names, and a different body means different transforms.
+        let root_id = arena.push(root.clone()).unwrap();
+        assert!(matches!(
+            arena.transform_cache(root_id).unwrap().jvp_program_cache().try_entry(()),
+            Ok(SpecializationCacheEntry::Vacant(_)),
+        ));
+
+        // The preserving path is the opt-out for re-sealing that provably keeps the region's reachable closure, which
+        // is how closure-copying imports and faithful whole-arena rebuilds keep their retained transforms.
+        let mut arena = RegionArena::new();
+        arena.push_preserving_transform_cache(leaf).unwrap();
+        let root_id = arena.push_preserving_transform_cache(root.clone()).unwrap();
+        match arena.transform_cache(root_id).unwrap().jvp_program_cache().try_entry(()) {
+            Ok(SpecializationCacheEntry::Occupied(artifact)) => assert!(Arc::ptr_eq(&artifact, &root_artifact)),
+            _ => panic!("closure-preserving sealing must preserve the retained fused forward-mode program"),
+        }
+    }
+
+    #[test]
     fn test_region_arena_rejects_unsealed_region_reference() {
         let atom = AtomId::new(0);
-        let region: Region<Array, TestRegionOperation> = Region {
-            atoms: vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
-            input_ids: vec![atom],
-            output_ids: vec![atom],
-            instructions: vec![Instruction::new(
+        let region: Region<Array, TestRegionOperation> = Region::new(
+            vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
+            vec![atom],
+            vec![atom],
+            vec![Instruction::new(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![atom],
                 vec![atom],
                 vec![RegionId::new(0)],
             )],
-        };
+        );
         assert!(matches!(
             RegionArena::from_regions(vec![region]),
             Err(ProgramError::MalformedProgram(message))
