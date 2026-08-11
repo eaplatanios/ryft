@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiationError;
@@ -17,6 +18,7 @@ use crate::programs::{
     ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
     TypeIdentityPosition, Typed, Value, ValueProjection,
 };
+use crate::specialization::{ReentrantSpecializationError, SpecializationCacheEntry};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
@@ -273,13 +275,19 @@ impl<
 /// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
 /// structural region access, while this trait adds transposition-specific recursion.
 pub trait TranspositionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> {
-    /// Transposes `region` according to the input linearity mask, re-entering the active transposition machinery,
-    /// and returns the transposed standalone [`Program`].
+    /// Transposes `region` according to the input linearity mask, re-entering the active transposition machinery, and
+    /// returns a shared handle to the transposed standalone [`Program`]. The result is shared rather than owned because
+    /// rules commonly re-attach the transposed program as a callee. An [`Arc`] lets a caching driver serve one artifact
+    /// for a callee that several programs share instead of re-transposing it per program, and it lets repeated
+    /// attachments of one artifact intern by [`Arc`] identity. The built-in recursive driver therefore serves the
+    /// region's retained transposition through the cached counterpart of [`RegionRef::transpose_with_respect_to`],
+    /// while a custom driver that retains nothing simply transposes the region uncached and wraps the result in
+    /// [`Arc::new`].
     fn transpose_program(
         &self,
         region: RegionRef<'_, V, O>,
         input_linearity: &[bool],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>;
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError>;
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for EmptyRegionDriver {
@@ -288,7 +296,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for Empty
         &self,
         _region: RegionRef<'_, V, O>,
         _input_linearity: &[bool],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot transpose a program".to_string()).into())
     }
 }
@@ -321,14 +329,15 @@ impl<
         &self,
         region: RegionRef<'_, V, O>,
         input_linearity: &[bool],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
-        region.transpose_with_respect_to(
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+        region.transpose_with_respect_to_shared(
             input_linearity
                 .iter()
                 .enumerate()
                 .filter_map(|(index, &linear)| linear.then_some(index))
                 .collect::<Vec<_>>()
                 .as_slice(),
+            &[],
         )
     }
 }
@@ -408,6 +417,13 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     /// [`MaybeZero::Zero`] means that the corresponding input receives a structural zero of the carried cotangent
     /// [`Type`] from this operation.
     ///
+    /// Rules must be deterministic structural functions of their inputs (i.e., of this operation, the input knowledge,
+    /// the output cotangents, and the attached regions reachable through `driver`), because the programs derived from
+    /// them may be retained and replayed by the per-region transform cache behind
+    /// [`transpose_program`](TranspositionDriver::transpose_program). When the `debug_assertions` feature is enabled,
+    /// every cache hit checks this with a rendering-based diagnostic whose fidelity is bounded by [`Operation::render`]
+    /// on operation metadata and by [`Display`](std::fmt::Display) on constants.
+    ///
     /// # Parameters
     ///
     ///   - `context`: Active [`TracingContext`] in which rules may stage additional linear operations.
@@ -439,12 +455,62 @@ impl<
 {
     /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
     /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
+    ///
+    /// This is the uncached half of a pair. Callers that publish their result, including the built-in
+    /// [`TranspositionDriver`], take it through [`RegionRef::transpose_with_respect_to_shared`] counterpart
+    /// instead, which serves the same program from the region's retained transform cache as a shared handle.
     #[inline]
     pub fn transpose_with_respect_to(
         &self,
         input_indices: &[usize],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.transpose_with_respect_to_and_zero_residuals(input_indices, &[])
+    }
+
+    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) through the region's retained transform
+    /// cache, returning a shared handle to the resulting _pullback_ [`Program`].
+    ///
+    /// Transposition is a pure function of the region's contents and of this function's arguments, so this function
+    /// returns exactly what [`RegionRef::transpose_with_respect_to`] would produce, and every content-preserving copy
+    /// of one sealed region shares one artifact per argument list. That is what keeps a shared callee program from
+    /// being transposed once per program that interned it, and it additionally lets repeated binds of the transposed
+    /// program be interned by [`Arc`] identity by their consumers.
+    ///
+    /// Recursive transposition of the region and argument list currently in flight on this thread is served without
+    /// the cache, so a self-referential region behaves exactly as it does through the uncached entry points.
+    pub fn transpose_with_respect_to_shared(
+        &self,
+        input_indices: &[usize],
+        zero_residual_input_indices: &[Vec<usize>],
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
+        let key = (input_indices.to_vec(), zero_residual_input_indices.to_vec());
+        match self.transform_cache().transposition_cache().try_entry(key) {
+            Ok(SpecializationCacheEntry::Occupied(cached_transposed_program)) => {
+                // With debug assertions enabled, re-derive the transposition and compare it against the artifact
+                // about to be served. A difference means a `transpose` rule is not a deterministic structural
+                // function of its inputs, which makes every retained pullback unsound rather than merely stale.
+                #[cfg(debug_assertions)]
+                {
+                    let fresh_transposed_program =
+                        self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?;
+                    assert_eq!(
+                        cached_transposed_program.to_string(),
+                        fresh_transposed_program.to_string(),
+                        "nondeterministic transform rule detected: re-deriving the transposition of this region \
+                         produced a different program than the artifact retained in its transform cache, but \
+                         `TransposableOperation::transpose` rules must be deterministic structural functions of their \
+                         inputs\n\ncached:\n{cached_transposed_program}\nderived:\n{fresh_transposed_program}"
+                    );
+                }
+                Ok(cached_transposed_program)
+            }
+            Ok(SpecializationCacheEntry::Vacant(producer)) => Ok(producer.insert(Arc::new(
+                self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?,
+            ))),
+            Err(ReentrantSpecializationError) => Ok(Arc::new(
+                self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?,
+            )),
+        }
     }
 
     /// Transposes this [`Region`](crate::Region) while mapping the residual inputs that supply runtime geometry
@@ -2409,12 +2475,7 @@ mod tests {
         let program = Program::<Array, TestLinearOperation, Array, ()>::new(
             Placeholder,
             (),
-            vec![Region {
-                atoms: Vec::new(),
-                input_ids: vec![input],
-                output_ids: Vec::new(),
-                instructions: Vec::new(),
-            }],
+            vec![Region::new(Vec::new(), vec![input], Vec::new(), Vec::new())],
             RegionId::new(0),
         );
         assert!(matches!(
@@ -2428,17 +2489,12 @@ mod tests {
         let program = Program::<Array, TestLinearOperation, Array, Array>::new(
             Placeholder,
             Placeholder,
-            vec![Region {
-                atoms: vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
-                input_ids: vec![input],
-                output_ids: vec![input],
-                instructions: vec![Instruction::new(
-                    TestLinearOperation::Identity,
-                    vec![input],
-                    vec![missing_output],
-                    Vec::new(),
-                )],
-            }],
+            vec![Region::new(
+                vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
+                vec![input],
+                vec![input],
+                vec![Instruction::new(TestLinearOperation::Identity, vec![input], vec![missing_output], Vec::new())],
+            )],
             RegionId::new(0),
         );
         assert!(matches!(
@@ -2677,6 +2733,86 @@ mod tests {
     }
 
     #[test]
+    fn test_region_transpose_with_respect_to_shared_specializes_by_argument_list() {
+        // A shared linear callee is transposed once per argument list and reused by every copy of its sealed region,
+        // which is what removes the repeated re-transposition that outer programs interning one callee would pay.
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
+        let callee = Arc::new(
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+        );
+
+        // Every argument of the shared entry point takes part in the key, so a different selection of linear inputs
+        // produces its own transposed program rather than reusing the first one.
+        let both = callee.entry_region_ref().transpose_with_respect_to_shared(&[0, 1], &[]).unwrap();
+        let reversed = callee.entry_region_ref().transpose_with_respect_to_shared(&[1, 0], &[]).unwrap();
+        let leading = callee.entry_region_ref().transpose_with_respect_to_shared(&[0], &[]).unwrap();
+        assert!(!Arc::ptr_eq(&both, &reversed));
+        assert!(!Arc::ptr_eq(&both, &leading));
+        assert_eq!(both.to_string(), callee.transpose_with_respect_to(&[0, 1]).unwrap().to_string());
+        assert_eq!(leading.to_string(), callee.transpose_with_respect_to(&[0]).unwrap().to_string());
+
+        // The same argument list reuses one artifact, including through an independently built program that interned
+        // the callee, because importing a region carries its retained transforms along with its contents.
+        assert!(Arc::ptr_eq(&callee.entry_region_ref().transpose_with_respect_to_shared(&[0, 1], &[]).unwrap(), &both));
+        let mut outer_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let interned = outer_builder.intern_callee(&callee, None).unwrap();
+        let interned = RegionRef::new(&outer_builder.regions, interned).unwrap();
+        assert!(Arc::ptr_eq(&interned.transpose_with_respect_to_shared(&[0, 1], &[]).unwrap(), &both));
+
+        // The zero-residual mappings change the transposed program too, so they separate entries as well.
+        let residualized = interned.transpose_with_respect_to_shared(&[0, 1], &[Vec::new(), Vec::new()]).unwrap();
+        assert!(!Arc::ptr_eq(&residualized, &both));
+        assert_eq!(residualized.to_string(), both.to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_transpose_with_respect_to_shared_debug_recheck_detects_corrupted_cached_program() {
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Publish an artifact that disagrees with what transposing this region produces, which is exactly the state a
+        // nondeterministic `transpose` rule would leave behind: a retained pullback of a linear map the region does
+        // not stage.
+        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
+        let unrelated = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        match program.entry_region().transform_cache().transposition_cache().try_entry((vec![0, 1], Vec::new())) {
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                producer.insert(unrelated);
+            }
+            _ => panic!("a freshly built region must have an empty transposition cache"),
+        }
+
+        // The recheck runs on the hit and reports the contract violation rather than serving the wrong pullback.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.entry_region_ref().transpose_with_respect_to_shared(&[0, 1], &[])
+        }))
+        .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains(
+                "nondeterministic transform rule detected: re-deriving the transposition of this region produced a \
+                 different program than the artifact retained in its transform cache",
+            ),
+            "{message}",
+        );
+    }
+
+    #[test]
     fn test_vjp() {
         // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = sin(x)` at
         // `x = 2` the primal output is `sin(2)`, and the returned pullback maps any number of output cotangents back
@@ -2869,6 +3005,54 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
+    }
+
+    #[test]
+    fn test_value_and_gradient_handles_deep_elementwise_chains_on_the_default_stack() {
+        // Linearization and transposition rebuild programs by walking use-def chains whose depth grows with the
+        // primal chain length. That walk used to recurse once per producer instruction, so differentiating a chain
+        // of a few hundred elementwise operations overflowed the default `libtest` thread stack in debug builds. This
+        // chain is an order of magnitude past that threshold and must differentiate on a default-size test thread.
+        const CHAIN_LENGTH: usize = 2000;
+        let (expected_value, expected_gradient) =
+            (0..CHAIN_LENGTH).fold((0.5f64, 1.0f64), |(value, gradient), _| (value.sin(), gradient * value.cos()));
+        let (value, gradient) = value_and_gradient(
+            |mut value| {
+                for _ in 0..CHAIN_LENGTH {
+                    value = value.sin().unwrap();
+                }
+                value
+            },
+            Array::scalar(0.5f64),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], expected_value, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], expected_gradient, epsilon = 1e-9);
+
+        // The staged counterpart drives the same rebuilds over a traced program: the primal chain, its linearization,
+        // and its transposition all stage into one deep program that is then interpreted (and dropped) on the same
+        // default-size thread.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (value, gradient) = value_and_gradient(
+                    |mut value| {
+                        for _ in 0..CHAIN_LENGTH {
+                            value = value.sin().unwrap();
+                        }
+                        value
+                    },
+                    inputs[0].clone(),
+                )
+                .unwrap();
+                Ok(vec![value, gradient])
+            },
+            vec![ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        let outputs = program.interpret(vec![Array::scalar(0.5f64)]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], expected_value, epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], expected_gradient, epsilon = 1e-9);
     }
 
     #[test]
