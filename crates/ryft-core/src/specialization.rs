@@ -213,17 +213,6 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> Debug for SpecializationCache<Key,
     }
 }
 
-/// Represents a [`SpecializationCache`] entry returned by [`SpecializationCache::try_entry`].
-#[derive(Debug)]
-pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
-    /// A retained artifact was found and its recency was refreshed.
-    Occupied(Artifact),
-
-    /// No artifact was retained. The producer guard holds the in-flight marker until it inserts a new entry
-    /// or is dropped.
-    Vacant(SpecializationCacheProducer<'c, Key, Artifact>),
-}
-
 /// Resource Acquisition Is Initialization (RAII) guard authorizing production of a specialization. This guard holds
 /// the `(ThreadId, Key)` in-flight marker for its key. Calling [`Self::insert`] publishes an artifact and releases
 /// the marker. Dropping the guard without inserting releases the marker, counts an abandoned production, and caches
@@ -271,6 +260,17 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProduc
     }
 }
 
+/// Represents a [`SpecializationCache`] entry returned by [`SpecializationCache::try_entry`].
+#[derive(Debug)]
+pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
+    /// A retained artifact was found and its recency was refreshed.
+    Occupied(Artifact),
+
+    /// No artifact was retained. The producer guard holds the in-flight marker until it inserts a new entry
+    /// or is dropped.
+    Vacant(SpecializationCacheProducer<'c, Key, Artifact>),
+}
+
 /// Bounded, process-local cache mapping owner-defined keys to retained artifacts. Refer to the documentation of
 /// [this module](self) for information on the reuse, production, reentrancy, and thread-safety contracts.
 ///
@@ -307,97 +307,38 @@ pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
     statistics: SpecializationCacheStatisticsAccumulator,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact> {
-    /// Creates an empty cache retaining at most `capacity` artifacts. A `capacity` of zero is clamped to one, because
-    /// a cache that can retain nothing would turn every producer into wasted work.
+    /// Creates an empty [`SpecializationCache`] retaining at most `capacity` artifacts. A `capacity` of zero is clamped
+    /// to one, because a cache that can retain nothing would turn every producer into wasted work.
+    #[inline]
     pub fn new(capacity: usize) -> Self {
-        let capacity = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
-            entries: Mutex::new(LruCache::new(capacity)),
+            entries: Mutex::new(LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap())),
             in_flight: Mutex::new(HashSet::new()),
             statistics: SpecializationCacheStatisticsAccumulator::default(),
         }
     }
 
-    /// Returns the cache entry for `key`, containing either the retained artifact or a producer authorized to make one.
-    ///
-    /// A hit refreshes the key's recency, counts a hit, and returns a clone of the artifact. A miss counts a miss —
-    /// including when the request is then rejected as reentrant — registers a `(current thread, key)` in-flight marker,
-    /// and returns a [`SpecializationCacheProducer`]. No lock is held once this method returns.
-    ///
-    /// # Parameters
-    ///   - `key`: Specialization to request. It is consumed because a vacant entry retains it as the producer's key.
-    pub fn try_entry(
-        &self,
-        key: Key,
-    ) -> Result<SpecializationCacheEntry<'_, Key, Artifact>, ReentrantSpecializationError> {
-        if let Some(artifact) = self.entries.lock().expect("specialization cache mutex is poisoned").get(&key).cloned()
-        {
-            self.statistics.increment_hits();
-            return Ok(SpecializationCacheEntry::Occupied(artifact));
-        }
-        self.statistics.increment_misses();
-        let thread = std::thread::current().id();
-
-        // Registering with `replace` rather than `insert` hands the equal marker that is already in flight back out of
-        // the guard, so a rejected duplicate registration drops its `Key` after the lock is released instead of under
-        // it. The two markers are interchangeable by definition, since they compare equal.
-        let already_in_flight = {
-            let mut in_flight = self.in_flight.lock().expect("specialization cache mutex is poisoned");
-            in_flight.replace((thread, key.clone()))
-        };
-        if already_in_flight.is_some() {
-            return Err(ReentrantSpecializationError);
-        }
-        Ok(SpecializationCacheEntry::Vacant(SpecializationCacheProducer {
-            cache: self,
-            thread,
-            key: Some(key),
-            marker: PhantomData,
-        }))
-    }
-
-    /// Returns the artifact retained for `key`, producing and retaining one with `produce` on a miss.
-    ///
-    /// This is the convenience form of [`Self::try_entry`]. Callers that need to time entry resolution separately from
-    /// production, or that need the producer's key, should use [`Self::try_entry`] directly. Production errors are
-    /// propagated and nothing is cached, so a later call retries.
-    ///
-    /// # Parameters
-    ///   - `key`: Specialization to look up.
-    ///   - `produce`: Runs on a miss, outside every cache lock, to build the artifact.
-    pub fn get_or_try_insert_with<E, F>(&self, key: Key, produce: F) -> Result<Artifact, SpecializationCacheError<E>>
-    where
-        E: Debug + Display,
-        F: FnOnce() -> Result<Artifact, E>,
-    {
-        match self.try_entry(key)? {
-            SpecializationCacheEntry::Occupied(artifact) => Ok(artifact),
-            SpecializationCacheEntry::Vacant(producer) => match produce() {
-                Ok(artifact) => Ok(producer.insert(artifact)),
-                Err(error) => Err(SpecializationCacheError::Production(error)),
-            },
-        }
-    }
-
-    /// Returns the number of retained artifacts.
+    /// Returns the number of retained artifacts in this [`SpecializationCache`].
+    #[inline]
     pub fn len(&self) -> usize {
         self.entries.lock().expect("specialization cache mutex is poisoned").len()
     }
 
-    /// Returns whether no artifact is retained.
+    /// Returns `true` if no artifact is retained in this [`SpecializationCache`].
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.lock().expect("specialization cache mutex is poisoned").is_empty()
     }
 
-    /// Returns the maximum number of artifacts this cache retains.
+    /// Returns the maximum number of artifacts this [`SpecializationCache`] can retain.
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.entries.lock().expect("specialization cache mutex is poisoned").cap().get()
     }
 
-    /// Returns the retained keys from most to least recently used.
+    /// Returns the keys retained in this [`SpecializationCache`] from most to least recently used.
+    #[inline]
     pub fn keys(&self) -> Vec<Key> {
         self.entries
             .lock()
@@ -407,13 +348,69 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
             .collect()
     }
 
-    /// Removes every retained artifact, leaving the statistics untouched.
-    ///
-    /// Clearing does not cancel producers that are already in flight. A producer that succeeds afterwards still
-    /// inserts its artifact, because it was authorized before the clear and its key still identifies an
-    /// interchangeable specialization.
+    /// Returns the cache entry for `key`, containing either the retained artifact or a [`SpecializationCacheProducer`]
+    /// authorized to make one. A hit refreshes the key's recency, counts a hit, and returns a clone of the artifact.
+    /// A miss counts a miss (including when the request is then rejected as reentrant) registers a
+    /// `(current thread, key)` in-flight marker, and returns a producer. No lock is held once this function returns.
+    pub fn try_entry(
+        &self,
+        key: Key,
+    ) -> Result<SpecializationCacheEntry<'_, Key, Artifact>, ReentrantSpecializationError> {
+        if let Some(artifact) = self.entries.lock().expect("specialization cache mutex is poisoned").get(&key).cloned()
+        {
+            self.statistics.increment_hits();
+            return Ok(SpecializationCacheEntry::Occupied(artifact));
+        }
+
+        self.statistics.increment_misses();
+        let thread = std::thread::current().id();
+
+        // Registering with `replace` rather than `insert` hands the equal marker that is already in flight back out
+        // of the guard, so that a rejected duplicate registration drops its `Key` after the lock is released instead
+        // of under it. The two markers are interchangeable by definition, since they compare equal.
+        if self
+            .in_flight
+            .lock()
+            .expect("specialization cache mutex is poisoned")
+            .replace((thread, key.clone()))
+            .is_some()
+        {
+            return Err(ReentrantSpecializationError);
+        }
+
+        Ok(SpecializationCacheEntry::Vacant(SpecializationCacheProducer {
+            cache: self,
+            thread,
+            key: Some(key),
+            marker: PhantomData,
+        }))
+    }
+
+    /// Returns the artifact retained for `key`, producing and retaining one with `produce_fn` on a miss. This is the
+    /// convenience form of [`Self::try_entry`]. Callers that need to time entry resolution separately from production,
+    /// or that need the producer's key, should use [`Self::try_entry`] directly. Production errors are propagated and
+    /// nothing is cached, so a later call retries.
+    #[inline]
+    pub fn get_or_try_insert_with<E: Debug + Display, F: FnOnce() -> Result<Artifact, E>>(
+        &self,
+        key: Key,
+        produce_fn: F,
+    ) -> Result<Artifact, SpecializationCacheError<E>> {
+        match self.try_entry(key)? {
+            SpecializationCacheEntry::Occupied(artifact) => Ok(artifact),
+            SpecializationCacheEntry::Vacant(producer) => match produce_fn() {
+                Ok(artifact) => Ok(producer.insert(artifact)),
+                Err(error) => Err(SpecializationCacheError::Production(error)),
+            },
+        }
+    }
+
+    /// Removes every retained artifact from this [`SpecializationCache`], leaving its [`SpecializationCacheStatistics`]
+    /// untouched. Note that clearing the cache does not cancel producers that are already in flight. A producer that
+    /// succeeds afterwards still inserts its artifact, because it was authorized before the clear and its key still
+    /// identifies an interchangeable specialization.
     pub fn clear(&self) {
-        // Swapping an empty map of the same capacity in under the lock, and dropping the removed one afterwards, keeps
+        // Swapping an empty map of the same capacity in under the lock and dropping the removed one afterwards keeps
         // every key and artifact destructor outside the lock so that a destructor may reenter the cache.
         let removed = {
             let mut entries = self.entries.lock().expect("specialization cache mutex is poisoned");
@@ -446,6 +443,8 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
         drop(removed);
         count
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns a snapshot of this cache's activity counters.
     pub fn statistics(&self) -> SpecializationCacheStatistics {
