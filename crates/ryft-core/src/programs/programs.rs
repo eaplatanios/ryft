@@ -1244,8 +1244,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     ///
     /// A [`Region`] body renders as a sequence of statements between its `lambda` header and its `in (...)` result
     /// list, where the first statement carries the `let` keyword and every later one is aligned beneath it. A statement
-    /// is either a binding of the form `%0:f64 = operation ...operands` or, for an [`Instruction`] that binds no output
-    /// atom (e.g., an effectful assertion), the resultless form `operation ...operands` without the `%0:f64 =` binder.
+    /// is either a binding of the form `%0:f64 = operation ...operands`, a constant binding of the form `%0:f64 = const
+    /// 1.0`, or, for an [`Instruction`] that binds no output atom (e.g., an effectful assertion), the resultless form
+    /// `operation ...operands` without the `%0:f64 =` binder. Constant payloads render through their [`Display`]
+    /// implementation, whose [`Value`] contract requires a deterministic and semantically complete representation.
     /// Resultless instructions render in [`Instruction`] order relative to the instructions that do bind atoms, so
     /// programs whose only difference is the presence or ordering of such instructions render differently.
     pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1351,14 +1353,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             let mut next_instruction_index = 0usize;
             for (atom_id, atom) in region.atoms.iter().enumerate() {
                 match atom {
-                    Atom::Constant(_) => {
+                    Atom::Constant(value) => {
                         write!(formatter, "{:indentation$}", "")?;
                         writeln!(
                             formatter,
-                            "{} {}:{} = const",
+                            "{} {}:{} = const {}",
                             if statement_count == 0 { "let" } else { "   " },
                             AtomId::new(atom_id),
-                            region.atoms[atom_id].r#type()
+                            region.atoms[atom_id].r#type(),
+                            value,
                         )?;
                         statement_count += 1;
                     }
@@ -3226,6 +3229,37 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_program_render_includes_constant_payloads() {
+        /// Builds a program whose nested region returns `constant`, so that constants of every region are covered.
+        fn build(constant: f64) -> Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> {
+            let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+            region_builder.add_input(ArrayType::scalar(DataType::F64));
+            let region_constant = region_builder.add_constant(Array::scalar(constant));
+            let region_program = region_builder
+                .build::<Vec<Array>, Vec<Array>>(vec![region_constant], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+            let region = builder.import_region(region_program.entry_region_ref());
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let output = builder
+                .add_instruction(
+                    TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                    vec![region],
+                    vec![input],
+                )
+                .unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+        }
+
+        // The nested region's constant payload is part of the ordinary program rendering, making that one rendering
+        // complete enough to distinguish programs whose only semantic difference is an embedded literal.
+        let first = build(1.0).to_string();
+        assert!(first.contains("%1:f64[] = const [1.0]"));
+        assert_ne!(first, build(2.0).to_string());
+        assert_eq!(first, build(1.0).to_string());
     }
 
     #[test]

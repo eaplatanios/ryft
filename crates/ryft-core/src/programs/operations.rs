@@ -514,10 +514,29 @@ pub trait Operation: Clone {
     }
 
     /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation
-    /// simply renders [`Operation::name`]. Operations carrying semantic metadata should override this function and
-    /// use [`OperationFormatter`] for consistent bracketed and indented formatting. Attached [`Region`](crate::Region)s
-    /// are not rendered here. The contextual [`Program`] renderer renders each instruction's attached regions after its
-    /// operation.
+    /// simply renders [`Operation::name`], which is complete only for operations whose payload carries no semantics.
+    /// Attached [`Region`](crate::Region)s are not rendered here. The contextual [`Program`] renderer renders each
+    /// instruction's attached regions after its operation.
+    ///
+    /// # Contract
+    ///
+    /// An implementation whose payload carries _semantics-bearing metadata_ (i.e., any field that changes what the
+    /// operation computes, how a transform rewrites it, or how a backend lowers it, and that is not already recoverable
+    /// from the instruction's rendered input and output atom types) **must** override this function and render that
+    /// metadata, using [`OperationFormatter`] for consistent bracketed and indented formatting. This is a requirement
+    /// rather than a stylistic preference, because a program's rendering doubles as its structural-equivalence
+    /// fingerprint (i.e., two programs that render identically are treated as the same program). Two consumers depend
+    /// on that:
+    ///
+    ///   - The transform cache debugging diagnostic, which compares a freshly derived transform against the artifact
+    ///     retained in a region's transform cache through the complete program rendering. Metadata that does not render
+    ///     is metadata whose corruption or nondeterminism the recheck cannot see.
+    ///   - Rendered-program test assertions, which pin the staged shape of the programs that transforms derive.
+    ///     Metadata that does not render is metadata those assertions silently stop protecting.
+    ///
+    /// Metadata that is fully recoverable from the rendered instruction line (most commonly an output shape or
+    /// data type that the operation only reflects into its inferred output [`Type`]) may be left out, because the
+    /// fingerprint already distinguishes it.
     ///
     /// # Parameters
     ///
