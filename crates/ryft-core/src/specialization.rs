@@ -161,14 +161,11 @@ impl<P, I, D> FunctionSpecializationKey<P, I, D> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Snapshot of one [`SpecializationCache`]'s activity since construction or since the last
-/// [`SpecializationCache::clear_statistics`] call.
-///
-/// Every counter saturates rather than wrapping. Note that `misses` counts lookups that found no retained artifact,
-/// including requests subsequently rejected with [`ReentrantSpecializationError`], and that
-/// `productions + abandoned_productions` need not equal `misses` while producers are still in flight.
+/// Snapshot of a [`SpecializationCache`]'s activity since construction or since the last
+/// [`SpecializationCache::clear_statistics`] call. Every counter saturates rather than wrapping. Note
+/// that `misses` counts lookups that found no retained artifact, including requests subsequently rejected with
+/// [`ReentrantSpecializationError`], and that `productions + abandoned_productions` need not equal `misses`
+/// while producers are still in flight.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpecializationCacheStatistics {
     /// Lookups served by a retained artifact.
@@ -183,17 +180,16 @@ pub struct SpecializationCacheStatistics {
     /// Producers dropped without publishing an artifact, including failed, panicking, or deliberately abandoned work.
     pub abandoned_productions: u64,
 
-    /// Retained artifacts dropped by the bounded LRU to make room for a new one. Entries removed by
-    /// [`SpecializationCache::clear`] or [`SpecializationCache::invalidate_entries_if`] are not evictions.
+    /// Retained artifacts dropped by the bounded Least Recently Used (LRU) cache to make room for a new one. Entries
+    /// removed by [`SpecializationCache::clear`] or [`SpecializationCache::invalidate_entries_if`] are not evictions.
     pub evictions: u64,
 }
 
-/// Atomic counters backing [`SpecializationCacheStatistics`].
-///
-/// All updates use [`Ordering::Relaxed`]: the counters are diagnostic, they order nothing, and the retained map's
-/// [`Mutex`] already provides the synchronization that correctness depends on.
+/// Internal accumulator of independent atomic counters backing [`SpecializationCacheStatistics`]. All updates use
+/// [`Ordering::Relaxed`] as the counters are diagnostic, they order nothing, and the retained map's [`Mutex`] already
+/// provides the synchronization that correctness depends on.
 #[derive(Debug, Default)]
-struct AtomicSpecializationCacheStatistics {
+struct SpecializationCacheStatisticsAccumulator {
     /// Lookups served by a retained artifact.
     hits: AtomicU64,
 
@@ -206,21 +202,49 @@ struct AtomicSpecializationCacheStatistics {
     /// Producers dropped without publishing an artifact.
     abandoned_productions: AtomicU64,
 
-    /// Retained artifacts dropped by the bounded LRU.
+    /// Retained artifacts dropped by the bounded Least Recently Used (LRU) cache.
     evictions: AtomicU64,
 }
 
-impl AtomicSpecializationCacheStatistics {
-    /// Adds one to `counter`, saturating instead of wrapping.
-    fn increment(counter: &AtomicU64) {
-        // The update closure always returns `Some`, so this update can never be rejected.
-        counter
+impl SpecializationCacheStatisticsAccumulator {
+    /// Records a lookup served by a retained artifact.
+    fn increment_hits(&self) {
+        self.hits
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
             .unwrap();
     }
 
-    /// Returns a consistent-enough snapshot of the counters. Counters are read independently, so a snapshot taken
-    /// while other threads are active reflects a plausible interleaving rather than a single instant.
+    /// Records a lookup that found no retained artifact.
+    fn increment_misses(&self) {
+        self.misses
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .unwrap();
+    }
+
+    /// Records an artifact published through a producer.
+    fn increment_productions(&self) {
+        self.productions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .unwrap();
+    }
+
+    /// Records a producer dropped without publishing an artifact.
+    fn increment_abandoned_productions(&self) {
+        self.abandoned_productions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .unwrap();
+    }
+
+    /// Records an artifact evicted by the bounded Least Recently Used (LRU) cache.
+    fn increment_evictions(&self) {
+        self.evictions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| Some(count.saturating_add(1)))
+            .unwrap();
+    }
+
+    /// Returns a [`SpecializationCacheStatistics`] of the counters underlying this
+    /// [`SpecializationCacheStatisticsAccumulator`]. The counters are read independently, so a snapshot
+    /// taken while other threads are active reflects a plausible interleaving rather than a single instant.
     fn snapshot(&self) -> SpecializationCacheStatistics {
         SpecializationCacheStatistics {
             hits: self.hits.load(Ordering::Relaxed),
@@ -231,7 +255,7 @@ impl AtomicSpecializationCacheStatistics {
         }
     }
 
-    /// Resets every counter to zero.
+    /// Resets all the underlying counters of this [`SpecializationCacheStatisticsAccumulator`] to zero.
     fn reset(&self) {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
@@ -241,7 +265,9 @@ impl AtomicSpecializationCacheStatistics {
     }
 }
 
-/// Bounded, process-local cache mapping one specialization key to one retained artifact.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Bounded, process-local cache mapping a [`FunctionSpecializationKey`] to one retained artifact.
 ///
 /// Refer to the [module documentation](self) for the reuse, production, reentrancy, and thread-safety contracts.
 ///
@@ -274,7 +300,7 @@ pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
     in_flight: Mutex<HashSet<(ThreadId, Key)>>,
 
     /// Diagnostic counters.
-    statistics: AtomicSpecializationCacheStatistics,
+    statistics: SpecializationCacheStatisticsAccumulator,
 }
 
 // `Debug` is implemented manually so that formatting never invokes `Key::fmt` or `Artifact::fmt`, which are not part
@@ -336,7 +362,7 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
         Self {
             entries: Mutex::new(LruCache::new(capacity)),
             in_flight: Mutex::new(HashSet::new()),
-            statistics: AtomicSpecializationCacheStatistics::default(),
+            statistics: SpecializationCacheStatisticsAccumulator::default(),
         }
     }
 
@@ -354,10 +380,10 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
     ) -> Result<SpecializationCacheEntry<'_, Key, Artifact>, ReentrantSpecializationError> {
         if let Some(artifact) = self.entries.lock().expect("specialization cache mutex is poisoned").get(&key).cloned()
         {
-            AtomicSpecializationCacheStatistics::increment(&self.statistics.hits);
+            self.statistics.increment_hits();
             return Ok(SpecializationCacheEntry::Occupied(artifact));
         }
-        AtomicSpecializationCacheStatistics::increment(&self.statistics.misses);
+        self.statistics.increment_misses();
         let thread = std::thread::current().id();
 
         // Registering with `replace` rather than `insert` hands the equal marker that is already in flight back out of
@@ -510,9 +536,9 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Ke
         if let Some((displaced_key, _)) = &displaced
             && *displaced_key != key
         {
-            AtomicSpecializationCacheStatistics::increment(&self.cache.statistics.evictions);
+            self.cache.statistics.increment_evictions();
         }
-        AtomicSpecializationCacheStatistics::increment(&self.cache.statistics.productions);
+        self.cache.statistics.increment_productions();
 
         // Both the marker offered for removal and the one recovered from the set are bound outside the guard, so that
         // a `Key` destructor may reenter the cache as well.
@@ -540,7 +566,7 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProduc
                 let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
                 in_flight.take(&marker)
             };
-            AtomicSpecializationCacheStatistics::increment(&self.cache.statistics.abandoned_productions);
+            self.cache.statistics.increment_abandoned_productions();
             drop(removed);
             drop(marker);
         }
