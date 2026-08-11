@@ -11,9 +11,9 @@
 //! [`SpecializationCache`] owns retained artifacts, in-flight markers, and private atomic counters.
 //! [`SpecializationCacheEntry`] and [`SpecializationCacheProducer`] model the entry-production protocol, while
 //! [`SpecializationCacheStatistics`] is an ordinary value snapshot of the live counters. Refer to the
-//! [`SpecializationCache`] documentation for more information on these relationships. [`FunctionSpecializationKey`]
-//! is the standard key for retained callables. [`TransformCache`](crate::programs::transforms::TransformCache) lets a
-//! typed transform descriptor select this same cache without wrapping or changing its entry protocol.
+//! [`SpecializationCache`] documentation for more information on these relationships.
+//! [`TransformCache`](crate::programs::transforms::TransformCache) lets a typed transform descriptor select this same
+//! cache without wrapping or changing its entry protocol.
 //!
 //! # Reuse Contract
 //!
@@ -97,69 +97,6 @@ pub enum SpecializationCacheError<E: Debug + Display> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Error)]
 #[error("recursive request for a specialization that is already being produced on this thread")]
 pub struct ReentrantSpecializationError;
-
-/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when
-/// all three components below agree. Equal keys must identify calls that can safely share the same staged
-/// [`Program`](crate::Program). Unequal keys remain separate even if they happen to stage structurally equivalent
-/// programs.
-///
-///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
-///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
-///     parameters must be `Clone + Debug + Eq + Hash`. Runtime arrays and other backend values should be represented
-///     as dynamic inputs rather than static parameters.
-///   - **Input Structure:** The [`Parameterized::ParameterStructure`](crate::Parameterized::ParameterStructure) shape
-///     of the dynamic function input. Tracing rebuilds the function's argument from this structure, so a function may
-///     legitimately branch on container arity. Keying on the structure rather than on the flattened leaves also
-///     distinguishes inputs that differ only in _empty_ substructure, which flat leaf paths and flat leaf types
-///     cannot see.
-///   - **Dispatch Key:** An owner-defined key used to select an interchangeable retained specialization for the dynamic
-///     inputs. It may be an exact abstract input signature or a normalized equivalence-class key such as a shape
-///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call as unequal
-///     keys conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
-///     [`CompilationDomain::DispatchKey`](crate::CompilationDomain::DispatchKey), for example.
-///
-/// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
-/// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
-/// carries no fragile function-pointer identity. All three components are call-level (i.e., function-level) concepts,
-/// since a bare program has neither static parameters nor a structured input. That is what separates function-level
-/// specialization caching from structural region transformation through [`Transform`](crate::Transform).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FunctionSpecializationKey<P, I, D> {
-    /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
-    static_parameters: P,
-
-    /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
-    input_structure: I,
-
-    /// Owner-defined cache key for the dynamic input, such as an exact abstract signature or normalized shape bucket.
-    dispatch_key: D,
-}
-
-impl<P, I, D> FunctionSpecializationKey<P, I, D> {
-    /// Creates a new [`FunctionSpecializationKey`].
-    #[inline]
-    pub fn new(static_parameters: P, input_structure: I, dispatch_key: D) -> Self {
-        Self { static_parameters, input_structure, dispatch_key }
-    }
-
-    /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
-    #[inline]
-    pub fn static_parameters(&self) -> &P {
-        &self.static_parameters
-    }
-
-    /// Returns the parameter structure of the dynamic input for the keyed specialization.
-    #[inline]
-    pub fn input_structure(&self) -> &I {
-        &self.input_structure
-    }
-
-    /// Returns the owner-defined dispatch key for the dynamic input.
-    #[inline]
-    pub fn dispatch_key(&self) -> &D {
-        &self.dispatch_key
-    }
-}
 
 /// Snapshot of a [`SpecializationCache`]'s activity since construction or since the last
 /// [`SpecializationCache::clear_statistics`] call. Every counter saturates rather than wrapping. Note
@@ -265,46 +202,6 @@ impl SpecializationCacheStatisticsAccumulator {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Bounded, process-local cache mapping a [`FunctionSpecializationKey`] to one retained artifact.
-///
-/// Refer to the [module documentation](self) for the reuse, production, reentrancy, and thread-safety contracts.
-///
-/// # Type Relationships
-///
-/// ```mermaid
-/// flowchart LR
-///   owner["Retained callable or transform owner"] -->|"owns"| cache["SpecializationCache: Key to Artifact"]
-///   function_key["FunctionSpecializationKey"] -.->|"one function-level Key"| cache
-///   caller["Caller"] -->|"try_entry(Key)"| cache
-///   cache -->|"Occupied"| artifact["Artifact clone"]
-///   cache -->|"Vacant"| producer["SpecializationCacheProducer"]
-///   cache -->|"same thread and Key"| reentrant["ReentrantSpecializationError"]
-///   producer -->|"insert(Artifact)"| cache
-///   producer -->|"drop without insert"| retry["Marker cleared; next request retries"]
-///   cache --> counters["Private atomic counters"]
-///   counters -->|"statistics()"| snapshot["SpecializationCacheStatistics snapshot"]
-/// ```
-///
-/// [`Self::try_entry`] is the low-level entry API. An occupied entry returns a cloned artifact; a vacant entry returns
-/// a thread-affine producer that authorizes publication. [`Self::get_or_try_insert_with`] wraps that protocol when
-/// callers do not need to separate entry resolution from production. Statistics are exposed as ordinary value
-/// snapshots, while private atomics accumulate events without participating in cache correctness.
-#[cfg_attr(doc, aquamarine::aquamarine)]
-pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
-    /// Retained artifacts in least-recently-used order.
-    entries: Mutex<LruCache<Key, Artifact>>,
-
-    /// Keys currently being produced, paired with the thread that is producing them.
-    in_flight: Mutex<HashSet<(ThreadId, Key)>>,
-
-    /// Diagnostic counters.
-    statistics: SpecializationCacheStatisticsAccumulator,
-}
-
-// `Debug` is implemented manually so that formatting never invokes `Key::fmt` or `Artifact::fmt`, which are not part
-// of the caller-controlled operations the module documentation permits to run while a cache lock is held.
 impl<Key: Clone + Eq + Hash, Artifact: Clone> Debug for SpecializationCache<Key, Artifact> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -316,34 +213,35 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> Debug for SpecializationCache<Key,
     }
 }
 
-/// Entry returned by [`SpecializationCache::try_entry`].
+/// Represents a [`SpecializationCache`] entry returned by [`SpecializationCache::try_entry`].
 #[derive(Debug)]
-pub enum SpecializationCacheEntry<'a, Key: Clone + Eq + Hash, Artifact: Clone> {
+pub enum SpecializationCacheEntry<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
     /// A retained artifact was found and its recency was refreshed.
     Occupied(Artifact),
 
-    /// No artifact was retained. The producer guard holds the in-flight marker until it inserts or is dropped.
-    Vacant(SpecializationCacheProducer<'a, Key, Artifact>),
+    /// No artifact was retained. The producer guard holds the in-flight marker until it inserts a new entry
+    /// or is dropped.
+    Vacant(SpecializationCacheProducer<'c, Key, Artifact>),
 }
 
-/// RAII guard authorizing production of one specialization.
+/// Resource Acquisition Is Initialization (RAII) guard authorizing production of a specialization. This guard holds
+/// the `(ThreadId, Key)` in-flight marker for its key. Calling [`Self::insert`] publishes an artifact and releases
+/// the marker. Dropping the guard without inserting releases the marker, counts an abandoned production, and caches
+/// nothing. Because the guard borrows the cache rather than holding a lock, production runs with the cache fully
+/// available to other threads.
 ///
-/// The guard holds the `(ThreadId, Key)` in-flight marker for its key. Calling [`Self::insert`] publishes an artifact
-/// and releases the marker; dropping the guard without inserting releases the marker, counts an abandoned production,
-/// and caches nothing. Because the guard borrows the cache rather than holding a lock, production runs with the cache
-/// fully available to other threads.
-///
-/// A producer is thread-affine and therefore neither `Send` nor `Sync`, which the [`PhantomData`] marker below
+/// A producer is thread-affine and therefore neither `Send` nor `Sync`, which the [`PhantomData`] marker it holds
 /// enforces at compile time. The in-flight marker is keyed by the thread that requested the entry, so production must
-/// complete on that thread: were a producer moved elsewhere, the originating thread would remain barred from the key
+/// complete on that thread. If a producer was moved elsewhere, the originating thread would remain barred from the key
 /// it is no longer producing, while the receiving thread could register the same key a second time and recursively
-/// produce it — the nonterminating recursion that [`ReentrantSpecializationError`] exists to reject.
+/// produce it (i.e., the nonterminating recursion that [`ReentrantSpecializationError`] exists to reject).
 #[derive(Debug)]
-pub struct SpecializationCacheProducer<'a, Key: Clone + Eq + Hash, Artifact: Clone> {
-    /// Cache this producer publishes to.
-    cache: &'a SpecializationCache<Key, Artifact>,
+pub struct SpecializationCacheProducer<'c, Key: Clone + Eq + Hash, Artifact: Clone> {
+    /// [`SpecializationCache`] that this producer publishes to.
+    cache: &'c SpecializationCache<Key, Artifact>,
 
-    /// Thread that registered the in-flight marker, so the marker is released with the key it was registered under.
+    /// [`ThreadId`] of the thread that registered the in-flight marker, so that the marker is released with the key
+    /// it was registered under.
     thread: ThreadId,
 
     /// Key being produced. Taken by [`Self::insert`] so that [`Drop`] does not double-release the marker.
@@ -353,6 +251,63 @@ pub struct SpecializationCacheProducer<'a, Key: Clone + Eq + Hash, Artifact: Clo
     /// neither `Send` nor `Sync`, and so neither is this guard.
     marker: PhantomData<*mut ()>,
 }
+
+impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProducer<'_, Key, Artifact> {
+    fn drop(&mut self) {
+        // `insert` takes the key, so this only runs when production failed or unwound. Releasing the marker here is
+        // what makes failed and panicking production retryable instead of permanently reentrant.
+        if let Some(key) = self.key.take() {
+            // Both the marker offered for removal and the one recovered from the set are bound outside the guard,
+            // so that a `Key` destructor may reenter the cache.
+            let marker = (self.thread, key);
+            let removed = {
+                let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
+                in_flight.take(&marker)
+            };
+            self.cache.statistics.increment_abandoned_productions();
+            drop(removed);
+            drop(marker);
+        }
+    }
+}
+
+/// Bounded, process-local cache mapping owner-defined keys to retained artifacts. Refer to the documentation of
+/// [this module](self) for information on the reuse, production, reentrancy, and thread-safety contracts.
+///
+/// # Type Relationships
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code, .edgeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart LR
+///   owner["Retained Callable or Transform Owner"] -->|"owns"| cache["&lt;code&gt;SpecializationCache&lt;/code&gt;"]
+///   key["Owner-Defined &lt;code&gt;Key&lt;/code&gt;"] --> cache
+///   caller["Caller"] -->|"&lt;code&gt;try_entry(Key)&lt;/code&gt;"| cache
+///   cache -->|"&lt;code&gt;Occupied&lt;/code&gt;"| artifact["Cloned &lt;code&gt;Artifact&lt;/code&gt;"]
+///   cache -->|"&lt;code&gt;Vacant&lt;/code&gt;"| producer["&lt;code&gt;SpecializationCacheProducer&lt;/code&gt;"]
+///   cache -->|"same thread and &lt;code&gt;Key&lt;/code&gt;"| reentrant["&lt;code&gt;ReentrantSpecializationError&lt;/code&gt;"]
+///   producer -->|"&lt;code&gt;insert(Artifact)&lt;/code&gt;"| cache
+///   producer -->|"drop without insert"| retry["Marker cleared; next request retries"]
+///   cache --> counters["Private atomic counters"]
+///   counters -->|"&lt;code&gt;statistics()&lt;/code&gt;"| snapshot["&lt;code&gt;SpecializationCacheStatistics&lt;/code&gt;"]
+/// ```
+///
+/// [`Self::try_entry`] represents the low-level entry API for this cache. An occupied entry returns a cloned artifact.
+/// A vacant entry returns a thread-affine producer that authorizes publication. [`Self::get_or_try_insert_with`] wraps
+/// that protocol when callers do not need to separate entry resolution from production. Statistics are exposed as
+/// ordinary value snapshots, while private atomics accumulate events without participating in cache correctness.
+#[cfg_attr(doc, aquamarine::aquamarine)]
+pub struct SpecializationCache<Key: Clone + Eq + Hash, Artifact: Clone> {
+    /// Retained artifacts in Least-Recently-Used (LRU) order.
+    entries: Mutex<LruCache<Key, Artifact>>,
+
+    /// Keys currently being produced, paired with the [`ThreadId`] of the thread that is producing them.
+    in_flight: Mutex<HashSet<(ThreadId, Key)>>,
+
+    /// [`SpecializationCacheStatisticsAccumulator`] that contains diagnostic counters.
+    statistics: SpecializationCacheStatisticsAccumulator,
+}
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact> {
     /// Creates an empty cache retaining at most `capacity` artifacts. A `capacity` of zero is clamped to one, because
@@ -551,25 +506,6 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Ke
         drop(marker);
         drop(displaced);
         artifact
-    }
-}
-
-impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProducer<'_, Key, Artifact> {
-    fn drop(&mut self) {
-        // `insert` takes the key, so this only runs when production failed or unwound. Releasing the marker here is
-        // what makes failed and panicking production retryable instead of permanently reentrant.
-        if let Some(key) = self.key.take() {
-            // Both the marker offered for removal and the one recovered from the set are bound outside the guard, so
-            // that a `Key` destructor may reenter the cache.
-            let marker = (self.thread, key);
-            let removed = {
-                let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
-                in_flight.take(&marker)
-            };
-            self.cache.statistics.increment_abandoned_productions();
-            drop(removed);
-            drop(marker);
-        }
     }
 }
 
@@ -1000,24 +936,5 @@ mod tests {
         });
 
         assert_eq!(cache.statistics(), SpecializationCacheStatistics { hits: 4, ..Default::default() });
-    }
-
-    #[test]
-    fn test_function_specialization_key() {
-        let key: FunctionSpecializationKey<(&str, usize), Vec<()>, &str> =
-            FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
-        assert_eq!(key.static_parameters(), &("training", 4));
-        assert_eq!(key.input_structure(), &vec![(), ()]);
-        assert_eq!(key.dispatch_key(), &"f32[2,3]");
-
-        // Every component participates in equality, and equal keys reuse one cache entry.
-        assert_eq!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
-        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
-
-        let cache = SpecializationCache::new(4);
-        expect_producer(cache.try_entry(key.clone())).insert("staged");
-        assert_eq!(expect_hit(cache.try_entry(key)), "staged");
     }
 }
