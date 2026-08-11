@@ -412,10 +412,10 @@ where
 /// [`NamedAxes`]. `NamedAxes` answers whether a name is in scope, while [`AxisIndex`] reads out the position along it.
 /// Resolution is validated against the active [`NamedAxes`] environment.
 pub trait AxisIndex: Context {
-    /// Returns a [`DataType::U64`](DataType::U64) scalar giving the current element's position along `name`. What that
-    /// position counts follows the kind of binder that introduced the axis (refer to the documentation of [`NamedAxis`]
-    /// for more information): a batching axis of size `N` yields the current element's position in `0..N`, and a device
-    /// mesh axis yields the current shard's coordinate along that mesh axis. `U64` matches the `usize` axis sizes the
+    /// Returns a [`DataType::U64`] scalar giving the current element's position along `name`. What that position counts
+    /// follows the kind of binder that introduced the axis (refer to the documentation of [`NamedAxis`] for more
+    /// information): a batching axis of size `N` yields the current element's position in `0..N`, and a device mesh
+    /// axis yields the current shard's coordinate along that mesh axis. `U64` matches the `usize` axis sizes the
     /// indices are drawn from and cannot be negative. A name that no enclosing binder binds will result in
     /// [`AxisError::UnboundAxisName`].
     fn axis_index(&self, name: &str) -> Result<Self::Value, ProgramError>;

@@ -340,7 +340,8 @@ where
 ///   program --> validate
 ///   validate --> closed["Validated Closed Program"]
 ///   closed --> reusable["Reusable Staged IR plus Concrete Capture Environment"]
-///   closed -->|"&lt;code&gt;to_program_with_lifted_captures&lt;/code&gt;"| lifted["Leading Capture Inputs then Public Inputs"]
+///   lifted["Leading Capture Inputs then Public Inputs"]
+///   closed -->|"&lt;code&gt;to_program_with_lifted_captures&lt;/code&gt;"| lifted
 ///   lifted --> compilation["Compilation Boundary"]
 /// ```
 ///

@@ -1,73 +1,83 @@
-//! Contains machinery for _batching_ (i.e., _vectorizing_) computations.
+//! Vectorizes computations by running one closure over packed batches while preserving each flowing value's unbatched
+//! per-item type.
 //!
-//! Batching turns a function written for individual array values into one that processes a whole batch. It does not
-//! mechanically add an outer dimension to every intermediate value. Instead, each flowing value carries the packed
-//! position of its batch axis, and each operation decides how to propagate, align, introduce, or remove that axis.
-//! Replicated values carry no batch axis and are broadcast only when an operation needs alignment.
+//! Batching does not mechanically prepend a dimension to every intermediate value. A policy-selected carrier owns the
+//! packed parent-context value and records whether one physical dimension is the mapped batch axis or whether the value
+//! is replicated across all batch items. Each operation-owned [`BatchableOperation`] rule decides how that metadata
+//! propagates, aligns, broadcasts, moves, reduces, or interacts with nested programs. Refer to [`BatchingContext`] for
+//! a rendered diagram of the value-level transform pipeline.
 //!
-//! ```text
-//!  ┌───────────────────────────────────┐
-//!  │ Values + Input Axis Specification │
-//!  └─────────────────┬─────────────────┘
-//!                    │ wrap each leaf in the policy-selected batch carrier
-//!                    ▼
-//!          ┌───────────────────┐
-//!          │ Batching Tracers  │
-//!          └─────────┬─────────┘
-//!                    │ bind each operation through its batching rule
-//!                    ▼
-//! ┌─────────────────────────────────────┐
-//! │ Values + Output Axis Specification  │
-//! └─────────────────────────────────────┘
-//! ```
+//! # Choosing an Entry Point
 //!
-//! # Entry Points
+//!   - [`batch`] is the ordinary value-level entry point. It recovers an execution context from the first input leaf,
+//!     broadcasts the input-axis specification across the input structure, invokes the closure once over
+//!     [`BatchingTracer`] values, and materializes the requested output axes. It cannot serve an input structure with
+//!     no leaves because there is no value from which to recover a context.
+//!   - [`Batch::batch`] performs the same transform through an explicitly owned [`Context`]. It supports empty input
+//!     structures when [`BatchAxisSpecification`] supplies an explicit extent.
+//!   - [`Program::batched`] structurally rewrites an already staged program. Higher-order operation rules use this path
+//!     when they need a reusable transformed region and explicit natural or aligned output-axis metadata.
 //!
-//! Use the free [`batch`] function for ordinary value-level vectorization. It recovers the input values' execution
-//! context, wraps leaves according to the requested input axes, runs the closure through a [`BatchingContext`], and
-//! returns values aligned to the requested output axes. The [`Batch`] context capability exposes the same transform
-//! when generic code already owns a context. For an already traced program, use [`Program::batched`]. Program-level
-//! batching rewrites the program while retaining explicit input and output axis metadata, which is useful for
-//! compilation and higher-order operation rules.
+//! # Axes, Extent, and Output Placement
 //!
-//! [`BatchAxis`] describes a leaf as either batched at a signed axis or replicated, and a
-//! [`BatchAxisSpecification`] supplies the batch-axis extent and optional name. Negative axes are normalized against
-//! each array's rank, and every batched input must agree on the batch extent.
+//! [`BatchAxis::new`] marks the physical dimension that indexes batch items; [`BatchAxis::replicated`] marks a value
+//! shared unchanged across them. Negative mapped axes normalize against the packed rank. Every mapped input must agree
+//! on one extent. [`BatchAxisSpecification`] may leave that extent to inference, pin it explicitly, or provide the only
+//! extent for a fully replicated or empty transform. Its optional name binds the new logical axis for collectives and
+//! other named-axis operations.
 //!
-//! # Core Abstractions
+//! Output specifications describe the requested physical placement. A naturally mapped output is transposed when its
+//! axis must move, while a naturally replicated output is broadcast when a mapped output is requested. Requesting a
+//! replicated result never silently collapses a genuinely mapped output; the closure must perform an explicit reduction
+//! when that is the intended computation.
 //!
-//! The array specialization [`ArrayBatch`](crate::ArrayBatch) pairs an underlying array value with its batch-axis
-//! position. Its alignment helpers can broadcast a replicated value, move an existing axis, or align several operands
-//! to a common position. The wrapper's type is the unbatched per-item type (the packed value retains its batch
-//! dimension).
+//! # Transform Frame and Policy
 //!
-//! [`BatchingContext`] wraps a parent [`Context`] and records the active axis extent and optional axis name.
-//! [`BatchingTracer`] is the value flowing through a batched closure. It carries the representation selected by a
-//! [`BatchingPolicy`] and delegates each bind to the bound operation's [`BatchableOperation`] rule. Because the parent
-//! may be eager or staging, the same rule can execute concrete values or build a transformed program.
+//! [`BatchingContext`] is one active batching level. It wraps the parent [`Context`] and stores the mapped extent,
+//! optional name, and sharding placement. [`BatchingTracer`] is the flowing value stamped with that level.
+//! [`BatchingPolicy`] selects the batch carrier, extent representation, operation-local validation evidence, and
+//! structurally batched program boundary for one value universe. [`BatchableOperation`] owns the semantic rule for one
+//! operation payload.
 //!
-//! [`ElementwiseOperation`]s infer a common batch size, align operands to a common batch-axis position, bind the underlying
-//! operation once, and propagate that axis to every result. Shape-changing, reducing, control-flow, and higher-order
-//! operations provide explicit rules because their output axes cannot be inferred from elementwise semantics.
+//! The array carrier [`ArrayBatch`](crate::ArrayBatch) pairs a packed array with its mapped-axis position and exposes
+//! shared alignment and broadcasting operations. Genuinely [`ElementwiseOperation`](crate::ElementwiseOperation)
+//! payloads use the common elementwise batching rule. Shape-changing, reducing, indexing, control-flow, and
+//! higher-order operations provide dedicated rules because their output axes follow operation-specific semantics.
+//!
+//! # Parent Ownership and Composition
+//!
+//! Packed values belong to the parent context, not to the active transform frame. Ordinary batching rules unpack their
+//! carriers, bind lifted work through [`BatchingContext::parent`], and wrap the parent-owned results in new carriers.
+//! An eager parent executes that work; a staging parent records it. Nested batching works without a side table because
+//! each outer carrier remains part of the inner level's parent value.
+//!
+//! Every rule returns [`BatchedOutputs`], pairing carriers with operation-local [`BatchingPolicy::Evidence`]. The
+//! active context validates that evidence immediately and discards it before the next operation, preventing
+//! rule-specific claims from escaping their application boundary.
 //!
 //! # Nested Programs
 //!
-//! Nested flat programs batch structurally through [`Program::batched`], requested by rules through their active
-//! [`BatchingDriver`]. [`ProgramBatchingOutputAxesPolicy`] controls whether nested results keep their inferred axes or
-//! are forced to explicit positions, and [`InterpretableBatchableOperation`] connects batching rules to eager
-//! interpretation when an operation needs both capabilities.
+//! [`BatchingDriver`] gives a higher-order rule two distinct recursive paths. [`BatchingDriver::batch_region`] replays
+//! a borrowed region through the active transform over batch carriers. [`BatchingDriver::batch_program`] structurally
+//! rewrites a region into a standalone batched program. [`ProgramBatchingOutputAxesPolicy`] preserves natural output
+//! axes or requests explicit alignment.
+//!
+//! Some policies widen a standalone transformed boundary with bookkeeping values such as a first-class dynamic batch
+//! extent. [`BatchedProgram`] preserves that policy-specific boundary. Consumers either thread it through compatible
+//! higher-order operations or use [`BatchingPolicy::adapt_batched_program`] to remove bookkeeping outputs and restore
+//! an ordinary region boundary.
 //!
 //! # Extending Batching
 //!
-//! Implement [`BatchableOperation`] for each primitive operation payload that can appear under batching. A rule
-//! receives batched inputs and the active batching context and returns batched outputs. Prefer the shared elementwise
-//! implementation for genuinely elementwise operations, and write a dedicated rule when dimensions are reordered,
-//! reduced, created, indexed, or controlled by nested programs.
+//! Implement [`BatchableOperation`] for each operation payload that may appear under batching. Use the shared
+//! elementwise path only for genuinely elementwise semantics; write a dedicated rule whenever dimensions, mapped axes,
+//! nested regions, named axes, or sharding require operation-specific handling. Composite member operations can reuse
+//! homogeneous rules through [`batch_projected_operation`] only when they are region-free and projectable.
 //!
-//! For a region-carrying operation, keep the recursive batching logic with that operation and request nested work
-//! through its active [`BatchingDriver`] (per-item replay via [`BatchingDriver::batch_region`] or structural program
-//! batching via [`BatchingDriver::batch_program`]). Preserve named-axis and sharding semantics when moving or
-//! introducing the batch axis, and return [`BatchingError`] for invalid axis contracts rather than panicking.
+//! A new value universe supplies a [`BatchingPolicy`] and, for the public entry point, a
+//! [`BatchingEntrypointPolicy`]. Add [`RecursiveBatchingPolicy`] only when its region programs can be transformed and
+//! their carrier metadata restored across opaque boundaries. Invalid axis, extent, metadata, projection, and region
+//! contracts must return an exact [`BatchingError`] rather than panic.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -1090,9 +1100,9 @@ pub trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation {
     ///   - **Axis Alignment:** If two or more inputs carry a mapped axis (i.e., `batch_axis.is_some()`), elementwise
     ///     operations require them to agree on the axis position. When they disagree, this function returns
     ///     [`BatchingError::MisalignedBatchAxes`] with an error message that names the misaligned axes and suggests the
-    ///     user repositions one of them with [`Transpose`] (i.e., the N-D axis permutation primitive) before invoking
-    ///     the operation. Operations with explicit axis arguments (e.g., `Dot`, `Transpose`, `Reshape`, etc.) rewrite
-    ///     those arguments to thread the mapped axis through correctly.
+    ///     user repositions one of them with [`TransposeOperation`](crate::TransposeOperation) (i.e., the N-D axis
+    ///     permutation primitive) before invoking the operation. Operations with explicit axis arguments (e.g., `Dot`,
+    ///     `Transpose`, `Reshape`, etc.) rewrite those arguments to thread the mapped axis through correctly.
     ///   - **Output Axes:** For elementwise operations, the output
     ///     [`ArrayBatch::batch_axis`](crate::ArrayBatch::batch_axis) matches the common input batch axis.
     ///     For operations with explicit axis arguments, the output axis follows from the lifted axis arguments.
@@ -1152,14 +1162,14 @@ pub enum ProgramBatchingOutputAxesPolicy {
     /// Replicated outputs remain replicated.
     Natural,
 
-    /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with [`Transpose`]
-    /// and broadcasting replicated outputs across the batch.
+    /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with
+    /// [`TransposeOperation`](crate::TransposeOperation) and broadcasting replicated outputs across the batch.
     AlignAllTo(Axis),
 
     /// Align each output `i` to the mapped axis of the `i`-th entry, with one entry per program output. A *mapped*
     /// entry forces the output to carry its batch axis at that position, moving an already-batched output with
-    /// [`Transpose`] and broadcasting a replicated output across the batch, while a *replicated* entry keeps that
-    /// output's natural axis (it is a lower bound, not an equality constraint).
+    /// [`TransposeOperation`](crate::TransposeOperation) and broadcasting a replicated output across the batch, while
+    /// a _replicated_ entry keeps that output's natural axis (it is a lower bound, not an equality constraint).
     AlignEachTo(Vec<BatchAxis>),
 }
 
@@ -1214,12 +1224,48 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
     }
 }
 
-/// [`Context`] used to batch a computation by introducing exactly one mapped batch axis. [`BatchingContext`] is the
-/// active context for one batching level. Its [`BatchingPolicy`] selects both the batch-carrying representation and the
-/// extent representation, allowing ordinary homogeneous arrays to use a static `usize` while composite programs retain
-/// a first-class dimension value. [`Operation`]s bound through this context are lifted through their
-/// [`BatchableOperation`] implementations into the parent context, so nested transforms compose without
-/// making an active transform pretend to be a backend domain.
+/// Active [`Context`] for one batching level, introducing exactly one logical mapped axis. Its [`BatchingPolicy`]
+/// selects the carrier, extent, validation evidence, and structural program-boundary representation. Operations bound
+/// through this context dispatch to their [`BatchableOperation`] rules, which ordinarily bind lifted packed work
+/// through the parent context. The active frame therefore owns transform metadata without pretending to be the backend
+/// that owns the packed values.
+///
+/// # Value-Level Batching Pipeline
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   inputs["Structured Inputs and Broadcast Input Axes"]
+///   prepare["Entrypoint Policy &lt;code&gt;prepare_inputs&lt;/code&gt;"]
+///   inputs --> prepare
+///   specification["Extent and Optional Axis Name"] --> prepare
+///   prepare --> context["Batching Context"]
+///   prepare --> carriers["Policy-Selected Batch Carriers"]
+///   context --> tracers["Batching Tracer Inputs"]
+///   carriers --> tracers
+///   tracers --> closure["Invoke Closure Once over Packed Batches"]
+///   closure -->|"operation application"| bind["Context &lt;code&gt;bind&lt;/code&gt;"]
+///   regions["Attached Regions"] --> driver["Instruction-Scoped Batching Driver"]
+///   bind --> driver
+///   driver --> rule["Batchable Operation Rule"]
+///   driver --> nested["Optional Active Region Replay or Structural Program Batching"]
+///   rule -->|"lift packed work"| parent["Parent Context &lt;code&gt;bind&lt;/code&gt;"]
+///   parent --> packed["Parent-Owned Packed Results"]
+///   packed --> assemble["Rule Assembles Output Carriers"]
+///   nested --> assemble
+///   rule -->|"metadata-only or specialized result"| assemble
+///   assemble --> outputs["Batched Outputs: Carriers and Evidence"]
+///   outputs --> validate["Policy &lt;code&gt;validate_operation_outputs&lt;/code&gt;"]
+///   validate --> flowing["Flowing Batching Tracer Results"]
+///   flowing --> closure
+///   closure -->|"returns"| closure_outputs["Structured Closure Outputs"]
+///   closure_outputs --> materialize["Entrypoint Policy &lt;code&gt;materialize_output&lt;/code&gt;"]
+///   materialize --> result["Parent-Owned Outputs in Requested Axis Positions"]
+/// ```
+///
+/// One context instance is shared by every tracer at this batching level. Its parent may itself be eager, staging, or
+/// another transform context, which is what makes batching compose without changing this pipeline.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Debug, Clone)]
 pub struct BatchingContext<C: Context, P: BatchingPolicy<C>> {
     /// [`Context`] that this [`BatchingContext`] is nested into.
