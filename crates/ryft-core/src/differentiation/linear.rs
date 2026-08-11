@@ -1096,6 +1096,7 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
 
         // Higher-order differentiation must include the dependence of the linear map on its residual parameters.
         // Replay the ordinary fused JVP of the attached forward region instead of assuming residual tangents are zero.
+        // The derived program is only interpreted here, never re-attached, so the shared handle is simply dereferenced.
         let jvp = driver.jvp_program(forward)?;
         let mut jvp_inputs = primals;
         for input in inputs {
@@ -1243,6 +1244,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -1323,7 +1325,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, Array, ArrayOperation<Array>>,
             _input_linearity: &[bool],
-        ) -> Result<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, DifferentiationError> {
+        ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "test driver does not transpose nested regions".to_string(),
             }
@@ -2144,7 +2146,7 @@ mod tests {
                 &self,
                 _region: RegionRef<'_, Array, ArrayOperation<Array>>,
                 _input_linearity: &[bool],
-            ) -> Result<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, DifferentiationError>
+            ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
             {
                 unreachable!("linear call transposition swaps regions and never re-enters transposition")
             }

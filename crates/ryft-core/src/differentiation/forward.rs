@@ -1152,8 +1152,8 @@ where
     /// Refer to the documentation of [`Program::jvp`] for more information.
     ///
     /// This is the uncached half of a pair. Callers that publish their result, including the built-in
-    /// [`DifferentiationDriver`], take it through [`Self::jvp_shared`] counterpart instead, which serves the
-    /// same program from the region's retained transform cache as a shared handle.
+    /// [`DifferentiationDriver`], take it through [`RegionRef::jvp_shared`] counterpart instead, which serves
+    /// the same program from the region's retained transform cache as a shared handle.
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
         let tangent_input_count = self
@@ -1354,11 +1354,11 @@ where
     /// the region's retained transform cache, returning a shared handle to it.
     ///
     /// The fused forward-mode program is a pure function of the region's contents, so this returns exactly what
-    /// [`Self::jvp`] would produce, and every content-preserving copy of one sealed region shares one artifact. That
-    /// is what keeps a shared region (e.g., a `jit_call` callee, a `condition` branch, or a `scan` body) from being
-    /// differentiated once per program that attached it, and it additionally lets repeated binds of the derived program
-    /// be interned by [`Arc`] identity by their consumers. Callers that want the owned [`Program`], or that must not
-    /// publish their result, use [`Self::jvp`] instead.
+    /// [`RegionRef::jvp`] would produce, and every content-preserving copy of one sealed region shares one artifact.
+    /// That is what keeps a shared region (e.g., a `jit_call` callee, a `condition` branch, or a `scan` body) from
+    /// being differentiated once per program that attached it, and it additionally lets repeated binds of the derived
+    /// program be interned by [`Arc`] identity by their consumers. Callers that want the owned [`Program`], or that
+    /// must not publish their result, use [`Self::jvp`] instead.
     ///
     /// Recursive forward-mode construction of the region currently in flight on this thread is served without the
     /// cache, so a self-referential region behaves exactly as it does through [`Self::jvp`].
@@ -1392,7 +1392,7 @@ where
     /// documentation of [`Program::linearize`] for more information.
     ///
     /// This is the uncached half of a pair. Callers that publish their result take it through
-    /// [`Self::linearize_shared`] instead, which serves the same sub-programs from the region's
+    /// [`RegionRef::linearize_shared`] instead, which serves the same sub-programs from the region's
     /// retained transform cache as shared handles.
     pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
@@ -1653,7 +1653,7 @@ where
     /// shared handles to the primal sub-program and the tangent sub-program together with the residual count relating
     /// them (i.e., the [`Linearization::into_parts`] triple behind [`Arc`]s).
     ///
-    /// Linearization is a pure function of the region's contents, so this returns exactly what [`Self::linearize`]
+    /// Linearization is a pure function of the region's contents, so this returns exactly what [`RegionRef::linearize`]
     /// would produce, and every content-preserving copy of one sealed region shares one artifact. That is what keeps a
     /// shared callee program from being linearized once per program that interned it, and it additionally lets repeated
     /// binds of the derived sub-programs be interned by [`Arc`] identity by their consumers. Callers that want the
@@ -1665,13 +1665,7 @@ where
         &self,
     ) -> Result<(Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize), DifferentiationError>
     {
-        // TODO(eaplatanios): Inline this closure.
-        // Linearizes this region and wraps the resulting sub-programs in shareable handles.
-        let produce = || {
-            let (primal, tangent, residual_count) = self.linearize()?.into_parts();
-            Ok((Arc::new(primal), Arc::new(tangent), residual_count))
-        };
-        match self.transform_cache().linearization_cache().try_entry(()) {
+        let producer = match self.transform_cache().linearization_cache().try_entry(()) {
             Ok(SpecializationCacheEntry::Occupied(cached_linearization)) => {
                 // With debug assertions enabled, re-derive the linearization and compare it against the artifact
                 // about to be served. A difference means a `jvp` rule is not a deterministic structural function of
@@ -1697,10 +1691,19 @@ where
                         fresh_linearization.tangent(),
                     );
                 }
-                Ok(cached_linearization)
+                return Ok(cached_linearization);
             }
-            Ok(SpecializationCacheEntry::Vacant(producer)) => Ok(producer.insert(produce()?)),
-            Err(ReentrantSpecializationError) => produce(),
+            Ok(SpecializationCacheEntry::Vacant(producer)) => Some(producer),
+            Err(ReentrantSpecializationError) => None,
+        };
+
+        // Linearizes this region once and wraps the resulting sub-programs in shareable handles. A vacant producer
+        // publishes the result. Recursive production returns the same structural artifact without caching it.
+        let (primal, tangent, residual_count) = self.linearize()?.into_parts();
+        let linearization = (Arc::new(primal), Arc::new(tangent), residual_count);
+        match producer {
+            Some(producer) => Ok(producer.insert(linearization)),
+            None => Ok(linearization),
         }
     }
 }
@@ -2500,6 +2503,88 @@ mod tests {
     }
 
     #[test]
+    fn test_region_jvp_shared_reuses_only_identity_preserving_region_copies() {
+        // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
+        // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let callee = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let retained = callee.entry_region_ref().jvp_shared().unwrap();
+        assert_eq!(retained.to_string(), callee.jvp().unwrap().to_string());
+        assert!(Arc::ptr_eq(&callee.entry_region_ref().jvp_shared().unwrap(), &retained));
+
+        // Two independently built programs that intern the same callee share its retained program, because importing
+        // a region copies its complete reachable contents and therefore carries its transforms along.
+        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first_region = first_builder.intern_callee(&callee, None).unwrap();
+        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let second_region = second_builder.intern_callee(&callee, None).unwrap();
+        assert!(Arc::ptr_eq(
+            &RegionRef::new(&first_builder.regions, first_region).unwrap().jvp_shared().unwrap(),
+            &retained,
+        ));
+        assert!(Arc::ptr_eq(
+            &RegionRef::new(&second_builder.regions, second_region).unwrap().jvp_shared().unwrap(),
+            &retained,
+        ));
+
+        // A region whose contents are genuinely rewritten starts over with a freshly derived program.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output]).unwrap();
+        let with_dead_work =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let before = with_dead_work.entry_region_ref().jvp_shared().unwrap();
+        let simplified = with_dead_work.simplified().unwrap();
+        let after = simplified.entry_region_ref().jvp_shared().unwrap();
+        assert!(!Arc::ptr_eq(&after, &before));
+        assert_eq!(after.to_string(), retained.to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_jvp_shared_debug_recheck_detects_corrupted_cached_program() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Publish an artifact that disagrees with what differentiating this region produces, which is exactly the
+        // state a nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does
+        // not compute.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let unrelated = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        match program.entry_region().transform_cache().jvp_program_cache().try_entry(()) {
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
+                producer.insert(unrelated);
+            }
+            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
+        }
+
+        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().jvp_shared()))
+                .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        assert!(
+            message.starts_with(
+                "nondeterministic transform rule detected: re-deriving the fused forward-mode program of this region \
+                 produced a different program than the artifact retained in its transform cache",
+            ),
+            "{message}",
+        );
+    }
+
+    #[test]
     fn test_program_linearize() {
         // Test that directly linearizing `f(x) = sin(x)` produces the primal sub-program `x ↦ (sin(x), cos(x))`,
         // whose trailing output is the `cos(x)` residual, and the linear tangent sub-program `(ẋ, r) ↦ r · ẋ`.
@@ -2592,7 +2677,35 @@ mod tests {
     }
 
     #[test]
-    fn test_linearize_shared_is_retained_by_the_region_it_was_derived_from() {
+    fn test_program_linearize_restores_pruned_tangent_inputs() {
+        // `stop_gradient` disconnects `dy` from the tangent output while `y` remains live in the primal program.
+        // The split must restore the canonical `dy` boundary slot after partial-evaluation liveness pruning.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let (_, program) = NestedTracingContext::trace(
+            context,
+            |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        let linearization = program.into_simplified().unwrap().linearize().unwrap();
+        assert_eq!(linearization.primal().output_ids().len(), 1 + linearization.residual_count());
+        assert_eq!(linearization.tangent().input_ids().len(), 2 + linearization.residual_count());
+
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret_in_context(&context, vec![Array::scalar(0.7), Array::scalar(1.3)])
+            .unwrap();
+        let residuals = primal_outputs.split_off(1);
+        let mut tangent_inputs = vec![Array::scalar(1.0), Array::scalar(123.0)];
+        tangent_inputs.extend(residuals);
+        assert_eq!(
+            linearization.tangent().interpret_in_context(&context, tangent_inputs),
+            Ok(vec![Array::scalar(0.7f64.cos())]),
+        );
+    }
+
+    #[test]
+    fn test_region_linearize_shared_reuses_only_identity_preserving_region_copies() {
         // A shared callee is linearized once and reused by every copy of its sealed region, which is what removes the
         // repeated re-transformation that outer programs interning one callee would otherwise pay.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2660,7 +2773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_linearize_shared_is_not_served_across_rebased_attached_regions() {
+    fn test_region_linearize_shared_invalidates_rebased_attached_regions() {
         /// Builds a program whose entry applies `operation` to its single scalar input.
         fn branch(operation: ArrayOperation<Array>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2706,91 +2819,9 @@ mod tests {
         assert!(Arc::ptr_eq(&first.entry_region_ref().linearize_shared().unwrap().0, &retained.0));
     }
 
-    #[test]
-    fn test_jvp_shared_is_retained_by_the_region_it_was_derived_from() {
-        // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
-        // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let callee = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        let retained = callee.entry_region_ref().jvp_shared().unwrap();
-        assert_eq!(retained.to_string(), callee.jvp().unwrap().to_string());
-        assert!(Arc::ptr_eq(&callee.entry_region_ref().jvp_shared().unwrap(), &retained));
-
-        // Two independently built programs that intern the same callee share its retained program, because importing
-        // a region copies its complete reachable contents and therefore carries its transforms along.
-        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first_region = first_builder.intern_callee(&callee, None).unwrap();
-        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let second_region = second_builder.intern_callee(&callee, None).unwrap();
-        assert!(Arc::ptr_eq(
-            &RegionRef::new(&first_builder.regions, first_region).unwrap().jvp_shared().unwrap(),
-            &retained,
-        ));
-        assert!(Arc::ptr_eq(
-            &RegionRef::new(&second_builder.regions, second_region).unwrap().jvp_shared().unwrap(),
-            &retained,
-        ));
-
-        // A region whose contents are genuinely rewritten starts over with a freshly derived program.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output]).unwrap();
-        let with_dead_work =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let before = with_dead_work.entry_region_ref().jvp_shared().unwrap();
-        let simplified = with_dead_work.simplified().unwrap();
-        let after = simplified.entry_region_ref().jvp_shared().unwrap();
-        assert!(!Arc::ptr_eq(&after, &before));
-        assert_eq!(after.to_string(), retained.to_string());
-    }
-
     #[cfg(debug_assertions)]
     #[test]
-    fn test_debug_assertions_detect_a_nondeterministic_fused_forward_mode_rule() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        // Publish an artifact that disagrees with what differentiating this region produces, which is exactly the
-        // state a nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does
-        // not compute.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let unrelated = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        match program.entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(unrelated);
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
-
-        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().jvp_shared()))
-                .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.starts_with(
-                "nondeterministic transform rule detected: re-deriving the fused forward-mode program of this region \
-                 produced a different program than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_debug_assertions_detect_a_nondeterministic_differentiation_rule() {
+    fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
@@ -2827,15 +2858,16 @@ mod tests {
         );
     }
 
-    /// Pins the metadata-fingerprint contract of [`Operation::render`]. The debug transform-cache diagnostic
-    /// compares programs purely by rendering, so an operation that fails to render its semantics-bearing payload is
-    /// an operation whose corruption the diagnostic cannot see. `tag` is the canonical example: its key is invisible
-    /// to types and to structure, yet rematerialization policies classify residuals by it. The two regions below
-    /// differ *only* in that key, so this test panics if and only if `TagOperation::render` renders it; a name-only
-    /// rendering would make the corrupted artifact compare equal and serve silently.
     #[cfg(debug_assertions)]
     #[test]
-    fn test_debug_assertions_detect_corrupted_transform_operation_metadata() {
+    fn test_region_linearize_shared_debug_recheck_detects_operation_metadata_changes() {
+        // This test pins the metadata-fingerprint contract of `Operation::render`. The transform cache debugging
+        // diagnostic compares programs purely by rendering, so an operation that fails to render its semantics-bearing
+        // payload is an operation whose corruption the diagnostic cannot see. `tag` is the canonical example: its key
+        // is invisible to types and structure, yet rematerialization policies classify residuals by it. The two regions
+        // below differ only in that key, so this test panics exactly when `TagOperation::render` renders it; a
+        // name-only rendering would make the corrupted artifact compare equal and serve silently.
+
         // Builds a single-instruction region tagging its input with `key`.
         fn tagged_program(key: &str) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2874,12 +2906,13 @@ mod tests {
         );
     }
 
-    /// Pins the constant-payload part of the rendering contract at a cache hit. The two regions below differ *only* in
-    /// one [`Atom::Constant`](crate::Atom) literal, so this test panics if and only if [`Program::render`] carries that
-    /// payload into the rendering compared by the recheck.
     #[cfg(debug_assertions)]
     #[test]
-    fn test_debug_assertions_detect_corrupted_transform_constant_payloads() {
+    fn test_region_linearize_shared_debug_recheck_detects_constant_payload_changes() {
+        // This test pins the constant-payload part of the rendering contract at a cache hit. The two regions below
+        // differ only in one `Atom::Constant` literal, so this test panics exactly when `Program::render` carries that
+        // payload into the rendering compared by the recheck.
+
         // Builds a single-instruction region scaling its input by the constant `factor`.
         fn scaled_program(factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2915,34 +2948,6 @@ mod tests {
                  different result than the artifact retained in its transform cache",
             ),
             "{message}",
-        );
-    }
-
-    #[test]
-    fn test_program_linearize_restores_pruned_tangent_inputs() {
-        // `stop_gradient` disconnects `dy` from the tangent output while `y` remains live in the primal program.
-        // The split must restore the canonical `dy` boundary slot after partial-evaluation liveness pruning.
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (_, program) = NestedTracingContext::trace(
-            context,
-            |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
-            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        )
-        .unwrap();
-        let linearization = program.into_simplified().unwrap().linearize().unwrap();
-        assert_eq!(linearization.primal().output_ids().len(), 1 + linearization.residual_count());
-        assert_eq!(linearization.tangent().input_ids().len(), 2 + linearization.residual_count());
-
-        let mut primal_outputs = linearization
-            .primal()
-            .interpret_in_context(&context, vec![Array::scalar(0.7), Array::scalar(1.3)])
-            .unwrap();
-        let residuals = primal_outputs.split_off(1);
-        let mut tangent_inputs = vec![Array::scalar(1.0), Array::scalar(123.0)];
-        tangent_inputs.extend(residuals);
-        assert_eq!(
-            linearization.tangent().interpret_in_context(&context, tangent_inputs),
-            Ok(vec![Array::scalar(0.7f64.cos())]),
         );
     }
 
