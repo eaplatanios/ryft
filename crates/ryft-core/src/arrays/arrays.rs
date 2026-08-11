@@ -586,29 +586,49 @@ impl PartialEq for Array {
     }
 }
 
-// The rendering intentionally matches how `Vec<f64>` debug-formats: a bracketed, comma-separated element list in
-// which real floating-point payloads keep a decimal point (e.g., `[1.0, 2.0]`), so program and interpreter
-// diagnostics involving constant arrays stay readable and stable.
+// Arrays render in logical shape order: a scalar renders as one element, and every array dimension contributes one
+// bracketed nesting level. Real floating-point payloads use debug formatting so integral values retain a decimal point
+// (e.g., `1.0` rather than `1`), keeping the element type visually apparent in diagnostics.
 impl Display for Array {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Writes one bracketed, comma-separated element list through the provided per-element renderer.
-        fn write_elements<T>(
+        // Renders elements in logical row-major order, adding one bracketed level per static array dimension.
+        fn write_elements(
             formatter: &mut std::fmt::Formatter<'_>,
-            elements: impl IntoIterator<Item = T>,
-            mut write_element: impl FnMut(&mut std::fmt::Formatter<'_>, T) -> std::fmt::Result,
+            dimensions: &[Dimension],
+            mut write_element: impl FnMut(&mut std::fmt::Formatter<'_>, usize) -> std::fmt::Result,
         ) -> std::fmt::Result {
-            formatter.write_str("[")?;
-            for (index, element) in elements.into_iter().enumerate() {
-                if index > 0 {
-                    formatter.write_str(", ")?;
+            // Renders the suffix of dimensions rooted at `dimensions`, consuming leaf elements through `flat_index`.
+            fn write_dimensions(
+                formatter: &mut std::fmt::Formatter<'_>,
+                dimensions: &[Dimension],
+                flat_index: &mut usize,
+                write_element: &mut impl FnMut(&mut std::fmt::Formatter<'_>, usize) -> std::fmt::Result,
+            ) -> std::fmt::Result {
+                let Some((dimension, nested_dimensions)) = dimensions.split_first() else {
+                    let index = *flat_index;
+                    *flat_index += 1;
+                    return write_element(formatter, index);
+                };
+                let Dimension::Static(extent) = dimension else {
+                    unreachable!("materialized arrays always have static shapes")
+                };
+                formatter.write_str("[")?;
+                for index in 0..*extent {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write_dimensions(formatter, nested_dimensions, flat_index, write_element)?;
                 }
-                write_element(formatter, element)?;
+                formatter.write_str("]")
             }
-            formatter.write_str("]")
+
+            let mut flat_index = 0;
+            write_dimensions(formatter, dimensions, &mut flat_index, &mut write_element)
         }
+        let dimensions = self.r#type.shape().dimensions();
         let data_type = self.r#type.data_type();
         if matches!(data_type, DataType::Token | DataType::Zero) {
-            return write_elements(formatter, 0..Self::element_count(&self.r#type), |formatter, _| {
+            return write_elements(formatter, dimensions, |formatter, _| {
                 formatter.write_str(if data_type == DataType::Token { "token" } else { "zero" })
             });
         }
@@ -616,25 +636,19 @@ impl Display for Array {
         match data_type {
             // `f32` and `f64` payloads keep a decimal point through debug formatting, per the rendering contract
             // stated above this implementation.
-            DataType::F32 => write_elements(
-                formatter,
-                (0..addressing.element_count())
-                    .map(|element| f32::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
-                |formatter, value| write!(formatter, "{value:?}"),
-            ),
-            DataType::F64 => write_elements(
-                formatter,
-                (0..addressing.element_count())
-                    .map(|element| f64::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
-                |formatter, value| write!(formatter, "{value:?}"),
-            ),
+            DataType::F32 => write_elements(formatter, dimensions, |formatter, element| {
+                let value = f32::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]);
+                write!(formatter, "{value:?}")
+            }),
+            DataType::F64 => write_elements(formatter, dimensions, |formatter, element| {
+                let value = f64::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]);
+                write!(formatter, "{value:?}")
+            }),
             _ => dispatch_on_array_element_type!(data_type, |Element| {
-                write_elements(
-                    formatter,
-                    (0..addressing.element_count())
-                        .map(|element| Element::decode(&self.bytes[addressing.byte_range_for_flat_index(element)])),
-                    |formatter, value| Display::fmt(&value, formatter),
-                )
+                write_elements(formatter, dimensions, |formatter, element| {
+                    let value = Element::decode(&self.bytes[addressing.byte_range_for_flat_index(element)]);
+                    Display::fmt(&value, formatter)
+                })
             }),
         }
     }
@@ -1096,14 +1110,41 @@ mod tests {
 
     #[test]
     fn test_array_display() {
-        // Real floating-point payloads keep a decimal point (matching how `Vec<f64>` debug-formats), while other
-        // payloads use the scalar rendering.
+        // Rank zero renders as a scalar and each higher rank contributes one bracketed level in logical row-major
+        // order. Real floating-point payloads keep a decimal point, while other payloads use scalar rendering.
+        assert_eq!(Array::scalar(1.0).to_string(), "1.0");
         assert_eq!(Array::vector(vec![1.0, 2.5]).to_string(), "[1.0, 2.5]");
+        assert_eq!(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]).to_string(), "[[1.0, 2.0], [3.0, 4.0]]");
+        assert_eq!(
+            Array::from_elements(array_type(DataType::F64, &[2, 1, 2]), &[1.0, 2.0, 3.0, 4.0])
+                .unwrap()
+                .to_string(),
+            "[[[1.0, 2.0]], [[3.0, 4.0]]]",
+        );
         assert_eq!(Array::vector(vec![1i32, 2]).to_string(), "[1, 2]");
         assert_eq!(Array::vector(vec![true, false]).to_string(), "[true, false]");
         let complex = Array::vector(vec![1.0]).complex(&Array::vector(vec![2.0])).unwrap();
         assert_eq!(complex.to_string(), "[1+2i]");
         assert_eq!(Array::vector(Vec::<f64>::new()).to_string(), "[]");
+        assert_eq!(
+            Array::from_elements(array_type(DataType::F64, &[2, 0]), &[] as &[f64]).unwrap().to_string(),
+            "[[], []]",
+        );
+        assert_eq!(Array::new(array_type(DataType::Token, &[]), Vec::new()).unwrap().to_string(), "token");
+        assert_eq!(
+            Array::new(array_type(DataType::Zero, &[2, 1]), Vec::new()).unwrap().to_string(),
+            "[[zero], [zero]]",
+        );
+
+        // Rendering follows logical coordinates rather than physical storage order.
+        let column_major = array_type(DataType::F64, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![
+            size_of::<f64>() as isize,
+            2 * size_of::<f64>() as isize,
+        ])));
+        assert_eq!(
+            Array::from_elements(column_major, &[1.0, 2.0, 3.0, 4.0]).unwrap().to_string(),
+            "[[1.0, 2.0], [3.0, 4.0]]",
+        );
 
         // Sub-byte payloads render through their typed elements, which have no scalar representation, and the debug
         // rendering shares the same element list.

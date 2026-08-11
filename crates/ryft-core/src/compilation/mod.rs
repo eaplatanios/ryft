@@ -5,61 +5,89 @@
 //! A backend supplies target-specific options, lowering, executable compilation, and execution through
 //! [`CompilationDomain`]. Backends opt into exact cache identity and serialization through
 //! [`CompilationCacheDomain`]. Backend representations therefore remain outside `ryft-core` while every backend
-//! follows the same lifecycle. The following diagram illustrates that lifecycle:
+//! follows the same lifecycle. The following diagram illustrates one [`JittedFunction`] call: a warm call takes the
+//! `hit` shortcut on the left, while a cold call runs the full pipeline on the right exactly once per specialization
+//! and then inserts the resulting executable:
 //!
 //! ```text
-//!                                                Per-Jitted-Function Cache
-//!               specialization key = static parameters + input structure + runtime-derived dispatch signature
+//!                  JittedFunction::call(static parameters, dynamic inputs)
+//!                                       │
+//!                                       │ derive the specialization key
+//!                                       │ (static parameters + input structure + dispatch signature)
+//!                                       ▼
+//!                        ┌──────────────────────────────┐
+//!                 ┌──────│     Specialization Cache     │◀─────────────┐
+//!                 │      │ one bounded LRU per function │              │
+//!                 │      └──────────────┬───────────────┘              │
+//!                 │ hit                 │ miss                         │
+//!                 │                     ▼                              │
+//!                 │      ┌──────────────────────────────┐              │
+//!                 │      │         Rust Closure         │              │
+//!                 │      └──────────────┬───────────────┘              │
+//!                 │                     │ trace                        │
+//!                 │                     ▼                              │
+//!                 │      ┌──────────────────────────────┐              │
+//!                 │      │ Program                      │              │
+//!                 │      │ Staged Function handle       │              │
+//!                 │      └──────────────┬───────────────┘              │
+//!                 │                     │ lower                        │ insert
+//!                 │                     ▼                              │
+//!                 │      ┌──────────────────────────────┐              │
+//!                 │      │ Lowered Program              │              │
+//!                 │      │ Lowered Function handle      │              │
+//!                 │      └──────────────┬───────────────┘              │
+//!                 │                     │ derive the domain cache key  │
+//!                 │                     ▼                              │
+//!                 │      ┌──────────────────────────────┐              │
+//!                 │      │ Compilation Context          │              │
+//!                 │      │ resolves shared cache tiers  │              │
+//!                 │      └──────────────┬───────────────┘              │
+//!                 │                     │ restore or compile           │
+//!                 │                     ▼                              │
+//!                 │      ┌──────────────────────────────┐              │
+//!                 └─────▶│ Executable Function          │──────────────┘
+//!                        │ shared through an Arc        │
+//!                        └──────────────┬───────────────┘
+//!                                       │ call
+//!                                       ▼
+//!                        ┌──────────────────────────────┐
+//!                        │ Runtime Values               │
+//!                        └──────────────────────────────┘
+//! ```
 //!
-//! ┌──────────────────────────────┐
-//! │         Rust Closure         │
-//! └──────────────┬───────────────┘
-//!                │ trace on a specialization miss
-//!                ▼
-//! ┌──────────────────────────────┐
-//! │ Program                      │
-//! │ Staged Function handle       │
-//! └──────────────┬───────────────┘
-//!                │ lower
-//!                ▼
-//! ┌──────────────────────────────┐
-//! │ Lowered Program              │
-//! │ Lowered Function handle      │
-//! └──────────────┬───────────────┘
-//!                │ derive the domain cache key
-//!                ▼
-//! ┌──────────────────────────────┐
-//! │ Compilation Context          │
-//! │ resolves shared cache tiers  │
-//! └──────────────┬───────────────┘
-//!                │ restore or compile, then attach metadata
-//!                ▼
-//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
-//! │ Executable Program           │ ◀────── store / reuse ───▶ │ Specialization Cache         │
-//! │ shared through an Arc        │                            │ retains Executable Programs  │
-//! └──────────────┬───────────────┘                            └──────────────────────────────┘
-//!                │ call
-//!                ▼
-//! ┌──────────────────────────────┐
-//! │ Runtime Values               │
-//! └──────────────────────────────┘
+//! Two transitions exist outside this dispatch loop. A staged function can be embedded as a nested call boundary in
+//! an enclosing trace instead of being lowered directly, and a compiled function can shed its staged and lowered
+//! transform metadata into the runtime-only executable handle that the cache retains:
 //!
+//! ```text
 //! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
-//! │ Program                      │ ─── embed in outer trace ▶ │ Nested Call Operation        │
-//! │ Staged Function handle       │                            │                              │
+//! │ Program                      │ ── embed in outer trace ─▶ │ Nested Call Operation        │
+//! │ Staged Function handle       │                            │ owned by the operation family│
 //! └──────────────────────────────┘                            └──────────────────────────────┘
 //!
-//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
-//! │ Compiled Program             │ ── discard metadata ────▶ │ Executable Program           │
-//! │ Compiled Function handle     │                           │                              │
-//! └──────────────────────────────┘                           └──────────────────────────────┘
+//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
+//! │ Compiled Function handle     │ ── discard metadata ─────▶ │ Executable Function          │
+//! │ executable + staged metadata │                            │ runtime-only handle          │
+//! └──────────────────────────────┘                            └──────────────────────────────┘
 //! ```
+//!
+//! # Terminology
+//!
+//! A _program_ is the transformable IR value: atoms, instructions, regions, and boundary types, carrying neither
+//! captures nor a structured signature. A _function_ is the callable package that pairs a program with everything a
+//! call needs, namely the capture table, the structured input and output signatures, the compilation options, and the
+//! backend artifacts. Every lifecycle handle below is therefore a function rather than a program, and
+//! [`JittedFunction`] is not a program at all: it is a retained dispatcher over a Rust closure that produces one
+//! program per specialization. The `*Program` names inside the domain contracts
+//! ([`CompilationDomain::LoweredProgram`], [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`])
+//! name the backend and IR artifacts that those functions carry.
 //!
 //! # Entry Points
 //!
 //! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`JittedFunction`] specializes on explicit static
-//!   host parameters, the dynamic parameter structure, and runtime-derived abstract input types. Its first call for a
-//!   specialization traces, lowers, and requests compilation; warm calls dispatch directly to the executable.
+//!   host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch signature.
+//!   Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch directly to
+//!   the retained executable.
 //! - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
 //!   [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed. Then
 //!   continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
@@ -69,16 +97,17 @@
 //!
 //! # Lifecycle Handles
 //!
-//! 1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::captures::ClosedProgram), concrete runtime captures, public input and output
-//!    signatures, output structure, and compilation options. It contains no backend lowering or executable, and its
-//!    [`StagedFunction::call`] method stages a nested call into an active context rather than executing at runtime.
+//! 1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::captures::ClosedProgram), concrete runtime captures,
+//!    public input and output signatures, output structure, and compilation options. It contains no backend lowering
+//!    or executable, and its [`StagedFunction::call`] method stages a nested call into an active context rather than
+//!    executing at runtime.
 //! 2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
 //!    options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
 //! 3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
 //!    transformations. Runtime execution uses [`CompilationDomain::call`].
-//! 4. [`ExecutableProgram`] retains only the executable, captures, signatures, and output structure. Use
-//!    [`CompiledFunction::into_executable_program`] when transform metadata is no longer needed; this runtime-only handle
-//!    gains `Send` and `Sync` structurally whenever its backend fields do.
+//! 4. [`ExecutableFunction`] retains only the executable, captures, signatures, and output structure. Use
+//!    [`CompiledFunction::into_executable_function`] when transform metadata is no longer needed; this runtime-only
+//!    handle gains `Send` and `Sync` structurally whenever its backend fields do.
 //!
 //! # Captures and Nested Calls
 //!
@@ -103,9 +132,16 @@
 //! executable; a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
 //! resulting executable. Tracing and lowering are cheap relative to backend compilation, so there are no intermediate
 //! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
-//! [`CompilationContext`] below still deduplicates the expensive backend compile. That context is the
-//! backend-artifact cache shared by every compilation using the same domain handle, and it resolves the domain's
-//! [`CompilationCacheDomain::CacheKey`] through these tiers:
+//! [`CompilationContext`] below still deduplicates the expensive backend compile.
+//!
+//! Cloned [`JittedFunction`] handles share one cache, and the dispatcher is usable from multiple threads whenever its
+//! domain, closure, static parameters, and artifact types are thread-safe: same-thread recursive dispatch of the
+//! specialization currently being produced is rejected with an error, while concurrent cold misses on different
+//! threads deliberately duplicate the cheap frontend work with idempotent inserts and leave backend-compile
+//! coordination to the shared context.
+//!
+//! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle,
+//! and it resolves the domain's [`CompilationCacheDomain::CacheKey`] through these tiers:
 //!
 //! ```text
 //! Compilation Context lookup (keyed by CompilationCacheDomain::CacheKey)
@@ -160,7 +196,8 @@
 //!
 //! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
 //! 2. Read [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and [`CallRequest`] alongside
-//!    [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableProgram`] for the typed lifecycle.
+//!    [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableFunction`] for the typed
+//!    lifecycle.
 //! 3. Read [`ClosedProgram`](crate::captures::ClosedProgram) and
 //!    [`CaptureReference`](crate::captures::CaptureReference) in [`crate::captures`] for capture handling.
 //! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
@@ -180,7 +217,7 @@ pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, ExecutableProgram, FlatCompilationProgram, JitCacheStatistics, JittedFunction, LoweredFunction,
+    CompiledFunction, ExecutableFunction, FlatCompilationProgram, JitCacheStatistics, JittedFunction, LoweredFunction,
     LoweringRequest, StageRequest, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
     try_jit_with_options, try_jit_with_options_and_capacity,
 };

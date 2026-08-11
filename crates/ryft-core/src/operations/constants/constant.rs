@@ -223,7 +223,7 @@ mod tests {
         // Verify the operation's literal value, identity, and rendering.
         let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
         assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
-        assert_eq!(format!("{operation}"), "constant [value=[3.5]]");
+        assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &Array::scalar(3.5));
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
@@ -262,7 +262,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64[] = constant [value=[3.5]]
+                let %0:f64[] = constant [value=3.5]
                 in (%0)
             "}
             .trim_end(),

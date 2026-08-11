@@ -311,7 +311,7 @@ mod tests {
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[] .
                     let %2:f64[] = erf %0
-                        %3:f64[] = constant [value=[1.1283791670955126]]
+                        %3:f64[] = constant [value=1.1283791670955126]
                         %4:f64[] = mul %0 %0
                         %5:f64[] = neg %4
                         %6:f64[] = exp %5

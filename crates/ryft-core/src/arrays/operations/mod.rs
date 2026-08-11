@@ -1134,8 +1134,8 @@ mod tests {
             reshape_program.to_string(),
             indoc! {"
                 lambda %0:f32[6] .
-                let %1:dimension<2> = const
-                    %2:dimension<3> = const
+                let %1:dimension<2> = const 2
+                    %2:dimension<3> = const 3
                     %3:f32[2, 3] = reshape %0 %1 %2
                 in (%3)
             "}
@@ -1179,8 +1179,8 @@ mod tests {
             zero_program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:dimension<2> = const
-                    %1:dimension<3> = const
+                let %0:dimension<2> = const 2
+                    %1:dimension<3> = const 3
                     %2:f32[2, 3] = zero [type=f32[2, 3]] %0 %1
                 in (%2)
             "}
@@ -1223,7 +1223,7 @@ mod tests {
             one_program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:dimension<3> = const
+                let %0:dimension<3> = const 3
                     %1:f32[3] = one [type=f32[3]] %0
                 in (%1)
             "}
@@ -1270,7 +1270,7 @@ mod tests {
             iota_program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:dimension<3> = const
+                let %0:dimension<3> = const 3
                     %1:i32[3] = iota [type=i32[3], dimension=0] %0
                 in (%1)
             "}
@@ -1313,7 +1313,7 @@ mod tests {
             concatenate_program.to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:f32[1] .
-                let %2:dimension<3> = const
+                let %2:dimension<3> = const 3
                     %3:f32[3] = concatenate [axis=0] %0 %1 %2
                 in (%3)
             "}
@@ -1459,15 +1459,15 @@ mod tests {
                 let %2:f64[batch] = custom_jvp [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4)
                     },
                     jvp={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const
-                            %4:f64[] = const
+                        let %3:f64[] = const 2.0
+                            %4:f64[] = const 3.0
                             %5:f64[batch] = broadcast [output_axes=[]] %3 %0
                             %6:f64[batch] = mul %1 %5
                             %7:f64[batch] = broadcast [output_axes=[]] %4 %0
@@ -1497,21 +1497,21 @@ mod tests {
                 let %2:f64[batch] = custom_vjp [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4)
                     },
                     forward={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4, %1)
                     },
                     backward={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const
+                        let %3:f64[] = const 3.0
                             %4:f64[batch] = broadcast [output_axes=[]] %3 %0
                             %5:f64[batch] = mul %2 %4
                         in (%5)
@@ -1538,28 +1538,28 @@ mod tests {
                 let %2:f64[batch] = rematerialize [non_differentiated_count=1] %0 %1 [
                     primal={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4)
                     },
                     forward={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[batch] = broadcast [output_axes=[]] %2 %0
                             %4:f64[batch] = mul %1 %3
                         in (%4, %1)
                     },
                     backward={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const
+                        let %3:f64[] = const 3.0
                             %4:f64[batch] = broadcast [output_axes=[]] %3 %0
                             %5:f64[batch] = mul %2 %4
                         in (%5)
                     },
                     tangent={
                         lambda %0:dimension<batch ∈ [1, 9)>, %1:f64[batch], %2:f64[batch] .
-                        let %3:f64[] = const
+                        let %3:f64[] = const 3.0
                             %4:f64[batch] = broadcast [output_axes=[]] %3 %0
                             %5:f64[batch] = mul %2 %4
                         in (%5)
@@ -1626,8 +1626,8 @@ mod tests {
             composite_custom_jvp_program().jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const
-                    %3:f64[] = const
+                let %2:f64[] = const 2.0
+                    %3:f64[] = const 3.0
                     %4:f64[] = mul %0 %2
                     %5:f64[] = mul %1 %3
                 in (%4, %5)
@@ -1934,7 +1934,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[extent], %1:dimension<extent ∈ [1, 5)> .
-                let %2:dimension<1> = const
+                let %2:dimension<1> = const 1
                     %3:dimension<extent * 1 ∈ [1, 5)> = dimension_mul %1 %2
                     %4:dimension<2> = dimension_add %2 %2
                     %5:f64[1, extent * 1] = reshape %0 %2 %3
@@ -2147,7 +2147,7 @@ mod tests {
             batched_program.to_string(),
             indoc! {"
                 lambda %1:f32[2, rows] .
-                let %0:dimension<2> = const
+                let %0:dimension<2> = const 2
                     %2:f32[2, rows] = add %1 %1
                     %3:dimension<rows ∈ [1, 5)> = dimension_size [axis=1] %2
                     %4:dimension<rows + rows ∈ [2, 9)> = dimension_add %3 %3

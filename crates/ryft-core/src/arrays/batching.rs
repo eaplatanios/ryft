@@ -3195,7 +3195,7 @@ mod tests {
         assert_eq!(*batched.r#type(), matrix_type);
         assert_eq!(batched.batch_size(), Ok(Some(2)));
         assert_eq!(batched.unbatched_type(), ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
-        assert_eq!(batched.to_string(), "batch[f64[2, 3], axis=0]([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])");
+        assert_eq!(batched.to_string(), "batch[f64[2, 3], axis=0]([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])");
         assert_eq!(batched.into_value(), matrix);
 
         // A different mapped axis reads the batch size and per-item type from that axis instead.
@@ -4335,7 +4335,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[3, 4] .
-                let %1:f64[] = const
+                let %1:f64[] = const 1.0
                     %2:f64[3, 4] = broadcast [output_type=f64[3, 4], output_axes=[]] %1
                     %3:f64[3, 4] = add %0 %2
                 in (%3)
@@ -4799,7 +4799,7 @@ mod tests {
             rendered,
             indoc! {"
                 lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 3] .
-                let %2:dimension<3> = const
+                let %2:dimension<3> = const 3
                     %3:f32[batch, 3] = reshape %1 %0 %2
                 in (%3)
             "}

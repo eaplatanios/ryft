@@ -9,8 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::batching::{align_array_batch, array_dimension};
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionValue,
-    DimensionVariable,
+    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};

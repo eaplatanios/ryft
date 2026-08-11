@@ -1179,7 +1179,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64[] = const
+                let %0:f64[] = const 2.5
                 in (%0)
             "}
             .trim_end(),
@@ -1320,8 +1320,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64[] = const
-                    %1:f64[] = const
+                let %0:f64[] = const 0.0
+                    %1:f64[] = const 1.0
                 in (%0, %1)
             "}
             .trim_end(),

@@ -458,13 +458,13 @@ mod tests {
                 let %3:dimension<extent ∈ [1, 8)>, %4:f64[] = condition %0 %1 %2 [
                     true={
                         lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 2.0
                             %3:f64[] = mul %1 %2
                         in (%0, %3)
                     },
                     false={
                         lambda %0:dimension<extent ∈ [1, 8)>, %1:f64[] .
-                        let %2:f64[] = const
+                        let %2:f64[] = const 3.0
                             %3:f64[] = mul %1 %2
                         in (%0, %3)
                     },

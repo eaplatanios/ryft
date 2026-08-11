@@ -2079,7 +2079,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const 3.0
                     %2:f64[] = add %0 %1
                 in (%2)
             "}
@@ -2356,7 +2356,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const 3.0
                     %2:f64[] = neg %0
                     %3:f64[] = add %2 %1
                     %4:bool[] = compare [direction=LessThan] %3 %1
@@ -2369,7 +2369,7 @@ mod tests {
             mapped.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const 3.0
                     %2:f64[] = neg %0
                     %3:f64[] = mul %2 %1
                     %4:bool[] = compare [direction=GreaterThan] %3 %1
@@ -2639,7 +2639,7 @@ mod tests {
             simplified.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const 3.0
                     %2:f64[] = add %0 %1
                 in (%2, %2)
             "}
@@ -2649,8 +2649,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
-                    %2:f64[] = const
+                let %1:f64[] = const 2.0
+                    %2:f64[] = const 3.0
                     %3:f64[] = add %0 %1
                     %4:f64[] = add %0 %2
                 in (%4, %4)
@@ -2908,8 +2908,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = const
+                let %1:f64 = const 2
+                    %2:f64 = const 3
                     %3:f64 = add %0 %1
                     %4:f64 = add %0 %2
                 in (%4, %4)
@@ -2930,7 +2930,7 @@ mod tests {
             simplified.to_string(),
             indoc! {"
                 lambda %0:f64 .
-                let %1:f64 = const
+                let %1:f64 = const 3
                     %2:f64 = add %0 %1
                 in (%2, %2)
             "}
@@ -3257,7 +3257,21 @@ mod tests {
         // The nested region's constant payload is part of the ordinary program rendering, making that one rendering
         // complete enough to distinguish programs whose only semantic difference is an embedded literal.
         let first = build(1.0).to_string();
-        assert!(first.contains("%1:f64[] = const [1.0]"));
+        assert_eq!(
+            first,
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = with_regions %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = const 1.0
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
         assert_ne!(first, build(2.0).to_string());
         assert_eq!(first, build(1.0).to_string());
     }

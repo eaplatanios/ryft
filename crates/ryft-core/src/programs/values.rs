@@ -59,10 +59,12 @@ impl ValueId {
 /// # Rendering Contract
 ///
 /// [`Display`] must be deterministic and semantically complete for values that can be stored as
-/// [`Atom::Constant`](crate::Atom::Constant)s (i.e., two constant payloads with different program semantics must render
-/// differently). Program constants are expected to be small and synchronously renderable. Large or device-resident
-/// values must instead be represented by a compact semantic reference such as [`CaptureReference`], whose displayed
-/// table index and type identify the program-level constant without reading back its runtime payload.
+/// [`Atom::Constant`](crate::Atom::Constant)s (i.e., two constants with the same rendered [`Type`] but different
+/// program semantics must render differently). [`Program`](crate::Program) combines this payload with the atom's
+/// separately rendered type, so shape and other type-level semantics need not be duplicated in the payload. Program
+/// constants are expected to be small and synchronously renderable. Large or device-resident values must instead be
+/// represented by a compact semantic reference such as [`CaptureReference`], whose displayed table index and type
+/// identify the program-level constant without reading back its runtime payload.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
     /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work

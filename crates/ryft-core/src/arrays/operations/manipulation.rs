@@ -893,7 +893,7 @@ mod tests {
             rendered_primal,
             "
 lambda %0:f64[source, 4] .
-let %1:dimension<2> = const
+let %1:dimension<2> = const 2
     %2:dimension<source ∈ [0, 9)> = dimension_size [axis=0] %0
     %3:dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
     %4:f64[2, source * 2] = reshape %0 %1 %3
@@ -906,7 +906,7 @@ in (%4, %3, %5)
             rendered_tangent,
             "
 lambda %0:f64[source, 4], %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)> .
-let %3:dimension<2> = const
+let %3:dimension<2> = const 2
     %4:f64[2, source * 2] = linear_call [residual_count=3] %3 %1 %2 %0 [
         forward={
             lambda %0:dimension<2>, %1:dimension<source * 2 ∈ [0, 17)>, %2:dimension<source ∈ [0, 9)>, \
@@ -2577,7 +2577,7 @@ in (%4)
                 let %2:dimension<left ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:dimension<right ∈ [1, 6)> = dimension_size [axis=0] %1
                     %4:dimension<left + right ∈ [2, 10)> = dimension_add %2 %3
-                    %5:f32[left + right] = concatenate [axis=0] %0 %1 %4
+                    %5:f32[left + right] = concatenate [axis=0, requires_runtime_assertion=true] %0 %1 %4
                 in (%5)
             "}
             .trim_end(),
@@ -2769,7 +2769,7 @@ in (%4)
             pullback.to_string(),
             indoc! {"
                 lambda %0:f64[3, columns] .
-                let %1:dimension<3> = const
+                let %1:dimension<3> = const 3
                     %2:dimension<0> = constant [value=0]
                     %3:dimension<columns ∈ [1, 9)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]

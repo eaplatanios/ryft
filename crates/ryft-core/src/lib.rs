@@ -16,6 +16,7 @@ pub mod operations;
 pub mod parameters;
 pub mod partial;
 pub mod programs;
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub mod specialization;
 pub mod tracing;
 pub mod tracing_v2;
@@ -48,7 +49,7 @@ pub use compilation::{
     CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
     CompilationCall, CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError,
     CompilationMissReason, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, DiskCache, ExecutableProgram, FlatCompilationProgram, JitCacheStatistics, JittedFunction,
+    CompiledFunction, DiskCache, ExecutableFunction, FlatCompilationProgram, JitCacheStatistics, JittedFunction,
     LoweredFunction, LoweringRequest, StageRequest, StagedFunction, call_function, jit, jit_with_options,
     stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
 };
@@ -160,8 +161,8 @@ pub use programs::{
     ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use specialization::{
-    FunctionSpecializationKey, ReentrantSpecializationError, SpecializationCache, SpecializationCacheError,
-    SpecializationCacheLookup, SpecializationCacheProducer, SpecializationCacheStatistics,
+    FunctionSpecializationKey, ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry,
+    SpecializationCacheError, SpecializationCacheProducer, SpecializationCacheStatistics,
 };
 pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,

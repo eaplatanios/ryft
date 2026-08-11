@@ -365,6 +365,24 @@ macro_rules! define_arithmetic_dimension_operation {
             ) -> Result<Self, $crate::programs::types::TypeError> {
                 Ok(Self { metadata: self.metadata.rename_type_identities(renaming)? })
             }
+
+            #[inline]
+            fn render(
+                &self,
+                formatter: &mut ::std::fmt::Formatter<'_>,
+                indentation: usize,
+            ) -> ::std::fmt::Result {
+                // The result name and bounds are recoverable from the instruction's rendered output atom type, and each
+                // declared operand type is pinned by the input atom type that must refine it, so the only payload field
+                // this rendering must carry is the runtime-assertion classification, which is invisible to the types
+                // and decides this operation's effects. It is elided when it is `false`.
+                let operation =
+                    $crate::programs::operations::OperationFormatter::new(formatter, indentation, $name)?;
+                if !self.metadata.requires_runtime_assertion() {
+                    return Ok(());
+                }
+                operation.bracketed(|operation| operation.field("requires_runtime_assertion", true))
+            }
         }
 
         impl $crate::operations::dimensions::ArithmeticDimensionOperation for $operation {

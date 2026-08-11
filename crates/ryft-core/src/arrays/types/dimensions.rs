@@ -326,7 +326,7 @@ impl TypeIdentity for DimensionVariable {
 ///
 /// ```text
 /// lambda %0: f64[source, 4] .
-/// let %1: dimension<2>                    = const
+/// let %1: dimension<2>                    = const 2
 ///     %2: dimension<source ∈ [0, 9)>      = dimension_size [axis=0] %0
 ///     %3: dimension<source * 2 ∈ [0, 17)> = dimension_mul %2 %1
 ///     %4: f64[2, source * 2]              = reshape %0 %1 %3

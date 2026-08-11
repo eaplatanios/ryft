@@ -19,7 +19,7 @@ use crate::parameters::Parameterized;
 use crate::programs::{ProgramError, Type};
 
 use super::function::{
-    CallRequest, CompileRequest, CompiledFunction, ExecutableProgram, LoweredFunction, LoweringRequest, StageRequest,
+    CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest, StageRequest,
     StagedFunction,
 };
 
@@ -29,7 +29,7 @@ use super::function::{
 ///   1. [`Self::stage`] traces a closure using options fixed before tracing.
 ///   2. [`Self::lower`] transforms the staged artifact into [`Self::LoweredProgram`].
 ///   3. [`Self::compile`] transforms the lowered artifact into [`Self::CompiledProgram`].
-///   4. [`Self::call`] executes an [`ExecutableProgram`] against structured runtime inputs.
+///   4. [`Self::call`] executes an [`ExecutableFunction`] against structured runtime inputs.
 ///
 /// The domain is the active service for every transition; staged, lowered, compiled, and executable artifacts remain
 /// passive values. Each method owns its complete backend-specific transition, including any validation, caching, or
@@ -154,10 +154,10 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
     /// Backend-owned, typed analysis report.
     type Analysis;
 
-    /// Analyzes an executable program without recompiling it.
+    /// Analyzes the compiled program carried by an [`ExecutableFunction`] without recompiling it.
     fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
         &self,
-        executable_program: &ExecutableProgram<Self, Input, Output>,
+        executable_function: &ExecutableFunction<Self, Input, Output>,
     ) -> Result<Self::Analysis, Self::Error>
     where
         Self: Sized;

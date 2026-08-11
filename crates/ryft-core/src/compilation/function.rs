@@ -12,7 +12,7 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, Typed, Value};
-use crate::specialization::{FunctionSpecializationKey, SpecializationCache, SpecializationCacheLookup};
+use crate::specialization::{FunctionSpecializationKey, SpecializationCache, SpecializationCacheEntry};
 use crate::tracing::{DomainTracingContext, Tracer};
 
 use super::contexts::CompilationDomain;
@@ -136,7 +136,7 @@ pub trait CompileRequest<D: CompilationDomain>: Sized {
 /// Complete typed request consumed by [`CompilationDomain::call`].
 pub struct CompilationCall<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
     /// Executable being invoked.
-    executable: ExecutableProgram<D, Input, Output>,
+    executable: ExecutableFunction<D, Input, Output>,
 
     /// Flat public runtime inputs, excluding captures.
     inputs: Vec<D::Value>,
@@ -150,7 +150,7 @@ where
     Input::To<D::Value>: Parameterized<D::Value>,
 {
     /// Creates a structured execution request.
-    pub fn new(executable: &ExecutableProgram<D, Input, Output>, inputs: Input::To<D::Value>) -> Self {
+    pub fn new(executable: &ExecutableFunction<D, Input, Output>, inputs: Input::To<D::Value>) -> Self {
         Self { executable: executable.clone(), inputs: inputs.into_parameters().collect() }
     }
 }
@@ -167,7 +167,7 @@ pub trait CallRequest<D: CompilationDomain>: Sized {
     type RuntimeOutput;
 
     /// Returns the executable artifact.
-    fn executable(&self) -> &ExecutableProgram<D, Self::Input, Self::Output>;
+    fn executable(&self) -> &ExecutableFunction<D, Self::Input, Self::Output>;
 
     /// Returns flat public runtime inputs, excluding captures.
     fn inputs(&self) -> &[D::Value];
@@ -177,7 +177,7 @@ pub trait CallRequest<D: CompilationDomain>: Sized {
 
     /// Reconstructs structured runtime outputs.
     fn reconstruct(
-        executable: &ExecutableProgram<D, Self::Input, Self::Output>,
+        executable: &ExecutableFunction<D, Self::Input, Self::Output>,
         outputs: Vec<D::Value>,
     ) -> Result<Self::RuntimeOutput, D::Error>;
 }
@@ -346,9 +346,10 @@ pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Typ
 
 /// Staged, unlowered form of one compiled function.
 ///
-/// A staged function owns the typed source [`ClosedProgram`], its runtime capture table, exact public input/output
-/// structures, and compilation options. It can be inspected, lowered by its domain, or embedded as a compiled-call
-/// boundary in an enclosing trace. No backend lowering or executable compilation has happened yet.
+/// A staged function is the first callable package in the lifecycle: it owns the typed source [`ClosedProgram`]
+/// together with the call-level state a bare program never carries, namely its runtime capture table, exact public
+/// input/output structures, and compilation options. It can be inspected, lowered by its domain, or embedded as a
+/// compiled-call boundary in an enclosing trace. No backend lowering or executable compilation has happened yet.
 pub struct StagedFunction<
     D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -603,6 +604,9 @@ where
 }
 
 /// Backend lowering of a [`StagedFunction`], ready for executable compilation.
+///
+/// It stays a function rather than a program: the backend's lowered program is one artifact it carries, alongside the
+/// captures, signatures, and options inherited from its staged source.
 pub struct LoweredFunction<
     D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
@@ -700,15 +704,16 @@ where
 
 /// Runtime-only handle for one compiled executable.
 ///
-/// This handle retains only the state required to validate and execute calls: the backend executable,
-/// concrete captures, flat signatures, and structured output shape. It deliberately does not retain the staged or
-/// lowered programs, so it becomes [`Send`] and [`Sync`] automatically whenever those runtime fields are `Send + Sync`.
-/// In contrast, [`CompiledFunction`] remains transformable and may retain `Rc`-backed source programs.
-pub struct ExecutableProgram<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
-    state: Arc<ExecutableProgramState<D, Input, Output>>,
+/// This handle retains only the state required to validate and execute calls: the backend executable, concrete
+/// captures, flat signatures, and structured output shape. That call-level state is what still makes it a function
+/// rather than a program, even though it has shed every transformable artifact: it deliberately does not retain the
+/// staged or lowered programs, so it becomes [`Send`] and [`Sync`] automatically whenever those runtime fields are
+/// `Send + Sync`. In contrast, [`CompiledFunction`] remains transformable and may retain `Rc`-backed source programs.
+pub struct ExecutableFunction<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
+    state: Arc<ExecutableFunctionState<D, Input, Output>>,
 }
 
-struct ExecutableProgramState<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
+struct ExecutableFunctionState<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> {
     program: Arc<D::CompiledProgram>,
     captures: Vec<D::Value>,
     input_types: Vec<D::Type>,
@@ -718,7 +723,7 @@ struct ExecutableProgramState<D: CompilationDomain, Input: Parameterized<D::Type
 }
 
 impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>> Clone
-    for ExecutableProgram<D, Input, Output>
+    for ExecutableFunction<D, Input, Output>
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -727,13 +732,13 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
 }
 
 impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>>
-    ExecutableProgram<D, Input, Output>
+    ExecutableFunction<D, Input, Output>
 {
     /// Replaces the backend payload after the backend has established call-boundary compatibility.
     #[doc(hidden)]
     pub fn with_compiled_program(&self, program: Arc<D::CompiledProgram>, output_types: Vec<D::Type>) -> Self {
         Self {
-            state: Arc::new(ExecutableProgramState {
+            state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: self.state.captures.clone(),
                 input_types: self.state.input_types.clone(),
@@ -805,7 +810,7 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     }
 }
 
-impl<D, Input, Output> ExecutableProgram<D, Input, Output>
+impl<D, Input, Output> ExecutableFunction<D, Input, Output>
 where
     D: CompilationDomain,
     Input: Parameterized<D::Type>,
@@ -833,7 +838,7 @@ where
     type Output = Output;
     type RuntimeOutput = Output::To<D::Value>;
 
-    fn executable(&self) -> &ExecutableProgram<D, Input, Output> {
+    fn executable(&self) -> &ExecutableFunction<D, Input, Output> {
         &self.executable
     }
 
@@ -846,7 +851,7 @@ where
     }
 
     fn reconstruct(
-        executable: &ExecutableProgram<D, Input, Output>,
+        executable: &ExecutableFunction<D, Input, Output>,
         outputs: Vec<D::Value>,
     ) -> Result<Self::RuntimeOutput, D::Error> {
         executable.reconstruct_outputs(outputs).map_err(D::Error::from)
@@ -854,13 +859,16 @@ where
 }
 
 /// Compiled executable plus the staged and lowered metadata required to invoke it safely.
+///
+/// The backend's compiled program is the artifact this function carries; the captures, structured signatures, and
+/// options carried with it are what make the handle callable as well as transformable.
 pub struct CompiledFunction<
     D: CompilationDomain,
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 > {
     /// Runtime-only executable handle.
-    executable_program: ExecutableProgram<D, Input, Output>,
+    executable_function: ExecutableFunction<D, Input, Output>,
 
     /// Lowered function retaining source metadata and options.
     lowered: LoweredFunction<D, Input, Output>,
@@ -875,7 +883,7 @@ where
     Output::Family: ParameterizedFamily<D::Constant>,
 {
     fn clone(&self) -> Self {
-        Self { executable_program: self.executable_program.clone(), lowered: self.lowered.clone() }
+        Self { executable_function: self.executable_function.clone(), lowered: self.lowered.clone() }
     }
 }
 
@@ -894,8 +902,8 @@ where
         program: Arc<D::CompiledProgram>,
         output_types: Vec<D::Type>,
     ) -> Self {
-        let executable_program = ExecutableProgram {
-            state: Arc::new(ExecutableProgramState {
+        let executable_function = ExecutableFunction {
+            state: Arc::new(ExecutableFunctionState {
                 program,
                 captures: lowered.staged.source_program().captures().to_vec(),
                 input_types: lowered.staged.input_types().to_vec(),
@@ -904,25 +912,25 @@ where
                 input: PhantomData,
             }),
         };
-        Self { executable_program, lowered }
+        Self { executable_function, lowered }
     }
 
     /// Returns the shared backend executable.
     #[inline]
     pub fn compiled_program(&self) -> &D::CompiledProgram {
-        self.executable_program.compiled_program()
+        self.executable_function.compiled_program()
     }
 
     /// Returns the runtime-only handle, which omits staged and lowered transform metadata.
     #[inline]
-    pub fn executable_program(&self) -> &ExecutableProgram<D, Input, Output> {
-        &self.executable_program
+    pub fn executable_function(&self) -> &ExecutableFunction<D, Input, Output> {
+        &self.executable_function
     }
 
     /// Consumes this transformable handle and returns its runtime-only executable state.
     #[inline]
-    pub fn into_executable_program(self) -> ExecutableProgram<D, Input, Output> {
-        self.executable_program
+    pub fn into_executable_function(self) -> ExecutableFunction<D, Input, Output> {
+        self.executable_function
     }
 
     /// Returns the lowering from which this executable was compiled.
@@ -948,18 +956,19 @@ where
     /// Returns the effective flat output types produced by the executable.
     #[inline]
     pub fn output_types(&self) -> &[D::Type] {
-        self.executable_program.output_types()
+        self.executable_function.output_types()
     }
 }
 
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
-/// Unlike [`CompiledFunction`], which represents one already-specialized executable, a `JittedFunction` accepts
-/// explicit host-side static parameters and runtime dynamic inputs. Its first call for a specialization traces,
-/// lowers, and requests compilation; later calls with the same static values, input parameter structure, and
-/// runtime-derived dispatch signature dispatch directly to the retained executable. Domain staging may normalize
-/// distinct runtime signatures to the same staged signature, which can produce harmless duplicate dispatch
-/// specializations.
+/// Unlike [`CompiledFunction`], which represents one already-specialized executable, a `JittedFunction` holds no
+/// program of its own: it is a retained dispatcher over a Rust closure that produces one program, and one function
+/// around that program, per specialization from explicit host-side static parameters and runtime dynamic inputs. Its
+/// first call for a specialization traces, lowers, and requests compilation; later calls with the same static values,
+/// input parameter structure, and runtime-derived dispatch signature dispatch directly to the retained executable.
+/// Domain staging may normalize distinct runtime signatures to the same staged signature, which can produce harmless
+/// duplicate dispatch specializations.
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
 /// once per retained specialization, not once per runtime call; observable per-call work must be represented by staged
@@ -1002,8 +1011,8 @@ struct JittedFunctionState<
     function: F,
     options: D::Options,
     specializations: SpecializationCache<
-        FunctionSpecializationKey<Input::ParameterStructure, D::DispatchKey, Static>,
-        ExecutableProgram<D, Input, Output>,
+        FunctionSpecializationKey<Static, Input::ParameterStructure, D::DispatchKey>,
+        ExecutableFunction<D, Input, Output>,
     >,
     statistics: JitCacheStatisticsState,
 }
@@ -1089,7 +1098,7 @@ where
 
     /// Invalidates every retained specialization for `static_parameters` and returns the number removed.
     pub fn invalidate_static(&self, static_parameters: &Static) -> usize {
-        self.state.specializations.invalidate_where(|key| key.static_parameters() == static_parameters)
+        self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
     }
 
     /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
@@ -1122,14 +1131,14 @@ where
         let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch);
 
         let dispatch_start = Instant::now();
-        let lookup = self.state.specializations.lookup(key);
+        let entry = self.state.specializations.try_entry(key);
         JitCacheStatisticsState::add_duration(&self.state.statistics.dispatch_duration_ns, dispatch_start.elapsed());
-        let producer = match lookup {
-            Ok(SpecializationCacheLookup::Hit(executable)) => {
+        let producer = match entry {
+            Ok(SpecializationCacheEntry::Occupied(executable)) => {
                 JitCacheStatisticsState::increment(&self.state.statistics.dispatch_hits);
                 return call_function(&self.state.domain, &executable, inputs);
             }
-            Ok(SpecializationCacheLookup::Miss(producer)) => {
+            Ok(SpecializationCacheEntry::Vacant(producer)) => {
                 JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
                 producer
             }
@@ -1180,7 +1189,7 @@ where
         };
         JitCacheStatisticsState::increment(&self.state.statistics.compilation_requests);
         let compiled = self.state.domain.compile(lowered)?;
-        let executable = producer.insert(compiled.into_executable_program());
+        let executable = producer.insert(compiled.into_executable_function());
         call_function(&self.state.domain, &executable, inputs)
     }
 }
@@ -1310,7 +1319,7 @@ where
 /// Executes a structured runtime call through `domain`.
 pub fn call_function<D, Input, Output>(
     domain: &D,
-    executable: &ExecutableProgram<D, Input, Output>,
+    executable: &ExecutableFunction<D, Input, Output>,
     inputs: Input::To<D::Value>,
 ) -> Result<Output::To<D::Value>, D::Error>
 where
@@ -1642,11 +1651,11 @@ mod tests {
         let negate = compile_from_one_call_site(&domain, true);
 
         assert_eq!(
-            call_function(&domain, identity.executable_program(), Array::scalar(3.0)).unwrap(),
+            call_function(&domain, identity.executable_function(), Array::scalar(3.0)).unwrap(),
             Array::scalar(3.0)
         );
         assert_eq!(
-            call_function(&domain, negate.executable_program(), Array::scalar(3.0)).unwrap(),
+            call_function(&domain, negate.executable_function(), Array::scalar(3.0)).unwrap(),
             Array::scalar(-3.0)
         );
         assert_eq!(domain.compilation_count(), 2);
@@ -1669,11 +1678,11 @@ mod tests {
         let second = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
         assert_eq!(
-            call_function(&domain, first.executable_program(), Array::scalar(2.0)).unwrap(),
+            call_function(&domain, first.executable_function(), Array::scalar(2.0)).unwrap(),
             Array::scalar(-2.0)
         );
         assert_eq!(
-            call_function(&domain, second.executable_program(), Array::scalar(4.0)).unwrap(),
+            call_function(&domain, second.executable_function(), Array::scalar(4.0)).unwrap(),
             Array::scalar(-4.0)
         );
         assert_eq!(domain.compilation_count(), 1);
@@ -1704,7 +1713,7 @@ mod tests {
         let compiled = compile_from_one_call_site(&domain, false);
 
         assert!(matches!(
-            call_function(&domain, compiled.executable_program(), Array::scalar(3_i64)),
+            call_function(&domain, compiled.executable_function(), Array::scalar(3_i64)),
             Err(ProgramError::InvalidArgument { message })
                 if message == "runtime input type i64[] does not refine declared type f64[]",
         ));
@@ -1723,12 +1732,12 @@ mod tests {
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
 
-        assert_eq!(call_function(&domain, compiled.executable_program(), ()).unwrap(), Array::scalar(7.0));
+        assert_eq!(call_function(&domain, compiled.executable_function(), ()).unwrap(), Array::scalar(7.0));
         assert_eq!(compiled.source_program().captures(), &[Array::scalar(7.0)]);
     }
 
     #[test]
-    fn test_executable_program_outlives_transform_metadata_and_executes_captures() {
+    fn test_executable_function_outlives_transform_metadata_and_executes_captures() {
         let domain = TestDomain::new();
         let staged: StagedFunction<TestDomain, (), ArrayType> = domain
             .stage(CompilationStagingRequest::new(
@@ -1739,7 +1748,7 @@ mod tests {
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
-        let executable = compiled.into_executable_program();
+        let executable = compiled.into_executable_function();
 
         assert_eq!(executable.captures(), &[Array::scalar(7.0)]);
         assert!(executable.input_types().is_empty());
@@ -1748,13 +1757,13 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_program_is_send_and_sync_for_thread_safe_runtime_state() {
+    fn test_executable_function_is_send_and_sync_for_thread_safe_runtime_state() {
         fn assert_send_and_sync<T: Send + Sync>() {}
 
-        assert_send_and_sync::<ExecutableProgram<TestDomain, ArrayType, ArrayType>>();
+        assert_send_and_sync::<ExecutableFunction<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
-        let executable = compile_from_one_call_site(&domain, true).into_executable_program();
+        let executable = compile_from_one_call_site(&domain, true).into_executable_function();
         let second = executable.clone();
         let first_domain = domain.clone();
         let second_domain = domain.clone();

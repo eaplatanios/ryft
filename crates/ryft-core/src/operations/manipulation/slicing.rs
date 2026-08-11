@@ -2,8 +2,7 @@ use std::fmt::Display;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding,
-    ShardingDimension,
+    DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{

@@ -127,7 +127,7 @@ mod tests {
                 Memory::Device,
                 indoc! {"
                     lambda  .
-                    let %0:f32[] = constant [value=[2.5]]
+                    let %0:f32[] = constant [value=2.5]
                         %1:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[]] %0
                     in (%1)
                 "}
@@ -137,7 +137,7 @@ mod tests {
                 Memory::Host { pinned: true },
                 indoc! {"
                     lambda  .
-                    let %0:f32[]@Host[Pinned] = constant [value=[2.5]]
+                    let %0:f32[]@Host[Pinned] = constant [value=2.5]
                         %1:f32[2, 3]@Host[Pinned] = broadcast \
                             [output_type=f32[2, 3]@Host[Pinned], output_axes=[]] %0
                     in (%1)
@@ -148,7 +148,7 @@ mod tests {
                 Memory::Host { pinned: false },
                 indoc! {"
                     lambda  .
-                    let %0:f32[]@Host[Unpinned] = constant [value=[2.5]]
+                    let %0:f32[]@Host[Unpinned] = constant [value=2.5]
                         %1:f32[2, 3]@Host[Unpinned] = broadcast \
                             [output_type=f32[2, 3]@Host[Unpinned], output_axes=[]] %0
                     in (%1)
@@ -186,7 +186,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:u32[] = constant [value=[2]]
+                let %0:u32[] = constant [value=2]
                 in (%0)
             "}
             .trim_end(),

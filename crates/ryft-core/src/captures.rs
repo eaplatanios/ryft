@@ -352,7 +352,9 @@ impl<
     /// and only capture-referencing constant atoms are rewritten to carry their new indices; immediate constants are
     /// index-free and pass through untouched. This function consumes `self` so that the surviving captures, the
     /// instruction operations, and the input/output structures can all be moved into the rebuilt program instead of
-    /// being cloned.
+    /// being cloned. Retained per-region transforms survive wherever the rewrite provably changed nothing (a region
+    /// detaches from them only when one of its own constant atoms was renumbered or when a region attached to it
+    /// detached).
     pub fn without_unused_captures(self) -> Result<Self, ProgramError> {
         let Self { program, captures } = self;
 
@@ -385,26 +387,44 @@ impl<
         // index. The program structure (i.e., atoms, identifiers, instructions, regions, and boundaries) is preserved
         // exactly. The `capture_index_map` lookups cannot fail because the marking pass above assigns a slot to every
         // capture referenced by any constant atom. Note that renumbering a capture reference changes what the region's
-        // constants denote, so every region whose atoms are rewritten also detaches from the transforms derived from
-        // its previous contents. Nothing is renumbered when every capture survives in place, which is the common case
-        // and keeps those transforms reusable.
+        // constants denote, so a region whose atoms actually change detaches from the transforms derived from its
+        // previous contents, and so does every region that attaches such a region, because a transform of a region
+        // consumes its attached descendants too. Regions precede the regions that reference them, which makes this one
+        // ascending pass enough to propagate that. Every other subtree keeps its transforms: dropping captures that
+        // shift no survivor (i.e., trailing unused ones) rewrites no reference at all, and renumbering one region's
+        // references leaves regions that reference no renumbered capture reusable.
         let Program { input_structure, output_structure, regions, entry, .. } = program;
         let mut regions = regions.into_regions();
-        let renumbers_captures = capture_index_map
-            .iter()
-            .enumerate()
-            .any(|(source_index, destination_index)| *destination_index != Some(source_index));
-        for region in &mut regions {
-            if renumbers_captures {
-                region.invalidate_transform_cache();
-            }
+        let mut is_invalidated = vec![false; regions.len()];
+        for (region_index, region) in regions.iter_mut().enumerate() {
+            let mut is_rewritten = false;
             for atom in &mut region.atoms {
-                if let Atom::Constant(constant) = atom {
-                    *constant = constant.map_capture_index(|index| capture_index_map[index].unwrap());
+                if let Atom::Constant(constant) = atom
+                    && let Some(source_index) = constant.capture_index()
+                {
+                    let destination_index = capture_index_map[source_index].unwrap();
+                    if destination_index != source_index {
+                        *constant = constant.map_capture_index(|_| destination_index);
+                        is_rewritten = true;
+                    }
                 }
             }
+            let invalidates = is_rewritten
+                || region
+                    .instructions()
+                    .iter()
+                    .flat_map(|instruction| instruction.regions())
+                    .any(|attached| is_invalidated.get(attached.index()).copied().unwrap_or(true));
+            if invalidates {
+                region.invalidate_transform_cache();
+            }
+            is_invalidated[region_index] = invalidates;
         }
-        let program = Program::new(input_structure, output_structure, regions, entry)?;
+
+        // Re-sealing preserves each region's retained transforms because this rebuild moves the complete source arena
+        // in its original order, so every attached identifier still names the same body. The regions whose reachable
+        // contents actually changed detached from their transforms above.
+        let program = Program::new_preserving_transform_caches(input_structure, output_structure, regions, entry)?;
 
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
@@ -454,9 +474,10 @@ impl<
         // (backend-specific lowering like XLA lowering will resolve capture references against the same hidden capture
         // argument prefix while lowering those regions, and materialize immediate constants in place). Nested regions
         // are imported verbatim ahead of the replay. Their identifiers are arena indices assigned in order, so copying
-        // them in order preserves every entry-instruction region reference.
+        // them in order preserves every entry-instruction region reference, which is also why re-sealing them keeps the
+        // transforms already derived from their contents.
         let mut builder = ProgramBuilder::new();
-        builder.regions = RegionArena::from_regions(
+        builder.regions = RegionArena::from_regions_preserving_transform_caches(
             self.program.regions().iter().take(self.program.entry().index()).cloned().collect(),
         )?;
         let capture_inputs = self
@@ -696,7 +717,7 @@ mod tests {
             pruned.program().to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const capture#0:f64[]
                     %2:f64[] = add %0 %1
                 in (%2)
             "}
@@ -724,6 +745,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, vec![Array::scalar(101.0)]);
+    }
+
+    #[test]
+    fn test_closed_program_without_unused_captures_invalidates_only_on_renumbering() {
+        /// Array-captured program family this test prunes.
+        type TestClosedProgram = ClosedProgram<
+            Array,
+            CaptureReference<ArrayType>,
+            ArrayOperation<Array>,
+            Vec<CaptureReference<ArrayType>>,
+            Vec<CaptureReference<ArrayType>>,
+        >;
+
+        /// Builds `input + capture#<used_capture>` over a two-entry capture table.
+        fn closed_program(used_capture: usize) -> TestClosedProgram {
+            let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let capture = builder.add_constant(CaptureReference::new(used_capture, ArrayType::scalar(DataType::F64)));
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
+            let program = builder
+                .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            ClosedProgram::new(program, vec![Array::scalar(3.0), Array::scalar(99.0)]).unwrap()
+        }
+
+        // Dropping an unused trailing capture shifts no surviving capture, so no constant atom is rewritten and every
+        // region keeps the cell holding the transforms already derived from its contents.
+        let closed = closed_program(0);
+        let retained = closed.program().entry_region().transform_cache().clone();
+        let pruned = closed.without_unused_captures().unwrap();
+        assert_eq!(pruned.captures(), &[Array::scalar(3.0)]);
+        assert!(pruned.program().entry_region().transform_cache().is_shared_with(&retained));
+
+        // Dropping an unused leading capture renumbers the survivor, which changes what the rewritten constant atoms
+        // denote and must therefore detach every region from its retained transforms.
+        let closed = closed_program(1);
+        let retained = closed.program().entry_region().transform_cache().clone();
+        let pruned = closed.without_unused_captures().unwrap();
+        assert_eq!(pruned.captures(), &[Array::scalar(99.0)]);
+        assert!(!pruned.program().entry_region().transform_cache().is_shared_with(&retained));
+    }
+
+    #[test]
+    fn test_closed_program_without_unused_captures_invalidates_only_affected_regions() {
+        // Capture #0 survives at index 0 and is referenced only by the first attached region, capture #1 is unused and
+        // dropped, and capture #2 is referenced only by the second attached region and renumbers to #1. Only the
+        // second sibling's contents therefore change, and the entry region inherits that through the attachment.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut unchanged_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let unchanged_constant = unchanged_builder.add_constant(CaptureReference::new(0, scalar_type.clone()));
+        let unchanged_program = unchanged_builder
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
+                vec![unchanged_constant],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut renumbered_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let renumbered_constant = renumbered_builder.add_constant(CaptureReference::new(2, scalar_type.clone()));
+        let renumbered_program = renumbered_builder
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
+                vec![renumbered_constant],
+                Vec::<Placeholder>::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
+        let unchanged_region = builder.import_region(unchanged_program.entry_region_ref());
+        let renumbered_region = builder.import_region(renumbered_program.entry_region_ref());
+        let input = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(
+                    const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                ),
+                vec![unchanged_region, renumbered_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let closed =
+            ClosedProgram::new(program, vec![Array::scalar(1.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        let unchanged_cache = closed.program().regions()[0].transform_cache().clone();
+        let renumbered_cache = closed.program().regions()[1].transform_cache().clone();
+        let entry_cache = closed.program().entry_region().transform_cache().clone();
+
+        // The untouched sibling keeps both its reference and the transforms derived from it, while the rewritten
+        // sibling and the entry region that attaches it detach from theirs.
+        let pruned = closed.without_unused_captures().unwrap();
+        assert_eq!(pruned.captures(), &[Array::scalar(1.0), Array::scalar(3.0)]);
+        assert_eq!(pruned.program().regions()[0].atoms()[0].as_constant().map(CaptureReference::index), Some(0));
+        assert_eq!(pruned.program().regions()[1].atoms()[0].as_constant().map(CaptureReference::index), Some(1));
+        assert!(pruned.program().regions()[0].transform_cache().is_shared_with(&unchanged_cache));
+        assert!(!pruned.program().regions()[1].transform_cache().is_shared_with(&renumbered_cache));
+        assert!(!pruned.program().entry_region().transform_cache().is_shared_with(&entry_cache));
     }
 
     #[test]
@@ -949,7 +1075,7 @@ mod tests {
             lifted.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const
+                let %2:f64[] = const 5.0
                     %3:f64[] = add %1 %0
                     %4:f64[] = add %3 %2
                 in (%4)
