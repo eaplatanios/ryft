@@ -292,9 +292,12 @@ where
 /// # Tracing Pipeline
 ///
 /// ```mermaid
+/// %%{init: {"themeCSS": ".edgeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
-///   values["Example Input Values"] -->|"<code>trace</code> or <code>infer_output_type</code>"| root["TracingContext"]
-///   types["Domain + Input Types"] -->|"<code>Trace</code> Trait"| root
+///   values["Example Input Values"]
+///   root["TracingContext"]
+///   values -->|"&lt;code&gt;trace&lt;/code&gt; or &lt;code&gt;infer_output_type&lt;/code&gt;"| root
+///   types["Domain + Input Types"] -->|"&lt;code&gt;Trace&lt;/code&gt; Trait"| root
 ///   request["Nested Trace Request"] --> nested["NestedTracingContext"]
 ///   parent["Enclosing Context"] -->|"universe and capabilities"| nested
 ///   root --> root_state["Shared Builder, Capture Table, and Named Axes"]
