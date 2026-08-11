@@ -6,7 +6,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
+use crate::programs::{Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Value};
 
 /// Canonical operation name for [`TagOperation`].
 pub const TAG_OPERATION_NAME: &str = "tag";
@@ -44,7 +44,7 @@ impl<T: Type> TagOperation<T> {
 
 impl<T: Type> Display for TagOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{TAG_OPERATION_NAME}[{}]", self.key)
+        self.render(formatter, 0)
     }
 }
 
@@ -64,6 +64,12 @@ impl<T: Type> Operation for TagOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, TAG_OPERATION_NAME)?
+            .bracketed(|operation| operation.field("key", &self.key))
     }
 }
 

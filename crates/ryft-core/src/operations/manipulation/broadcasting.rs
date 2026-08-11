@@ -1256,7 +1256,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:dimension<columns ∈ [1, 9)>, %1:f32[2, 1] .
-                let %2:dimension<2> = const
+                let %2:dimension<2> = const 2
                     %3:f32[2, columns] = broadcast [output_axes=[0, 1]] %1 %2 %0
                 in (%3)
             "}

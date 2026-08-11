@@ -57,7 +57,9 @@ mod tests {
         let left = test_dimension_type("left", 2, 9);
         let right = test_dimension_type("right", 1, 5);
         let operation = DimensionSubOperation::new(&left, &right).unwrap();
-        assert_eq!(operation.to_string(), DIMENSION_SUB_OPERATION_NAME);
+        // These operand bounds admit an underflow, so the rendering carries the runtime-assertion classification that
+        // makes this instruction effectful.
+        assert_eq!(operation.to_string(), format!("{DIMENSION_SUB_OPERATION_NAME} [requires_runtime_assertion=true]"));
         assert_eq!(operation.result_bounds(), DimensionBounds::new(0, Some(8)).unwrap());
         assert_eq!(
             DimensionValue::constant(7).unwrap().sub(&DimensionValue::constant(3).unwrap()).unwrap().extent(),

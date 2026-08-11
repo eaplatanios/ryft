@@ -298,13 +298,23 @@ impl<T: Type> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        // A call whose operands are all differentiated renders as a bare name, so the non-differentiated split appears
-        // in rendered programs exactly where it exists.
+        // A call whose operands are all differentiated and that carries no optimization barrier renders as a bare name,
+        // so the non-differentiated split and the barrier appear in rendered programs exactly where they exist. Both
+        // are invisible to the types, and the barrier changes how a backend lowers this call.
         let operation = OperationFormatter::new(formatter, indentation, self.name())?;
-        if self.non_differentiated_count == 0 {
+        if self.non_differentiated_count == 0 && !self.prevent_cse {
             return Ok(());
         }
-        operation.bracketed(|operation| operation.field("non_differentiated_count", self.non_differentiated_count))
+        operation.bracketed(|operation| {
+            // TODO(eaplatanios): Why are the fields rendered in reverse order?
+            if self.non_differentiated_count > 0 {
+                operation.field("non_differentiated_count", self.non_differentiated_count)?;
+            }
+            if self.prevent_cse {
+                operation.field("prevent_cse", true)?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2171,8 +2181,7 @@ where
             // stay valid because the rest of the arena is carried over verbatim (the entry region's identifier is
             // assigned last, so the copied instructions' region ids are unchanged).
             let mut regions = source.regions().iter().cloned().collect::<Vec<_>>();
-            regions[source.entry().index()] =
-                Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions };
+            regions[source.entry().index()] = Region::new(atoms, source.input_ids().to_vec(), output_ids, instructions);
             let forward = Program::new(vec![Placeholder; input_count], output_structure, regions, source.entry())?;
             (forward.into_simplified()?, saved_types)
         };

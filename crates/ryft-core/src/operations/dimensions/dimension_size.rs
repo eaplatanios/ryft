@@ -615,10 +615,10 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[rows] .
-                let %1:dimension<1> = const
+                let %1:dimension<1> = const 1
                     %2:dimension<rows ∈ [1, 5)> = dimension_size [axis=0] %0
                     %3:dimension<rows + rows ∈ [2, 9)> = dimension_add %2 %2
-                    %4:f32[rows + rows] = concatenate [axis=0] %0 %0 %3
+                    %4:f32[rows + rows] = concatenate [axis=0, requires_runtime_assertion=true] %0 %0 %3
                     %5:f32[rows + rows, 1] = reshape %4 %3 %1
                 in (%5)"},
         );

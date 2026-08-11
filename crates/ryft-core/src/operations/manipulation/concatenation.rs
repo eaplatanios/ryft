@@ -109,10 +109,19 @@ impl<T: Type> ConcatenateOperation<T> {
         self.axis
     }
 
-    /// Renders this payload independently of its homogeneous or composite operation contract.
+    // TODO(eaplatanios): Why is this a separate function instead of being inlined in `ConcatenateOperation::render`?
+    /// Renders this payload independently of its homogeneous or composite operation contract. The runtime-assertion
+    /// classification is rendered only when it is set, because it decides this operation's effects and is not
+    /// recoverable from the rendered operand types: a signature that proves the result extent may still carry the
+    /// assertion (which is what the conversion from the homogeneous payload produces).
     fn render_operation(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?
-            .bracketed(|operation| operation.field("axis", self.axis))
+        OperationFormatter::new(formatter, indentation, CONCATENATE_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("axis", self.axis)?;
+            if self.requires_runtime_assertion {
+                operation.field("requires_runtime_assertion", true)?;
+            }
+            Ok(())
+        })
     }
 }
 

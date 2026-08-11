@@ -1376,7 +1376,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
-                let %2:dimension<2> = const
+                let %2:dimension<2> = const 2
                     %3:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
                 in (%3)
             "}

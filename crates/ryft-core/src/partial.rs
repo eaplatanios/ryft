@@ -1823,8 +1823,8 @@ mod tests {
             outer_program.to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = const
-                    %3:f64[] = const
+                let %2:f64[] = const [2.0]
+                    %3:f64[] = const [3.0]
                     %4:f64[] = mul %1 %2
                     %5:f64[] = add %4 %3
                 in (%5)
@@ -2138,7 +2138,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %1 %0
-                    %3:f64[] = const
+                    %3:f64[] = const [1.0]
                     %4:f64[] = add %2 %3
                     %5:f64[] = add %1 %0
                 in (%4, %5)
@@ -2194,7 +2194,7 @@ mod tests {
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %0 %0
                     %3:f64[] = mul %2 %1
-                    %4:f64[] = const
+                    %4:f64[] = const [1.0]
                     %5:f64[] = add %3 %4
                     %6:f64[] = add %2 %1
                 in (%2, %5, %6)
@@ -2282,7 +2282,7 @@ mod tests {
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = mul %1 %0
-                    %3:f64[] = const
+                    %3:f64[] = const [1.0]
                     %4:f64[] = add %2 %3
                 in (%4)
             "}
@@ -2301,7 +2301,7 @@ mod tests {
             outer_program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = const
+                let %1:f64[] = const [1.0]
                     %2:f64[] = mul %0 %0
                 in (%2)
             "}
