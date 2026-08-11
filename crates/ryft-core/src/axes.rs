@@ -1,10 +1,10 @@
 //! Defines positional array axes and dynamically scoped named axes used by array operations and program transforms.
 //!
-//! Positional [`Axis`] values identify dimensions within one concrete array rank. Named axes instead identify logical
-//! transform dimensions—such as a vectorized batch or device-mesh axis—through the active [`Context`] stack. The two
-//! forms meet inside operation-owned rules: a named binding supplies value-free scope metadata, while the rule
-//! supplies the physical dimension of each participating value when one exists. Refer to [`NamedAxes`] for a rendered
-//! diagram of named-axis lookup and consumption.
+//! Positional [`Axis`] values identify dimensions within one concrete array rank. Named axes instead identify
+//! logical transform dimensions—such as a vectorized batch or device-mesh axis—through the active [`Context`] stack.
+//! The two forms meet inside operation-owned rules: a named binding supplies value-free scope metadata, while the
+//! rule supplies the physical dimension of each participating value when one exists. Refer to [`NamedAxes`] for a
+//! rendered diagram of named-axis lookup and consumption.
 //!
 //! # Positional Axes
 //!
