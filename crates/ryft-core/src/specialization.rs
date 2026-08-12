@@ -509,10 +509,11 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
 
 #[cfg(test)]
 mod tests {
-    use std::hash::Hasher;
-    use std::panic::AssertUnwindSafe;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::{Barrier, OnceLock};
+    use std::fmt::{Debug, Formatter};
+    use std::hash::{Hash, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier, OnceLock};
     use std::thread;
 
     use pretty_assertions::assert_eq;
@@ -520,7 +521,7 @@ mod tests {
     use super::*;
 
     /// Extracts the producer from an entry that is expected to be vacant.
-    fn expect_producer<Key: Clone + Eq + Hash, Artifact: Clone>(
+    fn expect_vacant_producer<Key: Clone + Eq + Hash, Artifact: Clone>(
         entry: Result<SpecializationCacheEntry<'_, Key, Artifact>, ReentrantSpecializationError>,
     ) -> SpecializationCacheProducer<'_, Key, Artifact> {
         match entry {
@@ -531,7 +532,7 @@ mod tests {
     }
 
     /// Extracts the artifact from an entry that is expected to be occupied.
-    fn expect_hit<Key: Clone + Eq + Hash, Artifact: Clone>(
+    fn expect_occupied_artifact<Key: Clone + Eq + Hash, Artifact: Clone>(
         entry: Result<SpecializationCacheEntry<'_, Key, Artifact>, ReentrantSpecializationError>,
     ) -> Artifact {
         match entry {
@@ -542,9 +543,91 @@ mod tests {
     }
 
     #[test]
-    fn test_reuse_requires_key_equality_not_hash_equality() {
-        /// Key whose `Hash` implementation collides for every value while `Eq` still distinguishes values, pinning
-        /// that reuse is decided by equality alone.
+    fn test_specialization_cache_errors() {
+        let reentrant_error = ReentrantSpecializationError;
+        assert_eq!(
+            reentrant_error.to_string(),
+            "recursive request for a specialization that is already being produced on this thread",
+        );
+        assert_eq!(format!("{reentrant_error:?}"), "ReentrantSpecializationError");
+
+        let cache_error = SpecializationCacheError::<&str>::from(reentrant_error);
+        assert_eq!(
+            cache_error.to_string(),
+            "recursive request for a specialization that is already being produced on this thread",
+        );
+        assert_eq!(format!("{cache_error:?}"), "Reentrant(ReentrantSpecializationError)");
+
+        let production_error = SpecializationCacheError::Production("production failed");
+        assert_eq!(production_error.to_string(), "production failed");
+        assert_eq!(format!("{production_error:?}"), "Production(\"production failed\")");
+    }
+
+    #[test]
+    fn test_specialization_cache_debug_does_not_format_entries() {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct UnformattableKey(u32);
+
+        impl Debug for UnformattableKey {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                let _formatter = formatter;
+                panic!("cache debug must not format retained keys")
+            }
+        }
+
+        #[derive(Clone)]
+        struct UnformattableArtifact;
+
+        impl Debug for UnformattableArtifact {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                let _formatter = formatter;
+                panic!("cache debug must not format retained artifacts")
+            }
+        }
+
+        let cache = SpecializationCache::new(2);
+        expect_vacant_producer(cache.try_entry(UnformattableKey(1))).insert(UnformattableArtifact);
+
+        assert_eq!(
+            format!("{cache:?}"),
+            "SpecializationCache { len: 1, capacity: 2, statistics: SpecializationCacheStatistics { hits: 0, \
+             misses: 1, productions: 1, abandoned_productions: 0, evictions: 0 }, .. }",
+        );
+    }
+
+    #[test]
+    fn test_specialization_cache_new() {
+        let cache = SpecializationCache::<u32, &'static str>::new(2);
+        assert_eq!(cache.capacity(), 2);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.keys(), Vec::<u32>::new());
+
+        // Zero capacity is clamped to one so that a producer's work is never discarded immediately.
+        let clamped_cache = SpecializationCache::<u32, &'static str>::new(0);
+        assert_eq!(clamped_cache.capacity(), 1);
+    }
+
+    #[test]
+    fn test_specialization_cache_try_entry_refreshes_lru_recency() {
+        let cache = SpecializationCache::<u32, &'static str>::new(2);
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        assert_eq!(cache.keys(), vec![2, 1]);
+
+        // A hit refreshes recency, so the other key becomes the eviction candidate.
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one");
+        assert_eq!(cache.keys(), vec![1, 2]);
+        expect_vacant_producer(cache.try_entry(3)).insert("three");
+        assert_eq!(cache.keys(), vec![3, 1]);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.statistics().evictions, 1);
+    }
+
+    #[test]
+    fn test_specialization_cache_try_entry_uses_key_equality() {
+        // Key whose `Hash` implementation collides for every value while `Eq` still distinguishes values, pinning
+        // that reuse is decided by equality alone.
         #[derive(Clone, Debug, PartialEq, Eq)]
         struct CollidingKey(u32);
 
@@ -555,55 +638,193 @@ mod tests {
         }
 
         let cache = SpecializationCache::<CollidingKey, &'static str>::new(4);
-        expect_producer(cache.try_entry(CollidingKey(1))).insert("one");
-        expect_producer(cache.try_entry(CollidingKey(2))).insert("two");
+        expect_vacant_producer(cache.try_entry(CollidingKey(1))).insert("one");
+        expect_vacant_producer(cache.try_entry(CollidingKey(2))).insert("two");
 
         // Colliding hashes must not alias: each key keeps its own artifact.
-        assert_eq!(expect_hit(cache.try_entry(CollidingKey(1))), "one");
-        assert_eq!(expect_hit(cache.try_entry(CollidingKey(2))), "two");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(CollidingKey(1))), "one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(CollidingKey(2))), "two");
         assert_eq!(cache.len(), 2);
 
         // An equal key reuses, and an unequal key with the same hash still misses.
-        expect_producer(cache.try_entry(CollidingKey(3)));
+        drop(expect_vacant_producer(cache.try_entry(CollidingKey(3))));
         assert_eq!(cache.statistics().misses, 3);
     }
 
     #[test]
-    fn test_bounded_lru_recency_eviction_and_capacity_clamping() {
-        let cache = SpecializationCache::<u32, &'static str>::new(2);
-        assert_eq!(cache.capacity(), 2);
-        assert!(cache.is_empty());
+    fn test_specialization_cache_producer_insert() {
+        let cache = SpecializationCache::<u32, String>::new(4);
+        let producer = expect_vacant_producer(cache.try_entry(7));
+        assert_eq!(producer.key(), &7);
 
-        expect_producer(cache.try_entry(1)).insert("one");
-        expect_producer(cache.try_entry(2)).insert("two");
-        assert_eq!(cache.keys(), vec![2, 1]);
-
-        // A hit refreshes recency, so the *other* key becomes the eviction candidate.
-        assert_eq!(expect_hit(cache.try_entry(1)), "one");
-        assert_eq!(cache.keys(), vec![1, 2]);
-        expect_producer(cache.try_entry(3)).insert("three");
-        assert_eq!(cache.keys(), vec![3, 1]);
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.statistics().evictions, 1);
-
-        // Zero capacity is clamped to one so that a producer's work is never discarded immediately.
-        let clamped = SpecializationCache::<u32, &'static str>::new(0);
-        assert_eq!(clamped.capacity(), 1);
-        expect_producer(clamped.try_entry(1)).insert("one");
-        expect_producer(clamped.try_entry(2)).insert("two");
-        assert_eq!(clamped.keys(), vec![2]);
-        assert_eq!(clamped.statistics().evictions, 1);
+        let artifact = producer.insert("compiled".to_string());
+        assert_eq!(artifact, "compiled");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(7)), "compiled");
     }
 
     #[test]
-    fn test_statistics_counting_and_clearing() {
+    fn test_specialization_cache_try_entry_rejects_same_thread_same_key_reentrancy() {
+        let cache = SpecializationCache::<u32, &'static str>::new(4);
+        let producer = expect_vacant_producer(cache.try_entry(1));
+
+        // Recursively producing the in-flight key cannot terminate, so it is rejected rather than awaited.
+        assert!(matches!(cache.try_entry(1), Err(ReentrantSpecializationError)));
+
+        // Nested production of a different key is legitimate and proceeds.
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        producer.insert("one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(2)), "two");
+
+        // The marker is released once production completes, so the same key can be produced again.
+        cache.clear();
+        expect_vacant_producer(cache.try_entry(1)).insert("one again");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one again");
+    }
+
+    #[test]
+    fn test_specialization_cache_producer_drop_releases_marker() {
+        let cache = SpecializationCache::<u32, &'static str>::new(4);
+
+        drop(expect_vacant_producer(cache.try_entry(1)));
+        assert!(cache.is_empty());
+        assert_eq!(cache.statistics().abandoned_productions, 1);
+
+        // Releasing the marker makes the same key immediately producible again.
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one");
+    }
+
+    #[test]
+    fn test_specialization_cache_producer_drop_releases_marker_after_panic() {
+        let cache = SpecializationCache::<u32, &'static str>::new(4);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let producer = expect_vacant_producer(cache.try_entry(1));
+            assert_eq!(producer.key(), &1);
+            panic!("production panicked");
+        }));
+        assert!(panicked.is_err());
+
+        // The unwound producer's `Drop` cleared the in-flight marker and cached nothing.
+        assert!(cache.is_empty());
+        assert_eq!(cache.statistics().abandoned_productions, 1);
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one");
+    }
+
+    #[test]
+    fn test_specialization_cache_get_or_try_insert_with() {
+        let cache = SpecializationCache::<u32, &'static str>::new(4);
+
+        let producer = expect_vacant_producer(cache.try_entry(1));
+        assert_eq!(
+            cache.get_or_try_insert_with::<&'static str, _>(1, || panic!("must reject before producing")),
+            Err(SpecializationCacheError::Reentrant(ReentrantSpecializationError)),
+        );
+        drop(producer);
+
+        let failed = cache.get_or_try_insert_with(1, || Err::<&'static str, _>("production failed"));
+        assert_eq!(failed, Err(SpecializationCacheError::Production("production failed")));
+        assert!(cache.is_empty());
+
+        assert_eq!(cache.get_or_try_insert_with::<&'static str, _>(1, || Ok("one")), Ok("one"));
+        assert_eq!(cache.get_or_try_insert_with::<&'static str, _>(1, || panic!("must not reproduce")), Ok("one"));
+        assert_eq!(
+            cache.statistics(),
+            SpecializationCacheStatistics {
+                hits: 1,
+                misses: 4,
+                productions: 1,
+                abandoned_productions: 2,
+                evictions: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_specialization_cache_clear() {
+        let cache = SpecializationCache::<u32, &'static str>::new(8);
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        let producer = expect_vacant_producer(cache.try_entry(3));
+        let statistics = cache.statistics();
+
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.statistics(), statistics);
+
+        // Clearing does not cancel an active producer, which may still publish afterwards.
+        producer.insert("three");
+        assert_eq!(cache.keys(), vec![3]);
+    }
+
+    #[test]
+    fn test_specialization_cache_invalidate_entries_if() {
+        let cache = SpecializationCache::<u32, &'static str>::new(8);
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        expect_vacant_producer(cache.try_entry(3)).insert("three");
+
+        // Selective invalidation reports how many retained keys it removed.
+        assert_eq!(cache.invalidate_entries_if(|key| key % 2 == 1), 2);
+        assert_eq!(cache.keys(), vec![2]);
+        assert_eq!(cache.invalidate_entries_if(|key| *key == 99), 0);
+
+        // Removal is not eviction, so the eviction counter stays untouched.
+        assert_eq!(cache.statistics().evictions, 0);
+
+        // Selection uses the original key snapshot, but removal targets the current equality class. A post-snapshot
+        // key is never offered to the predicate, while an equal replacement of a selected key is removed.
+        cache.clear();
+        expect_vacant_producer(cache.try_entry(1)).insert("original");
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        let mut offered_keys = Vec::new();
+        assert_eq!(
+            cache.invalidate_entries_if(|key| {
+                if offered_keys.is_empty() {
+                    cache.clear();
+                    expect_vacant_producer(cache.try_entry(1)).insert("replacement");
+                    expect_vacant_producer(cache.try_entry(3)).insert("post-snapshot");
+                }
+                offered_keys.push(*key);
+                *key == 1
+            }),
+            1,
+        );
+        assert_eq!(offered_keys, vec![2, 1]);
+        assert_eq!(cache.keys(), vec![3]);
+    }
+
+    #[test]
+    fn test_specialization_cache_invalidate_entries_if_runs_predicate_outside_locks() {
+        let cache = SpecializationCache::<u32, &'static str>::new(8);
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
+        expect_vacant_producer(cache.try_entry(3)).insert("three");
+
+        // The predicate observes the full snapshot while it runs, which pins that removal happens afterwards,
+        // and it reenters the cache without deadlocking because no lock is held while it runs.
+        assert_eq!(cache.invalidate_entries_if(|key| cache.len() == 3 && key % 2 == 1), 2);
+        assert_eq!(cache.keys(), vec![2]);
+
+        // A panicking predicate poisons nothing, because the panic unwinds with no cache lock held.
+        let panicked = catch_unwind(AssertUnwindSafe(|| cache.invalidate_entries_if(|_| panic!("predicate panicked"))));
+        assert!(panicked.is_err());
+        assert_eq!(cache.keys(), vec![2]);
+        expect_vacant_producer(cache.try_entry(4)).insert("four");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(2)), "two");
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_specialization_cache_statistics_and_clear_statistics() {
         let cache = SpecializationCache::<u32, &'static str>::new(1);
         assert_eq!(cache.statistics(), SpecializationCacheStatistics::default());
 
-        expect_producer(cache.try_entry(1)).insert("one");
-        let _ = expect_hit(cache.try_entry(1));
-        drop(expect_producer(cache.try_entry(2)));
-        expect_producer(cache.try_entry(2)).insert("two");
+        expect_vacant_producer(cache.try_entry(1)).insert("one");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "one");
+        drop(expect_vacant_producer(cache.try_entry(2)));
+        expect_vacant_producer(cache.try_entry(2)).insert("two");
         assert_eq!(
             cache.statistics(),
             SpecializationCacheStatistics {
@@ -618,181 +839,104 @@ mod tests {
         // Clearing statistics leaves the retained artifacts alone.
         cache.clear_statistics();
         assert_eq!(cache.statistics(), SpecializationCacheStatistics::default());
-        assert_eq!(expect_hit(cache.try_entry(2)), "two");
+        assert_eq!(expect_occupied_artifact(cache.try_entry(2)), "two");
         assert_eq!(cache.statistics(), SpecializationCacheStatistics { hits: 1, ..Default::default() });
     }
 
     #[test]
-    fn test_failed_production_caches_nothing_and_retries() {
-        let cache = SpecializationCache::<u32, &'static str>::new(4);
-
-        // Dropping a producer without inserting must leave no entry and no in-flight marker.
-        drop(expect_producer(cache.try_entry(1)));
-        assert!(cache.is_empty());
-        assert_eq!(cache.statistics().abandoned_productions, 1);
-
-        // The convenience entry point propagates production errors without caching them.
-        let failed = cache.get_or_try_insert_with(1, || Err::<&'static str, _>("production failed"));
-        assert!(matches!(failed, Err(SpecializationCacheError::Production(message)) if message == "production failed"));
-        assert!(cache.is_empty());
-
-        // A later attempt for the same key retries from scratch and succeeds.
-        assert_eq!(cache.get_or_try_insert_with::<&'static str, _>(1, || Ok("one")), Ok("one"));
-        assert_eq!(cache.get_or_try_insert_with::<&'static str, _>(1, || panic!("must not reproduce")), Ok("one"));
+    fn test_specialization_cache_statistics_accumulator() {
+        let statistics = SpecializationCacheStatisticsAccumulator::default();
+        statistics.increment_hits();
+        statistics.increment_misses();
+        statistics.increment_productions();
+        statistics.increment_abandoned_productions();
+        statistics.increment_evictions();
         assert_eq!(
-            cache.statistics(),
+            statistics.snapshot(),
             SpecializationCacheStatistics {
                 hits: 1,
-                misses: 3,
+                misses: 1,
                 productions: 1,
-                abandoned_productions: 2,
-                evictions: 0
+                abandoned_productions: 1,
+                evictions: 1,
+            },
+        );
+
+        statistics.reset();
+        assert_eq!(statistics.snapshot(), SpecializationCacheStatistics::default());
+
+        // Every counter saturates instead of wrapping.
+        statistics.hits.store(u64::MAX, Ordering::Relaxed);
+        statistics.misses.store(u64::MAX, Ordering::Relaxed);
+        statistics.productions.store(u64::MAX, Ordering::Relaxed);
+        statistics.abandoned_productions.store(u64::MAX, Ordering::Relaxed);
+        statistics.evictions.store(u64::MAX, Ordering::Relaxed);
+
+        statistics.increment_hits();
+        statistics.increment_misses();
+        statistics.increment_productions();
+        statistics.increment_abandoned_productions();
+        statistics.increment_evictions();
+
+        assert_eq!(
+            statistics.snapshot(),
+            SpecializationCacheStatistics {
+                hits: u64::MAX,
+                misses: u64::MAX,
+                productions: u64::MAX,
+                abandoned_productions: u64::MAX,
+                evictions: u64::MAX,
             },
         );
     }
 
     #[test]
-    fn test_panicking_production_unwinds_cleanly() {
-        let cache = SpecializationCache::<u32, &'static str>::new(4);
-        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let producer = expect_producer(cache.try_entry(1));
-            assert_eq!(producer.key(), &1);
-            panic!("production panicked");
-        }));
-        assert!(panicked.is_err());
-
-        // The unwound producer's `Drop` cleared the in-flight marker and cached nothing.
-        assert!(cache.is_empty());
-        assert_eq!(cache.statistics().abandoned_productions, 1);
-        expect_producer(cache.try_entry(1)).insert("one");
-        assert_eq!(expect_hit(cache.try_entry(1)), "one");
-    }
-
-    #[test]
-    fn test_same_thread_same_key_reentrancy_is_rejected() {
-        let cache = SpecializationCache::<u32, &'static str>::new(4);
-        let producer = expect_producer(cache.try_entry(1));
-
-        // Recursively producing the in-flight key cannot terminate, so it is rejected rather than awaited.
-        assert!(matches!(cache.try_entry(1), Err(ReentrantSpecializationError)));
-        assert_eq!(
-            ReentrantSpecializationError.to_string(),
-            "recursive request for a specialization that is already being produced on this thread",
-        );
-
-        // Nested production of a *different* key is legitimate and proceeds.
-        expect_producer(cache.try_entry(2)).insert("two");
-        producer.insert("one");
-        assert_eq!(expect_hit(cache.try_entry(1)), "one");
-        assert_eq!(expect_hit(cache.try_entry(2)), "two");
-
-        // The marker is released once production completes, so the same key can be produced again.
-        cache.clear();
-        expect_producer(cache.try_entry(1)).insert("one again");
-        assert_eq!(expect_hit(cache.try_entry(1)), "one again");
-    }
-
-    #[test]
-    fn test_clear_and_selective_invalidation() {
-        let cache = SpecializationCache::<u32, &'static str>::new(8);
-        expect_producer(cache.try_entry(1)).insert("one");
-        expect_producer(cache.try_entry(2)).insert("two");
-        expect_producer(cache.try_entry(3)).insert("three");
-
-        // Selective invalidation reports how many retained keys it removed.
-        assert_eq!(cache.invalidate_entries_if(|key| key % 2 == 1), 2);
-        assert_eq!(cache.keys(), vec![2]);
-        assert_eq!(cache.invalidate_entries_if(|key| *key == 99), 0);
-
-        // Removal is not eviction, so the eviction counter stays untouched.
-        assert_eq!(cache.statistics().evictions, 0);
-
-        // Clearing does not cancel an active producer, which may still publish afterwards.
-        let producer = expect_producer(cache.try_entry(4));
-        cache.clear();
-        assert!(cache.is_empty());
-        producer.insert("four");
-        assert_eq!(cache.keys(), vec![4]);
-    }
-
-    #[test]
-    fn test_thread_safety_is_structural_and_conditional() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        // Thread safety derives from the `Mutex`/`AtomicU64` state; there are no `unsafe impl`s in this module.
-        assert_send_and_sync::<SpecializationCache<u32, &'static str>>();
-        assert_send_and_sync::<SpecializationCacheStatistics>();
-        assert_send_and_sync::<ReentrantSpecializationError>();
-
-        // `SpecializationCacheProducer` is deliberately *not* `Send` or `Sync`, because its in-flight marker is keyed
-        // by the thread that looked the key up. That negative bound is enforced by the guard's `PhantomData<*mut ()>`
-        // marker and can only be observed as a compilation failure, which needs a compile-fail harness this crate
-        // intentionally does not depend on, and so it is pinned here as documentation rather than as an assertion.
-    }
-
-    #[test]
-    fn test_invalidation_predicate_runs_outside_the_locks() {
-        let cache = SpecializationCache::<u32, &'static str>::new(8);
-        expect_producer(cache.try_entry(1)).insert("one");
-        expect_producer(cache.try_entry(2)).insert("two");
-        expect_producer(cache.try_entry(3)).insert("three");
-
-        // The predicate observes the full snapshot while it runs, which pins that removal happens afterwards,
-        // and it reenters the cache without deadlocking because no lock is held while it runs.
-        assert_eq!(cache.invalidate_entries_if(|key| cache.len() == 3 && key % 2 == 1), 2);
-        assert_eq!(cache.keys(), vec![2]);
-
-        // A panicking predicate poisons nothing, because the panic unwinds with no cache lock held.
-        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            cache.invalidate_entries_if(|_| panic!("predicate panicked"))
-        }));
-        assert!(panicked.is_err());
-        assert_eq!(cache.keys(), vec![2]);
-        expect_producer(cache.try_entry(4)).insert("four");
-        assert_eq!(expect_hit(cache.try_entry(2)), "two");
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
-    fn test_removed_artifacts_are_dropped_outside_the_locks() {
-        /// Artifact whose destructor reads the cache holding it, which deadlocks unless every removal drops its
-        /// artifact after releasing the retained map's lock.
+    fn test_specialization_cache_removes_artifacts_outside_locks() {
+        // Artifact whose destructor reads the cache holding it, which deadlocks unless every removal drops its
+        // artifact after releasing the retained map's lock.
         #[derive(Clone)]
-        struct ReenteringArtifact(&'static SpecializationCache<u32, ReenteringArtifact>);
+        struct ReenteringArtifact(&'static SpecializationCache<u32, ReenteringArtifact>, u64);
 
         impl Drop for ReenteringArtifact {
             fn drop(&mut self) {
-                DROPS.fetch_add(self.0.len() as u64 + 1, Ordering::Relaxed);
+                let _cache_length = self.0.len();
+                REMOVAL_PATHS.fetch_or(self.1, Ordering::Relaxed);
             }
         }
 
-        /// Counts destructor runs, weighted so that a destructor that failed to observe the cache is visible.
-        static DROPS: AtomicU64 = AtomicU64::new(0);
+        const EVICTION: u64 = 1 << 0;
+        const INVALIDATION: u64 = 1 << 1;
+        const CLEARING: u64 = 1 << 2;
+        static REMOVAL_PATHS: AtomicU64 = AtomicU64::new(0);
 
         // The cache is leaked so that artifacts can name it for their whole lifetime, which is what lets a destructor
         // reenter it at all.
         let cache: &'static SpecializationCache<u32, ReenteringArtifact> =
             Box::leak(Box::new(SpecializationCache::new(1)));
+        REMOVAL_PATHS.store(0, Ordering::Relaxed);
 
         // Eviction replaces a retained artifact, invalidation removes selected ones, and clearing removes all of them.
-        expect_producer(cache.try_entry(1)).insert(ReenteringArtifact(cache));
-        expect_producer(cache.try_entry(2)).insert(ReenteringArtifact(cache));
+        let _eviction_artifact = expect_vacant_producer(cache.try_entry(1)).insert(ReenteringArtifact(cache, EVICTION));
+        let _invalidation_artifact =
+            expect_vacant_producer(cache.try_entry(2)).insert(ReenteringArtifact(cache, INVALIDATION));
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION);
         assert_eq!(cache.statistics().evictions, 1);
+
         assert_eq!(cache.invalidate_entries_if(|key| *key == 2), 1);
-        assert!(cache.is_empty());
-        expect_producer(cache.try_entry(3)).insert(ReenteringArtifact(cache));
-        cache.clear();
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION | INVALIDATION);
         assert!(cache.is_empty());
 
-        // Every removal path ran at least one destructor that read the cache and observed a consistent length.
-        assert!(DROPS.load(Ordering::Relaxed) >= 3);
+        let _clearing_artifact = expect_vacant_producer(cache.try_entry(3)).insert(ReenteringArtifact(cache, CLEARING));
+        cache.clear();
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION | INVALIDATION | CLEARING);
+        assert!(cache.is_empty());
     }
 
     #[test]
-    fn test_insertion_publishes_and_releases_before_dropping_the_displaced_artifact() {
-        /// Artifact whose destructor panics exactly once, after it has been armed. Arming it only once the artifact
-        /// is retained keeps every other copy's destructor harmless, and disarming inside the destructor keeps the
-        /// panic from firing again while the stack unwinds (which would abort the process).
+    fn test_specialization_cache_producer_insert_publishes_before_dropping_displaced_artifact() {
+        // Artifact whose destructor panics exactly once, after it has been armed. Arming it only once the artifact
+        // is retained keeps every other copy's destructor harmless, and disarming inside the destructor keeps the
+        // panic from firing again while the stack unwinds (which would abort the process).
         #[derive(Clone)]
         struct PanickingArtifact;
 
@@ -804,16 +948,16 @@ mod tests {
             }
         }
 
-        /// Whether the next destructor run must panic.
+        // Whether the next destructor run must panic.
         static ARMED: AtomicBool = AtomicBool::new(false);
 
         let cache = SpecializationCache::<u32, PanickingArtifact>::new(1);
-        expect_producer(cache.try_entry(1)).insert(PanickingArtifact);
+        expect_vacant_producer(cache.try_entry(1)).insert(PanickingArtifact);
         ARMED.store(true, Ordering::Relaxed);
 
         // Inserting a second key displaces the armed artifact, whose destructor unwinds out of the insertion.
-        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            expect_producer(cache.try_entry(2)).insert(PanickingArtifact);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            expect_vacant_producer(cache.try_entry(2)).insert(PanickingArtifact);
         }));
         assert!(panicked.is_err());
 
@@ -835,58 +979,121 @@ mod tests {
     }
 
     #[test]
-    fn test_removed_keys_are_dropped_outside_the_locks() {
-        /// Key whose destructor reenters the cache holding it, which deadlocks unless every owned key is dropped
-        /// after the guard that reached it has been released.
-        #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-        struct ReenteringKey(u32);
+    fn test_specialization_cache_removes_keys_outside_locks() {
+        // Key whose destructor reenters the cache holding it, which deadlocks unless every owned key is dropped
+        // after the guard that reached it has been released.
+        #[derive(Clone, Debug)]
+        struct ReenteringKey {
+            value: u32,
+            removal_path: u64,
+            armed: Arc<AtomicBool>,
+        }
+
+        impl ReenteringKey {
+            // Creates a key whose next clone to be dropped records `removal_path` and reenters the cache.
+            fn armed(value: u32, removal_path: u64) -> (Self, Arc<AtomicBool>) {
+                let armed = Arc::new(AtomicBool::new(false));
+                (Self { value, removal_path, armed: armed.clone() }, armed)
+            }
+
+            // Creates a key whose destructor does not reenter the cache.
+            fn unarmed(value: u32) -> Self {
+                Self { value, removal_path: 0, armed: Arc::new(AtomicBool::new(false)) }
+            }
+        }
+
+        impl PartialEq for ReenteringKey {
+            fn eq(&self, other: &Self) -> bool {
+                self.value == other.value
+            }
+        }
+
+        impl Eq for ReenteringKey {}
+
+        impl Hash for ReenteringKey {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                self.value.hash(state);
+            }
+        }
 
         impl Drop for ReenteringKey {
             fn drop(&mut self) {
-                // The reentry below itself drops keys, so it is performed once per destructor chain rather than
-                // recursing forever.
-                if REENTERED.swap(true, Ordering::Relaxed) {
+                if !self.armed.swap(false, Ordering::Relaxed) {
                     return;
                 }
 
                 // `len` reenters the retained map's lock and the nested lookup additionally reenters the in-flight
-                // lock, so a key dropped under either guard deadlocks here. The count is weighted so that a
-                // destructor that failed to observe the cache is visible.
+                // lock, so a key dropped under either guard deadlocks here.
                 let cache = CACHE.get().unwrap();
-                DROPS.fetch_add(cache.len() as u64 + 1, Ordering::Relaxed);
-                drop(expect_producer(cache.try_entry(ReenteringKey(u32::MAX))));
-                REENTERED.store(false, Ordering::Relaxed);
+                let _cache_length = cache.len();
+                drop(expect_vacant_producer(cache.try_entry(ReenteringKey::unarmed(u32::MAX))));
+                REMOVAL_PATHS.fetch_or(self.removal_path, Ordering::Relaxed);
             }
         }
 
-        /// Cache the destructors above reenter. It is leaked so that keys can name it for their whole lifetime.
+        // Cache the destructors above reenter. It is leaked so that keys can name it for their whole lifetime.
         static CACHE: OnceLock<&'static SpecializationCache<ReenteringKey, &'static str>> = OnceLock::new();
+        static REMOVAL_PATHS: AtomicU64 = AtomicU64::new(0);
 
-        /// Whether a destructor chain is already reentering the cache.
-        static REENTERED: AtomicBool = AtomicBool::new(false);
-
-        /// Counts destructor runs, weighted by the cache length each one observed.
-        static DROPS: AtomicU64 = AtomicU64::new(0);
+        const EVICTION: u64 = 1 << 0;
+        const INVALIDATION: u64 = 1 << 1;
+        const CLEARING: u64 = 1 << 2;
+        const REJECTED_REGISTRATION: u64 = 1 << 3;
+        const INSERTION_MARKER: u64 = 1 << 4;
+        const ABANDONED_MARKER: u64 = 1 << 5;
 
         let cache: &'static SpecializationCache<ReenteringKey, &'static str> =
-            Box::leak(Box::new(SpecializationCache::new(4)));
+            Box::leak(Box::new(SpecializationCache::new(1)));
         CACHE.set(cache).unwrap();
+        REMOVAL_PATHS.store(0, Ordering::Relaxed);
 
-        // A rejected duplicate registration drops the offered key, a successful insertion drops both the released
-        // marker and the key it was offered under, and a producer dropped without inserting drops the marker it
-        // releases.
-        let producer = expect_producer(cache.try_entry(ReenteringKey(1)));
-        assert!(matches!(cache.try_entry(ReenteringKey(1)), Err(ReentrantSpecializationError)));
-        producer.insert("one");
-        drop(expect_producer(cache.try_entry(ReenteringKey(2))));
+        // Retained keys are dropped through eviction, invalidation, and clearing.
+        let (eviction_key, eviction_armed) = ReenteringKey::armed(1, EVICTION);
+        expect_vacant_producer(cache.try_entry(eviction_key)).insert("one");
+        eviction_armed.store(true, Ordering::Relaxed);
 
-        // Every path above ran at least one destructor that read the cache and observed a consistent length.
-        assert!(DROPS.load(Ordering::Relaxed) >= 3);
-        assert_eq!(cache.keys(), vec![ReenteringKey(1)]);
+        let (invalidation_key, invalidation_armed) = ReenteringKey::armed(2, INVALIDATION);
+        expect_vacant_producer(cache.try_entry(invalidation_key)).insert("two");
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION);
+        invalidation_armed.store(true, Ordering::Relaxed);
+        assert_eq!(cache.invalidate_entries_if(|key| key.value == 2), 1);
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION | INVALIDATION);
+
+        let (clearing_key, clearing_armed) = ReenteringKey::armed(3, CLEARING);
+        expect_vacant_producer(cache.try_entry(clearing_key)).insert("three");
+        clearing_armed.store(true, Ordering::Relaxed);
+        cache.clear();
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION | INVALIDATION | CLEARING);
+
+        // In-flight keys are dropped after rejected registration, successful insertion, and abandoned production.
+        let (rejected_key, rejected_armed) = ReenteringKey::armed(4, REJECTED_REGISTRATION);
+        let rejected_producer = expect_vacant_producer(cache.try_entry(rejected_key));
+        rejected_armed.store(true, Ordering::Relaxed);
+        assert!(matches!(cache.try_entry(ReenteringKey::unarmed(4)), Err(ReentrantSpecializationError)));
+        assert_eq!(REMOVAL_PATHS.load(Ordering::Relaxed), EVICTION | INVALIDATION | CLEARING | REJECTED_REGISTRATION,);
+        drop(rejected_producer);
+
+        let (insertion_key, insertion_armed) = ReenteringKey::armed(5, INSERTION_MARKER);
+        let insertion_producer = expect_vacant_producer(cache.try_entry(insertion_key));
+        insertion_armed.store(true, Ordering::Relaxed);
+        insertion_producer.insert("five");
+        assert_eq!(
+            REMOVAL_PATHS.load(Ordering::Relaxed),
+            EVICTION | INVALIDATION | CLEARING | REJECTED_REGISTRATION | INSERTION_MARKER,
+        );
+
+        let (abandoned_key, abandoned_armed) = ReenteringKey::armed(6, ABANDONED_MARKER);
+        let abandoned_producer = expect_vacant_producer(cache.try_entry(abandoned_key));
+        abandoned_armed.store(true, Ordering::Relaxed);
+        drop(abandoned_producer);
+        assert_eq!(
+            REMOVAL_PATHS.load(Ordering::Relaxed),
+            EVICTION | INVALIDATION | CLEARING | REJECTED_REGISTRATION | INSERTION_MARKER | ABANDONED_MARKER,
+        );
     }
 
     #[test]
-    fn test_concurrent_cold_misses_both_produce_one_consistent_entry() {
+    fn test_specialization_cache_try_entry_allows_concurrent_same_key_production() {
         let cache = SpecializationCache::<u32, String>::new(4);
         let barrier = Barrier::new(2);
         thread::scope(|scope| {
@@ -894,7 +1101,7 @@ mod tests {
                 scope.spawn(|| {
                     // The barrier pins that both lookups miss before either producer publishes, so this exercises
                     // genuine cross-thread duplicate production rather than a hit after a race.
-                    let producer = expect_producer(cache.try_entry(1));
+                    let producer = expect_vacant_producer(cache.try_entry(1));
                     barrier.wait();
                     producer.insert("compiled".to_string());
                 });
@@ -904,7 +1111,7 @@ mod tests {
         // Duplicate production is allowed across threads and inserts are idempotent, so one entry remains. The second
         // insert replaces the first rather than evicting anything, which the zero eviction count below pins.
         assert_eq!(cache.len(), 1);
-        assert_eq!(expect_hit(cache.try_entry(1)), "compiled".to_string());
+        assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "compiled".to_string());
         assert_eq!(
             cache.statistics(),
             SpecializationCacheStatistics {
@@ -918,19 +1125,34 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_hits_on_a_warm_cache() {
+    fn test_specialization_cache_try_entry_serves_concurrent_hits() {
         let cache = SpecializationCache::<u32, String>::new(4);
-        expect_producer(cache.try_entry(1)).insert("compiled".to_string());
+        expect_vacant_producer(cache.try_entry(1)).insert("compiled".to_string());
         cache.clear_statistics();
         let barrier = Barrier::new(4);
         thread::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| {
                     barrier.wait();
-                    assert_eq!(expect_hit(cache.try_entry(1)), "compiled".to_string());
+                    assert_eq!(expect_occupied_artifact(cache.try_entry(1)), "compiled".to_string());
                 });
             }
         });
         assert_eq!(cache.statistics(), SpecializationCacheStatistics { hits: 4, ..Default::default() });
+    }
+
+    #[test]
+    fn test_specialization_cache_is_send_and_sync() {
+        fn assert_send_and_sync<T: Send + Sync>() {}
+
+        // Thread safety derives from the `Mutex`/`AtomicU64` state; there are no `unsafe impl`s in this module.
+        assert_send_and_sync::<SpecializationCache<u32, &'static str>>();
+        assert_send_and_sync::<SpecializationCacheStatistics>();
+        assert_send_and_sync::<ReentrantSpecializationError>();
+
+        // `SpecializationCacheProducer` is deliberately not `Send` or `Sync`, because its in-flight marker is keyed
+        // by the thread that looked the key up. That negative bound is enforced by the guard's `PhantomData<*mut ()>`
+        // marker and can only be observed as a compilation failure, which needs a compile-fail harness this crate
+        // intentionally does not depend on, and so it is pinned here as documentation rather than as an assertion.
     }
 }
