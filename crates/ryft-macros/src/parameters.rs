@@ -662,6 +662,135 @@ impl CodeGenerator {
         }));
     }
 
+    /// Generates the associated iterator type portion for the provided [`Field`]s. This includes both unnamed
+    /// iterators (i.e., [`Parameterized::ParameterIterator`], [`Parameterized::ParameterIteratorMut`], and
+    /// [`Parameterized::ParameterIntoIterator`]) and named iterators (i.e., [`Parameterized::NamedParameterIterator`],
+    /// [`Parameterized::NamedParameterIteratorMut`], and [`Parameterized::NamedParameterIntoIterator`]). The resulting
+    /// [`TokenStream`] contains an expression that evaluates to the appropriate type and that can be nested directly
+    /// within the generic arguments of other types (e.g., for nested tuples), which is also why both the
+    /// associated-type declarations and the generated iterator expressions (whose `Option` field closures are cast to
+    /// the exact `fn` pointer types spelled here), call this method. It is the responsibility of the caller to nest
+    /// this appropriately within other types, if needed, and to generate the surrounding code for the appropriate
+    /// associated type declaration.
+    ///
+    /// # Parameters
+    ///
+    ///   * `fields` - List of [`Field`]s for which to generate code.
+    ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
+    ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
+    ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
+    ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
+    ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
+    ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just
+    ///     directly use [`CodeGenerator::parameter_type`].
+    fn generate_assoc_iter_type_for_fields(
+        &self,
+        fields: &[Field],
+        iter_type: &IterType,
+        iter_parameter_type: &syn::Ident,
+    ) -> TokenStream {
+        let ryft = &self.ryft_crate;
+        let lifetime = &self.macro_parameter_lifetime;
+        fields
+            .iter()
+            .filter_map(|field| match &field {
+                Field { is_parameter: false, .. } => None,
+                Field { ty, fields: None, .. } => {
+                    let parameter_ty = &self.parameter_type;
+                    let assoc_ty = match &iter_type {
+                        IterType::Iter => quote!(ParameterIterator<#lifetime, #iter_parameter_type>),
+                        IterType::IterMut => quote!(ParameterIteratorMut<#lifetime, #iter_parameter_type>),
+                        IterType::IntoIter => quote!(ParameterIntoIterator<#iter_parameter_type>),
+                        IterType::NamedIter => quote!(NamedParameterIterator<#lifetime, #iter_parameter_type>),
+                        IterType::NamedIterMut => {
+                            quote!(NamedParameterIteratorMut<#lifetime, #iter_parameter_type>)
+                        }
+                        IterType::NamedIntoIter => quote!(NamedParameterIntoIterator<#iter_parameter_type>),
+                    };
+                    Some(quote!(<#ty as #ryft::Parameterized<#parameter_ty>>::#assoc_ty))
+                }
+                Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
+                    Some(self.generate_assoc_iter_type_for_fields(fields, iter_type, iter_parameter_type))
+                }
+                Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                    let inner_ty = &inner_field.ty;
+                    let inner_iterator_ty = self.generate_assoc_iter_type_for_fields(
+                        std::slice::from_ref(inner_field.as_ref()),
+                        iter_type,
+                        iter_parameter_type,
+                    );
+                    Some(match &iter_type {
+                        IterType::Iter => quote!(
+                            std::iter::FlatMap<
+                                std::option::Iter<#lifetime, #inner_ty>,
+                                #inner_iterator_ty,
+                                fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                        IterType::IterMut => quote!(
+                            std::iter::FlatMap<
+                                std::option::IterMut<#lifetime, #inner_ty>,
+                                #inner_iterator_ty,
+                                fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                        IterType::IntoIter => quote!(
+                            std::iter::FlatMap<
+                                std::option::IntoIter<#inner_ty>,
+                                #inner_iterator_ty,
+                                fn(#inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                        IterType::NamedIter => quote!(
+                            std::iter::FlatMap<
+                                std::option::Iter<#lifetime, #inner_ty>,
+                                #inner_iterator_ty,
+                                fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                        IterType::NamedIterMut => quote!(
+                            std::iter::FlatMap<
+                                std::option::IterMut<#lifetime, #inner_ty>,
+                                #inner_iterator_ty,
+                                fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                        IterType::NamedIntoIter => quote!(
+                            std::iter::FlatMap<
+                                std::option::IntoIter<#inner_ty>,
+                                #inner_iterator_ty,
+                                fn(#inner_ty) -> #inner_iterator_ty,
+                            >
+                        ),
+                    })
+                }
+            })
+            .map(|iterator_ty| match &iter_type {
+                IterType::Iter | IterType::IterMut | IterType::IntoIter => iterator_ty,
+                IterType::NamedIter => {
+                    quote!(#ryft::PathPrefixedParameterIterator<&#lifetime #iter_parameter_type, #iterator_ty>)
+                }
+                IterType::NamedIterMut => {
+                    quote!(#ryft::PathPrefixedParameterIterator<&#lifetime mut #iter_parameter_type, #iterator_ty>)
+                }
+                IterType::NamedIntoIter => {
+                    quote!(#ryft::PathPrefixedParameterIterator<#iter_parameter_type, #iterator_ty>)
+                }
+            })
+            .reduce(|chain_ty, ty| quote!(std::iter::Chain<#chain_ty, #ty>))
+            .unwrap_or_else(|| {
+                let item_ty = match &iter_type {
+                    IterType::Iter => quote!(&#lifetime #iter_parameter_type),
+                    IterType::IterMut => quote!(&#lifetime mut #iter_parameter_type),
+                    IterType::IntoIter => quote!(#iter_parameter_type),
+                    IterType::NamedIter => quote!((#ryft::ParameterPath, &#lifetime #iter_parameter_type)),
+                    IterType::NamedIterMut => quote!((#ryft::ParameterPath, &#lifetime mut #iter_parameter_type)),
+                    IterType::NamedIntoIter => quote!((#ryft::ParameterPath, #iter_parameter_type)),
+                };
+                quote!(std::iter::Empty<#item_ty>)
+            })
+    }
+
     /// Generates the associated [`Parameterized::Family`], [`Parameterized::To`],
     /// [`Parameterized::ParameterStructure`], [`Parameterized::ParameterIterator`],
     /// [`Parameterized::ParameterIteratorMut`], and [`Parameterized::ParameterIntoIterator`] type declarations
@@ -825,7 +954,7 @@ impl CodeGenerator {
 
             let body = match &generator.data {
                 Data::Struct(StructData { fields, .. }) => {
-                    generate_assoc_iter_type_for_fields(generator, fields, iter_type, macro_parameter_type)
+                    generator.generate_assoc_iter_type_for_fields(fields, iter_type, macro_parameter_type)
                 }
                 Data::Enum(EnumData { ident, variants }) => {
                     let iterator_ident = format_ident!("{}{}", &ident, iter_type.parameters_assoc_type_name());
@@ -884,136 +1013,6 @@ impl CodeGenerator {
                     type NamedParameterIntoIterator<#macro_parameter_type: #ryft::Parameter> = #body;
                 },
             }
-        }
-
-        /// Helper that generates the associated iterator type portion for the provided [`Field`]s. This includes both
-        /// unnamed iterators (i.e., [`Parameterized::ParameterIterator`], [`Parameterized::ParameterIteratorMut`],
-        /// and [`Parameterized::ParameterIntoIterator`]) and named iterators (i.e.,
-        /// [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
-        /// and [`Parameterized::NamedParameterIntoIterator`]). The resulting [`TokenStream`] contains an expression
-        /// that evaluates to the appropriate type and that can be nested directly within the generic arguments of other
-        /// types (e.g., for nested tuples). It is the responsibility of the caller to nest this appropriately within
-        /// other types, if needed, and to generate the surrounding code for the appropriate associated type
-        /// declaration.
-        ///
-        /// # Parameters
-        ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
-        ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
-        ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
-        ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
-        ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
-        ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just
-        ///     directly use [`CodeGenerator::parameter_type`].
-        fn generate_assoc_iter_type_for_fields(
-            generator: &CodeGenerator,
-            fields: &[Field],
-            iter_type: &IterType,
-            iter_parameter_type: &syn::Ident,
-        ) -> TokenStream {
-            let ryft = &generator.ryft_crate;
-            let lifetime = &generator.macro_parameter_lifetime;
-            fields
-                .iter()
-                .filter_map(|field| match &field {
-                    Field { is_parameter: false, .. } => None,
-                    Field { ty, fields: None, .. } => {
-                        let parameter_ty = &generator.parameter_type;
-                        let assoc_ty = match &iter_type {
-                            IterType::Iter => quote!(ParameterIterator<#lifetime, #iter_parameter_type>),
-                            IterType::IterMut => quote!(ParameterIteratorMut<#lifetime, #iter_parameter_type>),
-                            IterType::IntoIter => quote!(ParameterIntoIterator<#iter_parameter_type>),
-                            IterType::NamedIter => quote!(NamedParameterIterator<#lifetime, #iter_parameter_type>),
-                            IterType::NamedIterMut => {
-                                quote!(NamedParameterIteratorMut<#lifetime, #iter_parameter_type>)
-                            }
-                            IterType::NamedIntoIter => quote!(NamedParameterIntoIterator<#iter_parameter_type>),
-                        };
-                        Some(quote!(<#ty as #ryft::Parameterized<#parameter_ty>>::#assoc_ty))
-                    }
-                    Field { fields: Some(NestedFields::Tuple(fields)), .. } => {
-                        Some(generate_assoc_iter_type_for_fields(generator, fields, iter_type, iter_parameter_type))
-                    }
-                    Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
-                        let inner_ty = &inner_field.ty;
-                        let inner_iterator_ty = generate_assoc_iter_type_for_fields(
-                            generator,
-                            std::slice::from_ref(inner_field.as_ref()),
-                            iter_type,
-                            iter_parameter_type,
-                        );
-                        Some(match &iter_type {
-                            IterType::Iter => quote!(
-                                std::iter::FlatMap<
-                                    std::option::Iter<#lifetime, #inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                            IterType::IterMut => quote!(
-                                std::iter::FlatMap<
-                                    std::option::IterMut<#lifetime, #inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                            IterType::IntoIter => quote!(
-                                std::iter::FlatMap<
-                                    std::option::IntoIter<#inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(#inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                            IterType::NamedIter => quote!(
-                                std::iter::FlatMap<
-                                    std::option::Iter<#lifetime, #inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(&#lifetime #inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                            IterType::NamedIterMut => quote!(
-                                std::iter::FlatMap<
-                                    std::option::IterMut<#lifetime, #inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(&#lifetime mut #inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                            IterType::NamedIntoIter => quote!(
-                                std::iter::FlatMap<
-                                    std::option::IntoIter<#inner_ty>,
-                                    #inner_iterator_ty,
-                                    fn(#inner_ty) -> #inner_iterator_ty,
-                                >
-                            ),
-                        })
-                    }
-                })
-                .map(|iterator_ty| match &iter_type {
-                    IterType::Iter | IterType::IterMut | IterType::IntoIter => iterator_ty,
-                    IterType::NamedIter => quote!(
-                        #ryft::PathPrefixedParameterIterator<&#lifetime #iter_parameter_type, #iterator_ty>
-                    ),
-                    IterType::NamedIterMut => quote!(
-                        #ryft::PathPrefixedParameterIterator<&#lifetime mut #iter_parameter_type, #iterator_ty>
-                    ),
-                    IterType::NamedIntoIter => {
-                        quote!(#ryft::PathPrefixedParameterIterator<#iter_parameter_type, #iterator_ty>)
-                    }
-                })
-                .reduce(|chain_ty, ty| quote!(std::iter::Chain<#chain_ty, #ty>))
-                .unwrap_or_else(|| {
-                    let item_ty = match &iter_type {
-                        IterType::Iter => quote!(&#lifetime #iter_parameter_type),
-                        IterType::IterMut => quote!(&#lifetime mut #iter_parameter_type),
-                        IterType::IntoIter => quote!(#iter_parameter_type),
-                        IterType::NamedIter => quote!((#ryft::ParameterPath, &#lifetime #iter_parameter_type)),
-                        IterType::NamedIterMut => quote!((#ryft::ParameterPath, &#lifetime mut #iter_parameter_type)),
-                        IterType::NamedIntoIter => quote!((#ryft::ParameterPath, #iter_parameter_type)),
-                    };
-                    quote!(std::iter::Empty<#item_ty>)
-                })
         }
 
         /// Helper that generates any custom iterator types and their corresponding [`Iterator`] `impl` blocks
@@ -1076,8 +1075,7 @@ impl CodeGenerator {
 
                     let iterator_variants = variants.iter().map(|variant| {
                         let variant_ident = &variant.ident;
-                        let iterator_type = generate_assoc_iter_type_for_fields(
-                            generator,
+                        let iterator_type = generator.generate_assoc_iter_type_for_fields(
                             &variant.fields,
                             iter_type,
                             &generator.parameter_type,
@@ -1492,6 +1490,13 @@ impl CodeGenerator {
                             }
                         }
                         Field { fields: Some(NestedFields::Option(inner_field)), .. } => {
+                            let inner_type = &inner_field.ty;
+                            let lifetime = &generator.macro_parameter_lifetime;
+                            let inner_iterator_type = generator.generate_assoc_iter_type_for_fields(
+                                std::slice::from_ref(inner_field.as_ref()),
+                                iter_type,
+                                parameter_type,
+                            );
                             let iterator = generate_body_for_fields(
                                 generator,
                                 std::slice::from_ref(inner_field.as_ref()),
@@ -1499,12 +1504,17 @@ impl CodeGenerator {
                                 iter_type,
                             );
                             let iterator = match &iter_type {
-                                IterType::Iter => quote!(#receiver.iter().flat_map(|value| #iterator)),
-                                IterType::IterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
-                                IterType::IntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
-                                IterType::NamedIter => quote!(#receiver.iter().flat_map(|value| #iterator)),
-                                IterType::NamedIterMut => quote!(#receiver.iter_mut().flat_map(|value| #iterator)),
-                                IterType::NamedIntoIter => quote!(#receiver.into_iter().flat_map(|value| #iterator)),
+                                IterType::Iter | IterType::NamedIter => quote!(#receiver.iter().flat_map(
+                                    (|value| #iterator)
+                                        as for<#lifetime> fn(&#lifetime #inner_type) -> #inner_iterator_type,
+                                )),
+                                IterType::IterMut | IterType::NamedIterMut => quote!(#receiver.iter_mut().flat_map(
+                                    (|value| #iterator)
+                                        as for<#lifetime> fn(&#lifetime mut #inner_type) -> #inner_iterator_type,
+                                )),
+                                IterType::IntoIter | IterType::NamedIntoIter => quote!(#receiver.into_iter().flat_map(
+                                    (|value| #iterator) as fn(#inner_type) -> #inner_iterator_type,
+                                )),
                             };
                             if iter_type.is_named() {
                                 Some(quote!(#ryft::PathPrefixedParameterIterator::new(#iterator, #path_segment)))
@@ -1624,7 +1634,10 @@ impl CodeGenerator {
                                 std::slice::from_ref(inner_field.as_ref()),
                                 Some(quote!(structure)),
                             );
-                            quote!(#prefix #structure.map(|structure| Ok(#fields_expression)).transpose()?)
+                            quote!(#prefix match #structure {
+                                Some(structure) => Some(#fields_expression),
+                                None => None,
+                            })
                         }
                     }
                 })

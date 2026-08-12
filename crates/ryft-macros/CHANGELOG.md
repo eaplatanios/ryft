@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - Release Date
 
+### Fixed
+
+- Fixed `#[derive(Parameterized)]` for types containing optional parameter fields alongside other parameterized fields.
+
 ## [0.0.2] - 2026-03-02
 
 ### Changed
