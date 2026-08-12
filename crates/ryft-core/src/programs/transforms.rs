@@ -120,8 +120,9 @@
 //!
 //! ## Namespace Storage And Thread Safety
 //!
-//! Each region allocates only one small shared cache handle. The marker registry itself is created lazily on the first
-//! transform request. Every marker receives its own bounded namespace, so keys and eviction in one transform cannot
+//! Each region allocates only one small shared cache handle; the registry map inside it is empty, and therefore
+//! allocation-free, until the first transform request. Every marker receives its own bounded namespace, so keys and
+//! eviction in one transform cannot
 //! affect another. Registry and namespace locks protect only bookkeeping (i.e., derivation, rechecking, formatting,
 //! and caller-owned destruction run after those locks are released).
 //!
@@ -166,7 +167,7 @@ use std::any::{Any, TypeId, type_name};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dyn_eq::DynEq;
 use dyn_hash::DynHash;
@@ -419,37 +420,44 @@ impl<V: Typed + Parameter, O> Debug for ErasedTransformArtifact<V, O> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Marker-namespace registry of one sealed [`Region`]'s transform cache: one independently bounded cache per marker
+/// [`TypeId`]. An empty [`HashMap`] allocates nothing and the [`Mutex`] is inline, so an untouched registry costs
+/// only its few words inside the shared allocation every sealed region already pays.
+pub(crate) type RegionTransformRegistry<V, O> =
+    Mutex<HashMap<TypeId, Arc<SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>>>>;
 
-/// Per-marker region namespace cache after argument and metadata erasure.
-pub(crate) type RegionTransformSpecializationCache<V, O> =
-    SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>;
-
-/// Lazily allocated shared state of one sealed region's transform cache.
-pub(crate) struct RegionTransformCacheState<V: Typed + Parameter, O> {
-    /// Marker namespaces. The map and mutex are allocated only when the first transform is requested.
-    pub(crate) registry: OnceLock<Mutex<HashMap<TypeId, Arc<RegionTransformSpecializationCache<V, O>>>>>,
-}
-
-/// Region-owned registry of independently bounded structural transform namespaces.
-///
-/// Copies of one content-identical sealed region share this handle. Construction and rewriting code in
-/// [`super::regions`] mints or preserves it according to complete reachable-content identity; external transforms can
-/// only request typed artifacts through [`RegionRef::transform`].
+/// Cache of the structural [`Transform`] artifacts derived from one sealed [`Region`], shared by every
+/// content-identical copy of that region. Internally, it holds one independently bounded [`SpecializationCache`] per
+/// transform marker type (the marker's [`TypeId`] keys the registry map and the transform's arguments key the entries
+/// within each cache), so one transform's keys and eviction can never affect another's. The handle's [`Arc`] identity
+/// is the region-content identity: construction and rewriting code in [`regions`](crate::programs::regions) mints a
+/// fresh handle whenever a region's complete reachable contents change and preserves the handle across
+/// content-preserving copies, while artifact sanitization compares handles by pointer. External transforms
+/// never touch that provenance; they can only request typed artifacts through [`RegionRef::transform`].
 pub(crate) struct RegionTransformCache<V: Typed + Parameter, O> {
-    /// Shared state carried by content-preserving region copies.
-    pub(crate) state: Arc<RegionTransformCacheState<V, O>>,
+    /// Shared state carried by content-preserving [`Region`] copies.
+    pub(crate) state: Arc<RegionTransformRegistry<V, O>>,
 }
 
 impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
-    /// Creates an empty cache without allocating its namespace registry.
+    /// Creates a new empty [`RegionTransformCache`].
     pub(crate) fn new() -> Self {
-        Self { state: Arc::new(RegionTransformCacheState { registry: OnceLock::new() }) }
+        Self { state: Arc::new(Mutex::new(HashMap::new())) }
     }
 
-    /// Returns the namespace for `T`, creating it with `capacity` when first requested.
-    fn namespace<T: 'static>(&self, capacity: usize) -> Arc<RegionTransformSpecializationCache<V, O>> {
-        let registry = self.state.registry.get_or_init(|| Mutex::new(HashMap::new()));
+    /// Returns `true` if this [`RegionTransformCache`] and `other` share the same [`Region`]-content identity.
+    #[inline]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Returns the [`SpecializationCache`] (i.e., namespace) for [`Transform`] `T`, creating it with `capacity`
+    /// if it does not exist yet.
+    fn namespace<T: 'static>(
+        &self,
+        capacity: usize,
+    ) -> Arc<SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>> {
+        let registry = self.state.as_ref();
         if let Some(namespace) = registry
             .lock()
             .expect("region transform registry mutex is poisoned")
@@ -461,9 +469,9 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
 
         // A losing candidate is always a freshly built empty cache, so dropping it can never run caller-defined
         // metadata destructors. The explicit drop placed after the guard is released is still worth keeping, for two
-        // reasons: it holds the uniform discipline that no cache structure is ever dropped while the registry lock is
-        // held, and it keeps candidate construction and destruction visibly outside the critical section so that a
-        // later `entry().or_insert_with(...)` rewrite, which would construct and drop under the lock, is not mistaken
+        // reasons: (1) it holds the uniform discipline that no cache structure is ever dropped while the registry lock
+        // is held, and (2) it keeps candidate construction and destruction visibly outside the critical section so that
+        // a later `entry().or_insert_with(...)` rewrite, which would construct and drop under the lock, is not mistaken
         // for an equivalent simplification.
         let mut candidate = Some(Arc::new(SpecializationCache::new(capacity)));
         let namespace = {
@@ -479,12 +487,6 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
         drop(candidate);
         namespace
     }
-
-    /// Returns whether this cache and `other` share the same region-content identity.
-    #[inline]
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
 }
 
 impl<V: Typed + Parameter, O> Clone for RegionTransformCache<V, O> {
@@ -496,10 +498,10 @@ impl<V: Typed + Parameter, O> Clone for RegionTransformCache<V, O> {
 
 impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (namespace_count, artifact_count) = self.state.registry.get().map_or((0, 0), |registry| {
-            let registry = registry.lock().expect("region transform registry mutex is poisoned");
-            (registry.len(), registry.values().map(|namespace| namespace.len()).sum())
-        });
+        let (namespace_count, artifact_count) = {
+            let registry = self.state.lock().expect("region transform registry mutex is poisoned");
+            (registry.len(), registry.values().map(|namespace| namespace.len()).sum::<usize>())
+        };
         formatter
             .debug_struct("RegionTransformCache")
             .field("namespace_count", &namespace_count)
@@ -507,6 +509,8 @@ impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
             .finish()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the artifact retained for one structural transform, deriving and retaining it on a miss.
@@ -718,13 +722,13 @@ mod tests {
     #[test]
     fn test_region_transform_namespaces_are_lazy_collision_safe_and_independent() {
         let program = identity_program();
-        assert!(!program.entry_region().transform_cache().is_initialized());
+        assert!(!program.entry_region().transform_cache().has_namespaces());
 
         let first = program
             .entry_region_ref()
             .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
             .unwrap();
-        assert!(program.entry_region().transform_cache().is_initialized());
+        assert!(program.entry_region().transform_cache().has_namespaces());
         let repeated = program
             .entry_region_ref()
             .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
