@@ -11,12 +11,12 @@
 //!
 //! A warm call follows the cache-hit edge directly to execution. A cold call traces and lowers once in the producing
 //! thread, delegates backend artifact reuse to the shared compilation context, publishes the executable, and then
-//! executes it. Refer to [`JittedFunction`] for a rendered diagram of this dispatch loop.
+//! executes it. Refer to [`CompiledFunctionDispatcher`] for a rendered diagram of this dispatch loop.
 //!
 //! Two transitions exist outside this dispatch loop. A staged function can be embedded as a nested call boundary in
 //! an enclosing trace instead of being lowered directly, and a compiled function can shed its staged and lowered
 //! transform metadata into the runtime-only executable handle that the cache retains. The secondary transitions are
-//! included in the lifecycle diagram on [`JittedFunction`].
+//! included in the lifecycle diagram on [`CompiledFunctionDispatcher`].
 //!
 //! # Terminology
 //!
@@ -24,15 +24,15 @@
 //! captures nor a structured signature. A _function_ is the callable package that pairs a program with everything a
 //! call needs, namely the capture table, the structured input and output signatures, the compilation options, and the
 //! backend artifacts. Every lifecycle handle below is therefore a function rather than a program, and
-//! [`JittedFunction`] is not a program at all: it is a retained dispatcher over a Rust closure that produces one
-//! program per specialization. The `*Program` names inside the domain contracts
+//! [`CompiledFunctionDispatcher`] is not a program at all: it is a retained dispatcher over a Rust closure that
+//! produces one program per specialization. The `*Program` names inside the domain contracts
 //! ([`CompilationDomain::LoweredProgram`], [`CompilationDomain::CompiledProgram`], and [`FlatCompilationProgram`])
 //! name the backend and IR artifacts that those functions carry.
 //!
 //! # Entry Points
 //!
-//! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`JittedFunction`] specializes on explicit static
-//!   host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key.
+//! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`CompiledFunctionDispatcher`] specializes on explicit
+//!   static host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key.
 //!   Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch directly to
 //!   the retained executable.
 //! - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
@@ -72,7 +72,7 @@
 //!
 //! # Specialization and Caching
 //!
-//! [`JittedFunction`] keeps one bounded LRU cache of compiled specializations, built on the general
+//! [`CompiledFunctionDispatcher`] keeps one bounded LRU cache of compiled specializations, built on the general
 //! [`SpecializationCache`](crate::specialization::SpecializationCache) primitive and keyed by the static parameters,
 //! the input parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained
 //! executable; a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
@@ -80,10 +80,10 @@
 //! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
 //! [`CompilationContext`] below still deduplicates the expensive backend compile.
 //!
-//! Cloned [`JittedFunction`] handles share one cache, and the dispatcher is usable from multiple threads whenever its
-//! domain, closure, static parameters, and artifact types are thread-safe: same-thread recursive dispatch of the
-//! specialization currently being produced is rejected with an error, while concurrent cold misses on different
-//! threads deliberately duplicate the cheap frontend work with idempotent inserts and leave backend-compile
+//! Cloned [`CompiledFunctionDispatcher`] handles share one cache, and the dispatcher is usable from multiple threads
+//! whenever its domain, closure, static parameters, and artifact types are thread-safe: same-thread recursive dispatch
+//! of the specialization currently being produced is rejected with an error, while concurrent cold misses on
+//! different threads deliberately duplicate the cheap frontend work with idempotent inserts and leave backend-compile
 //! coordination to the shared context.
 //!
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle,
@@ -143,7 +143,8 @@ pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics,
-    JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, call_function, jit,
-    jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
+    CompiledFunction, CompiledFunctionDispatcher, ExecutableFunction, FlatCompilationProgram,
+    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, StageRequest, StagedFunction,
+    call_function, jit, jit_with_options, stage_function, try_jit, try_jit_with_options,
+    try_jit_with_options_and_capacity,
 };

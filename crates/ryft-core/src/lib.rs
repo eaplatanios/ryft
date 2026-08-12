@@ -48,9 +48,10 @@ pub use compilation::{
     CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
     CompilationCall, CompilationContext, CompilationDomain, CompilationEvent, CompilationExchangeError,
     CompilationMissReason, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, DiskCache, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey,
-    JitCacheStatistics, JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, call_function,
-    jit, jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
+    CompiledFunction, CompiledFunctionDispatcher, DiskCache, ExecutableFunction, FlatCompilationProgram,
+    FunctionSpecializationKey, JitCacheStatistics, LoweredFunction, LoweringRequest, StageRequest, StagedFunction,
+    call_function, jit, jit_with_options, stage_function, try_jit, try_jit_with_options,
+    try_jit_with_options_and_capacity,
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
@@ -187,7 +188,7 @@ pub(crate) mod tests {
     use crate::contexts::Context;
     use crate::macros::check_count;
     use crate::parameters::Parameter;
-    use crate::programs::transforms::{RegionTransformCache, RegionTransformCacheState};
+    use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
         Effect, Effects, Operation, Program, Region, RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform,
         TransformArtifact, TypeError, Typed, Value,
@@ -350,7 +351,7 @@ pub(crate) mod tests {
     /// Weak handle used to test [`RegionTransformCache`] ownership and cycle behavior.
     pub(crate) struct WeakRegionTransformCache<V: Typed + Parameter, O> {
         /// Weak reference to the cache state under test.
-        state: Weak<RegionTransformCacheState<V, O>>,
+        state: Weak<RegionTransformRegistry<V, O>>,
     }
 
     impl<V: Typed + Parameter, O> WeakRegionTransformCache<V, O> {
@@ -368,21 +369,19 @@ pub(crate) mod tests {
             WeakRegionTransformCache { state: Arc::downgrade(&self.state) }
         }
 
-        /// Returns whether the lazily allocated namespace registry exists.
+        /// Returns whether any transform namespace has been created on this cache.
         #[inline]
-        pub(crate) fn is_initialized(&self) -> bool {
-            self.state.registry.get().is_some()
+        pub(crate) fn has_namespaces(&self) -> bool {
+            !self.state.lock().expect("region transform registry mutex is poisoned").is_empty()
         }
 
         /// Returns statistics for `T` when its namespace has been initialized.
         pub(crate) fn statistics<T: 'static>(&self) -> Option<SpecializationCacheStatistics> {
-            self.state.registry.get().and_then(|registry| {
-                registry
-                    .lock()
-                    .expect("region transform registry mutex is poisoned")
-                    .get(&TypeId::of::<T>())
-                    .map(|namespace| namespace.statistics())
-            })
+            self.state
+                .lock()
+                .expect("region transform registry mutex is poisoned")
+                .get(&TypeId::of::<T>())
+                .map(|namespace| namespace.statistics())
         }
     }
 

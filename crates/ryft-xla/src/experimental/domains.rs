@@ -4093,12 +4093,12 @@ mod tests {
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
-        ComparisonDirection, CompilationTracer, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-        Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
-        DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation, JittedFunction, MulOperation,
-        NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, ScaledDotOperation,
+        ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, ConditionOperation, ConstantOperation,
+        ConvertElementTypeOperation, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
+        DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation,
+        DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation,
+        MulOperation, NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, ScaledDotOperation,
         ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
         SubOperation, WhileOperation, try_jit_with_options,
     };
@@ -5258,11 +5258,12 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("data_extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let function: JittedFunction<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = try_jit_with_options(
-            &domain,
-            move |(), inputs| trace_data_derived(extent.clone(), inputs),
-            XlaOptions::new(mesh.clone()),
-        );
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit_with_options(
+                &domain,
+                move |(), inputs| trace_data_derived(extent.clone(), inputs),
+                XlaOptions::new(mesh.clone()),
+            );
         let call = |size: i64| {
             let size =
                 Array::from_host_buffer(&client, scalar_i64.clone(), mesh.clone(), size.to_ne_bytes().as_slice())
@@ -6068,11 +6069,12 @@ mod tests {
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
         let scalar_f32 = replicated_scalar_type(&mesh, DataType::F32);
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let function: JittedFunction<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> = try_jit_with_options(
-            &domain,
-            move |(), inputs| trace(extent.clone(), inputs),
-            XlaOptions::new(mesh.clone()),
-        );
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), Vec<ArrayIrType>, ArrayIrType> =
+            try_jit_with_options(
+                &domain,
+                move |(), inputs| trace(extent.clone(), inputs),
+                XlaOptions::new(mesh.clone()),
+            );
 
         let call = |size: i64| {
             let size =
@@ -6817,7 +6819,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
-        let function: JittedFunction<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = try_jit_with_options(
+        let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = try_jit_with_options(
             &domain,
             |(), input| trace(input),
             XlaOptions::new(mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),

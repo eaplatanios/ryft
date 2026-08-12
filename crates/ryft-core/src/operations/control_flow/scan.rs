@@ -2873,6 +2873,8 @@ mod tests {
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::forward::FusedJvpTransform;
+    use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{
         HessianDifferentiate, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, vjp,
     };
@@ -4787,7 +4789,7 @@ mod tests {
         assert_ne!(first.tangent().to_string(), second.tangent().to_string());
 
         // The body's fused forward-mode program is derived by the first program and served to the second.
-        let statistics = body.entry_region().transform_cache().jvp_program_cache().statistics();
+        let statistics = body.entry_region_ref().transform_statistics::<FusedJvpTransform>().unwrap();
         assert_eq!((statistics.productions, statistics.hits), (1, 1));
 
         // An independently built copy of the same body shares no retained transforms, so it exercises the uncached
@@ -4812,9 +4814,8 @@ mod tests {
             .tangent()
             .region_ref(tangent_scan.regions()[0])
             .unwrap()
-            .transform_cache()
-            .transposition_cache()
-            .statistics();
+            .transform_statistics::<TranspositionTransform>()
+            .unwrap();
         assert_eq!((statistics.productions, statistics.hits), (1, 1));
         assert_eq!(
             pullback.to_string(),

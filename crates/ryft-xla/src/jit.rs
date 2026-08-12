@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, CapturingContext, ClosedProgram, CompilationDomain,
-    CompilationStagingRequest, CompiledFunction, Constant, Context, DeviceMesh, DifferentiableType,
-    DomainTracingContext, ExecutableFunction, ForwardModeDifferentiate, JitCacheStatistics,
-    JittedFunction as CoreJittedFunction, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
+    CompilationStagingRequest, CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher,
+    Constant, Context, DeviceMesh, DifferentiableType, DomainTracingContext, ExecutableFunction,
+    ForwardModeDifferentiate, JitCacheStatistics, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
     ProjectedValue, ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection, call_function,
     try_jit_with_options as core_try_jit_with_options,
 };
@@ -135,7 +135,8 @@ pub struct JittedXlaFunction<
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
 {
     /// Composite-domain dispatcher hidden behind the public array projection boundary.
-    function: CoreJittedFunction<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
+    function:
+        CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>,
 }
 
 impl<'c, F, Static, In, Out> Clone for JittedXlaFunction<'c, F, Static, In, Out>
@@ -146,7 +147,8 @@ where
     In::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaConstant>,
-    CoreJittedFunction<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>: Clone,
+    CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, XlaProgramParameters<In>, XlaProgramParameters<Out>>:
+        Clone,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -1033,12 +1035,11 @@ where
     /// Composite-region batching is assigned to Phase 5. Until that support lands, this method returns a precise
     /// unsupported-operation diagnostic instead of reinterpreting projected batching values.
     ///
-    /// That implementation must also define the key material for caching batching in the per-`Region` transform
-    /// cache, from which batching is excluded today because a batched program depends on live batching-context state:
-    /// the batch extent identity (or, for a dynamic extent, its type and identity contract), the axis name, the
-    /// mapped-axis sharding, the input axes, the output-axes policy, and the nesting level. Once that material is
-    /// explicit, the region transform cache is extended to cover batching behind a gate measurement, through a
-    /// batching-policy hook returning `Option<key>` whose `None` keeps a policy uncached.
+    /// Homogeneous static-extent array regions already retain structurally batched programs through
+    /// `ryft_core::programs::transforms::Transform`. Composite XLA batching must additionally define how its live
+    /// first-class extent crosses the transformed boundary: only the extent's static type/identity contract belongs in
+    /// the transform key, while the current extent value remains an explicit runtime operand. The axis name, mapped
+    /// sharding, normalized input axes, and output policy likewise complete that composite marker's structural key.
     ///
     /// # Limitation
     ///

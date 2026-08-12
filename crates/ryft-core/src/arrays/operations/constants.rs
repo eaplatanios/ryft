@@ -530,8 +530,9 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::compilation::{
-        CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction, FlatCompilationProgram,
-        JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, try_jit,
+        CallRequest, CompilationDomain, CompilationTracer, CompileRequest, CompiledFunction,
+        CompiledFunctionDispatcher, FlatCompilationProgram, LoweredFunction, LoweringRequest, StageRequest,
+        StagedFunction, try_jit,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
@@ -656,7 +657,7 @@ mod tests {
     #[test]
     fn test_array_ir_dynamic_zero_retained_jit_reuses_one_specialization() {
         let domain = RetainedJitDomain::new();
-        let function: JittedFunction<RetainedJitDomain, _, (), ArrayIrType, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<RetainedJitDomain, _, (), ArrayIrType, ArrayIrType> =
             try_jit(&domain, |(), extent: CompilationTracer<RetainedJitDomain>| {
                 let ArrayIrType::Dimension(extent_type) = extent.r#type().into_owned() else {
                     return Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() });
@@ -700,7 +701,7 @@ mod tests {
     #[test]
     fn test_array_ir_dynamic_zero_retained_jit_specializes_on_dimension_identity() {
         let domain = RetainedJitDomain::new();
-        let function: JittedFunction<RetainedJitDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
+        let function: CompiledFunctionDispatcher<RetainedJitDomain, _, (), Vec<ArrayIrType>, ArrayIrType> =
             try_jit(&domain, |(), extents: Vec<CompilationTracer<RetainedJitDomain>>| {
                 let dimensions = extents
                     .iter()

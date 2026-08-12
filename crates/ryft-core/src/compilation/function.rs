@@ -296,7 +296,7 @@ where
     }
 }
 
-/// Snapshot of one retained [`JittedFunction`]'s dispatch activity.
+/// Snapshot of one retained [`CompiledFunctionDispatcher`]'s dispatch activity.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct JitCacheStatistics {
     /// Calls served by an already compiled specialization.
@@ -390,7 +390,7 @@ impl JitCacheStatisticsState {
     }
 }
 
-/// Default number of compiled specializations retained by one [`JittedFunction`].
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
 const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 
 /// Operation-family capability for representing a call to a staged program.
@@ -795,15 +795,15 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
 
 /// Type-level source universe for retained JIT specialization.
 ///
-/// The owning [`JittedFunctionState`] fixes the closure identity, lexical captures, domain instance, and immutable
-/// compilation options. This token stores none of them; it only makes the descriptor's key and artifact families
-/// coherent at the type level. If any owner-fixed semantic becomes variable per call, it must enter the transform
-/// arguments instead.
+/// The owning [`CompiledFunctionDispatcherState`] fixes the closure identity, lexical captures, domain instance, and
+/// immutable compilation options. This token stores none of them; it only makes the descriptor's key and artifact
+/// families coherent at the type level. If any owner-fixed semantic becomes variable per call, it must enter the
+/// transform arguments instead.
 struct JitCompilationSource<D, StaticParameters, Input, Output>(
     PhantomData<fn() -> (D, StaticParameters, Input, Output)>,
 );
 
-/// Transform descriptor for the executable specializations retained by one [`JittedFunction`].
+/// Transform descriptor for the executable specializations retained by one [`CompiledFunctionDispatcher`].
 struct JitCompilationTransform;
 
 impl<D, StaticParameters, Input, Output> Transform<JitCompilationSource<D, StaticParameters, Input, Output>>
@@ -1052,13 +1052,13 @@ where
 
 /// Retained JIT dispatcher that caches compiled specializations of one Rust closure.
 ///
-/// Unlike [`CompiledFunction`], which represents one already-specialized executable, a `JittedFunction` holds no
-/// program of its own: it is a retained dispatcher over a Rust closure that produces one program, and one function
-/// around that program, per specialization from explicit host-side static parameters and runtime dynamic inputs. Its
-/// first call for a specialization traces, lowers, and requests compilation; later calls with the same static values,
-/// input parameter structure, and runtime-derived dispatch key dispatch directly to the retained executable.
-/// Domain staging may normalize distinct runtime signatures to the same staged signature, which can produce harmless
-/// duplicate dispatch specializations.
+/// Unlike [`CompiledFunction`], which represents one already-specialized executable, a
+/// `CompiledFunctionDispatcher` holds no program of its own: it is a retained dispatcher over a Rust closure that
+/// produces one program, and one function around that program, per specialization from explicit host-side static
+/// parameters and runtime dynamic inputs. Its first call for a specialization traces, lowers, and requests
+/// compilation; later calls with the same static values, input parameter structure, and runtime-derived dispatch key
+/// dispatch directly to the retained executable. Domain staging may normalize distinct runtime signatures to the
+/// same staged signature, which can produce harmless duplicate dispatch specializations.
 ///
 /// Tracing executes Rust host code only on a specialization miss. Host side effects inside `function` therefore run
 /// once per retained specialization, not once per runtime call; observable per-call work must be represented by staged
@@ -1082,7 +1082,7 @@ where
 /// ```mermaid
 /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TD
-///   call["&lt;code&gt;JittedFunction::call&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
+///   call["&lt;code&gt;CompiledFunctionDispatcher::call&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
 ///   call --> key["Derive Function Specialization Key"]
 ///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
 ///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
@@ -1100,7 +1100,7 @@ where
 /// The cache-hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path: a
 /// staged function can become a nested call boundary instead of continuing immediately toward an executable.
 #[cfg_attr(doc, aquamarine::aquamarine)]
-pub struct JittedFunction<
+pub struct CompiledFunctionDispatcher<
     D: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -1109,10 +1109,10 @@ pub struct JittedFunction<
 > where
     Input::ParameterStructure: Eq + Hash,
 {
-    state: Arc<JittedFunctionState<D, F, Static, Input, Output>>,
+    state: Arc<CompiledFunctionDispatcherState<D, F, Static, Input, Output>>,
 }
 
-struct JittedFunctionState<
+struct CompiledFunctionDispatcherState<
     D: CompilationDomain<Type: Eq + Hash>,
     F,
     Static: Clone + Debug + Eq + Hash,
@@ -1128,7 +1128,8 @@ struct JittedFunctionState<
     statistics: JitCacheStatisticsState,
 }
 
-impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone for JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> Clone
+    for CompiledFunctionDispatcher<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
@@ -1143,7 +1144,7 @@ where
     }
 }
 
-impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> JittedFunction<D, F, Static, Input, Output>
+impl<D, F, Static: Clone + Debug + Eq + Hash, Input, Output> CompiledFunctionDispatcher<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
@@ -1155,7 +1156,7 @@ where
 {
     fn new(domain: &D, function: F, options: D::Options, capacity: usize) -> Self {
         Self {
-            state: Arc::new(JittedFunctionState {
+            state: Arc::new(CompiledFunctionDispatcherState {
                 domain: domain.clone(),
                 function,
                 options,
@@ -1314,7 +1315,7 @@ pub fn try_jit_with_options_and_capacity<D, F, Static, Input, Output>(
     function: F,
     options: D::Options,
     capacity: usize,
-) -> JittedFunction<D, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
@@ -1323,7 +1324,7 @@ where
     Input::ParameterStructure: Eq + Hash,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
-    JittedFunction::new(domain, function, options, capacity)
+    CompiledFunctionDispatcher::new(domain, function, options, capacity)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using explicit options.
@@ -1332,7 +1333,7 @@ pub fn try_jit_with_options<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
     options: D::Options,
-) -> JittedFunction<D, F, Static, Input, Output>
+) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
 where
     D: CompilationDomain,
     D::Type: Eq + Hash,
@@ -1346,7 +1347,10 @@ where
 
 /// Constructs a retained dispatcher for a fallible closure using default options.
 #[inline]
-pub fn try_jit<D, F, Static, Input, Output>(domain: &D, function: F) -> JittedFunction<D, F, Static, Input, Output>
+pub fn try_jit<D, F, Static, Input, Output>(
+    domain: &D,
+    function: F,
+) -> CompiledFunctionDispatcher<D, F, Static, Input, Output>
 where
     D: CompilationDomain<Options: Default>,
     D::Type: Eq + Hash,
@@ -1363,7 +1367,7 @@ pub fn jit_with_options<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
     options: D::Options,
-) -> JittedFunction<
+) -> CompiledFunctionDispatcher<
     D,
     impl Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
     Static,
@@ -1389,7 +1393,7 @@ where
 pub fn jit<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
-) -> JittedFunction<
+) -> CompiledFunctionDispatcher<
     D,
     impl Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
     Static,
@@ -2001,9 +2005,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_reuses_warm_specializations() {
+    fn test_compiled_function_dispatcher_reuses_warm_specializations() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
@@ -2024,11 +2028,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_applies_staging_options_before_tracing() {
+    fn test_compiled_function_dispatcher_applies_staging_options_before_tracing() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
         assert!(matches!(
@@ -2049,9 +2053,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_distinguishes_hash_colliding_static_values() {
+    fn test_compiled_function_dispatcher_distinguishes_hash_colliding_static_values() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, CollidingStatic, ArrayType, ArrayType> = jit(
             &domain,
             |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
                 if static_parameters.0 { input.unary(NegateOperation) } else { input }
@@ -2065,9 +2069,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_input_structures_partition_specializations() {
+    fn test_compiled_function_dispatcher_input_structures_partition_specializations() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<ArrayType>, ArrayType> =
             try_jit(&domain, |(), mut inputs: Vec<CompilationTracer<TestDomain>>| {
                 inputs.drain(..1).next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
@@ -2078,13 +2082,13 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_distinguishes_inputs_differing_only_in_empty_substructure() {
+    fn test_compiled_function_dispatcher_distinguishes_inputs_differing_only_in_empty_substructure() {
         // Both calls flatten to zero leaves, so they share static parameters and an empty dispatch signature. Only
         // the input parameter structure distinguishes them, while the traced closure branches on the observed
         // container arity. Key reuse across these calls would therefore silently return the first call's staged
         // behavior for the second call's structurally different input.
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, (), Vec<Vec<ArrayType>>, Vec<ArrayType>> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), Vec<Vec<ArrayType>>, Vec<ArrayType>> =
             try_jit(&domain, |(), inputs: Vec<Vec<CompilationTracer<TestDomain>>>| {
                 if inputs.len() == 1 {
                     Ok(inputs.into_iter().next().unwrap())
@@ -2103,9 +2107,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_invalidates_one_static_specialization() {
+    fn test_compiled_function_dispatcher_invalidates_one_static_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
@@ -2123,9 +2127,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_retries_failed_specialization() {
+    fn test_compiled_function_dispatcher_retries_failed_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
             try_jit(&domain, |fail, input: CompilationTracer<TestDomain>| {
                 if fail {
                     Err(ProgramError::InvalidArgument { message: "expected trace failure".into() })
@@ -2146,10 +2150,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_retries_lowering_and_compilation_failures() {
+    fn test_compiled_function_dispatcher_retries_lowering_and_compilation_failures() {
         let lowering_domain = TestDomain::new();
         let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
-        let lowering_function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+        let lowering_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit_with_options(&lowering_domain, |(), input: CompilationTracer<TestDomain>| input, lowering_options);
         for _ in 0..2 {
             assert!(matches!(
@@ -2163,11 +2167,12 @@ mod tests {
 
         let compilation_domain = TestDomain::new();
         let compilation_options = TestOptions { fail_compilation: true, ..TestOptions::default() };
-        let compilation_function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> = jit_with_options(
-            &compilation_domain,
-            |(), input: CompilationTracer<TestDomain>| input,
-            compilation_options,
-        );
+        let compilation_function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options(
+                &compilation_domain,
+                |(), input: CompilationTracer<TestDomain>| input,
+                compilation_options,
+            );
         for _ in 0..2 {
             assert!(matches!(
                 compilation_function.call((), Array::scalar(2.0)),
@@ -2181,11 +2186,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_owners_isolate_frontend_specializations() {
+    fn test_compiled_function_dispatcher_owners_isolate_frontend_specializations() {
         let domain = TestDomain::new();
-        let first: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+        let first: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
-        let second: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+        let second: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
 
         assert_eq!(first.call((), Array::scalar(1.0)).unwrap(), Array::scalar(1.0));
@@ -2198,16 +2203,17 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_lru_capacity_retraces_evicted_specialization() {
+    fn test_compiled_function_dispatcher_lru_capacity_retraces_evicted_specialization() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = try_jit_with_options_and_capacity(
-            &domain,
-            |negate, input: CompilationTracer<TestDomain>| {
-                Ok(if negate { input.unary(NegateOperation) } else { input })
-            },
-            TestOptions::default(),
-            1,
-        );
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
+            try_jit_with_options_and_capacity(
+                &domain,
+                |negate, input: CompilationTracer<TestDomain>| {
+                    Ok(if negate { input.unary(NegateOperation) } else { input })
+                },
+                TestOptions::default(),
+                1,
+            );
 
         function.call(false, Array::scalar(1.0)).unwrap();
         function.call(true, Array::scalar(1.0)).unwrap();
@@ -2220,11 +2226,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_map_inputs_flatten_deterministically() {
+    fn test_compiled_function_dispatcher_map_inputs_flatten_deterministically() {
         // Map-like containers flatten in key order, so two runtime maps with the same keys must produce one
         // specialization regardless of construction order, and replay must bind flat arguments to the same leaves.
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), BTreeMap<&'static str, ArrayType>, ArrayType> =
             try_jit(&domain, |(), inputs: BTreeMap<&'static str, CompilationTracer<TestDomain>>| {
                 inputs.into_values().next().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })
             });
@@ -2238,11 +2244,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_rejects_same_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_rejects_same_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
             try_jit(&domain, move |_, input: CompilationTracer<TestDomain>| {
                 if let Some(call) = closure_recursive.borrow().as_ref() {
                     call()?;
@@ -2262,11 +2268,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_allows_different_key_recursive_dispatch() {
+    fn test_compiled_function_dispatcher_allows_different_key_recursive_dispatch() {
         let domain = TestDomain::new();
         let recursive: Rc<RefCell<Option<Box<dyn Fn() -> Result<Array, ProgramError>>>>> = Rc::new(RefCell::new(None));
         let closure_recursive = recursive.clone();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> =
             try_jit(&domain, move |nested, input: CompilationTracer<TestDomain>| {
                 if nested {
                     if let Some(call) = closure_recursive.borrow().as_ref() {
@@ -2284,11 +2290,11 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_retains_specialization_after_runtime_execution_failure() {
+    fn test_compiled_function_dispatcher_retains_specialization_after_runtime_execution_failure() {
         let domain = TestDomain::new();
         let options =
             TestOptions { staged_input_type: Some(ArrayType::scalar(DataType::I64)), ..TestOptions::default() };
-        let function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+        let function: CompiledFunctionDispatcher<TestDomain, _, (), ArrayType, ArrayType> =
             jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
         for _ in 0..2 {
@@ -2307,12 +2313,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_and_staged_functions_are_send_and_sync_for_thread_safe_state() {
+    fn test_compiled_function_dispatcher_and_staged_functions_are_send_and_sync_for_thread_safe_state() {
         fn assert_send_and_sync<T: Send + Sync>() {}
         fn assert_dispatcher_send_and_sync<F: Send + Sync>(
-            _function: &JittedFunction<TestDomain, F, bool, ArrayType, ArrayType>,
+            _function: &CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>,
         ) {
-            assert_send_and_sync::<JittedFunction<TestDomain, F, bool, ArrayType, ArrayType>>();
+            assert_send_and_sync::<CompiledFunctionDispatcher<TestDomain, F, bool, ArrayType, ArrayType>>();
         }
 
         assert_send_and_sync::<StagedFunction<TestDomain, ArrayType, ArrayType>>();
@@ -2320,7 +2326,7 @@ mod tests {
         assert_send_and_sync::<CompiledFunction<TestDomain, ArrayType, ArrayType>>();
 
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
@@ -2330,9 +2336,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_serves_concurrent_warm_calls() {
+    fn test_compiled_function_dispatcher_serves_concurrent_warm_calls() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }
@@ -2356,9 +2362,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jitted_function_concurrent_cold_misses_produce_duplicates_and_one_entry() {
+    fn test_compiled_function_dispatcher_concurrent_cold_misses_produce_duplicates_and_one_entry() {
         let domain = TestDomain::new();
-        let function: JittedFunction<TestDomain, _, bool, ArrayType, ArrayType> = jit(
+        let function: CompiledFunctionDispatcher<TestDomain, _, bool, ArrayType, ArrayType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
                 if negate { input.unary(NegateOperation) } else { input }

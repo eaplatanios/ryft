@@ -1378,6 +1378,8 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::forward::FusedJvpTransform;
+    use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{
         DifferentiationTracer, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize,
     };
@@ -2320,7 +2322,7 @@ mod tests {
 
         // Each branch's fused forward-mode program is derived by the first program and served to the second.
         for branch in [&true_branch, &false_branch] {
-            let statistics = branch.entry_region().transform_cache().jvp_program_cache().statistics();
+            let statistics = branch.entry_region_ref().transform_statistics::<FusedJvpTransform>().unwrap();
             assert_eq!((statistics.productions, statistics.hits), (1, 1));
         }
 
@@ -2345,8 +2347,12 @@ mod tests {
             .find(|instruction| matches!(instruction.operation(), ArrayOperation::Condition(_)))
             .unwrap();
         for region in tangent_condition.regions() {
-            let statistics =
-                first.tangent().region_ref(*region).unwrap().transform_cache().transposition_cache().statistics();
+            let statistics = first
+                .tangent()
+                .region_ref(*region)
+                .unwrap()
+                .transform_statistics::<TranspositionTransform>()
+                .unwrap();
             assert_eq!((statistics.productions, statistics.hits), (1, 1));
         }
         assert_eq!(
