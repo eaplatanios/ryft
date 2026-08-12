@@ -200,7 +200,7 @@ use crate::specialization::{ReentrantSpecializationError, SpecializationCache, S
 ///   region_owner["&lt;code&gt;RegionRef&lt;/code&gt;"]
 ///   registry["Per-Region Namespace Registry"]
 ///   region_artifact["&lt;code&gt;Program&lt;/code&gt; Bundle and Metadata"]
-///   dispatcher["&lt;code&gt;CompiledFunctionDispatcher&lt;/code&gt;"]
+///   dispatcher["&lt;code&gt;JittedFunction&lt;/code&gt;"]
 ///   executable["&lt;code&gt;ExecutableFunction&lt;/code&gt;"]
 ///   backend["&lt;code&gt;CompilationContext&lt;/code&gt; on a Miss"]
 ///   descriptor --> arguments
@@ -352,28 +352,39 @@ impl Hash for ErasedTransformArguments {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Homogeneous artifact stored by every namespace in one concrete region universe.
+/// Internal storage form of a [`TransformArtifact`] with its `Metadata` type erased. A [`Region`]'s registry must
+/// retain artifacts for marker types defined outside this crate, each choosing its own `Metadata` type, while all
+/// namespaces of one region share a single stored value type. This type is that common representation, and it erases
+/// as little as possible: the transformed programs stay concretely typed in `V` and `O` (they may carry non-`'static`
+/// backend lifetimes and therefore can never live behind [`Any`]), and only the metadata, which
+/// [`RegionRef::transform`] already requires to be `'static + Send + Sync`, is erased behind [`Any`].
+///
+/// [`Self::new`] erases a sanitized public artifact, and [`Self::typed`] reconstructs it. The reconstruction downcast
+/// cannot fail for a well-formed marker as coherence admits one [`Transform<Region<V, O>>`](Transform) implementation
+/// per marker type, and that implementation fixes one `Metadata` type per region universe, and so a downcast mismatch
+/// is an internal invariant violation and panics.
 pub(crate) struct ErasedTransformArtifact<V: Typed + Parameter, O> {
-    /// Concrete transformed programs, preserving any non-static `V`/`O` lifetimes.
+    /// Transformed [`Program`]s in [`Transform`]-defined order, concretely typed so that non-`'static` `V` and `O`
+    /// lifetimes are preserved.
     programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>,
 
-    /// Type-erased static metadata.
+    /// Type-erased `'static` metadata, recovered by [`Self::typed`].
     metadata: Arc<dyn Any + Send + Sync>,
 
-    /// Concrete metadata type name used only by the non-semantic debug summary and invariant diagnostics.
+    /// Concrete metadata type name, retained because [`Any`] cannot name its erased type. It is used only by the
+    /// non-semantic [`Debug`] summary and by the invariant-violation panic in [`Self::typed`].
     metadata_type_name: &'static str,
 }
 
 impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
-    /// Erases one sanitized public transform artifact.
+    /// Creates a new [`ErasedTransformArtifact`] by erasing the type of the provided [`TransformArtifact`].
     fn new<Metadata: Send + Sync + 'static>(artifact: TransformArtifact<V, O, Metadata>) -> Self {
         let (programs, metadata) = artifact.into_parts();
         Self { programs, metadata: Arc::new(metadata), metadata_type_name: type_name::<Metadata>() }
     }
 
-    /// Reconstructs a typed public artifact, panicking only if one marker violated its coherent artifact layout.
+    /// Reconstructs a typed [`TransformArtifact`] from this [`ErasedTransformArtifact`], panicking only if a marker
+    /// violated its coherent artifact layout.
     fn typed<Metadata: Clone + Send + Sync + 'static>(&self) -> TransformArtifact<V, O, Metadata> {
         let metadata = self.metadata.downcast_ref::<Metadata>().unwrap_or_else(|| {
             panic!(
@@ -398,6 +409,7 @@ impl<V: Typed + Parameter, O> Clone for ErasedTransformArtifact<V, O> {
 }
 
 impl<V: Typed + Parameter, O> Debug for ErasedTransformArtifact<V, O> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ErasedTransformArtifact")
@@ -407,14 +419,16 @@ impl<V: Typed + Parameter, O> Debug for ErasedTransformArtifact<V, O> {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Per-marker region namespace cache after argument and metadata erasure.
-pub(crate) type RegionTransformNamespace<V, O> =
+pub(crate) type RegionTransformSpecializationCache<V, O> =
     SpecializationCache<ErasedTransformArguments, ErasedTransformArtifact<V, O>>;
 
 /// Lazily allocated shared state of one sealed region's transform cache.
 pub(crate) struct RegionTransformCacheState<V: Typed + Parameter, O> {
     /// Marker namespaces. The map and mutex are allocated only when the first transform is requested.
-    pub(crate) registry: OnceLock<Mutex<HashMap<TypeId, Arc<RegionTransformNamespace<V, O>>>>>,
+    pub(crate) registry: OnceLock<Mutex<HashMap<TypeId, Arc<RegionTransformSpecializationCache<V, O>>>>>,
 }
 
 /// Region-owned registry of independently bounded structural transform namespaces.
@@ -434,7 +448,7 @@ impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
     }
 
     /// Returns the namespace for `T`, creating it with `capacity` when first requested.
-    fn namespace<T: 'static>(&self, capacity: usize) -> Arc<RegionTransformNamespace<V, O>> {
+    fn namespace<T: 'static>(&self, capacity: usize) -> Arc<RegionTransformSpecializationCache<V, O>> {
         let registry = self.state.registry.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(namespace) = registry
             .lock()
