@@ -173,7 +173,11 @@ pub use tracing_v2::rematerialization::RematerializeOperation;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::any::TypeId;
     use std::cell::Cell;
+    use std::convert::Infallible;
+    use std::fmt::Debug;
+    use std::sync::{Arc, Weak};
 
     use crate::arrays::ArrayType;
     use crate::batching::{
@@ -182,9 +186,13 @@ pub(crate) mod tests {
     };
     use crate::contexts::Context;
     use crate::macros::check_count;
+    use crate::parameters::Parameter;
+    use crate::programs::transforms::{RegionTransformCache, RegionTransformCacheState};
     use crate::programs::{
-        Effect, Effects, Operation, Program, RegionDriver, RegionInterface, RegionRef, RegionSlot, TypeError, Value,
+        Effect, Effects, Operation, Program, Region, RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform,
+        TransformArtifact, TypeError, Typed, Value,
     };
+    use crate::specialization::SpecializationCacheStatistics;
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
     /// (i.e., construction, interning and sharing, interface derivation, validation, effects propagation, rendering,
@@ -326,6 +334,101 @@ pub(crate) mod tests {
             inputs: &[P::Batch],
         ) -> Result<P::Batch, BatchingError> {
             P::restore_batch(value, batch_axis, r#type, inputs)
+        }
+    }
+
+    /// Transform marker used to observe generic region-cache preservation without depending on a built-in transform.
+    pub(crate) struct IdentityTransform;
+
+    impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for IdentityTransform {
+        type Arguments = ();
+        type Artifact = TransformArtifact<V, O, ()>;
+
+        const DEFAULT_CACHE_CAPACITY: usize = 1;
+    }
+
+    /// Weak handle used to test [`RegionTransformCache`] ownership and cycle behavior.
+    pub(crate) struct WeakRegionTransformCache<V: Typed + Parameter, O> {
+        /// Weak reference to the cache state under test.
+        state: Weak<RegionTransformCacheState<V, O>>,
+    }
+
+    impl<V: Typed + Parameter, O> WeakRegionTransformCache<V, O> {
+        /// Returns whether the source cache state is still retained.
+        #[inline]
+        pub(crate) fn is_alive(&self) -> bool {
+            self.state.upgrade().is_some()
+        }
+    }
+
+    impl<V: Typed + Parameter, O> RegionTransformCache<V, O> {
+        /// Returns a weak handle to this cache state for ownership tests.
+        #[inline]
+        pub(crate) fn downgrade(&self) -> WeakRegionTransformCache<V, O> {
+            WeakRegionTransformCache { state: Arc::downgrade(&self.state) }
+        }
+
+        /// Returns whether the lazily allocated namespace registry exists.
+        #[inline]
+        pub(crate) fn is_initialized(&self) -> bool {
+            self.state.registry.get().is_some()
+        }
+
+        /// Returns statistics for `T` when its namespace has been initialized.
+        pub(crate) fn statistics<T: 'static>(&self) -> Option<SpecializationCacheStatistics> {
+            self.state.registry.get().and_then(|registry| {
+                registry
+                    .lock()
+                    .expect("region transform registry mutex is poisoned")
+                    .get(&TypeId::of::<T>())
+                    .map(|namespace| namespace.statistics())
+            })
+        }
+    }
+
+    impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
+        /// Returns statistics for transform `T` when its namespace has been initialized.
+        #[inline]
+        pub(crate) fn transform_statistics<T: 'static>(self) -> Option<SpecializationCacheStatistics> {
+            self.transform_cache().statistics::<T>()
+        }
+
+        /// Inserts a purpose-built artifact into `T`'s namespace for diagnostic-corruption and provenance tests.
+        #[cfg(debug_assertions)]
+        pub(crate) fn insert_transform_artifact_for_testing<
+            T: 'static
+                + Transform<
+                    Region<V, O>,
+                    Arguments: 'static + Debug + Send + Sync,
+                    Artifact = TransformArtifact<V, O, Metadata>,
+                >,
+            Metadata: 'static + Clone + Debug + PartialEq + Send + Sync,
+        >(
+            self,
+            arguments: T::Arguments,
+            artifact: TransformArtifact<V, O, Metadata>,
+        ) {
+            let previous_productions = self.transform_statistics::<T>().map_or(0, |statistics| statistics.productions);
+            let retained = self.transform::<T, _, Infallible>(arguments, move |_, _| Ok(artifact)).unwrap();
+            drop(retained);
+            let statistics = self.transform_statistics::<T>().unwrap();
+            assert_eq!(
+                statistics.productions,
+                previous_productions + 1,
+                "test transform namespace entry must be vacant",
+            );
+        }
+
+        /// Returns this region materialized through the test-only [`IdentityTransform`] namespace.
+        pub(crate) fn retained_identity_transform(self) -> Arc<Program<V, O, Vec<V>, Vec<V>>> {
+            let artifact = self
+                .transform::<IdentityTransform, _, Infallible>((), |region, _| {
+                    Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+                })
+                .unwrap();
+            let (mut programs, ()) = artifact.into_parts();
+            assert_eq!(programs.len(), 1);
+            programs.pop().unwrap()
         }
     }
 }
