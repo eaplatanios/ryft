@@ -232,8 +232,8 @@ impl CodeGenerator {
     ///
     /// # Parameters
     ///
-    ///   * `tokens` - Tokens that the error spans.
-    ///   * `message` - Message describing the error.
+    ///   - `tokens`: Tokens that the error spans.
+    ///   - `message`: Message describing the error.
     fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
         self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
@@ -369,13 +369,13 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is called. We need to pass it as an
+        ///   - `generator`: [`CodeGenerator`] from within which this function is called. We need to pass it as an
         ///     additional argument because Rust functions do not capture the surrounding generator.
-        ///   * `field_index` - Index of the [`Field`] in the container in which it belongs.
-        ///   * `field_ident` - Optional [`syn::Ident`] of the [`Field`]. This must be set to [`None`] for anonymous
+        ///   - `field_index`: Index of the [`Field`] in the container in which it belongs.
+        ///   - `field_ident`: Optional [`syn::Ident`] of the [`Field`]. This must be set to [`None`] for anonymous
         ///     fields (e.g., the fields/elements of a tuple).
-        ///   * `field_ty` - [`syn::Type`] of the [`Field`].
-        ///   * `field_attrs` - Optional [`syn::Attribute`]s attached to the [`Field`].
+        ///   - `field_ty`: [`syn::Type`] of the [`Field`].
+        ///   - `field_attrs`: Optional [`syn::Attribute`]s attached to the [`Field`].
         fn extract_field(
             generator: &mut CodeGenerator,
             field_index: usize,
@@ -433,9 +433,9 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is called. We need to pass it as an
+        ///   - `generator`: [`CodeGenerator`] from within which this function is called. We need to pass it as an
         ///     additional argument because Rust function do not capture the surrounding generator.
-        ///   * `variant` - [`syn::Variant`] from which to extract a [`Variant`].
+        ///   - `variant`: [`syn::Variant`] from which to extract a [`Variant`].
         fn extract_variant(generator: &mut CodeGenerator, variant: &syn::Variant) -> Variant {
             // Check for invalid '#[ryft(...)]' attributes.
             variant
@@ -675,12 +675,12 @@ impl CodeGenerator {
     ///
     /// # Parameters
     ///
-    ///   * `fields` - List of [`Field`]s for which to generate code.
-    ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
+    ///   - `fields`: List of [`Field`]s for which to generate code.
+    ///   - `iter_type`: [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
     ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
     ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
     ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
-    ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
+    ///   - `iter_parameter_type`: [`syn::Ident`] that represents the item type of the resulting iterator type.
     ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just
     ///     directly use [`CodeGenerator::parameter_type`].
     fn generate_assoc_iter_type_for_fields(
@@ -938,13 +938,13 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
+        ///   - `generator`: [`CodeGenerator`] from within which this function is being called.
+        ///   - `fields`: List of [`Field`]s for which to generate code.
+        ///   - `iter_type`: [`IterType`] that specifies which variant among [`Parameterized::ParameterIterator`],
         ///     [`Parameterized::ParameterIteratorMut`], [`Parameterized::ParameterIntoIterator`],
         ///     [`Parameterized::NamedParameterIterator`], [`Parameterized::NamedParameterIteratorMut`],
         ///     and [`Parameterized::NamedParameterIntoIterator`] to generate code for.
-        ///   * `iter_parameter_type` - [`syn::Ident`] that represents the item type of the resulting iterator type.
+        ///   - `iter_parameter_type`: [`syn::Ident`] that represents the item type of the resulting iterator type.
         ///     This is necessary as due to parameter renames that take place in certain cases, we cannot just directly
         ///     use [`CodeGenerator::parameter_type`].
         fn generate_assoc_iter_type(generator: &CodeGenerator, iter_type: &IterType) -> TokenStream {
@@ -1233,8 +1233,8 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
+        ///   - `fields`: List of [`Field`]s for which to generate code.
+        ///   - `receiver`: Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
         fn generate_body(fields: &[Field], receiver: Option<TokenStream>) -> TokenStream {
@@ -1295,8 +1295,8 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
+        ///   - `fields`: List of [`Field`]s for which to generate code.
+        ///   - `receiver`: Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
         fn generate_body(fields: &[Field], receiver: Option<TokenStream>) -> TokenStream {
@@ -1379,8 +1379,8 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::parameters`],
+        ///   - `generator`: [`CodeGenerator`] from within which this function is being called.
+        ///   - `iter_type`: [`IterType`] that specifies which variant among [`Parameterized::parameters`],
         ///     [`Parameterized::parameters_mut`], [`Parameterized::into_parameters`],
         ///     [`Parameterized::named_parameters`], [`Parameterized::named_parameters_mut`],
         ///     and [`Parameterized::into_named_parameters`], to generate code for.
@@ -1431,12 +1431,12 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `receiver` - Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
+        ///   - `generator`: [`CodeGenerator`] from within which this function is being called.
+        ///   - `fields`: List of [`Field`]s for which to generate code.
+        ///   - `receiver`: Optional [`TokenStream`] that represents the "owner" of the provided [`Field`]s. Note that
         ///     the owner may be a tuple, a struct, or the variant of an enum. This is used to generate expressions that
         ///     access values of the provided [`Field`]s by invoking [`Field::member`].
-        ///   * `iter_type` - [`IterType`] that specifies which variant among [`Parameterized::parameters`],
+        ///   - `iter_type`: [`IterType`] that specifies which variant among [`Parameterized::parameters`],
         ///     [`Parameterized::parameters_mut`], [`Parameterized::into_parameters`],
         ///     [`Parameterized::named_parameters`], [`Parameterized::named_parameters_mut`],
         ///     and [`Parameterized::into_named_parameters`], to generate code for.
@@ -1594,9 +1594,9 @@ impl CodeGenerator {
         ///
         /// # Parameters
         ///
-        ///   * `generator` - [`CodeGenerator`] from within which this function is being called.
-        ///   * `fields` - List of [`Field`]s for which to generate code.
-        ///   * `structure` - Optional [`TokenStream`] that represents the [`Parameterized`] structure of the "owner" of
+        ///   - `generator`: [`CodeGenerator`] from within which this function is being called.
+        ///   - `fields`: List of [`Field`]s for which to generate code.
+        ///   - `structure`: Optional [`TokenStream`] that represents the [`Parameterized`] structure of the "owner" of
         ///     the provided [`Field`]s. Note that the owner may be a tuple, a struct, or the variant of an enum. This
         ///     is used to obtain the [`Parameterized`] structure that corresponds to each [`Field`] in the provided
         ///     list by invoking [`Field::member`] to construct the appropriate accessor.

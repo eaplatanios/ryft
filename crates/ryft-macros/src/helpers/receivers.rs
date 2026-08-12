@@ -13,7 +13,7 @@ use crate::helpers::spans::with_span;
 ///
 /// # Parameters
 ///
-///   * `input` - [`DeriveInput`] for which to replace instances of the `Self` type. Note that this function
+///   - `input`: [`DeriveInput`] for which to replace instances of the `Self` type. Note that this function
 ///     will mutate this [`DeriveInput`] instance directly. Note also that only structs and enums are supported.
 ///     [`DeriveInput`] instances that correspond to unions will be ignored by this function.
 pub fn replace_self_type(input: &mut syn::DeriveInput) {

@@ -162,8 +162,8 @@ impl OperationParser {
     ///
     /// # Parameters
     ///
-    ///   * `tokens` - Tokens that the error spans.
-    ///   * `message` - Message describing the error.
+    ///   - `tokens`: Tokens that the error spans.
+    ///   - `message`: Message describing the error.
     fn add_error<T: ToTokens, U: Display>(&mut self, tokens: T, message: U) {
         self.errors.push(syn::Error::new_spanned(tokens.into_token_stream(), message));
     }
@@ -456,9 +456,9 @@ impl OperationParser {
     ///
     /// # Parameters
     ///
-    ///   * `generics` - [`syn::Generics`] of the enum being derived, used to detect bare generic payloads.
-    ///   * `members` - Member universes declared by the enum, used to default and cross-check member markers.
-    ///   * `variant` - [`syn::Variant`] from which to extract an [`OperationVariant`].
+    ///   - `generics`: [`syn::Generics`] of the enum being derived, used to detect bare generic payloads.
+    ///   - `members`: Member universes declared by the enum, used to default and cross-check member markers.
+    ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(
         &mut self,
         generics: &syn::Generics,
@@ -510,8 +510,8 @@ impl OperationParser {
     ///
     /// # Parameters
     ///
-    ///   * `members` - Member universes declared by the enum, used to default and cross-check member markers.
-    ///   * `variant` - [`syn::Variant`] whose class marker and conversion policy are extracted.
+    ///   - `members`: Member universes declared by the enum, used to default and cross-check member markers.
+    ///   - `variant`: [`syn::Variant`] whose class marker and conversion policy are extracted.
     fn extract_variant_attributes(
         &mut self,
         members: &[OperationMember],
@@ -585,9 +585,9 @@ impl OperationParser {
 ///
 /// # Parameters
 ///
-///   * `meta` - Nested `#[ryft(...)]` meta item naming the boundary marker.
-///   * `members` - Member universes declared by the enum, used to default and cross-check the member type.
-///   * `allow_defaulted_member_type` - Whether this boundary accepts the abbreviated forms that omit the member type.
+///   - `meta`: Nested `#[ryft(...)]` meta item naming the boundary marker.
+///   - `members`: Member universes declared by the enum, used to default and cross-check the member type.
+///   - `allow_defaulted_member_type`: Whether this boundary accepts the abbreviated forms that omit the member type.
 fn parse_member_class(
     meta: &syn::meta::ParseNestedMeta,
     members: &[OperationMember],
@@ -644,9 +644,9 @@ fn parse_member_class(
 ///
 /// # Parameters
 ///
-///   * `tokens` - Tokens the diagnostic spans when the member type cannot be defaulted.
-///   * `class` - Name of the boundary marker being parsed, used in diagnostics.
-///   * `members` - Member universes declared by the enum.
+///   - `tokens`: Tokens the diagnostic spans when the member type cannot be defaulted.
+///   - `class`: Name of the boundary marker being parsed, used in diagnostics.
+///   - `members`: Member universes declared by the enum.
 fn defaulted_member_type<T: ToTokens>(tokens: T, class: &str, members: &[OperationMember]) -> syn::Result<syn::Type> {
     let computational_members =
         members.iter().filter(|member| !member.structural).map(|member| &member.r#type).collect::<Vec<_>>();
@@ -2164,9 +2164,9 @@ fn substitute_generics(generics: &syn::Generics, substitutions: &[(syn::Ident, s
 ///
 /// # Parameters
 ///
-///   * `generics` - Enum generics declaring the `source` parameter.
-///   * `source` - Enum value parameter whose bounds are copied.
-///   * `target` - Generated type that receives the copied bounds.
+///   - `generics`: Enum generics declaring the `source` parameter.
+///   - `source`: Enum value parameter whose bounds are copied.
+///   - `target`: Generated type that receives the copied bounds.
 fn generic_parameter_bounds_as_predicates(
     generics: &syn::Generics,
     source: &syn::Ident,

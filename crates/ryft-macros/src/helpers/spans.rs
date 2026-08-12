@@ -7,8 +7,8 @@ use proc_macro2::{Group, Span, TokenStream, TokenTree};
 ///
 /// # Parameters
 ///
-///   * `stream` - [`TokenStream`] to copy.
-///   * `span` - [`Span`] to use for the new [`TokenStream`].
+///   - `stream`: [`TokenStream`] to copy.
+///   - `span`: [`Span`] to use for the new [`TokenStream`].
 pub fn with_span(stream: TokenStream, span: Span) -> TokenStream {
     stream
         .into_iter()
