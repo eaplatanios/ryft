@@ -522,6 +522,42 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// instance is published and returned. With debug assertions enabled, a hit re-runs `derive_fn`, sanitizes the
     /// fresh artifact, and compares it with the retained programs and metadata; optimized builds compile that work out.
     ///
+    /// # Lifetime Requirements
+    ///
+    /// [`Transform`] itself permits marker and argument types that borrow data, but this region-owned cache does not.
+    /// Its registry uses the marker's [`TypeId`] as a namespace and type-erases retained arguments, so both `T` and
+    /// `T::Arguments` must be `'static`. Put borrowed key data in an owned type such as [`String`] or [`Arc<str>`]
+    /// before requesting a retained transform.
+    ///
+    /// The following implementation is a valid [`Transform`] descriptor, but its borrowed marker and arguments cannot
+    /// be retained by this method:
+    ///
+    /// ```compile_fail
+    /// # use std::convert::Infallible;
+    /// # use std::marker::PhantomData;
+    /// # use std::sync::Arc;
+    /// # use ryft_core::programs::transforms::{Transform, TransformArtifact};
+    /// # use ryft_core::{Array, ArrayOperation, Operation, Region, RegionRef, Value};
+    ///
+    /// struct BorrowedTransform<'a>(PhantomData<&'a str>);
+    ///
+    /// impl<'a, V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for BorrowedTransform<'a> {
+    ///     type Arguments = &'a str;
+    ///     type Artifact = TransformArtifact<V, O, ()>;
+    ///
+    ///     const DEFAULT_CACHE_CAPACITY: usize = 1;
+    /// }
+    ///
+    /// # fn cache_borrowed_arguments<'a>(
+    /// #     region: RegionRef<'_, Array, ArrayOperation<Array>>,
+    /// #     arguments: &'a str,
+    /// # ) {
+    /// let _ = region.transform::<BorrowedTransform<'a>, _, Infallible>(arguments, |region, _| {
+    ///     Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], ()))
+    /// });
+    /// # }
+    /// ```
+    ///
     /// ```mermaid
     /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
     /// flowchart LR
