@@ -179,56 +179,61 @@ use crate::programs::types::Typed;
 use crate::programs::values::Value;
 use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry};
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Describes one family of retained specializations within `Source`.
-///
-/// `Source` is a type-level coherence and documentation parameter. It is not stored or invoked by a cache. For
-/// example, structural region markers implement `Transform<Region<V, O>>`, while retained JIT specialization uses a
-/// private source token describing its domain and function signature.
-///
-/// Equal [`Arguments`](Self::Arguments) must make retained artifacts interchangeable within one owning cache. Any
-/// fixed semantics absent from the arguments, such as a retained closure or immutable options, must be fixed by that
-/// cache's owner.
+/// Describes a family of retained specializations within `Source`. `Source` is a type-level coherence and
+/// documentation parameter. It is not stored or invoked by a cache. For example, structural region markers implement
+/// `Transform<Region<V, O>>`, while retained Just-In-Time (JIT) compilation specialization uses a private source token
+/// describing its domain and function signature. Also, equal [`Arguments`](Self::Arguments) must make retained
+/// artifacts interchangeable within one owning cache. Any fixed semantics absent from the arguments, such as a retained
+/// closure or immutable options, must be fixed by that cache's owner.
 ///
 /// # Type Relationships
 ///
 /// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
 /// flowchart TB
-///   descriptor["Transform Descriptor"] --> arguments["Arguments"]
-///   descriptor --> artifact["Artifact"]
-///   descriptor --> capacity["Default Capacity"]
-///   typed_cache["TransformCache Alias"] --> specialization["SpecializationCache"]
-///   region_owner["Sealed RegionRef"] --> registry["Per-Region Namespace Registry"]
+///   descriptor["&lt;code&gt;Transform&lt;/code&gt; Descriptor"]
+///   arguments["&lt;code&gt;Arguments&lt;/code&gt;"]
+///   artifact["&lt;code&gt;Artifact&lt;/code&gt;"]
+///   capacity["&lt;code&gt;DEFAULT_CACHE_CAPACITY&lt;/code&gt;"]
+///   typed_cache["&lt;code&gt;TransformCache&lt;/code&gt; Alias"]
+///   specialization["&lt;code&gt;SpecializationCache&lt;/code&gt;"]
+///   region_owner["&lt;code&gt;RegionRef&lt;/code&gt;"]
+///   registry["Per-Region Namespace Registry"]
+///   region_artifact["&lt;code&gt;Program&lt;/code&gt; Bundle and Metadata"]
+///   dispatcher["&lt;code&gt;CompiledFunctionDispatcher&lt;/code&gt;"]
+///   executable["&lt;code&gt;ExecutableFunction&lt;/code&gt;"]
+///   backend["&lt;code&gt;CompilationContext&lt;/code&gt; on a Miss"]
+///   descriptor --> arguments
+///   descriptor --> artifact
+///   descriptor --> capacity
+///   typed_cache --> specialization
+///   region_owner --> registry
 ///   registry --> specialization
-///   registry --> region_artifact["Program Bundle and Metadata"]
-///   jit_owner["JittedFunction"] --> typed_cache
-///   typed_cache --> executable["ExecutableFunction"]
-///   jit_owner --> backend["CompilationContext on a Miss"]
+///   registry --> region_artifact
+///   dispatcher --> typed_cache
+///   typed_cache --> executable
+///   dispatcher --> backend
 /// ```
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub trait Transform<Source> {
     /// Complete equality and hash identity of one specialization within the owning transform cache.
     type Arguments: Clone + Eq + Hash;
 
-    /// Cheaply cloned artifact retained for one argument value.
+    /// Cheaply cloneable artifact retained for one [`Self::Arguments`] instance.
     type Artifact: Clone;
 
-    /// Default number of artifacts retained by one transform owner or region namespace.
+    /// Default number of [`Self::Artifact`]s retained by one transform owner or region namespace.
     const DEFAULT_CACHE_CAPACITY: usize;
 }
 
-/// Typed specialization cache selected by `T` for `Source`.
-///
-/// This is an alias rather than a forwarding wrapper, so it exposes the exact [`SpecializationCache`] entry,
-/// statistics, invalidation, synchronization, panic, and destructor behavior. Construct it with
-/// `SpecializationCache::new(T::DEFAULT_CACHE_CAPACITY)` when the descriptor default applies, or with an explicit
-/// owner-configured capacity.
+/// Typed [`SpecializationCache`] selected by [`Transform`] `T` for `Source`. This is an alias rather than a forwarding
+/// wrapper, so that it exposes the exact [`SpecializationCache`] entry, statistics, invalidation, synchronization,
+/// panic, and destructor behavior. Construct it with `SpecializationCache::new(T::DEFAULT_CACHE_CAPACITY)` when the
+/// descriptor default applies, or with an explicit owner-configured capacity.
 ///
 /// ```
-/// use std::convert::Infallible;
-///
-/// use ryft_core::programs::transforms::{Transform, TransformCache};
+/// # use std::convert::Infallible;
+/// # use ryft_core::programs::transforms::{Transform, TransformCache};
 ///
 /// struct Source;
 /// struct Square;
@@ -246,6 +251,8 @@ pub trait Transform<Source> {
 /// ```
 pub type TransformCache<T, Source> =
     SpecializationCache<<T as Transform<Source>>::Arguments, <T as Transform<Source>>::Artifact>;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Structural programs and static metadata retained for one region-transform specialization.
 ///
