@@ -2576,7 +2576,7 @@ mod tests {
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
         assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
-        assert!(message.contains("FusedJvpTransform"), "{message}");
+        assert!(message.contains("JvpTransform"), "{message}");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
@@ -35,8 +36,9 @@ use crate::operations::{
     IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
+use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Operation, OperationProjection, Program, ProgramError, ProjectedValue, RegionRef, RegionReplayMappings,
+    Operation, OperationProjection, Program, ProgramError, ProjectedValue, Region, RegionRef, RegionReplayMappings,
     ReplayRegionDriver, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -1267,6 +1269,35 @@ impl BatchableType for ArrayType {
     type Policy = ArrayBatching;
 }
 
+/// [`Region`] [`Transform`] marker for retained homogeneous array batched [`Program`]s.
+struct ArrayBatchingTransform;
+
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> Transform<Region<V, O>> for ArrayBatchingTransform {
+    type Arguments = ArrayBatchingTransformArguments;
+    type Artifact = TransformArtifact<V, O, Vec<BatchAxis>>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
+}
+
+/// Argument key for one retained [`ArrayBatchingTransform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ArrayBatchingTransformArguments {
+    /// Static extent inserted for the mapped axis.
+    axis_size: usize,
+
+    /// Optional name visible to named-axis operations while replaying the region.
+    axis_name: Option<String>,
+
+    /// Sharding assigned to every inserted mapped axis.
+    axis_sharding: ShardingDimension,
+
+    /// Normalized mapped axis or replication state of every source input.
+    input_batch_axes: Vec<BatchAxis>,
+
+    /// Normalized output-axis packaging requirements.
+    output_axes_policy: ProgramBatchingOutputAxesPolicy,
+}
+
 // Blanket `BatchableOperation` implementation for any `ElementwiseOperation`, so per-operation `BatchableOperation`
 // implementations do not have to be written for elementwise primitives (e.g., `ZeroLike`, `OneLike`, `Add`, `Sub`,
 // `Mul`, `Div`, `Neg`, `Sin`, `Cos`, `Select`, etc.). Operations with non-trivial axis arithmetic (e.g., `Dot`,
@@ -1475,13 +1506,13 @@ impl<
         + From<BroadcastOperation>,
 > RegionRef<'_, V, O>
 {
-    /// Structurally batches this borrowed homogeneous-array [`Region`](crate::Region) so that the resulting program
-    /// operates over inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`]
-    /// implementations use this function to batch captured programs *without* concretizing any batch-item values, so
-    /// that batched control-flow and custom-derivative structure can be staged back into the enclosing trace. This
-    /// function replays the region through an [`ArrayBatching`] [`BatchingContext`] over a fresh [`TracingContext`],
-    /// lifts every instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program
-    /// together with the requested [`ProgramBatchingOutputAxesPolicy`].
+    /// Structurally batches this borrowed homogeneous-array [`Region`] so that the resulting program operates over
+    /// inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations
+    /// use this function to batch captured programs *without* concretizing any batch-item values, so that batched
+    /// control-flow and custom-derivative structure can be staged back into the enclosing trace. This function replays
+    /// the region through an [`ArrayBatching`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
+    /// instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program together
+    /// with the requested [`ProgramBatchingOutputAxesPolicy`].
     ///
     /// This method is intentionally specific to [`ArrayType`]. It constructs mapped batched input types by inserting
     /// static [`Dimension`]s, rewrites array sharding metadata, and materializes output axes through [`ArrayBatch`].
@@ -1498,6 +1529,15 @@ impl<
     /// `while` fix-point keeps body outputs on the loop-invariant state axes.
     /// [`ProgramBatchingOutputAxesPolicy::AlignAllTo`] imposes one canonical
     /// output axis when a consumer explicitly requires one common layout.
+    ///
+    /// Successful structural results are retained in this sealed region's [`Transform`] namespace. The complete key
+    /// contains the static extent, named-axis scope, mapped-axis sharding, normalized input axes, and normalized output
+    /// policy. Equal repeated requests therefore clone the retained program boundary instead of replaying every
+    /// operation rule again; changed arguments derive an independent bounded specialization. Unlike the Jacobian-Vector
+    /// Product (JVP), linearization, and transposition boundaries, which hand back the retained [`Arc`]-shared
+    /// [`Program`] itself, [`BoundaryPreservingBatchedProgram`] owns its [`Program`], so a hit returns an owned deep
+    /// clone of the retained program. Repeated batched attachments therefore never dedupe by [`Arc`] identity, and the
+    /// cache removes replay cost only.
     ///
     /// Dynamic per-item dimensions are supported. The mapped axis is always _freshly inserted_ as [`Dimension::Static`]
     /// carrying the caller's `axis_size`, so program-level batching never reads a batch extent off an input type and
@@ -1545,118 +1585,223 @@ impl<
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<BoundaryPreservingBatchedProgram<V, O>, BatchingError> {
-        let input_count = self.input_ids().len();
-        check_count!("input", input_batch_axes, input_count, ProgramError);
+        // Cache the semantic packed-axis positions, not the caller's rank-relative spelling. For one rank-two source
+        // input, for example, `-1` and `2` both select the trailing axis after insertion and must share one transform
+        // specialization. Validation must also precede `zip`. Otherwise, a short axis list would silently omit source
+        // inputs from both the key and the derived boundary, while an overlong list would leave unchecked key material.
+        check_count!("input", input_batch_axes, self.input_ids().len(), ProgramError);
+        let input_batch_axes = self
+            .input_types()
+            .iter()
+            .zip(input_batch_axes)
+            .map(|(unbatched_type, batch_axis)| {
+                batch_axis.axis().map_or(Ok(*batch_axis), |axis| {
+                    let batched_rank = unbatched_type.rank() + 1;
+                    axis.normalize(batched_rank).map(BatchAxis::from_position).map_err(|_| {
+                        BatchingError::BatchAxisOutOfBounds { r#type: Box::new(unbatched_type.clone()), axis }
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let parent_context = TracingContext::<V, O>::new();
-        let builder = parent_context.builder().clone();
-
-        // Keep every tracer and context that holds a clone of `builder` inside the following scope so that recovering
-        // the builder later on (below) is a real ownership check. In particular, `context` (which owns a clone of the
-        // builder through its parent trace) must be created *inside* this scope so it is dropped before the builder is
-        // recovered below; leaving it in the enclosing scope leaks a builder clone past the recovery.
-        let (output_atom_ids, output_axes) = {
-            let batching_context = BatchingContext::new(parent_context, axis_size)
-                .with_axis_name(axis_name)
-                .with_axis_sharding(axis_sharding.clone());
-            let inputs = self
-                .input_types()
-                .iter()
-                .zip(input_batch_axes.iter())
-                .map(|(unbatched_type, batch_axis)| {
-                    let batched_type = match batch_axis.axis() {
-                        Some(axis) => {
-                            // A possibly-negative mapped axis is normalized against the packed input rank (i.e., with
-                            // the inserted batch dimension counted). Valid axes lie in `[-rank, rank)`, with `-1`
-                            // denoting the final axis.
-                            let batched_rank = unbatched_type.rank() + 1;
-                            let position = axis.normalize(batched_rank).map_err(|_| {
+        // Output policy is likewise part of the transform's semantic identity. Normalize `AlignEachTo` independently
+        // against each packed output rank so equivalent positive and negative spellings hit the same entry, and reject
+        // malformed arity or out-of-bounds axes before lookup. `AlignAllTo` is subtler: one signed axis is interpreted
+        // separately for every output, so heterogeneous ranks may resolve it to different positions. It can be replaced
+        // by one canonical nonnegative axis only when every output resolves to that same position. Otherwise, retaining
+        // the raw signed axis preserves the per-output semantics. Using the raw policy everywhere would remain correct,
+        // but equivalent requests would occupy duplicate cache entries and repeat structural derivation.
+        let output_axes_policy = match output_axes_policy {
+            ProgramBatchingOutputAxesPolicy::Natural => ProgramBatchingOutputAxesPolicy::Natural,
+            ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => {
+                let positions = self
+                    .output_types()
+                    .iter()
+                    .map(|unbatched_type| {
+                        axis.normalize(unbatched_type.rank() + 1).map_err(|_| BatchingError::BatchAxisOutOfBounds {
+                            r#type: Box::new(unbatched_type.clone()),
+                            axis,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // One signed axis can only be canonicalized when it resolves to the same position for every output, so
+                // outputs of differing ranks keep the caller's raw axis. Requests spelling one position two ways (e.g.
+                // `-1` and `1`) then occupy two cache entries, which costs extra misses but never reuses an artifact
+                // for a different alignment.
+                if positions.windows(2).all(|positions| positions[0] == positions[1]) {
+                    positions
+                        .first()
+                        .copied()
+                        .map(Axis::from)
+                        .map(ProgramBatchingOutputAxesPolicy::AlignAllTo)
+                        .unwrap_or(ProgramBatchingOutputAxesPolicy::AlignAllTo(axis))
+                } else {
+                    ProgramBatchingOutputAxesPolicy::AlignAllTo(axis)
+                }
+            }
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
+                check_count!("output", axes, self.output_types().len(), ProgramError);
+                let axes = self
+                    .output_types()
+                    .iter()
+                    .zip(axes)
+                    .map(|(unbatched_type, batch_axis)| -> Result<BatchAxis, BatchingError> {
+                        if let Some(axis) = batch_axis.axis() {
+                            let position = axis.normalize(unbatched_type.rank() + 1).map_err(|_| {
                                 BatchingError::BatchAxisOutOfBounds { r#type: Box::new(unbatched_type.clone()), axis }
                             })?;
-                            let mut batched_type =
-                                unbatched_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
-                            if let Some(sharding) = unbatched_type.sharding() {
-                                batched_type.sharding =
-                                    Some(sharding.with_inserted_dimension(position, axis_sharding.clone()).map_err(
-                                        |error| BatchingError::MisalignedBatchAxes { message: error.to_string() },
-                                    )?);
-                            }
-                            batched_type
+                            Ok(BatchAxis::from_position(position))
+                        } else {
+                            Ok(batch_axis)
                         }
-                        None => unbatched_type.clone(),
-                    };
-                    let input = builder.borrow_mut().add_input(batched_type.clone());
-                    let value = batching_context.parent().tracer(input, Some(batched_type.clone()));
-                    Ok(ArrayBatch::new(value, *batch_axis)?)
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-
-            // Replay this program by binding each instruction's `BatchableOperation` rule against the batching context,
-            // threading the batch-carrying inputs through. Constants lift in the parent trace and replicate across the
-            // batch. This only requires this program's own operation family to be batchable, so staged higher-order
-            // batching rules can batch a captured sub-program without concretizing any batch-item values.
-            let region_mappings = RegionReplayMappings::new();
-            let outputs = self.interpret_with(
-                inputs,
-                |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
-                |instruction, instruction_inputs| -> Result<_, BatchingError> {
-                    let regions = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-                    let (outputs, evidence) = instruction
-                        .operation()
-                        .batch(&batching_context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
-                        .into_parts();
-                    <ArrayBatching as BatchingPolicy<TracingContext<V, O>>>::validate_operation_outputs(
-                        instruction.operation().name(),
-                        instruction_inputs,
-                        outputs.as_slice(),
-                        &evidence,
-                    )?;
-                    Ok(outputs)
-                },
-            )?;
-
-            // Resolve `output_axes_policy` into one optional alignment declaration per output. The outer `None` keeps
-            // the natural axis, while `Some(mapped)` forces the output to carry its batch axis at that signed position.
-            // A replicated `AlignEachTo` entry is a lower bound rather than an equality constraint, mirroring JAX's
-            // `instantiate` behavior.
-            let output_target_batch_axes = match &output_axes_policy {
-                ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => vec![Some(BatchAxis::new(*axis)); outputs.len()],
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
-                    check_count!("output", outputs, axes.len(), ProgramError);
-                    axes.iter().map(|target| (!target.is_replicated()).then_some(*target)).collect::<Vec<_>>()
-                }
-            };
-            let mut output_atom_ids = Vec::with_capacity(outputs.len());
-            let mut output_axes = Vec::with_capacity(outputs.len());
-            for (output, output_target_batch_axis) in outputs.into_iter().zip(output_target_batch_axes) {
-                // The batched outputs must belong to this batched trace. A foreign tracer's atom ID would silently
-                // alias whichever atom shares its index in this builder, and so we perform a check here to avoid that.
-                check_builders!(&builder, output.value().builder())?;
-
-                // Untargeted outputs keep the natural axis produced by their batching rules.
-                let Some(target_batch_axis) = output_target_batch_axis else {
-                    output_atom_ids.push(output.value().atom_id()?);
-                    output_axes.push(output.batch_axis());
-                    continue;
-                };
-
-                // Move naturally mapped outputs or broadcast naturally replicated outputs while they are still live
-                // tracers, then report the normalized position stored by `ArrayBatch`.
-                let output =
-                    output.align_axis(target_batch_axis, axis_size, batching_context.axis_sharding().clone())?;
-                output_axes.push(output.batch_axis());
-                output_atom_ids.push(output.into_value().atom_id()?);
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(axes)
             }
+        };
+        let arguments = ArrayBatchingTransformArguments {
+            axis_size,
+            axis_name,
+            axis_sharding,
+            input_batch_axes,
+            output_axes_policy,
+        };
+        let artifact =
+            (*self).transform::<ArrayBatchingTransform, _, BatchingError>(arguments, |region, arguments| {
+                let ArrayBatchingTransformArguments {
+                    axis_size,
+                    axis_name,
+                    axis_sharding,
+                    input_batch_axes,
+                    output_axes_policy,
+                } = arguments;
+                let input_count = region.input_ids().len();
 
-            Ok::<_, ProgramError>((output_atom_ids, output_axes))
-        }?;
+                let parent_context = TracingContext::<V, O>::new();
+                let builder = parent_context.builder().clone();
 
-        let output_count = output_atom_ids.len();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder
-            .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-            .into_simplified()?;
+                // Keep every tracer and context that holds a clone of `builder` inside the following scope so that
+                // recovering the builder later on (below) is a real ownership check. In particular, `context` (which
+                // owns a clone of the builder through its parent trace) must be created *inside* this scope so it is
+                // dropped before the builder is recovered below; leaving it in the enclosing scope leaks a builder
+                // clone past the recovery.
+                let (output_atom_ids, output_axes) = {
+                    let batching_context = BatchingContext::new(parent_context, *axis_size)
+                        .with_axis_name(axis_name.clone())
+                        .with_axis_sharding(axis_sharding.clone());
+                    let inputs = region
+                        .input_types()
+                        .iter()
+                        .zip(input_batch_axes.iter())
+                        .map(|(unbatched_type, batch_axis)| {
+                            let batched_type = match batch_axis.axis() {
+                                Some(axis) => {
+                                    // The mapped axis is already normalized against the packed input rank (i.e., with
+                                    // the inserted batch dimension counted), so reading its position back cannot fail.
+                                    let position = usize::try_from(axis.value()).unwrap();
+                                    let mut batched_type = unbatched_type
+                                        .with_inserted_dimension(position, Dimension::Static(*axis_size))?;
+                                    if let Some(sharding) = unbatched_type.sharding() {
+                                        batched_type.sharding = Some(
+                                            sharding.with_inserted_dimension(position, axis_sharding.clone()).map_err(
+                                                |error| BatchingError::MisalignedBatchAxes {
+                                                    message: error.to_string(),
+                                                },
+                                            )?,
+                                        );
+                                    }
+                                    batched_type
+                                }
+                                None => unbatched_type.clone(),
+                            };
+                            let input = builder.borrow_mut().add_input(batched_type.clone());
+                            let value = batching_context.parent().tracer(input, Some(batched_type.clone()));
+                            Ok(ArrayBatch::new(value, *batch_axis)?)
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+
+                    // Replay this program by binding each instruction's `BatchableOperation` rule against the batching
+                    // context, threading the batch-carrying inputs through. Constants lift in the parent trace and
+                    // replicate across the batch. This only requires this program's own operation family to be
+                    // batchable, so staged higher-order batching rules can batch a captured sub-program without
+                    // concretizing any batch-item values.
+                    let region_mappings = RegionReplayMappings::new();
+                    let outputs = region.interpret_with(
+                        inputs,
+                        |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
+                        |instruction, instruction_inputs| -> Result<_, BatchingError> {
+                            let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                            let (outputs, evidence) = instruction
+                                .operation()
+                                .batch(&batching_context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
+                                .into_parts();
+                            <ArrayBatching as BatchingPolicy<TracingContext<V, O>>>::validate_operation_outputs(
+                                instruction.operation().name(),
+                                instruction_inputs,
+                                outputs.as_slice(),
+                                &evidence,
+                            )?;
+                            Ok(outputs)
+                        },
+                    )?;
+
+                    // Resolve `output_axes_policy` into one optional alignment declaration per output. The outer `None`
+                    // keeps the natural axis, while `Some(mapped)` forces the output to carry its batch axis at that
+                    // signed position. A replicated `AlignEachTo` entry is a lower bound rather than an equality
+                    // constraint, mirroring JAX's `instantiate` behavior.
+                    let output_target_batch_axes = match &output_axes_policy {
+                        ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
+                        ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => {
+                            vec![Some(BatchAxis::new(*axis)); outputs.len()]
+                        }
+                        ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
+                            // This check is defense in depth and cannot fire today, because `batched_with_axis_name`
+                            // already rejects a policy whose axis count differs from this region's output count, and
+                            // replaying the region produces exactly one output per region output.
+                            check_count!("output", axes, outputs.len(), ProgramError);
+                            axes.iter().map(|target| (!target.is_replicated()).then_some(*target)).collect::<Vec<_>>()
+                        }
+                    };
+                    let mut output_atom_ids = Vec::with_capacity(outputs.len());
+                    let mut output_axes = Vec::with_capacity(outputs.len());
+                    for (output, output_target_batch_axis) in outputs.into_iter().zip(output_target_batch_axes) {
+                        // The batched outputs must belong to this batched trace. A foreign tracer's atom ID would
+                        // silently alias whichever atom shares its index in this builder, and so we perform a check
+                        // here to avoid that.
+                        check_builders!(&builder, output.value().builder())?;
+
+                        // Untargeted outputs keep the natural axis produced by their batching rules.
+                        let Some(target_batch_axis) = output_target_batch_axis else {
+                            output_atom_ids.push(output.value().atom_id()?);
+                            output_axes.push(output.batch_axis());
+                            continue;
+                        };
+
+                        // Move naturally mapped outputs or broadcast naturally replicated outputs while they are still
+                        // live tracers, then report the normalized position stored by `ArrayBatch`.
+                        let output = output.align_axis(
+                            target_batch_axis,
+                            *axis_size,
+                            batching_context.axis_sharding().clone(),
+                        )?;
+                        output_axes.push(output.batch_axis());
+                        output_atom_ids.push(output.into_value().atom_id()?);
+                    }
+
+                    Ok::<_, ProgramError>((output_atom_ids, output_axes))
+                }?;
+
+                let output_count = output_atom_ids.len();
+                let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+                let program = builder
+                    .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+                    .into_simplified()?;
+                let (program, output_axes) = BoundaryPreservingBatchedProgram::new(program, output_axes)?.into_parts();
+                Ok(TransformArtifact::new(vec![Arc::new(program)], output_axes))
+            })?;
+        let (mut programs, output_axes) = artifact.into_parts();
+        assert_eq!(programs.len(), 1);
+        let program = programs.pop().unwrap().as_ref().clone();
         Ok(BoundaryPreservingBatchedProgram::new(program, output_axes)?)
     }
 }
@@ -1892,18 +2037,15 @@ impl<V: Value<Type = ArrayIrType>> Display for ArrayIrBatch<V> {
     }
 }
 
-/// Result of batching an array IR [`Region`](crate::Region), whose boundary explicitly
-/// threads its mapped extent.
-///
-/// Composite regions are retraced as standalone programs and therefore cannot capture the parent program's
-/// first-class mapped-extent SSA value. Their boundary has one additional leading dimension input and output:
-/// the input defines the identity referenced by every inserted dynamic batch dimension, and the output forwards that
-/// same atom so enclosing higher-order operations can carry it through the sealed region. Output-axis metadata
-/// excludes this bookkeeping output, and [`BatchedProgram::into_parts`] documents the arity contract consumers must
-/// uphold.
-/// Consumers that instead need an ordinary [`Region`](crate::Region) boundary shed the widening through
-/// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's operands with
-/// [`BatchingPolicy::boundary_operands`].
+/// Result of batching an array IR [`Region`], whose boundary explicitly threads its mapped extent. Composite regions
+/// are retraced as standalone programs and therefore cannot capture the parent program's first-class mapped-extent
+/// Single Static Assignment (SSA) value. Their boundary has one additional leading dimension input and output: the
+/// input defines the identity referenced by every inserted dynamic batch dimension, and the output forwards that same
+/// atom so enclosing higher-order operations can carry it through the sealed region. Output-axis metadata excludes this
+/// bookkeeping output, and [`BatchedProgram::into_parts`] documents the arity contract consumers must uphold. Consumers
+/// that instead need an ordinary [`Region`] boundary shed the widening through
+/// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's
+/// operands with [`BatchingPolicy::boundary_operands`].
 pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter, O> {
     /// Structurally transformed program, including its leading bookkeeping input and output.
     program: Program<V, O, Vec<V>, Vec<V>>,
@@ -3002,6 +3144,20 @@ where
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<Self::BatchedProgram, BatchingError> {
+        // There is deliberately no `ArrayIrBatchingTransform` analogous to `ArrayBatchingTransform` here. Homogeneous
+        // array batching is determined entirely by a sealed region plus static host metadata, including a `usize`
+        // mapped extent, so that complete request can key a region-owned artifact directly. Array IR batching instead
+        // receives `context.axis_extent()` as a live `C::Value` (i.e., a single static assignment value owned by the
+        // caller's current parent context). Such a value is neither stable cache-key material nor something a retained
+        // region artifact may capture. This function already makes the required template/runtime split: it converts
+        // only the live extent's _type_ into a fresh leading input/output of the transformed program, while each
+        // consumer supplies the current extent through `BatchingPolicy::boundary_operands` and removes the bookkeeping
+        // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
+        // context-neutral template. It would need its own marker and a complete normalized key containing the extent
+        // type and identity contract, named-axis scope, sharding, input axes, and output policy; the live extent would
+        // remain a per-call boundary operand. The current measured cache consumer is the simpler homogeneous path, so
+        // adding that separate specialization mechanism here would be premature rather than technically impossible.
+
         check_count!("input", input_axes, region.input_types().len(), ProgramError);
         let extent_type = context.axis_extent().r#type();
         let extent_type = <&DimensionType>::try_from(extent_type.as_ref())?.clone();
@@ -3143,6 +3299,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::time::Instant;
 
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
@@ -3173,8 +3330,8 @@ mod tests {
         ConditionOperation, DimensionAddOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize,
         DimensionToScalar, DimensionToScalarOperation, DotDimensionNumbers, DotOperation, DynamicBroadcast,
         DynamicReshapeOperation, IotaOperation, NegOperation, OneLike, OneOperation, PadOperation, Reduce,
-        ReduceOperation, ReductionKind, ReshardOperation, ScanOperation, SelectOperation, Slice, WhileOperation,
-        ZeroOperation,
+        ReduceOperation, ReductionKind, ReshardOperation, ScanOperation, SelectOperation, SinOperation, Slice,
+        WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -3832,6 +3989,291 @@ mod tests {
                 .batched(2, ShardingDimension::Replicated, &[], ProgramBatchingOutputAxesPolicy::Natural)
                 .is_err(),
         );
+    }
+
+    #[test]
+    fn test_program_batched_rejects_mismatched_output_axes_count() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // `AlignEachTo` must list exactly one axis per program output, and the rejection blames the caller-supplied
+        // axes: the program's output count is `expected` and the policy length is `actual`, matching the sibling
+        // input-axes check. Asserting the exact payload keeps those two roles from silently swapping.
+        assert_eq!(
+            program
+                .batched(
+                    2,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0), BatchAxis::new(0)]),
+                )
+                .map(|_| ()),
+            Err(BatchingError::from(ProgramError::InvalidOutputCount { expected: 1, actual: 2 })),
+        );
+    }
+
+    #[test]
+    fn test_region_batched_cache_specializes_complete_normalized_arguments() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let region = program.entry_region_ref();
+
+        let first = region
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let repeated = region
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        let (first, first_axes) = first.into_parts();
+        let (repeated, repeated_axes) = repeated.into_parts();
+        assert_eq!(first.to_string(), repeated.to_string());
+        assert_eq!(first_axes, repeated_axes);
+
+        // Signed axes normalize before lookup, so `-1` and `0` share the scalar input's one valid packed position.
+        region
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+
+        // Every other structural input separates entries: extent, named-axis scope, sharding, output policy,
+        // and mapped-versus-replicated input state.
+        region
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap();
+        region
+            .batched_with_axis_name(
+                2,
+                Some("items".to_string()),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        region
+            .batched_with_axis_name(
+                2,
+                Some("models".to_string()),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Unconstrained,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(-1)]),
+            )
+            .unwrap();
+        region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+
+        let statistics = region.transform_statistics::<ArrayBatchingTransform>().unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (8, 4));
+    }
+
+    #[test]
+    fn test_region_batched_cache_separates_named_axis_semantics() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                CollectiveOperation::new("items".to_string(), CollectiveKind::PSum),
+                Vec::new(),
+                vec![input],
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let region = program.entry_region_ref();
+
+        // The matching named level consumes the mapped axis, while a different level forwards the collective and
+        // preserves that axis. These are semantically distinct cached programs despite sharing every other argument.
+        let matching = region
+            .batched_with_axis_name(
+                4,
+                Some("items".to_string()),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        let forwarded = region
+            .batched_with_axis_name(
+                4,
+                Some("models".to_string()),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        let repeated = region
+            .batched_with_axis_name(
+                4,
+                Some("items".to_string()),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        let (matching, matching_axes) = matching.into_parts();
+        let (forwarded, forwarded_axes) = forwarded.into_parts();
+        let (repeated, repeated_axes) = repeated.into_parts();
+        assert_eq!(matching_axes, vec![BatchAxis::replicated()]);
+        assert_eq!(forwarded_axes, vec![BatchAxis::new(0)]);
+        assert_ne!(matching.to_string(), forwarded.to_string());
+        assert_eq!(matching.to_string(), repeated.to_string());
+        assert_eq!(matching_axes, repeated_axes);
+
+        let statistics = region.transform_statistics::<ArrayBatchingTransform>().unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (2, 1));
+    }
+
+    #[test]
+    fn test_region_batched_cache_artifacts_can_be_attached_repeatedly_with_dynamic_identities() {
+        let dimension =
+            Dimension::Dynamic(DimensionVariable::new("items", DimensionBounds::non_negative(Some(16)).unwrap()));
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dimension.clone()]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type);
+        let source =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let (first, first_axes) = source
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        let (second, second_axes) = source
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(first_axes, second_axes);
+        assert_eq!(first.to_string(), second.to_string());
+
+        // Attaching both cached copies as separate branches must not introduce any identity relationship that two
+        // independent derivations would not have had. Structural batching inherits the source program's own dynamic
+        // dimension identity instead of minting a fresh one per derivation, and importing splices region types
+        // verbatim, so both branches present exactly that source identity. Comparing types rather than renderings is
+        // what makes this an identity assertion: two separately created "items" variables render identically but are
+        // never equal.
+        let mut outer = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first_region = outer.import_program(first);
+        let second_region = outer.import_program(second);
+        let first_branch_type = RegionRef::new(&outer.regions, first_region).unwrap().input_types().remove(0);
+        let second_branch_type = RegionRef::new(&outer.regions, second_region).unwrap().input_types().remove(0);
+        assert_eq!(first_branch_type, second_branch_type);
+        assert_eq!(first_branch_type.shape().dimensions(), &[Dimension::Static(2), dimension]);
+
+        // The condition therefore seals against one coherent shared interface.
+        let predicate = outer.add_input(ArrayType::scalar(DataType::Boolean));
+        let operand = outer.add_input(
+            source
+                .batched(
+                    2,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+                .input_types()[0]
+                .clone(),
+        );
+        let output = outer
+            .add_instruction(ConditionOperation::new(), vec![first_region, second_region], vec![predicate, operand])
+            .unwrap()[0];
+        let outer = outer
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(outer.output_types(), &outer.input_types()[1..]);
+
+        let statistics = source.entry_region_ref().transform_statistics::<ArrayBatchingTransform>().unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (1, 2));
+    }
+
+    #[test]
+    #[ignore = "structural batching cache gate measurement"]
+    fn test_baseline_repeated_structural_region_batching() {
+        const OPERATION_COUNT: usize = 200;
+        const REPETITION_COUNT: usize = 32;
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut value = builder.add_input(ArrayType::scalar(DataType::F64));
+        for _ in 0..OPERATION_COUNT {
+            value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+        }
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let start = Instant::now();
+        for _ in 0..REPETITION_COUNT {
+            let batched = program
+                .batched(
+                    8,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap();
+            assert_eq!(batched.output_axes(), &[BatchAxis::new(0)]);
+        }
+        let duration = start.elapsed();
+
+        // Production counts every uncached derivation, so the repeated requests must all be served from the one
+        // retained artifact. Unlike a derivation counter, this is immune to the debug-assertion hit-path recheck,
+        // which re-derives without producing and therefore leaves the production count alone.
+        let statistics = program.entry_region_ref().transform_statistics::<ArrayBatchingTransform>().unwrap();
+        let productions = statistics.productions;
+        println!(
+            "cached repeated structural batching: operations={OPERATION_COUNT}, repetitions={REPETITION_COUNT}, \
+             productions={productions}, elapsed={duration:?}",
+        );
+        assert_eq!(productions, 1);
     }
 
     #[test]
