@@ -291,8 +291,6 @@ impl<V: Typed + Parameter, O, Metadata> TransformArtifact<V, O, Metadata> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Typed + Parameter, O, Metadata: Clone> Clone for TransformArtifact<V, O, Metadata> {
     #[inline]
     fn clone(&self) -> Self {
@@ -301,6 +299,7 @@ impl<V: Typed + Parameter, O, Metadata: Clone> Clone for TransformArtifact<V, O,
 }
 
 impl<V: Typed + Parameter, O, Metadata: Debug> Debug for TransformArtifact<V, O, Metadata> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("TransformArtifact")
@@ -310,22 +309,22 @@ impl<V: Typed + Parameter, O, Metadata: Debug> Debug for TransformArtifact<V, O,
     }
 }
 
-/// Object-safe equality/hash/debug contract for erased region-transform arguments.
+/// Object-safe equality, hashing, and debugging contract for erased [`Region`] [`Transform`] arguments.
 trait ErasedTransformArgumentsValue: Debug + Send + Sync + DynEq + DynHash {}
 
-impl<T: Debug + Eq + Hash + Send + Sync + 'static> ErasedTransformArgumentsValue for T {}
+impl<T: 'static + Debug + Eq + Hash + Send + Sync> ErasedTransformArgumentsValue for T {}
 
 dyn_eq::eq_trait_object!(ErasedTransformArgumentsValue);
 dyn_hash::hash_trait_object!(ErasedTransformArgumentsValue);
 
-/// Cloneable erased key used inside one transform marker's namespace.
+/// Cloneable type-erased key used inside a [`Transform`] marker's namespace.
 #[derive(Clone)]
 pub(crate) struct ErasedTransformArguments(Arc<dyn ErasedTransformArgumentsValue>);
 
 impl ErasedTransformArguments {
-    /// Erases one complete typed argument value.
+    /// Creates a new [`ErasedTransformArguments`] wrapping the provided arguments value and erasing its type.
     #[inline]
-    fn new(arguments: impl ErasedTransformArgumentsValue + 'static) -> Self {
+    fn new<A: 'static + ErasedTransformArgumentsValue>(arguments: A) -> Self {
         Self(Arc::new(arguments))
     }
 }
@@ -352,6 +351,8 @@ impl Hash for ErasedTransformArguments {
         self.0.hash(state);
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Homogeneous artifact stored by every namespace in one concrete region universe.
 pub(crate) struct ErasedTransformArtifact<V: Typed + Parameter, O> {
