@@ -241,8 +241,6 @@ pub struct SpecializationCacheProducer<'c, Key: Clone + Eq + Hash, Artifact: Clo
     marker: PhantomData<*mut ()>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Key, Artifact> {
     /// Returns the key this [`SpecializationCacheProducer`] is authorized to produce.
     #[inline]
@@ -284,9 +282,14 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Ke
             let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
             in_flight.take(&marker)
         };
+
+        // Reverse declaration-order dropping would currently produce this same order, but we keep it explicit here.
+        // These values contain caller-defined keys or artifacts whose destructors may reenter or panic, so they must
+        // run only after publication, counter updates, marker removal, and both mutex guards have completed.
         drop(removed);
         drop(marker);
         drop(displaced);
+
         artifact
     }
 }
@@ -734,8 +737,8 @@ mod tests {
         expect_producer(cache.try_entry(2)).insert("two");
         expect_producer(cache.try_entry(3)).insert("three");
 
-        // The predicate observes the full snapshot while it runs, which pins that removal happens afterwards, and it
-        // reenters the cache without deadlocking because no lock is held while it runs.
+        // The predicate observes the full snapshot while it runs, which pins that removal happens afterwards,
+        // and it reenters the cache without deadlocking because no lock is held while it runs.
         assert_eq!(cache.invalidate_entries_if(|key| cache.len() == 3 && key % 2 == 1), 2);
         assert_eq!(cache.keys(), vec![2]);
 
@@ -919,7 +922,6 @@ mod tests {
         let cache = SpecializationCache::<u32, String>::new(4);
         expect_producer(cache.try_entry(1)).insert("compiled".to_string());
         cache.clear_statistics();
-
         let barrier = Barrier::new(4);
         thread::scope(|scope| {
             for _ in 0..4 {
@@ -929,7 +931,6 @@ mod tests {
                 });
             }
         });
-
         assert_eq!(cache.statistics(), SpecializationCacheStatistics { hits: 4, ..Default::default() });
     }
 }
