@@ -3335,6 +3335,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
@@ -3922,101 +3923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_program_batched_transforms_input_and_output_axes() {
-        // Trace a per-item squaring function into a flat program over per-item vector types.
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
-            vec![vector_type.clone()],
-        )
-        .unwrap();
-
-        // A mapped input at axis 0 turns the program into one over `[2, 3]`-shaped packed inputs that squares each
-        // row, with the output naturally mapped on the same axis.
-        let (batched, output_axes) = program
-            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let outputs = batched.interpret(vec![input]).unwrap();
-        assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0])]);
-
-        // A negative input axis is normalized against the packed input rank. Mapping the final axis consumes a
-        // `[3, 2]` packed value and preserves that canonical axis through the elementwise body.
-        let (batched, output_axes) = program
-            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
-        let input = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-        let outputs = batched.interpret(vec![input]).unwrap();
-        assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 16.0, 4.0, 25.0, 9.0, 36.0])]);
-
-        // A replicated input keeps its unbatched `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
-        // output across the batch so the batched program still produces one `[2, 3]` output per item.
-        let (batched, output_axes) = program
-            .batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
-        assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 1.0, 4.0, 9.0])]);
-
-        // Signed output policies normalize after accounting for the inserted batch dimension. `-1` places the
-        // instantiated batch axis last.
-        let (batched, output_axes) = program
-            .batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
-        let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
-        assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0])]);
-
-        // A mismatched `input_batch_axes` count is rejected.
-        assert!(
-            program
-                .batched(2, ShardingDimension::Replicated, &[], ProgramBatchingOutputAxesPolicy::Natural)
-                .is_err(),
-        );
-    }
-
-    #[test]
-    fn test_program_batched_rejects_mismatched_output_axes_count() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        // `AlignEachTo` must list exactly one axis per program output, and the rejection blames the caller-supplied
-        // axes: the program's output count is `expected` and the policy length is `actual`, matching the sibling
-        // input-axes check. Asserting the exact payload keeps those two roles from silently swapping.
-        assert_eq!(
-            program
-                .batched(
-                    2,
-                    ShardingDimension::Replicated,
-                    &[BatchAxis::new(0)],
-                    ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0), BatchAxis::new(0)]),
-                )
-                .map(|_| ()),
-            Err(BatchingError::from(ProgramError::InvalidOutputCount { expected: 1, actual: 2 })),
-        );
-    }
-
-    #[test]
-    fn test_region_batched_cache_specializes_complete_normalized_arguments() {
+    fn test_region_batched_cache_normalizes_axes_and_specializes_semantic_arguments() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
@@ -4112,8 +4019,69 @@ mod tests {
             )
             .unwrap();
 
-        let statistics = region.transform_statistics::<ArrayBatchingTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (8, 4));
+        assert_eq!(
+            region.transform_statistics::<ArrayBatchingTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 4,
+                misses: 8,
+                productions: 8,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_batched_cache_preserves_mixed_rank_align_all_semantics() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64));
+        let vector = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![scalar, vector], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let input_axes = [BatchAxis::replicated(), BatchAxis::replicated()];
+
+        // `-1` resolves separately against each packed output rank: position 0 for the scalar and position 1 for the
+        // vector. It therefore cannot be canonicalized to one positive `AlignAllTo` position.
+        let negative = region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &input_axes,
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
+            )
+            .unwrap();
+        let repeated = region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &input_axes,
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
+            )
+            .unwrap();
+        let leading = region
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &input_axes,
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+            )
+            .unwrap();
+
+        assert_eq!(negative.output_axes(), &[BatchAxis::new(0), BatchAxis::new(1)]);
+        assert_eq!(repeated.output_axes(), negative.output_axes());
+        assert_eq!(leading.output_axes(), &[BatchAxis::new(0), BatchAxis::new(0)]);
+        assert_eq!(
+            region.transform_statistics::<ArrayBatchingTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
     }
 
     #[test]
@@ -4169,8 +4137,16 @@ mod tests {
         assert_eq!(matching.to_string(), repeated.to_string());
         assert_eq!(matching_axes, repeated_axes);
 
-        let statistics = region.transform_statistics::<ArrayBatchingTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (2, 1));
+        assert_eq!(
+            region.transform_statistics::<ArrayBatchingTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
     }
 
     #[test]
@@ -4232,8 +4208,16 @@ mod tests {
             .unwrap();
         assert_eq!(outer.output_types(), &outer.input_types()[1..]);
 
-        let statistics = source.entry_region_ref().transform_statistics::<ArrayBatchingTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (1, 2));
+        assert_eq!(
+            source.entry_region_ref().transform_statistics::<ArrayBatchingTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 2,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
     }
 
     #[test]
@@ -4268,12 +4252,117 @@ mod tests {
         // retained artifact. Unlike a derivation counter, this is immune to the debug-assertion hit-path recheck,
         // which re-derives without producing and therefore leaves the production count alone.
         let statistics = program.entry_region_ref().transform_statistics::<ArrayBatchingTransform>().unwrap();
-        let productions = statistics.productions;
         println!(
             "cached repeated structural batching: operations={OPERATION_COUNT}, repetitions={REPETITION_COUNT}, \
-             productions={productions}, elapsed={duration:?}",
+             productions={}, elapsed={duration:?}",
+            statistics.productions,
         );
-        assert_eq!(productions, 1);
+        assert_eq!(
+            statistics,
+            SpecializationCacheStatistics {
+                hits: 31,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn test_program_batched_transforms_input_and_output_axes() {
+        // Trace a per-item squaring function into a flat program over per-item vector types.
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
+            vec![vector_type.clone()],
+        )
+        .unwrap();
+
+        // A mapped input at axis 0 turns the program into one over `[2, 3]`-shaped packed inputs that squares each
+        // row, with the output naturally mapped on the same axis.
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        let input = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs = batched.interpret(vec![input]).unwrap();
+        assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0])]);
+
+        // A negative input axis is normalized against the packed input rank. Mapping the final axis consumes a
+        // `[3, 2]` packed value and preserves that canonical axis through the elementwise body.
+        let (batched, output_axes) = program
+            .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        let input = Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        let outputs = batched.interpret(vec![input]).unwrap();
+        assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 16.0, 4.0, 25.0, 9.0, 36.0])]);
+
+        // A replicated input keeps its unbatched `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
+        // output across the batch so the batched program still produces one `[2, 3]` output per item.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(0)),
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(outputs, vec![Array::matrix(2, 3, vec![1.0, 4.0, 9.0, 1.0, 4.0, 9.0])]);
+
+        // Signed output policies normalize after accounting for the inserted batch dimension. `-1` places the
+        // instantiated batch axis last.
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(Axis::from(-1)),
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        let outputs = batched.interpret(vec![Array::vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(outputs, vec![Array::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0])]);
+
+        // A mismatched `input_batch_axes` count is rejected with the source program's input count as `expected` and
+        // the caller-supplied axis count as `actual`.
+        assert_eq!(
+            program
+                .batched(2, ShardingDimension::Replicated, &[], ProgramBatchingOutputAxesPolicy::Natural)
+                .map(|_| ()),
+            Err(BatchingError::from(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+        );
+    }
+
+    #[test]
+    fn test_program_batched_rejects_mismatched_output_axes_count() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // `AlignEachTo` must list exactly one axis per program output, and the rejection blames the caller-supplied
+        // axes: the program's output count is `expected` and the policy length is `actual`, matching the sibling
+        // input-axes check. Asserting the exact payload keeps those two roles from silently swapping.
+        assert_eq!(
+            program
+                .batched(
+                    2,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0), BatchAxis::new(0)]),
+                )
+                .map(|_| ()),
+            Err(BatchingError::from(ProgramError::InvalidOutputCount { expected: 1, actual: 2 })),
+        );
     }
 
     #[test]
