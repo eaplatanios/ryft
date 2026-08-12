@@ -163,7 +163,7 @@
 //! debug-assertion build. The complete re-derivation and comparison path is compiled out when debug assertions are
 //! disabled.
 
-use std::any::{Any, TypeId, type_name};
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
@@ -381,7 +381,7 @@ impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
     /// Creates a new [`ErasedTransformArtifact`] by erasing the type of the provided [`TransformArtifact`].
     fn new<Metadata: Send + Sync + 'static>(artifact: TransformArtifact<V, O, Metadata>) -> Self {
         let (programs, metadata) = artifact.into_parts();
-        Self { programs, metadata: Arc::new(metadata), metadata_type_name: type_name::<Metadata>() }
+        Self { programs, metadata: Arc::new(metadata), metadata_type_name: std::any::type_name::<Metadata>() }
     }
 
     /// Reconstructs a typed [`TransformArtifact`] from this [`ErasedTransformArtifact`], panicking only if a marker
@@ -391,7 +391,7 @@ impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
             panic!(
                 "region transform cache metadata type mismatch: retained `{}` but requested `{}`",
                 self.metadata_type_name,
-                type_name::<Metadata>(),
+                std::any::type_name::<Metadata>(),
             )
         });
         TransformArtifact::new(self.programs.clone(), metadata.clone())
@@ -572,7 +572,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                              produced a different artifact than the region cache retained, but region transforms must \
                              be deterministic structural functions of their complete reachable contents and \
                              arguments\n\ncached metadata: {:?}\nderived metadata: {:?}\n\n{}",
-                            type_name::<T>(),
+                            std::any::type_name::<T>(),
                             arguments,
                             cached.metadata,
                             fresh.metadata,
@@ -602,14 +602,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::any::Any;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::convert::Infallible;
-    use std::fmt::{Debug, Formatter};
     use std::hash::{Hash, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Barrier};
 
     use pretty_assertions::assert_eq;
@@ -617,6 +617,7 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::parameters::Placeholder;
     use crate::programs::{Operation, ProgramBuilder, Region, RegionId, RegionRef, Value};
+    use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::{IdentityTransform, TestRegionOperation};
 
     use super::*;
@@ -651,34 +652,12 @@ mod tests {
         const DEFAULT_CACHE_CAPACITY: usize = 1;
     }
 
-    /// Key whose formatter panics, used to ensure cache summaries never inspect caller payloads.
-    #[derive(Clone, PartialEq, Eq, Hash)]
-    struct PanickingDebugKey;
-
-    impl Debug for PanickingDebugKey {
-        fn fmt(&self, _formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            panic!("argument formatting must not run")
-        }
-    }
-
-    /// Namespace whose key and metadata formatters are deliberately unusable.
-    struct PanickingDebugTransform;
-
-    impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for PanickingDebugTransform {
-        type Arguments = PanickingDebugKey;
-        type Artifact = TransformArtifact<V, O, PanickingDebugKey>;
-
-        const DEFAULT_CACHE_CAPACITY: usize = 1;
-    }
-
-    /// Builds a flat scalar identity program with no operation-specific behavior.
     fn identity_program() -> Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Derives the canonical test artifact for `key`.
     fn derive_test_artifact(
         region: RegionRef<'_, Array, TestRegionOperation>,
         key: &CollisionKey,
@@ -686,23 +665,157 @@ mod tests {
         Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], key.0))
     }
 
+    fn panic_message(payload: Box<dyn Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => payload.downcast::<&'static str>().map(|message| (*message).to_string()).unwrap(),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn transform_recheck_message(
+        arguments: &CollisionKey,
+        cached_metadata: usize,
+        derived_metadata: usize,
+        cached_programs: &[String],
+        derived_programs: &[String],
+    ) -> String {
+        let mut programs = String::new();
+        for index in 0..cached_programs.len().max(derived_programs.len()) {
+            for (label, renderings) in [("cached", cached_programs), ("fresh", derived_programs)] {
+                let rendering = renderings.get(index).map_or("<absent>", String::as_str);
+                programs.push_str(&format!("--- {label} program {index} ---\n{rendering}\n"));
+            }
+        }
+        format!(
+            "nondeterministic transform rule detected for `{}` with arguments {:?}: re-derivation produced a \
+             different artifact than the region cache retained, but region transforms must be deterministic \
+             structural functions of their complete reachable contents and arguments\n\ncached metadata: \
+             {:?}\nderived metadata: {:?}\n\n{}",
+            std::any::type_name::<TestTransform>(),
+            arguments,
+            cached_metadata,
+            derived_metadata,
+            programs,
+        )
+    }
+
     #[test]
-    fn test_transform_artifact() {
+    fn test_transform_artifact_new_accessors_clone_into_parts_and_debug() {
         let program = Arc::new(identity_program());
         let artifact = TransformArtifact::new(vec![program.clone()], 7usize);
         assert_eq!(artifact.programs().len(), 1);
         assert!(Arc::ptr_eq(&artifact.programs()[0], &program));
         assert_eq!(artifact.metadata(), &7);
-        assert_eq!(format!("{artifact:?}"), "TransformArtifact { program_count: 1, metadata: 7 }",);
-
+        assert_eq!(format!("{artifact:?}"), "TransformArtifact { program_count: 1, metadata: 7 }");
         let cloned = artifact.clone();
+        assert_eq!(cloned.programs().len(), 1);
+        assert!(Arc::ptr_eq(&cloned.programs()[0], &program));
+        assert_eq!(cloned.metadata(), &7);
         let (programs, metadata) = artifact.into_parts();
+        assert_eq!(programs.len(), 1);
+        assert!(Arc::ptr_eq(&programs[0], &program));
         assert_eq!(metadata, 7);
-        assert!(Arc::ptr_eq(&programs[0], &cloned.programs()[0]));
     }
 
     #[test]
-    fn test_region_transform_namespaces_are_lazy_collision_safe_and_independent() {
+    fn test_erased_transform_arguments_equality_hash_clone_and_debug() {
+        let first = ErasedTransformArguments::new(CollisionKey(1));
+        let equal = ErasedTransformArguments::new(CollisionKey(1));
+        let different = ErasedTransformArguments::new(CollisionKey(2));
+        let other_type = ErasedTransformArguments::new(1usize);
+        assert_eq!(first, first.clone());
+        assert_eq!(first, equal);
+        assert_ne!(first, different);
+        assert_ne!(first, other_type);
+        assert_eq!(format!("{first:?}"), "CollisionKey(1)");
+        let entries = HashMap::from([(first, "retained")]);
+        assert_eq!(entries.get(&equal), Some(&"retained"));
+        assert_eq!(entries.get(&different), None);
+    }
+
+    #[test]
+    fn test_erased_transform_artifact_new_typed_clone_and_debug() {
+        let program = Arc::new(identity_program());
+        let erased = ErasedTransformArtifact::<Array, TestRegionOperation>::new(TransformArtifact::new(
+            vec![program.clone()],
+            7usize,
+        ));
+        assert_eq!(format!("{erased:?}"), "ErasedTransformArtifact { program_count: 1, metadata_type: \"usize\" }",);
+        let cloned = erased.clone();
+        let typed = cloned.typed::<usize>();
+        assert_eq!(typed.programs().len(), 1);
+        assert!(Arc::ptr_eq(&typed.programs()[0], &program));
+        assert_eq!(typed.metadata(), &7);
+    }
+
+    #[test]
+    fn test_erased_transform_artifact_typed_rejects_metadata_type_mismatch() {
+        let erased = ErasedTransformArtifact::<Array, TestRegionOperation>::new(TransformArtifact::new(
+            vec![Arc::new(identity_program())],
+            7usize,
+        ));
+        let panicked = catch_unwind(AssertUnwindSafe(|| erased.typed::<u32>())).unwrap_err();
+        assert_eq!(
+            panic_message(panicked),
+            "region transform cache metadata type mismatch: retained `usize` but requested `u32`",
+        );
+    }
+
+    #[test]
+    fn test_region_transform_cache_new_clone_pointer_identity_and_debug() {
+        let cache = RegionTransformCache::<Array, TestRegionOperation>::new();
+        let cloned = cache.clone();
+        let independent = RegionTransformCache::<Array, TestRegionOperation>::new();
+        assert!(cache.ptr_eq(&cache));
+        assert!(cache.ptr_eq(&cloned));
+        assert!(!cache.ptr_eq(&independent));
+        assert_eq!(format!("{cache:?}"), "RegionTransformCache { namespace_count: 0, artifact_count: 0 }");
+    }
+
+    #[test]
+    fn test_region_transform_cache_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<RegionTransformCache<Array, TestRegionOperation>>();
+    }
+
+    #[test]
+    fn test_region_transform_cache_debug_does_not_format_payloads() {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct PanickingDebugKey;
+
+        impl Debug for PanickingDebugKey {
+            fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("argument formatting must not run")
+            }
+        }
+
+        struct PanickingDebugTransform;
+
+        impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for PanickingDebugTransform {
+            type Arguments = PanickingDebugKey;
+            type Artifact = TransformArtifact<V, O, PanickingDebugKey>;
+
+            const DEFAULT_CACHE_CAPACITY: usize = 1;
+        }
+
+        let program = identity_program();
+        program
+            .entry_region_ref()
+            .transform::<PanickingDebugTransform, _, Infallible>(PanickingDebugKey, |region, _| {
+                Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], PanickingDebugKey))
+            })
+            .unwrap();
+
+        assert_eq!(
+            format!("{:?}", program.entry_region().transform_cache()),
+            "RegionTransformCache { namespace_count: 1, artifact_count: 1 }",
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_namespaces_are_lazy_and_collision_safe() {
         let program = identity_program();
         assert!(!program.entry_region().transform_cache().has_namespaces());
 
@@ -724,36 +837,65 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.programs()[0], &collision.programs()[0]));
         assert_eq!(collision.metadata(), &1);
 
-        let other = program
-            .entry_region_ref()
-            .transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&first.programs()[0], &other.programs()[0]));
-
-        let evicting = program
-            .entry_region_ref()
-            .transform::<TestTransform, _, Infallible>(CollisionKey(2), derive_test_artifact)
-            .unwrap();
-        assert_eq!(evicting.metadata(), &2);
-        let first_after_eviction = program
-            .entry_region_ref()
-            .transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&first.programs()[0], &first_after_eviction.programs()[0]));
-        let other_repeated = program
-            .entry_region_ref()
-            .transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact)
-            .unwrap();
-        assert!(Arc::ptr_eq(&other.programs()[0], &other_repeated.programs()[0]));
-
-        let statistics = program.entry_region_ref().transform_statistics::<TestTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits, statistics.evictions), (4, 1, 2));
-        let statistics = program.entry_region_ref().transform_statistics::<OtherTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits, statistics.evictions), (1, 1, 0));
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
     }
 
     #[test]
-    fn test_region_transform_errors_panics_and_reentrancy_retry_cleanly() {
+    fn test_region_ref_transform_namespaces_are_independent_and_bounded() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+
+        let first = region.transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        let second = region.transform::<TestTransform, _, Infallible>(CollisionKey(1), derive_test_artifact).unwrap();
+        let first_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&first.programs()[0], &first_repeated.programs()[0]));
+
+        let other = region.transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(!Arc::ptr_eq(&first.programs()[0], &other.programs()[0]));
+
+        let third = region.transform::<TestTransform, _, Infallible>(CollisionKey(2), derive_test_artifact).unwrap();
+        assert_eq!(third.metadata(), &2);
+        let second_after_eviction =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(1), derive_test_artifact).unwrap();
+        assert!(!Arc::ptr_eq(&second.programs()[0], &second_after_eviction.programs()[0]));
+        let other_repeated =
+            region.transform::<OtherTransform, _, Infallible>(CollisionKey(0), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&other.programs()[0], &other_repeated.programs()[0]));
+
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 4,
+                productions: 4,
+                abandoned_productions: 0,
+                evictions: 2,
+            }),
+        );
+        assert_eq!(
+            region.transform_statistics::<OtherTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_transform_derivation_errors_are_not_retained() {
         let program = identity_program();
         let region = program.entry_region_ref();
 
@@ -761,20 +903,52 @@ mod tests {
             region.transform::<TestTransform, _, _>(CollisionKey(10), |_, _| {
                 Err::<TransformArtifact<Array, TestRegionOperation, usize>, _>("derivation failed")
             }),
-            Err("derivation failed"),
+            Err(message) if message == "derivation failed",
         ));
         let recovered =
             region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
         assert_eq!(recovered.metadata(), &10);
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 1,
+                evictions: 0,
+            }),
+        );
+    }
 
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    #[test]
+    fn test_region_ref_transform_derivation_panics_are_not_retained() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
             region.transform::<TestTransform, _, Infallible>(CollisionKey(11), |_, _| panic!("derivation panicked"))
-        }));
-        assert!(panicked.is_err());
+        }))
+        .unwrap_err();
+        assert_eq!(panic_message(panicked), "derivation panicked");
         let recovered =
             region.transform::<TestTransform, _, Infallible>(CollisionKey(11), derive_test_artifact).unwrap();
         assert_eq!(recovered.metadata(), &11);
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 1,
+                evictions: 0,
+            }),
+        );
+    }
 
+    #[test]
+    fn test_region_ref_transform_same_key_reentrancy_derives_uncached_and_publishes_outer_artifact() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
         let derivations = Cell::new(0);
         let recursive = region
             .transform::<TestTransform, _, Infallible>(CollisionKey(12), |region, arguments| {
@@ -790,26 +964,57 @@ mod tests {
             .unwrap();
         assert_eq!(recursive.metadata(), &12);
         assert_eq!(derivations.get(), 2);
+        let repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(12), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&recursive.programs()[0], &repeated.programs()[0]));
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 2,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
 
-        let different_argument = region
+    #[test]
+    fn test_region_ref_transform_different_key_reentrancy_retains_both_artifacts() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+        let nested_program = RefCell::new(None);
+        let outer = region
             .transform::<TestTransform, _, Infallible>(CollisionKey(20), |region, arguments| {
                 let nested =
                     region.transform::<TestTransform, _, Infallible>(CollisionKey(21), derive_test_artifact)?;
                 assert_eq!(nested.metadata(), &21);
+                nested_program.replace(Some(nested.programs()[0].clone()));
                 derive_test_artifact(region, arguments)
             })
             .unwrap();
-        assert_eq!(different_argument.metadata(), &20);
+        assert_eq!(outer.metadata(), &20);
 
-        let statistics = region.transform_statistics::<TestTransform>().unwrap();
-        assert_eq!(statistics.abandoned_productions, 2);
+        let outer_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(20), derive_test_artifact).unwrap();
+        let nested_repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(21), derive_test_artifact).unwrap();
+        assert!(Arc::ptr_eq(&outer.programs()[0], &outer_repeated.programs()[0]));
+        assert!(Arc::ptr_eq(nested_program.borrow().as_ref().unwrap(), &nested_repeated.programs()[0]));
+        assert_eq!(
+            region.transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 2,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
     }
 
     #[test]
-    fn test_region_transform_namespace_initialization_is_concurrent_and_cache_debug_is_payload_free() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<RegionTransformCache<Array, TestRegionOperation>>();
-
+    fn test_region_ref_transform_namespace_creation_is_concurrent() {
         let program = Arc::new(identity_program());
         let barrier = Arc::new(Barrier::new(2));
         let handles = (0..2)
@@ -828,28 +1033,35 @@ mod tests {
         for handle in handles {
             assert_eq!(handle.join().unwrap().programs().len(), 1);
         }
-        let statistics = program.entry_region_ref().transform_statistics::<TestTransform>().unwrap();
-        assert_eq!(statistics.productions, 2);
-
-        program
-            .entry_region_ref()
-            .transform::<PanickingDebugTransform, _, Infallible>(PanickingDebugKey, |region, _| {
-                Ok(TransformArtifact::new(vec![Arc::new(region.to_program())], PanickingDebugKey))
-            })
-            .unwrap();
-        let summary = format!("{:?}", program.entry_region().transform_cache());
-        assert_eq!(summary, "RegionTransformCache { namespace_count: 2, artifact_count: 3 }");
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 0,
+                misses: 2,
+                productions: 2,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+        assert_eq!(
+            format!("{:?}", program.entry_region().transform_cache()),
+            "RegionTransformCache { namespace_count: 1, artifact_count: 2 }",
+        );
     }
 
     #[test]
-    fn test_region_transform_sanitization_prevents_source_cycles_and_preserves_descendant_caches() {
+    fn test_region_ref_transform_sanitization_detaches_source_cache() {
         let source = identity_program();
         let source_cache = source.entry_region().transform_cache().downgrade();
         let artifact = source.entry_region_ref().retained_identity_transform();
         assert!(!source.entry_region().transform_cache().ptr_eq(&artifact.entry_region().transform_cache));
         drop(source);
         assert!(!source_cache.is_alive());
+        assert_eq!(artifact.output_types(), &[ArrayType::scalar(DataType::F64)]);
+    }
 
+    #[test]
+    fn test_region_ref_transform_sanitization_preserves_descendant_caches() {
         let leaf = identity_program();
         let leaf_retained = leaf.entry_region_ref().retained_identity_transform();
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
@@ -871,8 +1083,8 @@ mod tests {
     }
 
     #[test]
-    fn test_region_transform_does_not_require_static_value_or_operation_families() {
-        fn transform_borrowed_universe<'r, V: Value, O: Operation<Type = V::Type>>(
+    fn test_region_ref_transform_supports_generic_value_and_operation_families() {
+        fn transform_generic_universe<'r, V: Value, O: Operation<Type = V::Type>>(
             region: RegionRef<'r, V, O>,
         ) -> TransformArtifact<V, O, ()> {
             region
@@ -883,67 +1095,119 @@ mod tests {
         }
 
         let program = identity_program();
-        assert_eq!(transform_borrowed_universe(program.entry_region_ref()).programs().len(), 1);
+        let artifact = transform_generic_universe(program.entry_region_ref());
+        assert_eq!(artifact.programs().len(), 1);
+        assert_eq!(artifact.metadata(), &());
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn test_region_transform_debug_recheck_detects_program_count_changes() {
+    fn test_region_ref_transform_debug_recheck_detects_different_program_count() {
         let program = identity_program();
+        let derived_program = program.entry_region_ref().to_program().to_string();
         program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
             CollisionKey(6),
             TransformArtifact::new(Vec::new(), 6),
         );
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
             program
                 .entry_region_ref()
                 .transform::<TestTransform, _, Infallible>(CollisionKey(6), derive_test_artifact)
         }))
         .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}");
-        assert!(message.contains("TestTransform"), "{message}");
+        assert_eq!(panic_message(panicked), transform_recheck_message(&CollisionKey(6), 6, 6, &[], &[derived_program]),);
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn test_region_transform_debug_recheck_detects_program_rendering_changes() {
+    fn test_region_ref_transform_debug_recheck_detects_different_program_rendering() {
         let program = identity_program();
+        let derived_program = program.entry_region_ref().to_program().to_string();
         let mut different_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         different_builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = different_builder.add_constant(Array::scalar(1.0));
         let different = different_builder.build(vec![constant], vec![Placeholder], vec![Placeholder]).unwrap();
+        let cached_program = different.to_string();
         program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
             CollisionKey(7),
             TransformArtifact::new(vec![Arc::new(different)], 7),
         );
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
             program
                 .entry_region_ref()
                 .transform::<TestTransform, _, Infallible>(CollisionKey(7), derive_test_artifact)
         }))
         .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}");
-        assert!(message.contains("TestTransform"), "{message}");
+        assert_eq!(
+            panic_message(panicked),
+            transform_recheck_message(&CollisionKey(7), 7, 7, &[cached_program], &[derived_program]),
+        );
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn test_region_transform_debug_recheck_detects_metadata_changes() {
+    fn test_region_ref_transform_debug_recheck_detects_different_metadata() {
         let program = identity_program();
+        let program_rendering = program.entry_region_ref().to_program().to_string();
         program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
             CollisionKey(8),
             TransformArtifact::new(vec![Arc::new(program.entry_region_ref().to_program())], 9),
         );
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
             program
                 .entry_region_ref()
                 .transform::<TestTransform, _, Infallible>(CollisionKey(8), derive_test_artifact)
         }))
         .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}");
-        assert!(message.contains("TestTransform"), "{message}");
+        assert_eq!(
+            panic_message(panicked),
+            transform_recheck_message(&CollisionKey(8), 9, 8, &[program_rendering.clone()], &[program_rendering],),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_propagates_derivation_error() {
+        let program = identity_program();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TestTransform, _>(
+            CollisionKey(9),
+            TransformArtifact::new(vec![Arc::new(program.entry_region_ref().to_program())], 9),
+        );
+
+        assert!(matches!(
+            program.entry_region_ref().transform::<TestTransform, _, _>(CollisionKey(9), |_, _| {
+                Err::<TransformArtifact<Array, TestRegionOperation, usize>, _>("re-derivation failed")
+            }),
+            Err(message) if message == "re-derivation failed",
+        ));
+        assert_eq!(
+            program.entry_region_ref().transform_statistics::<TestTransform>(),
+            Some(SpecializationCacheStatistics {
+                hits: 1,
+                misses: 1,
+                productions: 1,
+                abandoned_productions: 0,
+                evictions: 0,
+            }),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_ref_transform_debug_recheck_sanitizes_fresh_artifact_before_comparison() {
+        let program = identity_program();
+        let region = program.entry_region_ref();
+        let retained =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
+        let repeated =
+            region.transform::<TestTransform, _, Infallible>(CollisionKey(10), derive_test_artifact).unwrap();
+
+        assert!(Arc::ptr_eq(&retained.programs()[0], &repeated.programs()[0]));
+        assert!(
+            !program
+                .entry_region()
+                .transform_cache()
+                .ptr_eq(&repeated.programs()[0].entry_region().transform_cache)
+        );
     }
 }

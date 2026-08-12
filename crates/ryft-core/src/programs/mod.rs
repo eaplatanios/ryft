@@ -6,25 +6,11 @@
 //! simplification, lowering, and compilation. Programs are immutable after construction. [`ProgramBuilder`]
 //! owns the mutable construction phase, sealing every non-entry region before instructions can attach it.
 //!
-//! ```text
-//! ┌─────────────────────────────┐
-//! │ Abstract Inputs + Constants │
-//! └──────────────┬──────────────┘
-//!                │ add atoms and record instructions
-//!                ▼
-//!       ┌─────────────────┐
-//!       │ Program Builder │
-//!       └────────┬────────┘
-//!                │ build structured boundaries
-//!                ▼
-//!           ┌─────────┐
-//!           │ Program │
-//!           └────┬────┘
-//!                ├── interpret through a context
-//!                ├── batch, differentiate, or partially evaluate
-//!                ├── simplify, filter, or inspect liveness and effects
-//!                └── lower and compile through a backend
-//! ```
+//! # Program Lifecycle
+//!
+//! Program construction is the only mutable phase. Every replay, transformation, analysis, and compilation step starts
+//! from an immutable program whose region graph and structured boundaries have already been validated. Refer to
+//! [`Program`] for a rendered diagram of this lifecycle.
 //!
 //! # Entry Points
 //!
@@ -92,6 +78,19 @@
 //! reachable subtree. Locators such as [`InstructionId`], [`ValueId`], and [`RegionId`] are scoped to the program they
 //! were derived from. Materialization and rebuilds renumber arenas, and locators never cross [`Program`] boundaries.
 //!
+//! # Structural Identity and Transform Reuse
+//!
+//! A sealed region may retain context-free program artifacts already derived from its complete reachable contents.
+//! Cloning a program, importing a faithful region closure, or rebasing region identifiers while preserving graph
+//! topology shares those artifacts. Rewriting a region or attaching it to a different descendant closure invalidates
+//! them. This ownership rule keeps reuse local to the programs that carry the region and prevents a derived program
+//! from being served for a different nested graph.
+//!
+//! Only context-free structural results belong in that retained state. Invocation-specific residual values, active
+//! contexts, backend buffers, and other runtime data remain outside the program and its regions. External crates
+//! can define a [`Transform`] and request its typed artifact through [`RegionRef::transform`]. Raw cache
+//! adoption and invalidation remain internal construction invariants.
+//!
 //! # Effects, Liveness, and Simplification
 //!
 //! [`Program::effects`] unions the effects declared by its operations. Instruction order is semantically relevant
@@ -131,6 +130,7 @@ pub mod operations;
 pub mod programs;
 pub mod regions;
 pub mod statistics;
+pub mod transforms;
 pub mod types;
 pub mod values;
 
@@ -150,6 +150,7 @@ pub use regions::{
     RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
+pub use transforms::{Transform, TransformArtifact, TransformCache};
 pub use types::{Type, TypeError, TypeRefinements, Typed};
 pub use values::{Concretizable, ProjectedValue, Value, ValueId, ValueProjection};
 
