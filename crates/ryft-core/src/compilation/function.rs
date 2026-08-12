@@ -11,11 +11,73 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
+use crate::programs::transforms::{Transform, TransformCache};
 use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, Typed, Value};
-use crate::specialization::{FunctionSpecializationKey, SpecializationCache, SpecializationCacheEntry};
+use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
 
 use super::contexts::CompilationDomain;
+
+/// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when
+/// all three components below agree. Equal keys must identify calls that can safely share the same staged
+/// [`Program`]. Unequal keys remain separate even if they happen to stage structurally equivalent programs.
+///
+///   - **Static Parameters:** The host values the traced function may branch on, read, or embed as literals. Unequal
+///     static parameters can stage arbitrarily different programs, so they must separate specializations. Static
+///     parameters must be `Clone + Debug + Eq + Hash`. Runtime arrays and other backend values should be represented
+///     as dynamic inputs rather than static parameters.
+///   - **Input Structure:** The [`Parameterized::ParameterStructure`] shape of the dynamic function input. Tracing
+///     rebuilds the function's argument from this structure, so a function may legitimately branch on container arity.
+///     Keying on the structure rather than on the flattened leaves also distinguishes inputs that differ only in
+///     _empty_ substructure, which flat leaf paths and flat leaf types cannot see.
+///   - **Dispatch Key:** An owner-defined key used to select an interchangeable retained specialization for the dynamic
+///     inputs. It may be an exact abstract input signature or a normalized equivalence-class key such as a shape
+///     bucket. Equal dispatch keys must guarantee that the retained artifact can safely serve either call; unequal keys
+///     conservatively separate specializations. Retained Just-In-Time (JIT) compilation dispatch uses
+///     [`CompilationDomain::DispatchKey`], for example.
+///
+/// Everything else that affects staging (e.g., the closure itself, its captures, the domain, any fixed options, etc.)
+/// is implicit in the cache's owner, because a cache is scoped to exactly one retained callable. That is why this key
+/// carries no fragile function-pointer identity. All three components are call-level (i.e., function-level) concepts,
+/// since a bare program has neither static parameters nor a structured input. That is what separates function-level
+/// specialization caching from structural region transformation through [`Transform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FunctionSpecializationKey<P, I, D> {
+    /// Host values declared static for the keyed specialization, such as an axis number, mode enum, or boolean option.
+    static_parameters: P,
+
+    /// Parameter structure of the dynamic input, such as the shape of a nested tuple or named parameter container.
+    input_structure: I,
+
+    /// Owner-defined cache key for the dynamic input, such as an exact abstract signature or normalized shape bucket.
+    dispatch_key: D,
+}
+
+impl<P, I, D> FunctionSpecializationKey<P, I, D> {
+    /// Creates a new [`FunctionSpecializationKey`].
+    #[inline]
+    pub fn new(static_parameters: P, input_structure: I, dispatch_key: D) -> Self {
+        Self { static_parameters, input_structure, dispatch_key }
+    }
+
+    /// Returns the static parameters (i.e., the host values declared static) for the keyed specialization.
+    #[inline]
+    pub fn static_parameters(&self) -> &P {
+        &self.static_parameters
+    }
+
+    /// Returns the parameter structure of the dynamic input for the keyed specialization.
+    #[inline]
+    pub fn input_structure(&self) -> &I {
+        &self.input_structure
+    }
+
+    /// Returns the owner-defined dispatch key for the dynamic input.
+    #[inline]
+    pub fn dispatch_key(&self) -> &D {
+        &self.dispatch_key
+    }
+}
 
 /// Flat source-program representation of a compiled call's callee, supplied through the operation's region driver and
 /// interned as a shared callee root region on the staged instruction.
@@ -252,7 +314,7 @@ pub struct JitCacheStatistics {
     /// Requests made to the domain compilation context after lowering.
     pub compilation_requests: u64,
 
-    /// Total host nanoseconds spent flattening inputs and deriving their dispatch signature.
+    /// Total host nanoseconds spent flattening inputs and deriving their dispatch key and effective signature.
     pub input_abstractification_duration_ns: u64,
 
     /// Total host nanoseconds spent looking up retained specializations.
@@ -731,6 +793,34 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     }
 }
 
+/// Type-level source universe for retained JIT specialization.
+///
+/// The owning [`JittedFunctionState`] fixes the closure identity, lexical captures, domain instance, and immutable
+/// compilation options. This token stores none of them; it only makes the descriptor's key and artifact families
+/// coherent at the type level. If any owner-fixed semantic becomes variable per call, it must enter the transform
+/// arguments instead.
+struct JitCompilationSource<D, StaticParameters, Input, Output>(
+    PhantomData<fn() -> (D, StaticParameters, Input, Output)>,
+);
+
+/// Transform descriptor for the executable specializations retained by one [`JittedFunction`].
+struct JitCompilationTransform;
+
+impl<D, StaticParameters, Input, Output> Transform<JitCompilationSource<D, StaticParameters, Input, Output>>
+    for JitCompilationTransform
+where
+    D: CompilationDomain,
+    StaticParameters: Clone + Eq + Hash,
+    Input: Parameterized<D::Type>,
+    Input::ParameterStructure: Eq + Hash,
+    Output: Parameterized<D::Type>,
+{
+    type Arguments = FunctionSpecializationKey<StaticParameters, Input::ParameterStructure, D::DispatchKey>;
+    type Artifact = ExecutableFunction<D, Input, Output>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = DEFAULT_JIT_CACHE_CAPACITY;
+}
+
 impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<D::Type>>
     ExecutableFunction<D, Input, Output>
 {
@@ -966,7 +1056,7 @@ where
 /// program of its own: it is a retained dispatcher over a Rust closure that produces one program, and one function
 /// around that program, per specialization from explicit host-side static parameters and runtime dynamic inputs. Its
 /// first call for a specialization traces, lowers, and requests compilation; later calls with the same static values,
-/// input parameter structure, and runtime-derived dispatch signature dispatch directly to the retained executable.
+/// input parameter structure, and runtime-derived dispatch key dispatch directly to the retained executable.
 /// Domain staging may normalize distinct runtime signatures to the same staged signature, which can produce harmless
 /// duplicate dispatch specializations.
 ///
@@ -986,6 +1076,30 @@ where
 /// with an error, while concurrent cold misses for one specialization on different threads deliberately produce
 /// duplicate frontend work (tracing and lowering are cheap and inserts are idempotent); the domain's shared
 /// [`CompilationContext`](super::contexts::CompilationContext) still coordinates the expensive backend compilation.
+///
+/// # Retained JIT Lifecycle
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   call["&lt;code&gt;JittedFunction::call&lt;/code&gt; with Static Parameters and Dynamic Inputs"]
+///   call --> key["Derive Function Specialization Key"]
+///   key --> frontend_cache["Per-Function Bounded Specialization Cache"]
+///   frontend_cache -->|"hit"| executable["Shared &lt;code&gt;ExecutableFunction&lt;/code&gt;"]
+///   frontend_cache -->|"miss"| closure["Invoke Rust Closure"]
+///   closure -->|"trace"| staged["&lt;code&gt;StagedFunction&lt;/code&gt; and Closed Source Program"]
+///   staged -->|"lower"| lowered["&lt;code&gt;LoweredFunction&lt;/code&gt; and Backend Lowered Program"]
+///   staged -.->|"&lt;code&gt;call&lt;/code&gt; inside an outer trace"| nested["Nested Call Operation"]
+///   lowered --> compilation_context["Shared &lt;code&gt;CompilationContext&lt;/code&gt;"]
+///   compilation_context -->|"restore or compile"| compiled["&lt;code&gt;CompiledFunction&lt;/code&gt;"]
+///   compiled -->|"&lt;code&gt;into_executable_function&lt;/code&gt;"| executable
+///   executable -->|"insert after cold production"| frontend_cache
+///   executable -->|"call"| outputs["Structured Runtime Outputs"]
+/// ```
+///
+/// The cache-hit edge skips tracing, lowering, and compilation. The dotted edge is the alternative staging path: a
+/// staged function can become a nested call boundary instead of continuing immediately toward an executable.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct JittedFunction<
     D: CompilationDomain<Type: Eq + Hash>,
     F,
@@ -1010,10 +1124,7 @@ struct JittedFunctionState<
     domain: D,
     function: F,
     options: D::Options,
-    specializations: SpecializationCache<
-        FunctionSpecializationKey<Static, Input::ParameterStructure, D::DispatchKey>,
-        ExecutableFunction<D, Input, Output>,
-    >,
+    specializations: TransformCache<JitCompilationTransform, JitCompilationSource<D, Static, Input, Output>>,
     statistics: JitCacheStatisticsState,
 }
 
@@ -1048,7 +1159,10 @@ where
                 domain: domain.clone(),
                 function,
                 options,
-                specializations: SpecializationCache::new(capacity),
+                specializations: TransformCache::<
+                    JitCompilationTransform,
+                    JitCompilationSource<D, Static, Input, Output>,
+                >::new(capacity),
                 statistics: JitCacheStatisticsState::new(),
             }),
         }
@@ -1122,13 +1236,13 @@ where
         let abstractification_start = Instant::now();
         let input_structure = inputs.parameter_structure();
         let runtime_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let (dispatch, effective_input_types) =
+        let (dispatch_key, effective_input_types) =
             self.state.domain.dispatch_signature(runtime_input_types, &self.state.options)?;
         JitCacheStatisticsState::add_duration(
             &self.state.statistics.input_abstractification_duration_ns,
             abstractification_start.elapsed(),
         );
-        let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch);
+        let key = FunctionSpecializationKey::new(static_parameters.clone(), input_structure, dispatch_key);
 
         let dispatch_start = Instant::now();
         let entry = self.state.specializations.try_entry(key);
@@ -1409,6 +1523,7 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::captures::CaptureReference;
     use crate::compilation::contexts::{CompilationCacheDomain, CompilationContext};
+    use crate::parameters::Placeholder;
     use crate::programs::{Operation, RegionInterface, Type, TypeError};
 
     use super::*;
@@ -1453,6 +1568,8 @@ mod tests {
         staged_input_type: Option<ArrayType>,
         lowered_output_type: Option<ArrayType>,
         compiled_output_type: Option<ArrayType>,
+        fail_lowering: bool,
+        fail_compilation: bool,
     }
 
     #[derive(Clone)]
@@ -1515,6 +1632,9 @@ mod tests {
         where
             Request: LoweringRequest<Self>,
         {
+            if staged.staged().options().fail_lowering {
+                return Err(ProgramError::InvalidArgument { message: "expected lowering failure".into() });
+            }
             let program = staged.lifted_program()?;
             let mut output_types: Vec<ArrayType> = program
                 .output_ids()
@@ -1562,6 +1682,9 @@ mod tests {
                 lowered,
                 |program| {
                     self.compilations.fetch_add(1, Ordering::Relaxed);
+                    if program.options.fail_compilation {
+                        return Err(ProgramError::InvalidArgument { message: "expected compilation failure".into() });
+                    }
                     let mut output_types = program.output_types.clone();
                     if let Some(output_type) = &program.options.compiled_output_type {
                         output_types.fill(output_type.clone());
@@ -1641,6 +1764,37 @@ mod tests {
         )
         .unwrap();
         domain.compile(domain.lower(staged).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_function_specialization_key() {
+        let key: FunctionSpecializationKey<(&str, usize), Vec<()>, &str> =
+            FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]");
+        assert_eq!(key.static_parameters(), &("training", 4));
+        assert_eq!(key.input_structure(), &vec![(), ()]);
+        assert_eq!(key.dispatch_key(), &"f32[2,3]");
+
+        // Every component participates in equality.
+        assert_eq!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, FunctionSpecializationKey::new(("inference", 4), vec![(), ()], "f32[2,3]"));
+        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![()], "f32[2,3]"));
+        assert_ne!(key, FunctionSpecializationKey::new(("training", 4), vec![(), ()], "f32[4,3]"));
+    }
+
+    #[test]
+    fn test_jit_compilation_transform_contract() {
+        type Source = JitCompilationSource<TestDomain, usize, Vec<ArrayType>, Vec<ArrayType>>;
+        type Arguments = FunctionSpecializationKey<usize, Vec<Placeholder>, Arc<[ArrayType]>>;
+        type Artifact = ExecutableFunction<TestDomain, Vec<ArrayType>, Vec<ArrayType>>;
+
+        fn assert_contract<T, S>()
+        where
+            T: Transform<S, Arguments = Arguments, Artifact = Artifact>,
+        {
+        }
+
+        assert_contract::<JitCompilationTransform, Source>();
+        assert_eq!(<JitCompilationTransform as Transform<Source>>::DEFAULT_CACHE_CAPACITY, DEFAULT_JIT_CACHE_CAPACITY,);
     }
 
     #[test]
@@ -1989,6 +2143,58 @@ mod tests {
         assert_eq!(function.call(false, Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
         assert_eq!(function.specialization_count(), 1);
         assert_eq!(function.statistics().traces, 3);
+    }
+
+    #[test]
+    fn test_jitted_function_retries_lowering_and_compilation_failures() {
+        let lowering_domain = TestDomain::new();
+        let lowering_options = TestOptions { fail_lowering: true, ..TestOptions::default() };
+        let lowering_function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+            jit_with_options(&lowering_domain, |(), input: CompilationTracer<TestDomain>| input, lowering_options);
+        for _ in 0..2 {
+            assert!(matches!(
+                lowering_function.call((), Array::scalar(2.0)),
+                Err(ProgramError::InvalidArgument { message }) if message == "expected lowering failure",
+            ));
+        }
+        assert_eq!(lowering_function.specialization_count(), 0);
+        let statistics = lowering_function.statistics();
+        assert_eq!((statistics.traces, statistics.lowerings, statistics.compilation_requests), (2, 2, 0));
+
+        let compilation_domain = TestDomain::new();
+        let compilation_options = TestOptions { fail_compilation: true, ..TestOptions::default() };
+        let compilation_function: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> = jit_with_options(
+            &compilation_domain,
+            |(), input: CompilationTracer<TestDomain>| input,
+            compilation_options,
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                compilation_function.call((), Array::scalar(2.0)),
+                Err(ProgramError::InvalidArgument { message }) if message == "expected compilation failure",
+            ));
+        }
+        assert_eq!(compilation_function.specialization_count(), 0);
+        let statistics = compilation_function.statistics();
+        assert_eq!((statistics.traces, statistics.lowerings, statistics.compilation_requests), (2, 2, 2));
+        assert_eq!(compilation_domain.compilation_count(), 2);
+    }
+
+    #[test]
+    fn test_jitted_function_owners_isolate_frontend_specializations() {
+        let domain = TestDomain::new();
+        let first: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+        let second: JittedFunction<TestDomain, _, (), ArrayType, ArrayType> =
+            jit(&domain, |(), input: CompilationTracer<TestDomain>| input);
+
+        assert_eq!(first.call((), Array::scalar(1.0)).unwrap(), Array::scalar(1.0));
+        assert_eq!(second.call((), Array::scalar(2.0)).unwrap(), Array::scalar(2.0));
+        assert_eq!(first.specialization_count(), 1);
+        assert_eq!(second.specialization_count(), 1);
+        assert_eq!(first.statistics().traces, 1);
+        assert_eq!(second.statistics().traces, 1);
+        assert_eq!(domain.compilation_count(), 1);
     }
 
     #[test]

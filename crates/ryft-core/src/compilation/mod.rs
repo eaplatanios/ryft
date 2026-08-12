@@ -5,71 +5,18 @@
 //! A backend supplies target-specific options, lowering, executable compilation, and execution through
 //! [`CompilationDomain`]. Backends opt into exact cache identity and serialization through
 //! [`CompilationCacheDomain`]. Backend representations therefore remain outside `ryft-core` while every backend
-//! follows the same lifecycle. The following diagram illustrates one [`JittedFunction`] call: a warm call takes the
-//! `hit` shortcut on the left, while a cold call runs the full pipeline on the right exactly once per specialization
-//! and then inserts the resulting executable:
+//! follows the same lifecycle.
 //!
-//! ```text
-//!                  JittedFunction::call(static parameters, dynamic inputs)
-//!                                       │
-//!                                       │ derive the specialization key
-//!                                       │ (static parameters + input structure + dispatch signature)
-//!                                       ▼
-//!                        ┌──────────────────────────────┐
-//!                 ┌──────│     Specialization Cache     │◀─────────────┐
-//!                 │      │ one bounded LRU per function │              │
-//!                 │      └──────────────┬───────────────┘              │
-//!                 │ hit                 │ miss                         │
-//!                 │                     ▼                              │
-//!                 │      ┌──────────────────────────────┐              │
-//!                 │      │         Rust Closure         │              │
-//!                 │      └──────────────┬───────────────┘              │
-//!                 │                     │ trace                        │
-//!                 │                     ▼                              │
-//!                 │      ┌──────────────────────────────┐              │
-//!                 │      │ Program                      │              │
-//!                 │      │ Staged Function handle       │              │
-//!                 │      └──────────────┬───────────────┘              │
-//!                 │                     │ lower                        │ insert
-//!                 │                     ▼                              │
-//!                 │      ┌──────────────────────────────┐              │
-//!                 │      │ Lowered Program              │              │
-//!                 │      │ Lowered Function handle      │              │
-//!                 │      └──────────────┬───────────────┘              │
-//!                 │                     │ derive the domain cache key  │
-//!                 │                     ▼                              │
-//!                 │      ┌──────────────────────────────┐              │
-//!                 │      │ Compilation Context          │              │
-//!                 │      │ resolves shared cache tiers  │              │
-//!                 │      └──────────────┬───────────────┘              │
-//!                 │                     │ restore or compile           │
-//!                 │                     ▼                              │
-//!                 │      ┌──────────────────────────────┐              │
-//!                 └─────▶│ Executable Function          │──────────────┘
-//!                        │ shared through an Arc        │
-//!                        └──────────────┬───────────────┘
-//!                                       │ call
-//!                                       ▼
-//!                        ┌──────────────────────────────┐
-//!                        │ Runtime Values               │
-//!                        └──────────────────────────────┘
-//! ```
+//! # Retained JIT Lifecycle
+//!
+//! A warm call follows the cache-hit edge directly to execution. A cold call traces and lowers once in the producing
+//! thread, delegates backend artifact reuse to the shared compilation context, publishes the executable, and then
+//! executes it. Refer to [`JittedFunction`] for a rendered diagram of this dispatch loop.
 //!
 //! Two transitions exist outside this dispatch loop. A staged function can be embedded as a nested call boundary in
 //! an enclosing trace instead of being lowered directly, and a compiled function can shed its staged and lowered
-//! transform metadata into the runtime-only executable handle that the cache retains:
-//!
-//! ```text
-//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
-//! │ Program                      │ ── embed in outer trace ─▶ │ Nested Call Operation        │
-//! │ Staged Function handle       │                            │ owned by the operation family│
-//! └──────────────────────────────┘                            └──────────────────────────────┘
-//!
-//! ┌──────────────────────────────┐                            ┌──────────────────────────────┐
-//! │ Compiled Function handle     │ ── discard metadata ─────▶ │ Executable Function          │
-//! │ executable + staged metadata │                            │ runtime-only handle          │
-//! └──────────────────────────────┘                            └──────────────────────────────┘
-//! ```
+//! transform metadata into the runtime-only executable handle that the cache retains. The secondary transitions are
+//! included in the lifecycle diagram on [`JittedFunction`].
 //!
 //! # Terminology
 //!
@@ -85,7 +32,7 @@
 //! # Entry Points
 //!
 //! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`JittedFunction`] specializes on explicit static
-//!   host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch signature.
+//!   host parameters, the dynamic input's parameter structure, and the domain's runtime-derived dispatch key.
 //!   Its first call for a specialization traces, lowers, and requests compilation; warm calls dispatch directly to
 //!   the retained executable.
 //! - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
@@ -119,16 +66,15 @@
 //! data.
 //!
 //! [`CapturingContext`](crate::captures::CapturingContext) lets ordinary and transform contexts register captures
-//! through their parent. To embed a
-//! staged function in a larger trace, an operation family implements [`CompiledCallOperation`]; that operation
-//! then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation, and
-//! interpretation.
+//! through their parent. To embed a staged function in a larger trace, an operation family implements
+//! [`CompiledCallOperation`]; that operation then owns how the nested call behaves under lowering, batching,
+//! differentiation, partial evaluation, and interpretation.
 //!
 //! # Specialization and Caching
 //!
 //! [`JittedFunction`] keeps one bounded LRU cache of compiled specializations, built on the general
 //! [`SpecializationCache`](crate::specialization::SpecializationCache) primitive and keyed by the static parameters,
-//! the input parameter structure, and the domain's dispatch signature. A hit dispatches directly to the retained
+//! the input parameter structure, and the domain's dispatch key. A hit dispatches directly to the retained
 //! executable; a miss traces the Rust closure, lowers the staged source, requests compilation, and inserts the
 //! resulting executable. Tracing and lowering are cheap relative to backend compilation, so there are no intermediate
 //! trace/lowering caches: after an eviction or failure the miss path simply reruns those stages, and the shared
@@ -141,29 +87,9 @@
 //! coordination to the shared context.
 //!
 //! [`CompilationContext`] is the backend-artifact cache shared by every compilation using the same domain handle,
-//! and it resolves the domain's [`CompilationCacheDomain::CacheKey`] through these tiers:
-//!
-//! ```text
-//! Compilation Context lookup (keyed by CompilationCacheDomain::CacheKey)
-//!          │
-//!          ├── 1. Memory LRU hit ───────────────────────────────▶ shared Compiled Program
-//!          │      stores Arc<CompiledProgram>
-//!          │
-//!          ├── 2. Same key in flight ──▶ wait for producer ─────▶ shared Compiled Program
-//!          │      coordinates one producer; different keys remain concurrent
-//!          │
-//!          ├── 3. Persistent Disk Cache hit ──▶ deserialize ─────▶ shared Compiled Program
-//!          │      stores a serialized Compiled Program
-//!          │
-//!          ├── 4. Distributed Artifact Exchange ─▶ deserialize ─▶ shared Compiled Program
-//!          │      shares the serialized Compiled Program between processes
-//!          │
-//!          └── 5. Backend compilation ──────────────────────────▶ shared Compiled Program
-//!                 │
-//!                 ├── always insert into the Memory LRU
-//!                 ├── optionally serialize into the Persistent Disk Cache
-//!                 └── optionally publish through the Distributed Artifact Exchange
-//! ```
+//! and it resolves the domain's [`CompilationCacheDomain::CacheKey`] through memory, same-key single-flight
+//! coordination, optional persistent storage, optional distributed exchange, and finally backend compilation. Refer
+//! to [`CompilationContext`] for the rendered tier diagram.
 //!
 //! Same-key misses are single-flight while different keys may compile concurrently. [`DiskCache`] provides optional
 //! checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts among
@@ -192,7 +118,7 @@
 //! method bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or `reconstruct`
 //! methods.
 //!
-//! # Reading order
+//! # Reading Order
 //!
 //! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
 //! 2. Read [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and [`CallRequest`] alongside
@@ -217,7 +143,7 @@ pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledCallOperation,
-    CompiledFunction, ExecutableFunction, FlatCompilationProgram, JitCacheStatistics, JittedFunction, LoweredFunction,
-    LoweringRequest, StageRequest, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
-    try_jit_with_options, try_jit_with_options_and_capacity,
+    CompiledFunction, ExecutableFunction, FlatCompilationProgram, FunctionSpecializationKey, JitCacheStatistics,
+    JittedFunction, LoweredFunction, LoweringRequest, StageRequest, StagedFunction, call_function, jit,
+    jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacity,
 };

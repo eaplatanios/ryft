@@ -411,8 +411,37 @@ impl<P> InFlightCompilation<P> {
 ///
 /// An optional [`DiskCache`] second-tier is configured via [`CompilationContext::with_disk_cache`]. When present, the
 /// disk tier is consulted between the in-memory tier and the producer closure. The cache uses
-/// [`CompilationCacheDomain::serialize_program`] and [`CompilationCacheDomain::deserialize_program`] to round-trip programs; any
-/// error from either method is treated as a cache miss for that entry.
+/// [`CompilationCacheDomain::serialize_program`] and [`CompilationCacheDomain::deserialize_program`] to round-trip
+/// programs; any error from either method is treated as a cache miss for that entry. An optional
+/// [`CompilationArtifactExchange`] may provide the next serialized tier according to the configured
+/// [`CompilationArtifactExchangePolicy`].
+///
+/// # Cache Resolution
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   request["Compile Request and Domain Cache Key"] --> memory["1. In-Memory LRU"]
+///   memory -->|"hit"| shared["Shared Compiled Program in &lt;code&gt;Arc&lt;/code&gt;"]
+///   memory -->|"miss"| flight["2. Same-Key Single-Flight Election"]
+///   flight -->|"another producer"| wait["Wait and Retry Memory Lookup"]
+///   wait --> memory
+///   publish["Publish Successful Artifact"]
+///   flight -->|"elected producer"| disk["3. Optional Persistent Disk Cache"]
+///   disk -->|"hit and deserialize"| publish
+///   disk -->|"miss or disabled"| exchange["4. Optional Distributed Artifact Exchange"]
+///   exchange -->|"hit and deserialize"| publish
+///   exchange -->|"miss or unavailable"| backend["5. Backend Compilation"]
+///   backend --> publish
+///   publish --> memory_insert["Insert into In-Memory LRU"]
+///   memory_insert --> shared
+///   publish -.->|"best-effort serialization"| disk_store["Store in Persistent Disk Cache"]
+///   publish -.->|"policy-controlled publication"| exchange_store["Publish through Artifact Exchange"]
+/// ```
+///
+/// Same-key misses coordinate one backend producer, while requests for different keys remain concurrent. Every
+/// successful source publishes to memory; persistent and exchange writes remain best-effort or policy-controlled.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct CompilationContext<D: CompilationCacheDomain> {
     /// In-memory LRU keyed by the domain's structural [`CompilationCacheDomain::CacheKey`].
     programs: Mutex<LruCache<D::CacheKey, Arc<D::CompiledProgram>>>,
