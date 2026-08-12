@@ -241,6 +241,56 @@ pub struct SpecializationCacheProducer<'c, Key: Clone + Eq + Hash, Artifact: Clo
     marker: PhantomData<*mut ()>,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
+impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Key, Artifact> {
+    /// Returns the key this [`SpecializationCacheProducer`] is authorized to produce.
+    #[inline]
+    pub fn key(&self) -> &Key {
+        self.key.as_ref().unwrap()
+    }
+
+    /// Publishes `artifact` for this [`SpecializationCacheProducer`]'s key, releases the in-flight marker, and returns
+    /// the artifact. Inserting is _idempotent_ meaning that if another thread produced the same key concurrently, the
+    /// later insert replaces the earlier one. Both artifacts are interchangeable by the [`SpecializationCache`]'s reuse
+    /// contract, so last-one-wins is safe.
+    ///
+    /// The entry this insertion displaces, if any, is dropped only after the artifact is published, the counters are
+    /// updated, and the in-flight marker is released, so a displaced destructor that panics leaves the cache exactly
+    /// as a successful insertion would.
+    pub fn insert(mut self, artifact: Artifact) -> Artifact {
+        let key = self.key.take().unwrap();
+
+        // The displaced pair is bound here so that it outlives the guard below and its destructors run unlocked, which
+        // is what lets an artifact reenter the cache while being dropped. It is deliberately dropped last, after the
+        // counters are updated and the in-flight marker is released, so that a destructor that panics can neither
+        // strand the marker (which would reject every later lookup of this key on this thread as reentrant) nor skip a
+        // counter update.
+        let displaced = {
+            let mut entries = self.cache.entries.lock().expect("specialization cache mutex is poisoned");
+            entries.push(key.clone(), artifact.clone())
+        };
+        if let Some((displaced_key, _)) = &displaced
+            && *displaced_key != key
+        {
+            self.cache.statistics.increment_evictions();
+        }
+        self.cache.statistics.increment_productions();
+
+        // Both the marker offered for removal and the one recovered from the set are bound outside the guard,
+        // so that a `Key` destructor may reenter the cache as well.
+        let marker = (self.thread, key);
+        let removed = {
+            let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
+            in_flight.take(&marker)
+        };
+        drop(removed);
+        drop(marker);
+        drop(displaced);
+        artifact
+    }
+}
+
 impl<Key: Clone + Eq + Hash, Artifact: Clone> Drop for SpecializationCacheProducer<'_, Key, Artifact> {
     fn drop(&mut self) {
         // `insert` takes the key, so this only runs when production failed or unwound. Releasing the marker here is
@@ -368,13 +418,11 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
         // Registering with `replace` rather than `insert` hands the equal marker that is already in flight back out
         // of the guard, so that a rejected duplicate registration drops its `Key` after the lock is released instead
         // of under it. The two markers are interchangeable by definition, since they compare equal.
-        if self
-            .in_flight
-            .lock()
-            .expect("specialization cache mutex is poisoned")
-            .replace((thread, key.clone()))
-            .is_some()
-        {
+        let already_in_flight = {
+            let mut in_flight = self.in_flight.lock().expect("specialization cache mutex is poisoned");
+            in_flight.replace((thread, key.clone()))
+        };
+        if already_in_flight.is_some() {
             return Err(ReentrantSpecializationError);
         }
 
@@ -420,19 +468,15 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
         drop(removed);
     }
 
-    /// Removes every retained artifact whose key satisfies `predicate`, returning how many were removed.
-    ///
-    /// The predicate runs outside every cache lock, against a snapshot of the keys retained when this call started,
-    /// and so it may reenter the cache. If it panics, no removal pass begins and no cache lock is poisoned. Keys
-    /// retained after the snapshot are not offered to the predicate. Removal is by key equality rather than entry
-    /// generation, so if another thread replaces a selected key with an equal key between the snapshot and removal,
-    /// that current equal entry is removed. Like [`Self::clear`], this does not cancel producers already in flight.
-    ///
-    /// # Parameters
-    ///   - `predicate`: Selects the keys to remove. It is called once per snapshot key, from most to least recently
-    ///     used.
-    pub fn invalidate_entries_if(&self, mut predicate: impl FnMut(&Key) -> bool) -> usize {
-        let selected = self.keys().into_iter().filter(|key| predicate(key)).collect::<Vec<_>>();
+    /// Removes every retained artifact whose key satisfies `predicate_fn` from this [`SpecializationCache`], returning
+    /// the number of artifacts that were removed. The predicate runs outside every cache lock, against a snapshot of
+    /// the keys retained when this call started, and so it may reenter the cache. If it panics, no removal pass begins
+    /// and no cache lock is poisoned. Keys retained after the snapshot are not offered to the predicate. Removal is by
+    /// key equality rather than entry generation, so if another thread replaces a selected key with an equal key
+    /// between the snapshot and removal, that current equal entry is removed. Like [`Self::clear`], this does not
+    /// cancel producers already in flight.
+    pub fn invalidate_entries_if(&self, mut predicate_fn: impl FnMut(&Key) -> bool) -> usize {
+        let selected = self.keys().into_iter().filter(|key| predicate_fn(key)).collect::<Vec<_>>();
         let removed = {
             let mut entries = self.entries.lock().expect("specialization cache mutex is poisoned");
             selected.iter().filter_map(|key| entries.pop_entry(key)).collect::<Vec<_>>()
@@ -444,67 +488,19 @@ impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCache<Key, Artifact>
         count
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns a snapshot of this cache's activity counters.
+    /// Returns a snapshot of this [`SpecializationCache`]'s [`SpecializationCacheStatistics`].
+    #[inline]
     pub fn statistics(&self) -> SpecializationCacheStatistics {
         self.statistics.snapshot()
     }
 
-    /// Resets this cache's activity counters, leaving the retained artifacts untouched.
-    ///
-    /// The relaxed atomic counters reset independently. When other threads are active, events may fall on either side
-    /// of the reset for each counter; exact interval accounting therefore requires callers to quiesce cache activity.
+    /// Resets this [`SpecializationCache`]'s [`SpecializationCacheStatistics`], leaving the retained artifacts
+    /// untouched. The relaxed atomic counters stored in the underlying statistics reset independently. When other
+    /// threads are active, events may fall on either side of the reset for each counter. Exact interval accounting
+    /// therefore requires callers to quiesce cache activity.
+    #[inline]
     pub fn clear_statistics(&self) {
         self.statistics.reset();
-    }
-}
-
-impl<Key: Clone + Eq + Hash, Artifact: Clone> SpecializationCacheProducer<'_, Key, Artifact> {
-    /// Returns the key this producer is authorized to produce.
-    #[inline]
-    pub fn key(&self) -> &Key {
-        self.key.as_ref().unwrap()
-    }
-
-    /// Publishes `artifact` for this producer's key, releases the in-flight marker, and returns the artifact.
-    ///
-    /// Inserting is idempotent: if another thread produced the same key concurrently, the later insert replaces the
-    /// earlier one. Both artifacts are interchangeable by the cache's reuse contract, so last-one-wins is safe.
-    ///
-    /// The entry this insertion displaces, if any, is dropped only after the artifact is published, the counters are
-    /// updated, and the in-flight marker is released, so a displaced destructor that panics leaves the cache exactly
-    /// as a successful insertion would.
-    pub fn insert(mut self, artifact: Artifact) -> Artifact {
-        let key = self.key.take().unwrap();
-
-        // The displaced pair is bound here so that it outlives the guard below and its destructors run unlocked, which
-        // is what lets an artifact reenter the cache while being dropped. It is deliberately dropped last, after the
-        // counters are updated and the in-flight marker is released, so that a destructor that panics can neither
-        // strand the marker (which would reject every later lookup of this key on this thread as reentrant) nor skip a
-        // counter update.
-        let displaced = {
-            let mut entries = self.cache.entries.lock().expect("specialization cache mutex is poisoned");
-            entries.push(key.clone(), artifact.clone())
-        };
-        if let Some((displaced_key, _)) = &displaced
-            && *displaced_key != key
-        {
-            self.cache.statistics.increment_evictions();
-        }
-        self.cache.statistics.increment_productions();
-
-        // Both the marker offered for removal and the one recovered from the set are bound outside the guard, so that
-        // a `Key` destructor may reenter the cache as well.
-        let marker = (self.thread, key);
-        let removed = {
-            let mut in_flight = self.cache.in_flight.lock().expect("specialization cache mutex is poisoned");
-            in_flight.take(&marker)
-        };
-        drop(removed);
-        drop(marker);
-        drop(displaced);
-        artifact
     }
 }
 
