@@ -510,8 +510,6 @@ impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`TransformArtifact`] retained for a structural transform of type `T` with the provided arguments,
     /// deriving and retaining it on a cache miss. The marker `T` owns an independent bounded namespace on this sealed
@@ -525,12 +523,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// fresh artifact, and compares it with the retained programs and metadata; optimized builds compile that work out.
     ///
     /// ```mermaid
+    /// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
     /// flowchart LR
-    ///   request["RegionRef and Arguments"] --> namespace["Marker Namespace"]
-    ///   namespace -->|"hit"| retained["Retained TransformArtifact"]
+    ///   request["&lt;code&gt;RegionRef&lt;/code&gt; and &lt;code&gt;Arguments&lt;/code&gt;"] --> namespace["Marker Namespace"]
+    ///   namespace -->|"hit"| retained["Retained &lt;code&gt;TransformArtifact&lt;/code&gt;"]
     ///   namespace -->|"miss"| derive["Uncached Derivation"]
     ///   derive --> sanitize["Detach Source Cache Identity"]
-    ///   sanitize --> publish["Publish and Return TransformArtifact"]
+    ///   sanitize --> publish["Publish and Return &lt;code&gt;TransformArtifact&lt;/code&gt;"]
     /// ```
     #[cfg_attr(doc, aquamarine::aquamarine)]
     pub fn transform<
@@ -558,8 +557,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                     let cached_programs = cached.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
                     let fresh_programs = fresh.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
                     if cached_programs != fresh_programs || cached.metadata != fresh.metadata {
-                        // Pair the two renderings position by position as indexed blocks of real lines. Formatting the
-                        // two `Vec<String>`s instead would escape every newline in every program and leave the
+                        // Pair the two renderings position by position as indexed blocks of real lines. Formatting
+                        // the two `Vec<String>`s instead would escape every newline in every program and leave the
                         // diagnostic unreadable.
                         let mut programs = String::new();
                         for index in 0..cached_programs.len().max(fresh_programs.len()) {
@@ -602,6 +601,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         artifact
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
