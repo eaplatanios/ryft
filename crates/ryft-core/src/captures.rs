@@ -661,7 +661,6 @@ mod tests {
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming, ValueProjection,
     };
-    use crate::specialization::SpecializationCacheEntry;
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 
@@ -850,36 +849,20 @@ mod tests {
         // Dropping an unused trailing capture shifts no surviving capture, so no constant atom is rewritten and every
         // region keeps the transforms already derived from its contents.
         let closed = closed_program(0);
-        let retained = Arc::new(closed_program(1).program().clone());
-        match closed.program().entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(retained.clone());
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
+        let retained = closed.program().entry_region_ref().retained_identity_transform();
         let pruned = closed.without_unused_captures().unwrap();
         assert_eq!(pruned.captures(), &[Array::scalar(3.0)]);
-        match pruned.program().entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Occupied(artifact)) => assert!(Arc::ptr_eq(&artifact, &retained)),
-            _ => panic!("dropping an unused trailing capture must preserve the retained fused forward-mode program"),
-        }
+        let artifact = pruned.program().entry_region_ref().retained_identity_transform();
+        assert!(Arc::ptr_eq(&artifact, &retained));
 
         // Dropping an unused leading capture renumbers the survivor, which changes what the rewritten constant atoms
         // denote and must therefore discard every transform retained for the region.
         let closed = closed_program(1);
-        let retained = Arc::new(closed_program(0).program().clone());
-        match closed.program().entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(retained);
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
+        let retained = closed.program().entry_region_ref().retained_identity_transform();
         let pruned = closed.without_unused_captures().unwrap();
         assert_eq!(pruned.captures(), &[Array::scalar(99.0)]);
-        assert!(matches!(
-            pruned.program().entry_region().transform_cache().jvp_program_cache().try_entry(()),
-            Ok(SpecializationCacheEntry::Vacant(_)),
-        ));
+        let artifact = pruned.program().entry_region_ref().retained_identity_transform();
+        assert!(!Arc::ptr_eq(&artifact, &retained));
     }
 
     #[test]
@@ -928,35 +911,9 @@ mod tests {
             .unwrap();
         let closed =
             ClosedProgram::new(program, vec![Array::scalar(1.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
-        let mut artifact_builder = ProgramBuilder::<CaptureReference<ArrayType>, TestRegionOperation>::new();
-        let artifact_input = artifact_builder.add_input(ArrayType::scalar(DataType::F64));
-        let retained = Arc::new(
-            artifact_builder
-                .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
-                    vec![artifact_input],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap(),
-        );
-        match closed.program().regions()[0].transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(retained.clone());
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
-        match closed.program().regions()[1].transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(retained.clone());
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
-        match closed.program().entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(retained.clone());
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
+        let unchanged_retained = closed.program().region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
+        let renumbered_retained = closed.program().region_ref(RegionId::new(1)).unwrap().retained_identity_transform();
+        let entry_retained = closed.program().entry_region_ref().retained_identity_transform();
 
         // The untouched sibling keeps both its reference and its retained transform, while the rewritten sibling and
         // the entry region that attaches it discard theirs.
@@ -964,18 +921,12 @@ mod tests {
         assert_eq!(pruned.captures(), &[Array::scalar(1.0), Array::scalar(3.0)]);
         assert_eq!(pruned.program().regions()[0].atoms()[0].as_constant().map(CaptureReference::index), Some(0));
         assert_eq!(pruned.program().regions()[1].atoms()[0].as_constant().map(CaptureReference::index), Some(1));
-        match pruned.program().regions()[0].transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Occupied(artifact)) => assert!(Arc::ptr_eq(&artifact, &retained)),
-            _ => panic!("an unchanged sibling must preserve its retained fused forward-mode program"),
-        }
-        assert!(matches!(
-            pruned.program().regions()[1].transform_cache().jvp_program_cache().try_entry(()),
-            Ok(SpecializationCacheEntry::Vacant(_)),
-        ));
-        assert!(matches!(
-            pruned.program().entry_region().transform_cache().jvp_program_cache().try_entry(()),
-            Ok(SpecializationCacheEntry::Vacant(_)),
-        ));
+        let unchanged = pruned.program().region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
+        let renumbered = pruned.program().region_ref(RegionId::new(1)).unwrap().retained_identity_transform();
+        let entry = pruned.program().entry_region_ref().retained_identity_transform();
+        assert!(Arc::ptr_eq(&unchanged, &unchanged_retained));
+        assert!(!Arc::ptr_eq(&renumbered, &renumbered_retained));
+        assert!(!Arc::ptr_eq(&entry, &entry_retained));
     }
 
     #[test]

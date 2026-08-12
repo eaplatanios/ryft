@@ -1156,7 +1156,7 @@ pub trait MemberBatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation 
 /// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over packed
 /// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
 /// packaged into the resulting program.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProgramBatchingOutputAxesPolicy {
     /// Keep the output axes naturally produced by the per-operation batching rules.
     /// Replicated outputs remain replicated.
