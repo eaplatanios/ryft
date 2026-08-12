@@ -12,17 +12,41 @@ use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionTransformCache};
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
 /// is a nested computation referenced by one or more [`Instruction`]s (e.g., the branches of a condition, or the
-/// shared program of a JIT call). Each region is a flat sequence of [`Instruction`]s over its own [`Atom`] table, and the
-/// entry region's flat boundary is paired with [`Parameterized`] input and output types. This is the primary
-/// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things
-/// like automatic differentiation and just-in-time compilation).
+/// shared program of a just-in-time compiled function call). Each region is a flat sequence of [`Instruction`]s over
+/// its own [`Atom`] table, and the entry region's flat boundary is paired with [`Parameterized`] input and output
+/// types. This is the primary intermediate representation (IR) used by the Ryft tracing and transformation system
+/// (e.g., to support things like automatic differentiation and just-in-time compilation).
+///
+/// # Program Lifecycle
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   inputs["Typed Inputs and Stored Constants"] --> builder["Mutable &lt;code&gt;ProgramBuilder&lt;/code&gt;"]
+///   regions["Sealed Nested Region Closures"] --> builder
+///   builder -->|"add atoms and checked instructions"| boundary["Validate Structured Boundaries"]
+///   program["Immutable &lt;code&gt;Program&lt;/code&gt; with One Region Arena"]
+///   boundary -->|"&lt;code&gt;build&lt;/code&gt;"| program
+///   program --> replay["Interpret through an Active Context"]
+///   program --> transform["Batch, Differentiate, or Partially Evaluate"]
+///   program --> analyze["Inspect Effects, Liveness, and Statistics"]
+///   program --> rewrite["Simplify or Filter"]
+///   program --> compile["Lower and Compile through a Backend"]
+///   transform --> derived["New Validated Program"]
+///   rewrite --> derived
+/// ```
+///
+/// Construction through [`ProgramBuilder`](crate::ProgramBuilder) is the only mutable phase. Every consumer starts
+/// from a program whose region graph and structured boundaries have already been validated.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Debug)]
 pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
@@ -1227,6 +1251,26 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         }
 
         Ok(ProgramLivenessAnalysis { instruction_by_output, input_liveness, effectful_instruction_indices })
+    }
+
+    /// Detaches every contained [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting
+    /// that region a fresh empty cache, while preserving every unrelated cache (in particular, descendants' caches,
+    /// whose retained transforms remain reusable inside the published artifact).
+    ///
+    /// This is the publish-time sanitization step of [`RegionRef::transform`]. Cache cells ride region copies by strong
+    /// [`Arc`], and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell to preserve
+    /// sharing. A derived program that legitimately contains a copy of its source region therefore carries the very
+    /// cell the artifact is about to be stored in, and publishing it unsanitized would close a strong reference cycle
+    /// (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public handle drops.
+    /// Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding derivation can
+    /// create. Refer to the ownership-cycle discussion in the documentation of
+    /// [`transforms`](crate::programs::transforms) for why that is sufficient.
+    ///
+    /// This delegates to [`RegionArena::detach_transform_cache`] across the complete arena, so the entry region
+    /// is covered too. This function is private to this crate deliberately as it is sound only as part of the
+    /// sanitize-then-publish sequence, and external transforms must never manipulate cache provenance directly.
+    pub(crate) fn detach_transform_cache(&mut self, source: &RegionTransformCache<V, O>) {
+        self.regions.detach_transform_cache(source);
     }
 }
 
