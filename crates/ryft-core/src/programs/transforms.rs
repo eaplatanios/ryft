@@ -513,17 +513,16 @@ impl<V: Typed + Parameter, O> Debug for RegionTransformCache<V, O> {
 // TODO(eaplatanios): Review from here onwards.
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
-    /// Returns the artifact retained for one structural transform, deriving and retaining it on a miss.
-    ///
-    /// The marker `T` owns an independent bounded namespace on this sealed region. `arguments` must contain every
-    /// semantic derivation input not represented by the complete reachable region graph. `derive` is the uncached
-    /// deterministic kernel and must have stable semantics for every use of `T`. It must not recursively request the
-    /// same marker and arguments itself; if recursion occurs indirectly, this method derives that nested request
-    /// uncached and publishes only the outer artifact.
+    /// Returns the [`TransformArtifact`] retained for a structural transform of type `T` with the provided arguments,
+    /// deriving and retaining it on a cache miss. The marker `T` owns an independent bounded namespace on this sealed
+    /// region. `arguments` must contain every semantic derivation input not represented by the complete reachable
+    /// region graph. `derive_fn` is the uncached deterministic kernel and must have stable semantics for every use of
+    /// `T`. It must not recursively request the same marker and arguments itself. If recursion occurs indirectly, this
+    /// function will derive that nested request uncached and publish only the outer artifact.
     ///
     /// Failed and panicking derivations retain nothing. A successful artifact is sanitized before the exact same
-    /// instance is published and returned. With debug assertions enabled, a hit re-runs `derive`, sanitizes the fresh
-    /// artifact, and compares it with the retained programs and metadata; optimized builds compile that work out.
+    /// instance is published and returned. With debug assertions enabled, a hit re-runs `derive_fn`, sanitizes the
+    /// fresh artifact, and compares it with the retained programs and metadata; optimized builds compile that work out.
     ///
     /// ```mermaid
     /// flowchart LR
@@ -533,23 +532,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     ///   derive --> sanitize["Detach Source Cache Identity"]
     ///   sanitize --> publish["Publish and Return TransformArtifact"]
     /// ```
-    ///
-    /// # Parameters
-    ///   - `arguments`: Complete transform-specific specialization key.
-    ///   - `derive`: Uncached deterministic structural derivation callback. Returning programs derived from regions
-    ///     unrelated to the source region violates the region reuse contract and can create unreclaimable reference
-    ///     cycles between region transform caches.
     #[cfg_attr(doc, aquamarine::aquamarine)]
-    pub fn transform<T, Metadata, Error>(
+    pub fn transform<
+        T: 'static
+            + Transform<
+                Region<V, O>,
+                Arguments: 'static + Debug + Send + Sync,
+                Artifact = TransformArtifact<V, O, Metadata>,
+            >,
+        Metadata: 'static + Clone + Debug + PartialEq + Send + Sync,
+        Error,
+    >(
         self,
         arguments: T::Arguments,
-        derive: impl FnOnce(Self, &T::Arguments) -> Result<TransformArtifact<V, O, Metadata>, Error>,
-    ) -> Result<TransformArtifact<V, O, Metadata>, Error>
-    where
-        T: Transform<Region<V, O>, Artifact = TransformArtifact<V, O, Metadata>> + 'static,
-        T::Arguments: Debug + Send + Sync + 'static,
-        Metadata: Clone + Debug + PartialEq + Send + Sync + 'static,
-    {
+        derive_fn: impl FnOnce(Self, &T::Arguments) -> Result<TransformArtifact<V, O, Metadata>, Error>,
+    ) -> Result<TransformArtifact<V, O, Metadata>, Error> {
         let namespace = self.transform_cache().namespace::<T>(T::DEFAULT_CACHE_CAPACITY);
         let erased_arguments = ErasedTransformArguments::new(arguments.clone());
         match namespace.try_entry(erased_arguments) {
@@ -557,16 +554,40 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                 let cached = cached.typed::<Metadata>();
                 #[cfg(debug_assertions)]
                 {
-                    let fresh = self.sanitize_transform_artifact(derive(self, &arguments)?);
-                    assert_transform_artifacts_match::<T, _, _, _>(&arguments, &cached, &fresh);
+                    let fresh = self.sanitize_transform_artifact(derive_fn(self, &arguments)?);
+                    let cached_programs = cached.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    let fresh_programs = fresh.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    if cached_programs != fresh_programs || cached.metadata != fresh.metadata {
+                        // Pair the two renderings position by position as indexed blocks of real lines. Formatting the
+                        // two `Vec<String>`s instead would escape every newline in every program and leave the
+                        // diagnostic unreadable.
+                        let mut programs = String::new();
+                        for index in 0..cached_programs.len().max(fresh_programs.len()) {
+                            for (label, renderings) in [("cached", &cached_programs), ("fresh", &fresh_programs)] {
+                                let rendering = renderings.get(index).map_or("<absent>", String::as_str);
+                                programs.push_str(&format!("--- {label} program {index} ---\n{rendering}\n"));
+                            }
+                        }
+                        panic!(
+                            "nondeterministic transform rule detected for `{}` with arguments {:?}: re-derivation \
+                             produced a different artifact than the region cache retained, but region transforms must \
+                             be deterministic structural functions of their complete reachable contents and \
+                             arguments\n\ncached metadata: {:?}\nderived metadata: {:?}\n\n{}",
+                            type_name::<T>(),
+                            arguments,
+                            cached.metadata,
+                            fresh.metadata,
+                            programs,
+                        );
+                    }
                 }
                 Ok(cached)
             }
             Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                let artifact = self.sanitize_transform_artifact(derive(self, &arguments)?);
+                let artifact = self.sanitize_transform_artifact(derive_fn(self, &arguments)?);
                 Ok(producer.insert(ErasedTransformArtifact::new(artifact)).typed::<Metadata>())
             }
-            Err(ReentrantSpecializationError) => Ok(self.sanitize_transform_artifact(derive(self, &arguments)?)),
+            Err(ReentrantSpecializationError) => Ok(self.sanitize_transform_artifact(derive_fn(self, &arguments)?)),
         }
     }
 
@@ -580,46 +601,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         }
         artifact
     }
-}
-
-/// Diagnoses a nondeterministic structural transform before a cached artifact is served.
-#[cfg(debug_assertions)]
-fn assert_transform_artifacts_match<T, V, O, Metadata>(
-    arguments: &T::Arguments,
-    cached: &TransformArtifact<V, O, Metadata>,
-    fresh: &TransformArtifact<V, O, Metadata>,
-) where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    T: Transform<Region<V, O>, Artifact = TransformArtifact<V, O, Metadata>>,
-    T::Arguments: Debug,
-    Metadata: Debug + PartialEq,
-{
-    let cached_programs = cached.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let fresh_programs = fresh.programs.iter().map(ToString::to_string).collect::<Vec<_>>();
-    if cached_programs == fresh_programs && cached.metadata == fresh.metadata {
-        return;
-    }
-
-    // Pair the two renderings position by position as indexed blocks of real lines. Formatting the two `Vec<String>`s
-    // instead would escape every newline in every program and leave the diagnostic unreadable.
-    let mut programs = String::new();
-    for index in 0..cached_programs.len().max(fresh_programs.len()) {
-        for (label, renderings) in [("cached", &cached_programs), ("fresh", &fresh_programs)] {
-            let rendering = renderings.get(index).map_or("<absent>", String::as_str);
-            programs.push_str(&format!("--- {label} program {index} ---\n{rendering}\n"));
-        }
-    }
-    panic!(
-        "nondeterministic transform rule detected for `{}` with arguments {:?}: re-derivation produced a different \
-         artifact than the region cache retained, but region transforms must be deterministic structural functions of \
-         their complete reachable contents and arguments\n\ncached metadata: {:?}\nderived metadata: {:?}\n\n{}",
-        type_name::<T>(),
-        arguments,
-        cached.metadata,
-        fresh.metadata,
-        programs,
-    );
 }
 
 #[cfg(test)]
