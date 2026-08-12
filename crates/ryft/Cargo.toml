@@ -6,6 +6,7 @@ description = "A Framework for Tracing, Automatic Differentiation, and Just-In-T
 keywords = ["ryft", "tracing", "autodiff", "compiler", "machine-learning"]
 include = [
     "src/**/*",
+    "examples/**/*",
     "Cargo.toml",
     "CHANGELOG.md",
     "../../README.md",
@@ -39,10 +40,10 @@ ryft-xla = { workspace = true, optional = true }
 [features]
 default = ["xla"]
 xla = ["ryft-mlir", "ryft-pjrt", "ryft-xla"]
-cuda-12 = ["ryft-xla/cuda-12"]
-cuda-13 = ["ryft-xla/cuda-13"]
-rocm-7 = ["ryft-xla/rocm-7"]
-tpu = ["ryft-xla/tpu"]
-neuron = ["ryft-xla/neuron"]
-metal = ["ryft-xla/metal"]
-mps = ["ryft-xla/mps"]
+cuda-12 = ["xla", "ryft-xla/cuda-12"]
+cuda-13 = ["xla", "ryft-xla/cuda-13"]
+rocm-7 = ["xla", "ryft-xla/rocm-7"]
+tpu = ["xla", "ryft-xla/tpu"]
+neuron = ["xla", "ryft-xla/neuron"]
+metal = ["xla", "ryft-xla/metal"]
+mps = ["xla", "ryft-xla/mps"]

@@ -20,10 +20,20 @@
 //! - [`value_and_gradient`] and [`gradient`] are scalar-output conveniences that seed the pullback with one. The
 //!   `*_with_aux` variants preserve non-differentiated auxiliary output, while the `*_holomorphic` variants explicitly
 //!   opt into the complex holomorphic contract.
+//! - [`jacobian_forward`] and [`jacobian_reverse`] materialize complete Jacobians by batching coordinate directions
+//!   through JVPs or pullbacks. Their relative cost depends on the input and output coordinate counts.
+//! - [`hessian`] differentiates a scalar-output gradient and returns the resulting structured block matrix. Like the
+//!   Jacobian and gradient families, auxiliary-output and holomorphic variants make those contracts explicit.
 //!
 //! Context-generic code can use [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`] directly, and already
 //! traced programs expose the corresponding program-level JVP, linearization, and transposition methods documented on
 //! [`Program`](crate::programs::Program).
+//!
+//! # Differentiation Pipeline
+//!
+//! Residuals are runtime values from the chosen linearization point. The reusable programs describe derivative
+//! structure, while each [`Pushforward`] or [`Pullback`] binds that structure to the residual values captured for one
+//! invocation. Refer to [`Linearization`] for a rendered diagram of the complete forward/reverse pipeline.
 //!
 //! # Forward Mode Differentiation
 //!
@@ -37,14 +47,6 @@
 //! computation become residuals, and the residual program becomes a reusable [`Pushforward`]. Host control flow may
 //! branch on concrete primals during this process, so only the taken path is linearized.
 //!
-//! The following is an illustration of forward mode differentiation:
-//!
-//! ```text
-//! ┌─────────────────────┐   apply operation JVP rules   ┌───────────────────────────┐
-//! │ Primals + Tangents  │ ────────────────────────────▶ │ Outputs + Output Tangents │
-//! └─────────────────────┘                               └───────────────────────────┘
-//! ```
-//!
 //! # Reverse Mode Differentiation
 //!
 //! Reverse mode differentiation reuses forward linearization instead of maintaining an independent nonlinear trace.
@@ -53,25 +55,28 @@
 //! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
 //! concerns.
 //!
-//! The following is an illustration of reverse mode differentiation:
+//! # Zero Differential Spaces
 //!
-//! ```text
-//!        ┌─────────────────────────────┐
-//!        │ Primals + Unknown Tangents  │
-//!        └──────────────┬──────────────┘
-//!                       │ linearize (JVP with unknown tangents under partial evaluation)
-//!                       ▼
-//! ┌───────────────────────────────────────────┐
-//! │ Primal Outputs + Residuals + Pushforward  │
-//! └─────────────────────┬─────────────────────┘
-//!                       │ transpose the linear pushforward
-//!                       ▼
-//!             ┌───────────────────┐
-//!             │ Reusable Pullback │
-//!             └───────────────────┘
-//! ```
+//! [`DifferentiableType`] may describe a tangent or cotangent space containing only zero. Such leaves remain present
+//! in public primal structures but need no Single Static Assignment (SSA) slots in linear tangent or pullback programs.
+//! Derivative entry points omit those internal slots, preserve their boundary positions as metadata, and reconstruct
+//! typed zeros when rebuilding public results. [`MaybeZero`](crate::MaybeZero) likewise lets operation rules propagate
+//! symbolic zeros without materializing arrays.
 //!
-//! # Extending differentiation
+//! # Structural Transform Reuse
+//!
+//! Higher-order rules frequently differentiate the same sealed [`Region`](crate::Region) from several outer programs.
+//! Region-level JVP, linearization, and transposition paths retain their context-free derived programs against the
+//! region's complete reachable contents and the transform's structural arguments. Faithful copies reuse those
+//! artifacts, while content-changing rewrites and changed descendant closures invalidate them. These built-ins use
+//! the same [`Transform`](crate::Transform) extension mechanism available to external structural program transforms;
+//! differentiation-specific artifact layouts remain private adapters around that general API.
+//!
+//! Runtime callables are deliberately different. A [`Pushforward`] or [`Pullback`] owns concrete residual values from
+//! one linearization point and is never cached as a type-only structural artifact. Immediate value-level transforms
+//! likewise retain their existing semantics, including concrete host control flow chosen from the current primals.
+//!
+//! # Extending Differentiation
 //!
 //! Implement [`DifferentiableType`] for types that possess tangent and cotangent spaces. Implement
 //! [`DifferentiableOperation`] for primitive JVP rules. Rules should express tangent behavior through the provided

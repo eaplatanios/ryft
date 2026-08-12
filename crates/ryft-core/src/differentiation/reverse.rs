@@ -13,12 +13,12 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::{AddOperation, OneOperation, Zero, ZeroLikeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
-use crate::specialization::{ReentrantSpecializationError, SpecializationCacheEntry};
 use crate::tracing::{Tracer, TracingContext};
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
@@ -270,7 +270,7 @@ impl<
     }
 }
 
-/// [`RegionDriver`] that provides call-scoped access to the [`Region`](crate::Region)s attached to the
+/// [`RegionDriver`] that provides call-scoped access to the [`Region`]s attached to the
 /// [`Instruction`](crate::Instruction) being transposed and to nested transposition work over those regions.
 /// The transposition engine constructs a [`TranspositionDriver`] for every instruction. [`RegionDriver`] provides
 /// structural region access, while this trait adds transposition-specific recursion.
@@ -302,9 +302,9 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionDriver<V, O> for Empty
 }
 
 /// [`TranspositionDriver`] scoped to one replayed linear [`Instruction`](crate::Instruction), borrowing exactly the
-/// [`Region`](crate::Region)s attached to that instruction.
+/// [`Region`]s attached to that instruction.
 struct RecursiveTranspositionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
-    /// Borrowed attached [`Region`](crate::Region)(crate::Region)s, in region order.
+    /// Borrowed attached [`Region`]s, in region order.
     regions: Vec<RegionRef<'r, V, O>>,
 }
 
@@ -453,7 +453,7 @@ impl<
     O: TransposableOperation<V, O> + ResidualZeroProvider<T> + From<AddOperation<T>>,
 > RegionRef<'_, V, O>
 {
-    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) into its reverse-mode _pullback_.
+    /// Transposes this borrowed linear _pushforward_ [`Region`] into its reverse-mode _pullback_.
     /// Refer to the documentation of [`Program::transpose_with_respect_to`] for more information.
     ///
     /// This is the uncached half of a pair. Callers that publish their result, including the built-in
@@ -467,8 +467,8 @@ impl<
         self.transpose_with_respect_to_and_zero_residuals(input_indices, &[])
     }
 
-    /// Transposes this borrowed linear _pushforward_ [`Region`](crate::Region) through the region's retained transform
-    /// cache, returning a shared handle to the resulting _pullback_ [`Program`].
+    /// Transposes this borrowed linear _pushforward_ [`Region`] through the region's retained transform cache,
+    /// returning a shared handle to the resulting _pullback_ [`Program`].
     ///
     /// Transposition is a pure function of the region's contents and of this function's arguments, so this function
     /// returns exactly what [`RegionRef::transpose_with_respect_to`] would produce, and every content-preserving copy
@@ -483,40 +483,28 @@ impl<
         input_indices: &[usize],
         zero_residual_input_indices: &[Vec<usize>],
     ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
-        let key = (input_indices.to_vec(), zero_residual_input_indices.to_vec());
-        match self.transform_cache().transposition_cache().try_entry(key) {
-            Ok(SpecializationCacheEntry::Occupied(cached_transposed_program)) => {
-                // With debug assertions enabled, re-derive the transposition and compare it against the artifact
-                // about to be served. A difference means a `transpose` rule is not a deterministic structural
-                // function of its inputs, which makes every retained pullback unsound rather than merely stale.
-                #[cfg(debug_assertions)]
-                {
-                    let fresh_transposed_program =
-                        self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?;
-                    assert_eq!(
-                        cached_transposed_program.to_string(),
-                        fresh_transposed_program.to_string(),
-                        "nondeterministic transform rule detected: re-deriving the transposition of this region \
-                         produced a different program than the artifact retained in its transform cache, but \
-                         `TransposableOperation::transpose` rules must be deterministic structural functions of their \
-                         inputs\n\ncached:\n{cached_transposed_program}\nderived:\n{fresh_transposed_program}"
-                    );
-                }
-                Ok(cached_transposed_program)
-            }
-            Ok(SpecializationCacheEntry::Vacant(producer)) => Ok(producer.insert(Arc::new(
-                self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?,
-            ))),
-            Err(ReentrantSpecializationError) => Ok(Arc::new(
-                self.transpose_with_respect_to_and_zero_residuals(input_indices, zero_residual_input_indices)?,
-            )),
-        }
+        let arguments = TranspositionTransformArguments {
+            input_indices: input_indices.to_vec(),
+            zero_residual_input_indices: zero_residual_input_indices.to_vec(),
+        };
+        let artifact =
+            (*self).transform::<TranspositionTransform, _, DifferentiationError>(arguments, |region, arguments| {
+                let program = region.transpose_with_respect_to_and_zero_residuals(
+                    arguments.input_indices.as_slice(),
+                    arguments.zero_residual_input_indices.as_slice(),
+                )?;
+                Ok(TransformArtifact::new(vec![Arc::new(program)], ()))
+            })?;
+        let (programs, ()) = artifact.into_parts();
+        let mut programs = programs.into_iter();
+        let program = programs.next().unwrap();
+        assert!(programs.next().is_none(), "transposition transform retained more than one program");
+        Ok(program)
     }
 
-    /// Transposes this [`Region`](crate::Region) while mapping the residual inputs that supply runtime geometry
-    /// for each disconnected selected-input cotangent. Linearization uses this internal form after appending those
-    /// residuals to its tangent program. Ordinary transposition uses [`Self::transpose_with_respect_to`] and supplies
-    /// no mappings.
+    /// Transposes this [`Region`] while mapping the residual inputs that supply runtime geometry for each disconnected
+    /// selected-input cotangent. Linearization uses this internal form after appending those residuals to its tangent
+    /// program. Ordinary transposition uses [`Self::transpose_with_respect_to`] and supplies no mappings.
     pub(crate) fn transpose_with_respect_to_and_zero_residuals(
         &self,
         input_indices: &[usize],
@@ -1762,11 +1750,11 @@ where
 }
 
 /// Applies a member operation's transpose rule through a projected view of a composite [`TracingContext`]. Use this
-/// function from a composite operation dispatcher when the linear operation is [`Region`](crate::Region)-free and every
-/// operand and result belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage
-/// through a member-typed [`TracingContext`], this function records the rule in a short-lived member program, converts
-/// that program to the composite type, and splices it into the active trace. Known primal inputs and live output
-/// cotangents become splice inputs in encounter order; structural zeros remain types and do not materialize values.
+/// function from a composite operation dispatcher when the linear operation is [`Region`]-free and every operand and
+/// result belongs to the same projectable member type `T`. Because [`TransposableOperation`] rules stage through a
+/// member-typed [`TracingContext`], this function records the rule in a short-lived member program, converts that
+/// program to the composite type, and splices it into the active trace. Known primal inputs and live output cotangents
+/// become splice inputs in encounter order; structural zeros remain types and do not materialize values.
 ///
 /// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit composite
 /// transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is rejected with an
@@ -1888,8 +1876,8 @@ where
 /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
 /// instruction consumes its `T`-typed member operands together with operands belonging to other members of the parent
 /// type universe (e.g., the first-class dimensions that supply a dynamic result geometry), in any arrangement. Use this
-/// function from a composite operation dispatcher for a [`Region`](crate::Region)-free payload that keeps its native
-/// member operation type while its instruction crosses member kinds.
+/// function from a composite operation dispatcher for a [`Region`]-free payload that keeps its native member operation
+/// type while its instruction crosses member kinds.
 ///
 /// Each operand is classified individually rather than by position. An operand whose type projects into `T` is a _data_
 /// operand and every other operand is a parent-universe geometry operand. The data operands, in operand order, are
@@ -1984,6 +1972,26 @@ where
             }
         })
         .collect()
+}
+
+/// [`Region`] [`Transform`] marker for retained transposed [`Program`]s.
+pub(crate) struct TranspositionTransform;
+
+impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for TranspositionTransform {
+    type Arguments = TranspositionTransformArguments;
+    type Artifact = TransformArtifact<V, O, ()>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
+}
+
+/// Argument key for one retained [`TranspositionTransform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TranspositionTransformArguments {
+    /// Selected linear input indices, in requested output order.
+    input_indices: Vec<usize>,
+
+    /// Per-selected-input residual indices supplying disconnected cotangent geometry.
+    zero_residual_input_indices: Vec<Vec<usize>>,
 }
 
 #[cfg(test)]
@@ -2790,12 +2798,10 @@ mod tests {
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
-        match program.entry_region().transform_cache().transposition_cache().try_entry((vec![0, 1], Vec::new())) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(unrelated);
-            }
-            _ => panic!("a freshly built region must have an empty transposition cache"),
-        }
+        program.entry_region_ref().insert_transform_artifact_for_testing::<TranspositionTransform, _>(
+            TranspositionTransformArguments { input_indices: vec![0, 1], zero_residual_input_indices: Vec::new() },
+            TransformArtifact::new(vec![unrelated], ()),
+        );
 
         // The recheck runs on the hit and reports the contract violation rather than serving the wrong pullback.
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2803,13 +2809,8 @@ mod tests {
         }))
         .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.contains(
-                "nondeterministic transform rule detected: re-deriving the transposition of this region produced a \
-                 different program than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
+        assert!(message.contains("TranspositionTransform"), "{message}");
     }
 
     #[test]

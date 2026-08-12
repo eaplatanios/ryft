@@ -20,12 +20,12 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
     PartialValue, PartiallyEvaluatableOperation,
 };
+use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver,
-    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, ProjectedValue, Region, RegionDriver, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
-use crate::specialization::{ReentrantSpecializationError, SpecializationCacheEntry};
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
@@ -124,10 +124,10 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
 ///     the residuals `r` (i.e., the intermediate values of the derivative computation that depend only on `x`; e.g.,
 ///     `cos(x)` when `f` is `sin`), and
 ///   - the [`tangent`](Self::tangent) sub-program `(live(ẋ), r) ↦ live(ẏ)`, computing
-///     `ẏ = (∂f/∂x)(x) · ẋ`. Here `live(ẋ)` contains one SSA input for each primal input whose tangent type is
-///     not a zero differential space, and `live(ẏ)` similarly contains one Single Static Assignment (SSA) output for
-///     each primal output whose tangent type is not a zero differential space. A tangent in a zero differential space
-///     can only be zero, so it requires no SSA slot; the corresponding primal value remains in the primal program, and
+///     `ẏ = (∂f/∂x)(x) · ẋ`. Here `live(ẋ)` contains one SSA input for each primal input whose tangent type is not a
+///     zero differential space, and `live(ẏ)` similarly contains one Single Static Assignment (SSA) output for each
+///     primal output whose tangent type is not a zero differential space. A tangent in a zero differential space can
+///     only be zero, so it requires no SSA slot; the corresponding primal value remains in the primal program, and
 ///     structured callable APIs reconstruct the uniquely determined typed zero where their public result structure
 ///     requires it. The tangent program is linear in `ẋ`, with the linearization point `x` entering only through the
 ///     residuals `r`.
@@ -135,15 +135,42 @@ impl<V: Typed + Display> Display for DifferentiationDual<V> {
 /// This is the domain-free, interpretation-free core shared by every linearization entry point. It carries only the
 /// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
 /// callers that interpret [`primal`](Self::primal) under a value semantics of their choice.
+///
+/// # Differentiation Pipeline
+///
+/// ```mermaid
+/// %%{init: {"themeCSS": ".nodeLabel code { white-space: nowrap !important; }"}}%%
+/// flowchart TD
+///   source["Closure or Immutable Program"] --> direct["&lt;code&gt;jvp&lt;/code&gt;: Primals plus Tangents"]
+///   direct --> dual_outputs["Primal Outputs plus Output Tangents"]
+///   direct --> forward_jacobian["Forward Jacobian via Batched Input Directions"]
+///   source --> linearize["Linearize with Unknown Tangents"]
+///   linearize --> primal["Primal Program: x to y plus Residuals"]
+///   linearize --> tangent["Linear Tangent Program: dx plus Residuals to dy"]
+///   primal --> residuals["Evaluate Once and Save Residual Values"]
+///   tangent --> pushforward["Reusable &lt;code&gt;Pushforward&lt;/code&gt;"]
+///   residuals --> pushforward
+///   tangent --> transpose["Transpose in Reverse Dataflow Order"]
+///   transpose --> pullback["Reusable &lt;code&gt;Pullback&lt;/code&gt;"]
+///   residuals --> pullback
+///   pullback --> reverse_jacobian["Reverse Jacobian via Batched Output Cotangents"]
+///   pullback --> gradient["Scalar-Output Gradient by Seeding One"]
+///   gradient --> hessian["Hessian by Differentiating the Gradient"]
+/// ```
+///
+/// The diagram includes both direct forward mode and the reverse-mode path built from this structural split. Concrete
+/// [`Pushforward`] and [`Pullback`](crate::Pullback) callables additionally retain residual values from one
+/// linearization point; this [`Linearization`] itself does not.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
     /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
     /// form the residual environment consumed by the tangent sub-program.
     primal: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input for
-    /// each primal input whose tangent type is not a zero differential space, followed by the residuals `r`, and one
-    /// SSA output for each primal output whose tangent type is not a zero differential space.
+    /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input
+    /// for each primal input whose tangent type is not a zero differential space, followed by the residuals `r`, and
+    /// one SSA output for each primal output whose tangent type is not a zero differential space.
     tangent: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program (i.e., the count of
@@ -796,16 +823,16 @@ pub trait DifferentiableOperation<C: Context>: Operation {
     /// bound through `context`.
     ///
     /// Rules must be deterministic structural functions of their inputs (i.e., of this operation, the input duals, and
-    /// the attached [`Region`](crate::Region)s reachable through `driver`), because the programs derived from them may
-    /// be retained and replayed by the per-region transform cache behind [`RegionRef::linearize_shared`]. When the
-    /// `debug_assertions` feature is enabled, every cache hit checks this with a rendering-based diagnostic whose
-    /// fidelity is bounded by [`Operation::render`] on operation metadata and by [`Display`] on constants.
+    /// the attached [`Region`]s reachable through `driver`), because the programs derived from them may be retained and
+    /// replayed by the per-region transform cache behind [`RegionRef::linearize_shared`]. When the `debug_assertions`
+    /// feature is enabled, every cache hit checks this with a rendering-based diagnostic whose fidelity is bounded by
+    /// [`Operation::render`] on operation metadata and by [`Display`] on constants.
     ///
     /// # Parameters
     ///
     ///   - `context`: [`Context`] through which the rule binds the primal and tangent [`Operation`]s it synthesizes.
     ///   - `driver`: [`DifferentiationDriver`] that provides [`Instruction`](crate::Instruction)-scoped access to
-    ///     attached [`Region`](crate::Region)s.
+    ///     attached [`Region`]s.
     ///   - `inputs`: Input [`DifferentiationDual`]s aligned with this operation's inputs/operands.
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
@@ -845,7 +872,7 @@ pub trait MemberDifferentiableOperation<C: Context>: Operation<Type: Differentia
     /// # Parameters
     ///
     ///   - `context`: Parent [`Context`] through which the rule stages member and mixed operations.
-    ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes any attached [`Region`](crate::Region)s.
+    ///   - `driver`: Instruction-scoped [`DifferentiationDriver`] that exposes any attached [`Region`]s.
     ///   - `inputs`: Parent-universe primal/tangent pairs aligned with this operation's operands.
     fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
@@ -1148,7 +1175,7 @@ where
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
         + ResidualZeroProvider<V::Type>,
 {
-    /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`](crate::Region).
+    /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`].
     /// Refer to the documentation of [`Program::jvp`] for more information.
     ///
     /// This is the uncached half of a pair. Callers that publish their result, including the built-in
@@ -1350,8 +1377,8 @@ where
             .map_err(DifferentiationError::from)
     }
 
-    /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`](crate::Region) through
-    /// the region's retained transform cache, returning a shared handle to it.
+    /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`] through the region's
+    /// retained transform cache, returning a shared handle to it.
     ///
     /// The fused forward-mode program is a pure function of the region's contents, so this returns exactly what
     /// [`RegionRef::jvp`] would produce, and every content-preserving copy of one sealed region shares one artifact.
@@ -1363,33 +1390,19 @@ where
     /// Recursive forward-mode construction of the region currently in flight on this thread is served without the
     /// cache, so a self-referential region behaves exactly as it does through [`Self::jvp`].
     pub fn jvp_shared(&self) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
-        match self.transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Occupied(cached_jvp_program)) => {
-                // With debug assertions enabled, re-derive the fused forward-mode program and compare it against the
-                // artifact about to be served. A difference means a `jvp` rule is not a deterministic structural
-                // function of its inputs, which makes every retained derivative unsound rather than merely stale.
-                #[cfg(debug_assertions)]
-                {
-                    let fresh_jvp_program = self.jvp()?;
-                    assert_eq!(
-                        cached_jvp_program.to_string(),
-                        fresh_jvp_program.to_string(),
-                        "nondeterministic transform rule detected: re-deriving the fused forward-mode program of this \
-                         region produced a different program than the artifact retained in its transform cache, but \
-                         `DifferentiableOperation::jvp` rules must be deterministic structural functions of their \
-                         inputs\n\ncached:\n{cached_jvp_program}\nderived:\n{fresh_jvp_program}",
-                    );
-                }
-                Ok(cached_jvp_program)
-            }
-            Ok(SpecializationCacheEntry::Vacant(producer)) => Ok(producer.insert(Arc::new(self.jvp()?))),
-            Err(ReentrantSpecializationError) => Ok(Arc::new(self.jvp()?)),
-        }
+        let artifact = (*self).transform::<JvpTransform, _, DifferentiationError>((), |region, _| {
+            Ok(TransformArtifact::new(vec![Arc::new(region.jvp()?)], ()))
+        })?;
+        let (programs, ()) = artifact.into_parts();
+        let mut programs = programs.into_iter();
+        let program = programs.next().unwrap();
+        assert!(programs.next().is_none(), "fused JVP transform retained more than one program");
+        Ok(program)
     }
 
-    /// Linearizes this borrowed [`Region`](crate::Region) by replaying it once through a [`DifferentiationContext`]
-    /// over a [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. Refer to the
-    /// documentation of [`Program::linearize`] for more information.
+    /// Linearizes this borrowed [`Region`] by replaying it once through a [`DifferentiationContext`] over a
+    /// [`PartialEvaluationContext`] whose known-side parent is a fresh [`TracingContext`]. Refer to the documentation
+    /// of [`Program::linearize`] for more information.
     ///
     /// This is the uncached half of a pair. Callers that publish their result take it through
     /// [`RegionRef::linearize_shared`] instead, which serves the same sub-programs from the region's
@@ -1649,9 +1662,9 @@ where
         Linearization::new(primal_program, tangent_program, residual_count).map_err(DifferentiationError::from)
     }
 
-    /// Linearizes this borrowed [`Region`](crate::Region) through the region's retained transform cache, returning
-    /// shared handles to the primal sub-program and the tangent sub-program together with the residual count relating
-    /// them (i.e., the [`Linearization::into_parts`] triple behind [`Arc`]s).
+    /// Linearizes this borrowed [`Region`] through the region's retained transform cache, returning shared handles to
+    /// the primal sub-program and the tangent sub-program together with the residual count relating them (i.e., the
+    /// [`Linearization::into_parts`] triple behind [`Arc`]s).
     ///
     /// Linearization is a pure function of the region's contents, so this returns exactly what [`RegionRef::linearize`]
     /// would produce, and every content-preserving copy of one sealed region shares one artifact. That is what keeps a
@@ -1665,46 +1678,16 @@ where
         &self,
     ) -> Result<(Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize), DifferentiationError>
     {
-        let producer = match self.transform_cache().linearization_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Occupied(cached_linearization)) => {
-                // With debug assertions enabled, re-derive the linearization and compare it against the artifact
-                // about to be served. A difference means a `jvp` rule is not a deterministic structural function of
-                // its inputs, which makes every retained derivative unsound rather than merely stale.
-                #[cfg(debug_assertions)]
-                {
-                    let fresh_linearization = self.linearize()?;
-                    let (primal, tangent, residual_count) = &cached_linearization;
-                    assert!(
-                        primal.to_string() == fresh_linearization.primal().to_string()
-                            && tangent.to_string() == fresh_linearization.tangent().to_string()
-                            && *residual_count == fresh_linearization.residual_count(),
-                        "nondeterministic transform rule detected: re-deriving the linearization of this region \
-                         produced a different result than the artifact retained in its transform cache, but \
-                         `DifferentiableOperation::jvp` rules must be deterministic structural functions of their \
-                         inputs\n\ncached primal ({} residual(s)):\n{}\nderived primal \
-                         ({} residual(s)):\n{}\ncached tangent:\n{}\nderived tangent:\n{}",
-                        residual_count,
-                        primal,
-                        fresh_linearization.residual_count(),
-                        fresh_linearization.primal(),
-                        tangent,
-                        fresh_linearization.tangent(),
-                    );
-                }
-                return Ok(cached_linearization);
-            }
-            Ok(SpecializationCacheEntry::Vacant(producer)) => Some(producer),
-            Err(ReentrantSpecializationError) => None,
-        };
-
-        // Linearizes this region once and wraps the resulting sub-programs in shareable handles. A vacant producer
-        // publishes the result. Recursive production returns the same structural artifact without caching it.
-        let (primal, tangent, residual_count) = self.linearize()?.into_parts();
-        let linearization = (Arc::new(primal), Arc::new(tangent), residual_count);
-        match producer {
-            Some(producer) => Ok(producer.insert(linearization)),
-            None => Ok(linearization),
-        }
+        let artifact = (*self).transform::<LinearizationTransform, _, DifferentiationError>((), |region, _| {
+            let (primal, tangent, residual_count) = region.linearize()?.into_parts();
+            Ok(TransformArtifact::new(vec![Arc::new(primal), Arc::new(tangent)], residual_count))
+        })?;
+        let (programs, residual_count) = artifact.into_parts();
+        let mut programs = programs.into_iter();
+        let primal = programs.next().unwrap();
+        let tangent = programs.next().unwrap();
+        assert!(programs.next().is_none(), "linearization transform retained more than two programs");
+        Ok((primal, tangent, residual_count))
     }
 }
 
@@ -2196,7 +2179,7 @@ pub fn linearize<
 
 /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
 /// differentiation context. Use this function from a composite operation dispatcher when the operation is
-/// [`Region`](crate::Region)-free and every operand and result belongs to the same projectable member type `T`. It
+/// [`Region`]-free and every operand and result belongs to the same projectable member type `T`. It
 /// projects primal values and live tangent values into the member value family, carries structural-zero tangents as
 /// types without materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the
 /// resulting duals back into the composite value family.
@@ -2333,6 +2316,26 @@ fn residualize_zero_from_residual_values<C: Context<Operation: ResidualZeroProvi
     let mut outputs = context.residualize(operation, Vec::new(), operands.as_slice())?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
+}
+
+///[`Region`] [`Transform`] marker for retained fused Jacobian-Vector Product (JVP) [`Program`]s.
+pub(crate) struct JvpTransform;
+
+impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpTransform {
+    type Arguments = ();
+    type Artifact = TransformArtifact<V, O, ()>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 1;
+}
+
+/// [`Region`] [`Transform`] marker for retained linearized [`Program`]s.
+pub(crate) struct LinearizationTransform;
+
+impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for LinearizationTransform {
+    type Arguments = ();
+    type Artifact = TransformArtifact<V, O, usize>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 1;
 }
 
 #[cfg(test)]
@@ -2563,25 +2566,17 @@ mod tests {
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
-        match program.entry_region().transform_cache().jvp_program_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(unrelated);
-            }
-            _ => panic!("a freshly built region must have an empty fused forward-mode cache"),
-        }
+        program
+            .entry_region_ref()
+            .insert_transform_artifact_for_testing::<JvpTransform, _>((), TransformArtifact::new(vec![unrelated], ()));
 
         // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().jvp_shared()))
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.contains(
-                "nondeterministic transform rule detected: re-deriving the fused forward-mode program of this region \
-                 produced a different program than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
+        assert!(message.contains("FusedJvpTransform"), "{message}");
     }
 
     #[test]
@@ -2819,6 +2814,30 @@ mod tests {
         assert!(Arc::ptr_eq(&first.entry_region_ref().linearize_shared().unwrap().0, &retained.0));
     }
 
+    #[test]
+    fn test_region_linearization_does_not_retain_its_source_cache() {
+        // `to_program` deliberately preserves the source entry region's cache. Linearizing that materialized copy is
+        // therefore the strongest ownership-cycle attempt available through today's built-in transform API.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let source_cache = program.entry_region().transform_cache.downgrade();
+        let materialized = program.entry_region_ref().to_program();
+        assert!(program.entry_region().transform_cache.ptr_eq(&materialized.entry_region().transform_cache));
+        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared().unwrap();
+
+        drop(program);
+        drop(materialized);
+        assert!(!source_cache.is_alive());
+
+        // The returned programs can outlive the source cache because built-in linearization constructs a fresh entry
+        // and imports only strict descendants from the acyclic source arena; neither artifact embeds the source root.
+        drop(primal);
+        drop(tangent);
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
@@ -2837,25 +2856,18 @@ mod tests {
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
-        match program.entry_region().transform_cache().linearization_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert((unrelated.clone(), unrelated, 0));
-            }
-            _ => panic!("a freshly built region must have an empty linearization cache"),
-        }
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            (),
+            TransformArtifact::new(vec![unrelated.clone(), unrelated], 0),
+        );
 
         // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().linearize_shared()))
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.starts_with(
-                "nondeterministic transform rule detected: re-deriving the linearization of this region produced a \
-                 different result than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
+        assert!(message.contains("LinearizationTransform"), "{message}");
     }
 
     #[cfg(debug_assertions)]
@@ -2885,25 +2897,18 @@ mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule that
         // is not a structural function of its operation would leave behind.
-        let unrelated = other.entry_region_ref().linearize_shared().unwrap();
-        match program.entry_region().transform_cache().linearization_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(unrelated);
-            }
-            _ => panic!("a freshly built region must have an empty linearization cache"),
-        }
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared().unwrap();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            (),
+            TransformArtifact::new(vec![primal, tangent], residual_count),
+        );
 
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().linearize_shared()))
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.starts_with(
-                "nondeterministic transform rule detected: re-deriving the linearization of this region produced a \
-                 different result than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
+        assert!(message.contains("LinearizationTransform"), "{message}");
     }
 
     #[cfg(debug_assertions)]
@@ -2930,25 +2935,18 @@ mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule
         // that is not a structural function of the constants it embeds would leave behind.
-        let unrelated = other.entry_region_ref().linearize_shared().unwrap();
-        match program.entry_region().transform_cache().linearization_cache().try_entry(()) {
-            Ok(SpecializationCacheEntry::Vacant(producer)) => {
-                producer.insert(unrelated);
-            }
-            _ => panic!("a freshly built region must have an empty linearization cache"),
-        }
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared().unwrap();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            (),
+            TransformArtifact::new(vec![primal, tangent], residual_count),
+        );
 
         let panicked =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().linearize_shared()))
                 .unwrap_err();
         let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(
-            message.starts_with(
-                "nondeterministic transform rule detected: re-deriving the linearization of this region produced a \
-                 different result than the artifact retained in its transform cache",
-            ),
-            "{message}",
-        );
+        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
+        assert!(message.contains("LinearizationTransform"), "{message}");
     }
 
     #[test]
