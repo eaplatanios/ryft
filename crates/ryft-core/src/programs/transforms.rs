@@ -252,51 +252,46 @@ pub trait Transform<Source> {
 pub type TransformCache<T, Source> =
     SpecializationCache<<T as Transform<Source>>::Arguments, <T as Transform<Source>>::Artifact>;
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Structural programs and static metadata retained for one region-transform specialization.
-///
-/// Program order is transform-defined semantic data. Prefer a transform-specific wrapper when one exists rather than
+/// Structural [`Program`]s and static metadata retained for one [`Region`]-transform specialization. Program order is
+/// determined by the transform. Users should generally prefer a transform-specific wrapper when one exists rather than
 /// depending directly on a built-in marker's raw layout. `Metadata` must be small, owned, and independent of runtime
-/// invocation state; it must not retain the source region, source program, cache state, live context, backend buffer,
+/// invocation state. It must not retain the source region, source program, cache state, live context, backend buffer,
 /// or invocation-specific residual value.
 pub struct TransformArtifact<V: Typed + Parameter, O, Metadata> {
-    /// Transformed programs in transform-defined semantic order.
+    /// Transformed [`Program`]s in [`Transform`]-defined order.
     programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>,
 
-    /// Small static metadata interpreting `programs`.
+    /// [`Transform`]-specific metadata associated with this [`TransformArtifact`].
     metadata: Metadata,
 }
 
 impl<V: Typed + Parameter, O, Metadata> TransformArtifact<V, O, Metadata> {
-    /// Creates a transform artifact from programs in transform-defined semantic order and their metadata.
-    ///
-    /// # Parameters
-    ///   - `programs`: Transformed programs in the order documented by the transform marker.
-    ///   - `metadata`: Small static metadata needed to interpret the programs.
+    /// Creates a new [`TransformArtifact`].
     #[inline]
     pub fn new(programs: Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>, metadata: Metadata) -> Self {
         Self { programs, metadata }
     }
 
-    /// Returns the transformed programs in transform-defined semantic order.
+    /// Returns the transformed [`Program`]s in [`Transform`]-defined order.
     #[inline]
     pub fn programs(&self) -> &[Arc<Program<V, O, Vec<V>, Vec<V>>>] {
         &self.programs
     }
 
-    /// Returns the transform-specific metadata.
+    /// Returns the [`Transform`]-specific metadata associated with this [`TransformArtifact`].
     #[inline]
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 
-    /// Consumes this artifact and returns its transformed programs and metadata.
+    /// Consumes this [`TransformArtifact`] and returns its transformed [`Program`]s and metadata.
     #[inline]
     pub fn into_parts(self) -> (Vec<Arc<Program<V, O, Vec<V>, Vec<V>>>>, Metadata) {
         (self.programs, self.metadata)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Typed + Parameter, O, Metadata: Clone> Clone for TransformArtifact<V, O, Metadata> {
     #[inline]
