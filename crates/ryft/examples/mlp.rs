@@ -26,9 +26,10 @@
 use std::ops::{Add, Mul, Sub};
 
 use ryft::{
-    Array, Context, DifferentiableType, DifferentiationDual, DifferentiationTracer, Dot, DotDimensionNumbers,
-    LinearizationTracer, Parameter, Parameterized, PartialEvaluationValue, PartialTracer,
-    PartiallyEvaluatableOperation, ProgramError, Reduce, ReductionKind, Tanh, TracingContext, value_and_gradient,
+    Array, Context, DifferentiableType, DifferentiationDual, DifferentiationTracer, Domain, Dot, DotDimensionNumbers,
+    LinearizationTracer, OneOperation, Parameter, Parameterized, PartialEvaluationValue, PartialTracer,
+    PartiallyEvaluatableOperation, ProgramError, Reduce, ReductionKind, ReverseModeDifferentiate, Tanh, TracingContext,
+    Value, Zero, value_and_gradient,
 };
 
 /// Trainable affine layer of an [`Mlp`].
@@ -143,56 +144,54 @@ fn gradient_descent_step<A>(model: Mlp<A>, gradients: Mlp<A>, learning_rate: &A)
 where
     A: Clone + Parameter + Mul<Output = A> + Sub<Output = A>,
 {
-    if model.layers.len() != gradients.layers.len() {
-        return Err(ProgramError::InvalidArgument {
-            message: format!(
-                "gradient descent requires matching model and gradient layer counts, but got {} and {}",
-                model.layers.len(),
-                gradients.layers.len(),
-            ),
-        });
-    }
-    let layers = model
-        .layers
-        .into_iter()
-        .zip(gradients.layers)
-        .map(|(layer, gradient)| {
-            let bias = match (layer.bias, gradient.bias) {
-                (Some(bias), Some(gradient)) => Some(bias - gradient * learning_rate.clone()),
-                (None, None) => None,
-                _ => {
-                    return Err(ProgramError::InvalidArgument {
-                        message: "gradient descent requires matching model and gradient bias structures".to_string(),
-                    });
-                }
-            };
-            Ok(Linear { weights: layer.weights - gradient.weights * learning_rate.clone(), bias })
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Mlp { layers })
+    let structure = model.parameter_structure();
+    let gradients = Mlp::from_named_parameters(structure.clone(), gradients.into_named_parameters())?;
+    let updates = gradients.map_parameters(|gradient| gradient * learning_rate.clone())?;
+    Ok(Mlp::from_parameters(
+        structure,
+        model.into_parameters().zip(updates.into_parameters()).map(|(parameter, update)| parameter - update),
+    )?)
 }
 
-/// Trains an MLP using backend adapters for differentiation and host value materialization.
-fn train<A, Differentiate, ReadValues>(
+/// Trains an MLP using a backend adapter only for host value materialization.
+fn train<A, ReadValues>(
     backend: &str,
     mut model: Mlp<A>,
     inputs: A,
     targets: A,
     learning_rate: A,
     mean_scale: A,
-    mut differentiate: Differentiate,
     mut read_values: ReadValues,
 ) -> ExampleResult<()>
 where
-    A: Clone + Parameter + Add<Output = A> + Sub<Output = A> + Mul<Output = A> + Dot + Reduce + Tanh,
-    Differentiate: FnMut(&Mlp<A>, &A, &A, &A) -> ExampleResult<(A, Mlp<A>)>,
+    A: Clone
+        + Parameter
+        + Value<Type: DifferentiableType, ExecutionDomain: ReverseModeDifferentiate + Zero<A>>
+        + Add<Output = A>
+        + Sub<Output = A>
+        + Mul<Output = A>
+        + Dot
+        + Reduce
+        + Tanh,
+    <A::ExecutionDomain as Domain>::Operation: From<OneOperation<A::Type>>,
+    LinearizationTracer<A::ExecutionDomain>: Clone
+        + Parameter
+        + Add<Output = LinearizationTracer<A::ExecutionDomain>>
+        + Sub<Output = LinearizationTracer<A::ExecutionDomain>>
+        + Mul<Output = LinearizationTracer<A::ExecutionDomain>>
+        + Dot
+        + Reduce
+        + Tanh,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
     let mut initial_loss = None;
     let mut final_loss = 0.0;
 
     for step in 0..STEP_COUNT {
-        let (step_loss, gradients) = differentiate(&model, &inputs, &targets, &mean_scale)?;
+        let (step_loss, gradients) = value_and_gradient(
+            |model| loss_with_captured_arguments(&model, inputs.clone(), targets.clone(), mean_scale.clone()),
+            model.clone(),
+        )?;
         final_loss =
             read_values(&step_loss)?.first().copied().ok_or_else(|| format!("{backend} loss has no values"))?;
         initial_loss.get_or_insert(final_loss);
@@ -244,21 +243,7 @@ fn run_core() -> ExampleResult<()> {
     let targets = Array::matrix(4, 1, target_values());
     let learning_rate = Array::scalar(0.1_f32);
     let mean_scale = Array::scalar(0.25_f32);
-    train(
-        "core",
-        model,
-        inputs,
-        targets,
-        learning_rate,
-        mean_scale,
-        |model, inputs, targets, mean_scale| {
-            Ok(value_and_gradient(
-                |model| loss_with_captured_arguments(&model, inputs.clone(), targets.clone(), mean_scale.clone()),
-                model.clone(),
-            )?)
-        },
-        |array| Ok(array.to_f64s()),
-    )
+    train("core", model, inputs, targets, learning_rate, mean_scale, |array| Ok(array.to_f64s()))
 }
 
 #[cfg(feature = "xla")]
@@ -271,13 +256,10 @@ mod xla_backend {
     use ryft::pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform};
     use ryft::xla::{Array, FromPjrt};
     use ryft::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType,
-        ReverseModeDifferentiate, Shape, Sharding, Value,
+        ArrayType, DataType, Device, DeviceMesh, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
     };
 
-    use super::{
-        ExampleResult, Linear, Mlp, initial_layer_values, input_values, loss_with_captured_arguments, target_values,
-    };
+    use super::{ExampleResult, Linear, Mlp, initial_layer_values, input_values, target_values};
 
     /// Converts a slice of `f32` values into native-endian host bytes for PJRT transfer.
     fn values_to_bytes(values: &[f32]) -> Vec<u8> {
@@ -394,22 +376,9 @@ mod xla_backend {
         let targets = array(&client, &mesh, &[4, 1], &target_values())?;
         let learning_rate = array(&client, &mesh, &[], &[0.1])?;
         let mean_scale = array(&client, &mesh, &[], &[0.25])?;
-        super::train(
-            "xla",
-            model,
-            inputs,
-            targets,
-            learning_rate,
-            mean_scale,
-            |model, inputs, targets, mean_scale| {
-                let domain = model.first_parameter()?.execution_domain();
-                Ok(domain.value_and_gradient(
-                    |model| loss_with_captured_arguments(&model, inputs.clone(), targets.clone(), mean_scale.clone()),
-                    model.clone(),
-                )?)
-            },
-            |array| Ok(read_f32s(array)?.into_iter().map(f64::from).collect()),
-        )
+        super::train("xla", model, inputs, targets, learning_rate, mean_scale, |array| {
+            Ok(read_f32s(array)?.into_iter().map(f64::from).collect())
+        })
     }
 }
 
