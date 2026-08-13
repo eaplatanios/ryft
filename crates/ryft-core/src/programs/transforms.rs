@@ -536,6 +536,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// # use std::convert::Infallible;
     /// # use std::marker::PhantomData;
     /// # use std::sync::Arc;
+    /// #
     /// # use ryft_core::programs::transforms::{Transform, TransformArtifact};
     /// # use ryft_core::{Array, ArrayOperation, Operation, Region, RegionRef, Value};
     ///

@@ -224,96 +224,6 @@ impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
     }
 }
 
-/// Extension trait carrying the value-level _Hessian_ differentiation transforms on every [`Context`], mirroring
-/// how [`JacobianDifferentiate`](crate::JacobianDifferentiate) carries *Jacobian* differentiation transforms.
-///
-/// User-facing code should leverage this transform through [`DifferentiationBuilder`](crate::DifferentiationBuilder).
-/// Refer to [`hessian`](crate::DifferentiationBuilder::hessian) for information on the mathematical interpretation,
-/// block representation, forward-over-reverse cost model, complex-type contract, runtime-capture behavior and
-/// auxiliary-output semantics.
-pub trait HessianDifferentiate:
-    Context<
-        Type: DenseDifferentiableType<Self>
-                  + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<Self>>>,
-        Operation: PartiallyEvaluatableOperation<Self>
-                       + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<Self>>>
-                       + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                       + DifferentiableOperation<PartialEvaluationContext<Self>>
-                       + DifferentiableOperation<TracingContext<Self::Constant, Self::Operation>>
-                       + DifferentiableOperation<
-            PartialEvaluationContext<TracingContext<Self::Constant, Self::Operation>>,
-        > + DifferentiableOperation<
-            PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<Self>>>,
-        > + TransposableOperation<Self::Constant, Self::Operation>
-                       + ResidualZeroProvider<Self::Type>
-                       + From<AddOperation<Self::Type>>,
-    >
-{
-    /// Implements the forward-over-reverse-mode [`Hessian`] differentiation transform in this [`Context`].
-    /// Refer to [`hessian`](crate::DifferentiationBuilder::hessian) for the full transform semantics.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Function returning the differentiated output.
-    ///   - `primal`: Structured input values specifying the differentiation point.
-    ///   - `capture`: Structured runtime values held fixed through both derivative levels.
-    #[inline]
-    fn hessian<
-        F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>>,
-            Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>>,
-        ) -> Result<Output, ProgramError>,
-        Input: Parameterized<
-                Self::Value,
-                To<Self::Value> = Input,
-                To<Self::Type>: Clone,
-                To<LinearizationTracer<Self>>: Parameterized<
-                    LinearizationTracer<Self>,
-                    To<LinearizationTracer<Self>> = Input::To<LinearizationTracer<Self>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>> = Input::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>,
-                    >,
-                    To<Self::Type> = Input::To<Self::Type>,
-                >,
-                Family: ParameterizedFamily<Self::Type>
-                            + ParameterizedFamily<LinearizationTracer<Self>>
-                            + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>,
-                >,
-            >,
-        Capture: Parameterized<
-                Self::Value,
-                To<Self::Value> = Capture,
-                To<LinearizationTracer<Self>>: Parameterized<
-                    LinearizationTracer<Self>,
-                    To<LinearizationTracer<Self>> = Capture::To<LinearizationTracer<Self>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>> = Capture::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>,
-                    >,
-                >,
-                Family: ParameterizedFamily<LinearizationTracer<Self>>
-                            + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>,
-                >,
-            >,
-        Output: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<Self>>>,
-                To<Self::Type>: Clone,
-                Family: ParameterizedFamily<Self::Type> + ParameterizedFamily<LinearizationTracer<Self>>,
-            >,
-    >(
-        &self,
-        function: F,
-        primal: Input,
-        capture: Capture,
-    ) -> Result<Hessian<Self::Type, Self::Value, Input::To<Self::Type>, Output::To<Self::Type>>, DifferentiationError>
-    {
-        let (hessian, ()) =
-            hessian_in_context(self, |input, capture| Ok((function(input, capture)?, ())), primal, capture, false)?;
-        Ok(hessian)
-    }
-}
-
 /// Implements the forward-over-reverse differentiation transform used by
 /// [`hessian`](crate::DifferentiationBuilder::hessian) in an explicitly provided [`Context`].
 /// Refer to the documentation of that function for information on the mathematical interpretation,
@@ -338,7 +248,21 @@ pub(crate) fn hessian_in_context<C, Input, Capture, Output, Aux, F>(
     DifferentiationError,
 >
 where
-    C: HessianDifferentiate,
+    C: Context<
+            Type: DenseDifferentiableType<C>
+                      + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<C>>>,
+            Operation: PartiallyEvaluatableOperation<C>
+                           + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<C>>>
+                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<C>>
+                           + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+                           + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+                           + DifferentiableOperation<
+                PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>,
+            > + TransposableOperation<C::Constant, C::Operation>
+                           + ResidualZeroProvider<C::Type>
+                           + From<AddOperation<C::Type>>,
+        >,
     Input: Parameterized<
             C::Value,
             To<C::Value> = Input,
@@ -418,23 +342,6 @@ where
     Ok((Hessian::new(input_types, output_types, values)?, auxiliary))
 }
 
-impl<C> HessianDifferentiate for C
-where
-    C: Context,
-    C::Type: DenseDifferentiableType<C> + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<C>>>,
-    C::Operation: PartiallyEvaluatableOperation<C>
-        + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<C>>>
-        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>
-        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + DifferentiableOperation<PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>>
-        + TransposableOperation<C::Constant, C::Operation>
-        + ResidualZeroProvider<C::Type>
-        + From<AddOperation<C::Type>>,
-{
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -445,7 +352,7 @@ mod tests {
 
     use crate::arrays::DataType::{F32, F64};
     use crate::arrays::{Array, ArrayType, DataType, Dimension, Shape};
-    use crate::differentiation::differentiate_at;
+    use crate::differentiation::{Differentiate, differentiate_at};
     use crate::operations::Sin;
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::Typed;
@@ -600,10 +507,10 @@ mod tests {
         // Jacobian computes the third derivative f‴(x) = 6.
         let derivative = differentiate_at(Array::scalar(2.0))
             .jacobian_forward(|input| {
-                let hessian = input
-                    .context()
-                    .clone()
-                    .hessian(|value, ()| Ok(value.clone() * value.clone() * value), input, ())
+                let context = input.context().clone();
+                let hessian = context
+                    .differentiate_at(input)
+                    .hessian(|value| Ok(value.clone() * value.clone() * value))
                     .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
                 Ok(hessian.into_values().remove(0))
             })

@@ -59,12 +59,12 @@ pub use differentiation::{
     CotangentBatchingPolicy, DenseDifferentiableType, DerivativeTransform, DerivedContext, DifferentiableOperation,
     DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationParameterRole, DifferentiationTracer,
-    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock, HessianDifferentiate, Holomorphic,
-    InContext, Jacobian, JacobianBlock, JacobianDifferentiate, LinearCallOperation, LinearityMode, Linearization,
-    LinearizationTracer, MemberDifferentiableOperation, NoAuxiliary, NoCaptures, Pullback, Pushforward, RealValued,
-    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver,
-    UnaryElementwiseJvpOperands, WithAuxiliary, binary_elementwise_jvp, differentiate_at, jvp_projected_operation,
-    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
+    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock, Holomorphic, InContext, Jacobian,
+    JacobianBlock, LinearCallOperation, LinearityMode, Linearization, LinearizationTracer,
+    MemberDifferentiableOperation, NoAuxiliary, NoCaptures, Pullback, Pushforward, RealValued, ResidualZeroProvider,
+    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliary,
+    binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
+    transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
