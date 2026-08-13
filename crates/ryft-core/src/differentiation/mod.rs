@@ -603,16 +603,13 @@ impl<Input, CaptureState, AuxiliaryOutputState, LinearityState>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, ContextState>
 {
-    /// Evaluates `function` at the builder's active primals and propagates `tangents` through its Jacobian.
-    ///
+    /// Evaluates `function` at the builder's active primals and propagates `tangents` through its Jacobian function.
     /// For a function `y = f(x)`, this returns the dual `(y, ẏ) = (f(x), J_f(x) · ẋ)`, where `ẋ` is the supplied
     /// tangent and `J_f(x) = ∂f/∂x`. This is direct forward-mode differentiation, analogous to
-    /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html): the closure runs once on
+    /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html). The closure runs once on
     /// [`DifferentiationTracer`] duals, and every operation propagates its primal and tangent together through its
     /// [`DifferentiableOperation`] rule.
     ///
@@ -623,16 +620,12 @@ impl<Input, ContextState>
     /// preserving runtime geometry for dynamically shaped values. Nested transforms differentiate through these duals
     /// and therefore compose forward, reverse-over-forward, and higher-order differentiation.
     ///
-    /// The closure executes exactly as written: the transform does not trim dead code, and observable effects fire as
-    /// the closure runs.
-    ///
-    /// The active primal tree must contain at least one leaf; otherwise this returns
-    /// [`DifferentiationError::EmptyInput`].
-    ///
     /// # Parameters
     ///
     ///   - `tangents`: Tangent tree matching the structure of the builder's active primals.
-    ///   - `function`: Function whose primal output and directional derivative are evaluated.
+    ///   - `function`: Function whose primal output and directional derivative are evaluated. The closure executes
+    ///     exactly as written. The transform does not trim dead code, and observable effects fire as the closure runs.
+    #[inline]
     pub fn jvp<V, Output, F>(
         self,
         tangents: Input::To<V>,
@@ -640,16 +633,6 @@ impl<Input, ContextState>
     ) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextState: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
-                Type = V::Type,
-                Value = V,
-                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + ResidualZeroProvider<V::Type>,
-            >,
-        F: FnOnce(
-            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<
@@ -660,6 +643,16 @@ impl<Input, ContextState>
         Output: Parameterized<
                 DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
+            >,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        F: FnOnce(
+            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ) -> Result<Output, ProgramError>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
+                               + ResidualZeroProvider<V::Type>,
             >,
     {
         DifferentiationBuilder {
@@ -672,28 +665,24 @@ impl<Input, ContextState>
         .jvp(tangents, |input, ()| function(input))
     }
 
-    /// Linearizes `function` at the builder's active primals, returning its value and a reusable [`Pushforward`].
-    ///
-    /// For `y = f(x)`, this returns `y` together with the linear map `ẋ ↦ ẏ = J_f(x) · ẋ` at the fixed
-    /// linearization point `x`, analogous to
-    /// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html).
-    /// Unlike [`jvp`](Self::jvp), which evaluates one `(primal, tangent)` pair, linearization performs the nonlinear
-    /// primal work once. The returned [`Pushforward`] can then apply the same Jacobian to any number of tangent trees
-    /// without retracing or redifferentiating `function`.
+    /// Linearizes `function` at the builder's active primals, returning its value and a reusable [`Pushforward`]. For
+    /// `y = f(x)`, this returns `y` together with the linear map `ẋ ↦ ẏ = J_f(x) · ẋ` at the fixed linearization point
+    /// `x`, analogous to [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html). Unlike
+    /// [`jvp`](Self::jvp), which evaluates one `(primal, tangent)` pair, linearization performs the nonlinear primal
+    /// work once. The returned [`Pushforward`] can then apply the same Jacobian to any number of tangent trees without
+    /// retracing or redifferentiating `function`.
     ///
     /// Internally, the closure runs on [`LinearizationTracer`] duals over a [`PartialEvaluationContext`]. Primal halves
     /// are known and execute in the selected context, while tangent halves are unknown and residualize into a linear
-    /// program `(ẋ, r) ↦ ẏ`. The residuals `r` contain the values from the linearization point needed by that
-    /// program, and the returned pushforward closes over them. Under an eager context, concrete primal values may drive
-    /// host control flow and only the taken path is linearized; under a staging context, primal work composes into the
+    /// program `(ẋ, r) ↦ ẏ`. The residuals `r` contain the values from the linearization point needed by that program
+    /// and the returned pushforward closes over them. Under an eager context, concrete primal values may drive host
+    /// control flow and only the taken path is linearized; under a staging context, primal work composes into the
     /// enclosing trace.
-    ///
-    /// The active primal tree must contain at least one leaf; otherwise this returns
-    /// [`DifferentiationError::EmptyInput`].
     ///
     /// # Parameters
     ///
     ///   - `function`: Function to evaluate and linearize at the builder's active primals.
+    #[inline]
     pub fn linearize<V, Output, F>(
         self,
         function: F,
@@ -706,7 +695,21 @@ impl<Input, ContextState>
     >
     where
         V: Value<Type: DifferentiableType>,
+        Input: Parameterized<
+                V,
+                To<V> = Input,
+                Family: ParameterizedFamily<
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                >,
+            >,
+        Output: Parameterized<
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                Family: ParameterizedFamily<V>,
+            >,
         ContextState: DifferentiationBuilderContext<V, Input>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ) -> Result<Output, ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -719,20 +722,6 @@ impl<Input, ContextState>
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
-        F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<Output, ProgramError>,
-        Input: Parameterized<
-                V,
-                To<V> = Input,
-                Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                >,
-            >,
-        Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                Family: ParameterizedFamily<V>,
-            >,
     {
         DifferentiationBuilder {
             primals: self.primals,
@@ -744,24 +733,21 @@ impl<Input, ContextState>
         .linearize(|input, ()| function(input))
     }
 
-    /// Reverse-mode-differentiates `function`, returning its value and a reusable [`Pullback`].
+    /// Differentiates `function` using reverse-mode differentiation, returning its value and a reusable [`Pullback`].
+    /// For `y = f(x)`, this returns `y` together with the transposed linear map `ȳ ↦ x̄ = J_f(x)ᵀ · ȳ`, analogous to
+    /// [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html). Applying the pullback maps an output
+    /// cotangent tree to the corresponding input cotangent tree at the builder's fixed primal point.
     ///
-    /// For `y = f(x)`, this returns `y` together with the transposed linear map `ȳ ↦ x̄ = J_f(x)ᵀ · ȳ`,
-    /// analogous to [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html). Applying the pullback maps
-    /// an output cotangent tree to the corresponding input cotangent tree at the builder's fixed primal point.
-    ///
-    /// Reverse mode first performs the partial-evaluation-backed linearization described by
-    /// [`linearize`](Self::linearize), then transposes its linear program by applying [`TransposableOperation`] rules
-    /// in reverse dataflow order. The returned pullback closes that transposed program over the saved linearization
-    /// residuals, so [`Pullback::apply`] handles residual arguments and reconstructs the structured input cotangents;
-    /// callers only provide output cotangents.
-    ///
-    /// The active primal tree must contain at least one leaf; otherwise this returns
-    /// [`DifferentiationError::EmptyInput`].
+    /// Reverse mode differentiation first performs the partial-evaluation-backed linearization described by
+    /// [`linearize`](Self::linearize) and then transposes its linear program by applying [`TransposableOperation`]
+    /// rules in reverse dataflow order. The returned pullback closes that transposed program over the saved
+    /// linearization residuals, so [`Pullback::apply`] handles residual arguments and reconstructs the structured
+    /// input cotangents. Callers only provide output cotangents.
     ///
     /// # Parameters
     ///
     ///   - `function`: Function to evaluate and reverse-mode-differentiate at the builder's active primals.
+    #[inline]
     pub fn vjp<V, Output, F>(
         self,
         function: F,
@@ -771,11 +757,6 @@ impl<Input, ContextState>
     >
     where
         V: Value<Type: DifferentiableType>,
-        ContextState: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate,
-        F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
@@ -787,6 +768,11 @@ impl<Input, ContextState>
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ) -> Result<Output, ProgramError>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate,
     {
         DifferentiationBuilder {
             primals: self.primals,
@@ -798,6 +784,8 @@ impl<Input, ContextState>
         .vjp(|input, ()| function(input))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, LinearityState, ContextState>
