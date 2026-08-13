@@ -31,7 +31,7 @@
 //!   - [`DifferentiationBuilder::hessian`] differentiates a scalar-output gradient and returns the resulting structured
 //!     [`Hessian`] block matrix.
 //!
-//! [`DifferentiationBuilder::with_auxiliary`] preserves non-differentiated auxiliary output, while
+//! [`DifferentiationBuilder::with_auxiliary_output`] preserves non-differentiated auxiliary output, while
 //! [`DifferentiationBuilder::holomorphic`] explicitly opts into the complex holomorphic contract.
 //! Furthermore, [`DifferentiationBuilder::with_captures`] accepts dynamic runtime values that affect the primal
 //! computation while only the first closure argument is differentiated. Captures are useful for model training,
@@ -45,7 +45,7 @@
 //! type nor have the same number of leaves. A transform replaces each dynamic leaf with the tracer type required by
 //! that transform, invokes the closure with the reparameterized trees, and reconstructs the same public tree shapes
 //! with runtime values. Non-parameter metadata in a derived type is preserved unchanged.
-//! [`DifferentiationBuilder::with_auxiliary`] applies this treatment to the second member of a closure result
+//! [`DifferentiationBuilder::with_auxiliary_output`] applies this treatment to the second member of a closure result
 //! `(differentiated_output, auxiliary_output)`, returning the entire auxiliary tree without seeding or transposing it.
 //!
 //! The trees are structurally polymorphic but homogeneous in their dynamic leaf family meaning that one builder
@@ -394,11 +394,11 @@ pub struct WithCaptures<Capture>(Capture);
 
 /// Type state indicating that a [`DifferentiationBuilder`] differentiates only its primary output.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct WithoutAuxiliary;
+pub struct WithoutAuxiliaryOutput;
 
 /// Type state indicating that a [`DifferentiationBuilder`] returns a non-differentiated auxiliary output.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct WithAuxiliary;
+pub struct WithAuxiliaryOutput;
 
 /// Type state selecting ordinary real-valued differentiation semantics.
 #[derive(Copy, Clone, Debug, Default)]
@@ -477,7 +477,7 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///     as ordinary values. If a capture is incompatible with the selected context, the operation or execution boundary
 ///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
 ///     fail preflight validation.
-///   - [`with_auxiliary`](Self::with_auxiliary) declares that the closure being differentiated returns
+///   - [`with_auxiliary_output`](Self::with_auxiliary_output) declares that the closure being differentiated returns
 ///     `(output, auxiliary)`. `auxiliary` may be any third, independently shaped [`Parameterized`] tree and is
 ///     reconstructed with runtime leaves without being differentiated.
 ///   - [`holomorphic`](Self::holomorphic) promises that the differentiated function is _holomorphic_ (i.e., that it
@@ -496,7 +496,7 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 pub struct DifferentiationBuilder<
     Input,
     CaptureState = WithoutCapture,
-    AuxiliaryState = WithoutAuxiliary,
+    AuxiliaryOutputState = WithoutAuxiliaryOutput,
     LinearityState = RealLinearity,
     ContextState = WithoutContext,
 > {
@@ -507,7 +507,7 @@ pub struct DifferentiationBuilder<
     captures: CaptureState,
 
     /// Auxiliary-output type state.
-    auxiliary: AuxiliaryState,
+    auxiliary: AuxiliaryOutputState,
 
     /// Linearity type state.
     linearity: LinearityState,
@@ -516,8 +516,8 @@ pub struct DifferentiationBuilder<
     context: ContextState,
 }
 
-impl<Input, AuxiliaryState, LinearityState, ContextState>
-    DifferentiationBuilder<Input, WithoutCapture, AuxiliaryState, LinearityState, ContextState>
+impl<Input, AuxiliaryOutputState, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, AuxiliaryOutputState, LinearityState, ContextState>
 {
     /// Supplies dynamic runtime values that affect primal evaluation without becoming differentiation variables.
     /// `captures` may be any [`Parameterized`] tree whose leaves use the same runtime value family as the active input.
@@ -528,7 +528,7 @@ impl<Input, AuxiliaryState, LinearityState, ContextState>
     pub fn with_captures<Capture>(
         self,
         captures: Capture,
-    ) -> DifferentiationBuilder<Input, WithCaptures<Capture>, AuxiliaryState, LinearityState, ContextState> {
+    ) -> DifferentiationBuilder<Input, WithCaptures<Capture>, AuxiliaryOutputState, LinearityState, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(captures),
@@ -539,46 +539,40 @@ impl<Input, AuxiliaryState, LinearityState, ContextState>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, CaptureState, LinearityState, ContextState>
-    DifferentiationBuilder<Input, CaptureState, WithoutAuxiliary, LinearityState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
     /// Declares that the transformed closure returns `(differentiated_output, auxiliary_output)`. The auxiliary output
     /// may be any [`Parameterized`] tree. Its leaves are traced during primal evaluation and reconstructed as runtime
     /// values in the terminal result, but they are excluded from derivative seeding and transposition. Its structure is
     /// independent of both the active input and any captures.
     #[inline]
-    pub fn with_auxiliary(
+    pub fn with_auxiliary_output(
         self,
-    ) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliary, LinearityState, ContextState> {
+    ) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliaryOutput, LinearityState, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
-            auxiliary: WithAuxiliary,
+            auxiliary: WithAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<Input, CaptureState, AuxiliaryState, ContextState>
-    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, RealLinearity, ContextState>
+impl<Input, CaptureState, AuxiliaryOutputState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, RealLinearity, ContextState>
 {
-    /// Treats the differentiated computation as complex linear under a holomorphy promise.
-    ///
-    /// Calling this function promises that the differentiated function is holomorphic. Ryft validates that active
+    /// Promises that the differentiated function is _holomorphic_. The differentiation transform validates that active
     /// inputs and differentiated outputs are complex, but it cannot prove that the function satisfies the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations). Runtime captures are
     /// exempt because they are fixed coefficients rather than coordinates of the differentiated map. Holomorphic mode
-    /// is available for Jacobian, Hessian, and scalar-gradient terminals; JVP, linearization, and VJP do not define a
-    /// separate holomorphic validation contract.
+    /// is available for Jacobian, Hessian, and scalar-gradient terminals. Linearization, Jacobian-Vector Products
+    /// (JVPs), and Vector-Jacobian Products (VJPs) do not define a separate holomorphic validation contract.
     #[inline]
     pub fn holomorphic(
         self,
-    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, HolomorphicLinearity, ContextState> {
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, HolomorphicLinearity, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
@@ -589,8 +583,10 @@ impl<Input, CaptureState, AuxiliaryState, ContextState>
     }
 }
 
-impl<Input, CaptureState, AuxiliaryState, LinearityState>
-    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithoutContext>
+// TODO(eaplatanios): Review from here onwards.
+
+impl<Input, CaptureState, AuxiliaryOutputState, LinearityState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, LinearityState, WithoutContext>
 {
     /// Selects the context in which the differentiation transform executes.
     ///
@@ -599,7 +595,7 @@ impl<Input, CaptureState, AuxiliaryState, LinearityState>
     pub fn in_context<C: Context>(
         self,
         context: &C,
-    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithContext<C>> {
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, LinearityState, WithContext<C>> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
@@ -610,7 +606,9 @@ impl<Input, CaptureState, AuxiliaryState, LinearityState>
     }
 }
 
-impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, RealLinearity, ContextState> {
+impl<Input, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, ContextState>
+{
     /// Evaluates `function` at the builder's active primals and propagates `tangents` through its Jacobian.
     ///
     /// For a function `y = f(x)`, this returns the dual `(y, ẏ) = (f(x), J_f(x) · ẋ)`, where `ẋ` is the supplied
@@ -668,7 +666,7 @@ impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutA
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -740,7 +738,7 @@ impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutA
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -794,7 +792,7 @@ impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutA
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -803,7 +801,7 @@ impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutA
 }
 
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
-    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
     /// Computes both the scalar value of `function` and its reverse-mode gradient.
     ///
@@ -844,7 +842,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -950,7 +948,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1024,7 +1022,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1112,7 +1110,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithoutAuxiliary,
+            auxiliary: WithoutAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1121,7 +1119,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
 }
 
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
-    DifferentiationBuilder<Input, WithoutCapture, WithAuxiliary, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithAuxiliaryOutput, LinearityState, ContextState>
 {
     /// Computes a scalar value, its reverse-mode gradient, and non-differentiated auxiliary output.
     ///
@@ -1183,7 +1181,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithAuxiliary,
+            auxiliary: WithAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1297,7 +1295,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithAuxiliary,
+            auxiliary: WithAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1363,7 +1361,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithAuxiliary,
+            auxiliary: WithAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1441,7 +1439,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(()),
-            auxiliary: WithAuxiliary,
+            auxiliary: WithAuxiliaryOutput,
             linearity: self.linearity,
             context: self.context,
         }
@@ -1450,7 +1448,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
 }
 
 impl<Input, Capture, ContextState>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, RealLinearity, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliaryOutput, RealLinearity, ContextState>
 {
     /// Evaluates `function` and its Jacobian-vector product while holding runtime captures fixed.
     ///
@@ -1624,7 +1622,7 @@ impl<Input, Capture, ContextState>
 }
 
 impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
     /// Materializes the complete forward-mode [`Jacobian`] with respect to the active primals only.
     ///
@@ -1951,7 +1949,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
 }
 
 impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithAuxiliary, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithAuxiliaryOutput, LinearityState, ContextState>
 {
     /// Materializes a forward-mode [`Jacobian`] over active primals and returns auxiliary output with captures fixed.
     ///
@@ -2332,7 +2330,7 @@ pub trait Differentiate: Context<Type: DifferentiableType> {
     fn differentiate_at<Input>(
         &self,
         primals: Input,
-    ) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, RealLinearity, WithContext<Self>> {
+    ) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, WithContext<Self>> {
         differentiate_at(primals).in_context(self)
     }
 }
@@ -2389,7 +2387,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///
 /// let ((value, auxiliary), gradient): ((Array, Auxiliary<Array>), Array) = differentiate_at(Array::scalar(2.0))
 ///     .with_captures((Array::scalar(3.0), vec![Array::scalar(4.0)]))
-///     .with_auxiliary()
+///     .with_auxiliary_output()
 ///     .value_and_gradient(evaluate)?;
 /// assert_eq!(value.to_f64s(), vec![10.0]);
 /// assert_eq!(auxiliary.prediction.to_f64s(), vec![10.0]);
@@ -2448,11 +2446,11 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 #[inline]
 pub fn differentiate_at<Input>(
     primals: Input,
-) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, RealLinearity, WithoutContext> {
+) -> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, WithoutContext> {
     DifferentiationBuilder {
         primals,
         captures: WithoutCapture,
-        auxiliary: WithoutAuxiliary,
+        auxiliary: WithoutAuxiliaryOutput,
         linearity: RealLinearity,
         context: WithoutContext,
     }
@@ -2719,7 +2717,7 @@ mod tests {
         // Auxiliary output is reconstructed from primal values and excluded from both Jacobian directions.
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_auxiliary()
+            .with_auxiliary_output()
             .jacobian_reverse(multiply_with_captured_auxiliary)
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
@@ -2727,7 +2725,7 @@ mod tests {
 
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_auxiliary()
+            .with_auxiliary_output()
             .jacobian_forward(multiply_with_captured_auxiliary)
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
@@ -2736,7 +2734,7 @@ mod tests {
         // Hessian auxiliary output follows the same nondifferentiated contract.
         let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_auxiliary()
+            .with_auxiliary_output()
             .hessian(scaled_square_with_auxiliary)
             .unwrap();
         assert_eq!(hessian_with_auxiliary.values()[0].to_f64s(), vec![6.0]);
@@ -3042,7 +3040,7 @@ mod tests {
         let ((value, auxiliary), gradient): ((Array, StructuredAuxiliary<Array>), Array) =
             differentiate_at(Array::scalar(2.0))
                 .with_captures((captures, Array::scalar(1.0)))
-                .with_auxiliary()
+                .with_auxiliary_output()
                 .value_and_gradient(structured_capture_function)
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
@@ -3057,12 +3055,12 @@ mod tests {
     fn test_differentiation_builder_modifier_order_is_orthogonal() {
         let first: (Array, Array) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_auxiliary()
+            .with_auxiliary_output()
             .gradient(multiply_with_captured_auxiliary)
             .unwrap();
         let second: (Array, Array) = differentiate_at(Array::scalar(2.0))
             // This reverse order is intentional because this test verifies that these transitions are orthogonal.
-            .with_auxiliary()
+            .with_auxiliary_output()
             .with_captures(Array::scalar(3.0))
             .gradient(multiply_with_captured_auxiliary)
             .unwrap();
