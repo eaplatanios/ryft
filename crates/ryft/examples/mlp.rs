@@ -111,24 +111,9 @@ fn train<A, ReadValues>(
     mut read_values: ReadValues,
 ) -> ExampleResult<()>
 where
-    A: Clone
-        + Parameter
-        + Value<Type: DifferentiableType, ExecutionDomain: ReverseModeDifferentiate + Zero<A>>
-        + Add<Output = A>
-        + Sub<Output = A>
-        + Mul<Output = A>
-        + Dot
-        + Reduce
-        + Tanh,
+    A: ArrayOperations + Value<Type: DifferentiableType, ExecutionDomain: ReverseModeDifferentiate + Zero<A>>,
     <A::ExecutionDomain as Domain>::Operation: From<OneOperation<A::Type>>,
-    LinearizationTracer<A::ExecutionDomain>: Clone
-        + Parameter
-        + Add<Output = LinearizationTracer<A::ExecutionDomain>>
-        + Sub<Output = LinearizationTracer<A::ExecutionDomain>>
-        + Mul<Output = LinearizationTracer<A::ExecutionDomain>>
-        + Dot
-        + Reduce
-        + Tanh,
+    LinearizationTracer<A::ExecutionDomain>: ArrayOperations,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
     let mut initial_loss = None;

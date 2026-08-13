@@ -1150,15 +1150,19 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, ConditionOperation,
-        CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver, RegionInterface, RegionRef,
-        RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
-        StagingContext, TracingContext, TranspositionDriver, TypeError, Typed, ValueProjection, WhileOperation,
-        ZeroOperation,
+        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
+        CaptureReference, ConditionOperation, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType,
+        DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis,
+        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver,
+        RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
+        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, Typed,
+        ValueProjection, WhileOperation, ZeroOperation,
     };
+
+    use crate::Array;
+    use crate::experimental::domains::XlaTracer;
+    use crate::experimental::shard_map::ShardMapTracer;
 
     use super::{
         CaptureConstant, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
@@ -1196,6 +1200,20 @@ mod tests {
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    #[test]
+    fn test_xla_operation_values_satisfy_the_core_capability_bundles() {
+        // Each bundle is satisfied exactly when every one of its member capabilities is, so instantiating these
+        // functions is a compile-time assertion that the XLA value families expose the complete value-level surface
+        // of the operation families they pair with.
+        fn requires_array_operations<V: ArrayOperations>() {}
+        fn requires_array_ir_operations<V: ArrayIrOperations>() {}
+
+        requires_array_operations::<Array<'static>>();
+        requires_array_operations::<ShardMapTracer>();
+        requires_array_ir_operations::<XlaTracer<'static>>();
+        requires_array_ir_operations::<Tracer<TracingContext<XlaConstant, XlaOperation>>>();
     }
 
     #[test]

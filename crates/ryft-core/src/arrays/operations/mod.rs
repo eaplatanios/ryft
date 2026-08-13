@@ -7,6 +7,8 @@
 
 // TODO(eaplatanios): Review this module.
 
+use std::ops::{Add as StandardAdd, Div as StandardDiv, Mul as StandardMul, Neg as StandardNeg, Sub as StandardSub};
+
 use ryft_macros::Operation;
 
 use crate::arrays::arrays::Array;
@@ -21,29 +23,37 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     LinearCallOperation, MemberDifferentiableOperation, ResidualZeroProvider, jvp_projected_operation,
 };
-use crate::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
+use crate::operations::attention::{
+    DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+};
 use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
-use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
+use crate::operations::complex::{
+    Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
+};
 use crate::operations::custom_call::CustomCallOperation;
 use crate::operations::random::RngBitGeneratorOperation;
-use crate::operations::sort::SortOperation;
+use crate::operations::sort::{Sort, SortOperation};
 use crate::operations::{
-    AbsOperation, AddOperation, AndOperation, Atan2Operation, BroadcastOperation, CeilOperation, CollectiveOperation,
-    CompareOperation, ConcatenateOperation, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
-    CoordinateBasisOperation, CosOperation, DimensionAddOperation, DimensionDivFloorOperation,
+    Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation,
+    Ceil, CeilOperation, CollectiveOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation,
+    ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, CoordinateBasisOperation,
+    Cos, CosOperation, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar,
     DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
     DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSaturatingSubOperation,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotOperation,
-    DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation,
-    LogOperation, LogisticOperation, MaxOperation, MinOperation, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, OrOperation, PadOperation, PowOperation, PrintOperation, ReduceOperation,
-    RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
-    TransferToMemoryOperation, TransposeOperation, UpdateSliceOperation, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation,
+    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
+    DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log,
+    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
+    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, Pow,
+    PowOperation, PrintOperation, Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation,
+    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
+    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
+    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
+    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::parameters::Parameter;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, Type, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
@@ -161,6 +171,95 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     CustomJvp(CustomJvpOperation<ArrayType>),
     CustomVjp(CustomVjpOperation<ArrayType>),
     LinearCall(LinearCallOperation<ArrayType>),
+}
+
+/// Value-level capability bundle paired with the [`ArrayOperation`] family.
+///
+/// [`ArrayOperations`] collects, as supertraits, the value-level capabilities through which a value materializes the
+/// [`ArrayOperation`] variants, so that generic array code states one bound instead of re-listing every capability it
+/// happens to use. It is a pure bundle: the blanket implementation below covers every value that satisfies the same
+/// supertrait list, so this trait must never be implemented manually.
+///
+/// # Membership
+///
+/// Membership is limited to *value-level capabilities of the family*: traits whose methods take and return values of
+/// the implementing type and stage or execute one [`ArrayOperation`] variant. Everything that a variant needs in
+/// order to exist, but that a value does not itself perform, stays out:
+///
+///   - type-semantics plumbing such as [`WhileTypeSemantics`](crate::operations::control_flow::WhileTypeSemantics),
+///     [`ScanTypeSemantics`](crate::operations::control_flow::scan::ScanTypeSemantics),
+///     [`ConditionTypeSemantics`](crate::operations::control_flow::condition::ConditionTypeSemantics), and
+///     [`WhilePredicate`](crate::operations::control_flow::WhilePredicate);
+///   - staging machinery such as [`Constant`](crate::operations::constants::Constant) and
+///     [`Tag`](crate::operations::tag::Tag), and the context-side constructors [`Zero`],
+///     [`One`](crate::operations::constants::One), [`Fill`](crate::operations::constants::Fill), and
+///     [`Iota`](crate::operations::constants::Iota), whose value-driven counterparts [`ZeroLike`] and [`OneLike`] are
+///     members instead;
+///   - effects and debugging such as [`Print`](crate::operations::debugging::Print), and the foreign-kernel escape
+///     hatch [`CustomCall`](crate::operations::custom_call::CustomCall);
+///   - first-class dimension plumbing, which belongs to [`ArrayIrOperations`] rather than to the homogeneous array
+///     family;
+///   - random bit generation, whose [`RngBitGenerator`](crate::operations::random::RngBitGenerator) contract threads
+///     explicit algorithm state rather than shaping a value-to-value capability;
+///   - the collectives ([`AllGather`](crate::operations::collectives::AllGather),
+///     [`AllToAll`](crate::operations::collectives::AllToAll),
+///     [`PSumScatter`](crate::operations::collectives::PSumScatter),
+///     [`PSwapAxes`](crate::operations::collectives::PSwapAxes),
+///     [`Pshuffle`](crate::operations::collectives::Pshuffle), [`Reshard`](crate::operations::sharding::Reshard),
+///     [`ConstrainSharding`](crate::operations::sharding::ConstrainSharding),
+///     [`Collective`](crate::operations::collectives::Collective), and
+///     [`TransferToMemory`](crate::operations::memory::TransferToMemory)), so that single-device generic code never
+///     carries sharded-programming obligations; and
+///   - differentiation plumbing such as [`ReverseModeDifferentiate`](crate::differentiation::ReverseModeDifferentiate)
+///     and the operation-family `From` bounds that transforms require of a domain.
+///
+/// Derived conveniences that a member already implies are also left out, because bounding them would only duplicate
+/// solver work: [`TopK`](crate::operations::sort::TopK), [`ArgMax`](crate::operations::sort::ArgMax), and
+/// [`ArgMin`](crate::operations::sort::ArgMin) all follow from [`Sort`], [`Slice`], and [`Reshape`], and
+/// [`DotOps`](crate::operations::math::DotOps) follows from [`Dot`] and [`Transpose`].
+///
+/// # Tracers
+///
+/// This bundle deliberately does *not* imply anything about the tracers derived from an implementing value. Generic
+/// code that traces (for example, code that differentiates) states the tracer requirement as its own separate bound,
+/// such as `LinearizationTracer<A::ExecutionDomain>: ArrayOperations`. Making the bundle recursively imply its own
+/// tracer bounds would make the trait solver chase an unbounded tower of nested tracer types.
+pub trait ArrayOperations:
+    Clone + Parameter + Typed<Type = ArrayType>
+    // Arithmetic, in both the panicking operator sugar and the fallible capability forms.
+    + StandardNeg<Output = Self> + StandardAdd<Output = Self> + StandardSub<Output = Self>
+    + StandardMul<Output = Self> + StandardDiv<Output = Self>
+    + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign
+    // Elementwise math and logic.
+    + Sin + Cos + Atan2 + Exp + Log + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil + Round
+    + Not + And + Or + Xor
+    // Complex numbers.
+    + Complex + Conjugate + Real + Imaginary
+    // Comparison and selection.
+    + Compare + Select
+    // Shape and layout manipulation.
+    + Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
+    + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
+    // Linear algebra and reduction.
+    + Dot + ScaledDot + DotProductAttention + Reduce
+    // Constants and differentiation barriers.
+    + ZeroLike + OneLike + StopGradient
+{
+}
+
+// The predicates below restate the supertrait list of `ArrayOperations`, one predicate per category, so that the
+// bundle is satisfied exactly when every one of its member capabilities is.
+impl<V> ArrayOperations for V
+where
+    V: Clone + Parameter + Typed<Type = ArrayType>,
+    V: StandardNeg<Output = V> + StandardAdd<Output = V> + StandardSub<Output = V> + StandardMul<Output = V>,
+    V: StandardDiv<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
+    V: Sin + Cos + Atan2 + Exp + Log + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil + Round,
+    V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
+    V: Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
+    V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
+    V: Dot + ScaledDot + DotProductAttention + Reduce + ZeroLike + OneLike + StopGradient,
+{
 }
 
 /// [`Operation`](crate::Operation) family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
@@ -306,6 +405,44 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Composite rematerialized call whose primal, forward, backward, and tangent regions may carry arrays and
     /// first-class dimensions.
     Rematerialize(RematerializeOperation<ArrayIrType>),
+}
+
+/// Value-level capability bundle paired with the [`ArrayIrOperation`] family.
+///
+/// [`ArrayIrOperations`] is to [`ArrayIrOperation`] what [`ArrayOperations`] is to [`ArrayOperation`]: a pure bundle
+/// of the value-level capabilities that the family's variants expose, blanket-implemented for every value that
+/// satisfies the same supertrait list and therefore never implemented manually. It obeys the same membership rule,
+/// documented on [`ArrayOperations`], but its inventory is deliberately *not* the array inventory pinned to
+/// [`ArrayIrType`], because the composite universe reaches the two surfaces differently:
+///
+///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
+///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
+///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], and [`DynamicBroadcast`].
+///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
+///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
+///     them through their [`ValueProjection`] view onto [`ArrayType`], whose projected value satisfies
+///     [`ArrayOperations`].
+///     Bounding them here would demand `From<AddOperation<ArrayIrType>>`-style conversions that the composite family
+///     intentionally does not provide.
+///
+/// As with [`ArrayOperations`], this bundle never implies anything about the tracers derived from an implementing
+/// value; a tracer requirement stays a separate explicit bound.
+pub trait ArrayIrOperations:
+    Clone + Parameter + Typed<Type = ArrayIrType>
+    // Comparison of first-class dimensions, producing ordinary Boolean array data.
+    + Compare
+    // First-class dimensions.
+    + DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast
+{
+}
+
+// The predicates below restate the supertrait list of `ArrayIrOperations`, so that the bundle is satisfied exactly
+// when every one of its member capabilities is.
+impl<V> ArrayIrOperations for V
+where
+    V: Clone + Parameter + Typed<Type = ArrayIrType> + Compare,
+    V: DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast,
+{
 }
 
 /// [`TracingContext`] over the array universe, pairing [`ArrayType`] types and [`Array`] staged constants with the
@@ -467,7 +604,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::batching::{ArrayBatching, ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
@@ -507,6 +644,27 @@ mod tests {
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
+
+    #[test]
+    fn test_array_operations_holds_for_every_canonical_array_value() {
+        // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
+        // compile-time assertion that the listed value families implement the complete `ArrayOperation` surface.
+        fn requires_array_operations<V: ArrayOperations>() {}
+
+        requires_array_operations::<Array>();
+        requires_array_operations::<Tracer<ArrayTracingContext>>();
+        requires_array_operations::<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>();
+        requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>>();
+    }
+
+    #[test]
+    fn test_array_ir_operations_holds_for_every_canonical_array_ir_value() {
+        fn requires_array_ir_operations<V: ArrayIrOperations>() {}
+
+        requires_array_ir_operations::<ArrayIrValue<Array>>();
+        requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
+        requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
+    }
 
     #[test]
     fn test_composite_pullback_materializes_a_dynamic_zero_space_input_cotangent() {
