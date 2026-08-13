@@ -3,14 +3,14 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, StagingContext};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
 use crate::differentiation::linear::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
 use crate::differentiation::types::DifferentiableType;
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::{AddOperation, OneOperation, Zero, ZeroLikeOperation};
+use crate::operations::{AddOperation, OneOperation, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::transforms::{Transform, TransformArtifact};
@@ -1168,94 +1168,16 @@ where
     }
 }
 
-/// Defines one [`ReverseModeDifferentiate`] method for a non-auxiliary gradient result. It centralizes the shared
-/// generic signature while allowing each public variant to select holomorphy and its result projection.
-macro_rules! define_value_and_gradient_function_in_trait {
-    (
-        $(#[doc = $documentation:literal])*
-        $method:ident,
-        result = $result:ty,
-        holomorphic = $holomorphic:literal,
-        map = |$output:ident, $gradient:ident| $map:expr,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        fn $method<
-            F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
-            Input: Parameterized<
-                    Self::Value,
-                    To<Self::Value> = Input,
-                    Family: ParameterizedFamily<LinearizationTracer<Self>>,
-                >,
-            Output: MaybeFallible<LinearizationTracer<Self>, DifferentiationError>,
-        >(
-            &self,
-            function: F,
-            primals: Input,
-        ) -> Result<$result, DifferentiationError>
-        where
-            Self: Zero<Self::Value>,
-            Self::Operation: From<OneOperation<Self::Type>>,
-        {
-            let ($output, $gradient) = value_and_gradient_in_context(self, function, primals, $holomorphic)?;
-            Ok($map)
-        }
-    };
-}
-
-/// Defines one [`ReverseModeDifferentiate`] method for a gradient result with auxiliary outputs. It keeps the auxiliary
-/// parameter bounds and cotangent-seeding contract consistent across ordinary, holomorphic, and projection variants.
-macro_rules! define_value_and_gradient_auxiliary_function_in_trait {
-    (
-        $(#[doc = $documentation:literal])*
-        $method:ident,
-        result = $result:ty,
-        holomorphic = $holomorphic:literal,
-        map = |$value_and_auxiliary:ident, $gradient:ident| $map:expr,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        fn $method<
-            F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
-            Input: Parameterized<
-                    Self::Value,
-                    To<Self::Value> = Input,
-                    Family: ParameterizedFamily<LinearizationTracer<Self>>,
-                >,
-            Output: MaybeFallible<(LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>), DifferentiationError>,
-            Aux: Parameterized<
-                    Self::Value,
-                    To<Self::Value> = Aux,
-                    Family: ParameterizedFamily<LinearizationTracer<Self>, To = Aux::To<LinearizationTracer<Self>>>,
-                >,
-        >(
-            &self,
-            function: F,
-            primals: Input,
-        ) -> Result<$result, DifferentiationError>
-        where
-            Self: Zero<Self::Value>,
-            Self::Operation: From<OneOperation<Self::Type>> + From<ZeroLikeOperation<Self::Type>>,
-            (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>): Parameterized<
-                    LinearizationTracer<Self>,
-                    To<Self::Value> = (Self::Value, Aux),
-                    Family: ParameterizedFamily<Self::Value>,
-                >,
-        {
-            let ($value_and_auxiliary, $gradient) =
-                value_and_gradient_with_aux_in_context(self, function, primals, $holomorphic)?;
-            Ok($map)
-        }
-    };
-}
-
-/// Extension trait carrying the value-level *reverse-mode* differentiation transforms on every [`Context`]. Reverse
-/// mode differentiation is implemented as forward mode plus transposition. Like [`ForwardModeDifferentiate`], this
-/// trait is blanket-implemented for every [`ForwardModeDifferentiate`] context whose operation family supports the
-/// partial-evaluation and transposition machinery needed by [`vjp`](Self::vjp). Gradient entry points additionally
-/// require multiplicative-identity operations, while auxiliary variants require value-level zero construction for
-/// auxiliary cotangent seeds. Cotangents, like tangents, are ordinary values of the same universe as the primals (i.e.,
-/// [`Domain::Value`]) flowing through the same context.
+/// Extension trait carrying the primitive value-level reverse-mode transform on every [`Context`]. Reverse mode is
+/// implemented as forward linearization followed by transposition. This trait is blanket-implemented for every
+/// [`ForwardModeDifferentiate`] context whose operation family supports the required partial-evaluation and
+/// transposition machinery. Cotangents are ordinary values in the same universe as the primals and flow through the
+/// same context.
+///
+/// User-facing scalar gradients, auxiliary outputs, and holomorphic validation are composed through
+/// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder typestate
+/// leaves this trait with the single reusable reverse-mode engine, [`vjp`](Self::vjp), instead of a method for every
+/// option combination.
 pub trait ReverseModeDifferentiate:
     ForwardModeDifferentiate
     + Context<
@@ -1268,20 +1190,25 @@ pub trait ReverseModeDifferentiate:
     >
 {
     /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
-    /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of the
-    /// [`vjp`] function for information on the reverse-mode differentiation transform and its arguments.
+    /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
+    /// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp) for the reverse-mode transform.
     fn vjp<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<Output, ProgramError>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+            Capture::To<LinearizationTracer<Self>>,
+        ) -> Result<Output, ProgramError>,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Capture: Parameterized<Self::Value, To<Self::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
         Output: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<Self::Value>>,
     >(
         &self,
         function: F,
-        primals: Input,
+        primal: Input,
+        capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Pullback<Self, Input, Output::To<Self::Value>>), DifferentiationError> {
-        let input_structure = primals.parameter_structure();
-        let primal_input_values = primals.parameters().cloned().collect::<Vec<_>>();
-        let (output, pushforward) = self.linearize(function, primals)?;
+        let input_structure = primal.parameter_structure();
+        let primal_input_values = primal.parameters().cloned().collect::<Vec<_>>();
+        let (output, pushforward) = self.linearize(function, primal, capture)?;
         let input_types = pushforward.primal_input_types().to_vec();
         let output_types = pushforward.primal_output_types().to_vec();
         let cotangent_reconstruction = ZeroSpaceBoundaryReconstruction::capture(
@@ -1310,139 +1237,6 @@ pub trait ReverseModeDifferentiate:
             )?,
         ))
     }
-
-    define_value_and_gradient_function_in_trait!(
-        /// Computes both the primal scalar output of `function` at `primals` and its reverse-mode gradient, with this
-        /// [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
-        /// documentation of the [`value_and_gradient`] function for information on the transform and its arguments.
-        value_and_gradient,
-        result = (Self::Value, Input::To<Self::Value>),
-        holomorphic = false,
-        map = |output, gradient| (output, gradient),
-    );
-
-    define_value_and_gradient_function_in_trait!(
-        /// Computes the reverse-mode gradient of `function` at `primals`, with this [`Context`] executing (or staging)
-        /// the primal-side operations and the pullback replay. This is the gradient-only counterpart of
-        /// [`value_and_gradient`](Self::value_and_gradient), discarding the primal output. Refer to the
-        /// documentation of the [`gradient`] function for information on the transform and its arguments.
-        gradient,
-        result = Input::To<Self::Value>,
-        holomorphic = false,
-        map = |_output, gradient| gradient,
-    );
-
-    define_value_and_gradient_function_in_trait!(
-        /// Computes both the primal scalar output of `function` at `primals` and its holomorphic reverse-mode gradient,
-        /// with this [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to
-        /// the documentation of the [`value_and_gradient_holomorphic`] function for information on the transform,
-        /// its arguments, and the holomorphy promise it relies on.
-        value_and_gradient_holomorphic,
-        result = (Self::Value, Input::To<Self::Value>),
-        holomorphic = true,
-        map = |output, gradient| (output, gradient),
-    );
-
-    define_value_and_gradient_function_in_trait!(
-        /// Computes the holomorphic reverse-mode gradient of `function` at `primals`, with this [`Context`] executing
-        /// (or staging) the primal-side operations and the pullback replay. This is the gradient-only counterpart of
-        /// [`value_and_gradient_holomorphic`](Self::value_and_gradient_holomorphic), discarding the primal output.
-        /// Refer to the documentation of the [`gradient_holomorphic`] function for information on the transform, its
-        /// arguments, and the holomorphy promise it relies on.
-        gradient_holomorphic,
-        result = Input::To<Self::Value>,
-        holomorphic = true,
-        map = |_output, gradient| gradient,
-    );
-
-    define_value_and_gradient_auxiliary_function_in_trait!(
-        /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode gradient,
-        /// with this [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to
-        /// the documentation of the [`value_and_gradient_with_aux`] function for information on the transform and its
-        /// arguments.
-        value_and_gradient_with_aux,
-        result = ((Self::Value, Aux), Input::To<Self::Value>),
-        holomorphic = false,
-        map = |value_and_auxiliary, gradient| (value_and_auxiliary, gradient),
-    );
-
-    define_value_and_gradient_auxiliary_function_in_trait!(
-        /// Computes the reverse-mode gradient of `function` at `primals` and its auxiliary outputs, with this
-        /// [`Context`] executing (or staging) the primal-side operations and the pullback replay. This is the
-        /// gradient-only counterpart of [`value_and_gradient_with_aux`](Self::value_and_gradient_with_aux), discarding
-        /// the primal scalar output. Refer to the documentation of the [`gradient_with_aux`] function for information
-        /// on the transform and its arguments.
-        gradient_with_aux,
-        result = (Input::To<Self::Value>, Aux),
-        holomorphic = false,
-        map = |value_and_auxiliary, gradient| {
-            let (_, auxiliary) = value_and_auxiliary;
-            (gradient, auxiliary)
-        },
-    );
-
-    define_value_and_gradient_auxiliary_function_in_trait!(
-        /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its holomorphic
-        /// reverse-mode gradient, with this [`Context`] executing (or staging) the primal-side operations and the
-        /// pullback replay. Refer to the documentation of the [`value_and_gradient_holomorphic_with_aux`] function
-        /// for information on the transform, its arguments, and the holomorphy promise it relies on.
-        value_and_gradient_holomorphic_with_aux,
-        result = ((Self::Value, Aux), Input::To<Self::Value>),
-        holomorphic = true,
-        map = |value_and_auxiliary, gradient| (value_and_auxiliary, gradient),
-    );
-
-    define_value_and_gradient_auxiliary_function_in_trait!(
-        /// Computes the holomorphic reverse-mode gradient of `function` at `primals` and its auxiliary outputs, with
-        /// this [`Context`] executing (or staging) the primal-side operations and the pullback replay. This is the
-        /// gradient-only counterpart of
-        /// [`value_and_gradient_holomorphic_with_aux`](Self::value_and_gradient_holomorphic_with_aux), discarding the
-        /// primal scalar output. Refer to the documentation of the [`gradient_holomorphic_with_aux`] function for
-        /// information on the transform, its arguments, and the holomorphy promise it relies on.
-        gradient_holomorphic_with_aux,
-        result = (Input::To<Self::Value>, Aux),
-        holomorphic = true,
-        map = |value_and_auxiliary, gradient| {
-            let (_, auxiliary) = value_and_auxiliary;
-            (gradient, auxiliary)
-        },
-    );
-
-    /// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be
-    /// a single rank-0 scalar with a cotangent space, and complex outputs additionally require `holomorphic`: a single
-    /// reverse-mode seed recovers the derivative of a complex-output function only when the function is holomorphic, so
-    /// without that promise a complex output is rejected with an error instead of silently computing a value that is
-    /// not a derivative (i.e., `holomorphic` changes nothing for real outputs). The seed is the multiplicative identity
-    /// typed with the output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays) and bound
-    /// through this context, so an eager context constructs a concrete value while a staging context stages into its
-    /// enclosing trace.
-    ///
-    /// This is the shared seeding step behind [`value_and_gradient`](Self::value_and_gradient),
-    /// [`value_and_gradient_holomorphic`](Self::value_and_gradient_holomorphic), and
-    /// [`value_and_gradient_with_aux`](Self::value_and_gradient_with_aux), exposed so that custom gradient-style
-    /// entry points built on top of [`vjp`](Self::vjp) can reuse the same validation and seeding contract.
-    fn gradient_seed(&self, output: &Self::Value, holomorphic: bool) -> Result<Self::Value, DifferentiationError>
-    where
-        Self::Operation: From<OneOperation<Self::Type>>,
-    {
-        // Reverse mode only defines a gradient for scalar-output functions.
-        let output_type = output.r#type();
-        if !output_type.is_scalar() {
-            return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.to_string() });
-        }
-        if !holomorphic && output_type.is_complex() {
-            return Err(DifferentiationError::ComplexGradientOutput { output_type: output_type.to_string() });
-        }
-        // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
-        // is degenerate and is rejected up front.
-        let output_cotangent_type = output_type.cotangent();
-        if output_cotangent_type.is_zero_space() {
-            return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
-        }
-        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
-        check_count!("output", seeds, 1, ProgramError);
-        Ok(seeds.pop().unwrap())
-    }
 }
 
 impl<C> ReverseModeDifferentiate for C
@@ -1457,277 +1251,61 @@ where
 {
 }
 
-/// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`]
-/// (i.e., the analogue of [JAX's `vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.vjp.html)). For `f` computing
-/// `y = f(x)`, this computes `y` together with the reusable transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`, pulling
-/// output cotangents back to input cotangents. The returned [`Pullback`] closes the transposed program over the
-/// linearization-point residuals, so that [`Pullback::apply`] maps output cotangents to input cotangents, appending
-/// the residuals, interpreting the program, and reshaping the flat input cotangents against the closure's input
-/// structure, without the caller threading the residuals by hand.
-#[inline]
-pub fn vjp<
-    V: Value<
-            Type: DifferentiableType,
-            ExecutionDomain: Context<
-                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                               + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + TransposableOperation<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                > + ResidualZeroProvider<V::Type>
-                               + From<AddOperation<V::Type>>,
-            >,
-        >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
-    Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
-    Output: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
+/// Computes a value and its gradient in `context` capturing `capture` as a non-differentiated `function` input
+/// and selecting ordinary or holomorphic output validation.
+pub(crate) fn value_and_gradient_in_context<
+    C: ReverseModeDifferentiate<Operation: From<OneOperation<C::Type>>> + Zero<C::Value>,
+    F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
+    Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Output: MaybeFallible<LinearizationTracer<C>, DifferentiationError>,
 >(
-    function: F,
-    primals: Input,
-) -> Result<(Output::To<V>, Pullback<V::ExecutionDomain, Input, Output::To<V>>), DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.vjp(function, primals)
-}
-
-/// Defines one context-recovering, non-auxiliary gradient function. It ensures the free-function API variants share
-/// the same bounds and delegate directly to their corresponding [`ReverseModeDifferentiate`] methods.
-macro_rules! define_value_and_gradient_function {
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-        result = $result:ty,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DifferentiableType,
-                    ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>> + Zero<V>,
-                >,
-            F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
-            Input: Parameterized<
-                    V,
-                    To<V> = Input,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-                >,
-            Output: MaybeFallible<LinearizationTracer<V::ExecutionDomain>, DifferentiationError>,
-        >(
-            function: F,
-            primals: Input,
-        ) -> Result<$result, DifferentiationError> {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-/// Defines one context-recovering gradient function with auxiliary outputs. It avoids repeating the structured
-/// auxiliary bounds while keeping each free function aligned with its [`ReverseModeDifferentiate`] method.
-macro_rules! define_value_and_gradient_auxiliary_function {
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-        result = $result:ty,
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DifferentiableType,
-                    ExecutionDomain: ReverseModeDifferentiate<
-                        Operation: From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
-                    > + Zero<V>,
-                >,
-            F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
-            Input: Parameterized<
-                    V,
-                    To<V> = Input,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>,
-                >,
-            Output: MaybeFallible<
-                    (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
-                    DifferentiationError,
-                >,
-            Aux: Parameterized<
-                    V,
-                    To<V> = Aux,
-                    Family: ParameterizedFamily<
-                        LinearizationTracer<V::ExecutionDomain>,
-                        To = Aux::To<LinearizationTracer<V::ExecutionDomain>>,
-                    >,
-                >,
-        >(
-            function: F,
-            primals: Input,
-        ) -> Result<$result, DifferentiationError>
-        where
-            (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>): Parameterized<
-                    LinearizationTracer<V::ExecutionDomain>,
-                    To<V> = (V, Aux),
-                    Family: ParameterizedFamily<V>,
-                >,
-        {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-define_value_and_gradient_function!(
-    /// Computes both the primal scalar output of `function` at `primals` and its reverse-mode gradient. For `f`
-    /// computing a real scalar `y = f(x)`, this computes `(f(x), ∇f(x))`, where `∇f(x) = (∂f/∂x)(x)ᵀ · 1` is the
-    /// pullback of the multiplicative-identity seed. The provided `function` may return its traced output either
-    /// directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be
-    /// used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
-    value_and_gradient,
-    result = (V, Input::To<V>),
-);
-
-define_value_and_gradient_function!(
-    /// Computes the reverse-mode gradient of `function` at `primals` (i.e., the analogue of
-    /// [JAX's `grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html)). For `f` computing a real
-    /// scalar `y = f(x)`, this computes `∇f(x) = (∂f/∂x)(x)ᵀ · 1`. This is the gradient-only counterpart of
-    /// [`value_and_gradient`], discarding the primal output. The provided `function` may return its traced output
-    /// either directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?`
-    /// can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
-    gradient,
-    result = Input::To<V>,
-);
-
-define_value_and_gradient_function!(
-    /// Computes both the primal scalar output of `function` at `primals` and its holomorphic reverse-mode gradient
-    /// (i.e., the analogue of
-    /// [JAX's `grad(f, holomorphic=True)`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html)). For a
-    /// holomorphic function `f` computing a complex scalar `y = f(z)`, this function computes `(f(z), ∂f/∂z)` (i.e.,
-    /// the complex derivative itself rather than a conjugate steepest-ascent direction). The provided `function` may
-    /// return its traced output either directly or wrapped in a [`Result`] whose error type converts into
-    /// [`DifferentiationError`], so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the
-    /// exact contract.
-    value_and_gradient_holomorphic,
-    result = (V, Input::To<V>),
-);
-
-define_value_and_gradient_function!(
-    /// Computes the holomorphic reverse-mode gradient of `function` at `primals`. For a holomorphic function `f`
-    /// computing a complex scalar `y = f(z)`, this function computes `∂f/∂z`. This is the gradient-only counterpart of
-    /// [`value_and_gradient_holomorphic`], discarding the primal output. The provided `function` may return its traced
-    /// output either directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so
-    /// `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
-    gradient_holomorphic,
-    result = Input::To<V>,
-);
-
-define_value_and_gradient_auxiliary_function!(
-    /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode gradient.
-    /// For a function `f` computing `(y, aux) = f(x)` with a real scalar `y`, this function computes
-    /// `((y, aux), (∂y/∂x)(x)ᵀ · 1)` where only `y` is differentiated, while the auxiliary outputs ride along as
-    /// primal values with zero cotangent seeds. The provided `function` may return its traced output either directly or
-    /// wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used inside the
-    /// closure. Refer to [`MaybeFallible`] for the exact contract.
-    value_and_gradient_with_aux,
-    result = ((V, Aux), Input::To<V>),
-);
-
-define_value_and_gradient_auxiliary_function!(
-    /// Computes the reverse-mode gradient of `function` at `primals` and its auxiliary outputs. For a function `f`
-    /// computing `(y, aux) = f(x)` with a real scalar `y`, this computes `((∂y/∂x)(x)ᵀ · 1, aux)`. This is the
-    /// gradient-only counterpart of [`value_and_gradient_with_aux`], discarding the primal scalar output. The provided
-    /// `function` may return its traced output either directly or wrapped in a [`Result`] whose error type converts
-    /// into [`DifferentiationError`], so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact
-    /// contract.
-    gradient_with_aux,
-    result = (Input::To<V>, Aux),
-);
-
-define_value_and_gradient_auxiliary_function!(
-    /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its holomorphic reverse-mode
-    /// gradient. For a holomorphic function `f` computing `(y, aux) = f(z)` with a complex scalar `y`, this function
-    /// computes `((y, aux), ∂y/∂z)`. This is [`value_and_gradient_with_aux`] with the complex-output guard lifted,
-    /// exactly as [`value_and_gradient_holomorphic`] lifts it for [`value_and_gradient`]. The provided `function` may
-    /// return its traced output either directly or wrapped in a [`Result`] whose error type converts into
-    /// [`DifferentiationError`], so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact
-    /// contract.
-    value_and_gradient_holomorphic_with_aux,
-    result = ((V, Aux), Input::To<V>),
-);
-
-define_value_and_gradient_auxiliary_function!(
-    /// Computes the holomorphic reverse-mode gradient of `function` at `primals` and its auxiliary outputs. For a
-    /// holomorphic function `f` computing `(y, aux) = f(z)` with a complex scalar `y`, this function computes
-    /// `(∂y/∂z, aux)`. This is the gradient-only counterpart of [`value_and_gradient_holomorphic_with_aux`], discarding
-    /// the primal scalar output. The provided `function` may return its traced output either directly or wrapped in a
-    /// [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used inside the closure.
-    /// Refer to [`MaybeFallible`] for the exact contract.
-    gradient_holomorphic_with_aux,
-    result = (Input::To<V>, Aux),
-);
-
-/// Computes a value and its gradient in `context`, selecting ordinary or holomorphic output validation.
-///
-/// # Parameters
-///
-///   - `context`: Context that executes or stages the reverse-mode transform.
-///   - `function`: Scalar-valued function to differentiate.
-///   - `primals`: Structured input values specifying the differentiation point.
-///   - `holomorphic`: Whether the output is validated under a holomorphy promise.
-fn value_and_gradient_in_context<C, F, Input, Output>(
     context: &C,
     function: F,
     primals: Input,
+    capture: Capture,
     holomorphic: bool,
-) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError>
-where
-    C: ReverseModeDifferentiate + Zero<C::Value>,
-    C::Operation: From<OneOperation<C::Type>>,
-    F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
-    Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    Output: MaybeFallible<LinearizationTracer<C>, DifferentiationError>,
-{
-    let (output, pullback) = context.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
-    let seed = context.gradient_seed(&output, holomorphic)?;
+) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError> {
+    let (output, pullback) = context.vjp(
+        |input, capture| function(input, capture).into_result().map_err(ProgramError::from),
+        primals,
+        capture,
+    )?;
+    let seed = gradient_seed(context, &output, holomorphic)?;
     let gradient = pullback.apply(seed)?;
     Ok((output, gradient))
 }
 
-/// Computes a value, auxiliary outputs, and a gradient in `context`, selecting ordinary or holomorphic output
-/// validation. Only the scalar value is differentiated; auxiliary leaves receive zero cotangent seeds.
-///
-/// # Parameters
-///
-///   - `context`: Context that executes or stages the reverse-mode transform.
-///   - `function`: Function returning the scalar value to differentiate and non-differentiated auxiliary outputs.
-///   - `primals`: Structured input values specifying the differentiation point.
-///   - `holomorphic`: Whether the scalar output is validated under a holomorphy promise.
-fn value_and_gradient_with_aux_in_context<C, F, Input, Output, Aux>(
-    context: &C,
-    function: F,
-    primals: Input,
-    holomorphic: bool,
-) -> Result<((C::Value, Aux), Input::To<C::Value>), DifferentiationError>
-where
-    C: ReverseModeDifferentiate + Zero<C::Value>,
-    C::Operation: ResidualZeroProvider<C::Type> + From<OneOperation<C::Type>>,
-    F: FnOnce(Input::To<LinearizationTracer<C>>) -> Output,
+/// Computes a value, auxiliary outputs, and a gradient in `context` capturing `capture` as a non-differentiated
+/// `function` input and selecting ordinary or holomorphic output validation. Only the scalar value is differentiated.
+/// Auxiliary leaves receive zero cotangent seeds.
+pub(crate) fn value_and_gradient_auxiliary_in_context<
+    C: ReverseModeDifferentiate<Operation: ResidualZeroProvider<C::Type> + From<OneOperation<C::Type>>> + Zero<C::Value>,
+    F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Output: MaybeFallible<(LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>), DifferentiationError>,
     Aux: Parameterized<
             C::Value,
             To<C::Value> = Aux,
             Family: ParameterizedFamily<LinearizationTracer<C>, To = Aux::To<LinearizationTracer<C>>>,
         >,
+>(
+    context: &C,
+    function: F,
+    primals: Input,
+    capture: Capture,
+    holomorphic: bool,
+) -> Result<((C::Value, Aux), Input::To<C::Value>), DifferentiationError>
+where
     (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>):
         Parameterized<LinearizationTracer<C>, To<C::Value> = (C::Value, Aux), Family: ParameterizedFamily<C::Value>>,
 {
-    let ((output, auxiliary), pullback): ((C::Value, Aux), _) =
-        context.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
+    let ((output, auxiliary), pullback): ((C::Value, Aux), _) = context.vjp(
+        |input, capture| function(input, capture).into_result().map_err(ProgramError::from),
+        primals,
+        capture,
+    )?;
 
     // Each auxiliary leaf supplies its own cotangent geometry. A reference-bearing cotangent type names runtime
     // extents that only a live value pins, and the leaf is such a value. The cotangent type derivation preserves
@@ -1745,7 +1323,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
 
-    let gradient = pullback.apply((context.gradient_seed(&output, holomorphic)?, auxiliary_cotangents))?;
+    let gradient = pullback.apply((gradient_seed(context, &output, holomorphic)?, auxiliary_cotangents))?;
     Ok(((output, auxiliary), gradient))
 }
 
@@ -1994,6 +1572,45 @@ pub(crate) struct TranspositionTransformArguments {
     zero_residual_input_indices: Vec<Vec<usize>>,
 }
 
+/// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be a
+/// single rank-0 scalar with a cotangent space, and complex outputs additionally require `holomorphic`: a single
+/// reverse-mode seed recovers the derivative of a complex-output function only when the function is holomorphic, so
+/// without that promise a complex output is rejected with an error instead of silently computing a value that is not
+/// a derivative (i.e., `holomorphic` changes nothing for real outputs). The seed is the multiplicative identity typed
+/// with the output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays) and bound through
+/// the provided [`Context`] `context`, so an eager context constructs a concrete value while a staging context stages
+/// into its enclosing trace.
+///
+/// This is the shared seeding step behind [`value_and_gradient_in_context`] and
+/// [`value_and_gradient_auxiliary_in_context`], exposed so that custom gradient-style entry points built on top of
+/// [`vjp`](crate::DifferentiationBuilder::vjp) can reuse the same validation and seeding contract.
+fn gradient_seed<C: ReverseModeDifferentiate<Operation: From<OneOperation<C::Type>>>>(
+    context: &C,
+    output: &C::Value,
+    holomorphic: bool,
+) -> Result<C::Value, DifferentiationError> {
+    // Reverse mode only defines a gradient for scalar-output functions.
+    let output_type = output.r#type();
+    if !output_type.is_scalar() {
+        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.to_string() });
+    }
+
+    if !holomorphic && output_type.is_complex() {
+        return Err(DifferentiationError::ComplexGradientOutput { output_type: output_type.to_string() });
+    }
+
+    // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
+    // is degenerate and is rejected up front.
+    let output_cotangent_type = output_type.cotangent();
+    if output_cotangent_type.is_zero_space() {
+        return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
+    }
+
+    let mut seeds = context.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
+    check_count!("output", seeds, 1, ProgramError);
+    Ok(seeds.pop().unwrap())
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -2009,7 +1626,7 @@ mod tests {
         ProjectedProgramValue,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::jvp;
+    use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types};
     use crate::operations::{AddOperation, Constant, MulOperation, Sin, ZeroOperation};
     use crate::parameters::Placeholder;
@@ -2234,7 +1851,7 @@ mod tests {
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
         )| Ok(left * right);
-        let (_, pullback) = vjp(function, (Array::scalar(3.0), Array::scalar(2.0))).unwrap();
+        let (_, pullback) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0))).vjp(function).unwrap();
         assert_eq!(pullback.apply(Array::scalar(4.0)), Ok((Array::scalar(8.0), Array::scalar(12.0))),);
     }
 
@@ -2818,8 +2435,9 @@ mod tests {
         // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = sin(x)` at
         // `x = 2` the primal output is `sin(2)`, and the returned pullback maps any number of output cotangents back
         // through the transposed Jacobian without re-tracing or re-differentiating.
-        let (value, pullback) =
-            EagerContext::<Array, ArrayOperation<Array>>::new().vjp(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        let (value, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|x, ()| x.sin(), Array::scalar(2.0), ())
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(
@@ -2828,16 +2446,17 @@ mod tests {
             epsilon = 1e-9
         );
 
-        // The free `vjp` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a
-        // rank-zero `Array` input recovers the eager array domain.
-        let (value, pullback) = vjp(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        // The builder's `vjp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // declarations: a rank-zero `Array` input recovers the eager array domain.
+        let (value, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| x.sin()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(pullback.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, pullback) =
-            EagerContext::<Array, ArrayOperation<Array>>::new().vjp(|token| Ok(token), token.clone()).unwrap();
+        let (value, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .vjp(|token, ()| Ok(token), token.clone(), ())
+            .unwrap();
         assert_eq!(value, token.clone());
         assert_eq!(pullback.apply(zero.clone()), Ok(zero.clone()));
         assert!(matches!(
@@ -2847,11 +2466,11 @@ mod tests {
                     == "pullback cotangent 0 has type token[] but its primal boundary requires cotangent type zero[]",
         ));
 
-        // Under an active trace, the free `vjp` recovers the staging context from its tracer input instead, so the
-        // primal work and the pullback replay both stage into the enclosing trace.
+        // Under an active trace, the builder's `vjp` terminal recovers the staging context from its tracer input,
+        // so the primal work and the pullback replay both stage into the enclosing trace.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, pullback) = vjp(|x| x.sin(), inputs[0].clone())?;
+                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|x| x.sin())?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
@@ -2867,7 +2486,7 @@ mod tests {
         // leaves and never constructs a token-valued zero operation.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, pullback) = vjp(|token| Ok(token), inputs[0].clone())?;
+                let (value, pullback) = differentiate_at(inputs[0].clone()).vjp(|token| Ok(token))?;
                 let cotangent = pullback.apply(inputs[1].clone())?;
                 Ok(vec![value, cotangent])
             },
@@ -2876,12 +2495,9 @@ mod tests {
         .unwrap();
         assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token, zero]));
 
-        // With no leaf value to recover a context from, the free `vjp` reports that differentiation requires
-        // at least one input leaf.
-        let error =
-            vjp(|x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x), Vec::<Array>::new())
-                .map(|(outputs, _)| outputs)
-                .unwrap_err();
+        // With no leaf value to recover a context from, the builder's `vjp` terminal reports that differentiation
+        // requires at least one input leaf.
+        let error = differentiate_at(Vec::<Array>::new()).vjp(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
@@ -2891,8 +2507,9 @@ mod tests {
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(vector_type.clone());
         let cotangent = context.input(vector_type);
-        let (_, pullback) =
-            context.vjp(|inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].sin()?]), vec![primal]).unwrap();
+        let (_, pullback) = context
+            .vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[0].clone() * inputs[0].sin()?]), vec![primal], ())
+            .unwrap();
         let input_cotangents = pullback.apply(vec![cotangent]).unwrap();
         let program = context
             .builder()
@@ -2923,24 +2540,27 @@ mod tests {
 
     #[test]
     fn test_value_and_gradient() {
-        // `ReverseModeDifferentiate::value_and_gradient` on an explicit context: `f(x, y) = x * y + x` has value `8`
-        // and gradient `(y + 1, x) = (4, 2)` at `(2, 3)`, reshaped into the closure's input structure.
+        // An explicitly selected context computes both the primal and pullback replay. For `f(x, y) = x * y + x`,
+        // the value is `8` and the gradient is `(y + 1, x) = (4, 2)` at `(2, 3)`.
         let (value, gradient): (Array, (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|(x, y)| x.clone() * y + x, (Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .value_and_gradient(|(x, y)| x.clone() * y + x)
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
         assert_eq!(gradient, (Array::scalar(4.0), Array::scalar(2.0)));
 
-        // The free `value_and_gradient` recovers the eager domain from the concrete primals.
-        let (value, gradient) = value_and_gradient(|x| x.clone() * x.sin().unwrap(), Array::scalar(0.7)).unwrap();
+        // The builder's `value_and_gradient` terminal recovers the eager domain from the concrete primals.
+        let (value, gradient) =
+            differentiate_at(Array::scalar(0.7)).value_and_gradient(|x| x.clone() * x.sin().unwrap()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
-        // Under an active trace, the free `value_and_gradient` recovers the staging context from its tracer input
-        // instead, so the primal work and the pullback replay both stage into the enclosing trace.
+        // Under an active trace, the builder's `value_and_gradient` terminal recovers the staging context from its
+        // tracer input instead, so the primal work and the pullback replay both stage into the enclosing trace.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, gradient) = value_and_gradient(|x| x.sin().unwrap(), inputs[0].clone()).unwrap();
+                let (value, gradient) =
+                    differentiate_at(inputs[0].clone()).value_and_gradient(|x| x.sin().unwrap()).unwrap();
                 Ok(vec![value, gradient])
             },
             vec![ArrayType::scalar(DataType::F64)],
@@ -2956,9 +2576,9 @@ mod tests {
         // primals under JAX's `grad`). For a true predicate and `x = 3`, `f(x) = x * x` with gradient `2x = 6`, and
         // the untaken `sin(x)` branch is never traced at all. The Boolean's cotangent remains in the zero space.
         let (value, (predicate_gradient, gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .differentiate_at((Array::scalar(true), Array::scalar(3.0)))
             .value_and_gradient(
                 |(predicate, x)| if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() },
-                (Array::scalar(true), Array::scalar(3.0)),
             )
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
@@ -2973,13 +2593,11 @@ mod tests {
             DomainTracer<EagerContext<Array, ArrayOperation<Array>>>,
             Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>,
         ) = context
-            .value_and_gradient(
-                |inputs| {
-                    calls.set(calls.get() + 1);
-                    inputs[0].clone() * inputs[0].clone()
-                },
-                vec![primal],
-            )
+            .differentiate_at(vec![primal])
+            .value_and_gradient(|inputs| {
+                calls.set(calls.get() + 1);
+                inputs[0].clone() * inputs[0].clone()
+            })
             .unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(gradient.len(), 1);
@@ -2991,20 +2609,19 @@ mod tests {
         let foreign_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(ArrayType::scalar(DataType::F64));
         let foreign_primal = foreign_context.input(ArrayType::scalar(DataType::F64));
-        let result =
-            context.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal, foreign_primal]);
+        let result = context
+            .differentiate_at(vec![primal, foreign_primal])
+            .value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone());
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
 
         // A complex scalar output is rejected toward the holomorphic entry points, and inputs with no leaf values
         // report an invalid input count.
         let z = Complex::new(0.7f64, -0.3f64);
-        let error = value_and_gradient(|x| x.clone() * x, Array::scalar(z)).unwrap_err();
+        let error = differentiate_at(Array::scalar(z)).value_and_gradient(|x| x.clone() * x).unwrap_err();
         assert!(matches!(error, DifferentiationError::ComplexGradientOutput { .. }));
-        let error = value_and_gradient(
-            |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| x.into_iter().next().unwrap(),
-            Vec::<Array>::new(),
-        )
-        .unwrap_err();
+        let error = differentiate_at(Vec::<Array>::new())
+            .value_and_gradient(|x| x.into_iter().next().unwrap())
+            .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
@@ -3017,16 +2634,14 @@ mod tests {
         const CHAIN_LENGTH: usize = 2000;
         let (expected_value, expected_gradient) =
             (0..CHAIN_LENGTH).fold((0.5f64, 1.0f64), |(value, gradient), _| (value.sin(), gradient * value.cos()));
-        let (value, gradient) = value_and_gradient(
-            |mut value| {
+        let (value, gradient) = differentiate_at(Array::scalar(0.5f64))
+            .value_and_gradient(|mut value| {
                 for _ in 0..CHAIN_LENGTH {
                     value = value.sin().unwrap();
                 }
                 value
-            },
-            Array::scalar(0.5f64),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], expected_value, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], expected_gradient, epsilon = 1e-9);
 
@@ -3035,16 +2650,14 @@ mod tests {
         // default-size thread.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, gradient) = value_and_gradient(
-                    |mut value| {
+                let (value, gradient) = differentiate_at(inputs[0].clone())
+                    .value_and_gradient(|mut value| {
                         for _ in 0..CHAIN_LENGTH {
                             value = value.sin().unwrap();
                         }
                         value
-                    },
-                    inputs[0].clone(),
-                )
-                .unwrap();
+                    })
+                    .unwrap();
                 Ok(vec![value, gradient])
             },
             vec![ArrayType::scalar(DataType::F64)],
@@ -3058,41 +2671,40 @@ mod tests {
 
     #[test]
     fn test_gradient() {
-        // `ReverseModeDifferentiate::gradient` is the gradient-only counterpart of `value_and_gradient`.
+        // The builder's `gradient` terminal is the gradient-only counterpart of `value_and_gradient`.
         let method_gradient: (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .gradient(|(x, y)| x.clone() * y + x, (Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .gradient(|(x, y)| x.clone() * y + x)
             .unwrap();
         assert_eq!(method_gradient, (Array::scalar(4.0), Array::scalar(2.0)));
 
-        // The free `gradient` recovers the eager domain from the concrete primal and agrees with the value-carrying
-        // form.
-        let free_gradient = gradient(|x| x.clone() * x.sin().unwrap(), Array::scalar(0.7)).unwrap();
+        // The builder's `gradient` terminal recovers the eager domain from the concrete primal and agrees with the
+        // value-carrying form.
+        let free_gradient = differentiate_at(Array::scalar(0.7)).gradient(|x| x.clone() * x.sin().unwrap()).unwrap();
         assert_abs_diff_eq!(free_gradient.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
-        // With no leaf value to recover a context from, the free `gradient` reports that differentiation requires
-        // at least one input leaf.
-        let error = gradient(
-            |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| x.into_iter().next().unwrap(),
-            Vec::<Array>::new(),
-        )
-        .unwrap_err();
+        // With no leaf value to recover a context from, the builder's `gradient` terminal reports that differentiation
+        // requires at least one input leaf.
+        let error = differentiate_at(Vec::<Array>::new()).gradient(|x| x.into_iter().next().unwrap()).unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
     #[test]
-    fn test_value_and_gradient_holomorphic() {
-        // `ReverseModeDifferentiate::value_and_gradient_holomorphic` on an explicit context recovers the complex
-        // derivative under the holomorphy promise: `∂z²/∂z = 2z` at a genuinely complex point.
+    fn test_builder_value_and_gradient_in_holomorphic_mode() {
+        // An explicitly selected builder context recovers `∂z²/∂z = 2z` under the holomorphy promise.
         let z = Complex::new(0.7f64, -0.3f64);
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient_holomorphic(|x| x.clone() * x, Array::scalar(z))
+            .differentiate_at(Array::scalar(z))
+            .holomorphic()
+            .value_and_gradient(|x| x.clone() * x)
             .unwrap();
         assert_eq!(value, Array::scalar(z * z));
         assert_eq!(gradient, Array::scalar(z + z));
 
-        // The free form recovers the eager domain from the concrete primal, and for real outputs the holomorphy
+        // The builder recovers the eager domain from the concrete primal, and for real outputs the holomorphy
         // promise changes nothing.
-        let (value, gradient) = value_and_gradient_holomorphic(|x| x.clone() * x, Array::scalar(2.0)).unwrap();
+        let (value, gradient) =
+            differentiate_at(Array::scalar(2.0)).holomorphic().value_and_gradient(|x| x.clone() * x).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 4.0, epsilon = 1e-9);
 
@@ -3102,67 +2714,73 @@ mod tests {
         // the plain one.
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(ArrayType::scalar(DataType::C64));
-        let result = context.value_and_gradient(|inputs: Vec<_>| inputs[0].clone(), vec![primal]);
+        let result = context.differentiate_at(vec![primal]).value_and_gradient(|inputs: Vec<_>| inputs[0].clone());
         assert!(matches!(
             result,
             Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c64[]",
         ));
         let primal = context.input(ArrayType::scalar(DataType::C64));
-        let (value, gradient) =
-            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
+        let (value, gradient) = context
+            .differentiate_at(vec![primal])
+            .holomorphic()
+            .value_and_gradient(|inputs: Vec<_>| inputs[0].clone())
+            .unwrap();
         assert_eq!(*value.r#type(), ArrayType::scalar(DataType::C64));
         assert_eq!(gradient.len(), 1);
         assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::C64));
         let primal = context.input(ArrayType::scalar(DataType::F64));
-        let (value, gradient) =
-            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
+        let (value, gradient) = context
+            .differentiate_at(vec![primal])
+            .holomorphic()
+            .value_and_gradient(|inputs: Vec<_>| inputs[0].clone())
+            .unwrap();
         assert_eq!(*value.r#type(), ArrayType::scalar(DataType::F64));
         assert_eq!(gradient.len(), 1);
         assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::F64));
     }
 
     #[test]
-    fn test_gradient_holomorphic() {
-        // `ReverseModeDifferentiate::gradient_holomorphic` is the gradient-only counterpart of
-        // `value_and_gradient_holomorphic`: `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
+    fn test_builder_gradient_in_holomorphic_mode() {
+        // The holomorphic builder gradient computes `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
         let z = Complex::new(0.7f64, -0.3f64);
         let method_gradient = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .gradient_holomorphic(|x| x.sin().unwrap(), Array::scalar(z))
+            .differentiate_at(Array::scalar(z))
+            .holomorphic()
+            .gradient(|x| x.sin().unwrap())
             .unwrap();
         assert_eq!(method_gradient, Array::scalar(z.cos()));
 
-        // The free form recovers the eager domain from the concrete primal and agrees.
-        let free_gradient = gradient_holomorphic(|x| x.sin().unwrap(), Array::scalar(z)).unwrap();
+        // The builder recovers the eager domain from the concrete primal and agrees.
+        let free_gradient = differentiate_at(Array::scalar(z)).holomorphic().gradient(|x| x.sin().unwrap()).unwrap();
         assert_eq!(free_gradient, Array::scalar(z.cos()));
     }
 
     #[test]
-    fn test_value_and_gradient_with_aux() {
-        // `ReverseModeDifferentiate::value_and_gradient_with_aux` on an explicit context returns the auxiliary
-        // outputs as ordinary primal values seeded with zero cotangents, so they do not contribute to the gradient.
+    fn test_builder_value_and_gradient_with_auxiliary_output() {
+        // An explicitly selected builder context returns auxiliary outputs as ordinary primal values seeded with zero
+        // cotangents, so they do not contribute to the gradient.
         let ((value, aux), gradient): ((Array, Array), (Array, Array)) =
             EagerContext::<Array, ArrayOperation<Array>>::new()
-                .value_and_gradient_with_aux(
-                    |(x, y)| (x.clone() * y.clone(), x + y),
-                    (Array::scalar(2.0), Array::scalar(3.0)),
-                )
+                .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+                .with_aux()
+                .value_and_gradient(|(x, y)| (x.clone() * y.clone(), x + y))
                 .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
         assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
 
-        // The free form recovers the eager domain from the concrete primals, and the auxiliary structure can carry
+        // The builder recovers the eager domain from the concrete primals, and the auxiliary structure can carry
         // multiple leaves (each rides along as a primal value with a zero cotangent seed, so none contributes to the
         // gradient of `x * y`).
-        let ((value, aux), gradient): ((Array, (Array, Array)), (Array, Array)) = value_and_gradient_with_aux(
-            |(x, y)| {
-                let value = x.clone() * y.clone();
-                let aux = (x.clone() + y, x.clone() * x);
-                (value, aux)
-            },
-            (Array::scalar(2.0), Array::scalar(3.0)),
-        )
-        .unwrap();
+        let ((value, aux), gradient): ((Array, (Array, Array)), (Array, Array)) =
+            differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+                .with_aux()
+                .value_and_gradient(|(x, y)| {
+                    let value = x.clone() * y.clone();
+                    let aux = (x.clone() + y, x.clone() * x);
+                    (value, aux)
+                })
+                .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
         assert_eq!(aux, (Array::scalar(5.0), Array::scalar(4.0)));
         assert_eq!(gradient, (Array::scalar(3.0), Array::scalar(2.0)));
@@ -3170,17 +2788,16 @@ mod tests {
         // Auxiliary cotangent seeds use each auxiliary leaf's cotangent type. This matters both for non-differentiable
         // leaves, whose cotangent type is the first-class zero space, and for differentiable storage representations
         // such as E8M0, whose cotangent type is widened to F32 and can represent zero.
-        let ((value, aux), gradient): ((Array, (Array, Array)), Array) = value_and_gradient_with_aux(
-            |x| {
+        let ((value, aux), gradient): ((Array, (Array, Array)), Array) = differentiate_at(Array::scalar(2.0))
+            .with_aux()
+            .value_and_gradient(|x| {
                 let integer = x.context().constant(Array::scalar(7i32))?;
                 let e8m0 = x
                     .context()
                     .constant(Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap())?;
                 Ok::<_, ProgramError>((x.clone() * x, (integer, e8m0)))
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value, Array::scalar(4.0));
         assert_eq!(
             aux,
@@ -3190,52 +2807,59 @@ mod tests {
     }
 
     #[test]
-    fn test_gradient_with_aux() {
-        // `ReverseModeDifferentiate::gradient_with_aux` is the gradient-only counterpart
-        // of `value_and_gradient_with_aux`, returning `(gradient, aux)`.
+    fn test_builder_gradient_with_auxiliary_output() {
+        // The auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
         let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Array::scalar(2.0), Array::scalar(3.0)))
+            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .with_aux()
+            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
             .unwrap();
         assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
 
-        // The free form recovers the eager domain from the concrete primals and agrees.
-        let (free_gradient, aux): ((Array, Array), Array) =
-            gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Array::scalar(2.0), Array::scalar(3.0)))
-                .unwrap();
+        // The builder recovers the eager domain from the concrete primals and agrees.
+        let (free_gradient, aux): ((Array, Array), Array) = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .with_aux()
+            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
+            .unwrap();
         assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
         assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
     }
 
     #[test]
-    fn test_value_and_gradient_holomorphic_with_aux() {
-        // `ReverseModeDifferentiate::value_and_gradient_holomorphic_with_aux` combines the holomorphy promise with
-        // auxiliary outputs: the gradient is `∂z²/∂z = 2z` while the auxiliary value rides along with a zero
-        // cotangent seed.
+    fn test_builder_value_and_gradient_with_auxiliary_output_in_holomorphic_mode() {
+        // Builder typestate composes the holomorphy promise with auxiliary output: the gradient is `∂z²/∂z = 2z`
+        // while the auxiliary value rides along with a zero cotangent seed.
         let z = Complex::new(0.7f64, -0.3f64);
         let ((value, aux), gradient): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z))
+            .differentiate_at(Array::scalar(z))
+            .with_aux()
+            .holomorphic()
+            .value_and_gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
         assert_eq!(value, Array::scalar(z * z));
         assert_eq!(aux, Array::scalar(z));
         assert_eq!(gradient, Array::scalar(z + z));
 
-        // The free form recovers the eager domain from the concrete primal and agrees.
-        let ((value, aux), gradient): ((Array, Array), Array) =
-            value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z)).unwrap();
+        // The builder recovers the eager domain from the concrete primal and agrees.
+        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
+            .with_aux()
+            .holomorphic()
+            .value_and_gradient(|x| (x.clone() * x.clone(), x))
+            .unwrap();
         assert_eq!(value, Array::scalar(z * z));
         assert_eq!(aux, Array::scalar(z));
         assert_eq!(gradient, Array::scalar(z + z));
 
         // The holomorphic entry point uses the same zero-space cotangent rule for non-differentiable auxiliary leaves.
-        let ((value, aux), gradient): ((Array, Array), Array) = value_and_gradient_holomorphic_with_aux(
-            |x| {
+        let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
+            .with_aux()
+            .holomorphic()
+            .value_and_gradient(|x| {
                 let aux = x.context().constant(Array::scalar(7i32))?;
                 Ok::<_, ProgramError>((x.clone() * x, aux))
-            },
-            Array::scalar(z),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value, Array::scalar(z * z));
         assert_eq!(aux, Array::scalar(7i32));
         assert_eq!(gradient, Array::scalar(z + z));
@@ -3246,10 +2870,10 @@ mod tests {
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(ArrayType::scalar(DataType::C64));
         let ((value, aux), gradient): ((TestTracer, TestTracer), Vec<TestTracer>) = context
-            .value_and_gradient_holomorphic_with_aux(
-                |inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()),
-                vec![primal],
-            )
+            .differentiate_at(vec![primal])
+            .with_aux()
+            .holomorphic()
+            .value_and_gradient(|inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()))
             .unwrap();
         assert_eq!(*value.r#type(), ArrayType::scalar(DataType::C64));
         assert_eq!(*aux.r#type(), ArrayType::scalar(DataType::C64));
@@ -3258,19 +2882,24 @@ mod tests {
     }
 
     #[test]
-    fn test_gradient_holomorphic_with_aux() {
-        // `ReverseModeDifferentiate::gradient_holomorphic_with_aux` is the gradient-only counterpart of
-        // `value_and_gradient_holomorphic_with_aux`, returning `(gradient, aux)`.
+    fn test_builder_gradient_with_auxiliary_output_in_holomorphic_mode() {
+        // The holomorphic auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
         let z = Complex::new(0.7f64, -0.3f64);
         let (method_gradient, aux): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z))
+            .differentiate_at(Array::scalar(z))
+            .with_aux()
+            .holomorphic()
+            .gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
         assert_eq!(method_gradient, Array::scalar(z + z));
         assert_eq!(aux, Array::scalar(z));
 
-        // The free form recovers the eager domain from the concrete primal and agrees.
-        let (free_gradient, aux): (Array, Array) =
-            gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Array::scalar(z)).unwrap();
+        // The builder recovers the eager domain from the concrete primal and agrees.
+        let (free_gradient, aux): (Array, Array) = differentiate_at(Array::scalar(z))
+            .with_aux()
+            .holomorphic()
+            .gradient(|x| (x.clone() * x.clone(), x))
+            .unwrap();
         assert_eq!(free_gradient, Array::scalar(z + z));
         assert_eq!(aux, Array::scalar(z));
     }
@@ -3285,10 +2914,11 @@ mod tests {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let x: f64 = 0.7;
 
-        // Reverse-over-reverse through the free functions alone: the outer value is `f'(x) = 2x cos(x²)` and the
+        // Reverse-over-reverse through builder terminals: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
-        let (value, second_derivative) =
-            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin(), x), Array::scalar(x)).unwrap();
+        let (value, second_derivative) = differentiate_at(Array::scalar(x))
+            .value_and_gradient(|x| differentiate_at(x).gradient(|y| (y.clone() * y).sin()))
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(
             second_derivative.to_f64s()[0],
@@ -3300,7 +2930,13 @@ mod tests {
         // through the trait solver, with every inner transform run through an explicitly recovered context receiver.
         // The outer gradient is the analytic third derivative `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
         let (value, third_derivative) = domain
-            .value_and_gradient(|x| gradient(|y| gradient(|z| (z.clone() * z).sin(), y), x), Array::scalar(x))
+            .differentiate_at(Array::scalar(x))
+            .value_and_gradient(|x| {
+                x.clone()
+                    .context()
+                    .differentiate_at(x)
+                    .gradient(|y| y.clone().context().differentiate_at(y).gradient(|z| (z.clone() * z).sin()))
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(
@@ -3309,12 +2945,12 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        // Forward-over-reverse through the free functions alone: pushing the tangent `v = 2` through the gradient
-        // computes the Hessian-vector product `f''(x) · v` without materializing a dense Hessian, because the `jvp`
-        // duals' stamped `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests
-        // on.
-        let (primal, tangent) =
-            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin(), x)?), Array::scalar(x), Array::scalar(2.0)).unwrap();
+        // Forward-over-reverse through builder terminals: pushing the tangent `v = 2` through the gradient computes the
+        // Hessian-vector product `f''(x) · v` without materializing a dense Hessian, because the `jvp` duals' stamped
+        // `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests on.
+        let (primal, tangent) = differentiate_at(Array::scalar(x))
+            .jvp(Array::scalar(2.0), |x| Ok(differentiate_at(x).gradient(|y| (y.clone() * y).sin())?))
+            .unwrap();
         assert_abs_diff_eq!(primal.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(
             tangent.to_f64s()[0],
