@@ -1780,37 +1780,41 @@ where
 /// implementations.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's [`Value`](Domain::Value) (i.e.,
-/// concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are detected lazily, like
-/// everything else about staging: a foreign tracer fails the builder-identity check either when an operation binds it
-/// (via [`StagingContext::stage_operation`]) or when it escapes through a trace boundary (i.e., the boundary output
-/// checks), with [`ProgramError::MismatchedProgramBuilders`].
+/// concrete vs [`Tracer`]), not by a separate trait. Captures follow the same operational validity rules as ordinary
+/// values: an incompatible capture fails at the operation or execution boundary where it is used, while an unused
+/// capture does not affect the transform.
 pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
-    /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward, with this
-    /// [`Context`] executing (or staging) the differentiated operations. Refer to the documentation of the [`jvp`]
-    /// function for information on the forward-mode transform and its arguments.
+    /// Evaluates `function` on the primal `primal` and runtime `capture`, and propagates the tangent `tangent`
+    /// forward only with respect to `primal`, with this [`Context`] executing or staging the differentiated
+    /// operations. Refer to the documentation of [`jvp`] for the forward-mode transform.
     fn jvp<
-        F: FnOnce(Input::To<DifferentiationTracer<Self>>) -> Result<Output, ProgramError>,
+        F: FnOnce(
+            Input::To<DifferentiationTracer<Self>>,
+            Capture::To<DifferentiationTracer<Self>>,
+        ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 Self::Value,
                 Family: ParameterizedFamily<DifferentiationTracer<Self>>,
                 ParameterStructure: Debug + PartialEq,
             >,
+        Capture: Parameterized<Self::Value, Family: ParameterizedFamily<DifferentiationTracer<Self>>>,
         Output: Parameterized<DifferentiationTracer<Self>, Family: ParameterizedFamily<Self::Value>>,
     >(
         &self,
         function: F,
-        primals: Input,
-        tangents: Input::To<Self::Value>,
+        primal: Input,
+        tangent: Input::To<Self::Value>,
+        capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
         Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type>,
     {
-        if primals.parameters().next().is_none() {
+        if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
         }
 
-        let primal_structure = primals.parameter_structure();
-        let tangent_structure = tangents.parameter_structure();
+        let primal_structure = primal.parameter_structure();
+        let tangent_structure = tangent.parameter_structure();
         if tangent_structure != primal_structure {
             return Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{primal_structure:?}"),
@@ -1819,12 +1823,12 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             .into());
         }
 
-        // Wrap each `(primal, tangent)` as a dual stamped with the forward-mode context so that the closure's value
-        // sugar dispatches through it, then run the closure directly on those duals.
+        // Active inputs receive the caller-provided tangents. Captures share the same transform context but receive
+        // only structural zero tangents, so they affect primal evaluation without affecting differentiation.
         let context = DifferentiationContext::new(self.clone());
-        let input_duals = primals
+        let input_duals = primal
             .into_parameters()
-            .zip(tangents.into_parameters())
+            .zip(tangent.into_parameters())
             .map(|(primal, tangent)| {
                 Ok::<_, ProgramError>(DifferentiationTracer::new(
                     DifferentiationDual::new(primal, tangent)?,
@@ -1833,7 +1837,15 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input = Input::To::<DifferentiationTracer<Self>>::from_parameters(primal_structure, input_duals)?;
-        let output = function(input)?;
+        let capture_structure = capture.parameter_structure();
+        let capture_duals = capture
+            .into_parameters()
+            .map(|primal| {
+                DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal), context.clone())
+            })
+            .collect::<Vec<_>>();
+        let capture = Capture::To::<DifferentiationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
+        let output = function(input, capture)?;
 
         // Split each output dual into its primal value and its materialized tangent. A structural zero derives its
         // runtime geometry from the corresponding primal result before the public boundary requires a concrete value.
@@ -1862,39 +1874,42 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         Ok((primal_output, tangent_output))
     }
 
-    /// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`], with this
-    /// [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of the [`linearize`]
-    /// function for information on the linearization transform and its arguments.
+    /// Linearizes `function` at `primal`, treating `capture` as known nondifferentiated runtime inputs and returning
+    /// the primal output and a reusable [`Pushforward`], with this [`Context`] executing or staging primal-side work.
     fn linearize<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<Output, ProgramError>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+            Capture::To<LinearizationTracer<Self>>,
+        ) -> Result<Output, ProgramError>,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Capture: Parameterized<Self::Value, To<Self::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
         Output: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<Self::Value>>,
     >(
         &self,
         function: F,
-        primals: Input,
+        primal: Input,
+        capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Pushforward<Self, Input, Output::To<Self::Value>>), DifferentiationError>
     where
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
             + ResidualZeroProvider<Self::Type>,
     {
-        if primals.parameters().next().is_none() {
+        if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
         }
 
-        let input_structure = primals.parameter_structure();
-        let input_values = primals.into_parameters().collect::<Vec<_>>();
+        let input_structure = primal.parameter_structure();
+        let input_values = primal.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
-        // The dual-seeding pass consumes `input_values` so we retain the primals separately because dead tangent inputs
-        // may later need their concrete runtime shapes captured as residuals before transposition.
+        // The dual-seeding pass consumes `input_values` so we retain the active primals separately because dead tangent
+        // inputs may later need their concrete runtime shapes captured as residuals before transposition.
         let primal_input_values = input_values.clone();
         let tangent_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
 
-        // Wrap each primal as a dual over a partial-evaluation context wrapping this context. The primal half is a
-        // known value and the tangent half is an unknown seeded as a leading residual-program input, in primal-input
-        // order.
+        // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
+        // so they can be residualized when needed without increasing the pushforward's tangent arity.
         let evaluation_context = PartialEvaluationContext::new(self.clone());
         let differentiation_context = DifferentiationContext::new(evaluation_context.clone());
         let mut tangent_index = 0usize;
@@ -1918,19 +1933,28 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input = Input::To::<LinearizationTracer<Self>>::from_parameters(input_structure, input_duals)?;
-        let output = function(input)?;
+        let capture_structure = capture.parameter_structure();
+        let capture_duals = capture
+            .into_parameters()
+            .map(|value| {
+                let primal = PartialTracer::new(evaluation_context.clone(), PartialEvaluationValue::known_input(value));
+                DifferentiationTracer::new(
+                    DifferentiationDual::new_with_zero_tangent(primal),
+                    differentiation_context.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let capture = Capture::To::<LinearizationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
+        let output = function(input, capture)?;
 
-        // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
-        // primal inputs, so every primal half must have folded to a known value. Zero differential outputs remain
-        // structural and are omitted from the executable pushforward boundary. A value tangent that folded to known is
-        // malformed. A well-formed rule must preserve an input-independent zero as `MaybeZero::Zero`, while accepting
-        // an arbitrary known value would silently turn the pushforward into an affine map.
+        // Split each output dual into its known primal value and its tangent. Primal work depends only on known primal
+        // inputs, so every primal half must have folded to a known value.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
 
         // Force structural zeros into the residual program. Calling `Zero` normally would allow partial evaluation to
-        // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a
-        // Single Static Assignment (SSA) value.
+        // keep the result known, but a reusable pushforward must expose every non-zero-space tangent output as a Single
+        // Static Assignment (SSA) value.
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         let mut output_types = Vec::with_capacity(output_duals.len());
@@ -1993,8 +2017,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         drop(differentiation_context);
         let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
 
-        // The pushforward program's inputs are the leading tangent unknowns followed by the residuals materialized
-        // during the trace. Collect the residual values in input order.
+        // The pushforward program's inputs are the leading active tangent unknowns
+        // followed by captured residual values.
         let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
         for (index, input) in evaluation.inputs.iter().enumerate() {
             match input {
@@ -2010,8 +2034,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             }
         }
 
-        // A dead tangent input is the only one that can become a disconnected cotangent after transposition. Capture
-        // the exact runtime geometry for those inputs now, while their concrete primal values remain available.
+        // A dead active tangent input is the only one that can become a disconnected cotangent after transposition.
         let mut program = evaluation.program;
         let live_sets = program.live_sets();
         let differentiable_primal_inputs =
@@ -2035,8 +2058,6 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         }
 
         if !zero_residuals.is_empty() {
-            // Append the geometry values and their types in one shared order. The rebuilt pushforward consumes them
-            // as trailing inputs, while `residuals` closes those inputs when the reusable callable is constructed.
             let mut builder = ProgramBuilder::<Self::Constant, Self::Operation>::new();
             let old_input_count = program.input_ids().len();
             let inputs = program
@@ -2051,7 +2072,6 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             residuals.extend(zero_residuals);
         }
 
-        // Close the pushforward program over the linearization-point residuals behind the reusable callable.
         let pushforward = Pushforward::new(
             self.clone(),
             program,
@@ -2097,9 +2117,11 @@ impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 /// [`DifferentiationContext`] (a [`Context`] carrying these transforms itself) differentiates through
 /// the duals, composing reverse-over-forward and higher-order forward modes.
 ///
-/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as there is nothing to
-/// recover a context from, and differentiating a function of no inputs is degenerate anyway.
-/// [`ForwardModeDifferentiate::jvp`] is the explicit-context method form behind this function.
+/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as an active input
+/// structure with no leaves carries no differentiation variable, and so the transform is undefined no matter how the
+/// execution context is obtained. Captures never fill that role, because they are deliberately neither differentiation
+/// variables nor context sources. [`ForwardModeDifferentiate::jvp`] is the explicit-context method form behind this
+/// function, and it rejects empty active inputs in exactly the same way.
 #[inline]
 pub fn jvp<
     V: Value<
@@ -2124,7 +2146,7 @@ pub fn jvp<
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
-    context.jvp(function, primals, tangents)
+    context.jvp(|input, ()| function(input), primals, tangents, ())
 }
 
 /// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`] (i.e., the
@@ -2149,9 +2171,11 @@ pub fn jvp<
 /// primals. This matches JAX's `linearize`/`grad` tracing semantics, where the same JVP interpreter runs over a
 /// partial-evaluation trace instead of the eval trace.
 ///
-/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error: there is nothing to
-/// recover a context from, and linearizing a function of no inputs is degenerate anyway.
-/// [`ForwardModeDifferentiate::linearize`] is the explicit-context method form behind this function.
+/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as an active input
+/// structure with no leaves carries no differentiation variable, and so the transform is undefined no matter how the
+/// execution context is obtained. Captures never fill that role, because they are deliberately neither differentiation
+/// variables nor context sources. [`ForwardModeDifferentiate::linearize`] is the explicit-context method form behind
+/// this function, and it rejects empty active inputs in exactly the same way.
 #[inline]
 pub fn linearize<
     V: Value<
@@ -2174,7 +2198,7 @@ pub fn linearize<
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
-    context.linearize(function, primals)
+    context.linearize(|input, ()| function(input), primals, ())
 }
 
 /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
@@ -2955,10 +2979,16 @@ mod tests {
         // `f(x) = sin(x)` at `x = 2` along the tangent `ẋ = 3`, the primal output is `sin(2)` and the tangent
         // output is `3 · cos(2)`.
         let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(|x| x.sin(), Array::scalar(2.0), Array::scalar(3.0))
+            .jvp(|x, ()| x.sin(), Array::scalar(2.0), Array::scalar(3.0), ())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(|input, scale| Ok(input * scale), Array::scalar(2.0), Array::scalar(1.0), Array::scalar(3.0))
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
 
         // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // A concrete array input recovers the eager array domain, so both dual halves are concrete.
@@ -2991,9 +3021,10 @@ mod tests {
         // is a rank-zero structural-zero array, and output structural zeros materialize with the same type.
         let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
-                |inputs| Ok(inputs),
+                |inputs, ()| Ok(inputs),
                 (Array::scalar(2.0f64), Array::scalar(3i32)),
                 (Array::scalar(1.0f64), zero.clone()),
+                (),
             )
             .unwrap();
         assert_eq!(value, (Array::scalar(2.0f64), Array::scalar(3i32)));
@@ -3001,12 +3032,17 @@ mod tests {
 
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(|token| Ok(token), token.clone(), zero.clone())
+            .jvp(|token, ()| Ok(token), token.clone(), zero.clone(), ())
             .unwrap();
         assert_eq!(value, token.clone());
         assert_eq!(tangent, zero.clone());
         assert!(matches!(
-            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(|token| Ok(token), token.clone(), token.clone()),
+            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(
+                |token, ()| Ok(token),
+                token.clone(),
+                token.clone(),
+                (),
+            ),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
@@ -3078,7 +3114,7 @@ mod tests {
         // returns the primal output together with a reusable pushforward: applying it pushes any number of tangents
         // through the Jacobian at that point without re-tracing or re-differentiating.
         let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .linearize(|x| x.sin(), Array::scalar(2.0))
+            .linearize(|x, ()| x.sin(), Array::scalar(2.0), ())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
@@ -3097,7 +3133,7 @@ mod tests {
         let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
         let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .linearize(|token| Ok(token), token.clone())
+            .linearize(|token, ()| Ok(token), token.clone(), ())
             .unwrap();
         assert_eq!(value, token.clone());
         assert_eq!(pushforward.apply(zero.clone()), Ok(zero.clone()));
@@ -3140,8 +3176,9 @@ mod tests {
         // its `cos` derivative can appear in the pushforward program.
         let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .linearize(
-                |(predicate, x)| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
+                |(predicate, x), ()| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
                 (Array::scalar(true), Array::scalar(3.0)),
+                (),
             )
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
