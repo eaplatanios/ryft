@@ -567,8 +567,8 @@ impl<Input, CaptureState, AuxiliaryOutputState, ContextState>
     /// inputs and differentiated outputs are complex, but it cannot prove that the function satisfies the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations). Runtime captures are
     /// exempt because they are fixed coefficients rather than coordinates of the differentiated map. Holomorphic mode
-    /// is available for Jacobian, Hessian, and scalar-gradient terminals. Linearization, Jacobian-Vector Products
-    /// (JVPs), and Vector-Jacobian Products (VJPs) do not define a separate holomorphic validation contract.
+    /// is available for Jacobian, Hessian, and scalar-gradient terminal functions. Jacobian-Vector Products (JVPs),
+    /// linearization, and Vector-Jacobian Products (VJPs) do not define a separate holomorphic validation contract.
     #[inline]
     pub fn holomorphic(
         self,
@@ -2488,9 +2488,9 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// let _ = differentiate_at(Array::scalar(2.0)).in_context(&first).in_context(&second);
 /// ```
 ///
-/// Holomorphic validation is intentionally unavailable for the Jacobian-Vector Product (JVP), linearization, and
-/// Vector-Jacobian Product (VJP) terminal functions, so those terminals do not exist in the [`HolomorphicLinearity`]
-/// state:
+/// Holomorphic validation is intentionally unavailable for the Jacobian-Vector Product (JVP), linearization,
+/// and Vector-Jacobian Product (VJP) terminal functions, so those terminal functions do not exist in the
+/// [`HolomorphicLinearity`] state:
 ///
 /// ```compile_fail
 /// # use std::ops::Mul;
@@ -2752,7 +2752,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_builder_jacobians_and_hessian_with_captures() {
+    fn test_differentiation_builder_jacobian_and_hessian_with_captures() {
         let primal = Array::scalar(2.0);
         let capture = Array::scalar(3.0);
 
@@ -2800,7 +2800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_builder_capture_free_terminals() {
+    fn test_differentiation_builder_capture_free_terminal_functions() {
         let primal = Array::scalar(2.0);
 
         // Capture-free scalar gradients retain the ergonomic unary closure shape.
@@ -2834,7 +2834,7 @@ mod tests {
             .trim_end(),
         );
 
-        // Higher-order terminals retain the same unary closure shape.
+        // Higher-order terminal functions retain the same unary closure shape.
         let hessian = differentiate_at(Array::scalar(2.0)).hessian(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(hessian.values()[0].to_f64s(), vec![2.0]);
     }
@@ -2977,7 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_builder_holomorphic_terminals_with_captures() {
+    fn test_differentiation_builder_holomorphic_terminal_functions_with_captures() {
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let capture = Array::scalar(ComplexNumber::new(3.0f32, -1.0));
         let (_, gradient) = differentiate_at(input)
