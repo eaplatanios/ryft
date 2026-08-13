@@ -27,28 +27,17 @@ use std::ops::{Add, Mul, Sub};
 
 use ryft::*;
 
-/// Trainable affine layer of an [`Mlp`].
 #[derive(Clone, Parameterized)]
 struct Linear<P: Parameter> {
-    /// Weights mapping input features to output features.
     weights: P,
-
-    /// Optional bias added to the output features.
     bias: Option<P>,
 }
 
 impl<P: Parameter> Linear<P> {
-    /// Creates a linear layer.
-    ///
-    /// # Parameters
-    ///
-    ///   - `weights`: Weights mapping input features to output features.
-    ///   - `bias`: Optional bias added to the output features.
     fn new(weights: P, bias: Option<P>) -> Self {
         Self { weights, bias }
     }
 
-    /// Applies this layer's affine transformation to `inputs`.
     fn forward(&self, inputs: &P) -> P
     where
         P: Clone + Add<Output = P> + Dot,
@@ -61,10 +50,8 @@ impl<P: Parameter> Linear<P> {
     }
 }
 
-/// Multi-layer perceptron represented as an ordered sequence of [`Linear`] layers.
 #[derive(Clone, Parameterized)]
 struct Mlp<P: Parameter> {
-    /// Layers ordered from the input projection through the output projection.
     layers: Vec<Linear<P>>,
 }
 
