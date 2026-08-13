@@ -4290,11 +4290,11 @@ macro_rules! check_operation_transposition {
 /// Asserts that the reverse-mode gradient of a function at an input matches a central finite-difference estimate of its
 /// derivative within an absolute tolerance. This is the standard oracle for testing operation gradient rules without
 /// hand-deriving the expected derivative and without trusting the machinery under test (i.e., the gradient side runs
-/// the function through [`gradient`](crate::gradient), while the finite-difference side evaluates the function directly
-/// on concrete values at the perturbed points, never touching the differentiation machinery that it is checking). That
-/// double instantiation is why this is a macro: the function must be a closure literal (or a generic function), and
-/// the macro instantiates it once over [`LinearizationTracer`](crate::LinearizationTracer) inputs and once over
-/// concrete [`Array`](crate::Array) inputs.
+/// the function through [`DifferentiationBuilder::gradient`](crate::DifferentiationBuilder::gradient), while the
+/// finite-difference side evaluates the function directly on concrete values at the perturbed points, never touching
+/// the differentiation machinery that it is checking). That double instantiation is why this is a macro: the function
+/// must be a closure literal (or a generic function), and the macro instantiates it once over
+/// [`LinearizationTracer`](crate::LinearizationTracer) inputs and once over concrete [`Array`](crate::Array) inputs.
 ///
 /// An `f64`-typed input estimates each ordinary partial derivative with `(f(x + h) - f(x - h)) / (2h)`, holding all
 /// other elements fixed. Rank-zero arrays therefore cover scalar functions without requiring a separate scalar value
@@ -4311,6 +4311,11 @@ macro_rules! check_operation_transposition {
 ///     fallible capability calls like `x.sin()` need no `.unwrap()`. Refer to [`MaybeFallible`](crate::MaybeFallible)
 ///     for the exact contract.
 ///   - `at = $input`: Expression convertible into the selected universe's value, at which the gradient is checked.
+///   - `with = $capture`: Optional single non-differentiated runtime capture, convertible into an
+///     [`Array`](crate::Array), that is passed as the function's second argument. The capture participates in the
+///     concrete and differentiated evaluations but is excluded from the gradient parameter tree. Structured capture
+///     trees are not accepted here and go through the builder API (i.e., `differentiate_at(...).with_captures(...)`)
+///     directly.
 ///   - `step = $step`: Central finite-difference spacing `h`.
 ///   - `tolerance = $tolerance`: Absolute tolerance for the comparison. Pick one compatible with the `O($step²)`
 ///     truncation error of the central difference.
@@ -4364,9 +4369,72 @@ macro_rules! check_gradient {
         let input: $crate::Array = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
-        let gradient = $crate::differentiation::gradient(pin_traced($function), input.clone()).unwrap();
+        let gradient = $crate::differentiation::differentiate_at(input.clone())
+            .gradient(pin_traced($function))
+            .unwrap();
 
         $crate::check_gradient!(@assert(gradient, pin_eager($function), input, step, tolerance))
+    }};
+
+    // This public branch evaluates an array function with nondifferentiated runtime captures through reverse-mode
+    // differentiation and concrete finite differences.
+    (
+        $function:expr,
+        at = $input:expr,
+        with = $capture:expr,
+        step = $step:expr,
+        tolerance = $tolerance:expr $(,)?
+    ) => {{
+        fn pin_traced<
+            __F: Fn(
+                $crate::differentiation::LinearizationTracer<
+                    $crate::contexts::EagerContext<
+                        $crate::Array,
+                        $crate::ArrayOperation<$crate::Array>,
+                    >,
+                >,
+                $crate::differentiation::LinearizationTracer<
+                    $crate::contexts::EagerContext<
+                        $crate::Array,
+                        $crate::ArrayOperation<$crate::Array>,
+                    >,
+                >,
+            ) -> __Output,
+            __Output,
+        >(function: __F) -> __F {
+            function
+        }
+
+        fn pin_eager<
+            __F: Fn($crate::Array, $crate::Array) -> __Output,
+            __Output: $crate::MaybeFallible<$crate::Array, $crate::ProgramError>,
+        >(
+            function: __F,
+        ) -> impl Fn($crate::Array, $crate::Array) -> $crate::Array {
+            move |input, captures| {
+                $crate::MaybeFallible::into_result(function(input, captures))
+                    .unwrap_or_else(|error| panic!("{error}"))
+            }
+        }
+
+        let input: $crate::Array = ::core::convert::Into::into($input);
+        let captures: $crate::Array = ::core::convert::Into::into($capture);
+        let step: f64 = $step;
+        let tolerance: f64 = $tolerance;
+        let gradient = $crate::differentiation::differentiate_at(input.clone())
+            .with_captures(captures.clone())
+            .gradient(pin_traced($function))
+            .unwrap();
+
+        $crate::check_gradient!(
+            @assert(
+                gradient,
+                move |input| pin_eager($function)(input, captures.clone()),
+                input,
+                step,
+                tolerance,
+            )
+        )
     }};
 
     // This internal branch checks a reverse-mode `$gradient` of the ℝⁿ → ℝ or ℂⁿ → ℝ function `$evaluate` at `$input`
@@ -6481,6 +6549,21 @@ mod tests {
         check_gradient!(
             |input| input.abs().map(|magnitudes| magnitudes.reduce(&[0], ReductionKind::Sum)),
             at = Array::vector(vec![Complex::new(0.7f64, -0.3), Complex::new(-1.2f64, 0.8)]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    fn test_check_gradient_with_captures() {
+        fn scaled_sum_squares<V: Clone + std::ops::Mul<Output = V> + Reduce>(input: V, scale: V) -> V {
+            (input.clone() * input).reduce(&[0], ReductionKind::Sum) * scale
+        }
+
+        check_gradient!(
+            scaled_sum_squares,
+            at = Array::vector(vec![0.7f64, -1.3, 2.1]),
+            with = Array::scalar(2.5),
             step = 1e-6,
             tolerance = 1e-6,
         );

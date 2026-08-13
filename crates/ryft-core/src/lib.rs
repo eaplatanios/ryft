@@ -55,19 +55,16 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, DenseDifferentiableType,
-    DerivativeTransform, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, BuilderContext, BuilderExecutionContext, CaptureValues,
+    CotangentBatchingPolicy, DenseDifferentiableType, DerivativeTransform, DerivedContext, DifferentiableOperation,
+    DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationParameterRole, DifferentiationTracer,
-    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock, HessianDifferentiate, Jacobian,
-    JacobianBlock, JacobianDifferentiate, LinearCallOperation, Linearization, LinearizationTracer,
-    MemberDifferentiableOperation, Pullback, Pushforward, ResidualZeroProvider, ReverseModeDifferentiate,
-    TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, binary_elementwise_jvp, gradient,
-    gradient_holomorphic, gradient_holomorphic_with_aux, gradient_with_aux, hessian, hessian_holomorphic,
-    hessian_holomorphic_with_aux, hessian_with_aux, jacobian_forward, jacobian_forward_holomorphic,
-    jacobian_forward_holomorphic_with_aux, jacobian_forward_with_aux, jacobian_reverse, jacobian_reverse_holomorphic,
-    jacobian_reverse_holomorphic_with_aux, jacobian_reverse_with_aux, jvp, jvp_projected_operation, linearize,
-    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp, value_and_gradient,
-    value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
+    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock, HessianDifferentiate, Holomorphic,
+    InContext, Jacobian, JacobianBlock, JacobianDifferentiate, LinearCallOperation, LinearityMode, Linearization,
+    LinearizationTracer, MemberDifferentiableOperation, NoAuxiliary, NoCaptures, Pullback, Pushforward, RealValued,
+    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver,
+    UnaryElementwiseJvpOperands, WithAuxiliary, binary_elementwise_jvp, differentiate_at, jvp_projected_operation,
+    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{

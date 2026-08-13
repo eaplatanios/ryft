@@ -86,9 +86,9 @@ dyn_hash::hash_trait_object!(CustomError);
 /// [`LinearizationTracer`](crate::LinearizationTracer) or a tracer/auxiliary tuple). A plain output can then never
 /// unify with [`Result`], which is what lets type inference select between the two implementations unambiguously.
 /// When `T` is itself a fully generic parameter inferred from the closure (e.g., the traced output structures of
-/// [`trace`](crate::trace), [`batch`](crate::batch), [`vjp`](crate::vjp), etc.), a [`Result`]-returning closure
-/// would make both implementations applicable and inference ambiguous, and so those entry points accept fallible
-/// closures only.
+/// [`trace`](crate::trace), [`batch`](crate::batch), and the [`differentiate_at`](crate::differentiate_at) mechanism),
+/// a [`Result`]-returning closure would make both implementations applicable and inference ambiguous, and so those
+/// entry points accept fallible closures only.
 pub trait MaybeFallible<T, E> {
     /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and converting the error type
     /// of already fallible outputs into `E`.

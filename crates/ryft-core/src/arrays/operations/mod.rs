@@ -515,7 +515,8 @@ mod tests {
         let context = TracingContext::<TestValue, TestOperation>::new();
         let key = context.input(key_type.clone().into());
         let accumulator = context.input(ArrayType::scalar(DataType::F64).into());
-        let (_, pullback) = context.vjp(|inputs: Vec<_>| Ok(inputs[1].clone()), vec![key, accumulator]).unwrap();
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![key, accumulator], ()).unwrap();
         let cotangent = context.input(ArrayType::scalar(DataType::F64).into());
 
         // The compact pullback has no result slot for the key's zero differential space. Rebuilding the public result
@@ -534,7 +535,8 @@ mod tests {
         let context = TracingContext::<TestValue, TestOperation>::new();
         let extent = context.input(extent_type.into());
         let key = context.input(key_type.clone().into());
-        let (_, pushforward) = context.linearize(|inputs: Vec<_>| Ok(inputs[1].clone()), vec![extent, key]).unwrap();
+        let (_, pushforward) =
+            context.linearize(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![extent, key], ()).unwrap();
         let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
         let key_tangent = context.input(key_type.tangent().into());
 
@@ -1644,7 +1646,7 @@ mod tests {
         let context = EagerContext::<TestValue, TestOperation>::new();
         let (value, pullback) = context
             .vjp(
-                |input: LinearizationTracer<_>| {
+                |input: LinearizationTracer<_>, ()| {
                     let context = input.context().clone();
                     Ok(context
                         .bind(
@@ -1655,6 +1657,7 @@ mod tests {
                         .remove(0))
                 },
                 ArrayIrValue::Array(Array::scalar(5.0_f64)),
+                (),
             )
             .unwrap();
         let gradient = pullback.apply(ArrayIrValue::Array(Array::scalar(1.0_f64))).unwrap();
@@ -1678,7 +1681,7 @@ mod tests {
         let context = TestContext::new();
         let (primal, tangent) = context
             .jvp(
-                |input| {
+                |input, ()| {
                     let context = input.context().clone();
                     let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64)))?;
                     Ok(context
@@ -1691,6 +1694,7 @@ mod tests {
                 },
                 ArrayIrValue::Array(Array::scalar(2.0_f64)),
                 ArrayIrValue::Array(Array::scalar(4.0_f64)),
+                (),
             )
             .unwrap();
         assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64)));
@@ -1700,7 +1704,7 @@ mod tests {
         // replay input to the homogeneous multiply transpose rule.
         let (primal, pullback) = context
             .vjp(
-                |input| {
+                |input, ()| {
                     let context = input.context().clone();
                     let factor = context.lift(ArrayIrValue::Array(Array::scalar(3.0_f64)))?;
                     Ok(context
@@ -1712,6 +1716,7 @@ mod tests {
                         .remove(0))
                 },
                 ArrayIrValue::Array(Array::scalar(2.0_f64)),
+                (),
             )
             .unwrap();
         assert_eq!(primal, ArrayIrValue::Array(Array::scalar(6.0_f64)));

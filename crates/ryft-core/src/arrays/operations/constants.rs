@@ -892,12 +892,13 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let (primal, tangent) = context
             .jvp(
-                move |extent| {
+                move |extent, ()| {
                     let context = extent.context().clone();
                     Ok(context.bind(ZeroOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
                 },
                 extent,
                 extent_tangent,
+                (),
             )
             .unwrap();
         assert_eq!(primal.atom_id(), tangent.atom_id());
@@ -955,12 +956,13 @@ mod tests {
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let (primal, tangent) = context
             .jvp(
-                move |extent| {
+                move |extent, ()| {
                     let context = extent.context().clone();
                     Ok(context.bind(OneOperation::new(dynamic_type), Vec::new(), &[extent])?.remove(0))
                 },
                 ArrayIrValue::Dimension(DimensionValue::new(extent_type, 3).unwrap()),
                 ArrayIrValue::Array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
+                (),
             )
             .unwrap();
         assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
@@ -1336,7 +1338,8 @@ mod tests {
 
         // Value-level reverse mode runs inside the outer trace. It saves only the disconnected array's extent, and
         // the reusable pullback consumes that dimension residual through the mixed zero constructor.
-        let (_, pullback) = context.vjp(|inputs: Vec<_>| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar]).unwrap();
+        let (_, pullback) =
+            context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
         assert_eq!(pullback.residuals().len(), 1);
         assert!(matches!(pullback.residuals()[0].r#type().as_ref(), ArrayIrType::Dimension(_)));
         let zero = pullback.program().instructions().last().unwrap();

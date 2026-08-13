@@ -602,7 +602,7 @@ mod tests {
         let eager = EagerContext::<TestValue, TestOperation>::new();
         let (primal, tangent) = eager
             .jvp(
-                |inputs| {
+                |inputs, ()| {
                     let context = inputs[0].context().clone();
                     context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())
                 },
@@ -614,6 +614,7 @@ mod tests {
                     array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
                     array(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()),
                 ],
+                (),
             )
             .unwrap();
         assert_eq!(primal, vec![array(Array::vector(vec![0.0_f64; 3]))]);
@@ -657,12 +658,13 @@ mod tests {
         let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
         let (_, tangent) = context
             .jvp(
-                |inputs| {
+                |inputs, ()| {
                     let context = inputs[0].context().clone();
                     Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
                 },
                 vec![predicate, extent],
                 vec![predicate_tangent, extent_tangent],
+                (),
             )
             .unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(output_type.clone()));
@@ -673,11 +675,12 @@ mod tests {
         let extent = context.input(extent_type.clone().into());
         let (_, pushforward) = context
             .linearize(
-                |inputs| {
+                |inputs, ()| {
                     let context = inputs[0].context().clone();
                     Ok(context.bind(ConditionOperation::new(), vec![branch(), branch()], inputs.as_slice())?.remove(0))
                 },
                 vec![predicate, extent],
+                (),
             )
             .unwrap();
         let predicate_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
