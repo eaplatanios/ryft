@@ -1418,11 +1418,12 @@ mod tests {
     use ryft_core::{
         Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Broadcast,
         CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh,
-        DifferentiableType, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, HessianDifferentiate, Iota,
-        Jacobian, JacobianDifferentiate, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, Reshape, ReverseModeDifferentiate, Select, Shape, Sharding,
-        ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
+        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian,
+        HessianDifferentiate, Iota, Jacobian, JacobianDifferentiate, LogicalMesh, Logistic, MeshAxis, MeshAxisType,
+        Mul, OneLike, ProgramError, ProjectedValue, Reduce, ReductionKind, Reshape, ReverseModeDifferentiate, Select,
+        Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -3577,7 +3578,8 @@ mod tests {
             |_, input: XlaCompileTracer<'_>| {
                 input
                     .dispatch_domain()
-                    .gradient(|value, ()| Mul::mul(&value, &value), input, ())
+                    .differentiate_at(input)
+                    .gradient(|value| Mul::mul(&value, &value))
                     .expect("the eager gradient should stage inside the jit boundary")
             },
             &domain,

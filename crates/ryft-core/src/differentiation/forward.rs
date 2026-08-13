@@ -1020,9 +1020,10 @@ where
     }
 }
 
-/// Value type flowing through the closures of the partial-evaluation-backed differentiation entry points (i.e.,
-/// [`ForwardModeDifferentiate::linearize`], [`ReverseModeDifferentiate::vjp`](crate::ReverseModeDifferentiate::vjp),
-/// [`ReverseModeDifferentiate::gradient`](crate::ReverseModeDifferentiate::gradient), and their derivatives). It is a
+/// Value type flowing through the closures of the partial-evaluation-backed differentiation entry points
+/// (i.e., [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize),
+/// [`DifferentiationBuilder::vjp`](crate::DifferentiationBuilder::vjp),
+/// [`DifferentiationBuilder::gradient`](crate::DifferentiationBuilder::gradient), and their derivatives). It is a
 /// [`DifferentiationTracer`] dual over a [`PartialEvaluationContext`] wrapping the context `C` the transform runs in.
 /// Its primal half is a *known* partial-evaluation value carrying a concrete value under an eager `C` (so that e.g.,
 /// host control flow on primal values works as expected) and its tangent half is *unknown*, accumulating the

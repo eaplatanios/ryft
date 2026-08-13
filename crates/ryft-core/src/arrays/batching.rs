@@ -3318,9 +3318,7 @@ mod tests {
         RecursiveBatchingPolicy, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{
-        ForwardModeDifferentiate, LinearCallOperation, LinearizationTracer, ReverseModeDifferentiate,
-    };
+    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearCallOperation, LinearizationTracer};
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatterOperation,
     };
@@ -4571,24 +4569,21 @@ mod tests {
         // operation on the differentiated value; the gradient must flow back through the broadcast's transpose rule
         // (a sum-reduction over the batch axis).
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let y = context.lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |(item, shift)| Ok(item * shift),
-                        (y, x),
-                        (BatchAxis::new(0), BatchAxis::replicated()),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::scalar(2.0),
-                (),
-            )
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let y = context.lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                    &context,
+                    |(item, shift)| Ok(item * shift),
+                    (y, x),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
         assert_eq!(gradient.to_f64s(), vec![10.0]);
@@ -4621,7 +4616,8 @@ mod tests {
                 |x| {
                     let context = x.context().clone();
                     Ok(context
-                        .value_and_gradient(|y, ()| y.clone() * y, x, ())
+                        .differentiate_at(x)
+                        .value_and_gradient(|y| y.clone() * y)
                         .expect("scalar value_and_gradient should succeed"))
                 },
                 Array::vector(vec![2.0, 3.0]),
@@ -4661,23 +4657,20 @@ mod tests {
     #[test]
     fn test_context_batch_composes_inside_value_and_gradient() {
         let (value, gradient): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| Ok(item.clone() * item),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![2.0, 3.0]),
-                (),
-            )
+            .differentiate_at(Array::vector(vec![2.0, 3.0]))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                    &context,
+                    |item| Ok(item.clone() * item),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
         assert_eq!(gradient.to_f64s(), vec![4.0, 6.0]);

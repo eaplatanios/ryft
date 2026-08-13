@@ -8920,13 +8920,14 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
         AndOperation, Array as CpuArray, ArrayOperation, Atan2Operation, BroadcastOperation, CompareOperation,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos, Dimension, DimensionAddOperation,
-        DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType, DimensionVariable, DivOperation,
-        Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-        EagerContext, Fill, LogicalMesh, MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation,
-        PadOperation, Placeholder, ProgramBuilder, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate,
-        ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError,
-        UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos, Differentiate, Dimension,
+        DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
+        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation,
+        DynamicUpdateSliceOperation, EagerContext, Fill, LogicalMesh, MeshAxis, MeshAxisType, OneLike,
+        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, ReduceOperation,
+        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension,
+        Sin, SliceOperation, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
+        ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -14114,7 +14115,8 @@ mod tests {
                 |x| {
                     let context = x.context().clone();
                     Ok(context
-                        .gradient(|input, ()| scalar_quartic_plus_sin(input), x, ())
+                        .differentiate_at(x)
+                        .gradient(scalar_quartic_plus_sin)
                         .expect("scalar gradient should succeed"))
                 },
                 CpuArray::scalar(2.0),
@@ -15338,7 +15340,8 @@ mod tests {
                 |inputs| {
                     let context = inputs.0.context().clone();
                     Ok(context
-                        .gradient(|input, ()| scalar_bilinear_sin(input), inputs, ())
+                        .differentiate_at(inputs)
+                        .gradient(scalar_bilinear_sin)
                         .expect("scalar gradient should succeed"))
                 },
                 (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),

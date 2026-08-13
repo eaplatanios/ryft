@@ -1131,7 +1131,7 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{
-        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
+        Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::operations::{
         Cos, CosOperation, Dot, DotDimensionNumbers, MulOperation, Reduce, ReductionKind, Sin, SinOperation,
@@ -1474,31 +1474,28 @@ mod tests {
         // rule: batching preserves the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| {
-                            let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                            Ok(item
-                                .context()
-                                .bind(operation, operation_regions, &[item.clone()])?
-                                .into_iter()
-                                .next()
-                                .unwrap())
-                        },
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![0.5, 1.0]),
-                (),
-            )
+            .differentiate_at(Array::vector(vec![0.5, 1.0]))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                    &context,
+                    |item| {
+                        let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                        Ok(item
+                            .context()
+                            .bind(operation, operation_regions, &[item.clone()])?
+                            .into_iter()
+                            .next()
+                            .unwrap())
+                    },
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
@@ -1526,14 +1523,11 @@ mod tests {
     #[test]
     fn test_custom_jvp_governs_reverse_mode() {
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
-                },
-                Array::scalar(3.0),
-                (),
-            )
+            .differentiate_at(Array::scalar(3.0))
+            .value_and_gradient(|x| {
+                let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
@@ -1546,28 +1540,22 @@ mod tests {
         // itself differentiable and arbitrary-order differentiation composes (as it does through JAX's `custom_jvp`).
         // The doubled rule makes the first derivative `2 cos(x)`, so the second derivative is `-2 sin(x)`.
         let (gradient, second_derivative) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    context
-                        .gradient(
-                            |y, ()| {
-                                let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
-                                y.context()
-                                    .bind(operation, operation_regions, &[y.clone()])
-                                    .unwrap()
-                                    .into_iter()
-                                    .next()
-                                    .unwrap()
-                            },
-                            x,
-                            (),
-                        )
-                        .unwrap()
-                },
-                Array::scalar(0.7),
-                (),
-            )
+            .differentiate_at(Array::scalar(0.7))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                context
+                    .differentiate_at(x)
+                    .gradient(|y| {
+                        let (operation, operation_regions) = custom_jvp_sin(&test_type(&[]));
+                        y.context()
+                            .bind(operation, operation_regions, &[y.clone()])
+                            .unwrap()
+                            .into_iter()
+                            .next()
+                            .unwrap()
+                    })
+                    .unwrap()
+            })
             .unwrap();
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 0.7f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(second_derivative.to_f64s()[0], -2.0 * 0.7f64.sin(), epsilon = 1e-9);
@@ -1733,31 +1721,28 @@ mod tests {
         // The reverse-mode analogue of the custom-JVP batching test: the (deliberately tripled) custom backward rule
         // governs the gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| {
-                            let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
-                            Ok(item
-                                .context()
-                                .bind(operation, operation_regions, &[item.clone()])?
-                                .into_iter()
-                                .next()
-                                .unwrap())
-                        },
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::vector(vec![0.5, 1.0]),
-                (),
-            )
+            .differentiate_at(Array::vector(vec![0.5, 1.0]))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
+                    &context,
+                    |item| {
+                        let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                        Ok(item
+                            .context()
+                            .bind(operation, operation_regions, &[item.clone()])?
+                            .into_iter()
+                            .next()
+                            .unwrap())
+                    },
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
@@ -1767,14 +1752,11 @@ mod tests {
     #[test]
     fn test_custom_vjp_governs_reverse_mode() {
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
-                    x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
-                },
-                Array::scalar(2.0),
-                (),
-            )
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| {
+                let (operation, operation_regions) = custom_vjp_sin(&test_type(&[]));
+                x.context().bind(operation, operation_regions, &[x.clone()]).unwrap().into_iter().next().unwrap()
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom backward rule triples the true gradient, proving it is in control.
@@ -1895,7 +1877,8 @@ mod tests {
         assert_abs_diff_eq!(tangent.to_f64s()[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(3.0), ())
+            .differentiate_at(Array::scalar(3.0))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
@@ -1936,7 +1919,8 @@ mod tests {
             },
         );
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(2.0), ())
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
@@ -1969,11 +1953,8 @@ mod tests {
             },
         );
         let (value, (gradient_x, gradient_y)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |(x, y), ()| function.call((x, y)).unwrap(),
-                (Array::scalar(2.0), Array::scalar(5.0)),
-                (),
-            )
+            .differentiate_at((Array::scalar(2.0), Array::scalar(5.0)))
+            .value_and_gradient(|(x, y)| function.call((x, y)).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 10.0, epsilon = 1e-9);
         // The custom rule triples the true gradients `(y, x)`.
@@ -1992,7 +1973,8 @@ mod tests {
             |(), cotangent: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok(cotangent.clone() + cotangent),
         );
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(2.0), ())
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0, epsilon = 1e-9);

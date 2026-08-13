@@ -283,12 +283,12 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, CoordinateBasisOperation, Cos, Device, DeviceMesh, Dimension, DimensionBounds, Dot, Erf,
-        Exp, Floor, ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate, Log, LogicalMesh, Logistic,
-        Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
-        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
-        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
+        ConvertElementType, CoordinateBasisOperation, Cos, Device, DeviceMesh, Differentiate, Dimension,
+        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate,
+        Log, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce,
+        ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt,
+        StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -835,7 +835,8 @@ mod tests {
             |(), cotangent| Ok(cotangent),
         );
         let (value, gradient) = domain
-            .value_and_gradient(|x, ()| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum), input, ())
+            .differentiate_at(input)
+            .value_and_gradient(|x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum))
             .unwrap();
         assert_eq!(read_f32s(&value), vec![6.0]);
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
@@ -1637,13 +1638,10 @@ mod tests {
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
         let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(scale, mask, None, None);
         let (loss, (query_gradient, key_gradient, value_gradient)) = domain
-            .value_and_gradient(
-                |(query, key, value), ()| {
-                    function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                },
-                (query, key, value),
-                (),
-            )
+            .differentiate_at((query, key, value))
+            .value_and_gradient(|(query, key, value)| {
+                function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            })
             .unwrap();
 
         let reference_function = differentiable_dot_product_attention::<EagerContext<CpuArray, ArrayOperation<CpuArray>>>(
@@ -1651,17 +1649,14 @@ mod tests {
         );
         let (reference_loss, (reference_query_gradient, reference_key_gradient, reference_value_gradient)) =
             EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-                .value_and_gradient(
-                    |(query, key, value), ()| {
-                        reference_function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                    },
-                    (
-                        reference(&query_values, &query_dimensions),
-                        reference(&key_values, &key_value_dimensions),
-                        reference(&value_values, &key_value_dimensions),
-                    ),
-                    (),
-                )
+                .differentiate_at((
+                    reference(&query_values, &query_dimensions),
+                    reference(&key_values, &key_value_dimensions),
+                    reference(&value_values, &key_value_dimensions),
+                ))
+                .value_and_gradient(|(query, key, value)| {
+                    reference_function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                })
                 .unwrap();
         assert!((f64::from(read_f32s(&loss)[0]) - reference_loss.to_f64s()[0]).abs() < 1e-5);
         for (device_gradient, reference_gradient) in [
@@ -1993,14 +1988,11 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let (value, gradient) = domain
-            .value_and_gradient(
-                |x, ()| {
-                    let squared = Mul::mul(&x, &x).unwrap();
-                    squared.reduce(&[0], ReductionKind::Sum)
-                },
-                x.clone(),
-                (),
-            )
+            .differentiate_at(x.clone())
+            .value_and_gradient(|x| {
+                let squared = Mul::mul(&x, &x).unwrap();
+                squared.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
@@ -2016,14 +2008,11 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let gradient = domain
-            .gradient(
-                |x, ()| {
-                    let squared = Mul::mul(&x, &x).unwrap();
-                    squared.reduce(&[0], ReductionKind::Sum)
-                },
-                x.clone(),
-                (),
-            )
+            .differentiate_at(x.clone())
+            .gradient(|x| {
+                let squared = Mul::mul(&x, &x).unwrap();
+                squared.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
     }
@@ -2067,7 +2056,8 @@ mod tests {
 
         // Holomorphic gradient of z² through the XLA eager domain: the `one` cotangent seed lowers through the
         // composed complex constant, and the pullback recovers ∂(z²)/∂z = 2z on device.
-        let (value, gradient) = domain.value_and_gradient_holomorphic(|x, ()| x.clone() * x, x.clone(), ()).unwrap();
+        let (value, gradient) =
+            domain.differentiate_at(x.clone()).holomorphic().value_and_gradient(|x| x.clone() * x).unwrap();
         assert_c64_close(read_c64s(&value)[0], z * z);
         assert_c64_close(read_c64s(&gradient)[0], z + z);
 
@@ -2077,8 +2067,11 @@ mod tests {
         let x_value = num_complex::Complex::new(-0.3f32, 0.4f32);
         let y_array = c64_scalar(&client, &mesh, y);
         let x_array = c64_scalar(&client, &mesh, x_value);
-        let (value, (y_gradient, x_gradient)) =
-            domain.value_and_gradient_holomorphic(|(y, x), ()| y.atan2(&x), (y_array, x_array), ()).unwrap();
+        let (value, (y_gradient, x_gradient)) = domain
+            .differentiate_at((y_array, x_array))
+            .holomorphic()
+            .value_and_gradient(|(y, x)| y.atan2(&x))
+            .unwrap();
         let denominator = x_value * x_value + y * y;
         let imaginary_unit = num_complex::Complex::new(0.0f32, 1.0f32);
         assert_c64_close(
@@ -2091,7 +2084,8 @@ mod tests {
         // ℂ → ℝ gradient of |z|² = Re(z · z̄) through the plain entry point, exercising the `conjugate` (lowered as
         // `complex(real, -imag)`), `real`, and `complex` StableHLO lowerings in the pullback: the gradient is 2·z̄.
         let gradient = domain
-            .gradient(|x, ()| (x.clone() * x.conjugate().unwrap()).real().unwrap(), x.clone(), ())
+            .differentiate_at(x.clone())
+            .gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap())
             .unwrap();
         assert_c64_close(read_c64s(&gradient)[0], (z + z).conj());
     }
@@ -2104,15 +2098,13 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let ((value, aux), gradient): ((Array<'_>, Array<'_>), Array<'_>) = domain
-            .value_and_gradient_with_aux(
-                |x, ()| {
-                    let squared = Mul::mul(&x, &x).unwrap();
-                    let aux = Add::add(&x, &x).unwrap();
-                    (squared.reduce(&[0], ReductionKind::Sum), aux)
-                },
-                x.clone(),
-                (),
-            )
+            .differentiate_at(x.clone())
+            .with_aux()
+            .value_and_gradient(|x| {
+                let squared = Mul::mul(&x, &x).unwrap();
+                let aux = Add::add(&x, &x).unwrap();
+                (squared.reduce(&[0], ReductionKind::Sum), aux)
+            })
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
         assert_eq!(read_f32s(&aux), vec![2.0, 4.0, 6.0]);
@@ -2179,15 +2171,12 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let gradient = domain
-            .gradient(
-                |x, ()| {
-                    let squared =
-                        batch(|item| Ok(item.clone() * item), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
-                    squared.reduce(&[0], ReductionKind::Sum)
-                },
-                x.clone(),
-                (),
-            )
+            .differentiate_at(x.clone())
+            .gradient(|x| {
+                let squared =
+                    batch(|item| Ok(item.clone() * item), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+                squared.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
     }

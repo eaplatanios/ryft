@@ -13,9 +13,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use ryft_core::{
-    Array, ArrayOperation, ArrayType, Context, DataType, DifferentiationError, Dimension, Dot, DotDimensionNumbers,
-    EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program, ProgramError,
-    ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin,
+    Array, ArrayOperation, ArrayType, Context, DataType, Differentiate, DifferentiationError, Dimension, Dot,
+    DotDimensionNumbers, EagerContext, ForwardModeDifferentiate, LogicalMesh, MeshAxis, MeshAxisType, Program,
+    ProgramError, ProgramStatistics, ReverseModeDifferentiate, Shape, Sharding, ShardingDimension, Sin,
 };
 use ryft_xla::experimental::{ShardMapTraceError, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
@@ -211,7 +211,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, StatisticsEr
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar case function.
-                context.gradient(|input, ()| quartic_plus_sin(input), x, ()).map_err(|error| match error {
+                context.differentiate_at(x).gradient(quartic_plus_sin).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
@@ -230,7 +230,7 @@ fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar case function.
-                context.value_and_gradient(|input, ()| quartic_plus_sin(input), x, ()).map_err(|error| match error {
+                context.differentiate_at(x).value_and_gradient(quartic_plus_sin).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })

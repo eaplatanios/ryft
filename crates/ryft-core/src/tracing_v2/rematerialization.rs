@@ -2240,7 +2240,7 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::RegionRole;
@@ -2344,13 +2344,13 @@ mod tests {
         let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (direct_value, direct_gradient) =
-            domain.value_and_gradient(|x, ()| dot_sine(x), input.clone(), ()).unwrap();
+            domain.differentiate_at(input.clone()).value_and_gradient(|x| dot_sine(x)).unwrap();
         fn check(policy: impl TestPolicy, input: &Array, direct_value: &Array, expected_gradient: &[f64]) {
             let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
             let function =
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(dot_sine_body).with_policy(policy);
             let (value, gradient) =
-                domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input.clone(), ()).unwrap();
+                domain.differentiate_at(input.clone()).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             assert_abs_diff_eq!(value.to_f64s()[0], direct_value.to_f64s()[0], epsilon = 1e-9);
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
@@ -2424,7 +2424,8 @@ mod tests {
             let forward_output_count = operation.forward().output_types().len();
 
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-                .value_and_gradient(|carry, ()| function.call(carry).unwrap(), Array::scalar(2.0), ())
+                .differentiate_at(Array::scalar(2.0))
+                .value_and_gradient(|carry| function.call(carry).unwrap())
                 .unwrap();
             assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * expected_gradient, epsilon = 1e-9);
             assert_abs_diff_eq!(gradient.to_f64s()[0], expected_gradient, epsilon = 1e-9);
@@ -2627,11 +2628,8 @@ mod tests {
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(body).with_policy(policy);
             let forward_output_count = staged_operation(&function, vector_type(2)).forward().output_types().len();
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-                .value_and_gradient(
-                    |input, ()| function.call(input).unwrap(),
-                    Array::from_f64s(vector_type(2), vec![0.5, 1.5]),
-                    (),
-                )
+                .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.5]))
+                .value_and_gradient(|input| function.call(input).unwrap())
                 .unwrap();
             (forward_output_count, value.to_f64s()[0], gradient.to_f64s())
         }
@@ -2693,8 +2691,10 @@ mod tests {
             .unwrap();
         assert_eq!(primal, Array::scalar(4.0));
         assert_eq!(tangent, Array::scalar(4.0));
-        let (value, gradient) =
-            domain.value_and_gradient(|x, ()| (x.clone() * x).tag("square"), Array::scalar(3.0), ()).unwrap();
+        let (value, gradient) = domain
+            .differentiate_at(Array::scalar(3.0))
+            .value_and_gradient(|x| (x.clone() * x).tag("square"))
+            .unwrap();
         assert_eq!(value, Array::scalar(9.0));
         assert_eq!(gradient, Array::scalar(6.0));
     }
@@ -2725,7 +2725,7 @@ mod tests {
             );
             // Every policy preserves the gradient; only the save/recompute split changes.
             let (_, gradient) =
-                domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input.clone(), ()).unwrap();
+                domain.differentiate_at(input.clone()).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             for (index, expected) in expected.iter().enumerate() {
                 assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
@@ -2777,8 +2777,10 @@ mod tests {
         )
         .with_policy(EverythingSaveable);
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let (value, gradient) =
-            domain.value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(2.0), ()).unwrap();
+        let (value, gradient) = domain
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
@@ -2906,7 +2908,7 @@ mod tests {
         let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
-        let (value, gradient) = domain.value_and_gradient(|x, ()| outer.call(x).unwrap(), input, ()).unwrap();
+        let (value, gradient) = domain.differentiate_at(input).value_and_gradient(|x| outer.call(x).unwrap()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], expected_value, epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
             assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
@@ -2989,7 +2991,7 @@ mod tests {
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
         let (value, gradient) =
-            domain.value_and_gradient(|x, ()| outer.call(x).unwrap(), Array::scalar(0.7), ()).unwrap();
+            domain.differentiate_at(Array::scalar(0.7)).value_and_gradient(|x| outer.call(x).unwrap()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.49f64.sin() * 0.7, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos(), epsilon = 1e-9);
     }
@@ -3094,23 +3096,14 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (value, gradient) = domain
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| function.call(item),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::from_f64s(vector_type(2), vec![0.5, 1.0]),
-                (),
-            )
+            .differentiate_at(Array::from_f64s(vector_type(2), vec![0.5, 1.0]))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
+                    Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
+                        .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
         assert_abs_diff_eq!(value.to_f64s()[0], 0.25f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
@@ -3160,11 +3153,15 @@ mod tests {
 
         // Cache hits still differentiate correctly: the second gradient call reuses the derivation staged by the
         // first one.
-        let (_, first_gradient) =
-            domain.value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(0.7), ()).unwrap();
+        let (_, first_gradient) = domain
+            .differentiate_at(Array::scalar(0.7))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
         let derivations_after_first_gradient = trace_count.get();
-        let (_, second_gradient) =
-            domain.value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(0.7), ()).unwrap();
+        let (_, second_gradient) = domain
+            .differentiate_at(Array::scalar(0.7))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
         assert_abs_diff_eq!(first_gradient.to_f64s()[0], 2.0 * 0.7 * 0.49f64.cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(second_gradient.to_f64s()[0], first_gradient.to_f64s()[0], epsilon = 1e-9);
@@ -3278,7 +3275,8 @@ mod tests {
             );
             // Custom policies only change the save/recompute split, never the gradient.
             let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
-            let (_, gradient) = domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input, ()).unwrap();
+            let (_, gradient) =
+                domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
@@ -3317,14 +3315,11 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (gradient, second_derivative) = domain
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    context.gradient(|y, ()| function.call(y).unwrap(), x, ()).unwrap()
-                },
-                Array::scalar(0.7),
-                (),
-            )
+            .differentiate_at(Array::scalar(0.7))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                context.differentiate_at(x).gradient(|y| function.call(y).unwrap()).unwrap()
+            })
             .unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
@@ -3441,7 +3436,7 @@ mod tests {
             );
             // Offloading changes placement, never values: gradients match the direct computation.
             let (_, gradient) =
-                domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input.clone(), ()).unwrap();
+                domain.differentiate_at(input.clone()).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
             }
@@ -3470,7 +3465,8 @@ mod tests {
 
         let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
-        let (value, gradient) = domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input, ()).unwrap();
+        let (value, gradient) =
+            domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
         assert_abs_diff_eq!(value.to_f64s()[0], u * u.sin(), epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
@@ -3521,7 +3517,7 @@ mod tests {
         // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
         let input = Array::from_f64s(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
-        let (_, gradient) = domain.value_and_gradient(|x, ()| function.call(x).unwrap(), input, ()).unwrap();
+        let (_, gradient) = domain.differentiate_at(input).value_and_gradient(|x| function.call(x).unwrap()).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
             assert_abs_diff_eq!(gradient.to_f64s()[index], *expected, epsilon = 1e-9);
         }
@@ -3561,23 +3557,14 @@ mod tests {
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
         let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
         let (_, gradient) = domain
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
-                        &context,
-                        |item| function.call(item),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
-                    mapped.reduce(&[0], ReductionKind::Sum)
-                },
-                Array::from_f64s(matrix_type, rows.as_flattened().to_vec()),
-                (),
-            )
+            .differentiate_at(Array::from_f64s(matrix_type, rows.as_flattened().to_vec()))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> =
+                    Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
+                        .unwrap();
+                mapped.reduce(&[0], ReductionKind::Sum)
+            })
             .unwrap();
         for (row, values) in rows.iter().enumerate() {
             let expected_row_gradient = dot_sine_gradient(values);
@@ -4052,7 +4039,8 @@ mod tests {
 
         // f(x) = x² · x = x³, so f'(x) = 3x².
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(2.0), ())
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 12.0, epsilon = 1e-9);
@@ -4083,7 +4071,8 @@ mod tests {
 
         // f(x) = (x²)² · x = x⁵, so f'(x) = 5x⁴.
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(1.5), ())
+            .differentiate_at(Array::scalar(1.5))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 1.5f64.powi(5), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 5.0 * 1.5f64.powi(4), epsilon = 1e-9);
@@ -4177,23 +4166,21 @@ mod tests {
         )
         .with_policy(policy);
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(|x, ()| function.call(x).unwrap(), Array::scalar(1.1), ())
+            .differentiate_at(Array::scalar(1.1))
+            .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
         // x -> x^2 -> x^4 -> x^8 (three squarings before the predicate 1.1^8 > 8 stops the loop... the exact
         // iteration count is loop-driven; the assertions below only require derivative consistency).
         let direct = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .value_and_gradient(
-                |x, ()| {
-                    let context = x.context().clone();
-                    let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
-                    let outputs = context
-                        .bind(ArrayOperation::While(operation), vec![condition.clone(), body.clone()], &[x])
-                        .unwrap();
-                    outputs.into_iter().next().unwrap()
-                },
-                Array::scalar(1.1),
-                (),
-            )
+            .differentiate_at(Array::scalar(1.1))
+            .value_and_gradient(|x| {
+                let context = x.context().clone();
+                let operation = WhileOperation::new().with_iteration_bound(3).unwrap();
+                let outputs = context
+                    .bind(ArrayOperation::While(operation), vec![condition.clone(), body.clone()], &[x])
+                    .unwrap();
+                outputs.into_iter().next().unwrap()
+            })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], direct.0.to_f64s()[0], epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], direct.1.to_f64s()[0], epsilon = 1e-9);

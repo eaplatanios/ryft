@@ -2466,7 +2466,7 @@ mod tests {
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
+        Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::one::One;
@@ -3721,17 +3721,14 @@ mod tests {
         // `value_and_gradient` composes the same machinery end to end.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
         let (value, gradient) = StagedDispatchTestDomain
-            .value_and_gradient(
-                move |x, ()| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::scalar(1.0),
-                (),
-            )
+            .differentiate_at(Array::scalar(1.0))
+            .value_and_gradient(move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![8.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
@@ -3816,22 +3813,19 @@ mod tests {
         let while_regions = vec![condition, body];
 
         let (value, gradient) = StagedDispatchTestDomain
-            .value_and_gradient(
-                move |x, ()| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    let state = outputs.remove(0);
-                    let mut outputs = state
-                        .context()
-                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[state.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::vector(vec![1.5, 2.0]),
-                (),
-            )
+            .differentiate_at(Array::vector(vec![1.5, 2.0]))
+            .value_and_gradient(move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                let state = outputs.remove(0);
+                let mut outputs = state
+                    .context()
+                    .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), &[state.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![21.0625]);
         assert_eq!(gradient.to_f64s(), vec![13.5, 32.0]);
@@ -3908,17 +3902,14 @@ mod tests {
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         let (value, gradient) = StagedDispatchTestDomain
-            .value_and_gradient(
-                move |x, ()| {
-                    let mut outputs = x
-                        .context()
-                        .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
-                        .unwrap();
-                    outputs.remove(0)
-                },
-                Array::scalar(2.0),
-                (),
-            )
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(move |x| {
+                let mut outputs = x
+                    .context()
+                    .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
+                    .unwrap();
+                outputs.remove(0)
+            })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
