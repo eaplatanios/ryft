@@ -2766,7 +2766,7 @@ mod tests {
         let ((value, aux), gradient): ((Array, Array), (Array, Array)) =
             EagerContext::<Array, ArrayOperation<Array>>::new()
                 .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-                .with_aux()
+                .with_auxiliary()
                 .value_and_gradient(|(x, y)| (x.clone() * y.clone(), x + y))
                 .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 6.0, epsilon = 1e-9);
@@ -2778,7 +2778,7 @@ mod tests {
         // gradient of `x * y`).
         let ((value, aux), gradient): ((Array, (Array, Array)), (Array, Array)) =
             differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-                .with_aux()
+                .with_auxiliary()
                 .value_and_gradient(|(x, y)| {
                     let value = x.clone() * y.clone();
                     let aux = (x.clone() + y, x.clone() * x);
@@ -2793,7 +2793,7 @@ mod tests {
         // leaves, whose cotangent type is the first-class zero space, and for differentiable storage representations
         // such as E8M0, whose cotangent type is widened to F32 and can represent zero.
         let ((value, aux), gradient): ((Array, (Array, Array)), Array) = differentiate_at(Array::scalar(2.0))
-            .with_aux()
+            .with_auxiliary()
             .value_and_gradient(|x| {
                 let integer = x.context().constant(Array::scalar(7i32))?;
                 let e8m0 = x
@@ -2815,7 +2815,7 @@ mod tests {
         // The auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
         let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-            .with_aux()
+            .with_auxiliary()
             .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
             .unwrap();
         assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
@@ -2823,7 +2823,7 @@ mod tests {
 
         // The builder recovers the eager domain from the concrete primals and agrees.
         let (free_gradient, aux): ((Array, Array), Array) = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-            .with_aux()
+            .with_auxiliary()
             .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
             .unwrap();
         assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
@@ -2837,7 +2837,7 @@ mod tests {
         let z = Complex::new(0.7f64, -0.3f64);
         let ((value, aux), gradient): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at(Array::scalar(z))
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .value_and_gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
@@ -2847,7 +2847,7 @@ mod tests {
 
         // The builder recovers the eager domain from the concrete primal and agrees.
         let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .value_and_gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
@@ -2857,7 +2857,7 @@ mod tests {
 
         // The holomorphic entry point uses the same zero-space cotangent rule for non-differentiable auxiliary leaves.
         let ((value, aux), gradient): ((Array, Array), Array) = differentiate_at(Array::scalar(z))
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .value_and_gradient(|x| {
                 let aux = x.context().constant(Array::scalar(7i32))?;
@@ -2875,7 +2875,7 @@ mod tests {
         let primal = context.input(ArrayType::scalar(DataType::C64));
         let ((value, aux), gradient): ((TestTracer, TestTracer), Vec<TestTracer>) = context
             .differentiate_at(vec![primal])
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .value_and_gradient(|inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()))
             .unwrap();
@@ -2891,7 +2891,7 @@ mod tests {
         let z = Complex::new(0.7f64, -0.3f64);
         let (method_gradient, aux): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at(Array::scalar(z))
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();
@@ -2900,7 +2900,7 @@ mod tests {
 
         // The builder recovers the eager domain from the concrete primal and agrees.
         let (free_gradient, aux): (Array, Array) = differentiate_at(Array::scalar(z))
-            .with_aux()
+            .with_auxiliary()
             .holomorphic()
             .gradient(|x| (x.clone() * x.clone(), x))
             .unwrap();

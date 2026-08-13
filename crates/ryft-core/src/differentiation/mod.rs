@@ -31,7 +31,7 @@
 //!   - [`DifferentiationBuilder::hessian`] differentiates a scalar-output gradient and returns the resulting structured
 //!     [`Hessian`] block matrix.
 //!
-//! [`DifferentiationBuilder::with_aux`] preserves non-differentiated auxiliary output, while
+//! [`DifferentiationBuilder::with_auxiliary`] preserves non-differentiated auxiliary output, while
 //! [`DifferentiationBuilder::holomorphic`] explicitly opts into the complex holomorphic contract.
 //! Furthermore, [`DifferentiationBuilder::with_captures`] accepts dynamic runtime values that affect the primal
 //! computation while only the first closure argument is differentiated. Captures are useful for model training,
@@ -45,7 +45,7 @@
 //! type nor have the same number of leaves. A transform replaces each dynamic leaf with the tracer type required by
 //! that transform, invokes the closure with the reparameterized trees, and reconstructs the same public tree shapes
 //! with runtime values. Non-parameter metadata in a derived type is preserved unchanged.
-//! [`DifferentiationBuilder::with_aux`] applies this treatment to the second member of a closure result
+//! [`DifferentiationBuilder::with_auxiliary`] applies this treatment to the second member of a closure result
 //! `(differentiated_output, auxiliary_output)`, returning the entire auxiliary tree without seeding or transposing it.
 //!
 //! The trees are structurally polymorphic but homogeneous in their dynamic leaf family meaning that one builder
@@ -480,7 +480,7 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
 ///     fail preflight validation.
 ///
-/// [`with_aux`](Self::with_aux) declares that the closure returns `(output, auxiliary)`. `auxiliary` may be any third,
+/// [`with_auxiliary`](Self::with_auxiliary) declares that the closure returns `(output, auxiliary)`. `auxiliary` may be any third,
 /// independently shaped [`Parameterized`] tree and is reconstructed with runtime leaves without being differentiated.
 ///
 /// [`holomorphic`](Self::holomorphic) opts the active inputs and differentiated outputs into complex-linear validation.
@@ -545,27 +545,6 @@ impl<Input, AuxiliaryState, LinearityState, ContextState>
     }
 }
 
-impl<Input, CaptureState, AuxiliaryState, LinearityState>
-    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithoutContext>
-{
-    /// Selects the context in which the differentiation transform executes.
-    ///
-    /// Without this modifier, terminal methods recover the context from the first active primal leaf.
-    #[inline]
-    pub fn in_context<C: Context>(
-        self,
-        context: &C,
-    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithContext<C>> {
-        DifferentiationBuilder {
-            primals: self.primals,
-            captures: self.captures,
-            auxiliary: self.auxiliary,
-            linearity: self.linearity,
-            context: WithContext(context.clone()),
-        }
-    }
-}
-
 impl<Input, CaptureState, LinearityState, ContextState>
     DifferentiationBuilder<Input, CaptureState, WithoutAuxiliary, LinearityState, ContextState>
 {
@@ -575,7 +554,9 @@ impl<Input, CaptureState, LinearityState, ContextState>
     /// reconstructed as runtime values in the terminal result, but they are excluded from derivative seeding and
     /// transposition. Its structure is independent of both the active input and any captures.
     #[inline]
-    pub fn with_aux(self) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliary, LinearityState, ContextState> {
+    pub fn with_auxiliary(
+        self,
+    ) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliary, LinearityState, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
@@ -605,6 +586,27 @@ impl<Input, CaptureState, AuxiliaryState, ContextState>
             auxiliary: self.auxiliary,
             linearity: HolomorphicLinearity,
             context: self.context,
+        }
+    }
+}
+
+impl<Input, CaptureState, AuxiliaryState, LinearityState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithoutContext>
+{
+    /// Selects the context in which the differentiation transform executes.
+    ///
+    /// Without this modifier, terminal methods recover the context from the first active primal leaf.
+    #[inline]
+    pub fn in_context<C: Context>(
+        self,
+        context: &C,
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithContext<C>> {
+        DifferentiationBuilder {
+            primals: self.primals,
+            captures: self.captures,
+            auxiliary: self.auxiliary,
+            linearity: self.linearity,
+            context: WithContext(context.clone()),
         }
     }
 }
@@ -2388,7 +2390,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///
 /// let ((value, auxiliary), gradient): ((Array, Auxiliary<Array>), Array) = differentiate_at(Array::scalar(2.0))
 ///     .with_captures((Array::scalar(3.0), vec![Array::scalar(4.0)]))
-///     .with_aux()
+///     .with_auxiliary()
 ///     .value_and_gradient(evaluate)?;
 /// assert_eq!(value.to_f64s(), vec![10.0]);
 /// assert_eq!(auxiliary.prediction.to_f64s(), vec![10.0]);
@@ -2718,7 +2720,7 @@ mod tests {
         // Auxiliary output is reconstructed from primal values and excluded from both Jacobian directions.
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_aux()
+            .with_auxiliary()
             .jacobian_reverse(multiply_with_captured_auxiliary)
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
@@ -2726,7 +2728,7 @@ mod tests {
 
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_aux()
+            .with_auxiliary()
             .jacobian_forward(multiply_with_captured_auxiliary)
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
@@ -2735,7 +2737,7 @@ mod tests {
         // Hessian auxiliary output follows the same nondifferentiated contract.
         let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_aux()
+            .with_auxiliary()
             .hessian(scaled_square_with_auxiliary)
             .unwrap();
         assert_eq!(hessian_with_auxiliary.values()[0].to_f64s(), vec![6.0]);
@@ -3041,7 +3043,7 @@ mod tests {
         let ((value, auxiliary), gradient): ((Array, StructuredAuxiliary<Array>), Array) =
             differentiate_at(Array::scalar(2.0))
                 .with_captures((captures, Array::scalar(1.0)))
-                .with_aux()
+                .with_auxiliary()
                 .value_and_gradient(structured_capture_function)
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
@@ -3056,11 +3058,12 @@ mod tests {
     fn test_differentiation_builder_modifier_order_is_orthogonal() {
         let first: (Array, Array) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
-            .with_aux()
+            .with_auxiliary()
             .gradient(multiply_with_captured_auxiliary)
             .unwrap();
         let second: (Array, Array) = differentiate_at(Array::scalar(2.0))
-            .with_aux()
+            // This reverse order is intentional because this test verifies that these transitions are orthogonal.
+            .with_auxiliary()
             .with_captures(Array::scalar(3.0))
             .gradient(multiply_with_captured_auxiliary)
             .unwrap();
