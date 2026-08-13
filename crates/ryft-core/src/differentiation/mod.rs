@@ -2524,7 +2524,6 @@ pub fn differentiate_at<Input>(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::ops::{Add, Mul};
 
     use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
@@ -2556,49 +2555,6 @@ mod tests {
         intermediates: Vec<P>,
         diagnostic: Option<P>,
         training: bool,
-    }
-
-    fn structured_capture_function<A: Clone + Parameter + Add<Output = A> + Mul<Output = A>>(
-        input: A,
-        (captures, tail): (StructuredCaptures<A>, A),
-    ) -> (A, StructuredAuxiliary<A>) {
-        let scaled = input * captures.scale;
-        let offset = captures.offsets[0].clone();
-        let output = scaled.clone() + offset.clone() + captures.extra.unwrap() + tail;
-        (
-            output.clone(),
-            StructuredAuxiliary {
-                prediction: output,
-                intermediates: vec![scaled],
-                diagnostic: Some(offset),
-                training: true,
-            },
-        )
-    }
-
-    fn scaled_square<A: Clone + Mul<Output = A>>(input: A, scale: A) -> Result<A, ProgramError> {
-        Ok(input.clone() * input * scale)
-    }
-
-    fn multiply_with_captured_auxiliary<A: Clone + Mul<Output = A>>(
-        input: A,
-        scale: A,
-    ) -> Result<(A, A), ProgramError> {
-        let output = input * scale;
-        Ok((output.clone(), output))
-    }
-
-    fn scaled_square_with_auxiliary<A: Clone + Mul<Output = A>>(input: A, scale: A) -> Result<(A, A), ProgramError> {
-        let output = input.clone() * input * scale;
-        Ok((output.clone(), output))
-    }
-
-    fn capture_only<A>(_: Vec<A>, capture: A) -> A {
-        capture
-    }
-
-    fn first_scaled<A: Clone + Mul<Output = A>>(inputs: Vec<A>, scale: A) -> Result<A, ProgramError> {
-        Ok(inputs[0].clone() * scale)
     }
 
     #[test]
@@ -2740,7 +2696,7 @@ mod tests {
         // Tangents must remain structurally isomorphic to the active primals.
         let error = differentiate_at(vec![Array::scalar(2.0)])
             .with_captures(Array::scalar(3.0))
-            .jvp(Vec::<Array>::new(), first_scaled)
+            .jvp(Vec::<Array>::new(), |inputs, scale| Ok(inputs[0].clone() * scale))
             .unwrap_err();
         assert_eq!(
             error,
@@ -2769,14 +2725,20 @@ mod tests {
         assert_eq!(reverse.values()[0].to_f64s(), vec![3.0]);
 
         // Hessian materialization holds the same capture fixed through both derivative levels.
-        let hessian = differentiate_at(primal).with_captures(capture).hessian(scaled_square).unwrap();
+        let hessian = differentiate_at(primal)
+            .with_captures(capture)
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
+            .unwrap();
         assert_eq!(hessian.values()[0].to_f64s(), vec![6.0]);
 
         // Auxiliary output is reconstructed from primal values and excluded from both Jacobian directions.
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
             .with_auxiliary_output()
-            .jacobian_reverse(multiply_with_captured_auxiliary)
+            .jacobian_reverse(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
         assert_eq!(auxiliary.to_f64s(), vec![6.0]);
@@ -2784,7 +2746,10 @@ mod tests {
         let (jacobian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
             .with_auxiliary_output()
-            .jacobian_forward(multiply_with_captured_auxiliary)
+            .jacobian_forward(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
             .unwrap();
         assert_eq!(jacobian_with_auxiliary.values()[0].to_f64s(), vec![3.0]);
         assert_eq!(auxiliary.to_f64s(), vec![6.0]);
@@ -2793,7 +2758,10 @@ mod tests {
         let (hessian_with_auxiliary, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
             .with_auxiliary_output()
-            .hessian(scaled_square_with_auxiliary)
+            .hessian(|input, scale| {
+                let output = input.clone() * input * scale;
+                Ok((output.clone(), output))
+            })
             .unwrap();
         assert_eq!(hessian_with_auxiliary.values()[0].to_f64s(), vec![6.0]);
         assert_eq!(auxiliary.to_f64s(), vec![12.0]);
@@ -3007,7 +2975,7 @@ mod tests {
         let hessian = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
             .with_captures(capture.clone())
             .holomorphic()
-            .hessian(scaled_square)
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
             .unwrap();
         assert_eq!(hessian.values()[0].elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(6.0, -2.0)]));
 
@@ -3052,7 +3020,7 @@ mod tests {
     fn test_differentiation_builder_empty_active_input_ignores_captures() {
         let error = differentiate_at(Vec::<Array>::new())
             .with_captures(Array::scalar(3.0))
-            .value_and_gradient(capture_only)
+            .value_and_gradient(|_input, capture| capture)
             .unwrap_err();
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
@@ -3089,7 +3057,10 @@ mod tests {
         let context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = context.input(ArrayType::scalar(DataType::F64));
         let capture = context.input(ArrayType::scalar(DataType::F64));
-        let hessian = differentiate_at(primal).with_captures(capture).hessian(scaled_square).unwrap();
+        let hessian = differentiate_at(primal)
+            .with_captures(capture)
+            .hessian(|input, scale| Ok(input.clone() * input * scale))
+            .unwrap();
 
         assert_eq!(hessian.values().len(), 1);
         assert!(matches!(context.resolve(&hessian.values()[0]), ValueResolution::Staged(_)));
@@ -3106,7 +3077,20 @@ mod tests {
             differentiate_at(Array::scalar(2.0))
                 .with_captures((captures, Array::scalar(1.0)))
                 .with_auxiliary_output()
-                .value_and_gradient(structured_capture_function)
+                .value_and_gradient(|input, (captures, tail)| {
+                    let scaled = input * captures.scale;
+                    let offset = captures.offsets[0].clone();
+                    let output = scaled.clone() + offset.clone() + captures.extra.unwrap() + tail;
+                    (
+                        output.clone(),
+                        StructuredAuxiliary {
+                            prediction: output,
+                            intermediates: vec![scaled],
+                            diagnostic: Some(offset),
+                            training: true,
+                        },
+                    )
+                })
                 .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
         assert_eq!(auxiliary.prediction.to_f64s(), vec![16.0]);
@@ -3121,13 +3105,19 @@ mod tests {
         let first: (Array, Array) = differentiate_at(Array::scalar(2.0))
             .with_captures(Array::scalar(3.0))
             .with_auxiliary_output()
-            .gradient(multiply_with_captured_auxiliary)
+            .gradient(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
             .unwrap();
         let second: (Array, Array) = differentiate_at(Array::scalar(2.0))
             // This reverse order is intentional because this test verifies that these transitions are orthogonal.
             .with_auxiliary_output()
             .with_captures(Array::scalar(3.0))
-            .gradient(multiply_with_captured_auxiliary)
+            .gradient(|input, scale| {
+                let output = input * scale;
+                Ok::<_, ProgramError>((output.clone(), output))
+            })
             .unwrap();
 
         assert_eq!(first.0.to_f64s(), vec![3.0]);
