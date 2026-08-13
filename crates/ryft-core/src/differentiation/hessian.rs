@@ -478,7 +478,7 @@ mod tests {
     fn test_hessian_with_auxiliary_outputs() {
         let evaluations = Cell::new(0);
         let (ordinary_hessian, auxiliary) = differentiate_at(Array::scalar(2.0))
-            .with_auxiliary()
+            .with_auxiliary_output()
             .hessian(|x| {
                 evaluations.set(evaluations.get() + 1);
                 Ok((x.clone() * x.clone(), x))
@@ -490,7 +490,7 @@ mod tests {
 
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let (holomorphic_hessian, auxiliary) = differentiate_at(input.clone())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .holomorphic()
             .hessian(|x| Ok((x.clone() * x.clone() * x.clone(), x)))
             .unwrap();

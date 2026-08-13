@@ -970,7 +970,7 @@ mod tests {
         let forward_evaluations = Cell::new(0);
         let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
             .jacobian_forward(|x, ()| {
                 forward_evaluations.set(forward_evaluations.get() + 1);
@@ -984,7 +984,7 @@ mod tests {
         let reverse_evaluations = Cell::new(0);
         let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
             .with_captures(())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
             .jacobian_reverse(|x, ()| {
                 reverse_evaluations.set(reverse_evaluations.get() + 1);
@@ -998,7 +998,7 @@ mod tests {
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
         let (jacobian, auxiliary) = differentiate_at(input.clone())
             .with_captures(())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .holomorphic()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
             .jacobian_forward(|x, ()| Ok((x.clone() * x.clone(), x)))
@@ -1011,7 +1011,7 @@ mod tests {
 
         let (jacobian, auxiliary) = differentiate_at(input.clone())
             .with_captures(())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .holomorphic()
             .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
             .jacobian_reverse(|x, ()| Ok((x.clone() * x.clone(), x)))

@@ -2099,7 +2099,7 @@ mod tests {
         let domain = x.execution_domain();
         let ((value, aux), gradient): ((Array<'_>, Array<'_>), Array<'_>) = domain
             .differentiate_at(x.clone())
-            .with_auxiliary()
+            .with_auxiliary_output()
             .value_and_gradient(|x| {
                 let squared = Mul::mul(&x, &x).unwrap();
                 let aux = Add::add(&x, &x).unwrap();

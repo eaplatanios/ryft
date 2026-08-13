@@ -62,10 +62,10 @@ pub use differentiation::{
     DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate,
     Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization,
     LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
-    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliary,
-    WithCaptures, WithContext, WithoutAuxiliary, WithoutCapture, WithoutContext, binary_elementwise_jvp,
-    differentiate_at, jvp_projected_operation, transpose_mixed_operation, transpose_projected_operation,
-    unary_elementwise_jvp,
+    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
+    WithAuxiliaryOutput, WithCaptures, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
+    binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
+    transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{

@@ -583,14 +583,11 @@ impl<Input, CaptureState, AuxiliaryOutputState, ContextState>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, CaptureState, AuxiliaryOutputState, LinearityState>
     DifferentiationBuilder<Input, CaptureState, AuxiliaryOutputState, LinearityState, WithoutContext>
 {
-    /// Selects the context in which the differentiation transform executes.
-    ///
-    /// Without this modifier, terminal methods recover the context from the first active primal leaf.
+    /// Selects the context in which the differentiation transform executes. Without this modifier, terminal functions
+    /// will try to recover the context from the first active primal value.
     #[inline]
     pub fn in_context<C: Context>(
         self,
@@ -605,6 +602,8 @@ impl<Input, CaptureState, AuxiliaryOutputState, LinearityState>
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, RealLinearity, ContextState>
