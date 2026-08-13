@@ -55,16 +55,17 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, BuilderContext, BuilderExecutionContext,
-    CotangentBatchingPolicy, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType,
-    Differentiate, DifferentiationBuilder, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment,
-    ForwardModeDifferentiate, Hessian, HessianBlock, Holomorphic, Jacobian, JacobianBlock, LinearCallOperation,
-    LinearityMode, Linearization, LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, Real,
-    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver,
-    UnaryElementwiseJvpOperands, WithAuxiliary, WithCaptures, WithContext, WithoutAuxiliary, WithoutCapture,
-    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
-    transpose_projected_operation, unary_elementwise_jvp,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, DenseDifferentiableType,
+    DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBuilder,
+    DifferentiationBuilderContext, DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate,
+    Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization,
+    LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
+    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliary,
+    WithCaptures, WithContext, WithoutAuxiliary, WithoutCapture, WithoutContext, binary_elementwise_jvp,
+    differentiate_at, jvp_projected_operation, transpose_mixed_operation, transpose_projected_operation,
+    unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
