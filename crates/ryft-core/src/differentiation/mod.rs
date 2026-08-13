@@ -458,8 +458,6 @@ impl<C: Context<Type = V::Type, Value = V>, V: Value, Input: Parameterized<V>> D
 pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
     <ContextState as DifferentiationBuilderContext<V, Input>>::Context;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Helper that is used to configure a value-level automatic differentiation transform.
 ///
 /// Use [`differentiate_at`] or [`Differentiate::differentiate_at`] to construct instances of this builder from primal
@@ -479,24 +477,21 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///     as ordinary values. If a capture is incompatible with the selected context, the operation or execution boundary
 ///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
 ///     fail preflight validation.
+///   - [`with_auxiliary`](Self::with_auxiliary) declares that the closure being differentiated returns
+///     `(output, auxiliary)`. `auxiliary` may be any third, independently shaped [`Parameterized`] tree and is
+///     reconstructed with runtime leaves without being differentiated.
+///   - [`holomorphic`](Self::holomorphic) promises that the differentiated function is _holomorphic_ (i.e., that it
+///     satisfies the [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations)).
+///   - [`in_context`](Self::in_context) selects a specific execution context. Otherwise, terminal methods recover one
+///     from the first active primal value.
 ///
-/// [`with_auxiliary`](Self::with_auxiliary) declares that the closure returns `(output, auxiliary)`. `auxiliary` may be any third,
-/// independently shaped [`Parameterized`] tree and is reconstructed with runtime leaves without being differentiated.
+/// These modifiers represent orthogonal type-state transitions, avoiding combined function-name variants.
 ///
-/// [`holomorphic`](Self::holomorphic) opts the active inputs and differentiated outputs into complex-linear validation.
-/// These modifiers are orthogonal type-state transitions, avoiding combined function-name variants.
-///
-/// [`in_context`](Self::in_context) selects a specific execution context; otherwise, terminal methods recover one from
-/// the first active primal leaf.
-///
-///
-///
-///
-/// All parameter leaves in one invocation use the same runtime value family `V`. The structures are otherwise fully
-/// polymorphic: tuples, arrays, [`Vec`]s, maps, and types deriving `Parameterized` may be nested freely. Derived types
-/// additionally support optional parameter fields and retain non-parameter metadata. A dynamic value family such as
-/// [`Array`](crate::Array) may represent different element types, shardings, and placements at individual
-/// leaves.
+/// Note that all parameter leaves in one invocation use the same runtime value family `V`. However, the structures are
+/// otherwise fully polymorphic (i.e., tuples, arrays, [`Vec`]s, maps, and types deriving `Parameterized` may be nested
+/// freely). Derived types additionally support optional parameter fields and retain non-parameter metadata. A dynamic
+/// value family such as [`Array`](crate::Array) may represent different element types, shardings, and placements at
+/// individual leaves.
 #[derive(Clone, Debug)]
 pub struct DifferentiationBuilder<
     Input,
@@ -505,10 +500,10 @@ pub struct DifferentiationBuilder<
     LinearityState = RealLinearity,
     ContextState = WithoutContext,
 > {
-    /// Active primal inputs at which the transform is evaluated.
+    /// Active primal inputs at which the differentiation transform is evaluated.
     primals: Input,
 
-    /// Dynamic nondifferentiated runtime captures, or [`WithoutCapture`].
+    /// Dynamic non-differentiated runtime captures type state.
     captures: CaptureState,
 
     /// Auxiliary-output type state.
@@ -517,9 +512,11 @@ pub struct DifferentiationBuilder<
     /// Linearity type state.
     linearity: LinearityState,
 
-    /// Execution-context selection state.
+    /// Execution-context selection type state.
     context: ContextState,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input, AuxiliaryState, LinearityState, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, AuxiliaryState, LinearityState, ContextState>
@@ -572,10 +569,12 @@ impl<Input, CaptureState, AuxiliaryState, ContextState>
 {
     /// Treats the differentiated computation as complex linear under a holomorphy promise.
     ///
-    /// The promise applies only to active inputs and differentiated outputs. Runtime captures are exempt because they
-    /// are fixed coefficients rather than coordinates of the differentiated map. Holomorphic mode is available for
-    /// Jacobian, Hessian, and scalar-gradient terminals; JVP, linearization, and VJP do not define a separate
-    /// holomorphic validation contract.
+    /// Calling this function promises that the differentiated function is holomorphic. Ryft validates that active
+    /// inputs and differentiated outputs are complex, but it cannot prove that the function satisfies the
+    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations). Runtime captures are
+    /// exempt because they are fixed coefficients rather than coordinates of the differentiated map. Holomorphic mode
+    /// is available for Jacobian, Hessian, and scalar-gradient terminals; JVP, linearization, and VJP do not define a
+    /// separate holomorphic validation contract.
     #[inline]
     pub fn holomorphic(
         self,
