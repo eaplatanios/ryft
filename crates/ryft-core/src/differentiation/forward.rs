@@ -14,7 +14,7 @@ use crate::differentiation::linear::{
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::{AddOperation, Zero};
+use crate::operations::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
@@ -1786,7 +1786,8 @@ where
 pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     /// Evaluates `function` on the primal `primal` and runtime `capture`, and propagates the tangent `tangent`
     /// forward only with respect to `primal`, with this [`Context`] executing or staging the differentiated
-    /// operations. Refer to the documentation of [`jvp`] for the forward-mode transform.
+    /// operations. Refer to the documentation of [`DifferentiationBuilder::jvp`](crate::DifferentiationBuilder::jvp)
+    /// for the forward-mode transform.
     fn jvp<
         F: FnOnce(
             Input::To<DifferentiationTracer<Self>>,
@@ -1876,6 +1877,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 
     /// Linearizes `function` at `primal`, treating `capture` as known nondifferentiated runtime inputs and returning
     /// the primal output and a reusable [`Pushforward`], with this [`Context`] executing or staging primal-side work.
+    /// Refer to the documentation of [`DifferentiationBuilder::linearize`](crate::DifferentiationBuilder::linearize)
+    /// for the forward-mode transform.
     fn linearize<
         F: FnOnce(
             Input::To<LinearizationTracer<Self>>,
@@ -2087,131 +2090,17 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
 
 impl<C: Context<Type: DifferentiableType>> ForwardModeDifferentiate for C {}
 
-/// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the closure
-/// **directly on [`DifferentiationTracer`] duals** (i.e., the single forward-mode entry point, and the analogue of
-/// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html)). For `f` computing `y = f(x)`, this
-/// computes the dual `(y, ẏ) = (f(x), (∂f/∂x)(x) · ẋ)` — the primal output paired with the Jacobian-vector product
-/// of the input tangent `ẋ`.
-///
-/// The transform recovers a [`Context`] from
-/// the input's leaf values through [`Value::ExecutionDomain`], exactly like [`batch`](crate::batching::batch):
-/// staged [`Tracer`]s recover their trace, transform tracers recover their transform level, and concrete values recover
-/// the eager backend domain they name, so the transform composes uniformly across the whole stack. Each input is then
-/// paired with its tangent as a dual over a [`DifferentiationContext`] wrapping the recovered context, and `function`
-/// runs directly on those duals, with each operation the closure performs (e.g., `x.sin()`, `x * y`, etc.) dispatching
-/// its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`]. Eager-versus-staged behavior is absorbed
-/// entirely by that context:
-///
-///   - Over an **eager** context both dual halves are concrete, so the closure sees real primal values (i.e., it can
-///     branch on them with `if x.concretize()? { … }`, print them, or otherwise use Rust control flow driven by the
-///     primal) and a staged data-dependent `while` combinator differentiates by running directly at the concrete
-///     primals, with no iteration bound needed.
-///   - Over a **staging** context the same closure stages the primal and tangent operations into the enclosing trace
-///     operation by operation (this is how a fused JVP computation is built under an outer trace), and branching on a
-///     primal errors because it is a [`Tracer`] with no concrete payload.
-///
-/// The closure executes exactly as written: no dead code is trimmed, and observable effects fire as the closure runs.
-/// Structural zero tangents stay symbolic between operations. At the output boundary they are materialized through
-/// [`ResidualZeroProvider`], which uses the corresponding primal result to retain exact runtime geometry when the zero
-/// type is dynamic. Also, transforms nest. Inside the closure, an inner transform invoked on a dual's
-/// [`DifferentiationContext`] (a [`Context`] carrying these transforms itself) differentiates through
-/// the duals, composing reverse-over-forward and higher-order forward modes.
-///
-/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as an active input
-/// structure with no leaves carries no differentiation variable, and so the transform is undefined no matter how the
-/// execution context is obtained. Captures never fill that role, because they are deliberately neither differentiation
-/// variables nor context sources. [`ForwardModeDifferentiate::jvp`] is the explicit-context method form behind this
-/// function, and it rejects empty active inputs in exactly the same way.
-#[inline]
-pub fn jvp<
-    V: Value<
-            Type: DifferentiableType,
-            ExecutionDomain: Context<
-                Operation: DifferentiableOperation<V::ExecutionDomain> + ResidualZeroProvider<V::Type>,
-            >,
-        >,
-    F: FnOnce(Input::To<DifferentiationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
-    Input: Parameterized<
-            V,
-            To<V> = Input,
-            Family: ParameterizedFamily<DifferentiationTracer<V::ExecutionDomain>>,
-            ParameterStructure: Debug + PartialEq,
-        >,
-    Output: Parameterized<DifferentiationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
->(
-    function: F,
-    primals: Input,
-    tangents: Input::To<V>,
-) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.jvp(|input, ()| function(input), primals, tangents, ())
-}
-
-/// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`] (i.e., the
-/// analogue of [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)). For `f` computing
-/// `y = f(x)`, this computes `y` together with the reusable linear pushforward map `ẋ ↦ ẏ = (∂f/∂x)(x) · ẋ` at the
-/// linearization point `x`, so that differentiating once serves any number of tangents.
-///
-/// This is the partial-evaluation sibling of [`jvp`]. Where `jvp` runs the closure once per `(primal, tangent)` pair,
-/// this function runs the closure once on [`DifferentiationTracer`] duals over a [`PartialEvaluationContext`] wrapping
-/// the context recovered from the input's leaf values through [`Value::ExecutionDomain`] (exactly like [`jvp`] and
-/// [`batch`](crate::batch)), with each dual's primal half *known* at its primal value and its tangent half *unknown*.
-/// Primal-side operations are then all-known and fold through the recovered context itself (i.e., executing eagerly
-/// under an eager context or staging into the enclosing trace under a staging one, so that linearization composes under
-/// an outer trace), while tangent-side operations residualize into the accumulated pushforward program `(ẋ, r) ↦ ẏ`,
-/// which is linear in `ẋ` with the linearization point entering only through the residuals `r` recovered along the way.
-/// The returned [`Pushforward`] closes that program over those residuals, so that [`Pushforward::apply`] pushes any
-/// number of tangents through the function's Jacobian at this point without re-tracing or re-differentiating.
-///
-/// Because the closure's primal halves carry concrete values under an eager context, host control flow on primals works
-/// exactly as under [`jvp`]: the closure can branch on a primal (e.g., `if x.concretize()? { … }`), the untaken branch
-/// is never traced at all, and a data-dependent `while` combinator differentiates by running directly at the concrete
-/// primals. This matches JAX's `linearize`/`grad` tracing semantics, where the same JVP interpreter runs over a
-/// partial-evaluation trace instead of the eval trace.
-///
-/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as an active input
-/// structure with no leaves carries no differentiation variable, and so the transform is undefined no matter how the
-/// execution context is obtained. Captures never fill that role, because they are deliberately neither differentiation
-/// variables nor context sources. [`ForwardModeDifferentiate::linearize`] is the explicit-context method form behind
-/// this function, and it rejects empty active inputs in exactly the same way.
-#[inline]
-pub fn linearize<
-    V: Value<
-            Type: DifferentiableType,
-            ExecutionDomain: Context<
-                Operation: DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-                               + PartiallyEvaluatableOperation<V::ExecutionDomain>
-                               + PartiallyEvaluatableOperation<
-                    TracingContext<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>,
-                > + ResidualZeroProvider<V::Type>,
-            > + Zero<V>,
-        >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
-    Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
-    Output: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
->(
-    function: F,
-    primals: Input,
-) -> Result<(Output::To<V>, Pushforward<V::ExecutionDomain, Input, Output::To<V>>), DifferentiationError> {
-    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(DifferentiationError::EmptyInput);
-    };
-    context.linearize(|input, ()| function(input), primals, ())
-}
-
 /// Applies a member operation's Jacobian-Vector Product (JVP) rule through a projected view of a composite
 /// differentiation context. Use this function from a composite operation dispatcher when the operation is
-/// [`Region`]-free and every operand and result belongs to the same projectable member type `T`. It
-/// projects primal values and live tangent values into the member value family, carries structural-zero tangents as
-/// types without materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the
-/// resulting duals back into the composite value family.
+/// [`Region`]-free and every operand and result belongs to the same projectable member type `T`. It projects primal
+/// values and live tangent values into the member value family, carries structural-zero tangents as types without
+/// materializing values, runs the member's existing [`DifferentiableOperation`] rule, and lifts the resulting duals
+/// back into the composite value family.
 ///
 /// Operations whose derivative crosses member types or whose rule needs attached regions require an explicit composite
 /// Jacobian-Vector Product (JVP) rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
 /// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access: the
-/// attached regions are programs in the _composite_ universe, and no projected driver can present them in the member
+/// attached regions are programs in the composite universe, and no projected driver can present them in the member
 /// universe.
 ///
 /// # Parameters
@@ -2377,6 +2266,7 @@ mod tests {
         ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::differentiate_at;
     use crate::operations::{
         CollectiveKind, CollectiveOperation, ConditionOperation, CosOperation, Dot, DotDimensionNumbers, MulOperation,
         Sin, SinOperation, StopGradient, StopGradientOperation,
@@ -2425,8 +2315,8 @@ mod tests {
         // `stop_gradient` severs the collective's tangent input. The differentiation context must therefore bind the
         // primal collective without consulting its absent JVP rule, while preserving the live tangent of the other
         // addition operand.
-        let (primal, tangent) = jvp(
-            |input| {
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0))
+            .jvp(Array::scalar(1.0), |input| {
                 let severed = input.stop_gradient();
                 let mut outputs = severed.context().bind(
                     CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
@@ -2434,11 +2324,8 @@ mod tests {
                     &[severed.clone()],
                 )?;
                 Ok(input + outputs.remove(0))
-            },
-            Array::scalar(2.0),
-            Array::scalar(1.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![1.0]);
     }
@@ -2990,9 +2877,9 @@ mod tests {
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
 
-        // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
-        // A concrete array input recovers the eager array domain, so both dual halves are concrete.
-        let (value, tangent): (Array, Array) = jvp(|x| x.sin(), Array::scalar(2.0), Array::scalar(3.0)).unwrap();
+        // The builder's `jvp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // declarations. A concrete array input recovers the eager array domain, so both dual halves are concrete.
+        let (value, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(3.0), |x| x.sin()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
@@ -3000,7 +2887,8 @@ mod tests {
         // at a genuinely complex point.
         let z = num_complex::Complex::new(0.7f64, -0.3f64);
         let tangent_seed = num_complex::Complex::new(1.0f64, 0.5f64);
-        let (value, tangent) = jvp(|x| Ok(x.clone() * x), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        let (value, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| Ok(x.clone() * x)).unwrap();
         assert_eq!(value.elements::<num_complex::Complex<f64>>().unwrap(), vec![z * z]);
         assert_eq!(tangent.elements::<num_complex::Complex<f64>>().unwrap(), vec![(z + z) * tangent_seed],);
 
@@ -3008,12 +2896,11 @@ mod tests {
         // without tracing the untaken branch. The Boolean has no tangent space and therefore receives a structural-zero
         // tangent alongside the live tangent of `x`.
         let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, tangent) = jvp(
-            |(predicate, x)| Ok(if predicate.concretize()? { x.clone() * x.sin()? } else { -x }),
-            (Array::scalar(true), Array::scalar(0.7)),
-            (zero.clone(), Array::scalar(1.0)),
-        )
-        .unwrap();
+        let (value, tangent) = differentiate_at((Array::scalar(true), Array::scalar(0.7)))
+            .jvp((zero.clone(), Array::scalar(1.0)), |(predicate, x)| {
+                Ok(if predicate.concretize()? { x.clone() * x.sin()? } else { -x })
+            })
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
 
@@ -3047,12 +2934,12 @@ mod tests {
                 if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
 
-        // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
-        // composes inside traced code without threading a context. The closure stages the fused primal and tangent
+        // Under an active trace, the builder's `jvp` terminal recovers the staging context from its tracer inputs, so
+        // it composes inside traced code without threading a context. The closure stages the fused primal and tangent
         // operations into the enclosing trace.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, tangent) = jvp(|x| x.sin(), inputs[0].clone(), inputs[1].clone())?;
+                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |x| x.sin())?;
                 Ok(vec![value, tangent])
             },
             vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
@@ -3067,7 +2954,7 @@ mod tests {
         // arithmetic while constructing the enclosing program.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, tangent) = jvp(|token| Ok(token), inputs[0].clone(), inputs[1].clone())?;
+                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |token| Ok(token))?;
                 Ok(vec![value, tangent])
             },
             vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
@@ -3078,32 +2965,28 @@ mod tests {
         // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
         // structure is rejected.
         assert!(matches!(
-            jvp(|x: Vec<_>| Ok(x), vec![Array::scalar(1.0)], vec![Array::scalar(1.0), Array::scalar(2.0)],)
+            differentiate_at(vec![Array::scalar(1.0)])
+                .jvp(vec![Array::scalar(1.0), Array::scalar(2.0)], |x| Ok(x))
                 .unwrap_err(),
             DifferentiationError::Program(ProgramError::Parameter(
                 ParameterError::MismatchedParameterStructures { .. },
             )),
         ));
 
-        // With no leaf value to recover a context from, the free `jvp` reports that differentiation requires
-        // at least one input leaf.
+        // With no leaf value to recover a context from, the builder's `jvp` terminal reports that differentiation
+        // requires at least one input leaf.
         assert_eq!(
-            jvp(
-                |x: Vec<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x),
-                Vec::<Array>::new(),
-                Vec::new(),
-            )
-            .unwrap_err(),
+            differentiate_at(Vec::<Array>::new()).jvp(Vec::new(), |x| Ok(x)).unwrap_err(),
             DifferentiationError::EmptyInput,
         );
 
         // Rank-zero arrays support both half-precision variants through the ordinary array operations.
         assert_eq!(
-            jvp(|x| Ok(x.clone() + x), Array::scalar(bf16::from_f32(3.0)), Array::scalar(bf16::ONE)),
+            differentiate_at(Array::scalar(bf16::from_f32(3.0))).jvp(Array::scalar(bf16::ONE), |x| Ok(x.clone() + x)),
             Ok((Array::scalar(bf16::from_f32(6.0)), Array::scalar(bf16::from_f32(2.0)))),
         );
         assert_eq!(
-            jvp(|x| Ok(x.clone() + x), Array::scalar(f16::from_f32(3.0)), Array::scalar(f16::ONE)),
+            differentiate_at(Array::scalar(f16::from_f32(3.0))).jvp(Array::scalar(f16::ONE), |x| Ok(x.clone() + x)),
             Ok((Array::scalar(f16::from_f32(6.0)), Array::scalar(f16::from_f32(2.0)))),
         );
     }
@@ -3124,9 +3007,10 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
-        // Primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
-        let (value, pushforward) = linearize(|x| x.sin(), Array::scalar(2.0)).unwrap();
+        // The builder's `linearize` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // declarations. Primal work executes eagerly at the concrete linearization point while the pushforward program
+        // accumulates.
+        let (value, pushforward) = differentiate_at(Array::scalar(2.0)).linearize(|x| x.sin()).unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
@@ -3143,11 +3027,11 @@ mod tests {
                 if message == "pushforward tangent 0 has type token[] but its primal boundary requires tangent type zero[]",
         ));
 
-        // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
+        // Under an active trace, the builder's `linearize` terminal recovers the staging context from its tracer input,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, pushforward) = linearize(|x| x.sin(), inputs[0].clone())?;
+                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|x| x.sin())?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
@@ -3161,7 +3045,7 @@ mod tests {
 
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, pushforward) = linearize(|token| Ok(token), inputs[0].clone())?;
+                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|token| Ok(token))?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
@@ -3196,7 +3080,7 @@ mod tests {
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
         )| Ok(a.clone() * b + a.sin()?);
-        let (_, pushforward) = linearize(function, (Array::scalar(0.5), Array::scalar(1.3))).unwrap();
+        let (_, pushforward) = differentiate_at((Array::scalar(0.5), Array::scalar(1.3))).linearize(function).unwrap();
         assert_abs_diff_eq!(
             pushforward.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap().to_f64s()[0],
             1.3 + 0.5f64.cos(),
@@ -3208,15 +3092,10 @@ mod tests {
             epsilon = 1e-9,
         );
 
-        // With no leaf value to recover a context from, the free `linearize` reports that differentiation requires
-        // at least one input leaf.
+        // With no leaf value to recover a context from, the builder's `linearize` terminal reports that differentiation
+        // requires at least one input leaf.
         assert_eq!(
-            linearize(
-                |x: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| Ok(x),
-                Vec::<Array>::new(),
-            )
-            .map(|(outputs, _)| outputs)
-            .unwrap_err(),
+            differentiate_at(Vec::<Array>::new()).linearize(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err(),
             DifferentiationError::EmptyInput
         );
     }
