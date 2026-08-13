@@ -3287,8 +3287,6 @@ mod tests {
 
     #[test]
     fn test_second_order_reverse_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::differentiation::HessianDifferentiate;
-
         // Second-order differentiation through a rematerialized call: the inner reverse pass replays the derived
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
         // the result. f(x) = sin(x²), so f''(x) = 2 cos(x²) - 4x² sin(x²).
@@ -3296,7 +3294,7 @@ mod tests {
         let function = rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
-        let hessian = domain.hessian(|x, ()| function.call(x), Array::scalar(0.7), ()).unwrap();
+        let hessian = domain.differentiate_at(Array::scalar(0.7)).hessian(|x| function.call(x)).unwrap();
         let block = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
         assert_abs_diff_eq!(

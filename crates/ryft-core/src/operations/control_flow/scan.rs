@@ -2875,10 +2875,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::JvpTransform;
     use crate::differentiation::reverse::TranspositionTransform;
-    use crate::differentiation::{
-        Differentiate, HessianDifferentiate, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
-        differentiate_at,
-    };
+    use crate::differentiation::{Differentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::math::add::AddOperation;
@@ -3376,10 +3373,12 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
         let forward = context
-            .jacobian_forward(|(initial, values), ()| stage_product_scan(initial, values), primals.clone(), ())
+            .differentiate_at(primals.clone())
+            .jacobian_forward(|(initial, values)| stage_product_scan(initial, values))
             .unwrap();
         let reverse = context
-            .jacobian_reverse(|(initial, values), ()| stage_product_scan(initial, values), primals, ())
+            .differentiate_at(primals)
+            .jacobian_reverse(|(initial, values)| stage_product_scan(initial, values))
             .unwrap();
 
         let blocks = forward.iter_blocks().collect::<Vec<_>>();
@@ -3399,11 +3398,8 @@ mod tests {
         // derivatives with `initial` are products excluding the corresponding value, while mixed derivatives between
         // values are `initial` times the remaining value.
         let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .hessian(
-                |(initial, values), ()| stage_product_scan(initial, values),
-                (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
-                (),
-            )
+            .differentiate_at((Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])))
+            .hessian(|(initial, values)| stage_product_scan(initial, values))
             .unwrap();
 
         let blocks = hessian.iter_blocks().collect::<Vec<_>>();

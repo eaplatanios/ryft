@@ -284,11 +284,11 @@ mod tests {
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
         ConvertElementType, CoordinateBasisOperation, Cos, Device, DeviceMesh, Differentiate, Dimension,
-        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, HessianDifferentiate, JacobianDifferentiate,
-        Log, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce,
-        ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt,
-        StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
+        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Log, LogicalMesh, Logistic, Max, MeshAxis,
+        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
+        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
+        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
+        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2191,7 +2191,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
+        let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2262,7 +2262,7 @@ mod tests {
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
+        let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2280,12 +2280,16 @@ mod tests {
         let context = input.execution_domain();
 
         let forward = context
-            .jacobian_forward_holomorphic(|input, ()| Mul::mul(&input, &input), input.clone(), ())
+            .differentiate_at(input.clone())
+            .holomorphic()
+            .jacobian_forward(|input| Mul::mul(&input, &input))
             .unwrap();
         let reverse = context
-            .jacobian_reverse_holomorphic(|input, ()| Mul::mul(&input, &input), input.clone(), ())
+            .differentiate_at(input.clone())
+            .holomorphic()
+            .jacobian_reverse(|input| Mul::mul(&input, &input))
             .unwrap();
-        let hessian = context.hessian_holomorphic(|input, ()| Mul::mul(&input, &input), input, ()).unwrap();
+        let hessian = context.differentiate_at(input).holomorphic().hessian(|input| Mul::mul(&input, &input)).unwrap();
 
         assert_c64_close(read_c64s(forward.iter_blocks().next().unwrap().value())[0], 2.0 * value);
         assert_c64_close(read_c64s(reverse.iter_blocks().next().unwrap().value())[0], 2.0 * value);
@@ -2311,7 +2315,7 @@ mod tests {
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
+        let jacobian = domain.differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -2375,14 +2379,11 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let hessian = domain
-            .hessian(
-                |x, ()| {
-                    let squared = Mul::mul(&x, &x).unwrap();
-                    Ok(squared.reduce(&[0], ReductionKind::Sum))
-                },
-                x,
-                (),
-            )
+            .differentiate_at(x)
+            .hessian(|x| {
+                let squared = Mul::mul(&x, &x).unwrap();
+                Ok(squared.reduce(&[0], ReductionKind::Sum))
+            })
             .unwrap();
 
         let block = hessian.iter_blocks().next().unwrap();

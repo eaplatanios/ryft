@@ -1380,7 +1380,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::JvpTransform;
     use crate::differentiation::reverse::TranspositionTransform;
-    use crate::differentiation::{JacobianDifferentiate, ReverseModeDifferentiate, differentiate_at};
+    use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::math::add::AddOperation;
@@ -2217,19 +2217,23 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         let forward = context
-            .jacobian_forward(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(4.0), ())
+            .differentiate_at(Array::scalar(4.0))
+            .jacobian_forward(stage_runtime_predicate_condition)
             .unwrap();
         let reverse = context
-            .jacobian_reverse(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(4.0), ())
+            .differentiate_at(Array::scalar(4.0))
+            .jacobian_reverse(stage_runtime_predicate_condition)
             .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
         assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
 
         let forward = context
-            .jacobian_forward(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(-4.0), ())
+            .differentiate_at(Array::scalar(-4.0))
+            .jacobian_forward(stage_runtime_predicate_condition)
             .unwrap();
         let reverse = context
-            .jacobian_reverse(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(-4.0), ())
+            .differentiate_at(Array::scalar(-4.0))
+            .jacobian_reverse(stage_runtime_predicate_condition)
             .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
         assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);

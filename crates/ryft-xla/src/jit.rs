@@ -1419,11 +1419,10 @@ mod tests {
         Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Broadcast,
         CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh,
         DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
-        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian,
-        HessianDifferentiate, Iota, Jacobian, JacobianDifferentiate, LogicalMesh, Logistic, MeshAxis, MeshAxisType,
-        Mul, OneLike, ProgramError, ProjectedValue, Reduce, ReductionKind, Reshape, ReverseModeDifferentiate, Select,
-        Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike,
+        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
+        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
+        ReductionKind, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value,
+        ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1539,7 +1538,8 @@ mod tests {
                 |input| {
                     input
                         .dispatch_domain()
-                        .jacobian_forward(|value, ()| Mul::mul(&value, &value), input, ())
+                        .differentiate_at(input)
+                        .jacobian_forward(|value| Mul::mul(&value, &value))
                         .expect("forward Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1552,7 +1552,8 @@ mod tests {
                 |input| {
                     input
                         .dispatch_domain()
-                        .jacobian_reverse(|value, ()| Mul::mul(&value, &value), input, ())
+                        .differentiate_at(input)
+                        .jacobian_reverse(|value| Mul::mul(&value, &value))
                         .expect("reverse Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1564,7 +1565,8 @@ mod tests {
             |input| {
                 input
                     .dispatch_domain()
-                    .hessian(|value, ()| Mul::mul(&value, &value), input, ())
+                    .differentiate_at(input)
+                    .hessian(|value| Mul::mul(&value, &value))
                     .expect("Hessian should stage")
             },
             input_type.clone(),
@@ -1578,7 +1580,8 @@ mod tests {
             |input| {
                 input
                     .dispatch_domain()
-                    .jacobian_forward(|value, ()| Mul::mul(&value, &value), input, ())
+                    .differentiate_at(input)
+                    .jacobian_forward(|value| Mul::mul(&value, &value))
                     .expect("forward Jacobian should stage")
             },
             input_type.clone(),
@@ -1646,7 +1649,8 @@ mod tests {
                 inputs
                     .0
                     .dispatch_domain()
-                    .jacobian_forward(|(scalar, vector), ()| scalar.atan2(&vector), inputs, ())
+                    .differentiate_at(inputs)
+                    .jacobian_forward(|(scalar, vector)| scalar.atan2(&vector))
                     .expect("forward Jacobian should stage")
             },
             (scalar_type.clone(), vector_type.clone()),

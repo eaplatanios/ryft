@@ -1176,8 +1176,8 @@ where
 ///
 /// User-facing scalar gradients, auxiliary outputs, and holomorphic validation are composed through
 /// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder typestate
-/// leaves this trait with the single reusable reverse-mode engine, [`vjp`](Self::vjp), instead of a method for every
-/// option combination.
+/// leaves this trait with the reusable reverse-mode engine [`vjp`](Self::vjp) and the low-level scalar cotangent-seed
+/// primitive [`gradient_seed`](Self::gradient_seed), instead of a method for every option combination.
 pub trait ReverseModeDifferentiate:
     ForwardModeDifferentiate
     + Context<
@@ -1237,6 +1237,49 @@ pub trait ReverseModeDifferentiate:
             )?,
         ))
     }
+
+    /// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be a
+    /// single rank-0 scalar with a cotangent space, and complex outputs additionally require `holomorphic`. A single
+    /// reverse-mode seed recovers the derivative of a complex-output function only when the function is holomorphic,
+    /// so without that promise a complex output is rejected with an error instead of silently computing a value that
+    /// is not a derivative (i.e., `holomorphic` changes nothing for real outputs). The seed is the multiplicative
+    /// identity typed with the output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays)
+    /// and bound through this [`Context`], so an eager context constructs a concrete value while a staging context
+    /// stages into its enclosing trace.
+    ///
+    /// This is the shared seeding step behind [`value_and_gradient_in_context`] and
+    /// [`value_and_gradient_auxiliary_in_context`], exposed so that custom gradient-style entry points built on top of
+    /// [`vjp`](crate::DifferentiationBuilder::vjp) can reuse the same validation and seeding contract.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output`: Scalar primal output whose cotangent space determines the seed type.
+    ///   - `holomorphic`: Whether a complex output is accepted under the caller's holomorphy promise.
+    fn gradient_seed(&self, output: &Self::Value, holomorphic: bool) -> Result<Self::Value, DifferentiationError>
+    where
+        Self::Operation: From<OneOperation<Self::Type>>,
+    {
+        // Reverse mode only defines a gradient for scalar-output functions.
+        let output_type = output.r#type();
+        if !output_type.is_scalar() {
+            return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.to_string() });
+        }
+
+        if !holomorphic && output_type.is_complex() {
+            return Err(DifferentiationError::ComplexGradientOutput { output_type: output_type.to_string() });
+        }
+
+        // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
+        // is degenerate and is rejected up front.
+        let output_cotangent_type = output_type.cotangent();
+        if output_cotangent_type.is_zero_space() {
+            return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
+        }
+
+        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
+        check_count!("output", seeds, 1, ProgramError);
+        Ok(seeds.pop().unwrap())
+    }
 }
 
 impl<C> ReverseModeDifferentiate for C
@@ -1271,7 +1314,7 @@ pub(crate) fn value_and_gradient_in_context<
         primals,
         capture,
     )?;
-    let seed = gradient_seed(context, &output, holomorphic)?;
+    let seed = context.gradient_seed(&output, holomorphic)?;
     let gradient = pullback.apply(seed)?;
     Ok((output, gradient))
 }
@@ -1323,7 +1366,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
 
-    let gradient = pullback.apply((gradient_seed(context, &output, holomorphic)?, auxiliary_cotangents))?;
+    let gradient = pullback.apply((context.gradient_seed(&output, holomorphic)?, auxiliary_cotangents))?;
     Ok(((output, auxiliary), gradient))
 }
 
@@ -1570,45 +1613,6 @@ pub(crate) struct TranspositionTransformArguments {
 
     /// Per-selected-input residual indices supplying disconnected cotangent geometry.
     zero_residual_input_indices: Vec<Vec<usize>>,
-}
-
-/// Validates the scalar `output` of a gradient entry point and constructs its cotangent seed. The output must be a
-/// single rank-0 scalar with a cotangent space, and complex outputs additionally require `holomorphic`: a single
-/// reverse-mode seed recovers the derivative of a complex-output function only when the function is holomorphic, so
-/// without that promise a complex output is rejected with an error instead of silently computing a value that is not
-/// a derivative (i.e., `holomorphic` changes nothing for real outputs). The seed is the multiplicative identity typed
-/// with the output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays) and bound through
-/// the provided [`Context`] `context`, so an eager context constructs a concrete value while a staging context stages
-/// into its enclosing trace.
-///
-/// This is the shared seeding step behind [`value_and_gradient_in_context`] and
-/// [`value_and_gradient_auxiliary_in_context`], exposed so that custom gradient-style entry points built on top of
-/// [`vjp`](crate::DifferentiationBuilder::vjp) can reuse the same validation and seeding contract.
-fn gradient_seed<C: ReverseModeDifferentiate<Operation: From<OneOperation<C::Type>>>>(
-    context: &C,
-    output: &C::Value,
-    holomorphic: bool,
-) -> Result<C::Value, DifferentiationError> {
-    // Reverse mode only defines a gradient for scalar-output functions.
-    let output_type = output.r#type();
-    if !output_type.is_scalar() {
-        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output_type.to_string() });
-    }
-
-    if !holomorphic && output_type.is_complex() {
-        return Err(DifferentiationError::ComplexGradientOutput { output_type: output_type.to_string() });
-    }
-
-    // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
-    // is degenerate and is rejected up front.
-    let output_cotangent_type = output_type.cotangent();
-    if output_cotangent_type.is_zero_space() {
-        return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
-    }
-
-    let mut seeds = context.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
-    check_count!("output", seeds, 1, ProgramError);
-    Ok(seeds.pop().unwrap())
 }
 
 #[cfg(test)]

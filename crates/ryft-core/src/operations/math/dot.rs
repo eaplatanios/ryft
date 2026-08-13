@@ -1832,7 +1832,7 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{JacobianDifferentiate, differentiate_at};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::{Operation, TypeError};
 
@@ -3381,12 +3381,8 @@ mod tests {
         assert_eq!(right.value().to_f64s(), vec![2.0, 3.0, 5.0]);
 
         // Forward mode batches input-coordinate basis tangents through the dot pushforward.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacobian_forward(
-                |(left, right), ()| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())),
-                inputs,
-                (),
-            )
+        let jacobian = differentiate_at(inputs)
+            .jacobian_forward(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())))
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [left, right] = blocks.as_slice() else { unreachable!() };
