@@ -2382,15 +2382,21 @@ pub trait Differentiate: Context<Type: DifferentiableType> {
 
 impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point. `primal`
-/// is the active [`Parameterized`] input tree that the transform differentiates with respect to. Each terminal function
-/// of the resulting [`DifferentiationBuilder`] takes the transformed closure as its last argument. The closure takes
-/// one active argument by default. Calling [`DifferentiationBuilder::with_captures`] changes its contract to a binary
-/// closure whose second argument is the traced capture structure. Because the active input, captures, and context are
-/// already fixed when the terminal function receives the closure, the closure's parameter and result types are deduced
-/// from the builder state and usually need no annotations.
+/// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point, with
+/// respect to the active [`Parameterized`] input value. The builder's modifier functions select nondifferentiated
+/// runtime captures, auxiliary outputs, holomorphic validation, and an explicit execution context, and each of its
+/// terminal functions takes the differentiated closure as its last argument.
+///
+/// The closure's contract follows the builder state. By default, the closure takes the active input as its only
+/// argument, and calling [`DifferentiationBuilder::with_captures`] changes that contract to a binary closure whose
+/// second argument is the traced capture structure. Because the active input, captures, and execution context are all
+/// fixed by the time a terminal function receives the closure, the closure's parameter and result types are deduced
+/// from the builder state and they usually require no annotations.
+///
+/// # Examples
+///
+/// The following is an example showing differentiation with respect to an input value while also providing
+/// a non-differentiated runtime capture:
 ///
 /// ```
 /// # use std::ops::Mul;
@@ -2409,16 +2415,25 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
 ///
-/// Capture and auxiliary structures are independent trees:
+/// And the following example shows how the capture and the auxiliary output structures are independent:
 ///
 /// ```
-/// use std::ops::{Add, Mul};
-///
-/// use ryft_core::{Array, Parameter, differentiate_at};
-/// use ryft_macros::Parameterized;
+/// # use std::ops::{Add, Mul};
+/// #
+/// # use ryft_core::{Array, Parameter, differentiate_at};
+/// #
+/// # /// Test-only shim to avoid taking a (circular) dependency on `ryft`.
+/// # mod ryft {
+/// #     pub use ryft_core::parameters::ParameterError;
+/// #     pub use ryft_core::parameters::{
+/// #         Parameter, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
+/// #         PathPrefixedParameterIterator, Placeholder,
+/// #     };
+/// #     pub use ryft_macros::Parameterized;
+/// # }
+/// # use ryft::Parameterized;
 ///
 /// #[derive(Clone, Parameterized)]
-/// #[ryft(crate = "ryft_core")]
 /// struct Auxiliary<P: Parameter> {
 ///     prediction: P,
 ///     diagnostic: Option<P>,
@@ -2443,11 +2458,13 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
 ///
-/// Closure arity follows the builder state and is checked where the terminal receives the closure. A capture-free
-/// builder requires a unary closure, so a binary closure literal fails to match the expected signature:
+/// The remaining examples fail to compile by design, because the builder's type states reject invalid configurations
+/// at compile time. Closure arity follows the builder state and is checked where the terminal function receives the
+/// closure. A capture-free builder requires a unary closure, so a binary closure literal fails to match the expected
+/// signature:
 ///
 /// ```compile_fail
-/// use ryft_core::{Array, differentiate_at};
+/// # use ryft_core::{Array, differentiate_at};
 ///
 /// let _ = differentiate_at(Array::scalar(2.0)).gradient(|input, capture| input * capture);
 /// ```
@@ -2455,7 +2472,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// A builder with captures requires a binary closure, so a unary closure literal fails the same way:
 ///
 /// ```compile_fail
-/// use ryft_core::{Array, differentiate_at};
+/// # use ryft_core::{Array, differentiate_at};
 ///
 /// let _ = differentiate_at(Array::scalar(2.0)).with_captures(Array::scalar(3.0)).gradient(|input| input);
 /// ```
@@ -2464,20 +2481,21 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// exists in the unconfigured [`WithoutContext`] state:
 ///
 /// ```compile_fail
-/// use ryft_core::{Array, ArrayOperation, EagerContext, differentiate_at};
+/// # use ryft_core::{Array, ArrayOperation, EagerContext, differentiate_at};
 ///
 /// let first = EagerContext::<Array, ArrayOperation<Array>>::new();
 /// let second = EagerContext::<Array, ArrayOperation<Array>>::new();
 /// let _ = differentiate_at(Array::scalar(2.0)).in_context(&first).in_context(&second);
 /// ```
 ///
-/// Holomorphic validation is intentionally unavailable for JVP, linearization, and VJP terminals, so those terminals
-/// do not exist in the [`HolomorphicLinearity`] state:
+/// Holomorphic validation is intentionally unavailable for the Jacobian-Vector Product (JVP), linearization, and
+/// Vector-Jacobian Product (VJP) terminal functions, so those terminals do not exist in the [`HolomorphicLinearity`]
+/// state:
 ///
 /// ```compile_fail
-/// use std::ops::Mul;
-///
-/// use ryft_core::{Array, ProgramError, differentiate_at};
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, ProgramError, differentiate_at};
 ///
 /// fn square<A: Clone + Mul<Output = A>>(input: A) -> Result<A, ProgramError> {
 ///     Ok(input.clone() * input)
@@ -2488,8 +2506,8 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 ///
 /// # Parameters
 ///
-///   - `primal`: Active input tree the transform differentiates with respect to. It may be a leaf, tuple, array,
-///     [`Vec`], map, or any type deriving `Parameterized`.
+///   - `primal`: Active [`Parameterized`] input value the transform differentiates with respect to. It may be a leaf,
+///     tuple, array, [`Vec`], map, or any other type that implements the [`Parameterized`] trait.
 #[inline]
 pub fn differentiate_at<Input>(
     primal: Input,
