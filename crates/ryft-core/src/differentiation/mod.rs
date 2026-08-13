@@ -1119,10 +1119,10 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///     outputs directly or in a [`Result`] whose error converts into [`DifferentiationError`], as specified by
     ///     [`MaybeFallible`].
     #[inline]
-    pub fn value_and_gradient<V, Output, Aux, F>(
+    pub fn value_and_gradient<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<((V, Aux), Input::To<V>), DifferentiationError>
+    ) -> Result<((V, AuxiliaryOutput), Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -1135,24 +1135,28 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output: MaybeFallible<
                 (
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 ),
                 DifferentiationError,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 V,
-                To<V> = Aux,
+                To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    To = AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 >,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            AuxiliaryOutput::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                To<V> = (V, Aux),
+                To<V> = (V, AuxiliaryOutput),
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
@@ -1183,7 +1187,10 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///
     ///   - `function`: Function returning the differentiated scalar and auxiliary output.
     #[inline]
-    pub fn gradient<V, Output, Aux, F>(self, function: F) -> Result<(Input::To<V>, Aux), DifferentiationError>
+    pub fn gradient<V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<(Input::To<V>, AuxiliaryOutput), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -1196,24 +1203,28 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         Output: MaybeFallible<
                 (
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 ),
                 DifferentiationError,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 V,
-                To<V> = Aux,
+                To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    To = AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 >,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            AuxiliaryOutput::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                To<V> = (V, Aux),
+                To<V> = (V, AuxiliaryOutput),
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
@@ -1238,10 +1249,13 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn jacobian_forward<V, Output, Aux, F>(
+    pub fn jacobian_forward<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
     where
         V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         Input: Parameterized<
@@ -1255,14 +1269,14 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -1298,10 +1312,13 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn jacobian_reverse<V, Output, Aux, F>(
+    pub fn jacobian_reverse<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
     where
         V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         Input: Parameterized<
@@ -1315,14 +1332,14 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -1364,10 +1381,10 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///
     ///   - `function`: Function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn hessian<V, Output, Aux, F>(
+    pub fn hessian<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<(Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>), DifferentiationError>
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
@@ -1396,15 +1413,15 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
-                To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = Aux::To<V>>,
+                To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = AuxiliaryOutput::To<V>>,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> + ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -1952,10 +1969,10 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     ///
     ///   - `function`: Binary function returning the differentiated scalar and auxiliary output.
     #[inline]
-    pub fn value_and_gradient<V, Output, Aux, F>(
+    pub fn value_and_gradient<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<((V, Aux), Input::To<V>), DifferentiationError>
+    ) -> Result<((V, AuxiliaryOutput), Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -1972,27 +1989,31 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 V,
-                To<V> = Aux,
+                To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    To = AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 >,
             >,
         Output: MaybeFallible<
                 (
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 ),
                 DifferentiationError,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            AuxiliaryOutput::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                To<V> = (V, Aux),
+                To<V> = (V, AuxiliaryOutput),
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
@@ -2024,7 +2045,10 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     ///
     ///   - `function`: Binary function returning the differentiated scalar and auxiliary output.
     #[inline]
-    pub fn gradient<V, Output, Aux, F>(self, function: F) -> Result<(Input::To<V>, Aux), DifferentiationError>
+    pub fn gradient<V, Output, AuxiliaryOutput, F>(
+        self,
+        function: F,
+    ) -> Result<(Input::To<V>, AuxiliaryOutput), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
         Input: Parameterized<
@@ -2041,27 +2065,31 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 V,
-                To<V> = Aux,
+                To<V> = AuxiliaryOutput,
                 Family: ParameterizedFamily<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    To = AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 >,
             >,
         Output: MaybeFallible<
                 (
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+                    AuxiliaryOutput::To<
+                        LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    >,
                 ),
                 DifferentiationError,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            AuxiliaryOutput::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                To<V> = (V, Aux),
+                To<V> = (V, AuxiliaryOutput),
                 Family: ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
@@ -2088,10 +2116,13 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn jacobian_forward<V, Output, Aux, F>(
+    pub fn jacobian_forward<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
     where
         V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         Input: Parameterized<
@@ -2112,7 +2143,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
@@ -2120,7 +2151,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -2155,10 +2186,13 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn jacobian_reverse<V, Output, Aux, F>(
+    pub fn jacobian_reverse<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<
+        (Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>),
+        DifferentiationError,
+    >
     where
         V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         Input: Parameterized<
@@ -2179,7 +2213,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
@@ -2187,7 +2221,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -2229,10 +2263,10 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     ///
     ///   - `function`: Binary function returning the differentiated output and auxiliary output.
     #[inline]
-    pub fn hessian<V, Output, Aux, F>(
+    pub fn hessian<V, Output, AuxiliaryOutput, F>(
         self,
         function: F,
-    ) -> Result<(Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
+    ) -> Result<(Hessian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, AuxiliaryOutput::To<V>), DifferentiationError>
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
@@ -2276,16 +2310,16 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
-        Aux: Parameterized<
+        AuxiliaryOutput: Parameterized<
                 LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
-                To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = Aux::To<V>>,
+                To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = AuxiliaryOutput::To<V>>,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> + ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
             Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
-        ) -> Result<(Output, Aux), ProgramError>,
+        ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
@@ -2334,7 +2368,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
 pub trait Differentiate: Context<Type: DifferentiableType> {
-    /// Creates a new [`DifferentiationBuilder`] that can be used to differentiate closure at the `primal` point,
+    /// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point,
     /// within this [`Context`]. Refer to the documentation of [`differentiate_at`] for information on how to use
     /// this function.
     #[inline]
@@ -2350,19 +2384,18 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Starts configuring a value-level automatic differentiation transform at `primal`.
-///
-/// `primal` is the active input tree that the transform differentiates with respect to. Each terminal method takes
-/// the transformed closure as its last argument. The closure takes one active argument by default; calling
-/// [`DifferentiationBuilder::with_captures`] changes its contract to a binary closure whose second argument is the
-/// traced capture structure. Because the active input, captures, and context are already fixed when the terminal
-/// receives the closure, the closure's parameter and result types are deduced from the builder state and usually need
-/// no annotations.
+/// Creates a new [`DifferentiationBuilder`] that can be used to differentiate a closure at the `primal` point. `primal`
+/// is the active [`Parameterized`] input tree that the transform differentiates with respect to. Each terminal function
+/// of the resulting [`DifferentiationBuilder`] takes the transformed closure as its last argument. The closure takes
+/// one active argument by default. Calling [`DifferentiationBuilder::with_captures`] changes its contract to a binary
+/// closure whose second argument is the traced capture structure. Because the active input, captures, and context are
+/// already fixed when the terminal function receives the closure, the closure's parameter and result types are deduced
+/// from the builder state and usually need no annotations.
 ///
 /// ```
-/// use std::ops::Mul;
-///
-/// use ryft_core::{Array, differentiate_at};
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, differentiate_at};
 ///
 /// fn scale<A: Mul<Output = A>>(input: A, scale: A) -> A {
 ///     input * scale
@@ -2371,6 +2404,7 @@ impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
 /// let (_, gradient) = differentiate_at(Array::scalar(2.0))
 ///     .with_captures(Array::scalar(3.0))
 ///     .value_and_gradient(scale)?;
+///
 /// assert_eq!(gradient.to_f64s(), vec![3.0]);
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
@@ -2477,6 +2511,7 @@ mod tests {
     use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
+
     use ryft_macros::Parameterized;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
@@ -2489,14 +2524,6 @@ mod tests {
     use crate::tracing::DomainTracingContext;
 
     use super::*;
-
-    fn square<A: Clone + Mul<Output = A>>(input: A) -> A {
-        input.clone() * input
-    }
-
-    fn fallible_square<A: Clone + Mul<Output = A>>(input: A) -> Result<A, ProgramError> {
-        Ok(square(input))
-    }
 
     #[derive(Clone, Parameterized)]
     struct StructuredCaptures<P: Parameter> {
@@ -2532,7 +2559,7 @@ mod tests {
     }
 
     fn scaled_square<A: Clone + Mul<Output = A>>(input: A, scale: A) -> Result<A, ProgramError> {
-        Ok(square(input) * scale)
+        Ok(input.clone() * input * scale)
     }
 
     fn multiply_with_captured_auxiliary<A: Clone + Mul<Output = A>>(
@@ -2544,7 +2571,7 @@ mod tests {
     }
 
     fn scaled_square_with_auxiliary<A: Clone + Mul<Output = A>>(input: A, scale: A) -> Result<(A, A), ProgramError> {
-        let output = square(input) * scale;
+        let output = input.clone() * input * scale;
         Ok((output.clone(), output))
     }
 
@@ -2759,14 +2786,15 @@ mod tests {
         let primal = Array::scalar(2.0);
 
         // Capture-free scalar gradients retain the ergonomic unary closure shape.
-        let (value, gradient) = differentiate_at(primal.clone()).value_and_gradient(square).unwrap();
+        let (value, gradient) =
+            differentiate_at(primal.clone()).value_and_gradient(|input| input.clone() * input).unwrap();
         assert_eq!(value.to_f64s(), vec![4.0]);
         assert_eq!(gradient.to_f64s(), vec![4.0]);
 
         // Fallible and infallible unary VJP closures produce equivalent pullbacks.
         let (expected_value, expected_pullback) =
             differentiate_at(primal.clone()).vjp(|input| Ok(input.clone() * input)).unwrap();
-        let (actual_value, actual_pullback) = differentiate_at(primal).vjp(fallible_square).unwrap();
+        let (actual_value, actual_pullback) = differentiate_at(primal).vjp(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(actual_value, expected_value);
         assert_eq!(
             actual_pullback.apply(Array::scalar(1.0)).unwrap(),
@@ -2774,7 +2802,8 @@ mod tests {
         );
 
         // Capture-free linearization stages the expected unary pushforward program.
-        let (_, actual_pushforward) = differentiate_at(Array::scalar(2.0)).linearize(fallible_square).unwrap();
+        let (_, actual_pushforward) =
+            differentiate_at(Array::scalar(2.0)).linearize(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(
             actual_pushforward.program().to_string(),
             indoc! {"
@@ -2788,7 +2817,7 @@ mod tests {
         );
 
         // Higher-order terminals retain the same unary closure shape.
-        let hessian = differentiate_at(Array::scalar(2.0)).hessian(fallible_square).unwrap();
+        let hessian = differentiate_at(Array::scalar(2.0)).hessian(|input| Ok(input.clone() * input)).unwrap();
         assert_eq!(hessian.values()[0].to_f64s(), vec![2.0]);
     }
 
@@ -2898,7 +2927,10 @@ mod tests {
         // The selected context may differ from `Array::ExecutionDomain`; its type drives all tracer and transform
         // machinery when the builder is context-bound.
         let context = ExplicitContext(EagerContext::new());
-        let (_, gradient) = context.differentiate_at(Array::scalar(2.0)).value_and_gradient(square).unwrap();
+        let (_, gradient) = context
+            .differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(|input| input.clone() * input)
+            .unwrap();
         assert_eq!(gradient.to_f64s(), vec![4.0]);
 
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
@@ -2914,13 +2946,15 @@ mod tests {
         let primal_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let explicit_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = primal_context.input(ArrayType::scalar(DataType::F64));
-        let result = explicit_context.differentiate_at(primal).value_and_gradient(square);
+        let result = explicit_context.differentiate_at(primal).value_and_gradient(|input| input.clone() * input);
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
 
         let primal_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let explicit_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
         let primal = primal_context.input(ArrayType::scalar(DataType::F64));
-        let result = differentiate_at(primal).in_context(&explicit_context).value_and_gradient(square);
+        let result = differentiate_at(primal)
+            .in_context(&explicit_context)
+            .value_and_gradient(|input| input.clone() * input);
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
     }
 

@@ -1327,11 +1327,11 @@ pub(crate) fn value_and_gradient_auxiliary_in_context<
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    Output: MaybeFallible<(LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>), DifferentiationError>,
-    Aux: Parameterized<
+    Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), DifferentiationError>,
+    AuxiliaryOutput: Parameterized<
             C::Value,
-            To<C::Value> = Aux,
-            Family: ParameterizedFamily<LinearizationTracer<C>, To = Aux::To<LinearizationTracer<C>>>,
+            To<C::Value> = AuxiliaryOutput,
+            Family: ParameterizedFamily<LinearizationTracer<C>, To = AuxiliaryOutput::To<LinearizationTracer<C>>>,
         >,
 >(
     context: &C,
@@ -1339,12 +1339,15 @@ pub(crate) fn value_and_gradient_auxiliary_in_context<
     primals: Input,
     capture: Capture,
     holomorphic: bool,
-) -> Result<((C::Value, Aux), Input::To<C::Value>), DifferentiationError>
+) -> Result<((C::Value, AuxiliaryOutput), Input::To<C::Value>), DifferentiationError>
 where
-    (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>):
-        Parameterized<LinearizationTracer<C>, To<C::Value> = (C::Value, Aux), Family: ParameterizedFamily<C::Value>>,
+    (LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>): Parameterized<
+            LinearizationTracer<C>,
+            To<C::Value> = (C::Value, AuxiliaryOutput),
+            Family: ParameterizedFamily<C::Value>,
+        >,
 {
-    let ((output, auxiliary), pullback): ((C::Value, Aux), _) = context.vjp(
+    let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) = context.vjp(
         |input, capture| function(input, capture).into_result().map_err(ProgramError::from),
         primals,
         capture,
@@ -1364,7 +1367,8 @@ where
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let auxiliary_cotangents = Aux::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
+    let auxiliary_cotangents =
+        AuxiliaryOutput::To::<C::Value>::from_parameters(auxiliary_structure, auxiliary_cotangents)?;
 
     let gradient = pullback.apply((context.gradient_seed(&output, holomorphic)?, auxiliary_cotangents))?;
     Ok(((output, auxiliary), gradient))

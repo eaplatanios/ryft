@@ -204,16 +204,22 @@ pub(crate) fn jacobian_forward_in_context<
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    AuxiliaryOutput: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+    F: FnOnce(
+        I::To<LinearizationTracer<C>>,
+        Capture::To<LinearizationTracer<C>>,
+    ) -> Result<(O, AuxiliaryOutput), ProgramError>,
 >(
     context: &C,
     function: F,
     primal: I,
     capture: Capture,
     holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
+) -> Result<
+    (Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, AuxiliaryOutput::To<C::Value>),
+    DifferentiationError,
+> {
     // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
     // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
     let input_structure = primal.parameter_structure();
@@ -397,16 +403,22 @@ pub(crate) fn jacobian_reverse_in_context<
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Type>,
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
-    Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
+    AuxiliaryOutput: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+    F: FnOnce(
+        I::To<LinearizationTracer<C>>,
+        Capture::To<LinearizationTracer<C>>,
+    ) -> Result<(O, AuxiliaryOutput), ProgramError>,
 >(
     context: &C,
     function: F,
     primal: I,
     capture: Capture,
     holomorphic: bool,
-) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
+) -> Result<
+    (Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, AuxiliaryOutput::To<C::Value>),
+    DifferentiationError,
+> {
     // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
     // inputs in the ordinary case, but still requires each input parameter to have a nonzero cotangent space.
     let input_structure = primal.parameter_structure();

@@ -237,14 +237,14 @@ impl<'o, T: Type, V> Clone for HessianBlock<'o, T, V> {
 ///   - `primal`: Structured input values specifying the differentiation point.
 ///   - `capture`: Structured runtime values held fixed through both derivative levels.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
-pub(crate) fn hessian_in_context<C, Input, Capture, Output, Aux, F>(
+pub(crate) fn hessian_in_context<C, Input, Capture, Output, AuxiliaryOutput, F>(
     context: &C,
     function: F,
     primal: Input,
     capture: Capture,
     holomorphic: bool,
 ) -> Result<
-    (Hessian<C::Type, C::Value, Input::To<C::Type>, Output::To<C::Type>>, Aux::To<C::Value>),
+    (Hessian<C::Type, C::Value, Input::To<C::Type>, Output::To<C::Type>>, AuxiliaryOutput::To<C::Value>),
     DifferentiationError,
 >
 where
@@ -297,15 +297,18 @@ where
             To<C::Type>: Clone,
             Family: ParameterizedFamily<C::Type> + ParameterizedFamily<LinearizationTracer<C>>,
         >,
-    Aux: Parameterized<
+    AuxiliaryOutput: Parameterized<
             LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
-            To<LinearizationTracer<C>>: Parameterized<LinearizationTracer<C>, To<C::Value> = Aux::To<C::Value>>,
+            To<LinearizationTracer<C>>: Parameterized<
+                LinearizationTracer<C>,
+                To<C::Value> = AuxiliaryOutput::To<C::Value>,
+            >,
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Value>,
         >,
     F: FnOnce(
         Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
         Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
-    ) -> Result<(Output, Aux), ProgramError>,
+    ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
 {
     let (outer, auxiliary) = jacobian_forward_in_context(
         context,
