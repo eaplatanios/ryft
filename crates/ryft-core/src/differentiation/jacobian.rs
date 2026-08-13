@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameterized;
 
-use crate::contexts::{Context, Domain};
+use crate::contexts::Context;
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
 use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation};
@@ -12,7 +12,7 @@ use crate::macros::check_count;
 use crate::operations::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Type, Typed, Value};
+use crate::programs::{ProgramError, Type, Typed};
 use crate::tracing::TracingContext;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
@@ -179,546 +179,113 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
     }
 }
 
-/// Defines one non-auxiliary [`JacobianDifferentiate`] method. It centralizes the shared structured-input and output
-/// bounds and adapts its corresponding auxiliary method with a unit auxiliary value.
-macro_rules! define_jacobian_function_in_trait {
-    (
-        $(#[doc = $documentation:literal])*
-        $method:ident,
-        delegate = $delegate:ident,
-        operation_bounds = [$($operation_bounds:tt)+],
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        fn $method<
-            F: FnOnce(I::To<LinearizationTracer<Self>>) -> Result<O, ProgramError>,
-            I: Parameterized<
-                    Self::Value,
-                    To<Self::Value> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<Self>> + ParameterizedFamily<Self::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<Self>,
-                    Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Type>,
-                >,
-        >(
-            &self,
-            function: F,
-            primals: I,
-        ) -> Result<
-            Jacobian<Self::Type, Self::Value, I::To<Self::Type>, O::To<Self::Type>>,
-            DifferentiationError,
-        >
-        where
-            Self::Operation: $($operation_bounds)+,
-        {
-            let (jacobian, ()) = self.$delegate(|input| Ok((function(input)?, ())), primals)?;
-            Ok(jacobian)
-        }
-    };
-}
-
-/// Defines one auxiliary-output [`JacobianDifferentiate`] method. It keeps the additional auxiliary parameter bounds
-/// consistent across differentiation directions and holomorphy modes.
-macro_rules! define_jacobian_auxiliary_function_in_trait {
-    (
-        $(#[doc = $documentation:literal])*
-        $method:ident,
-        delegate = $delegate:ident,
-        holomorphic = $holomorphic:literal,
-        operation_bounds = [$($operation_bounds:tt)+],
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        fn $method<
-            F: FnOnce(I::To<LinearizationTracer<Self>>) -> Result<(O, A), ProgramError>,
-            I: Parameterized<
-                    Self::Value,
-                    To<Self::Value> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<Self>> + ParameterizedFamily<Self::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<Self>,
-                    Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Type>,
-                >,
-            A: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<Self::Value>>,
-        >(
-            &self,
-            function: F,
-            primals: I,
-        ) -> Result<
-            (
-                Jacobian<Self::Type, Self::Value, I::To<Self::Type>, O::To<Self::Type>>,
-                A::To<Self::Value>,
-            ),
-            DifferentiationError,
-        >
-        where
-            Self::Operation: $($operation_bounds)+,
-        {
-            $delegate(self, function, primals, $holomorphic)
-        }
-    };
-}
-
-/// Extension trait carrying the value-level *Jacobian* differentiation transforms on every [`Context`], mirroring
-/// how [`ForwardModeDifferentiate`] carries forward-mode differentiation transforms.
+/// Extension trait carrying the value-level _Jacobian_ differentiation transforms on every [`Context`],
+/// mirroring how [`ForwardModeDifferentiate`] carries forward-mode differentiation transforms.
 /// [`HessianDifferentiate`](crate::HessianDifferentiate) is its sibling for *Hessian* differentiation transforms.
-/// Implementations enumerate every finite input or output coordinate and return structured derivative blocks. For a
-/// structured function `y = f(x)`, these methods materialize every block of `J_f(x) = ∂f/∂x`. Forward variants apply
-/// the [`Pushforward`](crate::Pushforward) to packed input-coordinate basis tangents, while reverse variants apply the
-/// [`Pullback`](crate::Pullback) to packed output-coordinate basis cotangents. Both produce the same
-/// output-major/input-minor [`Jacobian`] representation.
 ///
-/// Below we provide a cost model that drives the decision of when to use forward-mode or reverse-mode differentiation
-/// for computing a [`Jacobian`]. The cost model uses the following notation:
-///
-///   - `n`: Total input coordinate-space dimension size.
-///   - `m`: Total output coordinate-space dimension size.
-///   - `T_linearize`: One-time computation needed to evaluate the primal function and construct its pushforward.
-///   - `T_pushforward`: Computation needed to propagate one input basis tangent through the constructed pushforward.
-///   - `T_vjp`: One-time computation needed to evaluate the primal function and construct its pullback.
-///   - `T_pullback`: Computation needed to propagate one output basis cotangent through the constructed pullback.
-///   - `R_forward`: Memory occupied by forward-linearization residuals shared by all packed tangent directions.
-///   - `R_reverse`: Memory occupied by reverse-linearization residuals shared by all packed cotangent directions.
-///   - `M_pushforward`: Additional peak intermediate memory needed by one pushforward direction.
-///   - `M_pullback`: Additional peak intermediate memory needed by one pullback direction.
-///
-/// Forward mode evaluates an `n`-way packed pushforward, so use it when `n <= m` (i.e., for functions with few inputs
-/// and many outputs). Its derivative work is approximately `O(T_linearize + n · T_pushforward)`, and its working memory
-/// excluding the result is approximately `O(R_forward + n · M_pushforward)`. Reverse mode evaluates an `m`-way packed
-/// pullback, so use it when `m < n` (i.e., for functions with many inputs and few outputs). Its derivative work is
-/// approximately `O(T_vjp + m · T_pullback)`, and its working memory excluding the result is approximately
-/// `O(R_reverse + m · M_pullback)`. Both approaches additionally require the unavoidable `Θ(mn)` memory for the
-/// materialized Jacobian itself. Packing may execute the directions in parallel, but does not change these total-work
-/// or storage scalings.
-///
-/// Ordinary forward mode requires real differentiated inputs but permits complex outputs. Ordinary reverse mode
-/// requires real differentiated outputs but permits complex inputs. Holomorphic variants require every differentiated
-/// input and output leaf to be complex. [`HessianDifferentiate`](crate::HessianDifferentiate) provides the
-/// corresponding second-order transform.
+/// User-facing code should leverage these transforms through [`DifferentiationBuilder`](crate::DifferentiationBuilder).
+/// Refer to [`jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward) and
+/// [`jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse) for information
+/// on the mathematical interpretation, block representation, cost model, complex-type contracts, runtime captures,
+/// and auxiliary-output semantics.
 pub trait JacobianDifferentiate: Context<Type: DenseDifferentiableType<Self>> {
-    define_jacobian_function_in_trait!(
-        /// Materializes the complete [`Jacobian`] using forward-mode differentiation.
-        /// Refer to [`jacobian_forward`] for the mathematical interpretation and representation.
-        jacobian_forward,
-        delegate = jacobian_forward_with_aux,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + ResidualZeroProvider<Self::Type>
-        ],
-    );
+    /// Materializes the complete [`Jacobian`] using forward-mode differentiation. Refer to
+    /// [`jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward) for the mathematical
+    /// interpretation and representation.
+    #[inline]
+    fn jacobian_forward<
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+            Capture::To<LinearizationTracer<Self>>,
+        ) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                Self::Value,
+                To<Self::Value> = Input,
+                Family: ParameterizedFamily<LinearizationTracer<Self>> + ParameterizedFamily<Self::Type>,
+            >,
+        Capture: Parameterized<Self::Value, To<Self::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: Parameterized<
+                LinearizationTracer<Self>,
+                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Type>,
+            >,
+    >(
+        &self,
+        function: F,
+        primal: Input,
+        capture: Capture,
+    ) -> Result<Jacobian<Self::Type, Self::Value, Input::To<Self::Type>, Output::To<Self::Type>>, DifferentiationError>
+    where
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
+            + ResidualZeroProvider<Self::Type>,
+    {
+        let (jacobian, ()) = jacobian_forward_in_context(
+            self,
+            |input, capture| Ok((function(input, capture)?, ())),
+            primal,
+            capture,
+            false,
+        )?;
+        Ok(jacobian)
+    }
 
-    define_jacobian_function_in_trait!(
-        /// Materializes the complete forward-mode [`Jacobian`] under the promise that `function` is holomorphic.
-        /// Refer to [`jacobian_forward_holomorphic`] for the holomorphy contract.
-        jacobian_forward_holomorphic,
-        delegate = jacobian_forward_holomorphic_with_aux,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + ResidualZeroProvider<Self::Type>
-        ],
-    );
-
-    define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
-        /// Refer to [`jacobian_forward_with_aux`] for details.
-        jacobian_forward_with_aux,
-        delegate = jacobian_forward_in_context,
-        holomorphic = false,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + ResidualZeroProvider<Self::Type>
-        ],
-    );
-
-    define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a holomorphic forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
-        /// Refer to [`jacobian_forward_holomorphic_with_aux`] for details.
-        jacobian_forward_holomorphic_with_aux,
-        delegate = jacobian_forward_in_context,
-        holomorphic = true,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + ResidualZeroProvider<Self::Type>
-        ],
-    );
-
-    define_jacobian_function_in_trait!(
-        /// Materializes the complete [`Jacobian`] using reverse-mode differentiation.
-        /// Refer to [`jacobian_reverse`] for the mathematical interpretation and representation.
-        jacobian_reverse,
-        delegate = jacobian_reverse_with_aux,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + DifferentiableOperation<PartialEvaluationContext<Self>>
-                + TransposableOperation<Self::Constant, Self::Operation>
-                + ResidualZeroProvider<Self::Type>
-                + From<AddOperation<Self::Type>>
-        ],
-    );
-
-    define_jacobian_function_in_trait!(
-        /// Materializes the complete reverse-mode [`Jacobian`] under the promise that `function` is holomorphic.
-        /// Refer to [`jacobian_reverse_holomorphic`] for the holomorphy contract.
-        jacobian_reverse_holomorphic,
-        delegate = jacobian_reverse_holomorphic_with_aux,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + DifferentiableOperation<PartialEvaluationContext<Self>>
-                + TransposableOperation<Self::Constant, Self::Operation>
-                + ResidualZeroProvider<Self::Type>
-                + From<AddOperation<Self::Type>>
-        ],
-    );
-
-    define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
-        /// Refer to [`jacobian_reverse_with_aux`] for details.
-        jacobian_reverse_with_aux,
-        delegate = jacobian_reverse_in_context,
-        holomorphic = false,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + DifferentiableOperation<PartialEvaluationContext<Self>>
-                + TransposableOperation<Self::Constant, Self::Operation>
-                + ResidualZeroProvider<Self::Type>
-                + From<AddOperation<Self::Type>>
-        ],
-    );
-
-    define_jacobian_auxiliary_function_in_trait!(
-        /// Materializes a holomorphic reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs.
-        /// Refer to [`jacobian_reverse_holomorphic_with_aux`] for details.
-        jacobian_reverse_holomorphic_with_aux,
-        delegate = jacobian_reverse_in_context,
-        holomorphic = true,
-        operation_bounds = [
-            PartiallyEvaluatableOperation<Self>
-                + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-                + DifferentiableOperation<PartialEvaluationContext<Self>>
-                + TransposableOperation<Self::Constant, Self::Operation>
-                + ResidualZeroProvider<Self::Type>
-                + From<AddOperation<Self::Type>>
-        ],
-    );
+    /// Materializes the complete [`Jacobian`] using reverse-mode differentiation. Refer to
+    /// [`jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse) for the mathematical
+    /// interpretation and representation.
+    #[inline]
+    fn jacobian_reverse<
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+            Capture::To<LinearizationTracer<Self>>,
+        ) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                Self::Value,
+                To<Self::Value> = Input,
+                Family: ParameterizedFamily<LinearizationTracer<Self>> + ParameterizedFamily<Self::Type>,
+            >,
+        Capture: Parameterized<Self::Value, To<Self::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: Parameterized<
+                LinearizationTracer<Self>,
+                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Type>,
+            >,
+    >(
+        &self,
+        function: F,
+        primal: Input,
+        capture: Capture,
+    ) -> Result<Jacobian<Self::Type, Self::Value, Input::To<Self::Type>, Output::To<Self::Type>>, DifferentiationError>
+    where
+        Self::Operation: PartiallyEvaluatableOperation<Self>
+            + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
+            + DifferentiableOperation<PartialEvaluationContext<Self>>
+            + TransposableOperation<Self::Constant, Self::Operation>
+            + ResidualZeroProvider<Self::Type>
+            + From<AddOperation<Self::Type>>,
+    {
+        let (jacobian, ()) = jacobian_reverse_in_context(
+            self,
+            |input, capture| Ok((function(input, capture)?, ())),
+            primal,
+            capture,
+            false,
+        )?;
+        Ok(jacobian)
+    }
 }
 
 impl<C: Context<Type: DenseDifferentiableType<C>>> JacobianDifferentiate for C {}
 
-/// Defines one context-recovering Jacobian function without auxiliary outputs. It centralizes the structured generic
-/// signature and empty-input handling while keeping each variant's operation requirements explicit at its invocation.
-macro_rules! define_jacobian_function {
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-        operation_bounds = [$($operation_bounds:tt)+],
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>,
-                    ExecutionDomain: Context<Operation: $($operation_bounds)+>,
-                >,
-            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<V::ExecutionDomain>,
-                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-                >,
-        >(
-            function: F,
-            primals: I,
-        ) -> Result<Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, DifferentiationError> {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-/// Defines one context-recovering Jacobian function with auxiliary outputs. It centralizes the structured generic
-/// signature and empty-input handling while keeping each variant's operation requirements explicit at its invocation.
-macro_rules! define_jacobian_auxiliary_function {
-    (
-        $(#[doc = $documentation:literal])*
-        $function_name:ident,
-        operation_bounds = [$($operation_bounds:tt)+],
-    ) => {
-        $(#[doc = $documentation])*
-        #[inline]
-        pub fn $function_name<
-            V: Value<
-                    Type: DenseDifferentiableType<V::ExecutionDomain>,
-                    ExecutionDomain: Context<Operation: $($operation_bounds)+>,
-                >,
-            F: FnOnce(I::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<(O, A), ProgramError>,
-            I: Parameterized<
-                    V,
-                    To<V> = I,
-                    Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>> + ParameterizedFamily<V::Type>,
-                >,
-            O: Parameterized<
-                    LinearizationTracer<V::ExecutionDomain>,
-                    Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
-                >,
-            A: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
-        >(
-            function: F,
-            primals: I,
-        ) -> Result<(Jacobian<V::Type, V, I::To<V::Type>, O::To<V::Type>>, A::To<V>), DifferentiationError> {
-            let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-                return Err(DifferentiationError::EmptyInput);
-            };
-            context.$function_name(function, primals)
-        }
-    };
-}
-
-define_jacobian_function!(
-    /// Computes the complete [`Jacobian`] of `function` at `primals` using forward-mode differentiation.
-    /// For `y = f(x)`, the Jacobian is the linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This function
-    /// linearizes `function` once, applies the resulting [`Pushforward`](crate::Pushforward) to a packed basis of the
-    /// finite input coordinate space, and assembles the resulting columns into a [`Jacobian`]. Each block corresponds
-    /// to one output parameter and one input parameter; array blocks place the output axes before the input axes.
-    /// [`jacobian_reverse`] produces the same representation by applying the transposed map and is generally
-    /// preferable when the output coordinate space is smaller.
-    ///
-    /// The active context is recovered from the first value in `primals`, so the same entry point works for eager
-    /// values and staged tracers. Ordinary forward materialization requires real input leaves, although output leaves
-    /// may be complex. Use [`jacobian_forward_holomorphic`] for a complex holomorphic function.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Function whose Jacobian is materialized.
-    ///   - `primals`: Structured input values specifying the linearization point.
-    jacobian_forward,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + ResidualZeroProvider<V::Type>
-    ],
-);
-
-define_jacobian_function!(
-    /// Computes the forward-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
-    /// the algorithm and representation described by [`jacobian_forward`], but treats the derivative as complex linear
-    /// and requires every differentiated input and output parameter to be complex. Passing `function` is a promise of
-    /// holomorphy; this function validates the parameter types but cannot prove that the function satisfies the
-    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_forward_holomorphic,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + ResidualZeroProvider<V::Type>
-    ],
-);
-
-define_jacobian_auxiliary_function!(
-    /// Computes a forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The closure returns
-    /// `(output, auxiliary)`. Only `output` contributes to the Jacobian. `auxiliary` is materialized from its primal
-    /// trace and returned with it. Refer to [`jacobian_forward`] for the mathematical interpretation, block layout,
-    /// context recovery, and ordinary complex-type rules.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_forward_with_aux,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + ResidualZeroProvider<V::Type>
-    ],
-);
-
-define_jacobian_auxiliary_function!(
-    /// Computes a holomorphic forward-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The
-    /// closure and auxiliary-output behavior are described by [`jacobian_forward_with_aux`]. The holomorphy promise
-    /// and complex-type requirements are the same as for [`jacobian_forward_holomorphic`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_forward_holomorphic_with_aux,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + ResidualZeroProvider<V::Type>
-    ],
-);
-
-define_jacobian_function!(
-    /// Computes the complete [`Jacobian`] of `function` at `primals` using reverse-mode differentiation.
-    /// For `y = f(x)`, the pullback maps an output cotangent `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This
-    /// function constructs that [`Pullback`](crate::Pullback) once, applies it to a packed basis of the finite output
-    /// coordinate space, and reorients the resulting rows into the same output-major/input-minor [`Jacobian`]
-    /// representation returned by [`jacobian_forward`]. Reverse materialization is generally preferable when the
-    /// output coordinate space is smaller than the input coordinate space.
-    ///
-    /// The active context is recovered from the first value in `primals`, so the same entry point works for eager
-    /// values and staged tracers. Ordinary reverse materialization requires real output leaves, although input leaves
-    /// may be complex. Use [`jacobian_reverse_holomorphic`] for a complex holomorphic function.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Function whose Jacobian is materialized.
-    ///   - `primals`: Structured input values specifying the linearization point.
-    jacobian_reverse,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-            + TransposableOperation<
-                <V::ExecutionDomain as Domain>::Constant,
-                <V::ExecutionDomain as Domain>::Operation,
-            >
-            + ResidualZeroProvider<V::Type>
-            + From<AddOperation<V::Type>>
-    ],
-);
-
-define_jacobian_function!(
-    /// Computes the reverse-mode [`Jacobian`] of a complex holomorphic `function` at `primals`. This function uses
-    /// the algorithm and representation described by [`jacobian_reverse`], but treats the derivative as complex linear
-    /// and requires every differentiated input and output parameter to be complex. Passing `function` is a promise of
-    /// holomorphy; this function validates the parameter types but cannot prove that the function satisfies the
-    /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_reverse_holomorphic,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-            + TransposableOperation<
-                <V::ExecutionDomain as Domain>::Constant,
-                <V::ExecutionDomain as Domain>::Operation,
-            >
-            + ResidualZeroProvider<V::Type>
-            + From<AddOperation<V::Type>>
-    ],
-);
-
-define_jacobian_auxiliary_function!(
-    /// Computes a reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The closure returns
-    /// `(output, auxiliary)`. Only `output` contributes to the Jacobian; `auxiliary` is materialized from its primal
-    /// trace and returned with it. Refer to [`jacobian_reverse`] for the mathematical interpretation, block layout,
-    /// context recovery, and ordinary complex-type rules.
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_reverse_with_aux,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-            + TransposableOperation<
-                <V::ExecutionDomain as Domain>::Constant,
-                <V::ExecutionDomain as Domain>::Operation,
-            >
-            + ResidualZeroProvider<V::Type>
-            + From<AddOperation<V::Type>>
-    ],
-);
-
-define_jacobian_auxiliary_function!(
-    /// Computes a holomorphic reverse-mode [`Jacobian`] and returns non-differentiated auxiliary outputs. The
-    /// closure and auxiliary-output behavior are described by [`jacobian_reverse_with_aux`]. The holomorphy promise
-    /// and complex-type requirements are the same as for [`jacobian_reverse_holomorphic`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `function`: Holomorphic function whose complex Jacobian is materialized.
-    ///   - `primals`: Structured complex input values specifying the linearization point.
-    jacobian_reverse_holomorphic_with_aux,
-    operation_bounds = [
-        PartiallyEvaluatableOperation<V::ExecutionDomain>
-            + PartiallyEvaluatableOperation<
-                TracingContext<
-                    <V::ExecutionDomain as Domain>::Constant,
-                    <V::ExecutionDomain as Domain>::Operation,
-                >,
-            >
-            + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-            + TransposableOperation<
-                <V::ExecutionDomain as Domain>::Constant,
-                <V::ExecutionDomain as Domain>::Operation,
-            >
-            + ResidualZeroProvider<V::Type>
-            + From<AddOperation<V::Type>>
-    ],
-);
-
-/// Implements forward-mode [`Jacobian`] materialization in an explicitly provided [`Context`] for a function that also
-/// returns auxiliary outputs. It linearizes the differentiated output once, packs one tangent basis direction for every
-/// input coordinate, replays the resulting pushforward over the packed batch, and returns the materialized primal
+/// Implements the forward-mode differentiation transform used by
+/// [`jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward) in an explicitly
+/// provided [`Context`]. It linearizes once, replays a packed active-input basis, and returns
 /// auxiliary output unchanged.
 ///
 /// # Parameters
 ///
 ///   - `context`: Context in which to trace and replay the transform.
 ///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
+///   - `primal`: Structured input value specifying the linearization point.
+///   - `capture`: Structured runtime value held fixed while differentiating the input.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
 pub(crate) fn jacobian_forward_in_context<
     C: Context<
@@ -734,17 +301,19 @@ pub(crate) fn jacobian_forward_in_context<
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
     Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
 >(
     context: &C,
     function: F,
-    primals: I,
+    primal: I,
+    capture: Capture,
     holomorphic: bool,
 ) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
     // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
     // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
-    let input_structure = primals.parameter_structure();
-    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_structure = primal.parameter_structure();
+    let input_values = primal.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
@@ -770,8 +339,8 @@ pub(crate) fn jacobian_forward_in_context<
     // A future operand-relative zero operation may make this early validation redundant.
     let mut auxiliary = None;
     let (output, pushforward) = context.linearize(
-        |input| {
-            let (output, value) = function(input)?;
+        |input, capture| {
+            let (output, value) = function(input, capture)?;
             auxiliary = Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?);
             let output_structure = output.parameter_structure();
             let output_values = output.into_parameters().collect::<Vec<_>>();
@@ -791,6 +360,7 @@ pub(crate) fn jacobian_forward_in_context<
             Ok(O::from_parameters(output_structure, output_values)?)
         },
         primals,
+        capture,
     )?;
 
     // Recover and validate the output type tree from the primal output returned by linearization. These types later
@@ -895,16 +465,17 @@ pub(crate) fn jacobian_forward_in_context<
     Ok((jacobian, auxiliary))
 }
 
-/// Implements reverse-mode [`Jacobian`] materialization in an explicitly provided [`Context`] for a function that also
-/// returns auxiliary outputs. It constructs the pullback of the differentiated output once, packs one cotangent basis
-/// direction for every output coordinate, replays that pullback over the packed batch, and returns the materialized
-/// primal auxiliary output unchanged.
+/// Implements the reverse-mode differentiation transform used by
+/// [`jacobian_reverse`](crate::DifferentiationBuilder::jacobian_reverse) in an explicitly
+/// provided [`Context`]. It constructs one pullback, replays a packed differentiated-output basis,
+/// and returns auxiliary output unchanged.
 ///
 /// # Parameters
 ///
 ///   - `context`: Context in which to trace and replay the transform.
 ///   - `function`: Function returning the differentiated output and auxiliary output.
-///   - `primals`: Structured input values specifying the linearization point.
+///   - `primal`: Structured input value specifying the linearization point.
+///   - `capture`: Structured runtime value held fixed while differentiating the input.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
 pub(crate) fn jacobian_reverse_in_context<
     C: Context<
@@ -923,17 +494,19 @@ pub(crate) fn jacobian_reverse_in_context<
         >,
     O: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Type>>,
     Aux: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-    F: FnOnce(I::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
+    Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
+    F: FnOnce(I::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Result<(O, Aux), ProgramError>,
 >(
     context: &C,
     function: F,
-    primals: I,
+    primal: I,
+    capture: Capture,
     holomorphic: bool,
 ) -> Result<(Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, Aux::To<C::Value>), DifferentiationError> {
     // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
     // inputs in the ordinary case, but still requires each input parameter to have a nonzero cotangent space.
-    let input_structure = primals.parameter_structure();
-    let input_values = primals.into_parameters().collect::<Vec<_>>();
+    let input_structure = primal.parameter_structure();
+    let input_values = primal.into_parameters().collect::<Vec<_>>();
     let input_types = I::To::<C::Type>::from_parameters(
         input_structure.clone(),
         input_values.iter().map(|value| value.r#type().into_owned()),
@@ -957,12 +530,13 @@ pub(crate) fn jacobian_reverse_in_context<
     // constructing the Jacobian.
     let mut auxiliary = None;
     let (output, pullback) = context.vjp(
-        |input| {
-            let (output, value) = function(input)?;
+        |input, capture| {
+            let (output, value) = function(input, capture)?;
             auxiliary = Some(extract_auxiliary_primals(value).map_err(ProgramError::from)?);
             Ok(output)
         },
         primals,
+        capture,
     )?;
 
     // Recover and validate the output type tree from the primal output. In reverse mode these types determine the
@@ -1205,7 +779,9 @@ mod tests {
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
+    use crate::differentiation::{
+        DerivativeTransform, DifferentiationError, DifferentiationParameterRole, differentiate_at,
+    };
     use crate::operations::{Add, Compare, ComparisonDirection, Select, Sin, ZeroLike};
     use crate::parameters::{ParameterPath, Parameterized};
     use crate::programs::{Typed, Value};
@@ -1258,7 +834,9 @@ mod tests {
     fn test_jacobian_forward() {
         // A vector identity function packs every input coordinate direction into one replay and reconstructs the
         // complete identity matrix as a single output/input block.
-        let jacobian = jacobian_forward(|input| Ok(input), Array::vector(vec![1.0, 2.0, 3.0])).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|input, ()| Ok(input), Array::vector(vec![1.0, 2.0, 3.0]), ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(
             block.value().r#type().into_owned(),
@@ -1267,11 +845,13 @@ mod tests {
         assert_eq!(block.value().to_f64s(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
 
         // Structured inputs and outputs produce blocks in output-major/input-minor order.
-        let jacobian = jacobian_forward(
-            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
-            (Array::scalar(2.0), Array::scalar(3.0)),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(
+                |(x, y), ()| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
@@ -1288,11 +868,13 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // An output independent of one input retains an explicit zero block in the Cartesian product.
-        let jacobian = jacobian_forward(
-            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
-            (Array::scalar(2.0), Array::scalar(3.0)),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(
+                |(x, y), ()| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 6);
         assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
@@ -1303,25 +885,33 @@ mod tests {
         assert_abs_diff_eq!(blocks[5].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Forward replay follows primal control flow and selects the tangent of the branch taken at the primal point.
-        let jacobian = jacobian_forward(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|x, ()| Ok(piecewise_select(x)), Array::scalar(2.0), ())
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = jacobian_forward(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|x, ()| Ok(piecewise_select(x)), Array::scalar(-2.0), ())
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let jacobian = jacobian_forward(|value| value.sin(), input).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|value, ()| value.sin(), input, ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
         assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
-        let jacobian = jacobian_forward(
-            |(scalar, vector)| Ok(scalar.clone() * vector + scalar),
-            (Array::scalar(2.0), Array::vector(vec![3.0, 4.0])),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(
+                |(scalar, vector), ()| Ok(scalar.clone() * vector + scalar),
+                (Array::scalar(2.0), Array::vector(vec![3.0, 4.0])),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2]);
@@ -1331,8 +921,9 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian =
-            jacobian_forward(|input| Ok(input.clone() + input), Array::from_f64s(r#type.clone(), Vec::new())).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_forward(|input, ()| Ok(input.clone() + input), Array::from_f64s(r#type.clone(), Vec::new()), ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[0]);
@@ -1341,7 +932,7 @@ mod tests {
 
         // The holomorphic entry point treats a complex derivative as complex linear.
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
-        let jacobian = jacobian_forward_holomorphic(|x| Ok(x.clone() * x), input).unwrap();
+        let jacobian = differentiate_at(input).holomorphic().jacobian_forward(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(4.0, 2.0)]),
@@ -1351,11 +942,13 @@ mod tests {
     #[test]
     fn test_jacobian_reverse() {
         // Structured inputs and outputs produce the same output-major/input-minor blocks as forward mode.
-        let jacobian = jacobian_reverse(
-            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
-            (Array::scalar(2.0), Array::scalar(3.0)),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(
+                |(x, y), ()| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
+                (Array::scalar(2.0), Array::scalar(3.0)),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 4);
         assert_eq!(blocks[0].output_path().to_string(), "$.0");
@@ -1372,15 +965,21 @@ mod tests {
         assert_abs_diff_eq!(blocks[3].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
         // Reverse replay routes output cotangents through the branch selected at the primal point.
-        let jacobian = jacobian_reverse(|x| Ok(piecewise_select(x)), Array::scalar(2.0)).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|x, ()| Ok(piecewise_select(x)), Array::scalar(2.0), ())
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
-        let jacobian = jacobian_reverse(|x| Ok(piecewise_select(x)), Array::scalar(-2.0)).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|x, ()| Ok(piecewise_select(x)), Array::scalar(-2.0), ())
+            .unwrap();
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 3.0, epsilon = 1e-9);
 
         // Per-element masking over a vector input makes the Jacobian diagonal, with entries 2 for positive inputs and
         // 3 otherwise.
-        let jacobian = jacobian_reverse(|x| Ok(piecewise_select(x)), Array::vector(vec![1.0, -1.0])).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|x, ()| Ok(piecewise_select(x)), Array::vector(vec![1.0, -1.0]), ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[2]);
@@ -1394,14 +993,16 @@ mod tests {
         let f32_vector_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]));
         let vector = Array::from_f64s(ArrayType::new(F64, Shape::new(vec![Dimension::Static(2)])), vec![2.0, -3.0]);
 
-        let jacobian = jacobian_reverse(
-            |(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &scalar, &vector)
-            },
-            (scalar.clone(), vector.clone()),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(
+                |(scalar, vector), ()| {
+                    let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                    Select::select(&condition, &scalar, &vector)
+                },
+                (scalar.clone(), vector.clone()),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
@@ -1412,14 +1013,16 @@ mod tests {
         );
         assert_eq!(blocks[1].value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0]);
 
-        let jacobian = jacobian_reverse(
-            |(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
-                Select::select(&condition, &vector, &scalar)
-            },
-            (scalar, vector),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(
+                |(scalar, vector), ()| {
+                    let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                    Select::select(&condition, &vector, &scalar)
+                },
+                (scalar, vector),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().into_owned(), f32_vector_type);
@@ -1433,7 +1036,9 @@ mod tests {
         // Promoted elementwise cotangents are converted back to the differential type of each input leaf.
         let f32 = Array::from_f64s(ArrayType::scalar(F32), vec![2.0]);
         let f64 = Array::from_f64s(ArrayType::scalar(F64), vec![3.0]);
-        let jacobian = jacobian_reverse(|(left, right)| Ok(left + right), (f32.clone(), f64.clone())).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|(left, right), ()| Ok(left + right), (f32.clone(), f64.clone()), ())
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().data_type(), F32);
@@ -1441,29 +1046,37 @@ mod tests {
         assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 1.0, epsilon = 1e-9);
 
-        let jacobian = jacobian_reverse(|(left, right)| Ok(left - right), (f32.clone(), f64.clone())).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|(left, right), ()| Ok(left - right), (f32.clone(), f64.clone()), ())
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], -1.0, epsilon = 1e-9);
 
-        let jacobian = jacobian_reverse(|(left, right)| Ok(left * right), (f32, f64)).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|(left, right), ()| Ok(left * right), (f32, f64), ())
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_abs_diff_eq!(blocks[0].value().to_f64s()[0], 3.0, epsilon = 1e-9);
         assert_abs_diff_eq!(blocks[1].value().to_f64s()[0], 2.0, epsilon = 1e-9);
 
         // Narrow primal element types use their widened differential representation for dense Jacobian blocks.
         let input = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
-        let jacobian = jacobian_reverse(|value| value.sin(), input).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|value, ()| value.sin(), input, ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().r#type().as_ref(), &ArrayType::scalar(F32));
         assert_abs_diff_eq!(block.value().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-6);
 
         // Scalar inputs broadcast into vector outputs are unbroadcast when their dense block is reconstructed.
-        let jacobian = jacobian_reverse(
-            |(scalar, vector)| Ok(scalar.clone() * vector + scalar),
-            (Array::scalar(2.0), Array::vector(vec![3.0, 4.0])),
-        )
-        .unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(
+                |(scalar, vector), ()| Ok(scalar.clone() * vector + scalar),
+                (Array::scalar(2.0), Array::vector(vec![3.0, 4.0])),
+                (),
+            )
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].value().r#type().static_shape().unwrap().as_slice(), &[2]);
@@ -1473,8 +1086,9 @@ mod tests {
 
         // Zero-sized inputs and outputs remain concrete, honestly typed dense blocks.
         let r#type = ArrayType::new(F64, Shape::new(vec![Dimension::Static(0)]));
-        let jacobian =
-            jacobian_reverse(|input| Ok(input.clone() + input), Array::from_f64s(r#type.clone(), Vec::new())).unwrap();
+        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(|input, ()| Ok(input.clone() + input), Array::from_f64s(r#type.clone(), Vec::new()), ())
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[0]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[0]);
@@ -1483,7 +1097,7 @@ mod tests {
 
         // The holomorphic entry point transposes a complex-linear pushforward without conjugating it.
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
-        let jacobian = jacobian_reverse_holomorphic(|x| Ok(x.clone() * x), input).unwrap();
+        let jacobian = differentiate_at(input).holomorphic().jacobian_reverse(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(4.0, 2.0)]),
@@ -1493,42 +1107,54 @@ mod tests {
     #[test]
     fn test_jacobian_with_auxiliary_outputs() {
         let forward_evaluations = Cell::new(0);
-        let (jacobian, auxiliary) = jacobian_forward_with_aux(
-            |x| {
+        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
+            .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
+            .with_captures(())
+            .with_aux()
+            .jacobian_forward(|x, ()| {
                 forward_evaluations.set(forward_evaluations.get() + 1);
                 Ok((x.clone() * x.clone(), x))
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(forward_evaluations.get(), 1);
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
         let reverse_evaluations = Cell::new(0);
-        let (jacobian, auxiliary) = jacobian_reverse_with_aux(
-            |x| {
+        let (jacobian, auxiliary) = differentiate_at(Array::scalar(2.0))
+            .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
+            .with_captures(())
+            .with_aux()
+            .jacobian_reverse(|x, ()| {
                 reverse_evaluations.set(reverse_evaluations.get() + 1);
                 Ok((x.clone() * x.clone(), x))
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(reverse_evaluations.get(), 1);
         assert_abs_diff_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s()[0], 4.0, epsilon = 1e-9);
         assert_eq!(auxiliary.to_f64s(), vec![2.0]);
 
         let input = Array::scalar(ComplexNumber::new(2.0f32, 1.0));
-        let (jacobian, auxiliary) =
-            jacobian_forward_holomorphic_with_aux(|x| Ok((x.clone() * x.clone(), x)), input.clone()).unwrap();
+        let (jacobian, auxiliary) = differentiate_at(input.clone())
+            .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
+            .with_captures(())
+            .with_aux()
+            .holomorphic()
+            .jacobian_forward(|x, ()| Ok((x.clone() * x.clone(), x)))
+            .unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(4.0, 2.0)]),
         );
         assert_eq!(auxiliary, input);
 
-        let (jacobian, auxiliary) =
-            jacobian_reverse_holomorphic_with_aux(|x| Ok((x.clone() * x.clone(), x)), input.clone()).unwrap();
+        let (jacobian, auxiliary) = differentiate_at(input.clone())
+            .in_context(&EagerContext::<Array, ArrayOperation<Array>>::new())
+            .with_captures(())
+            .with_aux()
+            .holomorphic()
+            .jacobian_reverse(|x, ()| Ok((x.clone() * x.clone(), x)))
+            .unwrap();
         assert_eq!(
             jacobian.iter_blocks().next().unwrap().value().elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(4.0, 2.0)]),
@@ -1541,13 +1167,13 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
         assert_eq!(
-            jacobian_forward(|inputs| Ok(inputs), Vec::<Array>::new()).unwrap_err(),
+            context.jacobian_forward(|inputs: Vec<_>, ()| Ok(inputs), Vec::<Array>::new(), ()).unwrap_err(),
             DifferentiationError::EmptyInput,
         );
 
         let integer = Array::from_f64s(ArrayType::scalar(DataType::I32), vec![2.0]);
         assert_eq!(
-            context.jacobian_forward(|x| Ok(x), integer).unwrap_err(),
+            context.jacobian_forward(|x, ()| Ok(x), integer, ()).unwrap_err(),
             DifferentiationError::NonDifferentiableParameter {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -1558,7 +1184,7 @@ mod tests {
 
         let complex = Array::scalar(ComplexNumber::new(2.0f32, 0.0));
         assert_eq!(
-            context.jacobian_forward(|x| Ok(x), complex).unwrap_err(),
+            context.jacobian_forward(|x, ()| Ok(x), complex, ()).unwrap_err(),
             DifferentiationError::ComplexParameter {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -1567,7 +1193,11 @@ mod tests {
             },
         );
         assert_eq!(
-            context.jacobian_reverse_holomorphic(|x| Ok(x), Array::scalar(2.0)).unwrap_err(),
+            differentiate_at(Array::scalar(2.0))
+                .in_context(&context)
+                .holomorphic()
+                .jacobian_reverse(|x| Ok(x))
+                .unwrap_err(),
             DifferentiationError::NonComplexParameter {
                 transform: DerivativeTransform::JacobianReverse,
                 role: DifferentiationParameterRole::Input,
@@ -1578,8 +1208,9 @@ mod tests {
 
         let complex_output_error = context
             .jacobian_reverse(
-                |input| Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)))?),
+                |input, ()| Ok(input.context().lift(Array::scalar(ComplexNumber::new(1.0f32, 0.0)))?),
                 Array::scalar(2.0),
+                (),
             )
             .unwrap_err();
         assert_eq!(
@@ -1598,7 +1229,7 @@ mod tests {
         );
         let dynamic = Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec());
         assert_eq!(
-            context.jacobian_forward(|x| Ok(x), dynamic).unwrap_err(),
+            context.jacobian_forward(|x, ()| Ok(x), dynamic, ()).unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianForward,
                 role: DifferentiationParameterRole::Input,
@@ -1609,10 +1240,11 @@ mod tests {
         assert_eq!(
             context
                 .jacobian_forward(
-                    |input| Ok(input
+                    |input, ()| Ok(input
                         .context()
                         .lift(Array::with_unchecked_type(dynamic_type.clone(), 1.0f64.to_le_bytes().to_vec()))?),
                     Array::scalar(1.0),
+                    (),
                 )
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
@@ -1626,7 +1258,7 @@ mod tests {
         let dynamic = Array::with_unchecked_type(dynamic_type, 1.0f64.to_le_bytes().to_vec());
         assert_eq!(
             context
-                .jacobian_reverse(|input| Ok(input.context().lift(Array::scalar(1.0))?), dynamic)
+                .jacobian_reverse(|input, ()| Ok(input.context().lift(Array::scalar(1.0))?), dynamic, ())
                 .unwrap_err(),
             DifferentiationError::NonFiniteCoordinateSpace {
                 transform: DerivativeTransform::JacobianReverse,
@@ -1644,7 +1276,7 @@ mod tests {
                 input
                     .context()
                     .clone()
-                    .jacobian_forward(|value| Ok(value.clone() * value), input)
+                    .jacobian_forward(|value, ()| Ok(value.clone() * value), input, ())
                     .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
             },
             Array::vector(vec![1.0, 2.0, 3.0]),
@@ -1660,17 +1292,19 @@ mod tests {
     fn test_jacobian_forward_nested_in_jacobian_reverse() {
         // For f(x) = x², the forward Jacobian is f′(x) = 2x. Differentiating that materialized Jacobian with a
         // reverse Jacobian computes the second derivative f″(x) = 2.
-        let derivative = jacobian_reverse(
-            |input| {
-                let nested_context = input.context().clone();
-                let jacobian = nested_context
-                    .jacobian_forward(|value| Ok(value.clone() * value), input)
-                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
-                Ok(jacobian.into_values().remove(0))
-            },
-            Array::scalar(3.0),
-        )
-        .unwrap();
+        let derivative = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jacobian_reverse(
+                |input, ()| {
+                    let nested_context = input.context().clone();
+                    let jacobian = nested_context
+                        .jacobian_forward(|value, ()| Ok(value.clone() * value), input, ())
+                        .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                    Ok(jacobian.into_values().remove(0))
+                },
+                Array::scalar(3.0),
+                (),
+            )
+            .unwrap();
         assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
     }
 
