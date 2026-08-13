@@ -785,8 +785,6 @@ impl<Input, ContextState>
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliaryOutput, LinearityState, ContextState>
 {
@@ -800,8 +798,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     ///
     /// # Parameters
     ///
-    ///   - `function`: Scalar-valued function to evaluate and differentiate at the builder's active primal. This
-    ///     closure may return its traced scalar directly or in a [`Result`] whose error converts into
+    ///   - `function`: Scalar-valued function to evaluate and differentiate at the builder's active primal.
+    ///     This closure may return its traced scalar directly or in a [`Result`] whose error converts into
     ///     [`DifferentiationError`], as specified by [`MaybeFallible`].
     #[inline]
     pub fn value_and_gradient<V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
@@ -870,23 +868,21 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
 
-    /// Materializes the complete [`Jacobian`] of `function` using forward-mode differentiation.
-    ///
-    /// For `y = f(x)`, the Jacobian is the linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This
-    /// method linearizes `function` once, applies the resulting [`Pushforward`] to a packed basis of the finite input
-    /// coordinate space, and assembles the resulting columns into a Jacobian. Each block corresponds to one output
-    /// leaf and one input leaf in deterministic output-major/input-minor order; for arrays, a block places output axes
-    /// before input axes.
+    /// Computes the [`Jacobian`] of `function` using forward-mode differentiation. For `y = f(x)`, the Jacobian is the
+    /// linear map `J_f(x) = ∂f/∂x` satisfying `ẏ = J_f(x) · ẋ`. This method linearizes `function` once, applies the
+    /// resulting [`Pushforward`] to a packed basis of the finite input coordinate space, and assembles the resulting
+    /// columns into a Jacobian. Each block corresponds to one output leaf and one input leaf in deterministic
+    /// output-major/input-minor order. For arrays, a block places output axes before input axes.
     ///
     /// Let `n` and `m` be the total input and output coordinate counts, `T_linearize` the one-time cost of constructing
     /// the pushforward, and `T_pushforward` the cost of one tangent direction. Forward materialization evaluates an
-    /// `n`-way packed pushforward, so its derivative work is approximately
-    /// `O(T_linearize + n · T_pushforward)`. If `R_forward` is the shared residual storage and `M_pushforward` the
-    /// additional peak memory for one direction, its working memory excluding the result is approximately
-    /// `O(R_forward + n · M_pushforward)`. The materialized Jacobian itself necessarily occupies `Θ(mn)` storage.
-    /// [`jacobian_reverse`](Self::jacobian_reverse) produces the same representation and is generally preferable when
-    /// `m < n`; use forward mode when `n <= m`. Packing may execute directions in parallel, but does not change these
-    /// total-work or storage scalings.
+    /// `n`-way packed pushforward, so its derivative work is approximately `O(T_linearize + n · T_pushforward)`. If
+    /// `R_forward` is the shared residual storage and `M_pushforward` the additional peak memory for one direction,
+    /// its working memory excluding the result is approximately `O(R_forward + n · M_pushforward)`. The materialized
+    /// Jacobian itself necessarily occupies `Θ(mn)` storage. [`jacobian_reverse`](Self::jacobian_reverse) produces the
+    /// same representation and is generally preferable when `m < n`; use forward mode when `n <= m`. Packing lets the
+    /// backend evaluate derivative directions concurrently, potentially reducing wall-clock time, but it does not
+    /// reduce the total arithmetic work or asymptotic storage required.
     ///
     /// Ordinary mode requires real active input leaves but permits complex differentiated outputs.
     /// [`HolomorphicLinearity`] mode treats the derivative as complex linear and requires every active input and
@@ -941,21 +937,20 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_forward(|input, ()| function(input))
     }
 
-    /// Materializes the complete [`Jacobian`] of `function` using reverse-mode differentiation.
-    ///
-    /// For `y = f(x)`, the pullback maps `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This method
-    /// constructs one [`Pullback`], applies it to a packed basis of the finite output coordinate space, and reorients
-    /// the resulting rows into the same output-major/input-minor [`Jacobian`] representation returned by
-    /// [`jacobian_forward`](Self::jacobian_forward). Array blocks place output axes before input axes.
+    /// Computes the [`Jacobian`] of `function` using reverse-mode differentiation. For `y = f(x)`, the pullback maps
+    /// `ȳ` to `x̄ = J_f(x)ᵀ · ȳ`, where `J_f(x) = ∂f/∂x`. This method constructs one [`Pullback`], applies it to a
+    /// packed basis of the finite output coordinate space, and reorients the resulting rows into the same
+    /// output-major/input-minor [`Jacobian`] representation returned by [`jacobian_forward`](Self::jacobian_forward).
+    /// Array blocks place output axes before input axes.
     ///
     /// Let `n` and `m` be the total input and output coordinate counts, `T_vjp` the one-time cost of constructing the
     /// pullback, and `T_pullback` the cost of one cotangent direction. Reverse materialization evaluates an `m`-way
     /// packed pullback, so its derivative work is approximately `O(T_vjp + m · T_pullback)`. If `R_reverse` is the
     /// shared residual storage and `M_pullback` the additional peak memory for one direction, its working memory
     /// excluding the result is approximately `O(R_reverse + m · M_pullback)`. The materialized Jacobian itself
-    /// necessarily occupies `Θ(mn)` storage. Reverse mode is generally preferable when `m < n`; use
-    /// [`jacobian_forward`](Self::jacobian_forward) when `n <= m`. Packing may execute directions in parallel, but does
-    /// not change these total-work or storage scalings.
+    /// necessarily occupies `Θ(mn)` storage. Reverse mode is generally preferable when `m < n`; use forward-mode when
+    /// `n <= m`. Packing lets the backend evaluate derivative directions concurrently, potentially reducing wall-clock
+    /// time, but it does not reduce the total arithmetic work or asymptotic storage required.
     ///
     /// Ordinary mode requires real differentiated output leaves but permits complex active inputs.
     /// [`HolomorphicLinearity`] mode treats the derivative as complex linear and requires every active input and
@@ -1016,25 +1011,25 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .jacobian_reverse(|input, ()| function(input))
     }
 
-    /// Materializes the complete [`Hessian`] of `function` using forward-over-reverse differentiation.
-    ///
-    /// For `y = f(x)`, each entry is `H_f(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. The inner reverse transform
-    /// materializes `J_f(x)` by applying a [`Pullback`] to packed output-coordinate basis cotangents; the outer forward
-    /// transform differentiates those Jacobian entries by applying a [`Pushforward`] to packed input-coordinate basis
-    /// tangents. The result stores blocks in output-major/first-input-major/second-input-minor order. For arrays, a
-    /// block places output axes first, followed by first-input axes and then second-input axes.
+    /// Computes the [`Hessian`] of `function` using forward-over-reverse-mode differentiation. For `y = f(x)`, each
+    /// entry is `H_f(x)[k, i, j] = ∂²y[k]/(∂x[i] ∂x[j])`. The inner reverse transform materializes `J_f(x)` by applying
+    /// a [`Pullback`] to packed output-coordinate basis cotangents. The outer forward transform differentiates those
+    /// Jacobian entries by applying a [`Pushforward`] to packed input-coordinate basis tangents. The result stores
+    /// blocks in output-major/first-input-major/second-input-minor order. For arrays, a block places output axes first,
+    /// followed by first-input axes and then second-input axes.
     ///
     /// Let `n` and `m` be the total input and output coordinate counts. The transform performs an `m`-way packed inner
     /// pullback and an `n`-way packed outer pushforward. If `T_inner_vjp` and `T_outer_linearize` are the one-time
     /// costs of those transforms and `T_inner_pullback` and `T_outer_pushforward` are their per-direction costs, the
-    /// derivative work is approximately
-    /// `O(T_inner_vjp + m · T_inner_pullback + T_outer_linearize + n · T_outer_pushforward)`. If `R_hessian` is the
-    /// nested residual storage and `M_inner_pullback` and `M_outer_pushforward` are the additional peak memories for
-    /// one direction, working memory excluding the result is approximately
-    /// `O(R_hessian + m · M_inner_pullback + n · M_outer_pushforward)`. The materialized Hessian necessarily occupies
-    /// `Θ(mn²)` storage. This decomposition is particularly well suited to scalar-output functions, where `m = 1`:
-    /// reverse mode constructs the gradient with one cotangent direction and forward mode differentiates that
-    /// input-to-gradient map. Packing may execute directions in parallel, but does not change these scalings.
+    /// derivative work is approximately `O(T_inner_vjp + m · T_inner_pullback + T_outer_linearize + n ·
+    /// T_outer_pushforward)`. If `R_hessian` is the nested residual storage and `M_inner_pullback` and
+    /// `M_outer_pushforward` are the additional peak memories for one direction, working memory excluding the result
+    /// is approximately `O(R_hessian + m · M_inner_pullback + n · M_outer_pushforward)`. The materialized Hessian
+    /// necessarily occupies `Θ(mn²)` storage. This decomposition is particularly well suited to scalar-output
+    /// functions, where `m = 1`: reverse mode constructs the gradient with one cotangent direction, and forward mode
+    /// differentiates that input-to-gradient map. Packing lets the backend evaluate derivative directions concurrently,
+    /// potentially reducing wall-clock time, but it does not reduce the total arithmetic work or asymptotic storage
+    /// required.
     ///
     /// Complete materialization requires finite, statically enumerable coordinate spaces. Ordinary mode requires real
     /// active input and differentiated output leaves. [`HolomorphicLinearity`] mode requires them all to be complex and
@@ -1053,26 +1048,6 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
                           + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
             >,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
-                Type = V::Type,
-                Value = V,
-                Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
-                               + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
-                               + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
-                               + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
-                               + DifferentiableOperation<
-                    PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
-                > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
-                > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
-                               + ResidualZeroProvider<V::Type>
-                               + From<AddOperation<V::Type>>,
-            >,
-        ContextState: DifferentiationBuilderContext<V, Input>,
-        F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
-        ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
@@ -1096,6 +1071,26 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
+        ) -> Result<Output, ProgramError>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
+                Type = V::Type,
+                Value = V,
+                Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
+                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
+                               + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
+                               + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
+                               + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
+                               + DifferentiableOperation<
+                    PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
+                > + DifferentiableOperation<
+                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
+                               + ResidualZeroProvider<V::Type>
+                               + From<AddOperation<V::Type>>,
+            >,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1107,6 +1102,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         .hessian(|input, ()| function(input))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, WithAuxiliaryOutput, LinearityState, ContextState>
