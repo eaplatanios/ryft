@@ -55,15 +55,15 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, BuilderContext, BuilderExecutionContext, CaptureValues,
-    CotangentBatchingPolicy, DenseDifferentiableType, DerivativeTransform, DerivedContext, DifferentiableOperation,
-    DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationParameterRole, DifferentiationTracer,
-    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock, Holomorphic, InContext, Jacobian,
-    JacobianBlock, LinearCallOperation, LinearityMode, Linearization, LinearizationTracer,
-    MemberDifferentiableOperation, NoAuxiliary, NoCaptures, Pullback, Pushforward, RealValued, ResidualZeroProvider,
-    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliary,
-    binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, BuilderContext, BuilderExecutionContext,
+    CotangentBatchingPolicy, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType,
+    Differentiate, DifferentiationBuilder, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment,
+    ForwardModeDifferentiate, Hessian, HessianBlock, Holomorphic, Jacobian, JacobianBlock, LinearCallOperation,
+    LinearityMode, Linearization, LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, Real,
+    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver,
+    UnaryElementwiseJvpOperands, WithAuxiliary, WithCaptures, WithContext, WithoutAuxiliary, WithoutCapture,
+    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
     transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};

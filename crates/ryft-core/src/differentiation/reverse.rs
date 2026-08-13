@@ -1175,7 +1175,7 @@ where
 /// same context.
 ///
 /// User-facing scalar gradients, auxiliary outputs, and holomorphic validation are composed through
-/// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder typestate
+/// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder type state
 /// leaves this trait with the reusable reverse-mode engine [`vjp`](Self::vjp) and the low-level scalar cotangent-seed
 /// primitive [`gradient_seed`](Self::gradient_seed), instead of a method for every option combination.
 pub trait ReverseModeDifferentiate:
@@ -2832,7 +2832,7 @@ mod tests {
 
     #[test]
     fn test_builder_value_and_gradient_with_auxiliary_output_in_holomorphic_mode() {
-        // Builder typestate composes the holomorphy promise with auxiliary output: the gradient is `∂z²/∂z = 2z`
+        // Builder type state composes the holomorphy promise with auxiliary output: the gradient is `∂z²/∂z = 2z`
         // while the auxiliary value rides along with a zero cotangent seed.
         let z = Complex::new(0.7f64, -0.3f64);
         let ((value, aux), gradient): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
