@@ -2313,17 +2313,16 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Starts configuring a differentiation transform that executes in this context.
+/// Provides the ability to initiate a differentiation transform that executes in the current [`Context`]. This
+/// trait is blanket-implemented for every differentiable [`Context`]. Calling `context.differentiate_at(primal)`
+/// is equivalent to calling `differentiate_at(primal).in_context(&context)`.
 ///
-/// This trait is blanket-implemented for every differentiable [`Context`]. Calling `context.differentiate_at(primal)`
-/// is equivalent to `differentiate_at(primal).in_context(&context)`.
+/// # Example
 ///
 /// ```
-/// use std::ops::Mul;
-///
-/// use ryft_core::{Array, ArrayOperation, Differentiate, EagerContext};
+/// # use std::ops::Mul;
+/// #
+/// # use ryft_core::{Array, ArrayOperation, Differentiate, EagerContext};
 ///
 /// fn square<A: Clone + Mul<Output = A>>(input: A) -> A {
 ///     input.clone() * input
@@ -2335,7 +2334,9 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
 /// # Ok::<(), ryft_core::DifferentiationError>(())
 /// ```
 pub trait Differentiate: Context<Type: DifferentiableType> {
-    /// Starts configuring a transform at `primal` with this context selected explicitly.
+    /// Creates a new [`DifferentiationBuilder`] that can be used to differentiate closure at the `primal` point,
+    /// within this [`Context`]. Refer to the documentation of [`differentiate_at`] for information on how to use
+    /// this function.
     #[inline]
     fn differentiate_at<Input>(
         &self,
@@ -2346,6 +2347,8 @@ pub trait Differentiate: Context<Type: DifferentiableType> {
 }
 
 impl<C: Context<Type: DifferentiableType>> Differentiate for C {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Starts configuring a value-level automatic differentiation transform at `primal`.
 ///
