@@ -455,34 +455,42 @@ impl<C: Context<Type = V::Type, Value = V>, V: Value, Input: Parameterized<V>> D
 }
 
 /// Execution [`Context`] selected by a [`DifferentiationBuilder`] type state.
-pub type DifferentiationBuilderExecutionContext<ContextMode, V, Input> =
-    <ContextMode as DifferentiationBuilderContext<V, Input>>::Context;
+pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
+    <ContextState as DifferentiationBuilderContext<V, Input>>::Context;
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Configures a value-level automatic differentiation transform.
+/// Helper that is used to configure a value-level automatic differentiation transform.
 ///
-/// Use [`differentiate_at`] or [`Differentiate::differentiate_at`] to construct this builder from the active primals.
-/// Each terminal method takes the differentiated closure as its last argument, so the builder state determines the
-/// closure's parameter types and they rarely need to be annotated at the call site.
-/// [`in_context`](Self::in_context) selects a specific execution context; otherwise, terminal methods recover one from
-/// the first active primal leaf.
-/// [`with_captures`](Self::with_captures) supplies dynamic runtime values that participate in the primal computation
-/// but are excluded from derivative bookkeeping. The active input and captures can have unrelated [`Parameterized`]
-/// structures: for example, a derived model struct can be active while a tuple containing batches, targets, and
-/// optional runtime state is captured. The builder reparameterizes both structures from runtime leaves `V` to the
-/// terminal's tracer leaves before invoking the closure. Unlike [`stop_gradient()`](crate::stop_gradient()), captures
-/// do not allocate Jacobian or Hessian basis families at all. They are also distinct from compilation captures stored
-/// by [`ClosedProgram`](crate::ClosedProgram): differentiation captures remain explicit runtime inputs to this
-/// closure, and changing their values does not make them static specialization arguments.
-/// Captures follow the same operational validity rules as ordinary values. If a capture is incompatible with the
-/// selected context, the operation or execution boundary that uses it returns its normal context- or backend-specific
-/// error; an unused capture is harmless and does not fail preflight validation.
+/// Use [`differentiate_at`] or [`Differentiate::differentiate_at`] to construct instances of this builder from primal
+/// values. Each terminal function takes the differentiated closure as its last argument, and the builder state
+/// determines the closure's parameter types. The following functions can be used to configure the automatic
+/// differentiation transform:
+///
+///   - [`with_captures`](Self::with_captures) supplies dynamic runtime values that participate in the primal
+///     computation but which are excluded from derivative bookkeeping. The active input and captures can have unrelated
+///     [`Parameterized`] structures. For example, a derived model struct can be active while a tuple containing
+///     batches, targets, and optional runtime state is captured. The builder reparameterizes both structures from
+///     runtime leaves to the terminal function's tracer leaves before invoking the closure. Unlike
+///     [`stop_gradient`](crate::stop_gradient()), captures do not allocate any gradient, Jacobian, or Hessian values.
+///     They are also distinct from compilation captures stored by [`ClosedProgram`](crate::ClosedProgram).
+///     Differentiation captures remain explicit runtime inputs to the function being differentiated, and changing their
+///     values does not make them static specialization arguments. Captures follow the same operational validity rules
+///     as ordinary values. If a capture is incompatible with the selected context, the operation or execution boundary
+///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
+///     fail preflight validation.
 ///
 /// [`with_aux`](Self::with_aux) declares that the closure returns `(output, auxiliary)`. `auxiliary` may be any third,
 /// independently shaped [`Parameterized`] tree and is reconstructed with runtime leaves without being differentiated.
+///
 /// [`holomorphic`](Self::holomorphic) opts the active inputs and differentiated outputs into complex-linear validation.
 /// These modifiers are orthogonal type-state transitions, avoiding combined function-name variants.
+///
+/// [`in_context`](Self::in_context) selects a specific execution context; otherwise, terminal methods recover one from
+/// the first active primal leaf.
+///
+///
+///
 ///
 /// All parameter leaves in one invocation use the same runtime value family `V`. The structures are otherwise fully
 /// polymorphic: tuples, arrays, [`Vec`]s, maps, and types deriving `Parameterized` may be nested freely. Derived types
@@ -492,50 +500,29 @@ pub type DifferentiationBuilderExecutionContext<ContextMode, V, Input> =
 #[derive(Clone, Debug)]
 pub struct DifferentiationBuilder<
     Input,
-    Capture = WithoutCapture,
-    Auxiliary = WithoutAuxiliary,
-    Linearity = RealLinearity,
-    ContextMode = WithoutContext,
+    CaptureState = WithoutCapture,
+    AuxiliaryState = WithoutAuxiliary,
+    LinearityState = RealLinearity,
+    ContextState = WithoutContext,
 > {
     /// Active primal inputs at which the transform is evaluated.
     primals: Input,
 
     /// Dynamic nondifferentiated runtime captures, or [`WithoutCapture`].
-    captures: Capture,
+    captures: CaptureState,
 
     /// Auxiliary-output type state.
-    auxiliary: Auxiliary,
+    auxiliary: AuxiliaryState,
 
     /// Linearity type state.
-    linearity: Linearity,
+    linearity: LinearityState,
 
     /// Execution-context selection state.
-    context: ContextMode,
+    context: ContextState,
 }
 
-impl<Input, Capture, Auxiliary, Linearity>
-    DifferentiationBuilder<Input, Capture, Auxiliary, Linearity, WithoutContext>
-{
-    /// Selects the context in which the differentiation transform executes.
-    ///
-    /// Without this modifier, terminal methods recover the context from the first active primal leaf.
-    #[inline]
-    pub fn in_context<C: Context>(
-        self,
-        context: &C,
-    ) -> DifferentiationBuilder<Input, Capture, Auxiliary, Linearity, WithContext<C>> {
-        DifferentiationBuilder {
-            primals: self.primals,
-            captures: self.captures,
-            auxiliary: self.auxiliary,
-            linearity: self.linearity,
-            context: WithContext(context.clone()),
-        }
-    }
-}
-
-impl<Input, Auxiliary, Linearity, ContextMode>
-    DifferentiationBuilder<Input, WithoutCapture, Auxiliary, Linearity, ContextMode>
+impl<Input, AuxiliaryState, LinearityState, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, AuxiliaryState, LinearityState, ContextState>
 {
     /// Supplies dynamic runtime values that affect primal evaluation without becoming differentiation variables.
     ///
@@ -547,7 +534,7 @@ impl<Input, Auxiliary, Linearity, ContextMode>
     pub fn with_captures<Capture>(
         self,
         captures: Capture,
-    ) -> DifferentiationBuilder<Input, WithCaptures<Capture>, Auxiliary, Linearity, ContextMode> {
+    ) -> DifferentiationBuilder<Input, WithCaptures<Capture>, AuxiliaryState, LinearityState, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: WithCaptures(captures),
@@ -558,8 +545,29 @@ impl<Input, Auxiliary, Linearity, ContextMode>
     }
 }
 
-impl<Input, Capture, Linearity, ContextMode>
-    DifferentiationBuilder<Input, Capture, WithoutAuxiliary, Linearity, ContextMode>
+impl<Input, CaptureState, AuxiliaryState, LinearityState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithoutContext>
+{
+    /// Selects the context in which the differentiation transform executes.
+    ///
+    /// Without this modifier, terminal methods recover the context from the first active primal leaf.
+    #[inline]
+    pub fn in_context<C: Context>(
+        self,
+        context: &C,
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, LinearityState, WithContext<C>> {
+        DifferentiationBuilder {
+            primals: self.primals,
+            captures: self.captures,
+            auxiliary: self.auxiliary,
+            linearity: self.linearity,
+            context: WithContext(context.clone()),
+        }
+    }
+}
+
+impl<Input, CaptureState, LinearityState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, WithoutAuxiliary, LinearityState, ContextState>
 {
     /// Declares that the transformed closure returns `(differentiated_output, auxiliary_output)`.
     ///
@@ -567,7 +575,7 @@ impl<Input, Capture, Linearity, ContextMode>
     /// reconstructed as runtime values in the terminal result, but they are excluded from derivative seeding and
     /// transposition. Its structure is independent of both the active input and any captures.
     #[inline]
-    pub fn with_aux(self) -> DifferentiationBuilder<Input, Capture, WithAuxiliary, Linearity, ContextMode> {
+    pub fn with_aux(self) -> DifferentiationBuilder<Input, CaptureState, WithAuxiliary, LinearityState, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
@@ -578,8 +586,8 @@ impl<Input, Capture, Linearity, ContextMode>
     }
 }
 
-impl<Input, Capture, Auxiliary, ContextMode>
-    DifferentiationBuilder<Input, Capture, Auxiliary, RealLinearity, ContextMode>
+impl<Input, CaptureState, AuxiliaryState, ContextState>
+    DifferentiationBuilder<Input, CaptureState, AuxiliaryState, RealLinearity, ContextState>
 {
     /// Treats the differentiated computation as complex linear under a holomorphy promise.
     ///
@@ -588,7 +596,9 @@ impl<Input, Capture, Auxiliary, ContextMode>
     /// Jacobian, Hessian, and scalar-gradient terminals; JVP, linearization, and VJP do not define a separate
     /// holomorphic validation contract.
     #[inline]
-    pub fn holomorphic(self) -> DifferentiationBuilder<Input, Capture, Auxiliary, HolomorphicLinearity, ContextMode> {
+    pub fn holomorphic(
+        self,
+    ) -> DifferentiationBuilder<Input, CaptureState, AuxiliaryState, HolomorphicLinearity, ContextState> {
         DifferentiationBuilder {
             primals: self.primals,
             captures: self.captures,
@@ -599,7 +609,7 @@ impl<Input, Capture, Auxiliary, ContextMode>
     }
 }
 
-impl<Input, ContextMode> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, RealLinearity, ContextMode> {
+impl<Input, ContextState> DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, RealLinearity, ContextState> {
     /// Evaluates `function` at the builder's active primals and propagates `tangents` through its Jacobian.
     ///
     /// For a function `y = f(x)`, this returns the dual `(y, ẏ) = (f(x), J_f(x) · ẋ)`, where `ẋ` is the supplied
@@ -632,25 +642,25 @@ impl<Input, ContextMode> DifferentiationBuilder<Input, WithoutCapture, WithoutAu
     ) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
-                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>
+                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
                                + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<
-                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
-                DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -692,37 +702,37 @@ impl<Input, ContextMode> DifferentiationBuilder<Input, WithoutCapture, WithoutAu
     ) -> Result<
         (
             Output::To<V>,
-            Pushforward<DifferentiationBuilderExecutionContext<ContextMode, V, Input>, Input, Output::To<V>>,
+            Pushforward<DifferentiationBuilderExecutionContext<ContextState, V, Input>, Input, Output::To<V>>,
         ),
         DifferentiationError,
     >
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -758,25 +768,25 @@ impl<Input, ContextMode> DifferentiationBuilder<Input, WithoutCapture, WithoutAu
         self,
         function: F,
     ) -> Result<
-        (Output::To<V>, Pullback<DifferentiationBuilderExecutionContext<ContextMode, V, Input>, Input, Output::To<V>>),
+        (Output::To<V>, Pullback<DifferentiationBuilderExecutionContext<ContextState, V, Input>, Input, Output::To<V>>),
         DifferentiationError,
     >
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -791,8 +801,8 @@ impl<Input, ContextMode> DifferentiationBuilder<Input, WithoutCapture, WithoutAu
     }
 }
 
-impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
-    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, Linearity, ContextMode>
+impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithoutAuxiliary, LinearityState, ContextState>
 {
     /// Computes both the scalar value of `function` and its reverse-mode gradient.
     ///
@@ -811,22 +821,22 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     pub fn value_and_gradient<V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 DifferentiationError,
             >,
     {
@@ -854,22 +864,22 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     pub fn gradient<V, Output, F>(self, function: F) -> Result<Input::To<V>, DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 DifferentiationError,
             >,
     {
@@ -907,32 +917,32 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
         function: F,
     ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
     {
@@ -975,38 +985,38 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
         function: F,
     ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + TransposableOperation<
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                 > + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
     {
@@ -1070,7 +1080,7 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
                                + From<AddOperation<C::Type>>,
             >,
         V: Value<Type = C::Type>,
-        ContextMode: DifferentiationBuilderContext<V, Input, Context = C>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
         ) -> Result<Output, ProgramError>,
@@ -1109,8 +1119,8 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     }
 }
 
-impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
-    DifferentiationBuilder<Input, WithoutCapture, WithAuxiliary, Linearity, ContextMode>
+impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithoutCapture, WithAuxiliary, LinearityState, ContextState>
 {
     /// Computes a scalar value, its reverse-mode gradient, and non-differentiated auxiliary output.
     ///
@@ -1131,24 +1141,24 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     ) -> Result<((V, Aux), Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
                 (
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 ),
                 DifferentiationError,
             >,
@@ -1156,15 +1166,15 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
                 V,
                 To<V> = Aux,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 >,
             >,
         (
-            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 To<V> = (V, Aux),
                 Family: ParameterizedFamily<V>,
             >,
@@ -1192,24 +1202,24 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     pub fn gradient<V, Output, Aux, F>(self, function: F) -> Result<(Input::To<V>, Aux), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
                 (
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 ),
                 DifferentiationError,
             >,
@@ -1217,15 +1227,15 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
                 V,
                 To<V> = Aux,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 >,
             >,
         (
-            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 To<V> = (V, Aux),
                 Family: ParameterizedFamily<V>,
             >,
@@ -1250,36 +1260,36 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
         function: F,
     ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<(Output, Aux), ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
         Aux: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -1310,42 +1320,42 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
         function: F,
     ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + TransposableOperation<
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                 > + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<(Output, Aux), ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
         Aux: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -1394,7 +1404,7 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
                                + From<AddOperation<C::Type>>,
             >,
         V: Value<Type = C::Type>,
-        ContextMode: DifferentiationBuilderContext<V, Input, Context = C>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
         ) -> Result<(Output, Aux), ProgramError>,
@@ -1438,8 +1448,8 @@ impl<Input, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
     }
 }
 
-impl<Input, Capture, ContextMode>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, RealLinearity, ContextMode>
+impl<Input, Capture, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, RealLinearity, ContextState>
 {
     /// Evaluates `function` and its Jacobian-vector product while holding runtime captures fixed.
     ///
@@ -1462,32 +1472,32 @@ impl<Input, Capture, ContextMode>
     ) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
-                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>
+                Operation: DifferentiableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
                                + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 Family: ParameterizedFamily<
-                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
                 ParameterStructure: Debug + PartialEq,
             >,
         Capture: Parameterized<
                 V,
                 Family: ParameterizedFamily<
-                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                DifferentiationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -1515,45 +1525,45 @@ impl<Input, Capture, ContextMode>
     ) -> Result<
         (
             Output::To<V>,
-            Pushforward<DifferentiationBuilderExecutionContext<ContextMode, V, Input>, Input, Output::To<V>>,
+            Pushforward<DifferentiationBuilderExecutionContext<ContextState, V, Input>, Input, Output::To<V>>,
         ),
         DifferentiationError,
     >
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -1577,33 +1587,33 @@ impl<Input, Capture, ContextMode>
         self,
         function: F,
     ) -> Result<
-        (Output::To<V>, Pullback<DifferentiationBuilderExecutionContext<ContextMode, V, Input>, Input, Output::To<V>>),
+        (Output::To<V>, Pullback<DifferentiationBuilderExecutionContext<ContextState, V, Input>, Input, Output::To<V>>),
         DifferentiationError,
     >
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
@@ -1612,8 +1622,8 @@ impl<Input, Capture, ContextMode>
     }
 }
 
-impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, Linearity, ContextMode>
+impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithoutAuxiliary, LinearityState, ContextState>
 {
     /// Materializes the complete forward-mode [`Jacobian`] with respect to the active primals only.
     ///
@@ -1635,40 +1645,40 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
         function: F,
     ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
     {
@@ -1678,7 +1688,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
             |input, captures| Ok((function(input, captures)?, ())),
             self.primals,
             self.captures.0,
-            Linearity::HOLOMORPHIC,
+            LinearityState::HOLOMORPHIC,
         )?;
         Ok(jacobian)
     }
@@ -1703,46 +1713,46 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
         function: F,
     ) -> Result<Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + TransposableOperation<
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                 > + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
     {
@@ -1752,7 +1762,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
             |input, captures| Ok((function(input, captures)?, ())),
             self.primals,
             self.captures.0,
-            Linearity::HOLOMORPHIC,
+            LinearityState::HOLOMORPHIC,
         )?;
         Ok(jacobian)
     }
@@ -1795,7 +1805,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
                                + From<AddOperation<C::Type>>,
             >,
         V: Value<Type = C::Type>,
-        ContextMode: DifferentiationBuilderContext<V, Input, Context = C>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
             Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
@@ -1845,7 +1855,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
             |input, captures| Ok((function(input, captures)?, ())),
             self.primals,
             self.captures.0,
-            Linearity::HOLOMORPHIC,
+            LinearityState::HOLOMORPHIC,
         )?;
         Ok(hessian)
     }
@@ -1863,35 +1873,35 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
     pub fn value_and_gradient<V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 DifferentiationError,
             >,
     {
         let context = self.context.resolve(&self.primals)?;
-        value_and_gradient_in_context(&context, function, self.primals, self.captures.0, Linearity::HOLOMORPHIC)
+        value_and_gradient_in_context(&context, function, self.primals, self.captures.0, LinearityState::HOLOMORPHIC)
     }
 
     /// Computes a scalar reverse-mode gradient with respect to the active primals only.
@@ -1908,30 +1918,30 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
     pub fn gradient<V, Output, F>(self, function: F) -> Result<Input::To<V>, DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 DifferentiationError,
             >,
     {
@@ -1939,8 +1949,8 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
     }
 }
 
-impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode>
-    DifferentiationBuilder<Input, WithCaptures<Capture>, WithAuxiliary, Linearity, ContextMode>
+impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
+    DifferentiationBuilder<Input, WithCaptures<Capture>, WithAuxiliary, LinearityState, ContextState>
 {
     /// Materializes a forward-mode [`Jacobian`] over active primals and returns auxiliary output with captures fixed.
     ///
@@ -1959,49 +1969,49 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
         function: F,
     ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + ResidualZeroProvider<V::Type>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<(Output, Aux), ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
         Aux: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
         let context = self.context.resolve(&self.primals)?;
-        jacobian_forward_in_context(&context, function, self.primals, self.captures.0, Linearity::HOLOMORPHIC)
+        jacobian_forward_in_context(&context, function, self.primals, self.captures.0, LinearityState::HOLOMORPHIC)
     }
 
     /// Materializes a reverse-mode [`Jacobian`] over active primals and returns auxiliary output with captures fixed.
@@ -2021,55 +2031,55 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
         function: F,
     ) -> Result<(Jacobian<V::Type, V, Input::To<V::Type>, Output::To<V::Type>>, Aux::To<V>), DifferentiationError>
     where
-        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: Context<
+        V: Value<Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<
-                    DifferentiationBuilderExecutionContext<ContextMode, V, Input>,
+                    DifferentiationBuilderExecutionContext<ContextState, V, Input>,
                 > + PartiallyEvaluatableOperation<
                     TracingContext<
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                     >,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + TransposableOperation<
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Constant,
-                    <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant,
+                    <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
                 > + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
             >,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Result<(Output, Aux), ProgramError>,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 > + ParameterizedFamily<V::Type>,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V> + ParameterizedFamily<V::Type>,
             >,
         Aux: Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 Family: ParameterizedFamily<V>,
             >,
     {
         let context = self.context.resolve(&self.primals)?;
-        jacobian_reverse_in_context(&context, function, self.primals, self.captures.0, Linearity::HOLOMORPHIC)
+        jacobian_reverse_in_context(&context, function, self.primals, self.captures.0, LinearityState::HOLOMORPHIC)
     }
 
     /// Materializes a forward-over-reverse [`Hessian`] over active primals and returns auxiliary output.
@@ -2107,7 +2117,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
                                + From<AddOperation<C::Type>>,
             >,
         V: Value<Type = C::Type>,
-        ContextMode: DifferentiationBuilderContext<V, Input, Context = C>,
+        ContextState: DifferentiationBuilderContext<V, Input, Context = C>,
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
             Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
@@ -2157,7 +2167,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
             >,
     {
         let context = self.context.resolve(&self.primals)?;
-        hessian_in_context(&context, function, self.primals, self.captures.0, Linearity::HOLOMORPHIC)
+        hessian_in_context(&context, function, self.primals, self.captures.0, LinearityState::HOLOMORPHIC)
     }
 
     /// Computes a scalar value, its active-primal gradient, and auxiliary output while holding captures fixed.
@@ -2176,32 +2186,32 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
     ) -> Result<((V, Aux), Input::To<V>), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
                 (
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 ),
                 DifferentiationError,
             >,
@@ -2209,15 +2219,15 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
                 V,
                 To<V> = Aux,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 >,
             >,
         (
-            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 To<V> = (V, Aux),
                 Family: ParameterizedFamily<V>,
             >,
@@ -2228,7 +2238,7 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
             function,
             self.primals,
             self.captures.0,
-            Linearity::HOLOMORPHIC,
+            LinearityState::HOLOMORPHIC,
         )
     }
 
@@ -2246,32 +2256,32 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
     pub fn gradient<V, Output, Aux, F>(self, function: F) -> Result<(Input::To<V>, Aux), DifferentiationError>
     where
         V: Value<Type: DifferentiableType>,
-        ContextMode: DifferentiationBuilderContext<V, Input>,
-        DifferentiationBuilderExecutionContext<ContextMode, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextMode, V, Input> as Domain>::Operation:
+        ContextState: DifferentiationBuilderContext<V, Input>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
+        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
             From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
-            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
+            Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         Input: Parameterized<
                 V,
                 To<V> = Input,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Capture: Parameterized<
                 V,
                 To<V> = Capture,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 >,
             >,
         Output: MaybeFallible<
                 (
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 ),
                 DifferentiationError,
             >,
@@ -2279,15 +2289,15 @@ impl<Input, Capture, Linearity: DifferentiationBuilderLinearityMode, ContextMode
                 V,
                 To<V> = Aux,
                 Family: ParameterizedFamily<
-                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+                    LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+                    To = Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
                 >,
             >,
         (
-            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
-            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>>,
+            LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
+            Aux::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ): Parameterized<
-                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextMode, V, Input>>,
+                LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                 To<V> = (V, Aux),
                 Family: ParameterizedFamily<V>,
             >,
