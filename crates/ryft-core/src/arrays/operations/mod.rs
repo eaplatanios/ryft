@@ -53,7 +53,6 @@ use crate::operations::{
     TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
     UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::parameters::Parameter;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, Type, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
@@ -225,7 +224,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 /// such as `LinearizationTracer<A::ExecutionDomain>: ArrayOperations`. Making the bundle recursively imply its own
 /// tracer bounds would make the trait solver chase an unbounded tower of nested tracer types.
 pub trait ArrayOperations:
-    Clone + Parameter + Typed<Type = ArrayType>
+    Value<Type = ArrayType>
     // Arithmetic, in both the panicking operator sugar and the fallible capability forms.
     + StandardNeg<Output = Self> + StandardAdd<Output = Self> + StandardSub<Output = Self>
     + StandardMul<Output = Self> + StandardDiv<Output = Self>
@@ -251,7 +250,7 @@ pub trait ArrayOperations:
 // bundle is satisfied exactly when every one of its member capabilities is.
 impl<V> ArrayOperations for V
 where
-    V: Clone + Parameter + Typed<Type = ArrayType>,
+    V: Value<Type = ArrayType>,
     V: StandardNeg<Output = V> + StandardAdd<Output = V> + StandardSub<Output = V> + StandardMul<Output = V>,
     V: StandardDiv<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
     V: Sin + Cos + Atan2 + Exp + Log + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil + Round,
@@ -428,7 +427,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// As with [`ArrayOperations`], this bundle never implies anything about the tracers derived from an implementing
 /// value; a tracer requirement stays a separate explicit bound.
 pub trait ArrayIrOperations:
-    Clone + Parameter + Typed<Type = ArrayIrType>
+    Value<Type = ArrayIrType>
     // Comparison of first-class dimensions, producing ordinary Boolean array data.
     + Compare
     // First-class dimensions.
@@ -440,7 +439,7 @@ pub trait ArrayIrOperations:
 // when every one of its member capabilities is.
 impl<V> ArrayIrOperations for V
 where
-    V: Clone + Parameter + Typed<Type = ArrayIrType> + Compare,
+    V: Value<Type = ArrayIrType> + Compare,
     V: DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast,
 {
 }

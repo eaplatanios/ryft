@@ -111,8 +111,8 @@ fn train<A, ReadValues>(
     mut read_values: ReadValues,
 ) -> ExampleResult<()>
 where
-    A: ArrayOperations + Value<Type: DifferentiableType, ExecutionDomain: ReverseModeDifferentiate + Zero<A>>,
-    <A::ExecutionDomain as Domain>::Operation: From<OneOperation<A::Type>>,
+    A: ArrayOperations,
+    A::ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<ArrayType>>> + Zero<A>,
     LinearizationTracer<A::ExecutionDomain>: ArrayOperations,
     ReadValues: FnMut(&A) -> ExampleResult<Vec<f64>>,
 {
