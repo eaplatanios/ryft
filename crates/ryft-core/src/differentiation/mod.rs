@@ -516,17 +516,14 @@ pub struct DifferentiationBuilder<
     context: ContextState,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<Input, AuxiliaryState, LinearityState, ContextState>
     DifferentiationBuilder<Input, WithoutCapture, AuxiliaryState, LinearityState, ContextState>
 {
     /// Supplies dynamic runtime values that affect primal evaluation without becoming differentiation variables.
-    ///
     /// `captures` may be any [`Parameterized`] tree whose leaves use the same runtime value family as the active input.
-    /// The terminal method passes the closure a reparameterized copy whose leaves are its tracer type. Container shape
-    /// and non-parameter metadata are preserved. Captures remain explicit runtime inputs but contribute no tangent,
-    /// cotangent, Jacobian, or Hessian coordinates.
+    /// The terminal function passes the closure a reparameterized copy whose leaves are its tracer type. Container
+    /// shape and non-parameter metadata are preserved. Captures remain explicit runtime inputs but contribute no
+    /// tangent, cotangent, Jacobian, or Hessian values.
     #[inline]
     pub fn with_captures<Capture>(
         self,
@@ -542,14 +539,15 @@ impl<Input, AuxiliaryState, LinearityState, ContextState>
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 impl<Input, CaptureState, LinearityState, ContextState>
     DifferentiationBuilder<Input, CaptureState, WithoutAuxiliary, LinearityState, ContextState>
 {
-    /// Declares that the transformed closure returns `(differentiated_output, auxiliary_output)`.
-    ///
-    /// The auxiliary output may be any [`Parameterized`] tree. Its leaves are traced during primal evaluation and
-    /// reconstructed as runtime values in the terminal result, but they are excluded from derivative seeding and
-    /// transposition. Its structure is independent of both the active input and any captures.
+    /// Declares that the transformed closure returns `(differentiated_output, auxiliary_output)`. The auxiliary output
+    /// may be any [`Parameterized`] tree. Its leaves are traced during primal evaluation and reconstructed as runtime
+    /// values in the terminal result, but they are excluded from derivative seeding and transposition. Its structure is
+    /// independent of both the active input and any captures.
     #[inline]
     pub fn with_auxiliary(
         self,
@@ -563,6 +561,8 @@ impl<Input, CaptureState, LinearityState, ContextState>
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<Input, CaptureState, AuxiliaryState, ContextState>
     DifferentiationBuilder<Input, CaptureState, AuxiliaryState, RealLinearity, ContextState>
