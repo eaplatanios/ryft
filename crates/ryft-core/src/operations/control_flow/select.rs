@@ -352,7 +352,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, Dimension, Shape};
-    use crate::differentiation::{jvp, value_and_gradient};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
@@ -460,30 +460,26 @@ mod tests {
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
 
-        let (primal, tangent) = jvp(
-            |(x, y)| piecewise(x, y),
-            (Array::scalar(3.0), Array::scalar(2.0)),
-            (Array::scalar(1.0), Array::scalar(0.0)),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
+            .jvp((Array::scalar(1.0), Array::scalar(0.0)), |(x, y)| piecewise(x, y))
+            .unwrap();
         assert_eq!(primal, Array::scalar(6.0));
         assert_eq!(tangent, Array::scalar(2.0));
-        let (value, gradient) =
-            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Array::scalar(3.0), Array::scalar(2.0))).unwrap();
+        let (value, gradient) = differentiate_at((Array::scalar(3.0), Array::scalar(2.0)))
+            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap())
+            .unwrap();
         assert_eq!(value, Array::scalar(6.0));
         assert_eq!(gradient.0, Array::scalar(2.0));
         assert_eq!(gradient.1, Array::scalar(0.0));
 
-        let (primal, tangent) = jvp(
-            |(x, y)| piecewise(x, y),
-            (Array::scalar(1.0), Array::scalar(2.0)),
-            (Array::scalar(0.0), Array::scalar(1.0)),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at((Array::scalar(1.0), Array::scalar(2.0)))
+            .jvp((Array::scalar(0.0), Array::scalar(1.0)), |(x, y)| piecewise(x, y))
+            .unwrap();
         assert_eq!(primal, Array::scalar(6.0));
         assert_eq!(tangent, Array::scalar(3.0));
-        let (value, gradient) =
-            value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Array::scalar(1.0), Array::scalar(2.0))).unwrap();
+        let (value, gradient) = differentiate_at((Array::scalar(1.0), Array::scalar(2.0)))
+            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap())
+            .unwrap();
         assert_eq!(value, Array::scalar(6.0));
         assert_eq!(gradient.0, Array::scalar(0.0));
         assert_eq!(gradient.1, Array::scalar(3.0));

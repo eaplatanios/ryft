@@ -193,8 +193,11 @@ fn emit_scalar_bilinear_sin_jit() -> Result<ProgramStatistics, StatisticsError> 
 
 /// Emits the staged scalar bilinear pullback case.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, StatisticsError> {
-    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new()
-        .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Array::scalar(2.0), Array::scalar(3.0)))?;
+    let (_, pullback): (Array, _) = EagerContext::<Array, ArrayOperation<Array>>::new().vjp(
+        |inputs, ()| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
+        (Array::scalar(2.0), Array::scalar(3.0)),
+        (),
+    )?;
     let (pullback, _residuals) = pullback.into_parts();
     Ok(pullback.statistics())
 }
@@ -208,7 +211,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, StatisticsEr
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar case function.
-                context.gradient(quartic_plus_sin, x).map_err(|error| match error {
+                context.gradient(|input, ()| quartic_plus_sin(input), x, ()).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
@@ -227,7 +230,7 @@ fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar case function.
-                context.value_and_gradient(quartic_plus_sin, x).map_err(|error| match error {
+                context.value_and_gradient(|input, ()| quartic_plus_sin(input), x, ()).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })
@@ -240,8 +243,11 @@ fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics
 /// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)`, closed over its lifted residuals.
 fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatistics, StatisticsError> {
     let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-    let (_, pushforward) =
-        context.linearize(|x| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?), Array::scalar(2.0))?;
+    let (_, pushforward) = context.linearize(
+        |x, ()| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?),
+        Array::scalar(2.0),
+        (),
+    )?;
     let (pushforward, residuals) = pushforward.into_parts();
     let (_, closed_pushforward) = context.interpret_and_trace(
         move |tangent| {

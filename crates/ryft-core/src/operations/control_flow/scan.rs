@@ -2876,7 +2876,8 @@ mod tests {
     use crate::differentiation::forward::JvpTransform;
     use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{
-        HessianDifferentiate, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, vjp,
+        Differentiate, HessianDifferentiate, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
+        differentiate_at,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -3321,25 +3322,23 @@ mod tests {
             Ok((outputs.remove(0), outputs.remove(0)))
         };
         let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
-        let (outputs, pushforward) = linearize(function, primals.clone()).unwrap();
+        let (outputs, pushforward) = differentiate_at(primals.clone()).linearize(function).unwrap();
         assert_eq!(outputs, (Array::scalar(24.0), Array::vector(vec![2.0, 6.0, 24.0])));
         assert_eq!(
             pushforward.apply((Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0]))),
             Ok((Array::scalar(24.0), Array::vector(vec![2.0, 6.0, 24.0]))),
         );
 
-        let (final_carry, pullback) = vjp(
-            |(carry, values): (TestTracer, TestTracer)| {
+        let (final_carry, pullback) = differentiate_at(primals)
+            .vjp(|(carry, values)| {
                 let mut outputs = carry.context().bind(
                     ArrayOperation::Scan(ScanOperation::new(1, 3)),
                     vec![product_body()],
                     &[carry.clone(), values],
                 )?;
                 Ok(outputs.remove(0))
-            },
-            primals,
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(final_carry, Array::scalar(24.0));
         assert_eq!(pullback.apply(Array::scalar(1.0)), Ok((Array::scalar(24.0), Array::vector(vec![12.0, 8.0, 6.0]))),);
     }
@@ -3348,8 +3347,9 @@ mod tests {
     fn test_scan_vjp_stages_reusable_reversed_scan_pullback() {
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
-                |(initial, values)| stage_product_scan(initial, values),
+                |(initial, values), ()| stage_product_scan(initial, values),
                 (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+                (),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
@@ -3376,10 +3376,11 @@ mod tests {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let primals = (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
         let forward = context
-            .jacobian_forward(|(initial, values)| stage_product_scan(initial, values), primals.clone())
+            .jacobian_forward(|(initial, values), ()| stage_product_scan(initial, values), primals.clone(), ())
             .unwrap();
-        let reverse =
-            context.jacobian_reverse(|(initial, values)| stage_product_scan(initial, values), primals).unwrap();
+        let reverse = context
+            .jacobian_reverse(|(initial, values), ()| stage_product_scan(initial, values), primals, ())
+            .unwrap();
 
         let blocks = forward.iter_blocks().collect::<Vec<_>>();
         assert_eq!(blocks.len(), 2);
@@ -3399,8 +3400,9 @@ mod tests {
         // values are `initial` times the remaining value.
         let hessian = EagerContext::<Array, ArrayOperation<Array>>::new()
             .hessian(
-                |(initial, values)| stage_product_scan(initial, values),
+                |(initial, values), ()| stage_product_scan(initial, values),
                 (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
+                (),
             )
             .unwrap();
 
@@ -3474,7 +3476,7 @@ mod tests {
         };
         // Reverse visit order: `c = 2·5 = 10 → 10·4 = 40 → 40·3 = 120`, with `ys[i]` still paired with `xs[i]`.
         let primals = (Array::scalar(2.0), Array::vector(vec![3.0, 4.0, 5.0]));
-        let (outputs, pushforward) = linearize(function, primals.clone()).unwrap();
+        let (outputs, pushforward) = differentiate_at(primals.clone()).linearize(function).unwrap();
         assert_eq!(outputs, (Array::scalar(120.0), Array::vector(vec![120.0, 40.0, 10.0])));
         // A pure carry tangent scales by the running product of the slices consumed after each visit.
         assert_eq!(
@@ -3482,18 +3484,16 @@ mod tests {
             Ok((Array::scalar(60.0), Array::vector(vec![60.0, 20.0, 5.0]))),
         );
 
-        let (final_carry, pullback) = vjp(
-            |(carry, values): (TestTracer, TestTracer)| {
+        let (final_carry, pullback) = differentiate_at(primals)
+            .vjp(|(carry, values)| {
                 let mut outputs = carry.context().bind(
                     ArrayOperation::Scan(ScanOperation::new(1, 3).with_reverse(true)),
                     vec![product_body()],
                     &[carry.clone(), values],
                 )?;
                 Ok(outputs.remove(0))
-            },
-            primals,
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(final_carry, Array::scalar(120.0));
         // `∂(2·3·4·5)/∂carry = 60` and `∂/∂xs = [40, 30, 24]`.
         assert_eq!(
@@ -4264,12 +4264,13 @@ mod tests {
         // while the key input receives a typed zero-space cotangent at the public boundary.
         let ((output, stacked), pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
-                |(accumulator, key, values)| stage_keyed_product_scan(accumulator, key, values),
+                |(accumulator, key, values), ()| stage_keyed_product_scan(accumulator, key, values),
                 (
                     Array::scalar(1.0),
                     Array::from_elements(ArrayType::scalar(DataType::U64), &[7u64]).unwrap(),
                     Array::vector(vec![2.0, 3.0, 4.0]),
                 ),
+                (),
             )
             .unwrap();
         assert_eq!(output.to_f64s(), vec![24.0]);
@@ -4287,19 +4288,18 @@ mod tests {
         // products are `[2, 6, 24]`. A unit tangent on `init` propagates as `d(init * x0 * x1 * x2)/d(init) = 24`
         // on the final carry and `[2, 6, 24]` on the stacked outputs.
         let (scan, scan_body) = product_scan();
-        let ((carry, ys), (carry_tangent, ys_tangent)) = jvp(
-            move |(init, xs)| {
-                let mut outputs = init.context().bind(
-                    TestOperation::Scan(scan),
-                    vec![scan_body.clone()],
-                    &[init.clone(), xs.clone()],
-                )?;
-                let ys = outputs.remove(1);
-                Ok((outputs.remove(0), ys))
-            },
-            (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
-            (Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0])),
-        )
+        let ((carry, ys), (carry_tangent, ys_tangent)) = crate::EagerContext::<
+            crate::Array,
+            crate::ArrayOperation<crate::Array>,
+        >::new()
+        .differentiate_at((Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])))
+        .jvp((Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 0.0])), move |(init, xs)| {
+            let mut outputs =
+                init.context()
+                    .bind(TestOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])?;
+            let ys = outputs.remove(1);
+            Ok((outputs.remove(0), ys))
+        })
         .unwrap();
         assert_eq!(carry.to_f64s(), vec![24.0]);
         assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0]);
@@ -4309,19 +4309,18 @@ mod tests {
         // A unit tangent on `xs[1]` propagates as `d(init * x0 * x1 * x2)/d(x1) = init * x0 * x2 = 8` on the final
         // carry and `[0, 2, 8]` on the stacked outputs (`y0` does not depend on `x1`).
         let (scan, scan_body) = product_scan();
-        let ((carry, _), (carry_tangent, ys_tangent)) = jvp(
-            move |(init, xs)| {
-                let mut outputs = init.context().bind(
-                    TestOperation::Scan(scan),
-                    vec![scan_body.clone()],
-                    &[init.clone(), xs.clone()],
-                )?;
-                let ys = outputs.remove(1);
-                Ok((outputs.remove(0), ys))
-            },
-            (Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])),
-            (Array::scalar(0.0), Array::vector(vec![0.0, 1.0, 0.0])),
-        )
+        let ((carry, _), (carry_tangent, ys_tangent)) = crate::EagerContext::<
+            crate::Array,
+            crate::ArrayOperation<crate::Array>,
+        >::new()
+        .differentiate_at((Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0])))
+        .jvp((Array::scalar(0.0), Array::vector(vec![0.0, 1.0, 0.0])), move |(init, xs)| {
+            let mut outputs =
+                init.context()
+                    .bind(TestOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])?;
+            let ys = outputs.remove(1);
+            Ok((outputs.remove(0), ys))
+        })
         .unwrap();
         assert_eq!(carry.to_f64s(), vec![24.0]);
         assert_eq!(carry_tangent.to_f64s(), vec![8.0]);
@@ -4334,19 +4333,18 @@ mod tests {
         // The final carry is the product of every element, and a unit tangent on the initial carry follows the same
         // cumulative-product path through both scan levels.
         let (scan, scan_body) = product_scan_with_lengths(&[2, 3]);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = jvp(
-            move |(init, xs)| {
-                let mut outputs = init.context().bind(
-                    TestOperation::Scan(scan),
-                    vec![scan_body.clone()],
-                    &[init.clone(), xs.clone()],
-                )?;
-                let ys = outputs.remove(1);
-                Ok((outputs.remove(0), ys))
-            },
-            (Array::scalar(1.0), Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
-            (Array::scalar(1.0), Array::matrix(2, 3, vec![0.0; 6])),
-        )
+        let ((carry, ys), (carry_tangent, ys_tangent)) = crate::EagerContext::<
+            crate::Array,
+            crate::ArrayOperation<crate::Array>,
+        >::new()
+        .differentiate_at((Array::scalar(1.0), Array::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0])))
+        .jvp((Array::scalar(1.0), Array::matrix(2, 3, vec![0.0; 6])), move |(init, xs)| {
+            let mut outputs =
+                init.context()
+                    .bind(TestOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])?;
+            let ys = outputs.remove(1);
+            Ok((outputs.remove(0), ys))
+        })
         .unwrap();
         assert_eq!(carry.to_f64s(), vec![5040.0]);
         assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0]);
@@ -4360,19 +4358,21 @@ mod tests {
         // linear body contains another scan whose body also has scan-local residual references.
         let (scan, scan_body) = product_scan_with_lengths(&[2, 2, 2]);
         let xs_type = f64_type(&[2, 2, 2]);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = jvp(
-            move |(init, xs)| {
-                let mut outputs = init.context().bind(
-                    TestOperation::Scan(scan),
-                    vec![scan_body.clone()],
-                    &[init.clone(), xs.clone()],
-                )?;
-                let ys = outputs.remove(1);
-                Ok((outputs.remove(0), ys))
-            },
-            (Array::scalar(1.0), Array::from_f64s(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])),
-            (Array::scalar(1.0), Array::from_f64s(xs_type, vec![0.0; 8])),
-        )
+        let ((carry, ys), (carry_tangent, ys_tangent)) = crate::EagerContext::<
+            crate::Array,
+            crate::ArrayOperation<crate::Array>,
+        >::new()
+        .differentiate_at((
+            Array::scalar(1.0),
+            Array::from_f64s(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
+        ))
+        .jvp((Array::scalar(1.0), Array::from_f64s(xs_type, vec![0.0; 8])), move |(init, xs)| {
+            let mut outputs =
+                init.context()
+                    .bind(TestOperation::Scan(scan), vec![scan_body.clone()], &[init.clone(), xs.clone()])?;
+            let ys = outputs.remove(1);
+            Ok((outputs.remove(0), ys))
+        })
         .unwrap();
         assert_eq!(carry.to_f64s(), vec![362880.0]);
         assert_eq!(ys.to_f64s(), vec![2.0, 6.0, 24.0, 120.0, 720.0, 5040.0, 40320.0, 362880.0]);

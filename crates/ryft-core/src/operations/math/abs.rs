@@ -186,7 +186,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayType};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{gradient, jvp, value_and_gradient};
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -323,15 +323,17 @@ mod tests {
     }
 
     #[test]
-    fn test_abs_differentiation_at_zero() {
+    fn test_abx_differentiation_at_zero() {
         // The real rule chooses the right derivative at zero and remains constant under another derivative.
         assert_abs_diff_eq!(
-            gradient(|x| x.abs().unwrap(), Array::scalar(0.0f64)).unwrap(),
+            differentiate_at(Array::scalar(0.0f64)).gradient(|x| x.abs().unwrap()).unwrap(),
             Array::scalar(1.0),
             epsilon = 1e-9,
         );
         assert_abs_diff_eq!(
-            gradient(|x| gradient(|x| x.abs().unwrap(), x).unwrap(), Array::scalar(0.0f64)).unwrap(),
+            differentiate_at(Array::scalar(0.0f64))
+                .gradient(|x| { differentiate_at(x).gradient(|x| x.abs().unwrap()).unwrap() })
+                .unwrap(),
             Array::scalar(0.0),
             epsilon = 1e-9,
         );
@@ -343,7 +345,8 @@ mod tests {
         // d|z| = Re(z̄ · dz) / |z|, the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction):
         // the reverse-mode counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Array::scalar(z)).unwrap();
+        let (value, gradient_value) =
+            differentiate_at(Array::scalar(z)).value_and_gradient(|z| z.abs().unwrap()).unwrap();
         assert_eq!(value, Array::scalar(z.norm()));
         let expected = z.conj() / z.norm();
         assert_abs_diff_eq!(gradient_value, Array::scalar(expected), epsilon = 1e-12);
@@ -360,15 +363,12 @@ mod tests {
         // The complex rule replaces a zero magnitude denominator with one, so the zero numerator produces a finite
         // zero tangent and gradient at the origin.
         assert_eq!(
-            jvp(
-                |z| z.abs(),
-                Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
-                Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)),
-            ),
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)))
+                .jvp(Array::scalar(ComplexNumber::new(1.0f64, 2.0f64)), |z| z.abs()),
             Ok((Array::scalar(0.0f64), Array::scalar(0.0f64))),
         );
         assert_eq!(
-            gradient(|z| z.abs().unwrap(), Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))),
+            differentiate_at(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))).gradient(|z| z.abs().unwrap()),
             Ok(Array::scalar(ComplexNumber::new(0.0f64, 0.0f64))),
         );
     }
@@ -378,11 +378,8 @@ mod tests {
         // Normalizing the complex coefficient before applying the tangent avoids overflowing the otherwise finite
         // directional derivative `Re((conj(z) / |z|) * dz)`.
         assert_eq!(
-            jvp(
-                |z| z.abs(),
-                Array::scalar(ComplexNumber::new(1e308f64, 0.0)),
-                Array::scalar(ComplexNumber::new(2.0f64, 0.0)),
-            ),
+            differentiate_at(Array::scalar(ComplexNumber::new(1e308f64, 0.0)))
+                .jvp(Array::scalar(ComplexNumber::new(2.0f64, 0.0)), |z| z.abs()),
             Ok((Array::scalar(1e308f64), Array::scalar(2.0f64))),
         );
     }
@@ -392,7 +389,7 @@ mod tests {
         // The coefficient and tangent are computed in the widened differential representation.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (_, tangent) = jvp(|input| input.abs(), primal, input_tangent).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.abs()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         assert_eq!(tangent.to_f64s(), vec![3.0]);
     }

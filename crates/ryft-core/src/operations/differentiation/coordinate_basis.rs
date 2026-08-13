@@ -278,7 +278,7 @@ mod tests {
     use crate::arrays::DataType::{Boolean, F6E2M3FN, F6E3M2FN, F8E8M0FNU, F32, I32};
     use crate::arrays::{Array, ArrayType, Dimension, DimensionBounds, DimensionVariable, Shape, f6e2m3fn, f6e3m2fn};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{jacobian_forward, jacobian_reverse};
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::{EmptyRegionDriver, Operation};
@@ -345,9 +345,9 @@ mod tests {
             &[one, zero, zero, one],
         )
         .unwrap();
-        let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
+        let forward = differentiate_at(input.clone()).jacobian_forward(|input| Ok(input)).unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
-        let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
+        let reverse = differentiate_at(input).jacobian_reverse(|input| Ok(input)).unwrap();
         assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
 
         let zero = f6e3m2fn::from_bits(0).unwrap();
@@ -359,9 +359,9 @@ mod tests {
             &[one, zero, zero, one],
         )
         .unwrap();
-        let forward = jacobian_forward(|input| Ok(input), input.clone()).unwrap();
+        let forward = differentiate_at(input.clone()).jacobian_forward(|input| Ok(input)).unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value(), &expected);
-        let reverse = jacobian_reverse(|input| Ok(input), input).unwrap();
+        let reverse = differentiate_at(input).jacobian_reverse(|input| Ok(input)).unwrap();
         assert_eq!(reverse.iter_blocks().next().unwrap().value(), &expected);
     }
 

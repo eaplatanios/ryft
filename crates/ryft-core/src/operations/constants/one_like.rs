@@ -102,9 +102,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType};
     use crate::contexts::EagerContext;
-    use crate::differentiation::JacobianDifferentiate;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -155,8 +155,8 @@ mod tests {
         );
 
         // Dense forward-mode differentiation batches the constant rule while constructing the identity Jacobian.
-        let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacobian_forward(|input| Ok(input.clone() + input.one_like()), Array::scalar(2.0))
+        let jacobian = differentiate_at(Array::scalar(2.0))
+            .jacobian_forward(|input| Ok(input.clone() + input.one_like()))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().to_f64s(), vec![1.0]);

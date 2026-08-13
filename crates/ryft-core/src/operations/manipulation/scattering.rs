@@ -961,7 +961,7 @@ mod tests {
         Sharding, ShardingDimension, StridedLayout,
     };
     use crate::contexts::Context;
-    use crate::differentiation::jacobian_forward;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
@@ -1239,8 +1239,8 @@ mod tests {
         // Forward mode through `f(x) = scatter_add(x, [[1], [3]], [10, 20])` exercises the captured-index scatter-add
         // under batched basis tangents (the per-item batch rule). Scatter-add is the identity in its operand, so the
         // Jacobian with respect to `x` is the identity matrix.
-        let jacobian = jacobian_forward(
-            |x| {
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .jacobian_forward(|x| {
                 let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
                 let updates = x.context().lift(Array::vector(vec![10.0, 20.0]))?;
                 let operation = ScatterOperation::new(
@@ -1248,10 +1248,8 @@ mod tests {
                     ScatterReductionKind::Add,
                 );
                 Ok(x.scatter(&indices, &updates, &operation).unwrap())
-            },
-            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);

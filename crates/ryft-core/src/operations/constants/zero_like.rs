@@ -109,7 +109,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::contexts::EagerContext;
-    use crate::differentiation::jacobian_reverse;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
@@ -162,7 +162,9 @@ mod tests {
         );
 
         // Dense reverse-mode differentiation batches the constant rule while constructing the identity Jacobian.
-        let jacobian = jacobian_reverse(|input| Ok(input.clone() + input.zero_like()), Array::scalar(2.0)).unwrap();
+        let jacobian = differentiate_at(Array::scalar(2.0))
+            .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()))
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().to_f64s(), vec![1.0]);
     }

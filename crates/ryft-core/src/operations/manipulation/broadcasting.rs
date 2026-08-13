@@ -1108,7 +1108,7 @@ mod tests {
         StridedLayout,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{TransposableOperation, jvp};
+    use crate::differentiation::{TransposableOperation, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -1586,12 +1586,11 @@ mod tests {
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
         let tangent_output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let (primal, tangent) = jvp(
-            |value| value.broadcast(primal_output_type.clone(), &[1]),
-            Array::from_f64s(primal_type, vec![2.0, 4.0]),
-            Array::from_f64s(tangent_type, vec![1.0, 3.0]),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at(Array::from_f64s(primal_type, vec![2.0, 4.0]))
+            .jvp(Array::from_f64s(tangent_type, vec![1.0, 3.0]), |value| {
+                value.broadcast(primal_output_type.clone(), &[1])
+            })
+            .unwrap();
         assert_eq!(primal.r#type().as_ref(), &primal_output_type);
         assert_eq!(tangent.r#type().as_ref(), &tangent_output_type);
         assert_eq!(tangent.to_f64s(), vec![1.0, 3.0, 1.0, 3.0]);

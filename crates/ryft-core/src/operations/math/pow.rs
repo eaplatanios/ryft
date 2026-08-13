@@ -92,7 +92,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -208,14 +208,13 @@ mod tests {
         // The holomorphic gradient of z² is 2z.
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_abs_diff_eq!(
-            gradient_holomorphic(
-                |input| {
+            differentiate_at(Array::scalar(input))
+                .holomorphic()
+                .gradient(|input| {
                     let exponent = input.one_like() + input.one_like();
                     input.pow(&exponent).unwrap()
-                },
-                Array::scalar(input),
-            )
-            .unwrap(),
+                })
+                .unwrap(),
             Array::scalar(input * 2.0),
             epsilon = 1e-12,
         );

@@ -14113,7 +14113,9 @@ mod tests {
             .interpret_and_trace(
                 |x| {
                     let context = x.context().clone();
-                    Ok(context.gradient(scalar_quartic_plus_sin, x).expect("scalar gradient should succeed"))
+                    Ok(context
+                        .gradient(|input, ()| scalar_quartic_plus_sin(input), x, ())
+                        .expect("scalar gradient should succeed"))
                 },
                 CpuArray::scalar(2.0),
             )
@@ -14487,7 +14489,7 @@ mod tests {
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -14509,7 +14511,11 @@ mod tests {
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+            .vjp(
+                |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
+                CpuArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+                (),
+            )
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -14531,11 +14537,12 @@ mod tests {
         // input positions cannot contaminate its sum.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
-                |(x, padding_value)| {
+                |(x, padding_value), ()| {
                     use ryft_core::Pad;
                     Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
                 },
                 (CpuArray::vector(vec![1.0, 2.0, 3.0]), CpuArray::scalar(9.0)),
+                (),
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
@@ -14567,12 +14574,13 @@ mod tests {
         // integer constants through `lower_literal_value`.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(
-                |x| {
+                |x, ()| {
                     let start =
                         x.context().lift(CpuArray::from_f64s(ArrayType::scalar(DataType::I32), vec![1.0])).unwrap();
                     Ok(x.dynamic_slice(&[start], &[2]).unwrap())
                 },
                 CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+                (),
             )
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
@@ -14602,7 +14610,7 @@ mod tests {
         // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
         // explicit arguments.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (CpuArray::scalar(2.0), CpuArray::scalar(3.0)))
+            .vjp(|inputs, ()| Ok(scalar_bilinear_sin(inputs)), (CpuArray::scalar(2.0), CpuArray::scalar(3.0)), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
 
@@ -14659,7 +14667,7 @@ mod tests {
             },
         );
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x| function.call(x), CpuArray::scalar(2.0))
+            .vjp(|x, ()| function.call(x), CpuArray::scalar(2.0), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -14678,7 +14686,7 @@ mod tests {
         )
         .with_prevent_cse(false);
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x| function.call(x), CpuArray::scalar(2.0))
+            .vjp(|x, ()| function.call(x), CpuArray::scalar(2.0), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -15305,7 +15313,7 @@ mod tests {
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0))
+            .vjp(|x, ()| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0), ())
             .unwrap();
         let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -15329,7 +15337,9 @@ mod tests {
             .interpret_and_trace(
                 |inputs| {
                     let context = inputs.0.context().clone();
-                    Ok(context.gradient(scalar_bilinear_sin, inputs).expect("scalar gradient should succeed"))
+                    Ok(context
+                        .gradient(|input, ()| scalar_bilinear_sin(input), inputs, ())
+                        .expect("scalar gradient should succeed"))
                 },
                 (CpuArray::scalar(2.0), CpuArray::scalar(3.0)),
             )

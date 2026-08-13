@@ -128,7 +128,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
-    use crate::differentiation::{jvp, value_and_gradient_holomorphic};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -262,12 +262,9 @@ mod tests {
 
     #[test]
     fn test_atan2_differentiation_avoids_overflow() {
-        let (_, tangent): (Array, Array) = jvp(
-            |(y, x)| y.atan2(&x),
-            (Array::scalar(1.0e308), Array::scalar(1.0e308)),
-            (Array::scalar(1.0e308), Array::scalar(1.0e308)),
-        )
-        .unwrap();
+        let (_, tangent) = differentiate_at((Array::scalar(1.0e308), Array::scalar(1.0e308)))
+            .jvp((Array::scalar(1.0e308), Array::scalar(1.0e308)), |(y, x)| y.atan2(&x))
+            .unwrap();
         assert_eq!(tangent, Array::scalar(0.0));
     }
 
@@ -275,9 +272,10 @@ mod tests {
     fn test_atan2_complex_differentiation() {
         let y = Complex::new(0.7f64, -0.2);
         let x = Complex::new(-0.3f64, 0.4);
-        let (value, (y_gradient, x_gradient)) =
-            value_and_gradient_holomorphic(|(y, x)| y.atan2(&x).unwrap(), (Array::scalar(y), Array::scalar(x)))
-                .unwrap();
+        let (value, (y_gradient, x_gradient)) = differentiate_at((Array::scalar(y), Array::scalar(x)))
+            .holomorphic()
+            .value_and_gradient(|(y, x)| y.atan2(&x).unwrap())
+            .unwrap();
         let denominator = x * x + y * y;
         let imaginary_unit = Complex::new(0.0, 1.0);
         assert_abs_diff_eq!(
@@ -293,8 +291,9 @@ mod tests {
     fn test_atan2_low_precision_differentiation_uses_widened_tangents() {
         let y = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let x = Array::scalar(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let (primal, tangent): (Array, Array) =
-            jvp(|(y, x)| y.atan2(&x), (y, x), (Array::scalar(1.0f32), Array::scalar(1.0f32))).unwrap();
+        let (primal, tangent) = differentiate_at((y, x))
+            .jvp((Array::scalar(1.0f32), Array::scalar(1.0f32)), |(y, x)| y.atan2(&x))
+            .unwrap();
         assert_eq!(primal.r#type().data_type(), DataType::F8E8M0FNU);
         assert_abs_diff_eq!(tangent.to_f64s()[0], 0.1f32 as f64, epsilon = 1e-6);
     }

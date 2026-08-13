@@ -245,7 +245,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
-    use crate::differentiation::jvp;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -350,14 +350,16 @@ mod tests {
         // Low-precision primals use their wider differential representations in both conversion directions.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (output, output_tangent) = jvp(|value| value.convert_element_type(DataType::F32), primal, tangent).unwrap();
+        let (output, output_tangent) =
+            differentiate_at(primal).jvp(tangent, |value| value.convert_element_type(DataType::F32)).unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F32));
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (_, output_tangent) =
-            jvp(|value| value.convert_element_type(DataType::F8E8M0FNU), primal, tangent).unwrap();
+        let (_, output_tangent) = differentiate_at(primal)
+            .jvp(tangent, |value| value.convert_element_type(DataType::F8E8M0FNU))
+            .unwrap();
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
         // When the differential element representation changes, JVP and transposition align the complete derivative
@@ -370,20 +372,16 @@ mod tests {
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
         let plain_f32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
-        let (_, tangent) = jvp(
-            |value| value.convert_element_type(DataType::F8E8M0FNU),
-            Array::from_f64s(laid_out_f32.clone(), vec![2.0]),
-            Array::from_f64s(laid_out_f32.clone(), vec![3.0]),
-        )
-        .unwrap();
+        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f32.clone(), vec![2.0]))
+            .jvp(Array::from_f64s(laid_out_f32.clone(), vec![3.0]), |value| {
+                value.convert_element_type(DataType::F8E8M0FNU)
+            })
+            .unwrap();
         assert_eq!(tangent, Array::from_f64s(plain_f32.clone(), vec![3.0]));
 
-        let (_, tangent) = jvp(
-            |value| value.convert_element_type(DataType::F32),
-            Array::from_f64s(laid_out_f8.clone(), vec![2.0]),
-            Array::from_f64s(plain_f32.clone(), vec![3.0]),
-        )
-        .unwrap();
+        let (_, tangent) = differentiate_at(Array::from_f64s(laid_out_f8.clone(), vec![2.0]))
+            .jvp(Array::from_f64s(plain_f32.clone(), vec![3.0]), |value| value.convert_element_type(DataType::F32))
+            .unwrap();
         assert_eq!(tangent, Array::from_f64s(laid_out_f32.clone(), vec![3.0]));
 
         check_operation_transposition!(
@@ -407,31 +405,26 @@ mod tests {
         );
 
         // Narrowing real and complex primals also narrows their concrete tangent values.
-        let (_, tangent) = jvp(
-            |value| value.convert_element_type(DataType::F32),
-            Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]),
-            Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]),
-        )
-        .unwrap();
+        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0]))
+            .jvp(Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]), |value| {
+                value.convert_element_type(DataType::F32)
+            })
+            .unwrap();
         assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]));
 
-        let (_, tangent) = jvp(
-            |value| value.convert_element_type(DataType::C64),
-            Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]),
-            Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]),
-        )
-        .unwrap();
+        let (_, tangent) = differentiate_at(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![2.0]))
+            .jvp(Array::from_f64s(ArrayType::scalar(DataType::C128), vec![3.0]), |value| {
+                value.convert_element_type(DataType::C64)
+            })
+            .unwrap();
         assert_eq!(tangent, Array::from_f64s(ArrayType::scalar(DataType::C64), vec![3.0]));
 
         // Passing through an element type with a zero-dimensional tangent space erases the incoming tangent.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.75]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0]);
-        let (output, output_tangent) = jvp(
-            |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64),
-            primal,
-            tangent,
-        )
-        .unwrap();
+        let (output, output_tangent) = differentiate_at(primal)
+            .jvp(tangent, |value| value.convert_element_type(DataType::I32)?.convert_element_type(DataType::F64))
+            .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]));
     }

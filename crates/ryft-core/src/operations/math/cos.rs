@@ -64,7 +64,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
-    use crate::differentiation::{gradient_holomorphic, jvp};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -153,7 +153,7 @@ mod tests {
     fn test_cos_complex_differentiation() {
         let input = ComplexNumber::new(0.7f64, -0.3f64);
         assert_eq!(
-            gradient_holomorphic(|input| input.cos().unwrap(), Array::scalar(input)),
+            differentiate_at(Array::scalar(input)).holomorphic().gradient(|input| input.cos().unwrap()),
             Ok(Array::scalar(-input.sin())),
         );
     }
@@ -162,7 +162,7 @@ mod tests {
     fn test_cos_low_precision_differentiation_uses_widened_tangents() {
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![4.0]);
         let input_tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
-        let (_, tangent) = jvp(|input| input.cos(), primal, input_tangent).unwrap();
+        let (_, tangent) = differentiate_at(primal).jvp(input_tangent, |input| input.cos()).unwrap();
         assert_eq!(tangent.r#type().as_ref(), &ArrayType::scalar(DataType::F32));
         // The tangent payload is honestly `f32`-encoded, so the comparison happens at `f32` precision.
         assert_abs_diff_eq!(tangent.to_f64s()[0], -3.0 * 4.0f64.sin(), epsilon = 1e-6);

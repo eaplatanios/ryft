@@ -288,7 +288,7 @@ mod tests {
         Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
         ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
         ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
-        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, jacobian_reverse,
+        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -835,7 +835,7 @@ mod tests {
             |(), cotangent| Ok(cotangent),
         );
         let (value, gradient) = domain
-            .value_and_gradient(|x| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum), input)
+            .value_and_gradient(|x, ()| function.call(x).unwrap().reduce(&[0], ReductionKind::Sum), input, ())
             .unwrap();
         assert_eq!(read_f32s(&value), vec![6.0]);
         assert_eq!(read_f32s(&gradient), vec![1.0, 1.0]);
@@ -1638,10 +1638,11 @@ mod tests {
         let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(scale, mask, None, None);
         let (loss, (query_gradient, key_gradient, value_gradient)) = domain
             .value_and_gradient(
-                |(query, key, value)| {
+                |(query, key, value), ()| {
                     function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
                 },
                 (query, key, value),
+                (),
             )
             .unwrap();
 
@@ -1651,7 +1652,7 @@ mod tests {
         let (reference_loss, (reference_query_gradient, reference_key_gradient, reference_value_gradient)) =
             EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
                 .value_and_gradient(
-                    |(query, key, value)| {
+                    |(query, key, value), ()| {
                         reference_function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
                     },
                     (
@@ -1659,6 +1660,7 @@ mod tests {
                         reference(&key_values, &key_value_dimensions),
                         reference(&value_values, &key_value_dimensions),
                     ),
+                    (),
                 )
                 .unwrap();
         assert!((f64::from(read_f32s(&loss)[0]) - reference_loss.to_f64s()[0]).abs() < 1e-5);
@@ -1922,7 +1924,8 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let tangents = f32_vector(&client, &mesh, &[1.0, 1.0, 1.0]);
         let domain = x.execution_domain();
-        let (value, tangent): (Array<'_>, Array<'_>) = domain.jvp(|x| Mul::mul(&x, &x), x.clone(), tangents).unwrap();
+        let (value, tangent): (Array<'_>, Array<'_>) =
+            domain.jvp(|x, ()| Mul::mul(&x, &x), x.clone(), tangents, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![1.0, 4.0, 9.0]);
         assert_eq!(read_f32s(&tangent), vec![2.0, 4.0, 6.0]);
     }
@@ -1937,13 +1940,15 @@ mod tests {
         let primal = f32_scalar(&client, &mesh, 0.0);
         let tangent = f32_scalar(&client, &mesh, 3.0);
 
-        let (value, tangent) = primal.execution_domain().jvp(|input| input.abs(), primal.clone(), tangent).unwrap();
+        let (value, tangent) =
+            primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![3.0]);
 
         let primal = c64_scalar(&client, &mesh, num_complex::Complex::new(0.0, 0.0));
         let tangent = c64_scalar(&client, &mesh, num_complex::Complex::new(1.0, 2.0));
-        let (value, tangent) = primal.execution_domain().jvp(|input| input.abs(), primal.clone(), tangent).unwrap();
+        let (value, tangent) =
+            primal.execution_domain().jvp(|input, ()| input.abs(), primal.clone(), tangent, ()).unwrap();
         assert_eq!(read_f32s(&value), vec![0.0]);
         assert_eq!(read_f32s(&tangent), vec![0.0]);
     }
@@ -1989,11 +1994,12 @@ mod tests {
         let domain = x.execution_domain();
         let (value, gradient) = domain
             .value_and_gradient(
-                |x| {
+                |x, ()| {
                     let squared = Mul::mul(&x, &x).unwrap();
                     squared.reduce(&[0], ReductionKind::Sum)
                 },
                 x.clone(),
+                (),
             )
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
@@ -2011,11 +2017,12 @@ mod tests {
         let domain = x.execution_domain();
         let gradient = domain
             .gradient(
-                |x| {
+                |x, ()| {
                     let squared = Mul::mul(&x, &x).unwrap();
                     squared.reduce(&[0], ReductionKind::Sum)
                 },
                 x.clone(),
+                (),
             )
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
@@ -2031,7 +2038,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
-        let (value, pullback) = domain.vjp(|x| Ok(vec![Mul::mul(&x, &x)?]), x.clone()).unwrap();
+        let (value, pullback) = domain.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
         let (pullback, residuals) = pullback.into_parts();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
@@ -2060,7 +2067,7 @@ mod tests {
 
         // Holomorphic gradient of z² through the XLA eager domain: the `one` cotangent seed lowers through the
         // composed complex constant, and the pullback recovers ∂(z²)/∂z = 2z on device.
-        let (value, gradient) = domain.value_and_gradient_holomorphic(|x| x.clone() * x, x.clone()).unwrap();
+        let (value, gradient) = domain.value_and_gradient_holomorphic(|x, ()| x.clone() * x, x.clone(), ()).unwrap();
         assert_c64_close(read_c64s(&value)[0], z * z);
         assert_c64_close(read_c64s(&gradient)[0], z + z);
 
@@ -2071,7 +2078,7 @@ mod tests {
         let y_array = c64_scalar(&client, &mesh, y);
         let x_array = c64_scalar(&client, &mesh, x_value);
         let (value, (y_gradient, x_gradient)) =
-            domain.value_and_gradient_holomorphic(|(y, x)| y.atan2(&x), (y_array, x_array)).unwrap();
+            domain.value_and_gradient_holomorphic(|(y, x), ()| y.atan2(&x), (y_array, x_array), ()).unwrap();
         let denominator = x_value * x_value + y * y;
         let imaginary_unit = num_complex::Complex::new(0.0f32, 1.0f32);
         assert_c64_close(
@@ -2083,7 +2090,9 @@ mod tests {
 
         // ℂ → ℝ gradient of |z|² = Re(z · z̄) through the plain entry point, exercising the `conjugate` (lowered as
         // `complex(real, -imag)`), `real`, and `complex` StableHLO lowerings in the pullback: the gradient is 2·z̄.
-        let gradient = domain.gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap(), x.clone()).unwrap();
+        let gradient = domain
+            .gradient(|x, ()| (x.clone() * x.conjugate().unwrap()).real().unwrap(), x.clone(), ())
+            .unwrap();
         assert_c64_close(read_c64s(&gradient)[0], (z + z).conj());
     }
 
@@ -2096,17 +2105,67 @@ mod tests {
         let domain = x.execution_domain();
         let ((value, aux), gradient): ((Array<'_>, Array<'_>), Array<'_>) = domain
             .value_and_gradient_with_aux(
-                |x| {
+                |x, ()| {
                     let squared = Mul::mul(&x, &x).unwrap();
                     let aux = Add::add(&x, &x).unwrap();
                     (squared.reduce(&[0], ReductionKind::Sum), aux)
                 },
                 x.clone(),
+                (),
             )
             .unwrap();
         assert_eq!(read_f32s(&value), vec![14.0]);
         assert_eq!(read_f32s(&aux), vec![2.0, 4.0, 6.0]);
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
+    }
+
+    /// Differentiation captures remain device-resident residuals with their nontrivial sharding and placement.
+    #[test]
+    fn test_eager_differentiation_capture_preserves_nontrivial_sharding_and_placement() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = cpu_mesh_with_axis_size(&client, 2);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let primal = Array::from_host_buffer(
+            &client,
+            r#type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let capture = Array::from_host_buffer(
+            &client,
+            r#type,
+            mesh.clone(),
+            values_to_bytes::<f32>(&[4.0, 5.0, 6.0, 7.0]).as_slice(),
+        )
+        .unwrap();
+
+        let (value, gradient) = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .in_context(&primal.execution_domain())
+            .value_and_gradient(|input, capture| Mul::mul(&input, &capture).unwrap().reduce(&[0], ReductionKind::Sum))
+            .unwrap();
+        assert_eq!(read_f32s(&value), vec![60.0]);
+        assert_eq!(read_f64_coordinates(&gradient), vec![4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(gradient.sharding(), &sharding);
+        assert!(gradient.client().is_some());
+
+        let (_, pushforward) = differentiate_at(primal.clone())
+            .with_captures(capture)
+            .in_context(&primal.execution_domain())
+            .linearize(|input, capture| Mul::mul(&input, &capture))
+            .unwrap();
+        let capture_residual = pushforward
+            .residuals()
+            .iter()
+            .find(|residual| read_f64_coordinates(residual) == vec![4.0, 5.0, 6.0, 7.0])
+            .expect("capture should survive as a pushforward residual");
+        assert_eq!(capture_residual.sharding(), &sharding);
+        assert!(capture_residual.client().is_some());
     }
 
     /// Nested transform composition over concrete arrays: `grad` of a function that internally maps its per-item
@@ -2121,12 +2180,13 @@ mod tests {
         let domain = x.execution_domain();
         let gradient = domain
             .gradient(
-                |x| {
+                |x, ()| {
                     let squared =
                         batch(|item| Ok(item.clone() * item), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
                     squared.reduce(&[0], ReductionKind::Sum)
                 },
                 x.clone(),
+                (),
             )
             .unwrap();
         assert_eq!(read_f32s(&gradient), vec![2.0, 4.0, 6.0]);
@@ -2142,7 +2202,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2213,7 +2273,7 @@ mod tests {
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2230,9 +2290,13 @@ mod tests {
         let input = c64_scalar(&client, &mesh, value);
         let context = input.execution_domain();
 
-        let forward = context.jacobian_forward_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
-        let reverse = context.jacobian_reverse_holomorphic(|input| Mul::mul(&input, &input), input.clone()).unwrap();
-        let hessian = context.hessian_holomorphic(|input| Mul::mul(&input, &input), input).unwrap();
+        let forward = context
+            .jacobian_forward_holomorphic(|input, ()| Mul::mul(&input, &input), input.clone(), ())
+            .unwrap();
+        let reverse = context
+            .jacobian_reverse_holomorphic(|input, ()| Mul::mul(&input, &input), input.clone(), ())
+            .unwrap();
+        let hessian = context.hessian_holomorphic(|input, ()| Mul::mul(&input, &input), input, ()).unwrap();
 
         assert_c64_close(read_c64s(forward.iter_blocks().next().unwrap().value())[0], 2.0 * value);
         assert_c64_close(read_c64s(reverse.iter_blocks().next().unwrap().value())[0], 2.0 * value);
@@ -2258,7 +2322,7 @@ mod tests {
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
         let domain = x.execution_domain();
-        let jacobian = domain.jacobian_forward(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = domain.jacobian_forward(|x, ()| Mul::mul(&x, &x), x, ()).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -2283,7 +2347,7 @@ mod tests {
             .unwrap();
         let bytes = values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]);
         let x = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
-        let jacobian = jacobian_reverse(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
@@ -2303,7 +2367,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
-        let jacobian = jacobian_reverse(|x| Mul::mul(&x, &x), x).unwrap();
+        let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
 
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[3]);
@@ -2323,11 +2387,12 @@ mod tests {
         let domain = x.execution_domain();
         let hessian = domain
             .hessian(
-                |x| {
+                |x, ()| {
                     let squared = Mul::mul(&x, &x).unwrap();
                     Ok(squared.reduce(&[0], ReductionKind::Sum))
                 },
                 x,
+                (),
             )
             .unwrap();
 
@@ -2348,7 +2413,7 @@ mod tests {
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
-        let (value, pullback) = domain.vjp(|x| Ok(vec![Mul::mul(&x, &x)?]), x).unwrap();
+        let (value, pullback) = domain.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x, ()).unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
         let cotangent = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);

@@ -871,7 +871,7 @@ where
                     .context()
                     .clone();
                 let (output, pullback) = context.vjp(
-                    move |inputs| {
+                    move |inputs, ()| {
                         let mut outputs =
                             staged.call_with_flat_capture_references(capture_references.as_slice(), inputs)?;
                         if outputs.len() != 1 {
@@ -880,6 +880,7 @@ where
                         Ok(outputs.remove(0))
                     },
                     primals,
+                    (),
                 )?;
                 let output = ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from)?;
                 let seed = ProjectedContext::<_, ArrayType>::new(context).gradient_seed(&output, false)?.into_value();
@@ -998,9 +999,10 @@ where
                     .context()
                     .clone();
                 let (primal_outputs, tangent_outputs) = context.jvp(
-                    move |inputs| staged.call_with_flat_capture_references(capture_references.as_slice(), inputs),
+                    move |inputs, ()| staged.call_with_flat_capture_references(capture_references.as_slice(), inputs),
                     primals,
                     tangents,
+                    (),
                 )?;
                 let primal_outputs = primal_outputs
                     .into_iter()
@@ -1536,7 +1538,7 @@ mod tests {
                 |input| {
                     input
                         .dispatch_domain()
-                        .jacobian_forward(|value| Mul::mul(&value, &value), input)
+                        .jacobian_forward(|value, ()| Mul::mul(&value, &value), input, ())
                         .expect("forward Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1549,7 +1551,7 @@ mod tests {
                 |input| {
                     input
                         .dispatch_domain()
-                        .jacobian_reverse(|value| Mul::mul(&value, &value), input)
+                        .jacobian_reverse(|value, ()| Mul::mul(&value, &value), input, ())
                         .expect("reverse Jacobian should stage")
                 },
                 input_type.clone(),
@@ -1561,7 +1563,7 @@ mod tests {
             |input| {
                 input
                     .dispatch_domain()
-                    .hessian(|value| Mul::mul(&value, &value), input)
+                    .hessian(|value, ()| Mul::mul(&value, &value), input, ())
                     .expect("Hessian should stage")
             },
             input_type.clone(),
@@ -1575,7 +1577,7 @@ mod tests {
             |input| {
                 input
                     .dispatch_domain()
-                    .jacobian_forward(|value| Mul::mul(&value, &value), input)
+                    .jacobian_forward(|value, ()| Mul::mul(&value, &value), input, ())
                     .expect("forward Jacobian should stage")
             },
             input_type.clone(),
@@ -1643,7 +1645,7 @@ mod tests {
                 inputs
                     .0
                     .dispatch_domain()
-                    .jacobian_forward(|(scalar, vector)| scalar.atan2(&vector), inputs)
+                    .jacobian_forward(|(scalar, vector), ()| scalar.atan2(&vector), inputs, ())
                     .expect("forward Jacobian should stage")
             },
             (scalar_type.clone(), vector_type.clone()),
@@ -2470,12 +2472,13 @@ mod tests {
                 let context = primal.context().clone();
                 let (primal_output, tangent_output) = context
                     .jvp(
-                        move |x| {
+                        move |x, ()| {
                             let x = ValueProjection::<ArrayType>::into_projected(x).map_err(ProgramError::from)?;
                             Ok(inner.call(x)?.into_value())
                         },
                         primal,
                         tangent,
+                        (),
                     )
                     .expect("nested captured jvp(jit) should stage");
                 (
@@ -3574,7 +3577,7 @@ mod tests {
             |_, input: XlaCompileTracer<'_>| {
                 input
                     .dispatch_domain()
-                    .gradient(|value| Mul::mul(&value, &value), input)
+                    .gradient(|value, ()| Mul::mul(&value, &value), input, ())
                     .expect("the eager gradient should stage inside the jit boundary")
             },
             &domain,

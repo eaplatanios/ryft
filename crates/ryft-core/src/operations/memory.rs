@@ -230,7 +230,7 @@ mod tests {
     use crate::arrays::{Array, ArrayBatch, ArrayOperation, DataType, Dimension, Shape};
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{jvp, value_and_gradient, vjp};
+    use crate::differentiation::differentiate_at;
     use crate::operations::math::dot::{Dot, DotDimensionNumbers};
     use crate::programs::Typed;
     use crate::tracing::Trace;
@@ -333,19 +333,18 @@ mod tests {
     #[test]
     fn test_transfer_to_memory_jvp_moves_the_primal_and_the_tangent() {
         // Eagerly the transfer is the identity on both the primal and the tangent.
-        let (primal, tangent) = jvp(
-            |x| Ok(x.transfer_to_memory(PINNED_HOST)),
-            Array::vector(vec![2.0, 3.0]),
-            Array::vector(vec![1.0, 0.5]),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]))
+            .jvp(Array::vector(vec![1.0, 0.5]), |x| Ok(x.transfer_to_memory(PINNED_HOST)))
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
         assert_eq!(tangent.to_f64s(), vec![1.0, 0.5]);
     }
 
     #[test]
     fn test_transfer_to_memory_transposition_moves_the_cotangent_back_to_the_source_memory() {
-        let (output, pullback) = vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), Array::vector(vec![2.0, 3.0])).unwrap();
+        let (output, pullback) = differentiate_at(Array::vector(vec![2.0, 3.0]))
+            .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)))
+            .unwrap();
         let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.to_f64s(), vec![2.0, 3.0]);
         // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
@@ -368,15 +367,13 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = value_and_gradient(
-            |x| {
+        let (value, gradient) = differentiate_at(Array::vector(vec![0.5, 1.5]))
+            .value_and_gradient(|x| {
                 let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
                 let back = on_host.transfer_to_memory(Memory::Device);
                 back.dot(&back, &DotDimensionNumbers::inner_product())
-            },
-            Array::vector(vec![0.5, 1.5]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.5, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);

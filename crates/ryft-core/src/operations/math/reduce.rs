@@ -1034,7 +1034,7 @@ mod tests {
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::StagingContext;
-    use crate::differentiation::{jvp, value_and_gradient};
+    use crate::differentiation::differentiate_at;
     use crate::macros::check_operation_batching;
     use crate::programs::Typed;
 
@@ -1382,13 +1382,15 @@ mod tests {
     fn test_reduce_extrema_derivatives_split_ties_evenly() {
         for kind in [ReductionKind::Max, ReductionKind::Min] {
             let input = Array::vector(vec![1.0, 1.0]);
-            let (primal, tangent) =
-                jvp(|input| Ok(input.reduce(&[0], kind)), input.clone(), Array::vector(vec![1.0, 3.0])).unwrap();
+            let (primal, tangent) = differentiate_at(input.clone())
+                .jvp(Array::vector(vec![1.0, 3.0]), |input| Ok(input.reduce(&[0], kind)))
+                .unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-            let (primal, gradient) =
-                value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)), input).unwrap();
+            let (primal, gradient) = differentiate_at(input)
+                .value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)))
+                .unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
             assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);

@@ -70,7 +70,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
-    use crate::differentiation::gradient_holomorphic;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -155,7 +155,10 @@ mod tests {
         let expected = input.powc(ComplexNumber::new(-1.5, 0.0)) * ComplexNumber::new(-0.5, 0.0);
         assert_abs_diff_eq!(
             Array::scalar(expected),
-            gradient_holomorphic(|input| input.rsqrt().unwrap(), Array::scalar(input)).unwrap(),
+            differentiate_at(Array::scalar(input))
+                .holomorphic()
+                .gradient(|input| { input.rsqrt().unwrap() })
+                .unwrap(),
             epsilon = 1e-12,
         );
     }

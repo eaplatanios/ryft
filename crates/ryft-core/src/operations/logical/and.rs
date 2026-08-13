@@ -69,7 +69,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, DataType};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationTracer, jvp};
+    use crate::differentiation::{DifferentiationTracer, differentiate_at};
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::one_like::OneLike;
@@ -132,11 +132,11 @@ mod tests {
 
         // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
         // predicates hold (x > 1) and 3 otherwise.
-        let (primal, tangent) = jvp(masked_select, Array::scalar(2.0), Array::scalar(1.0)).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), masked_select).unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-        let (primal, tangent) = jvp(masked_select, Array::scalar(0.5), Array::scalar(1.0)).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(0.5)).jvp(Array::scalar(1.0), masked_select).unwrap();
         assert_eq!(primal.to_f64s(), vec![1.5]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
 

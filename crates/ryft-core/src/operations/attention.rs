@@ -2248,7 +2248,7 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, DimensionBounds, DimensionVariable, ShardingDimension};
     use crate::batching::{BatchedProgram, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::EagerContext;
-    use crate::differentiation::value_and_gradient;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -4033,11 +4033,12 @@ mod tests {
 
         let function =
             differentiable_dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(scale, mask, None, None);
-        let (loss_value, (query_gradient, key_gradient, value_gradient)) = value_and_gradient(
-            |(query, key, value)| function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum),
-            (query.clone(), key.clone(), value.clone()),
-        )
-        .unwrap();
+        let (loss_value, (query_gradient, key_gradient, value_gradient)) =
+            differentiate_at((query.clone(), key.clone(), value.clone()))
+                .value_and_gradient(|(query, key, value)| {
+                    function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                })
+                .unwrap();
         let loss = |query_values: &[f64], key_values: &[f64], value_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());
@@ -4068,13 +4069,11 @@ mod tests {
         let function = differentiable_dot_product_attention_with_bias::<EagerContext<Array, ArrayOperation<Array>>>(
             scale, mask, None, None,
         );
-        let (_, (_, _, _, bias_gradient)) = value_and_gradient(
-            |(query, key, value, bias)| {
+        let (_, (_, _, _, bias_gradient)) = differentiate_at((query, key, value, bias))
+            .value_and_gradient(|(query, key, value, bias)| {
                 function.call((query, key, value, bias)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-            },
-            (query, key, value, bias),
-        )
-        .unwrap();
+            })
+            .unwrap();
         let bias_loss = |bias_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());
@@ -4116,17 +4115,16 @@ mod tests {
         let function = differentiable_dot_product_attention_with_sequence_lengths::<
             EagerContext<Array, ArrayOperation<Array>>,
         >(scale, mask, None, None);
-        let (loss_value, (query_gradient, key_gradient, value_gradient, query_lengths_gradient, _)) =
-            value_and_gradient(
-                |(query, key, value, query_lengths, key_value_lengths)| {
-                    function
-                        .call((query, key, value, query_lengths, key_value_lengths))
-                        .unwrap()
-                        .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                },
-                (query.clone(), key.clone(), value.clone(), query_lengths.clone(), key_value_lengths.clone()),
-            )
-            .unwrap();
+        let (loss_value, (query_gradient, key_gradient, value_gradient, query_lengths_gradient, _)) = differentiate_at(
+            (query.clone(), key.clone(), value.clone(), query_lengths.clone(), key_value_lengths.clone()),
+        )
+        .value_and_gradient(|(query, key, value, query_lengths, key_value_lengths)| {
+            function
+                .call((query, key, value, query_lengths, key_value_lengths))
+                .unwrap()
+                .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+        })
+        .unwrap();
         let loss = |query_values: &[f64], key_values: &[f64], value_values: &[f64]| -> f64 {
             let query = Array::from_f64s(query_type.clone(), query_values.to_vec());
             let key = Array::from_f64s(key_value_type.clone(), key_values.to_vec());

@@ -4572,7 +4572,7 @@ mod tests {
         // (a sum-reduction over the batch axis).
         let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
-                |x| {
+                |x, ()| {
                     let context = x.context().clone();
                     let y = context.lift(Array::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
                     let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
@@ -4587,6 +4587,7 @@ mod tests {
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
                 Array::scalar(2.0),
+                (),
             )
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
@@ -4599,7 +4600,7 @@ mod tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    ForwardModeDifferentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
+                    ForwardModeDifferentiate::jvp(&context, |y, ()| Ok(y.clone() * y), x.clone(), x.one_like(), ())
                         .map_err(ProgramError::from)
                 },
                 Array::vector(vec![2.0, 3.0]),
@@ -4620,7 +4621,7 @@ mod tests {
                 |x| {
                     let context = x.context().clone();
                     Ok(context
-                        .value_and_gradient(|y| y.clone() * y, x)
+                        .value_and_gradient(|y, ()| y.clone() * y, x, ())
                         .expect("scalar value_and_gradient should succeed"))
                 },
                 Array::vector(vec![2.0, 3.0]),
@@ -4637,7 +4638,7 @@ mod tests {
     fn test_context_batch_composes_inside_jvp() {
         let (primal, tangent): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .jvp(
-                |x| {
+                |x, ()| {
                     let context = x.context().clone();
                     Ok(Batch::batch(
                         &context,
@@ -4650,6 +4651,7 @@ mod tests {
                 },
                 Array::vector(vec![2.0, 3.0]),
                 Array::vector(vec![1.0, 1.0]),
+                (),
             )
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0, 9.0]);
@@ -4660,7 +4662,7 @@ mod tests {
     fn test_context_batch_composes_inside_value_and_gradient() {
         let (value, gradient): (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .value_and_gradient(
-                |x| {
+                |x, ()| {
                     let context = x.context().clone();
                     let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = Batch::batch(
                         &context,
@@ -4674,6 +4676,7 @@ mod tests {
                     mapped.reduce(&[0], ReductionKind::Sum)
                 },
                 Array::vector(vec![2.0, 3.0]),
+                (),
             )
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);

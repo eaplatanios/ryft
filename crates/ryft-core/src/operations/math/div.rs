@@ -116,7 +116,7 @@ mod tests {
         ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, jvp};
+    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, differentiate_at};
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -298,9 +298,9 @@ mod tests {
     fn test_div_low_precision_differentiation_uses_widened_tangents() {
         let left = Array::scalar(4.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let right = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
-        let (primal, tangent): (Array, Array) =
-            jvp(|(left, right)| Ok(left / right), (left, right), (Array::scalar(1.0f32), Array::scalar(1.0f32)))
-                .unwrap();
+        let (primal, tangent) = differentiate_at((left, right))
+            .jvp((Array::scalar(1.0f32), Array::scalar(1.0f32)), |(left, right)| Ok(left / right))
+            .unwrap();
         assert_eq!(primal, Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Array::scalar(-0.5f32));
     }

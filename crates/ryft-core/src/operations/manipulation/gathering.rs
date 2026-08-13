@@ -1017,7 +1017,7 @@ mod tests {
         MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::contexts::Context;
-    use crate::differentiation::jacobian_forward;
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
@@ -1313,16 +1313,14 @@ mod tests {
         );
 
         // Forward mode selects the operand coordinate feeding each gathered output.
-        let jacobian = jacobian_forward(
-            |operand| {
+        let jacobian = differentiate_at(Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+            .jacobian_forward(|operand| {
                 let indices = index_array(&operand, vec![2, 1], vec![0.0, 2.0]);
                 let operation =
                     GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
                 Ok(operand.gather(&indices, &operation).unwrap())
-            },
-            Array::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2, 2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[3, 2]);

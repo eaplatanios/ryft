@@ -366,7 +366,7 @@ mod tests {
 
     use crate::arrays::Array;
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::jvp;
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_type_inference;
     use crate::programs::EmptyRegionDriver;
@@ -515,38 +515,35 @@ mod tests {
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
 
         // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) = jvp(|x| x.conjugate(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.conjugate()).unwrap();
         assert_eq!(primal, Array::scalar(z.conj()));
         assert_eq!(tangent, Array::scalar(tangent_seed.conj()));
 
         // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
-        let (primal, tangent) = jvp(|x| x.real(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.real()).unwrap();
         assert_eq!(primal, Array::scalar(z.re));
         assert_eq!(tangent, Array::scalar(tangent_seed.re));
-        let (primal, tangent) = jvp(|x| x.imaginary(), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.imaginary()).unwrap();
         assert_eq!(primal, Array::scalar(z.im));
         assert_eq!(tangent, Array::scalar(tangent_seed.im));
 
         // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
         // structural zero that must be materialized to keep the staged `complex` arity.
-        let (primal, tangent) = jvp(
-            |(real, imaginary)| real.complex(&imaginary),
-            (Array::scalar(1.5f64), Array::scalar(-2.0f64)),
-            (Array::scalar(0.25f64), Array::scalar(4.0f64)),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at((Array::scalar(1.5f64), Array::scalar(-2.0f64)))
+            .jvp((Array::scalar(0.25f64), Array::scalar(4.0f64)), |(real, imaginary)| real.complex(&imaginary))
+            .unwrap();
         assert_eq!(primal, Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)));
         assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 4.0f64)));
-        let (_, tangent) = jvp(
-            |(real, imaginary)| {
+        let (_, tangent) = differentiate_at((Array::scalar(1.5f64), Array::scalar(-2.0f64)))
+            .jvp((Array::scalar(0.25f64), Array::scalar(4.0f64)), |(real, imaginary)| {
                 let constant = imaginary.context().lift(Array::scalar(0.0f64))?;
                 let _ = imaginary;
                 real.complex(&constant)
-            },
-            (Array::scalar(1.5f64), Array::scalar(-2.0f64)),
-            (Array::scalar(0.25f64), Array::scalar(4.0f64)),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(tangent, Array::scalar(ComplexNumber::new(0.25f64, 0.0f64)));
     }
 
@@ -558,17 +555,16 @@ mod tests {
         // z̄ (from the `z` factor) plus conjugate(z) (from the transposed conjugation branch), so the gradient is
         // 2·z̄ — the same value JAX's `grad` returns for real-valued functions of complex inputs.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let gradient = crate::differentiation::gradient(
-            |x| (x.clone() * x.conjugate().unwrap()).real().unwrap(),
-            Array::scalar(z),
-        )
-        .unwrap();
+        let gradient = differentiate_at(Array::scalar(z))
+            .gradient(|x| (x.clone() * x.conjugate().unwrap()).real().unwrap())
+            .unwrap();
         assert_eq!(gradient, Array::scalar(z.conj() + z.conj()));
 
         // Forward and reverse agree through the ℝ-linear rules: the jvp of f at tangent ż is 2·Re(z̄ · ż).
         let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-        let (primal, tangent) =
-            jvp(|x| Ok((x.clone() * x.conjugate()?).real()?), Array::scalar(z), Array::scalar(tangent_seed)).unwrap();
+        let (primal, tangent) = differentiate_at(Array::scalar(z))
+            .jvp(Array::scalar(tangent_seed), |x| Ok((x.clone() * x.conjugate()?).real()?))
+            .unwrap();
         assert_eq!(primal, Array::scalar(z.norm_sqr()));
         assert_eq!(tangent, Array::scalar((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
     }

@@ -20,17 +20,12 @@
 //! ```
 //!
 //! Replace `cuda-13` with `cuda-12` to use the CUDA 12 plugin. Both runners optimize the same two-layer MLP and XOR
-//! dataset. As in JAX's usual `value_and_grad(lambda model: loss(model, data))` pattern, the differentiated closure
-//! takes only the model; the dataset and loss scale are closed over as constant runtime values.
+//! dataset. The differentiated closure takes only the model as its active argument; the dataset and loss scale are
+//! supplied separately as nondifferentiated runtime captures.
 
 use std::ops::{Add, Mul, Sub};
 
-use ryft::{
-    Array, Context, DifferentiableType, DifferentiationDual, DifferentiationTracer, Domain, Dot, DotDimensionNumbers,
-    LinearizationTracer, OneOperation, Parameter, Parameterized, PartialEvaluationValue, PartialTracer,
-    PartiallyEvaluatableOperation, ProgramError, Reduce, ReductionKind, ReverseModeDifferentiate, Tanh, TracingContext,
-    Value, Zero, value_and_gradient,
-};
+use ryft::*;
 
 /// Trainable affine layer of an [`Mlp`].
 #[derive(Clone, Parameterized)]
@@ -87,41 +82,6 @@ impl<P: Parameter> Mlp<P> {
             .try_fold(inputs.clone(), |activations, layer| layer.forward(&activations).tanh())?;
         Ok(output_layer.forward(&hidden))
     }
-
-    /// Returns the first parameter, used to recover the execution domain for backend arrays.
-    fn first_parameter(&self) -> Result<&P, ProgramError> {
-        self.layers.first().map(|layer| &layer.weights).ok_or_else(|| ProgramError::InvalidArgument {
-            message: "an MLP must contain at least one layer".to_string(),
-        })
-    }
-}
-
-/// Adapts closed-over data and scaling arrays into constant linearization values before computing [`loss`].
-fn loss_with_captured_arguments<C: Context>(
-    model: &Mlp<LinearizationTracer<C>>,
-    inputs: C::Value,
-    targets: C::Value,
-    mean_scale: C::Value,
-) -> Result<LinearizationTracer<C>, ProgramError>
-where
-    C::Type: DifferentiableType,
-    C::Operation:
-        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    LinearizationTracer<C>: Clone
-        + Parameter
-        + Add<Output = LinearizationTracer<C>>
-        + Sub<Output = LinearizationTracer<C>>
-        + Mul<Output = LinearizationTracer<C>>
-        + Dot
-        + Reduce
-        + Tanh,
-{
-    let context = model.first_parameter()?.context().clone();
-    let constant = |value| {
-        let primal = PartialTracer::new(context.parent().clone(), PartialEvaluationValue::known_input(value));
-        DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal), context.clone())
-    };
-    loss(model, &constant(inputs), &constant(targets), &constant(mean_scale))
 }
 
 /// Number of full-batch gradient-descent steps.
@@ -188,10 +148,9 @@ where
     let mut final_loss = 0.0;
 
     for step in 0..STEP_COUNT {
-        let (step_loss, gradients) = value_and_gradient(
-            |model| loss_with_captured_arguments(&model, inputs.clone(), targets.clone(), mean_scale.clone()),
-            model.clone(),
-        )?;
+        let (step_loss, gradients) = differentiate_at(model.clone())
+            .with_captures((inputs.clone(), targets.clone(), mean_scale.clone()))
+            .value_and_gradient(|model, (inputs, targets, mean_scale)| loss(&model, &inputs, &targets, &mean_scale))?;
         final_loss =
             read_values(&step_loss)?.first().copied().ok_or_else(|| format!("{backend} loss has no values"))?;
         initial_loss.get_or_insert(final_loss);

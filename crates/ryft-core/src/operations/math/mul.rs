@@ -189,7 +189,7 @@ mod tests {
         Array, ArrayType, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::differentiation::{jvp, vjp};
+    use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -380,16 +380,16 @@ mod tests {
         let right = Complex::new(0.5f64, -1.0);
         let left_tangent = Complex::new(-0.5f64, 0.25);
         let right_tangent = Complex::new(2.0f64, 1.0);
-        let (primal, tangent) = jvp(
-            |(left, right)| Ok(left * right),
-            (Array::vector(vec![left]), Array::vector(vec![right])),
-            (Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at((Array::vector(vec![left]), Array::vector(vec![right])))
+            .jvp((Array::vector(vec![left_tangent]), Array::vector(vec![right_tangent])), |(left, right)| {
+                Ok(left * right)
+            })
+            .unwrap();
         assert_eq!(primal, Array::vector(vec![left * right]));
         assert_eq!(tangent, Array::vector(vec![left_tangent * right + left * right_tangent]));
-        let (_, pullback) =
-            vjp(|(left, right)| Ok(left * right), (Array::vector(vec![left]), Array::vector(vec![right]))).unwrap();
+        let (_, pullback) = differentiate_at((Array::vector(vec![left]), Array::vector(vec![right])))
+            .vjp(|(left, right)| Ok(left * right))
+            .unwrap();
         let cotangent = Complex::new(0.5f64, 3.0);
         let (left_cotangent, right_cotangent) = pullback.apply(Array::vector(vec![cotangent])).unwrap();
         assert_eq!(left_cotangent, Array::vector(vec![cotangent * right]));

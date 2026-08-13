@@ -33,7 +33,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::Array;
-    use crate::differentiation::value_and_gradient;
+    use crate::differentiation::differentiate_at;
     use crate::operations::constants::one_like::OneLike;
 
     use super::*;
@@ -64,13 +64,16 @@ mod tests {
     #[test]
     fn test_clamp_differentiation() {
         // The gradient follows the clamped value: `1` strictly inside the interval and `0` outside it.
-        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(0.5)).unwrap();
+        let (value, gradient) =
+            differentiate_at(Array::scalar(0.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![0.5]);
         assert_eq!(gradient.to_f64s(), vec![1.0]);
-        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(2.5)).unwrap();
+        let (value, gradient) =
+            differentiate_at(Array::scalar(2.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
-        let (value, gradient) = value_and_gradient(clamp_to_unit_interval, Array::scalar(-2.5)).unwrap();
+        let (value, gradient) =
+            differentiate_at(Array::scalar(-2.5)).value_and_gradient(clamp_to_unit_interval).unwrap();
         assert_eq!(value.to_f64s(), vec![-1.0]);
         assert_eq!(gradient.to_f64s(), vec![0.0]);
     }

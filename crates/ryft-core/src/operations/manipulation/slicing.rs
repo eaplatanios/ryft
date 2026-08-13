@@ -2539,7 +2539,7 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{LinearizationTracer, jacobian_forward, value_and_gradient};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -3778,14 +3778,12 @@ mod tests {
 
         // Forward mode through `f(x) = dynamic_slice(x, [1], [2])` exercises the captured-index dynamic slice under
         // batched basis tangents.
-        let jacobian = jacobian_forward(
-            |x| {
+        let jacobian = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .jacobian_forward(|x| {
                 let start = index_constant(&x, 1.0);
                 Ok(x.dynamic_slice(&[start], &[2]).unwrap())
-            },
-            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[2]);
         assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
@@ -3845,14 +3843,13 @@ mod tests {
 
         // Composing JVP and transposition must retain the captured start index: the input gradient is the output
         // cotangent with the update window zeroed, while the update gradient is that window of the cotangent.
-        let (value, (input_gradient, update_gradient)) = value_and_gradient(
-            |(x, update)| {
-                let start = index_constant(&x, 1.0);
-                x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
-            },
-            (Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])),
-        )
-        .unwrap();
+        let (value, (input_gradient, update_gradient)) =
+            differentiate_at((Array::vector(vec![1.0, 2.0, 3.0, 4.0]), Array::vector(vec![7.0, 8.0])))
+                .value_and_gradient(|(x, update)| {
+                    let start = index_constant(&x, 1.0);
+                    x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+                })
+                .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.to_f64s(), vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.to_f64s(), vec![1.0, 1.0]);
@@ -4044,8 +4041,8 @@ mod tests {
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = value_and_gradient(
-            |x| {
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .value_and_gradient(|x| {
                 let context = x.context().clone();
                 let starts = context
                     .lift(Array::from_f64s(
@@ -4053,7 +4050,7 @@ mod tests {
                         vec![1.0, 2.0],
                     ))
                     .unwrap();
-                let stacked: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+                let stacked = batch(
                     |(item, start)| item.dynamic_slice(&[start], &[2]),
                     (x, starts),
                     (BatchAxis::replicated(), BatchAxis::new(0)),
@@ -4063,10 +4060,8 @@ mod tests {
                 .unwrap();
                 let weights = context.lift(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
                 (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
-            },
-            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
         assert_abs_diff_eq!(value.to_f64s()[0], 33.0, epsilon = 1e-9);
         assert_eq!(gradient.to_f64s(), vec![0.0, 1.0, 5.0, 4.0]);

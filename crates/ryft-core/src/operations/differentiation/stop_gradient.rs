@@ -185,7 +185,7 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{LinearizationTracer, gradient, jvp, value_and_gradient};
+    use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
@@ -229,34 +229,27 @@ mod tests {
             Array::scalar(1.0f32),
             vec![Array::scalar(2_i32), Array::scalar(Complex::new(3.0f64, -4.0)), Array::scalar(true)],
         );
-        assert_eq!(crate::stop_gradient(values.clone()), values);
+        assert_eq!(stop_gradient(values.clone()), values);
 
-        assert!(crate::stop_gradient(Vec::<Array>::new()).is_empty());
-        assert_eq!(crate::stop_gradient::<Array, _>(()), ());
+        assert!(stop_gradient(Vec::<Array>::new()).is_empty());
+        assert_eq!(stop_gradient::<Array, _>(()), ());
 
-        let first_derivative = gradient(
-            |input| {
-                let stopped = crate::stop_gradient((input.clone(), vec![input.clone(), input]));
+        let first_derivative = differentiate_at(Array::scalar(2.0))
+            .gradient(|input| {
+                let stopped = stop_gradient((input.clone(), vec![input.clone(), input]));
                 stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(first_derivative, Array::scalar(0.0));
 
-        let second_derivative = gradient(
-            |input| {
-                gradient(
-                    |inner| {
-                        let stopped = crate::stop_gradient((inner.clone(), vec![inner.clone(), inner]));
-                        stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
-                    },
-                    input,
-                )
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+        let second_derivative = differentiate_at(Array::scalar(2.0))
+            .gradient(|input| {
+                differentiate_at(input).gradient(|inner| {
+                    let stopped = stop_gradient((inner.clone(), vec![inner.clone(), inner]));
+                    stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
+                })
+            })
+            .unwrap();
         assert_eq!(second_derivative, Array::scalar(0.0));
     }
 
@@ -358,20 +351,19 @@ mod tests {
 
         // When batching is nested inside forward mode, the batch rule must rebind the barrier through the surrounding
         // differentiation context instead of cloning the packed differentiation tracer.
-        let (primal, tangent): (Array, Array) = jvp(
-            |x| Ok(batch(|item| Ok(item.stop_gradient()), x, BatchAxis::new(0), BatchAxis::new(0), None)?),
-            Array::vector(vec![2.0, 3.0]),
-            Array::vector(vec![5.0, 7.0]),
-        )
-        .unwrap();
+        let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]))
+            .jvp(Array::vector(vec![5.0, 7.0]), |x| {
+                Ok(batch(|item| Ok(item.stop_gradient()), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            })
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
         assert_eq!(tangent.to_f64s(), vec![0.0, 0.0]);
 
         // Reverse mode exercises the same transform order. Each item differentiates as `x * c`, where the stopped
         // factor `c` is frozen at that item's primal value.
-        let (value, gradient): (Array, Array) = value_and_gradient(
-            |x| {
-                let mapped: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+        let (value, gradient) = differentiate_at(Array::vector(vec![2.0, 3.0]))
+            .value_and_gradient(|x| {
+                let mapped = batch(
                     |item| Ok(item.clone() * item.stop_gradient()),
                     x,
                     BatchAxis::new(0),
@@ -379,10 +371,8 @@ mod tests {
                     None,
                 )?;
                 Ok::<_, ProgramError>(mapped.reduce(&[0], ReductionKind::Sum))
-            },
-            Array::vector(vec![2.0, 3.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
         assert_eq!(gradient.to_f64s(), vec![2.0, 3.0]);
     }
@@ -391,21 +381,23 @@ mod tests {
     fn test_stop_gradient_differentiation() {
         // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
         // derivative of the identity primal function, so the finite-difference operation helper does not apply.
-        let (primal, tangent) = jvp(|x| Ok(x.stop_gradient()), Array::scalar(2.0), Array::scalar(3.0)).unwrap();
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(3.0), |x| Ok(x.stop_gradient())).unwrap();
         assert_eq!(primal, Array::scalar(2.0));
         assert_eq!(tangent, Array::scalar(0.0));
 
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like `x * c` with `c` frozen
         // at the primal value, so `f'(x) = stop_gradient(x)`.
         let (value, first_derivative) =
-            value_and_gradient(|x| x.clone() * x.stop_gradient(), Array::scalar(3.0)).unwrap();
+            differentiate_at(Array::scalar(3.0)).value_and_gradient(|x| x.clone() * x.stop_gradient()).unwrap();
         assert_eq!(value, Array::scalar(9.0));
         assert_eq!(first_derivative, Array::scalar(3.0));
 
         // A stop-gradient barrier applies to every active differentiation level. The first derivative of
         // `x * stop_gradient(x)` is the frozen primal `x`, but an enclosing derivative cannot differentiate it again.
-        let second_derivative =
-            gradient(|x| gradient(|y| y.clone() * y.stop_gradient(), x), Array::scalar(3.0)).unwrap();
+        let second_derivative = differentiate_at(Array::scalar(3.0))
+            .gradient(|x| differentiate_at(x).gradient(|y| y.clone() * y.stop_gradient()))
+            .unwrap();
         assert_eq!(second_derivative, Array::scalar(0.0));
 
         // The staged tangent program replays the primal operation and stages no tangent computation: the severed

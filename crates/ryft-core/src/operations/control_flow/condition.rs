@@ -1380,9 +1380,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::forward::JvpTransform;
     use crate::differentiation::reverse::TranspositionTransform;
-    use crate::differentiation::{
-        DifferentiationTracer, JacobianDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize,
-    };
+    use crate::differentiation::{JacobianDifferentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::math::add::AddOperation;
@@ -2171,14 +2169,11 @@ mod tests {
 
     #[test]
     fn test_condition_linearization_replays_the_selected_branch() {
-        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
-        type TestTracer = LinearizationTracer<TestContext>;
-
         for (predicate, expected_value, expected_tangent) in
             [(true, 1.4, 3.0), (false, 0.7f64.sin(), 1.5 * 0.7f64.cos())]
         {
-            let (value, pushforward) = linearize(
-                move |input: TestTracer| {
+            let (value, pushforward) = differentiate_at(Array::scalar(0.7))
+                .linearize(move |input| {
                     let predicate = input.context().lift(Array::from_f64s(
                         ArrayType::scalar(DataType::Boolean),
                         vec![if predicate { 1.0 } else { 0.0 }],
@@ -2192,10 +2187,8 @@ mod tests {
                         &[predicate, input.clone()],
                     )?;
                     Ok(outputs.remove(0))
-                },
-                Array::scalar(0.7),
-            )
-            .unwrap();
+                })
+                .unwrap();
             assert_eq!(value, Array::scalar(expected_value));
             assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
         }
@@ -2203,11 +2196,8 @@ mod tests {
 
     #[test]
     fn test_condition_jvp_preserves_zero_space_output_tangents() {
-        type TestContext = EagerContext<Array, ArrayOperation<Array>>;
-        type TestTracer = DifferentiationTracer<TestContext>;
-
-        let (primal, tangent) = jvp(
-            |input: TestTracer| {
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0))
+            .jvp(Array::scalar(3.0), |input| {
                 let predicate =
                     input.context().lift(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
                 let mut outputs = input.context().bind(
@@ -2216,11 +2206,8 @@ mod tests {
                     &[predicate, input.clone()],
                 )?;
                 Ok(outputs.remove(0))
-            },
-            Array::scalar(2.0),
-            Array::scalar(3.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(primal, Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]));
         assert_eq!(tangent, Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
     }
@@ -2229,13 +2216,21 @@ mod tests {
     fn test_condition_dense_jacobians_replay_runtime_regions() {
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
 
-        let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
-        let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(4.0)).unwrap();
+        let forward = context
+            .jacobian_forward(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(4.0), ())
+            .unwrap();
+        let reverse = context
+            .jacobian_reverse(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(4.0), ())
+            .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
         assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0]);
 
-        let forward = context.jacobian_forward(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
-        let reverse = context.jacobian_reverse(stage_runtime_predicate_condition, Array::scalar(-4.0)).unwrap();
+        let forward = context
+            .jacobian_forward(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(-4.0), ())
+            .unwrap();
+        let reverse = context
+            .jacobian_reverse(|input, ()| stage_runtime_predicate_condition(input), Array::scalar(-4.0), ())
+            .unwrap();
         assert_eq!(forward.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
         assert_eq!(reverse.iter_blocks().next().unwrap().value().to_f64s(), vec![3.0]);
     }
@@ -2244,7 +2239,7 @@ mod tests {
     fn test_condition_vjp_selects_runtime_branch_cotangents() {
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
-                |(predicate, operand)| {
+                |(predicate, operand), ()| {
                     let mut outputs = predicate.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
                         vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
@@ -2253,6 +2248,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![1.0]), Array::scalar(4.0)),
+                (),
             )
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();
@@ -2262,7 +2258,7 @@ mod tests {
 
         let (output, pullback) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .vjp(
-                |(predicate, operand)| {
+                |(predicate, operand), ()| {
                     let mut outputs = predicate.context().bind(
                         ArrayOperation::Condition(ConditionOperation::new()),
                         vec![scalar_scale_branch(2.0), scalar_scale_branch(3.0)],
@@ -2271,6 +2267,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 (Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0]), Array::scalar(4.0)),
+                (),
             )
             .unwrap();
         let cotangents = pullback.apply(Array::scalar(5.0)).unwrap();

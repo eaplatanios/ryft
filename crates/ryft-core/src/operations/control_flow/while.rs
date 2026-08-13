@@ -2466,8 +2466,7 @@ mod tests {
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, jvp, linearize, value_and_gradient,
-        vjp,
+        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::one::One;
@@ -2757,11 +2756,11 @@ mod tests {
             )?;
             Ok(outputs.remove(0))
         };
-        let (output, pushforward) = linearize(function, Array::scalar(3.5)).unwrap();
+        let (output, pushforward) = differentiate_at(Array::scalar(3.5)).linearize(function).unwrap();
         assert_eq!(output, Array::scalar(-0.5));
         assert_eq!(pushforward.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
 
-        let (output, pullback) = vjp(function, Array::scalar(3.5)).unwrap();
+        let (output, pullback) = differentiate_at(Array::scalar(3.5)).vjp(function).unwrap();
         assert_eq!(output, Array::scalar(-0.5));
         assert_eq!(pullback.apply(Array::scalar(2.0)), Ok(Array::scalar(2.0)));
     }
@@ -3684,7 +3683,7 @@ mod tests {
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
         let (output, pullback) = StagedDispatchTestDomain
             .vjp(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -3693,6 +3692,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 Array::scalar(1.0),
+                (),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
@@ -3722,7 +3722,7 @@ mod tests {
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
         let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x
                         .context()
                         .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
@@ -3730,6 +3730,7 @@ mod tests {
                     outputs.remove(0)
                 },
                 Array::scalar(1.0),
+                (),
             )
             .unwrap();
         assert_eq!(value.to_f64s(), vec![8.0]);
@@ -3746,7 +3747,7 @@ mod tests {
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 4);
         let (output, pullback) = StagedDispatchTestDomain
             .vjp(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -3755,6 +3756,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 Array::scalar(2.0),
+                (),
             )
             .unwrap();
         let (pullback, residuals) = pullback.into_parts();
@@ -3767,17 +3769,15 @@ mod tests {
 
         // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let (while_operation, while_regions) = bounded_squaring_while_operation(100.0, 4);
-        let (value, gradient) = value_and_gradient(
-            move |x| {
+        let (value, gradient) = differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(move |x| {
                 let mut outputs = x
                     .context()
                     .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                     .unwrap();
                 outputs.remove(0)
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![256.0]);
         assert_eq!(gradient.to_f64s(), vec![1024.0]);
     }
@@ -3817,7 +3817,7 @@ mod tests {
 
         let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x
                         .context()
                         .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
@@ -3830,6 +3830,7 @@ mod tests {
                     outputs.remove(0)
                 },
                 Array::vector(vec![1.5, 2.0]),
+                (),
             )
             .unwrap();
         assert_eq!(value.to_f64s(), vec![21.0625]);
@@ -3841,17 +3842,15 @@ mod tests {
         // The eager-domain entry point differentiates the same bounded loop to identical numbers: the loop exits
         // through its condition after three iterations, well below the bound of five.
         let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = value_and_gradient(
-            move |x| {
+        let (value, gradient) = differentiate_at(Array::scalar(1.0))
+            .value_and_gradient(move |x| {
                 let mut outputs = x
                     .context()
                     .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                     .unwrap();
                 outputs.remove(0)
-            },
-            Array::scalar(1.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![8.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
     }
@@ -3863,7 +3862,7 @@ mod tests {
         let (while_operation, while_regions) = effectful_doubling_while_operation();
         let (primal, tangent) = context
             .jvp(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -3873,6 +3872,7 @@ mod tests {
                 },
                 Array::scalar(1.0),
                 Array::scalar(1.0),
+                (),
             )
             .unwrap();
 
@@ -3894,24 +3894,22 @@ mod tests {
         assert_eq!(outputs[0].to_f64s(), vec![16.0]);
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = value_and_gradient(
-            move |x| {
+        let (value, gradient) = differentiate_at(Array::scalar(2.0))
+            .value_and_gradient(move |x| {
                 let mut outputs = x
                     .context()
                     .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
                     .unwrap();
                 outputs.remove(0)
-            },
-            Array::scalar(2.0),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
         assert_eq!(gradient.to_f64s(), vec![8.0]);
 
         let (while_operation, while_regions) = bounded_doubling_while_operation(f64::INFINITY, 3);
         let (value, gradient) = StagedDispatchTestDomain
             .value_and_gradient(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x
                         .context()
                         .bind(TestDomainOperation::While(while_operation), while_regions.clone(), &[x.clone()])
@@ -3919,6 +3917,7 @@ mod tests {
                     outputs.remove(0)
                 },
                 Array::scalar(2.0),
+                (),
             )
             .unwrap();
         assert_eq!(value.to_f64s(), vec![16.0]);
@@ -4348,21 +4347,28 @@ mod tests {
             Ok(mapped)
         }
         let (primal, tangent) = StagedDispatchTestDomain
-            .jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0]))
+            .jvp(
+                |input, ()| batched_bounded_while(input),
+                Array::vector(vec![1.0, 5.0, 9.0]),
+                Array::vector(vec![1.0, 1.0, 1.0]),
+                (),
+            )
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![8.0, 10.0, 9.0]);
         assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 
         // The plain eager domain produces the same numbers...
-        let (primal, tangent) =
-            jvp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0]), Array::vector(vec![1.0, 1.0, 1.0])).unwrap();
+        let (primal, tangent) = differentiate_at(Array::vector(vec![1.0, 5.0, 9.0]))
+            .jvp(Array::vector(vec![1.0, 1.0, 1.0]), batched_bounded_while)
+            .unwrap();
         assert_eq!(primal.to_f64s(), vec![8.0, 10.0, 9.0]);
         assert_eq!(tangent.to_f64s(), vec![8.0, 2.0, 1.0]);
 
         // ... and reverse mode composes through the masked linear scan: the pullback contains the reversed scan
         // and no while loop, and the per-item gradients match the tangent scales.
-        let (output, pullback) =
-            StagedDispatchTestDomain.vjp(batched_bounded_while, Array::vector(vec![1.0, 5.0, 9.0])).unwrap();
+        let (output, pullback) = StagedDispatchTestDomain
+            .vjp(|input, ()| batched_bounded_while(input), Array::vector(vec![1.0, 5.0, 9.0]), ())
+            .unwrap();
         assert_eq!(output.to_f64s(), vec![8.0, 10.0, 9.0]);
         let rendered_pullback = pullback.program().to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
@@ -4380,7 +4386,7 @@ mod tests {
         let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
         let (output, tangent) = StagedDispatchTestDomain
             .jvp(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -4390,6 +4396,7 @@ mod tests {
                 },
                 Array::scalar(2.0),
                 Array::scalar(1.0),
+                (),
             )
             .unwrap();
         assert_eq!(output.to_f64s(), vec![16.0]);
@@ -4505,7 +4512,7 @@ mod tests {
         let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
         let (output, pushforward) = StagedDispatchTestDomain
             .linearize(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -4514,6 +4521,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 Array::scalar(2.0),
+                (),
             )
             .unwrap();
         assert_eq!(output.to_f64s(), vec![16.0]);
@@ -4529,7 +4537,7 @@ mod tests {
         let (while_operation, while_regions) = unbounded_squaring_while_operation(16.0);
         assert!(matches!(
             StagedDispatchTestDomain.vjp(
-                move |x| {
+                move |x, ()| {
                     let mut outputs = x.context().bind(
                         TestDomainOperation::While(while_operation),
                         while_regions.clone(),
@@ -4538,6 +4546,7 @@ mod tests {
                     Ok(outputs.remove(0))
                 },
                 Array::scalar(2.0),
+                (),
             ),
             Err(crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message,

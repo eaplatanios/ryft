@@ -3795,7 +3795,7 @@ mod tests {
         BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{transpose_mixed_operation, value_and_gradient};
+    use crate::differentiation::{differentiate_at, transpose_mixed_operation};
 
     use super::*;
 
@@ -3908,18 +3908,16 @@ mod tests {
 
     #[test]
     fn test_collective_psum_value_and_grad_through_vmap_re_sums_the_cotangent() {
-        use crate::arrays::{Array, ArrayOperation};
+        use crate::arrays::Array;
         use crate::batching::BatchAxisSpecification;
-        use crate::contexts::EagerContext;
-        use crate::differentiation::LinearizationTracer;
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `psum`, which re-broadcasts the cotangent across the batch items, giving `∂g/∂x_i = 1`
         // for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = value_and_gradient(
-            |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                let total: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+            .value_and_gradient(|x| {
+                let total = batch(
                     |item| item.collective("i", CollectiveKind::PSum),
                     x,
                     BatchAxis::new(0),
@@ -3928,29 +3926,25 @@ mod tests {
                 )
                 .unwrap();
                 total
-            },
-            Array::vector(vec![1.0, 2.0, 3.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 1.0]);
     }
 
     #[test]
     fn test_collective_pmean_value_and_grad_through_vmap_carries_the_inverse_batch_size() {
-        use crate::arrays::{Array, ArrayOperation};
+        use crate::arrays::Array;
         use crate::batching::BatchAxisSpecification;
-        use crate::contexts::EagerContext;
-        use crate::differentiation::LinearizationTracer;
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `pmean`, which carries the `1/N` factor, so `∂g/∂x_i = 1/N` for every input. With `x =
         // [1, 2, 3]` (so `N = 3`) the value is `2` and the gradient is `[1/3, 1/3, 1/3]`, witnessing the `1/N`
         // scaling that distinguishes `pmean` from `psum`.
-        let (value, gradient) = value_and_gradient(
-            |x: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>| {
-                let mean: LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>> = batch(
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+            .value_and_gradient(|x| {
+                let mean = batch(
                     |item| item.collective("i", CollectiveKind::PMean),
                     x,
                     BatchAxis::new(0),
@@ -3959,10 +3953,8 @@ mod tests {
                 )
                 .unwrap();
                 mean
-            },
-            Array::vector(vec![1.0, 2.0, 3.0]),
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(value.to_f64s(), vec![2.0]);
         assert_eq!(gradient.to_f64s(), vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
     }

@@ -1832,7 +1832,7 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{JacobianDifferentiate, jacobian_reverse};
+    use crate::differentiation::{JacobianDifferentiate, differentiate_at};
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::programs::{Operation, TypeError};
 
@@ -3372,11 +3372,9 @@ mod tests {
         let inputs = (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0]));
 
         // Reverse mode batches the pullback's adjoint dots over output-coordinate cotangents.
-        let jacobian = jacobian_reverse(
-            |(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())),
-            inputs.clone(),
-        )
-        .unwrap();
+        let jacobian = differentiate_at(inputs.clone())
+            .jacobian_reverse(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())))
+            .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [left, right] = blocks.as_slice() else { unreachable!() };
         assert_eq!(left.value().to_f64s(), vec![7.0, 11.0, 13.0]);
@@ -3384,7 +3382,11 @@ mod tests {
 
         // Forward mode batches input-coordinate basis tangents through the dot pushforward.
         let jacobian = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jacobian_forward(|(left, right)| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())), inputs)
+            .jacobian_forward(
+                |(left, right), ()| Ok(left.dot(&right, &DotDimensionNumbers::inner_product())),
+                inputs,
+                (),
+            )
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
         let [left, right] = blocks.as_slice() else { unreachable!() };
