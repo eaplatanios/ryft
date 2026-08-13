@@ -420,7 +420,7 @@ mod tests {
         ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::differentiation::Differentiate;
     use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, SinOperation};
     use crate::programs::{MaybeZero, Typed};
 
@@ -749,13 +749,11 @@ mod tests {
             .unwrap();
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, pullback) = context
-            .vjp(
-                |(left, right)| Ok(left + right),
-                (
-                    Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
-                    Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]),
-                ),
-            )
+            .differentiate_at((
+                Array::from_f64s(sharded_type.clone(), vec![1.0, 2.0]),
+                Array::from_f64s(replicated_type.clone(), vec![3.0, 4.0]),
+            ))
+            .vjp(|(left, right)| Ok(left + right))
             .unwrap();
         assert!(pullback.program().to_string().contains("reshard"));
         let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
