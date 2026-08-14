@@ -1186,8 +1186,8 @@ mod tests {
     use crate::experimental::shard_map::ShardMapTracer;
 
     use super::{
-        CaptureConstant, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder,
-        materialize_transpose_cotangent, transpose_primal_jit_call,
+        CaptureConstant, JIT_CALL_OPERATION_NAME, JitCallOperation, XlaArrayConstant, XlaConstant, XlaOperation,
+        XlaProgram, XlaProgramBuilder, materialize_transpose_cotangent, transpose_primal_jit_call,
     };
 
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
@@ -1477,6 +1477,14 @@ mod tests {
         );
         let operation = JitCallOperation::new();
 
+        assert_eq!(operation.name(), JIT_CALL_OPERATION_NAME);
+        assert_eq!(
+            operation.infer_output_types(&[], &[]),
+            Err(TypeError::invalid(format!(
+                "{} expects 1 attached callee region but got 0",
+                JIT_CALL_OPERATION_NAME,
+            ))),
+        );
         assert_eq!(
             operation
                 .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface))
