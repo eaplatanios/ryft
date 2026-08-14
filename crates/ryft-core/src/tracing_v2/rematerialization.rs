@@ -1150,7 +1150,7 @@ where
     }
 }
 
-/// Save residuals produced by dot contractions whose [`DotDimensionNumbers`](crate::operations::math::DotDimensionNumbers)
+/// Save residuals produced by dot contractions whose [`DotDimensionNumbers`](crate::operations::dot::DotDimensionNumbers)
 /// have no batch dimensions and recompute the rest. Batched contractions behave more like cheap elementwise work per
 /// batch element, so saving only the unbatched ones targets the genuinely expensive matrix products. Matches JAX's
 /// `dots_with_no_batch_dims_saveable`.
@@ -1408,7 +1408,7 @@ where
 }
 
 /// Offloads residuals produced by dot contractions whose
-/// [`DotDimensionNumbers`](crate::operations::math::DotDimensionNumbers) have no batch dimensions to
+/// [`DotDimensionNumbers`](crate::operations::dot::DotDimensionNumbers) have no batch dimensions to
 /// `destination` and recomputes the rest. Matches JAX's `offload_dot_with_no_batch_dims`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OffloadDotsWithNoBatchDims {
@@ -2384,7 +2384,7 @@ mod tests {
             let row = builder.add_input(vector_type(2));
             let dot = builder
                 .add_instruction(
-                    crate::operations::math::DotOperation::new(DotDimensionNumbers::inner_product()),
+                    crate::operations::dot::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
                 )
@@ -3620,7 +3620,7 @@ mod tests {
             let row = builder.add_input(row_type.clone());
             let dot = builder
                 .add_instruction(
-                    crate::operations::math::DotOperation::new(DotDimensionNumbers::inner_product()),
+                    crate::operations::dot::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
                 )

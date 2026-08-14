@@ -231,7 +231,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
-    use crate::operations::math::dot::{Dot, DotDimensionNumbers};
+    use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::programs::Typed;
     use crate::tracing::Trace;
 

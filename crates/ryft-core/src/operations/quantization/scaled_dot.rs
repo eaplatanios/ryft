@@ -513,7 +513,7 @@ mod tests {
     use crate::arrays::{Array, ArrayBatch, ArrayType, DataType, Dimension, Shape};
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
-    use crate::operations::math::dot::DotDimensionNumbers;
+    use crate::operations::dot::DotDimensionNumbers;
     use crate::programs::{Operation, TypeError};
 
     use super::*;

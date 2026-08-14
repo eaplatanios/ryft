@@ -2,7 +2,7 @@
 
 use crate::arrays::arrays::Array;
 use crate::arrays::types::data::DataType;
-use crate::operations::math::dot::DotDimensionNumbers;
+use crate::operations::dot::DotDimensionNumbers;
 use crate::operations::quantization::{ScaledDot, ScaledDotOperation, scaled_dot_composition};
 use crate::programs::{ProgramError, Typed};
 

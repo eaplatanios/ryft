@@ -24,6 +24,7 @@ use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dot::{Dot, DotDimensionNumbers};
 use crate::operations::logical::and::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversion::ConvertElementType;
@@ -31,7 +32,6 @@ use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshap
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::Add;
 use crate::operations::math::div::Div;
-use crate::operations::math::dot::{Dot, DotDimensionNumbers};
 use crate::operations::math::exp::Exp;
 use crate::operations::math::log::Log;
 use crate::operations::math::mul::Mul;

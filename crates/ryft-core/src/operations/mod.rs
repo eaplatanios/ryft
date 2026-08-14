@@ -14,6 +14,7 @@ pub mod custom_call;
 pub mod debugging;
 pub mod differentiation;
 pub mod dimensions;
+pub mod dot;
 pub mod logical;
 pub mod manipulation;
 pub mod math;
@@ -45,6 +46,7 @@ pub use dimensions::{
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
     DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
 };
+pub use dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use logical::*;
 pub use manipulation::*;
 pub use math::*;

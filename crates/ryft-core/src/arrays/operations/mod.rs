@@ -218,7 +218,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 /// Derived conveniences that a member already implies are also left out, because bounding them would only duplicate
 /// solver work: [`TopK`](crate::operations::sort::TopK), [`ArgMax`](crate::operations::sort::ArgMax), and
 /// [`ArgMin`](crate::operations::sort::ArgMin) all follow from [`Sort`], [`Slice`], and [`Reshape`], and
-/// [`DotOps`](crate::operations::math::DotOps) follows from [`Dot`] and [`Transpose`].
+/// [`DotOps`](crate::operations::dot::DotOps) follows from [`Dot`] and [`Transpose`].
 ///
 /// # Tracers
 ///

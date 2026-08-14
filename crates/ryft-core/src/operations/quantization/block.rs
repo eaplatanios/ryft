@@ -182,7 +182,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Shape};
     use crate::contexts::StagingContext;
-    use crate::operations::math::dot::{Dot, DotDimensionNumbers};
+    use crate::operations::dot::{Dot, DotDimensionNumbers};
     use crate::operations::quantization::ScaledDot;
     use crate::programs::Typed;
     use crate::tracing::TracingContext;
