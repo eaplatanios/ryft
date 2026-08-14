@@ -21,21 +21,24 @@ use ryft_core::{
     CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation,
     CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
     ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DifferentiableOperation, DifferentiableType,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionFromScalarOperation,
-    DimensionOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, LogOperation, LogisticOperation,
-    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
-    Operation, OrOperation, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, RegionInterface,
-    RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation,
+    DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation,
+    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
+    OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation, Parameter, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation,
+    PrintOperation, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue,
+    ReduceOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
+    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
+    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
+    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
 use ryft_macros::Parameter;
 
@@ -441,6 +444,21 @@ macro_rules! impl_composite_operation_conversion {
         )+
     };
 }
+
+// Every first-class dimension arithmetic operation lifts directly, mirroring the composite family, so that generic
+// staging code (e.g., the `DimensionArithmetic` capability) can bound `From<DimensionMulOperation>`-style conversions
+// without naming this family's dimension member.
+impl_composite_operation_conversion!(
+    DimensionAddOperation,
+    DimensionSubOperation,
+    DimensionSaturatingSubOperation,
+    DimensionMulOperation,
+    DimensionPowOperation,
+    DimensionDivFloorOperation,
+    DimensionRemOperation,
+    DimensionMinOperation,
+    DimensionMaxOperation,
+);
 
 impl_composite_operation_conversion!(
     ZeroLikeOperation<ArrayIrType>,

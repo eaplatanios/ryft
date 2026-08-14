@@ -15,7 +15,7 @@ use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::dimensions::DimensionType;
+use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
@@ -37,7 +37,7 @@ use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation,
     Ceil, CeilOperation, CollectiveOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation,
     ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, CoordinateBasisOperation,
-    Cos, CosOperation, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar,
+    Cos, CosOperation, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar,
     DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
     DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
@@ -55,7 +55,8 @@ use crate::operations::{
     UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, Type, TypeIdentityPosition, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -278,6 +279,58 @@ pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Requirement(DimensionRequirementOperation),
 }
 
+/// Value-level capability bundle paired with the [`DimensionOperation`] family.
+///
+/// [`DimensionOperations`] is to [`DimensionOperation`] what [`ArrayOperations`] is to [`ArrayOperation`]: a pure
+/// bundle of the value-level capabilities through which a [`DimensionType`]-typed value materializes the family's
+/// variants, blanket-implemented for every value that satisfies the same supertrait list and therefore never
+/// implemented manually. Generic first-class-dimension code states this one bound instead of re-listing checked
+/// dimension arithmetic capability by capability, and it is also the dimension member profile that
+/// [`ArrayIrOperations`] pins on its [`ValueProjection<DimensionType>`](ValueProjection) supertrait.
+///
+/// # Membership
+///
+/// Membership follows the rule documented on [`ArrayOperations`]: a member is a value-level capability whose methods
+/// take [`DimensionType`]-typed values and stage or execute one [`DimensionOperation`] variant. Checked arithmetic
+/// reaches the shared capabilities [`Add`], [`Sub`], [`Mul`], [`Div`] (flooring division), and [`Rem`] pinned to
+/// dimension-typed values, alongside the dedicated [`DimensionSaturatingSub`], [`DimensionPow`], [`DimensionMin`],
+/// and [`DimensionMax`]. [`DimensionRequirement`] is the family's assertion surface and is a member even though its
+/// methods return no value, because it is still performed by a dimension-typed value.
+///
+/// What a variant needs in order to exist, but that a dimension value does not itself perform, stays out:
+///
+///   - staging machinery, namely [`DimensionOperation::Constant`], exactly as
+///     [`Constant`](crate::operations::constants::Constant) stays out of [`ArrayOperations`]; and
+///   - the mixed conversions [`DimensionSize`], [`DimensionFromScalar`], and [`DimensionToScalar`], whose signatures
+///     cross the array and first-class-dimension member kinds. They live in the composite family and belong to
+///     [`ArrayIrOperations`]. [`DimensionToScalar`] does have a dimension-typed receiver, but its output is an array
+///     representation the member universe cannot name, so it is reached through the composite value instead.
+///
+/// The composite counterpart of this bundle's arithmetic is [`DimensionArithmetic`], which spells the same operations
+/// directly on [`ArrayIrType`]-typed values so that composite shape arithmetic needs no projection vocabulary.
+///
+/// # Tracers
+///
+/// As with [`ArrayOperations`], this bundle deliberately implies nothing about the tracers derived from an
+/// implementing value; a tracer requirement stays a separate explicit bound.
+pub trait DimensionOperations:
+    Value<Type = DimensionType>
+    // Checked first-class-dimension arithmetic.
+    + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub + DimensionPow + DimensionMin + DimensionMax
+    // Runtime assertions over first-class dimensions.
+    + DimensionRequirement
+{
+}
+
+// The predicates below restate the supertrait list of `DimensionOperations`, so that the bundle is satisfied exactly
+// when every one of its member capabilities is.
+impl<V> DimensionOperations for V
+where
+    V: Value<Type = DimensionType> + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub,
+    V: DimensionPow + DimensionMin + DimensionMax + DimensionRequirement,
+{
+}
+
 /// Closed [`Operation`](crate::Operation) family for Ryft's array IR, whose values include ordinary arrays and
 /// first-class runtime dimensions. This dispatcher preserves the homogeneous contracts of [`ArrayOperation`] and
 /// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
@@ -427,29 +480,45 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///
 /// # Member Profiles
 ///
-/// The two member projections are themselves supertraits, so one bound carries the complete surface: the array member
-/// satisfies [`ArrayOperations`] and the first-class-dimension member satisfies the checked dimension arithmetic
-/// capabilities. Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
-/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
+/// The two member projections are themselves supertraits, each pinned to the sibling bundle of the member family it
+/// projects onto, so one bound carries the complete surface: the array member satisfies [`ArrayOperations`] and the
+/// first-class-dimension member satisfies [`DimensionOperations`]. Generic composite code therefore states
+/// `V: ArrayIrOperations` alone instead of restating `ValueProjection<ArrayType, Projected: ArrayOperations>`-style
+/// bounds at every call site.
 ///
-/// Both member surfaces are reached the same way: project the composite value, use the member capability, and inject
-/// the member result back. For first-class dimension arithmetic that reads
-/// `value.into_projected()?.mul(&other.into_projected()?)`, followed by `from_projected`:
+/// Checked arithmetic over two first-class dimensions is a bundle member in its own right, through
+/// [`DimensionArithmetic`], so composite shape arithmetic needs no projection vocabulary at all:
 ///
 /// ```rust
-/// use ryft_core::arrays::{DimensionType, DimensionValue};
-/// use ryft_core::{Array, ArrayIrValue, Mul, ProgramError, ValueProjection};
+/// use ryft_core::arrays::DimensionValue;
+/// use ryft_core::{Array, ArrayIrValue, DimensionArithmetic, ProgramError};
 ///
 /// # fn main() -> Result<(), ProgramError> {
 /// let rows: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
 /// let columns: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
-/// let elements = ValueProjection::<DimensionType>::into_projected(rows)?
-///     .mul(&ValueProjection::<DimensionType>::into_projected(columns)?)?;
-/// let elements = <ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(elements);
-/// let ArrayIrValue::Dimension(elements) = elements else {
+/// let ArrayIrValue::Dimension(elements) = rows.dimension_mul(&columns)? else {
 ///     unreachable!("dimension arithmetic returns a first-class dimension");
 /// };
 /// assert_eq!(elements.extent(), 6);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Every other member surface is reached by the general mechanism instead: project the composite value, use the
+/// member capability, and inject the member result back. For the array member that reads
+/// `value.into_projected()?.mul(&other.into_projected()?)`, followed by `from_projected`:
+///
+/// ```rust
+/// use ryft_core::arrays::ArrayType;
+/// use ryft_core::{Array, ArrayIrValue, Mul, ProgramError, ValueProjection};
+///
+/// # fn main() -> Result<(), ProgramError> {
+/// let left: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]));
+/// let right: ArrayIrValue<Array> = ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0]));
+/// let product = ValueProjection::<ArrayType>::into_projected(left)?
+///     .mul(&ValueProjection::<ArrayType>::into_projected(right)?)?;
+/// let product = <ArrayIrValue<Array> as ValueProjection<ArrayType>>::from_projected(product);
+/// assert_eq!(product, ArrayIrValue::Array(Array::vector(vec![8.0_f64, 15.0])));
 /// # Ok(())
 /// # }
 /// ```
@@ -468,16 +537,12 @@ pub trait ArrayIrOperations:
     // Array member profile.
     + ValueProjection<ArrayType, Projected: ArrayOperations>
     // First-class-dimension member profile.
-    + ValueProjection<
-        DimensionType,
-        Projected: Value<Type = DimensionType>
-                       + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub + DimensionPow
-                       + DimensionMin + DimensionMax + DimensionRequirement,
-    >
+    + ValueProjection<DimensionType, Projected: DimensionOperations>
     // Comparison of first-class dimensions, producing ordinary Boolean array data.
     + Compare
     // First-class dimensions.
-    + DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast + DynamicReshape
+    + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
+    + DynamicBroadcast + DynamicReshape
 {
 }
 
@@ -486,22 +551,10 @@ pub trait ArrayIrOperations:
 impl<V> ArrayIrOperations for V
 where
     V: Value<Type = ArrayIrType> + Compare,
-    V: DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast + DynamicReshape,
+    V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
+    V: DynamicBroadcast + DynamicReshape,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
-    V: ValueProjection<
-            DimensionType,
-            Projected: Value<Type = DimensionType>
-                           + Add
-                           + Sub
-                           + Mul
-                           + Div
-                           + Rem
-                           + DimensionSaturatingSub
-                           + DimensionPow
-                           + DimensionMin
-                           + DimensionMax
-                           + DimensionRequirement,
-        >,
+    V: ValueProjection<DimensionType, Projected: DimensionOperations>,
 {
 }
 
@@ -585,6 +638,146 @@ impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for Arr
     }
 }
 
+/// Replicates the operands of an implicitly broadcasting elementwise [`ArrayOperation`] into its result geometry, when
+/// that geometry carries a runtime extent, so that the projected member rule differentiates operands that already have
+/// the result shape.
+///
+/// The member-family alignment ([`ElementwiseDerivativeAlignment`](crate::ElementwiseDerivativeAlignment)) cannot
+/// replicate into a runtime extent itself, because its [`BroadcastOperation`] carries the complete output geometry as
+/// payload metadata and program replay never refines a payload type. Such an extent is therefore only reachable
+/// through an operand edge, which this composite arm supplies: it reads each runtime extent off the operand that owns
+/// that axis as a first-class dimension value and replicates with [`DynamicBroadcastOperation`]. Linearization then
+/// keeps one scalar dimension value per runtime axis alive as a residual, instead of one result-shaped array per
+/// aligned operand.
+///
+/// Returns `None` when the replication does not apply, in which case the caller differentiates the operands as they
+/// are: the operation is not one of the implicitly broadcasting elementwise variants, its result has no tangent space
+/// (so no operand is ever aligned), its result geometry is fully static, or every operand already has the result
+/// shape.
+///
+/// # Parameters
+///
+///   - `context`: [`Context`] that owns the primal trace, in which the extent reads and the replications are bound.
+///   - `operation`: Elementwise [`ArrayOperation`] whose operands are being replicated.
+///   - `inputs`: Input [`DifferentiationDual`]s that the rule received.
+fn replicated_elementwise_duals<A, C>(
+    context: &C,
+    operation: &ArrayOperation<A>,
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, DifferentiationError>
+where
+    A: Value<Type = ArrayType>,
+    C: Context<Type = ArrayIrType>,
+    C::Operation:
+        From<DynamicBroadcastOperation> + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
+    ArrayOperation<A>: Operation<Type = ArrayType>,
+{
+    // The variants whose type inference broadcasts several operands into one result, and whose differentiation rules
+    // therefore align narrower operands (both live tangents and primal coefficients) with that result type.
+    if !matches!(
+        operation,
+        ArrayOperation::Add(_)
+            | ArrayOperation::Sub(_)
+            | ArrayOperation::Mul(_)
+            | ArrayOperation::Div(_)
+            | ArrayOperation::Rem(_)
+            | ArrayOperation::Pow(_)
+            | ArrayOperation::Max(_)
+            | ArrayOperation::Min(_)
+            | ArrayOperation::Atan2(_)
+            | ArrayOperation::And(_)
+            | ArrayOperation::Or(_)
+            | ArrayOperation::Xor(_)
+            | ArrayOperation::Complex(_)
+            | ArrayOperation::Compare(_)
+            | ArrayOperation::Select(_),
+    ) {
+        return Ok(None);
+    }
+
+    let input_types = inputs
+        .iter()
+        .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.clone()))
+        .collect::<Result<Vec<_>, TypeError>>()?;
+    let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
+    let [output_type] = output_types.as_slice() else {
+        return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+    };
+    let output_shape = output_type.shape();
+    if output_type.tangent().is_zero_space()
+        || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+        || input_types.iter().all(|input_type| input_type.shape() == output_shape)
+    {
+        return Ok(None);
+    }
+
+    // One first-class dimension operand per result axis, as the mixed broadcast requires. A repeated dimension denotes
+    // one runtime extent, so it is read once and shared by every axis that carries it.
+    let mut extents = Vec::<C::Value>::with_capacity(output_shape.rank());
+    for (axis, dimension) in output_shape.dimensions().iter().enumerate() {
+        if let Some(previous) = output_shape.dimensions()[..axis].iter().position(|earlier| earlier == dimension) {
+            extents.push(extents[previous].clone());
+            continue;
+        }
+        let extent = match dimension {
+            Dimension::Static(extent) => {
+                let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
+                context.bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+            }
+            Dimension::Dynamic(_) => {
+                let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
+                    let input_axis = axis.checked_sub(output_shape.rank() - input_type.rank())?;
+                    (&input_type.dimension(input_axis) == dimension).then_some((index, input_axis))
+                });
+                let Some((index, input_axis)) = source else {
+                    return Err(TypeError::invalid(format!(
+                        "cannot replicate '{}' operands into result shape {output_shape} because no operand carries \
+                         its runtime axis {axis}",
+                        operation.name(),
+                    ))
+                    .into());
+                };
+                context
+                    .bind(
+                        DimensionSizeOperation::new(&input_types[index], input_axis)?,
+                        Vec::new(),
+                        std::slice::from_ref(inputs[index].primal()),
+                    )?
+                    .remove(0)
+            }
+        };
+        extents.push(extent);
+    }
+
+    // Replication is structurally linear, so the primal and the tangent of a narrower operand ride the same mixed
+    // broadcast, and a structural-zero tangent stays structural at the replicated tangent type.
+    inputs
+        .iter()
+        .zip(input_types.iter())
+        .map(|(input, input_type)| {
+            if input_type.shape() == output_shape {
+                return Ok(input.clone());
+            }
+            let offset = output_shape.rank() - input_type.rank();
+            let replication =
+                DynamicBroadcastOperation::new((0..input_type.rank()).map(|axis| axis + offset).collect());
+            let mut replication_inputs = Vec::with_capacity(1 + extents.len());
+            replication_inputs.push(input.primal().clone());
+            replication_inputs.extend(extents.iter().cloned());
+            let primal = context.bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?.remove(0);
+            let tangent = match input.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Value(tangent) => {
+                    replication_inputs[0] = tangent.clone();
+                    MaybeZero::Value(context.bind(replication, Vec::new(), replication_inputs.as_slice())?.remove(0))
+                }
+            };
+            Ok(DifferentiationDual::new(primal, tangent)?)
+        })
+        .collect::<Result<Vec<_>, DifferentiationError>>()
+        .map(Some)
+}
+
 impl<A, C> MemberDifferentiableOperation<C> for ArrayOperation<A>
 where
     A: Value<Type = ArrayType>,
@@ -618,7 +811,10 @@ where
             Self::Gather(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::Scatter(operation) => operation.jvp_in_parent(context, driver, inputs)?,
             Self::Reduce(operation) => operation.jvp_in_parent(context, driver, inputs)?,
-            operation => jvp_projected_operation(context, operation, inputs)?,
+            operation => match replicated_elementwise_duals(context, operation, inputs)? {
+                Some(duals) => jvp_projected_operation(context, operation, duals.as_slice())?,
+                None => jvp_projected_operation(context, operation, inputs)?,
+            },
         };
         output_duals
             .into_iter()
@@ -722,6 +918,23 @@ mod tests {
     }
 
     #[test]
+    fn test_dimension_operations_holds_for_every_canonical_dimension_value() {
+        // The bundle is satisfied exactly when every member capability is, so instantiating this function is a
+        // compile-time assertion that the listed value families implement the complete `DimensionOperation` surface.
+        fn requires_dimension_operations<V: DimensionOperations>() {}
+
+        requires_dimension_operations::<DimensionValue>();
+        requires_dimension_operations::<Tracer<DimensionTracingContext>>();
+
+        // `ArrayIrOperations` pins this bundle on its first-class-dimension member profile, so the dimension member
+        // projected out of every canonical composite value must satisfy it as well.
+        requires_dimension_operations::<<ArrayIrValue<Array> as ValueProjection<DimensionType>>::Projected>();
+        requires_dimension_operations::<
+            <Tracer<TracingContext<TestValue, TestOperation>> as ValueProjection<DimensionType>>::Projected,
+        >();
+    }
+
+    #[test]
     fn test_array_ir_operations_holds_for_every_canonical_array_ir_value() {
         fn requires_array_ir_operations<V: ArrayIrOperations>() {}
 
@@ -729,16 +942,15 @@ mod tests {
         requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
         requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
 
-        // The bundle's member profiles make one bound enough to reach both surfaces: ordinary array math on the array
-        // member and checked arithmetic on the first-class dimension member, with no projection bounds restated here.
+        // The bundle's member profiles make one bound enough to reach both surfaces: ordinary array math through the
+        // array member projection and checked dimension arithmetic directly on the composite value, with no
+        // projection bounds restated here.
         fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
             // The array member carries both the fallible capability and its panicking operator sugar, so the
             // capability is named explicitly here.
             let array = <V as ValueProjection<ArrayType>>::into_projected(value.clone())?;
             let square = <V as ValueProjection<ArrayType>>::from_projected(Mul::mul(&array, &array)?);
-            let rows = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(0)?)?;
-            let columns = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(1)?)?;
-            let elements = <V as ValueProjection<DimensionType>>::from_projected(rows.mul(&columns)?);
+            let elements = value.dimension_size(0)?.dimension_mul(&value.dimension_size(1)?)?;
             Ok((square, elements))
         }
 

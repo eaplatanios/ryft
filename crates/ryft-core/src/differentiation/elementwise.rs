@@ -478,10 +478,10 @@ mod tests {
         DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::differentiation::Differentiate;
+    use crate::differentiation::{Differentiate, differentiate_at};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, ReduceOperation, SinOperation,
-        TanhOperation,
+        AddOperation, CompareOperation, ComparisonDirection, ConvertElementType, MulOperation, ReduceOperation,
+        SinOperation, TanhOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{MaybeZero, ProgramBuilder, Typed};
@@ -542,9 +542,9 @@ mod tests {
                                type f64[] has a different shape",
         ));
 
-        // Aligning the narrow operand's tangent with an implicitly broadcasting result that has a runtime extent takes
-        // its shape from the primal result instead of from the metadata-only broadcast, whose payload output type
-        // program replay would never refine.
+        // An implicitly broadcasting result with a runtime extent is served by the composite arm instead. The narrow
+        // operand is replicated explicitly against first-class extents read off the operand that owns the runtime
+        // axis, because the metadata-only broadcast's payload output type is one that program replay never refines.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(dynamic_type.into());
         let bias = builder.add_input(bias_type.into());
@@ -566,11 +566,37 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[batch, 2], %1:f64[2], %2:f64[batch, 2], %3:f64[2] .
-                let %4:f64[batch, 2] = add %0 %1
-                    %5:f64[batch, 2] = zero_like %4
-                    %6:f64[batch, 2] = add %3 %5
-                    %7:f64[batch, 2] = add %2 %6
-                in (%4, %7)"},
+                let %4:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %5:dimension<2> = constant [value=2]
+                    %6:f64[batch, 2] = broadcast [output_axes=[1]] %1 %4 %5
+                    %7:f64[batch, 2] = broadcast [output_axes=[1]] %3 %4 %5
+                    %8:f64[batch, 2] = add %0 %6
+                    %9:f64[batch, 2] = add %2 %7
+                in (%8, %9)"},
+        );
+
+        // Linearizing the same program carries only first-class extents across the primal-linear boundary
+        // (i.e., the runtime one plus the static one the mixed broadcast names explicitly).
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                ArrayIrValue::Array(Array::vector(vec![0.5, -0.25])),
+            ])
+            .unwrap();
+        let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+        let extents = residuals
+            .iter()
+            .map(|residual| match residual {
+                ArrayIrValue::Dimension(extent) => extent.extent(),
+                residual => panic!("expected only first-class extent residuals but got {residual:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(extents, vec![3, 2]);
+        assert_eq!(
+            primal_outputs,
+            vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.5, 1.75, 3.5, 3.75, 5.5, 5.75]))],
         );
     }
 
@@ -948,6 +974,70 @@ mod tests {
                     ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents)),
                     ArrayIrValue::Array(Array::vector(expected_bias_cotangents)),
                 ]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_bilinear_elementwise_differentiation_with_dynamic_output_axes() {
+        // `sum(x * scale)` with a runtime-sized leading axis. A bilinear rule aligns the primal coefficient of each
+        // side as well as the tangents, so this pins the replicated operands against the eager gradients of the same
+        // computation at two concrete extents.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.into());
+        let scale = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let scaled = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
+                Vec::new(),
+                vec![input, scale],
+            )
+            .unwrap()[0];
+        let loss = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
+                Vec::new(),
+                vec![scaled],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![loss],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        let scale_values = vec![1.5, -0.5];
+        for rows in [3usize, 1] {
+            let values = (0..rows * 2).map(|index| index as f64 * 0.25 + 1.0).collect::<Vec<_>>();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone())),
+                    ArrayIrValue::Array(Array::vector(scale_values.clone())),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0))];
+            pullback_inputs.extend(residuals);
+
+            // The same computation differentiated eagerly at this concrete extent, which never involves a runtime
+            // extent and therefore never takes the replication path.
+            let (eager_loss, eager_pullback) =
+                differentiate_at((Array::matrix(rows, 2, values), Array::vector(scale_values.clone())))
+                    .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)))
+                    .unwrap();
+            let (input_cotangent, scale_cotangent) = eager_pullback.apply(Array::scalar(1.0)).unwrap();
+            assert_eq!(primal_outputs, vec![ArrayIrValue::Array(eager_loss)]);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(vec![ArrayIrValue::Array(input_cotangent), ArrayIrValue::Array(scale_cotangent)]),
             );
         }
     }

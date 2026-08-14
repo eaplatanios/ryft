@@ -1199,7 +1199,8 @@ where
 /// Computed or input dimensions remain ordinary SSA operands, which is what makes a runtime-derived output shape
 /// expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent is read off the input while
 /// its trailing extent is an exact lifted dimension. Extents derived by first-class dimension arithmetic work the
-/// same way; refer to [`ArrayIrOperations`](crate::ArrayIrOperations) for that projection path.
+/// same way, using the [`DimensionArithmetic`](crate::DimensionArithmetic) capability (e.g.,
+/// `rows.dimension_mul(&columns)?`) directly on the composite values.
 ///
 /// ```rust
 /// use ryft_core::operations::manipulation::DynamicReshape;
@@ -1312,7 +1313,7 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::operations::{DimensionSize, Mul};
+    use crate::operations::{DimensionArithmetic, DimensionSize};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::Trace;
@@ -1962,12 +1963,9 @@ mod tests {
         );
         let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| {
-                // Dimension arithmetic lives in the first-class-dimension member, so the two static extents are
-                // multiplied through the dimension projection and the product is injected back.
+                // Dimension arithmetic is a composite capability, so the two static extents multiply directly.
                 let rows = input.dimension_size(0)?;
-                let width = ValueProjection::<DimensionType>::into_projected(input.dimension_size(1)?)?;
-                let height = ValueProjection::<DimensionType>::into_projected(input.dimension_size(2)?)?;
-                let columns = ValueProjection::<DimensionType>::from_projected(width.mul(&height)?);
+                let columns = input.dimension_size(1)?.dimension_mul(&input.dimension_size(2)?)?;
                 input.dynamic_reshape(&[rows, columns])
             },
             ArrayIrType::Array(input_type),

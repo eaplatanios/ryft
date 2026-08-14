@@ -29,7 +29,7 @@ pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,
-    DimensionTracingContext,
+    DimensionOperations, DimensionTracingContext,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
