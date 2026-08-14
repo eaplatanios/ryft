@@ -48,7 +48,7 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 ///     survives batching applied _before_ differentiation, and
 ///   - _differentiation_ replays the user JVP region instead of differentiating the primal body, so the user-supplied
 ///     derivative governs both forward and reverse mode differentiation.
-/// 
+///
 /// Refer to the documentation of [`custom_jvp`] for the full semantics and for when to reach for a custom JVP.
 ///
 /// Note that this operation is deliberately non-transposable, which does not restrict reverse-mode differentiation.
@@ -156,13 +156,7 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 2 {
-            return Err(TypeError::invalid(format!(
-                "`{}` expects 2 attached regions but got {}",
-                CUSTOM_JVP_OPERATION_NAME,
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 2, TypeError);
         let (_, differentiated_input_types) = self.split_inputs(input_types)?;
         let mut jvp_input_types = input_types.to_vec();
         jvp_input_types.extend(differentiated_input_types.iter().map(DifferentiableType::tangent));
@@ -174,12 +168,9 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        if region_interfaces.len() != 2 {
-            return Err(TypeError::invalid(format!(
-                "custom_jvp expects 2 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        // Output inference is a standalone validation entry point, so it must validate the complete post-instantiation
+        // region contract even when `infer_region_input_types` was not called first.
+        check_count!("region", region_interfaces, 2, TypeError);
         let primal_interface = &region_interfaces[0];
         let jvp_interface = &region_interfaces[1];
         let primal_input_types = primal_interface.input_types();
@@ -645,12 +636,7 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         &self,
         region_interfaces: &'i [RegionInterface<T>],
     ) -> Result<&'i RegionInterface<T>, TypeError> {
-        if region_interfaces.len() != 3 {
-            return Err(TypeError::invalid(format!(
-                "custom_vjp expects 3 attached regions but got {}",
-                region_interfaces.len()
-            )));
-        }
+        check_count!("region", region_interfaces, 3, TypeError);
         let primal_interface = &region_interfaces[0];
         let forward_interface = &region_interfaces[1];
         let backward_interface = &region_interfaces[2];
@@ -729,12 +715,7 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 3 {
-            return Err(TypeError::invalid(format!(
-                "custom_vjp expects 3 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 3, TypeError);
         let primal_interface = &region_interfaces[0];
         let forward_interface = &region_interfaces[1];
 

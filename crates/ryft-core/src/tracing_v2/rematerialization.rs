@@ -163,12 +163,7 @@ impl<T: Type> RematerializeOperation<T> {
         &self,
         region_interfaces: &'i [RegionInterface<T>],
     ) -> Result<&'i RegionInterface<T>, TypeError> {
-        if region_interfaces.len() != 4 {
-            return Err(TypeError::invalid(format!(
-                "rematerialize expects 4 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 4, TypeError);
         let primal_interface = &region_interfaces[0];
         let forward_interface = &region_interfaces[1];
         let backward_interface = &region_interfaces[2];
@@ -249,12 +244,7 @@ impl<T: Type> Operation for RematerializeOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 4 {
-            return Err(TypeError::invalid(format!(
-                "rematerialize expects 4 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 4, TypeError);
         let primal_interface = &region_interfaces[0];
         let forward_interface = &region_interfaces[1];
         let primal_renaming = T::derive_identity_renaming(primal_interface.input_types(), input_types)?;

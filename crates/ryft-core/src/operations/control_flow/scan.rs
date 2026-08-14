@@ -708,9 +708,7 @@ fn validated_scan_interface<'i, T: ScanTypeSemantics>(
     carry_count: usize,
     length: &Dimension,
 ) -> Result<&'i RegionInterface<T>, TypeError> {
-    if region_interfaces.len() != 1 {
-        return Err(TypeError::invalid(format!("scan expects 1 attached region but got {}", region_interfaces.len())));
-    }
+    check_count!("region", region_interfaces, 1, TypeError);
     let body_interface = &region_interfaces[0];
     T::validate_scan_body(body_interface.input_types(), body_interface.output_types(), carry_count, length)?;
     Ok(body_interface)
@@ -738,12 +736,7 @@ where
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 1 {
-            return Err(TypeError::invalid(format!(
-                "scan expects 1 attached region but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 1, TypeError);
         let body_input_types = T::scan_body_input_types(
             input_types,
             region_interfaces[0].input_types().len(),
@@ -3108,7 +3101,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[scalar_f64.clone(), stacked_f64.clone()], &[]),
-            Err(TypeError::invalid("scan expects 1 attached region but got 0".to_string())),
+            Err(TypeError::invalid("expected 1 region but got 0")),
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_f64), interfaces.as_slice()),

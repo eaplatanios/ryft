@@ -283,12 +283,7 @@ impl WhileTypeSemantics for ArrayIrType {
 fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
-    if region_interfaces.len() != 2 {
-        return Err(TypeError::invalid(format!(
-            "while expects 2 attached regions but got {}",
-            region_interfaces.len()
-        )));
-    }
+    check_count!("region", region_interfaces, 2, TypeError);
     let condition_interface = &region_interfaces[0];
     let body_interface = &region_interfaces[1];
     let state_types = body_interface.input_types();
@@ -332,12 +327,7 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        if region_interfaces.len() != 2 {
-            return Err(TypeError::invalid(format!(
-                "while expects 2 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 2, TypeError);
         if region_interfaces.iter().all(|interface| interface.input_types() == input_types) {
             return Ok(vec![None, None]);
         }
@@ -2601,7 +2591,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&state_type), &[]),
-            Err(TypeError::invalid("while expects 2 attached regions but got 0".to_string())),
+            Err(TypeError::invalid("expected 2 regions but got 0")),
         );
         assert_eq!(
             operation.infer_output_types(&[], interfaces.as_slice()),

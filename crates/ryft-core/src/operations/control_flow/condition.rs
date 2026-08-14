@@ -126,12 +126,7 @@ impl ConditionTypeSemantics for ArrayIrType {
 fn validated_branch_interfaces<'i, T: Type>(
     region_interfaces: &'i [RegionInterface<T>],
 ) -> Result<(&'i RegionInterface<T>, &'i RegionInterface<T>), TypeError> {
-    if region_interfaces.len() != 2 {
-        return Err(TypeError::invalid(format!(
-            "condition expects 2 attached regions but got {}",
-            region_interfaces.len()
-        )));
-    }
+    check_count!("region", region_interfaces, 2, TypeError);
     let true_interface = &region_interfaces[0];
     let false_interface = &region_interfaces[1];
     check_types!(@same, "condition branch input", [
@@ -166,12 +161,7 @@ where
         input_types: &[F::Type],
         region_interfaces: &[RegionInterface<F::Type>],
     ) -> Result<Vec<Option<Vec<F::Type>>>, TypeError> {
-        if region_interfaces.len() != 2 {
-            return Err(TypeError::invalid(format!(
-                "condition expects 2 attached regions but got {}",
-                region_interfaces.len(),
-            )));
-        }
+        check_count!("region", region_interfaces, 2, TypeError);
         if input_types.is_empty() {
             return Err(TypeError::invalid("condition expects at least one input but got 0"));
         }
@@ -1552,7 +1542,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[predicate_type.clone(), operand_type.clone()], &[]),
-            Err(TypeError::invalid("condition expects 2 attached regions but got 0".to_string())),
+            Err(TypeError::invalid("expected 2 regions but got 0")),
         );
         assert_eq!(
             operation.infer_output_types(&[], interfaces.as_slice()),
