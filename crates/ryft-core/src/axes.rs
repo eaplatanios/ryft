@@ -541,9 +541,9 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperati
         check_count!("input", inputs, 0, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`axis_index` for the device mesh axis '{}' has no eager value; \
+                "`{}` for the device mesh axis '{}' has no eager value; \
                 it is only defined inside a `shard_map` manual region",
-                self.axis_name,
+                AXIS_INDEX_OPERATION_NAME, self.axis_name,
             ),
         })
     }

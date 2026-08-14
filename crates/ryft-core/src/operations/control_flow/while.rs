@@ -300,10 +300,10 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     if T::is_batched_predicate(&condition_output_types[0])
         && (!condition_interface.effects().is_pure() || !body_interface.effects().is_pure())
     {
-        return Err(TypeError::invalid(
-            format!("'{WHILE_OPERATION_NAME}' loop with a batched predicate must be pure because observable effects cannot be \
-                      masked for finished batch items"),
-        ));
+        return Err(TypeError::invalid(format!(
+            "'{WHILE_OPERATION_NAME}' loop with a batched predicate must be pure because observable effects cannot be \
+                      masked for finished batch items"
+        )));
     }
     Ok((condition_interface, body_interface))
 }
@@ -1219,9 +1219,9 @@ where
         // Composite region batching forwards the extent as its leading output. The while condition consumes that
         // extent as loop state but returns only its predicate, so project the bookkeeping output from this boundary.
         if batched_condition.output_count() < 2 {
-            return Err(ProgramError::MalformedProgram(
-                format!("a structurally batched {WHILE_OPERATION_NAME} condition must return its threaded extent and predicate"),
-            )
+            return Err(ProgramError::MalformedProgram(format!(
+                "a structurally batched {WHILE_OPERATION_NAME} condition must return its threaded extent and predicate"
+            ))
             .into());
         }
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
@@ -2164,12 +2164,16 @@ where
             let original_input_count = primal_body.input_ids().len();
             let mut extra_inputs = inputs[original_input_count..].iter();
             let counter_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("bounded {WHILE_OPERATION_NAME} body adapter is missing the counter input"))
+                ProgramError::MalformedProgram(format!(
+                    "bounded {WHILE_OPERATION_NAME} body adapter is missing the counter input"
+                ))
             })?;
             let stack_inputs = extra_inputs.by_ref().take(stack_types.len()).cloned().collect::<Vec<_>>();
             check_count!("input", stack_inputs, stack_types.len(), ProgramError);
             let mask_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("bounded {WHILE_OPERATION_NAME} body adapter is missing the mask input"))
+                ProgramError::MalformedProgram(format!(
+                    "bounded {WHILE_OPERATION_NAME} body adapter is missing the mask input"
+                ))
             })?;
             let mut body_outputs =
                 primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;

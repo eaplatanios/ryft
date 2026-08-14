@@ -79,7 +79,7 @@ impl_differentiable_operation! {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
                 MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
                     return Err(ProgramError::UnsupportedOperation {
-                        message: format!("'abs' output type {} has no tangent space", primal.r#type()),
+                        message: format!("'{}' output type {} has no tangent space", ABS_OPERATION_NAME, primal.r#type()),
                     }
                     .into());
                 }
@@ -137,7 +137,7 @@ macro_rules! impl_capability_for_primitive {
         impl Abs for $type {
             fn abs(&self) -> Result<Self, ProgramError> {
                 self.checked_abs().ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'abs' result does not fit in {}", stringify!($type)),
+                    message: format!("'{}' result does not fit in {}", ABS_OPERATION_NAME, stringify!($type)),
                 })
             }
         }

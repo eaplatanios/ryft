@@ -73,7 +73,11 @@ macro_rules! impl_capability_for_primitive {
         impl Div for $type {
             fn div(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'div' divisor is zero or the result does not fit in {}", stringify!($type)),
+                    message: format!(
+                        "'{}' divisor is zero or the result does not fit in {}",
+                        DIV_OPERATION_NAME,
+                        stringify!($type),
+                    ),
                 })
             }
         }

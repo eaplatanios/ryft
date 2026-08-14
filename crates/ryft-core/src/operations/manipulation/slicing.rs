@@ -431,9 +431,10 @@ impl SliceOperation {
             .into());
         }
         if let Some(axis) = strides.iter().position(|stride| *stride == 0) {
-            return Err(
-                TypeError::invalid(format!("'{SLICE_OPERATION_NAME}' strides must be at least 1 but axis {axis} has stride 0")).into()
-            );
+            return Err(TypeError::invalid(format!(
+                "'{SLICE_OPERATION_NAME}' strides must be at least 1 but axis {axis} has stride 0"
+            ))
+            .into());
         }
         self.strides = strides;
         Ok(self)
@@ -743,10 +744,14 @@ where
                         size => input_size - (start + (size - 1) * stride) - 1,
                     };
                     edge_padding_low.push(i64::try_from(start).map_err(|_| {
-                        TypeError::invalid(format!("'{SLICE_OPERATION_NAME}' transpose start index is too large on axis {axis}"))
+                        TypeError::invalid(format!(
+                            "'{SLICE_OPERATION_NAME}' transpose start index is too large on axis {axis}"
+                        ))
                     })?);
                     edge_padding_high.push(i64::try_from(high).map_err(|_| {
-                        TypeError::invalid(format!("'{SLICE_OPERATION_NAME}' transpose high padding is too large on axis {axis}"))
+                        TypeError::invalid(format!(
+                            "'{SLICE_OPERATION_NAME}' transpose high padding is too large on axis {axis}"
+                        ))
                     })?);
                     interior_padding.push(stride - 1);
                 }
@@ -1293,7 +1298,9 @@ impl UpdateSlice for ArrayType {
                 .into());
             };
             let limit = start.checked_add(update_size).ok_or_else(|| {
-                TypeError::invalid(format!("'{UPDATE_SLICE_OPERATION_NAME}' update limit overflows usize on axis {axis}"))
+                TypeError::invalid(format!(
+                    "'{UPDATE_SLICE_OPERATION_NAME}' update limit overflows usize on axis {axis}"
+                ))
             })?;
             match self.dimension(axis) {
                 Dimension::Static(input_size) if limit > input_size => {
@@ -1382,10 +1389,10 @@ impl Operation for DynamicSliceOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         if input_types.is_empty() {
-            return Err(TypeError::invalid(
-                format!("'{DYNAMIC_SLICE_OPERATION_NAME}' expects an input operand followed by its start index operands but got no \
-                    inputs"),
-            ));
+            return Err(TypeError::invalid(format!(
+                "'{DYNAMIC_SLICE_OPERATION_NAME}' expects an input operand followed by its start index operands but got no \
+                    inputs"
+            )));
         }
         match input_types[0].dynamic_slice(&input_types[1..], self.sizes.as_slice()) {
             Ok(output_type) => Ok(vec![output_type]),
@@ -2356,8 +2363,10 @@ fn static_update_sizes(operation_name: &str, update_type: &ArrayType) -> Result<
         .enumerate()
         .map(|(axis, size)| {
             size.value().ok_or_else(|| {
-                TypeError::invalid(format!("'{operation_name}' transpose requires a static update shape but axis {axis} has size {size}"))
-                    .into()
+                TypeError::invalid(format!(
+                    "'{operation_name}' transpose requires a static update shape but axis {axis} has size {size}"
+                ))
+                .into()
             })
         })
         .collect()

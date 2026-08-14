@@ -918,7 +918,7 @@ where
         if backward_output_axes != differentiated_axes {
             return Err(BatchingError::MisalignedBatchAxes {
                 message: format!(
-                "batched {CUSTOM_VJP_OPERATION_NAME} backward output axes {backward_output_axes:?} do not match its \
+                    "batched {CUSTOM_VJP_OPERATION_NAME} backward output axes {backward_output_axes:?} do not match its \
                  differentiated input axes {differentiated_axes:?}",
                 ),
             });

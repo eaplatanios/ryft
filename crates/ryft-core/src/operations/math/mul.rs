@@ -146,7 +146,7 @@ macro_rules! impl_capability_for_primitive {
         impl Mul for $type {
             fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_mul(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'mul' result does not fit in {}", stringify!($type)),
+                    message: format!("'{}' result does not fit in {}", MUL_OPERATION_NAME, stringify!($type)),
                 })
             }
         }

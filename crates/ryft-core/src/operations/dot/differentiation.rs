@@ -106,7 +106,7 @@ impl<
             // Both operands linear is a bilinear product, which is not a linear map in both operands jointly and so
             // never appears in a valid pushforward.
             (true, true) => Err(ProgramError::UnsupportedOperation {
-                message: "bilinear `dot` with two linear operands cannot be transposed".to_string(),
+                message: format!("bilinear `{DOT_OPERATION_NAME}` with two linear operands cannot be transposed"),
             }
             .into()),
             // Exactly one operand is linear: stage the adjoint dot reading the known operand's value, and emit a

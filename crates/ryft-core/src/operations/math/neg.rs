@@ -20,7 +20,9 @@ define_elementwise_operation!(
         check_types!(@numeric, NEG_OPERATION_NAME, input_types);
         let input_type = input_types[0];
         if input_type == DataType::F8E8M0FNU {
-            return Err(TypeError::invalid("'neg' does not support input data type f8e8m0fnu".to_string()));
+            return Err(TypeError::invalid(format!(
+                "'{NEG_OPERATION_NAME}' does not support input data type f8e8m0fnu",
+            )));
         }
         Ok(vec![input_type])
     },
@@ -54,7 +56,7 @@ macro_rules! impl_capability_for_primitive {
         impl Neg for $type {
             fn neg(&self) -> Result<Self, ProgramError> {
                 self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'neg' result does not fit in {}", stringify!($type)),
+                    message: format!("'{}' result does not fit in {}", NEG_OPERATION_NAME, stringify!($type)),
                 })
             }
         }

@@ -229,10 +229,7 @@ where
                                 TypeError::invalid(format!(
                                     "cannot eagerly allocate {} output {} because its dynamic dimension {} is not \
                                      supplied as a first-class {} input",
-                                    SCAN_OPERATION_NAME,
-                                    r#type,
-                                    variable,
-                                    SCAN_OPERATION_NAME,
+                                    SCAN_OPERATION_NAME, r#type, variable, SCAN_OPERATION_NAME,
                                 ))
                             }),
                     })

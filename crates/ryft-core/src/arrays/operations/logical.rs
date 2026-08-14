@@ -9,7 +9,7 @@ use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::types::data::DataType;
-use crate::operations::{And, Not, Or, Xor};
+use crate::operations::{And, NOT_OPERATION_NAME, Not, Or, Xor};
 use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
@@ -84,7 +84,7 @@ impl Not for Array {
             data_type if data_type.is_integer() => u8::MAX,
             data_type => {
                 return Err(TypeError::invalid(format!(
-                    "cannot apply `not` to an array of element data type {data_type}"
+                    "cannot apply `{NOT_OPERATION_NAME}` to an array of element data type {data_type}"
                 ))
                 .into());
             }

@@ -58,7 +58,9 @@ where
         let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(self.dimensions(), aligned_axes[0], aligned_axes[1])
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
-                message: "'dot' batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
+                message: format!(
+                    "'{DOT_OPERATION_NAME}' batching failed to lift its dimension numbers for the aligned batch axes",
+                ),
             })?;
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let lifted_op = DotOperation::new(lifted_dimensions)

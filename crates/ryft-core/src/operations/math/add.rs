@@ -52,7 +52,7 @@ macro_rules! impl_capability_for_primitive {
         impl Add for $type {
             fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
                 self.checked_add(*rhs).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'add' result does not fit in {}", stringify!($type)),
+                    message: format!("'{}' result does not fit in {}", ADD_OPERATION_NAME, stringify!($type)),
                 })
             }
         }

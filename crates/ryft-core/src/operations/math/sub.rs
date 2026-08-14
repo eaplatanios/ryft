@@ -50,7 +50,7 @@ macro_rules! impl_capability_for_primitive {
         impl Sub for $type {
             fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_sub(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'sub' result does not fit in {}", stringify!($type)),
+                    message: format!("'{}' result does not fit in {}", SUB_OPERATION_NAME, stringify!($type)),
                 })
             }
         }

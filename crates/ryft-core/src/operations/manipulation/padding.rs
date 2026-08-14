@@ -487,7 +487,9 @@ where
                         .enumerate()
                         .map(|(axis, padding)| {
                             padding.checked_add(1).ok_or_else(|| {
-                                TypeError::invalid(format!("'{PAD_OPERATION_NAME}' transpose stride overflows usize on axis {axis}"))
+                                TypeError::invalid(format!(
+                                    "'{PAD_OPERATION_NAME}' transpose stride overflows usize on axis {axis}"
+                                ))
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -1226,7 +1228,9 @@ fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                 .map_err(|error| {
-                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' dependency scalar sharding construction failed: {error}"))
+                    TypeError::invalid(format!(
+                        "'{PAD_OPERATION_NAME}' dependency scalar sharding construction failed: {error}"
+                    ))
                 })
         })
         .transpose()?;
@@ -1249,17 +1253,18 @@ fn padded_extent(
         .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
     let gap_count = i128::try_from(gap_count)
         .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
-    let interior_padding = i128::try_from(interior_padding)
-        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' interior padding is too large on axis {axis}")))?;
+    let interior_padding = i128::try_from(interior_padding).map_err(|_| {
+        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' interior padding is too large on axis {axis}"))
+    })?;
     let dilated_size = input_size
-        .checked_add(
-            gap_count
-                .checked_mul(interior_padding)
-                .ok_or_else(|| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))?,
-        )
+        .checked_add(gap_count.checked_mul(interior_padding).ok_or_else(|| {
+            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"))
+        })?)
         .and_then(|size| size.checked_add(i128::from(edge_padding_low)))
         .and_then(|size| size.checked_add(i128::from(edge_padding_high)))
-        .ok_or_else(|| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))?;
+        .ok_or_else(|| {
+            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"))
+        })?;
     Ok(dilated_size)
 }
 
@@ -1273,7 +1278,9 @@ fn static_padded_extent(
 ) -> Result<usize, TypeError> {
     let output_size = padded_extent(input_size, edge_padding_low, edge_padding_high, interior_padding, axis)?;
     if output_size < 0 {
-        return Err(TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size is negative ({output_size}) on axis {axis}")));
+        return Err(TypeError::invalid(format!(
+            "'{PAD_OPERATION_NAME}' output size is negative ({output_size}) on axis {axis}"
+        )));
     }
     usize::try_from(output_size)
         .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))
@@ -1296,9 +1303,10 @@ fn validate_pad_inputs(
         .into());
     }
     if padding_value.rank() != 0 {
-        return Err(
-            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' padding value must be a scalar but has type {padding_value}")).into()
-        );
+        return Err(TypeError::invalid(format!(
+            "'{PAD_OPERATION_NAME}' padding value must be a scalar but has type {padding_value}"
+        ))
+        .into());
     }
     if input.memory() != padding_value.memory() {
         return Err(TypeError::invalid(format!(
@@ -1373,9 +1381,9 @@ fn padded_output_type(
             && input.sharding().map(|sharding| sharding.mesh())
                 != padding_value.sharding().map(|sharding| sharding.mesh())
         {
-            return Err(TypeError::invalid(
-                format!("'{PAD_OPERATION_NAME}' input and padding value with distributed dependencies must use the same mesh"),
-            )
+            return Err(TypeError::invalid(format!(
+                "'{PAD_OPERATION_NAME}' input and padding value with distributed dependencies must use the same mesh"
+            ))
             .into());
         }
     }

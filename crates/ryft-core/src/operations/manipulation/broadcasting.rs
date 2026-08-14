@@ -106,7 +106,9 @@ impl Operation for DynamicBroadcastOperation {
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
-            return Err(TypeError::invalid(format!("'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents")));
+            return Err(TypeError::invalid(format!(
+                "'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents"
+            )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
         let output_shape = Shape::new(ArrayIrType::extents(output_extent_types)?);
@@ -140,7 +142,10 @@ where
             return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
         }
         let Some((input, output_extents)) = inputs.split_first() else {
-            return Err(TypeError::invalid(format!("'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents")).into());
+            return Err(TypeError::invalid(format!(
+                "'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents"
+            ))
+            .into());
         };
         let input = <C::Value as ValueProjection<ArrayType>>::into_projected(input.clone())?;
         let output_shape = Shape::new(

@@ -369,27 +369,31 @@ impl Pad for Array {
         let mut written = 0usize;
         'elements: while written < input_addressing.element_count() {
             for axis in 0..rank {
-                let input_coordinate = i128::try_from(input_index[axis])
-                    .map_err(|_| TypeError::invalid(format!("'pad' input index is too large on axis {axis}")))?;
-                let stride = i128::try_from(interior_padding[axis])
-                    .ok()
-                    .and_then(|padding| padding.checked_add(1))
-                    .ok_or_else(|| TypeError::invalid(format!("'pad' stride is too large on axis {axis}")))?;
-                let output_coordinate =
-                    i128::from(edge_padding_low[axis])
-                        .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
-                            TypeError::invalid(format!("'pad' output index overflows on axis {axis}"))
-                        })?)
-                        .ok_or_else(|| TypeError::invalid(format!("'pad' output index overflows on axis {axis}")))?;
-                let output_extent = i128::try_from(output_shape[axis])
-                    .map_err(|_| TypeError::invalid(format!("'pad' output extent is too large on axis {axis}")))?;
+                let input_coordinate = i128::try_from(input_index[axis]).map_err(|_| {
+                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input index is too large on axis {axis}"))
+                })?;
+                let stride =
+                    i128::try_from(interior_padding[axis]).ok().and_then(|padding| padding.checked_add(1)).ok_or_else(
+                        || TypeError::invalid(format!("'{PAD_OPERATION_NAME}' stride is too large on axis {axis}")),
+                    )?;
+                let output_coordinate = i128::from(edge_padding_low[axis])
+                    .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
+                        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index overflows on axis {axis}"))
+                    })?)
+                    .ok_or_else(|| {
+                        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index overflows on axis {axis}"))
+                    })?;
+                let output_extent = i128::try_from(output_shape[axis]).map_err(|_| {
+                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output extent is too large on axis {axis}"))
+                })?;
                 if output_coordinate < 0 || output_coordinate >= output_extent {
                     written += 1;
                     input_addressing.advance_index(&mut input_index);
                     continue 'elements;
                 }
-                output_index[axis] = usize::try_from(output_coordinate)
-                    .map_err(|_| TypeError::invalid(format!("'pad' output index is too large on axis {axis}")))?;
+                output_index[axis] = usize::try_from(output_coordinate).map_err(|_| {
+                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index is too large on axis {axis}"))
+                })?;
             }
             bytes[output_addressing.byte_range_unchecked(&output_index)]
                 .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
@@ -407,12 +411,10 @@ impl Concatenate for Array {
     ) -> Result<Self, ProgramError> {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
-            return Err(
-                TypeError::invalid(format!(
-                    "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none",
-                ))
-                .into()
-            );
+            return Err(TypeError::invalid(format!(
+                "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none",
+            ))
+            .into());
         };
         if inputs.len() == 1 {
             return Ok((*first).clone());

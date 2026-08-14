@@ -243,7 +243,9 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: &Dimension) -> Result<
         if unroll == 1 {
             return Ok(());
         }
-        return Err(TypeError::invalid(format!("{SCAN_OPERATION_NAME} with dynamic length {length} only supports unroll factor 1",)));
+        return Err(TypeError::invalid(format!(
+            "{SCAN_OPERATION_NAME} with dynamic length {length} only supports unroll factor 1",
+        )));
     };
     if length % unroll != 0 {
         return Err(TypeError::invalid(format!(
@@ -660,7 +662,10 @@ impl ScanTypeSemantics for ArrayIrType {
 
     fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
         let Self::Array(r#type) = r#type else {
-            return Err(TypeError::invalid(format!("{SCAN_OPERATION_NAME} cannot stack first-class dimension type {}", r#type)));
+            return Err(TypeError::invalid(format!(
+                "{SCAN_OPERATION_NAME} cannot stack first-class dimension type {}",
+                r#type
+            )));
         };
         Ok(Self::Array(stacked_scan_type(r#type, length)))
     }
@@ -1318,9 +1323,9 @@ where
                     known_program_output_edges.push(None);
                 }
                 PartialEvaluationOutput::Unknown(_) => {
-                    return Err(ProgramError::MalformedProgram(
-                        format!("{SCAN_OPERATION_NAME} known-ness fixed point converged with an unknown next value for a known carry"),
-                    ));
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "{SCAN_OPERATION_NAME} known-ness fixed point converged with an unknown next value for a known carry"
+                    )));
                 }
             }
         }
@@ -1422,7 +1427,9 @@ where
         .iter()
         .map(|&index| {
             body_inputs.get(index).cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} body partition references missing {SCAN_OPERATION_NAME} input {index}",))
+                ProgramError::MalformedProgram(format!(
+                    "{SCAN_OPERATION_NAME} body partition references missing {SCAN_OPERATION_NAME} input {index}",
+                ))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1522,14 +1529,16 @@ where
             match input {
                 PartialEvaluationInput::Unknown(index) => {
                     spliced_inputs.push(unknown_body_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
-                        ProgramError::MalformedProgram(
-                            format!("{SCAN_OPERATION_NAME} known-ness split saw a residual feeder for a known body input"),
-                        )
+                        ProgramError::MalformedProgram(format!(
+                            "{SCAN_OPERATION_NAME} known-ness split saw a residual feeder for a known body input"
+                        ))
                     })?);
                 }
                 PartialEvaluationInput::Known(edge) => {
                     spliced_inputs.push(*edge_input_atoms.get(*edge).ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} known-ness split lost a residual edge"))
+                        ProgramError::MalformedProgram(format!(
+                            "{SCAN_OPERATION_NAME} known-ness split lost a residual edge"
+                        ))
                     })?)
                 }
             }
@@ -1551,9 +1560,9 @@ where
                 PartialEvaluationOutput::Unknown(spliced) => unknown_output_atoms.push(spliced_outputs[*spliced]),
                 PartialEvaluationOutput::Known(_) => {
                     let (edge, _) = instantiated_edge_positions[index].ok_or_else(|| {
-                        ProgramError::MalformedProgram(
-                            format!("{SCAN_OPERATION_NAME} known-ness split lost an instantiated carry edge"),
-                        )
+                        ProgramError::MalformedProgram(format!(
+                            "{SCAN_OPERATION_NAME} known-ness split lost an instantiated carry edge"
+                        ))
                     })?;
                     unknown_output_atoms.push(edge_input_atoms[edge]);
                 }
@@ -1967,7 +1976,9 @@ where
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
                 BatchingError::UnsupportedOperation {
-                    message: format!("{SCAN_OPERATION_NAME} batching requires static stacked input types but got {stack_type}"),
+                    message: format!(
+                        "{SCAN_OPERATION_NAME} batching requires static stacked input types but got {stack_type}"
+                    ),
                 }
                 .into()
             })
@@ -2534,7 +2545,9 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     for (index, input) in runtime_length_inputs.iter().enumerate() {
         materialized.push(input.as_known().cloned().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"))
+            ProgramError::MalformedProgram(format!(
+                "{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"
+            ))
         })?);
     }
     let cotangents = context.stage_operation(
@@ -2718,14 +2731,18 @@ where
         if index >= carry_count {
             // A known scanned operand is a residual stack; the dispatch guarantees it carries its pullback value.
             let residual = scan_inputs[index].as_known().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose operand {index} has no known residual value"))
+                ProgramError::MalformedProgram(format!(
+                    "{SCAN_OPERATION_NAME} transpose operand {index} has no known residual value"
+                ))
             })?;
             operands.push(residual.clone());
         }
     }
     for (index, input) in runtime_length_inputs.iter().enumerate() {
         operands.push(input.as_known().cloned().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"))
+            ProgramError::MalformedProgram(format!(
+                "{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"
+            ))
         })?);
     }
 
@@ -2821,9 +2838,9 @@ where
     let (program, live_inputs) =
         program.into_filtered(selected_inputs.as_slice(), output_ids.as_slice(), selected_inputs.as_slice())?;
     if !live_inputs.iter().copied().eq(0..selected_input_count) {
-        return Err(ProgramError::MalformedProgram(
-            format!("{SCAN_OPERATION_NAME} transpose boundary projection dropped a retained input"),
-        ));
+        return Err(ProgramError::MalformedProgram(format!(
+            "{SCAN_OPERATION_NAME} transpose boundary projection dropped a retained input"
+        )));
     }
 
     let input_types = program.input_types();

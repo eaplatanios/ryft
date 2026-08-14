@@ -76,7 +76,11 @@ macro_rules! impl_capability_for_primitive {
         impl Rem for $type {
             fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_rem(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'rem' divisor is zero or the result does not fit in {}", stringify!($type)),
+                    message: format!(
+                        "'{}' divisor is zero or the result does not fit in {}",
+                        REM_OPERATION_NAME,
+                        stringify!($type),
+                    ),
                 })
             }
         }
