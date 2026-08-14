@@ -78,8 +78,12 @@ dyn_hash::hash_trait_object!(CustomError);
 
 /// Adapter that lets closure-taking entry points accept both plain and fallible closures. An entry point that expects
 /// a closure producing `T` and reports errors as `E` can instead accept any closure output implementing
-/// `MaybeFallible<T, E>`. Returning `T` directly requires no wrapping, while returning `Result<T, SourceError>`
-/// for any `SourceError` that converts into `E` enables using `?` inside the closure.
+/// `MaybeFallible<T, E>`. Returning `T` directly requires no wrapping, while returning `Result<T, E>`, with `E` being
+/// exactly the entry point's error type, enables using `?` inside the closure: `?` still converts each intermediate
+/// error into `E` through [`From`]. A closure that instead returns a foreign-error [`Result`] wholesale adapts it with
+/// `.map_err(Into::into)`. The fallible implementation is deliberately exact rather than covering every source error
+/// that converts into `E`, because exact unification is what lets a bare `Ok(...)` closure body infer its error type
+/// from the entry point instead of requiring an explicit annotation.
 ///
 /// This dual-mode contract is only sound where the expected closure output `T` has a concrete outer type
 /// constructor at the entry point (e.g., the reverse-mode gradient entry points, whose closures produce a
@@ -90,8 +94,8 @@ dyn_hash::hash_trait_object!(CustomError);
 /// a [`Result`]-returning closure would make both implementations applicable and inference ambiguous, and so those
 /// entry points accept fallible closures only.
 pub trait MaybeFallible<T, E> {
-    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and converting the error type
-    /// of already fallible outputs into `E`.
+    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and returning already fallible
+    /// outputs unchanged.
     fn into_result(self) -> Result<T, E>;
 }
 
@@ -102,9 +106,9 @@ impl<T, E> MaybeFallible<T, E> for T {
     }
 }
 
-impl<T, E, SourceError: Into<E>> MaybeFallible<T, E> for Result<T, SourceError> {
+impl<T, E> MaybeFallible<T, E> for Result<T, E> {
     #[inline]
     fn into_result(self) -> Result<T, E> {
-        self.map_err(Into::into)
+        self
     }
 }

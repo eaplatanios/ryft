@@ -244,10 +244,12 @@ mod tests {
 
         let second_derivative = differentiate_at(Array::scalar(2.0))
             .gradient(|input| {
-                differentiate_at(input).gradient(|inner| {
-                    let stopped = stop_gradient((inner.clone(), vec![inner.clone(), inner]));
-                    stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
-                })
+                differentiate_at(input)
+                    .gradient(|inner| {
+                        let stopped = stop_gradient((inner.clone(), vec![inner.clone(), inner]));
+                        stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
+                    })
+                    .map_err(Into::into)
             })
             .unwrap();
         assert_eq!(second_derivative, Array::scalar(0.0));
@@ -370,7 +372,7 @@ mod tests {
                     BatchAxis::new(0),
                     None,
                 )?;
-                Ok::<_, ProgramError>(mapped.reduce(&[0], ReductionKind::Sum))
+                Ok(mapped.reduce(&[0], ReductionKind::Sum))
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
@@ -396,7 +398,7 @@ mod tests {
         // A stop-gradient barrier applies to every active differentiation level. The first derivative of
         // `x * stop_gradient(x)` is the frozen primal `x`, but an enclosing derivative cannot differentiate it again.
         let second_derivative = differentiate_at(Array::scalar(3.0))
-            .gradient(|x| differentiate_at(x).gradient(|y| y.clone() * y.stop_gradient()))
+            .gradient(|x| differentiate_at(x).gradient(|y| y.clone() * y.stop_gradient()).map_err(Into::into))
             .unwrap();
         assert_eq!(second_derivative, Array::scalar(0.0));
 

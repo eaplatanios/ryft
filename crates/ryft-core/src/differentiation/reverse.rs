@@ -1301,7 +1301,7 @@ pub(crate) fn value_and_gradient_in_context<
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    Output: MaybeFallible<LinearizationTracer<C>, DifferentiationError>,
+    Output: MaybeFallible<LinearizationTracer<C>, ProgramError>,
 >(
     context: &C,
     function: F,
@@ -1309,11 +1309,7 @@ pub(crate) fn value_and_gradient_in_context<
     capture: Capture,
     holomorphic: bool,
 ) -> Result<(C::Value, Input::To<C::Value>), DifferentiationError> {
-    let (output, pullback) = context.vjp(
-        |input, capture| function(input, capture).into_result().map_err(ProgramError::from),
-        primals,
-        capture,
-    )?;
+    let (output, pullback) = context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
     let seed = context.gradient_seed(&output, holomorphic)?;
     let gradient = pullback.apply(seed)?;
     Ok((output, gradient))
@@ -1327,7 +1323,7 @@ pub(crate) fn value_and_gradient_auxiliary_in_context<
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), DifferentiationError>,
+    Output: MaybeFallible<(LinearizationTracer<C>, AuxiliaryOutput::To<LinearizationTracer<C>>), ProgramError>,
     AuxiliaryOutput: Parameterized<
             C::Value,
             To<C::Value> = AuxiliaryOutput,
@@ -1347,11 +1343,8 @@ where
             Family: ParameterizedFamily<C::Value>,
         >,
 {
-    let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) = context.vjp(
-        |input, capture| function(input, capture).into_result().map_err(ProgramError::from),
-        primals,
-        capture,
-    )?;
+    let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) =
+        context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
 
     // Each auxiliary leaf supplies its own cotangent geometry. A reference-bearing cotangent type names runtime
     // extents that only a live value pins, and the leaf is such a value. The cotangent type derivation preserves
@@ -2803,7 +2796,7 @@ mod tests {
                 let e8m0 = x
                     .context()
                     .constant(Array::from_logical_bytes(ArrayType::scalar(DataType::F8E8M0FNU), &[0x7f]).unwrap())?;
-                Ok::<_, ProgramError>((x.clone() * x, (integer, e8m0)))
+                Ok((x.clone() * x, (integer, e8m0)))
             })
             .unwrap();
         assert_eq!(value, Array::scalar(4.0));
@@ -2865,7 +2858,7 @@ mod tests {
             .holomorphic()
             .value_and_gradient(|x| {
                 let aux = x.context().constant(Array::scalar(7i32))?;
-                Ok::<_, ProgramError>((x.clone() * x, aux))
+                Ok((x.clone() * x, aux))
             })
             .unwrap();
         assert_eq!(value, Array::scalar(z * z));
@@ -2917,15 +2910,15 @@ mod tests {
         // Every nesting shape differentiates `f(x) = sin(x²)` at `x = 0.7` through closure-level nesting. Inner
         // transforms run on the nested tracing context their tracers flow in, recovered either implicitly by the
         // free differentiation functions from their tracer inputs or explicitly through `x.context()`. Every closure
-        // is fallible, propagating staging failures outward through `?` (or by returning the inner transform's
-        // `Result` directly) instead of unwrapping.
+        // is fallible, propagating staging failures outward through `?` (or by adapting the inner transform's
+        // `Result` with `.map_err(Into::into)`) instead of unwrapping.
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let x: f64 = 0.7;
 
         // Reverse-over-reverse through builder terminals: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
         let (value, second_derivative) = differentiate_at(Array::scalar(x))
-            .value_and_gradient(|x| differentiate_at(x).gradient(|y| (y.clone() * y).sin()))
+            .value_and_gradient(|x| differentiate_at(x).gradient(|y| (y.clone() * y).sin()).map_err(Into::into))
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(
@@ -2943,7 +2936,10 @@ mod tests {
                 x.clone()
                     .context()
                     .differentiate_at(x)
-                    .gradient(|y| y.clone().context().differentiate_at(y).gradient(|z| (z.clone() * z).sin()))
+                    .gradient(|y| {
+                        y.clone().context().differentiate_at(y).gradient(|z| (z.clone() * z).sin()).map_err(Into::into)
+                    })
+                    .map_err(Into::into)
             })
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);

@@ -1408,9 +1408,8 @@ mod tests {
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_eq!(tangent.to_f64s(), vec![2.0]);
 
-            let (primal, gradient) = differentiate_at(input)
-                .value_and_gradient(|input| Ok::<_, ProgramError>(input.reduce(&[0], kind)))
-                .unwrap();
+            let (primal, gradient) =
+                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind))).unwrap();
             assert_eq!(primal.to_f64s(), vec![1.0]);
             assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
             assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);

@@ -799,8 +799,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// # Parameters
     ///
     ///   - `function`: Scalar-valued function to evaluate and differentiate at the builder's active primal.
-    ///     This closure may return its traced scalar directly or in a [`Result`] whose error converts into
-    ///     [`DifferentiationError`], as specified by [`MaybeFallible`].
+    ///     This closure may return its traced scalar directly or in a [`Result`] whose error type is
+    ///     [`ProgramError`], as specified by [`MaybeFallible`].
     #[inline]
     pub fn value_and_gradient<V, Output, F>(self, function: F) -> Result<(V, Input::To<V>), DifferentiationError>
     where
@@ -814,7 +814,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             >,
         Output: MaybeFallible<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                DifferentiationError,
+                ProgramError,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
@@ -856,7 +856,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             >,
         Output: MaybeFallible<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                DifferentiationError,
+                ProgramError,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
@@ -1116,7 +1116,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// # Parameters
     ///
     ///   - `function`: Function returning the differentiated scalar and auxiliary output. This closure may return its
-    ///     outputs directly or in a [`Result`] whose error converts into [`DifferentiationError`], as specified by
+    ///     outputs directly or in a [`Result`] whose error type is [`ProgramError`], as specified by
     ///     [`MaybeFallible`].
     #[inline]
     pub fn value_and_gradient<V, Output, AuxiliaryOutput, F>(
@@ -1139,7 +1139,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                         LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     >,
                 ),
-                DifferentiationError,
+                ProgramError,
             >,
         AuxiliaryOutput: Parameterized<
                 V,
@@ -1207,7 +1207,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                         LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     >,
                 ),
-                DifferentiationError,
+                ProgramError,
             >,
         AuxiliaryOutput: Parameterized<
                 V,
@@ -1629,7 +1629,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     /// the active primal only. For `y = f(x; c)` with real scalar `y`, this returns `(f(x; c), (∂f/∂x)(x; c)ᵀ · 1)`.
     /// Captures are fixed runtime coefficients: they may change the value and gradient but receive no gradient result.
     /// In [`HolomorphicLinearity`] mode, complex `y` yields `(f(x; c), ∂f/∂x)` under the caller's holomorphy promise.
-    /// The closure supports the [`MaybeFallible`] result contract.
+    /// The closure may return its traced scalar directly or in a [`Result`] whose error type is [`ProgramError`],
+    /// as specified by [`MaybeFallible`].
     ///
     /// # Parameters
     ///
@@ -1654,7 +1655,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             >,
         Output: MaybeFallible<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                DifferentiationError,
+                ProgramError,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
@@ -1703,7 +1704,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             >,
         Output: MaybeFallible<
                 LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
-                DifferentiationError,
+                ProgramError,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
@@ -1962,8 +1963,9 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     /// with respect to the active primal while holding captures fixed. For `(y, a) = f(x; c)` with real scalar `y`,
     /// this returns `((y, a), (∂y/∂x)(x; c)ᵀ · 1)`. Captures affect the computation as fixed runtime coefficients,
     /// auxiliary leaves receive zero cotangent seeds, and neither receives a gradient result. In
-    /// [`HolomorphicLinearity`] mode, complex `y` yields `∂y/∂x` under the caller's holomorphy promise.
-    /// The closure supports the [`MaybeFallible`] result contract.
+    /// [`HolomorphicLinearity`] mode, complex `y` yields `∂y/∂x` under the caller's holomorphy promise. The closure may
+    /// return its outputs directly or in a [`Result`] whose error type is [`ProgramError`], as specified by
+    /// [`MaybeFallible`].
     ///
     /// # Parameters
     ///
@@ -2006,7 +2008,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                         LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     >,
                 ),
-                DifferentiationError,
+                ProgramError,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
@@ -2082,7 +2084,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                         LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     >,
                 ),
-                DifferentiationError,
+                ProgramError,
             >,
         (
             LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
@@ -2777,6 +2779,13 @@ mod tests {
         assert_eq!(value.to_f64s(), vec![4.0]);
         assert_eq!(gradient.to_f64s(), vec![4.0]);
 
+        // A fallible gradient closure needs no error-type annotation: the terminal's `MaybeFallible` bound names
+        // `ProgramError` exactly, so a bare `Ok(...)` body infers its error type from the terminal itself.
+        let (value, gradient) =
+            differentiate_at(primal.clone()).value_and_gradient(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(value.to_f64s(), vec![4.0]);
+        assert_eq!(gradient.to_f64s(), vec![4.0]);
+
         // Fallible and infallible unary VJP closures produce equivalent pullbacks.
         let (expected_value, expected_pullback) =
             differentiate_at(primal.clone()).vjp(|input| Ok(input.clone() * input)).unwrap();
@@ -2856,7 +2865,7 @@ mod tests {
                     BatchAxis::new(0),
                     None,
                 )?;
-                Ok::<_, ProgramError>(mapped.reduce(&[0], ReductionKind::Sum))
+                Ok(mapped.reduce(&[0], ReductionKind::Sum))
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![23.0]);
@@ -2986,7 +2995,7 @@ mod tests {
         let (value, gradient) = differentiate_at(Array::scalar(ComplexNumber::new(2.0f32, 1.0)))
             .with_captures(real_capture.clone())
             .holomorphic()
-            .value_and_gradient(|input, capture| Ok::<_, ProgramError>(input * capture.complex(&capture)?))
+            .value_and_gradient(|input, capture| Ok(input * capture.complex(&capture)?))
             .unwrap();
         assert_eq!(value.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 9.0)]));
         assert_eq!(gradient.elements::<ComplexNumber<f32>>(), Ok(vec![ComplexNumber::new(3.0, 3.0)]));
@@ -3004,7 +3013,7 @@ mod tests {
         // Symmetrically, a complex capture in ordinary (i.e., real-valued) mode must not raise `ComplexParameter`.
         let (value, gradient) = differentiate_at(Array::scalar(2.0f32))
             .with_captures(capture.clone())
-            .value_and_gradient(|input, capture| Ok::<_, ProgramError>(input * capture.real()?))
+            .value_and_gradient(|input, capture| Ok(input * capture.real()?))
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(gradient.to_f64s(), vec![3.0]);
@@ -3107,7 +3116,7 @@ mod tests {
             .with_auxiliary_output()
             .gradient(|input, scale| {
                 let output = input * scale;
-                Ok::<_, ProgramError>((output.clone(), output))
+                Ok((output.clone(), output))
             })
             .unwrap();
         let second: (Array, Array) = differentiate_at(Array::scalar(2.0))
@@ -3116,7 +3125,7 @@ mod tests {
             .with_captures(Array::scalar(3.0))
             .gradient(|input, scale| {
                 let output = input * scale;
-                Ok::<_, ProgramError>((output.clone(), output))
+                Ok((output.clone(), output))
             })
             .unwrap();
 
