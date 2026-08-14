@@ -6,11 +6,11 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
-// TODO(eaplatanios): Break this down into per-submodule imports for `differentiation`.
-use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, LinearCallOperation, ResidualZeroProvider,
-};
+use crate::differentiation::DifferentiationError;
+use crate::differentiation::batching::CotangentBatchingPolicy;
+use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
+use crate::differentiation::linear::{LinearCallOperation, ResidualZeroProvider};
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::operations::Zero;
@@ -24,8 +24,8 @@ use crate::tracing::{DomainTracer, Trace};
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 
-/// Higher-order [`Operation`] pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
-/// [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
+/// Higher-order [`Operation`] pairing a primal program with a user-supplied Jacobian-Vector Product (JVP) program. This
+/// is the direct analogue of JAX's [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
 ///
 /// The two [`Program`](crate::Program)s are supplied as the operation's attached regions (via the region driver passed
 /// to [`Context::bind`]) in the region order `["primal", "jvp"]`, and [`Operation::infer_output_types`] validates the
