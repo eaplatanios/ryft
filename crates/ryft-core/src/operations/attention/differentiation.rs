@@ -5,9 +5,11 @@ use ryft_macros::Parameterized;
 use crate::arrays::ArrayType;
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiableType;
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
-    AttentionConfiguration, AttentionInputs, DotProductAttention, DotProductAttentionBackwardOperation,
+    AttentionConfiguration, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
+    DOT_PRODUCT_ATTENTION_OPERATION_NAME, DotProductAttention, DotProductAttentionBackwardOperation,
+    DotProductAttentionOperation,
 };
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::parameters::Parameter;
@@ -26,6 +28,51 @@ pub struct AttentionResiduals<P: Parameter> {
 
     /// Log-sum-exp statistic consumed by the fused backward boundary.
     statistic: P,
+}
+
+impl_differentiable_operation! {
+    DotProductAttentionOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<DotProductAttentionOperation>,
+    {
+        |_operation, _context, _driver, _inputs| {
+            // The operation is the inference fast path, so there is no differentiation rule: differentiating reports an
+            // error directing users to the [`differentiable_dot_product_attention`] training entry point, which pairs
+            // the activation-producing forward with [`DotProductAttentionBackwardOperation`] through [`custom_vjp`].
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support differentiation; use \
+                     'differentiable_dot_product_attention' for the training path"
+                ),
+            }
+            .into())
+        }
+    },
+    transpose = @nonlinear,
+}
+
+impl_differentiable_operation! {
+    DotProductAttentionBackwardOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<DotProductAttentionBackwardOperation>,
+    {
+        |_operation, _context, _driver, _inputs| {
+            // The backward operation rejects differentiation: second-order derivatives go through an explicit attention
+            // composition instead of the fused backward pass.
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support differentiation; \
+                     differentiate an explicit attention composition for higher-order derivatives"
+                ),
+            }
+            .into())
+        }
+    },
+    transpose = @nonlinear,
 }
 
 /// Stages the fused attention backward boundary over one canonical input structure.

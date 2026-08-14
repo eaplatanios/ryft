@@ -18,6 +18,7 @@ pub mod logical;
 pub mod manipulation;
 pub mod math;
 pub mod memory;
+pub mod quantization;
 pub mod random;
 pub mod sharding;
 pub mod sort;
@@ -48,6 +49,7 @@ pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
+pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 

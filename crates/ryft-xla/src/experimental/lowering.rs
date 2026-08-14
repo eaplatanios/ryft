@@ -14,7 +14,8 @@ use ryft_core::operations::collectives::{
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::operations::math::dot::{lhs_result_axes, rhs_result_axes, scaled_dot_ir_composition};
+use ryft_core::operations::math::dot::{lhs_result_axes, rhs_result_axes};
+use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SortDirection, SortOperation};
 use ryft_core::{

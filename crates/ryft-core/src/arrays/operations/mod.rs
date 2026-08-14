@@ -75,6 +75,7 @@ mod logical;
 mod manipulation;
 mod math;
 mod memory;
+mod quantization;
 mod random;
 mod sharding;
 mod sort;

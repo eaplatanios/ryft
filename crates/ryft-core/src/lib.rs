@@ -106,17 +106,18 @@ pub use operations::manipulation::{
 };
 pub use operations::math::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, Atan2,
-    Atan2Operation, BlockQuantize, CEIL_OPERATION_NAME, COS_OPERATION_NAME, Ceil, CeilOperation, Clamp, Cos,
-    CosOperation, DIV_OPERATION_NAME, DOT_OPERATION_NAME, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation,
-    DotOps, ERF_OPERATION_NAME, EXP_OPERATION_NAME, Erf, ErfOperation, Exp, ExpOperation, FLOOR_OPERATION_NAME, Floor,
+    Atan2Operation, CEIL_OPERATION_NAME, COS_OPERATION_NAME, Ceil, CeilOperation, Clamp, Cos, CosOperation,
+    DIV_OPERATION_NAME, DOT_OPERATION_NAME, Div, DivOperation, Dot, DotDimensionNumbers, DotOperation, DotOps,
+    ERF_OPERATION_NAME, EXP_OPERATION_NAME, Erf, ErfOperation, Exp, ExpOperation, FLOOR_OPERATION_NAME, Floor,
     FloorOperation, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Log, LogOperation, Logistic, LogisticOperation,
     MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, Max, MaxOperation, Min, MinOperation, Mul,
     MulOperation, NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME,
     ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, SCALED_DOT_OPERATION_NAME, SIGN_OPERATION_NAME, SIN_OPERATION_NAME,
-    SQRT_OPERATION_NAME, SUB_OPERATION_NAME, ScaledDot, ScaledDotOperation, Sign, SignOperation, Sin, SinOperation,
-    Sqrt, SqrtOperation, Sub, SubOperation, TANH_OPERATION_NAME, Tanh, TanhOperation,
+    RoundOperation, Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SQRT_OPERATION_NAME,
+    SUB_OPERATION_NAME, Sign, SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation,
+    TANH_OPERATION_NAME, Tanh, TanhOperation,
 };
+pub use operations::quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use operations::sharding::{
     ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
     ShardingConstraintOperation,

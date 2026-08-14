@@ -28,8 +28,7 @@ use crate::operations::math::erf::erf_f64;
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
     Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, ScaledDot, ScaledDotOperation, Sign,
-    Sin, Sqrt, Sub, Tanh, scaled_dot_composition,
+    Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, Sign, Sin, Sqrt, Sub, Tanh,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
@@ -1786,30 +1785,6 @@ impl_array_unary_math!(@real_float Round, round, "cannot round a scalar of data 
 impl_array_binary_arithmetic!(@extremum Max, max, maximum, "maximum");
 impl_array_binary_arithmetic!(@extremum Min, min, minimum, "minimum");
 impl_array_binary_arithmetic!(@real Rem, rem, ElementRem, "remainder");
-
-impl ScaledDot for Array {
-    fn scaled_dot(
-        &self,
-        rhs: &Self,
-        lhs_scale: Option<&Self>,
-        rhs_scale: Option<&Self>,
-        dimensions: Option<&DotDimensionNumbers>,
-        preferred_element_type: Option<DataType>,
-    ) -> Result<Self, ProgramError> {
-        let dimensions = dimensions
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| ScaledDotOperation::default_dimensions(self.r#type().rank()))?;
-        scaled_dot_composition(
-            self,
-            rhs,
-            lhs_scale,
-            rhs_scale,
-            &dimensions,
-            preferred_element_type.unwrap_or(DataType::BF16),
-        )
-    }
-}
 
 impl Dot for Array {
     /// Computes an accumulation-typed dot by upcasting both operands to `accumulation_type` and delegating to the

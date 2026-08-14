@@ -504,3 +504,194 @@ where
         <V as ValueProjection<ArrayType>>::into_projected(expanded_scale)?.convert_element_type(DataType::BF16)?;
     elements.mul(&expanded_scale)
 }
+
+#[cfg(test)]
+mod tests {
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayBatch, ArrayType, DataType, Dimension, Shape};
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
+    use crate::contexts::EagerContext;
+    use crate::operations::math::dot::DotDimensionNumbers;
+    use crate::programs::{Operation, TypeError};
+
+    use super::*;
+
+    #[test]
+    fn test_scaled_dot_jax_contract() {
+        // This fixture uses JAX's rank-2 default convention: the left trailing axis contracts with the right leading
+        // axis. The two sides infer independent block ratios of two from different scale-axis positions.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
+            (1..=12).map(|value| value as f64).collect(),
+        );
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            vec![1.0, 2.0, 0.5, 1.0],
+        );
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+            vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+        );
+        let product = lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)).unwrap();
+        assert_eq!(
+            product.r#type().as_ref(),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+        );
+        assert_eq!(product.to_f64s(), vec![253.0, 284.0, 315.0, 272.5, 308.0, 343.5]);
+
+        // Each scale is independently optional. Missing scales are the multiplicative identity, and omitting both
+        // therefore reduces to a `bf16`-intermediate generalized dot with an `f32` result.
+        assert_eq!(
+            lhs.scaled_dot(&rhs, None, None, None, Some(DataType::F32)).unwrap().to_f64s(),
+            vec![70.0, 80.0, 90.0, 158.0, 184.0, 210.0],
+        );
+        assert_eq!(
+            lhs.scaled_dot(&rhs, Some(&lhs_scale), None, None, Some(DataType::F32)).unwrap().to_f64s(),
+            vec![131.0, 148.0, 165.0, 143.5, 164.0, 184.5],
+        );
+
+        let dimensions = ScaledDotOperation::default_dimensions(2).unwrap();
+        let operation = ScaledDotOperation::new(dimensions.clone(), DataType::F32, true, true);
+        assert_eq!(operation.dimensions(), &dimensions);
+        assert_eq!(operation.preferred_element_type(), DataType::F32);
+        assert!(operation.has_lhs_scale());
+        assert!(operation.has_rhs_scale());
+        assert_eq!(
+            operation.to_string(),
+            indoc! {"
+                scaled_dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    preferred_element_type=f32,
+                    lhs_scale=true,
+                    rhs_scale=true,
+                ]
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_scaled_dot_inference() {
+        let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
+        let operation = ScaledDotOperation::new(dimensions, DataType::BF16, true, true);
+        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 3.into(), 4.into(), 6.into()]));
+        let rhs = ArrayType::new(DataType::F8E5M2, Shape::new(vec![2.into(), 4.into(), 6.into(), 5.into()]));
+        let lhs_scale = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 3.into(), 2.into(), 2.into()]));
+        let rhs_scale = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 2.into(), 2.into(), 5.into()]));
+        assert_eq!(
+            operation.infer_output_types(&[lhs.clone(), rhs.clone(), lhs_scale.clone(), rhs_scale.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::BF16, Shape::new(vec![2.into(), 3.into(), 5.into()]))]),
+        );
+        assert_eq!(
+            ScaledDotOperation::new(operation.dimensions().clone(), DataType::F64, true, true)
+                .infer_output_types(&[lhs.clone(), rhs.clone(), lhs_scale.clone(), rhs_scale.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 5.into()]))]),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[
+                    lhs,
+                    rhs,
+                    lhs_scale.with_shape(Shape::new(vec![2.into(), 3.into(), 4.into(), 2.into()])),
+                    ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 2.into(), 2.into(), 5.into()]),),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "'scaled_dot' left contracting axis 2 to scale ratio must be at least 2 but got 1".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_scaled_dot_composition_supports_multiple_contracting_dimensions() {
+        // Both contracting axes carry independent block ratios. Expanding all scale axes in one broadcast preserves
+        // their original axis positions before the final reshape; every dequantized element is one in this fixture.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into(), 6.into()])),
+            vec![1.0; 48],
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 4.into(), 6.into(), 3.into()])),
+            vec![1.0; 72],
+        );
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 2.into()])),
+            vec![1.0; 8],
+        );
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 3.into()])),
+            vec![1.0; 12],
+        );
+        let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
+        let output = lhs
+            .scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
+            .unwrap();
+        assert_eq!(output.r#type().shape(), &Shape::new(vec![1.into(), 2.into(), 3.into()]));
+        assert_eq!(output.to_f64s(), vec![24.0; 6]);
+
+        // The ergonomic wrapper follows JAX's `[B, M, K] x [B, N, K]` convention and defaults to an `f32` result.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 4.into()])),
+            vec![1.0; 4],
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into()])),
+            vec![1.0; 8],
+        );
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 2.into()])),
+            vec![1.0; 2],
+        );
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into()])),
+            vec![1.0; 4],
+        );
+        let output = lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, None).unwrap();
+        assert_eq!(output.r#type().data_type(), DataType::F32);
+        assert_eq!(output.r#type().shape(), &Shape::new(vec![1.into(), 1.into(), 2.into()]));
+        assert_eq!(output.to_f64s(), vec![4.0; 2]);
+
+        // Ryft honors the wrapper's documented independent block-ratio semantics even though pinned JAX's wrapper
+        // currently rejects unequal scale contracting dimensions before reaching `lax.scaled_dot`.
+        let independently_scaled_rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 1.into()])),
+            vec![1.0; 2],
+        );
+        let output = lhs.scaled_matmul(&rhs, &lhs_scale, &independently_scaled_rhs, None).unwrap();
+        assert_eq!(output.to_f64s(), vec![4.0; 2]);
+    }
+
+    #[test]
+    fn test_scaled_dot_batching() {
+        // Batching moves each mapped axis to the front and lifts it into the generalized-dot batch dimensions. Scale
+        // operands follow the same rule, so each example retains its own block scales.
+        let elements = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 4.into()]));
+        let scales = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
+        let lhs = ArrayBatch::new(Array::from_f64s(elements.clone(), vec![1.0; 8]), BatchAxis::new(0)).unwrap();
+        let rhs = ArrayBatch::new(Array::from_f64s(elements, vec![1.0; 8]), BatchAxis::new(0)).unwrap();
+        let lhs_scale = ArrayBatch::new(Array::from_f64s(scales.clone(), vec![1.0; 4]), BatchAxis::new(0)).unwrap();
+        let rhs_scale = ArrayBatch::new(Array::from_f64s(scales, vec![1.0; 4]), BatchAxis::new(0)).unwrap();
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, true);
+
+        let outputs = operation
+            .batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &crate::EmptyRegionDriver,
+                &[lhs, rhs, lhs_scale, rhs_scale],
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().to_f64s(), vec![4.0, 4.0]);
+    }
+}
