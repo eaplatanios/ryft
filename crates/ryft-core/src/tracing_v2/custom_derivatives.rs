@@ -6,6 +6,7 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
+// TODO(eaplatanios): Break this down into per-submodule imports for `differentiation`.
 use crate::differentiation::{
     CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, LinearCallOperation, ResidualZeroProvider,
@@ -19,7 +20,6 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
-use crate::tracing_v2::operands::{check_non_differentiated_tangents_are_zero, split_non_differentiated};
 
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
@@ -101,7 +101,16 @@ impl<T: DifferentiableType> CustomJvpOperation<T> {
     /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_non_differentiated(self.name(), self.non_differentiated_count, values)
+        let input_count = values.len();
+        if self.non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "{} non-differentiated operand count {} exceeds input count {}",
+                self.name(),
+                self.non_differentiated_count,
+                input_count,
+            )));
+        }
+        Ok(values.split_at(self.non_differentiated_count))
     }
 }
 
@@ -113,6 +122,15 @@ impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
 }
 
 impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
+    // The operation carries two regions with one shared primal boundary. Writing the leading non-differentiated
+    // operands as `p`, the differentiated operands as `x`, and the primal outputs as `y`, their contracts are
+    //
+    //   primal: (p, x)    -> y
+    //   jvp:    (p, x, ẋ) -> (y, ẏ).
+    //
+    // Inference declares those region inputs independently of the concrete programs and then checks that the supplied
+    // interfaces realize the declaration exactly. Keeping `p` explicit but omitting `ṗ` distinguishes an operand
+    // that parameterizes the rule from an ordinary input whose tangent merely happens to be zero.
     type Type = T;
 
     #[inline]
@@ -193,33 +211,22 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJv
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // An ordinary call computes only `f(p, x) = y`. Replaying the JVP region here would also compute `ẏ` and
+        // would charge every non-differentiated execution for derivative work, so interpretation delegates solely to
+        // the primal region at slot 0.
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a
-/// [`CustomJvpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
-/// residualizes unchanged.
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type> where
-    C::Operation: From<CustomJvpOperation<C::Type>>
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomJvpOperation<C::Type>
+where
+    C::Operation: From<CustomJvpOperation<C::Type>>,
 {
+    // The default partial-evaluation rule is the desired one: interpret the primal region when every operand is known;
+    // otherwise residualize the complete custom-JVP call so its attached derivative rule remains available to later
+    // differentiation.
 }
 
-/// Batching rule for [`CustomJvpOperation`]. The primal region receives the wrapper operands' existing batch axes,
-/// while the JVP region receives those axes followed by the differentiated operands' axes again, once per tangent. For
-/// each output, the rule reconciles the ordinary primal, JVP-primal, and JVP-tangent axes, aligns the three
-/// corresponding values to that axis, and records the reconciled axis on the wrapper result. This preserves naturally
-/// replicated outputs and nonzero mapped axes while keeping the custom derivative attached for later differentiation.
-///
-/// The batching policy owns the boundary shape of its structurally batched programs.
-/// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program) adapts each batched
-/// region back to the plain custom-JVP region boundary, and any
-/// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
-/// first-class mapped extent) become additional leading
-/// [non-differentiated](CustomJvpOperation::non_differentiated_count) operands of the batched call, which is precisely
-/// the operand role those bookkeeping values play: every region consumes them and none of them carries a
-/// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for CustomJvpOperation<T>
 where
@@ -231,6 +238,21 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // Batch the two region contracts without opening the custom derivative:
+        //
+        //   primal: (p, x)        -> y
+        //   jvp:    (p, x, ẋ) -> (y_jvp, ẏ).
+        //
+        // Each `ẋ` follows the batch axis of its corresponding `x`, while `p` has no tangent counterpart. The
+        // ordinary primal, JVP-primal, and JVP-tangent computations may independently choose replicated or mapped
+        // representations for the same logical output. Reconcile those three axes to one wrapper axis, align both
+        // batched regions to it, and retain the custom-JVP carrier so differentiation performed after batching still
+        // uses the user rule.
+        //
+        // A batching policy may add runtime boundary operands such as a first-class mapped extent. Those values must
+        // reach both regions but have no derivative, so prepend them to `p` and increase `non_differentiated_count`.
+        // Region adaptation owns any corresponding boundary rewrites; this rule owns only the flat operand split and
+        // the agreement of output axes.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (_, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let primal_region = driver.region(0)?;
@@ -307,18 +329,6 @@ where
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`CustomJvpOperation`]: replays the user-supplied JVP program through the
-/// active context, staging its operations in the shared builder.
-///
-/// The JVP program is already JVP-shaped over the primal operation family — it maps `(inputs..., input_tangents...)`
-/// to `(outputs..., output_tangents...)` — so the rule simply replays it through
-/// [`Program::interpret_in_context`](crate::Program::interpret_in_context)
-/// over the dual inputs: the primal tracers followed by the tangent tracers feed the JVP program, and its outputs
-/// split into the primal outputs and the staged output tangents. Because the replayed program is straight-line
-/// primal-enum operations referencing those tracers directly, it introduces no symbolic capture and the enclosing
-/// partial-evaluation split discovers the residual operand edges structurally — so the rule is a leaf needing no
-/// nested differentiation or linearization request, and reverse mode transposes the replayed bilinear operations
-/// exactly as it does for any other straight-line tangent program.
 impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Type>
 where
     C::Operation: ResidualZeroProvider<C::Type>,
@@ -329,14 +339,35 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // The user's JVP computation is region 1 (region 0 is the primal), mapping
-        // `(inputs..., differentiated_input_tangents...)` to `(outputs..., output_tangents...)`.
+        // Apply the user-supplied pushforward directly. For `f(p, x) = y`, region 1 implements
+        //
+        //   j(p, x, ẋ) = (f(p, x), D_x f(p, x)[ẋ]) = (y, ẏ).
+        //
+        // Feed every primal value, followed only by the differentiated inputs' tangents; a live tangent for `p` would
+        // violate the declared non-differentiated boundary and is rejected below. Replay stages the rule's ordinary
+        // primitive operations directly in the active context, so it introduces no symbolic capture. Consequently,
+        // reverse mode can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
+        // no nested differentiation request or special reverse rule is needed here.
         let jvp_region = driver.region(1)?;
         let output_count = jvp_region.output_types().len() / 2;
         let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
         check_count!("input", jvp_region.input_types(), inputs.len() + differentiated_inputs.len(), ProgramError);
 
-        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
+        if let Some(input) = non_differentiated_inputs
+            .iter()
+            .find(|input| !input.tangent().is_zero() && !input.tangent().r#type().is_zero_space())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
+                     non-differentiated operands, because its rule has no tangent slot for them",
+                    self.name(),
+                    input.tangent().r#type(),
+                    non_differentiated_inputs.len(),
+                ),
+            }
+            .into());
+        }
 
         // The JVP region consumes `(primals..., differentiated_input_tangents...)`, so feed every dual primal followed
         // by the differentiated duals' tangents.
@@ -364,9 +395,10 @@ where
     }
 }
 
-// Rejecting transposition is correct: the `jvp` rule above replays the user JVP program as plain primitive operations,
-// so a linearized tangent program never contains this operation and its transpose entry point is unreachable through
-// reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
+// The raw carrier is intentionally non-transposable. Differentiation first replaces `f(p, x)` with the ordinary
+// primitive program computing the linear map `ẋ -> D_x f(p, x)[ẋ]`; reverse mode transposes that replayed
+// program, not `CustomJvpOperation`. Therefore only an invalid direct transpose of an un-linearized carrier can reach
+// this rejection path.
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 /// Function with a user-supplied JVP rule, built by [`custom_jvp`]. It stores the primal and JVP closures together
@@ -460,9 +492,12 @@ where
 /// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
 /// inputs and outputs can be single tracers, tuples, or any other parameterized structure. `primal` maps the input
 /// tree to the output tree, and `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a
-/// JAX `defjvp` rule. There is no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static,
-/// non-differentiated configuration is simply captured by the closures (all of them can see it), exactly like JAX
-/// threads non-differentiated arguments through to the rule functions.
+/// JAX `defjvp` rule. Ryft does not expose JAX's `nondiff_argnums` calling convention at this level. Static
+/// non-differentiated configuration should be captured by both closures. A dynamic typed value should remain an
+/// explicit input; its tangent is consequently present in `input_tangents`, and a rule that treats the value as a
+/// parameter ignores that tangent when constructing `output_tangents`. Transform-injected runtime metadata uses the
+/// lower-level [`CustomJvpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand
+/// while contributing no tangent slot.
 ///
 /// # Tracing semantics
 ///
@@ -566,7 +601,16 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
     /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_non_differentiated(self.name(), self.non_differentiated_count, values)
+        let input_count = values.len();
+        if self.non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "{} non-differentiated operand count {} exceeds input count {}",
+                self.name(),
+                self.non_differentiated_count,
+                input_count,
+            )));
+        }
+        Ok(values.split_at(self.non_differentiated_count))
     }
 
     /// Validates the custom-VJP contract over the three attached region interfaces
@@ -631,6 +675,18 @@ impl<T: DifferentiableType> Display for CustomVjpOperation<T> {
 }
 
 impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
+    // The operation carries three regions. Writing the leading non-differentiated operands as `p`, differentiated
+    // operands as `x`, primal outputs as `y`, forward residuals as `r`, and cotangents using an overbar, their contracts
+    // are
+    //
+    //   primal:   (p, x)        -> y
+    //   forward:  (p, x)        -> (y, r)
+    //   backward: (p, r, ȳ)  -> x̄.
+    //
+    // Inference renames the independently traced primal and forward identities into the call boundary, derives the
+    // backward signature from their resulting `y` and `r` types, and validates that no cotangent is produced for `p`.
+    // Keeping the split explicit distinguishes a parameter operand from a differentiable operand whose cotangent merely
+    // evaluates to zero.
     type Type = T;
 
     #[inline]
@@ -715,34 +771,21 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomVj
         driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
+        // An ordinary call computes only `f(p, x) = y`. The forward region additionally materializes residuals `r`
+        // solely for reverse mode, so interpretation replays the lean primal region at slot 0.
         driver.interpret_region(context, 0, inputs.to_vec())
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a
-/// [`CustomVjpOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
-/// residualizes unchanged.
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type> where
-    C::Operation: From<CustomVjpOperation<C::Type>>
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for CustomVjpOperation<C::Type>
+where
+    C::Operation: From<CustomVjpOperation<C::Type>>,
 {
+    // The default partial-evaluation rule is the desired one: interpret the primal region when every operand is known;
+    // otherwise residualize the complete custom-VJP call so its forward and backward regions remain attached for a
+    // later reverse-mode transformation.
 }
 
-/// Batching rule for [`CustomVjpOperation`]. The primal and forward regions receive the wrapper operands' existing
-/// axes; corresponding primal outputs are reconciled while forward residuals keep their natural axes. The backward
-/// region then receives the non-differentiated operands' axes, those residual axes, and the reconciled
-/// output-cotangent axes, and its result cotangents are aligned back to the differentiated operands' axes. A cotangent
-/// that is mapped for a replicated primal input is summed across the mapped axis, as required by the transpose of
-/// replication.
-///
-/// The batching policy owns the boundary shape of its structurally batched programs.
-/// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program) adapts each batched
-/// region back to the plain custom-VJP region boundary, and any
-/// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
-/// first-class mapped extent) become additional leading
-/// [non-differentiated](CustomVjpOperation::non_differentiated_count) operands of the batched call, which is precisely
-/// the operand role those bookkeeping values play: every region consumes them and none of them carries a
-/// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
     for CustomVjpOperation<T>
 where
@@ -754,6 +797,21 @@ where
         driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        // Batch all three region contracts while retaining the opaque custom-VJP carrier:
+        //
+        //   primal:   (p, x)       -> y
+        //   forward:  (p, x)       -> (y_fwd, r)
+        //   backward: (p, r, ȳ)    -> x̄.
+        //
+        // Reconcile each `y` with its corresponding `y_fwd` so the wrapper exposes one physical output axis, but keep
+        // every residual's naturally produced axis because residuals are internal edges between the forward and
+        // backward rules. Batch the backward region with `(p, r, ȳ)` on those exact axes and align each `x̄`
+        // with its corresponding differentiated input `x`. When a replicated `x` receives a mapped cotangent, the
+        // batching policy sums that mapped axis, which is the transpose of broadcasting `x` across the batch.
+        //
+        // A batching policy may add runtime boundary operands such as a first-class mapped extent. Those values must
+        // reach all three regions but have no cotangent, so prepend them to `p` and increase
+        // `non_differentiated_count` after the regions have been adapted to their new boundaries.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let (non_differentiated_axes, differentiated_axes) = self.split_inputs(input_axes.as_slice())?;
         let differentiated_axes = differentiated_axes.to_vec();
@@ -860,22 +918,6 @@ where
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`CustomVjpOperation`]: replays the user-supplied forward program through
-/// the active context and stages one transpose-only [`LinearCallOperation`] carrier for the output tangents.
-///
-/// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
-/// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
-/// the same structure the capture-based reverse rule builds: the forward program (already an ordinary primal-enum
-/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
-/// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over
-/// the dual primals, recovering the primal outputs and the residuals; then one [`LinearCallOperation`] is staged over
-/// `[non_differentiated..., residuals..., differentiated_input_tangents...]` with the leading non-differentiated
-/// operands and the residuals as ordinary linear-call *residual operands* (not capture factors). That carrier
-/// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it fails
-/// with the canonical reverse-only error, while [`LinearCallOperation`]'s transpose rule replays the user's `backward`
-/// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
-/// primal-enum operation, the rule introduces no symbolic capture and needs no nested differentiation or linearization
-/// request.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
 where
     C::Type: DifferentiableType,
@@ -887,6 +929,19 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // A custom VJP specifies the transpose `ȳ -> x̄`, not the pushforward `ẋ -> ẏ`. Replay
+        //
+        //   forward(p, x) = (y, r)
+        //
+        // to recover the primal outputs and residuals, then stage an opaque linear call representing the unknown map
+        //
+        //   L_(p,r): ẋ -> ẏ.
+        //
+        // `LinearCallOperation` knows only how to transpose that map: its transpose replays
+        // `backward(p, r, ȳ) = x̄`. An eager forward-mode use attempts to execute `L_(p,r)` and is therefore
+        // rejected, while reverse mode transposes it without execution. Passing `p` and `r` as the carrier's leading
+        // residual operands keeps the path capture-free and exposes every dependency as an ordinary SSA edge.
+        //
         // The attached regions are `["primal", "forward", "backward"]`; the primal interface provides the boundary
         // types.
         let primal_region = driver.region(0)?;
@@ -909,7 +964,21 @@ where
         let primal_outputs = forward_outputs;
         let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
 
-        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
+        if let Some(input) = non_differentiated_inputs
+            .iter()
+            .find(|input| !input.tangent().is_zero() && !input.tangent().r#type().is_zero_space())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
+                     non-differentiated operands, because its rule has no tangent slot for them",
+                    self.name(),
+                    input.tangent().r#type(),
+                    non_differentiated_inputs.len(),
+                ),
+            }
+            .into());
+        }
 
         let input_tangent_types =
             differentiated_inputs.iter().map(|input| input.primal().r#type().tangent()).collect::<Vec<_>>();
@@ -966,9 +1035,10 @@ where
     }
 }
 
-// Rejecting transposition is correct: the `jvp` rule above replaces this operation with a transpose-only
-// `LinearCallOperation` carrier, so a linearized tangent program never contains this operation and its transpose entry
-// point is unreachable through reverse mode. Only a direct transpose of a raw, un-linearized program can reach it.
+// The raw carrier is intentionally non-transposable. Differentiation first replaces `f(p, x)` with the opaque linear
+// map `L_(p,r): ẋ -> ẏ`; reverse mode transposes that `LinearCallOperation`, whose rule evaluates
+// `backward(p, r, ȳ) = x̄`. Therefore only an invalid direct transpose of an un-linearized custom-VJP carrier
+// can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
 /// Function with user-supplied forward/backward (VJP) rules, built by [`custom_vjp`]. It stores the primal, forward,
@@ -1087,10 +1157,12 @@ where
 /// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
 /// inputs, outputs, and residuals can be single tracers, tuples, or any other parameterized structure. `primal` maps
 /// the input tree to the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural
-/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. There is
-/// no analogue of JAX's `nondiff_argnums` because closure capture subsumes it: static, non-differentiated
-/// configuration is simply captured by the closures (all of them can see it), exactly like JAX threads
-/// non-differentiated arguments through to the rule functions.
+/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. Ryft does
+/// not expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration should
+/// be captured by all three closures. A dynamic typed value should remain an explicit input; preserve it as a residual
+/// when `backward` needs it and return a zero cotangent for it. Transform-injected runtime metadata uses the lower-level
+/// [`CustomVjpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand while
+/// contributing no cotangent output.
 ///
 /// # Tracing semantics
 ///

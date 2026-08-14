@@ -63,7 +63,6 @@ use crate::programs::{
     RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
-use crate::tracing_v2::operands::{check_non_differentiated_tangents_are_zero, split_non_differentiated};
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
@@ -145,7 +144,16 @@ impl<T: Type> RematerializeOperation<T> {
     /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        split_non_differentiated(self.name(), self.non_differentiated_count, values)
+        let input_count = values.len();
+        if self.non_differentiated_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "{} non-differentiated operand count {} exceeds input count {}",
+                self.name(),
+                self.non_differentiated_count,
+                input_count,
+            )));
+        }
+        Ok(values.split_at(self.non_differentiated_count))
     }
 
     /// Validates the rematerialization contract over the four attached region interfaces
@@ -396,7 +404,21 @@ where
         let primal_outputs = forward_outputs;
         let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
 
-        check_non_differentiated_tangents_are_zero(self.name(), non_differentiated_inputs)?;
+        if let Some(input) = non_differentiated_inputs
+            .iter()
+            .find(|input| !input.tangent().is_zero() && !input.tangent().r#type().is_zero_space())
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
+                     non-differentiated operands, because its rule has no tangent slot for them",
+                    self.name(),
+                    input.tangent().r#type(),
+                    non_differentiated_inputs.len(),
+                ),
+            }
+            .into());
+        }
 
         // Replay the tangent region on `(non_differentiated..., forward_tail..., differentiated_input_tangents...)`,
         // yielding one output tangent per primal output.
