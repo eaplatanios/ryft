@@ -145,7 +145,7 @@ impl<T: Type> WhileOperation<T> {
     pub fn with_iteration_bound(mut self, bound: impl Into<Option<usize>>) -> Result<Self, ProgramError> {
         let bound = bound.into();
         if bound == Some(0) {
-            return Err(TypeError::invalid("while iteration bound must be at least 1".to_string()).into());
+            return Err(TypeError::invalid(format!("{WHILE_OPERATION_NAME} iteration bound must be at least 1")).into());
         }
         self.iteration_bound = bound;
         Ok(self)
@@ -209,7 +209,7 @@ impl WhileTypeSemantics for ArrayType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         if !condition_output.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'while' condition output type must be a Boolean array, but got {condition_output}"
+                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
             )));
         }
         let predicate_shape = condition_output.shape();
@@ -219,7 +219,7 @@ impl WhileTypeSemantics for ArrayType {
                 && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
             if !is_prefix {
                 return Err(TypeError::invalid(format!(
-                    "'while' condition predicate shape must be a prefix of every state shape, but predicate \
+                    "'{WHILE_OPERATION_NAME}' condition predicate shape must be a prefix of every state shape, but predicate \
                          {condition_output} is not a prefix of state {state_type}",
                 )));
             }
@@ -236,12 +236,12 @@ impl WhileTypeSemantics for ArrayIrType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         let Self::Array(condition_output) = condition_output else {
             return Err(TypeError::invalid(format!(
-                "'while' condition output type must be a Boolean array, but got {condition_output}"
+                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
             )));
         };
         if !condition_output.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'while' condition output type must be a Boolean array, but got {condition_output}"
+                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
             )));
         }
         let predicate_shape = condition_output.shape();
@@ -260,7 +260,7 @@ impl WhileTypeSemantics for ArrayIrType {
                 && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
             if !is_prefix {
                 return Err(TypeError::invalid(format!(
-                    "'while' condition predicate shape must be a prefix of every array state shape, but predicate \
+                    "'{WHILE_OPERATION_NAME}' condition predicate shape must be a prefix of every array state shape, but predicate \
                      {condition_output} is not a prefix of state {state_type}",
                 )));
             }
@@ -287,23 +287,22 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     let condition_interface = &region_interfaces[0];
     let body_interface = &region_interfaces[1];
     let state_types = body_interface.input_types();
-    check_types!(@same, "while condition/body input", [state_types, condition_interface.input_types()]);
+    check_types!(@same, format!("{WHILE_OPERATION_NAME} condition/body input"), [state_types, condition_interface.input_types()]);
     let condition_output_types = condition_interface.output_types();
     if condition_output_types.len() != 1 {
         return Err(TypeError::invalid(format!(
-            "while condition must return exactly one predicate leaf but returned {}",
+            "{WHILE_OPERATION_NAME} condition must return exactly one predicate leaf but returned {}",
             condition_output_types.len()
         )));
     }
     T::validate_while_condition_output(&condition_output_types[0], state_types)?;
-    check_types!(@same, "while body output", [state_types, body_interface.output_types()]);
+    check_types!(@same, format!("{WHILE_OPERATION_NAME} body output"), [state_types, body_interface.output_types()]);
     if T::is_batched_predicate(&condition_output_types[0])
         && (!condition_interface.effects().is_pure() || !body_interface.effects().is_pure())
     {
         return Err(TypeError::invalid(
-            "'while' loop with a batched predicate must be pure because observable effects cannot be \
-                      masked for finished batch items"
-                .to_string(),
+            format!("'{WHILE_OPERATION_NAME}' loop with a batched predicate must be pure because observable effects cannot be \
+                      masked for finished batch items"),
         ));
     }
     Ok((condition_interface, body_interface))
@@ -342,7 +341,7 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
         let (_, body_interface) = validated_while_interfaces(region_interfaces)?;
         let state_types = body_interface.input_types();
         check_count!("input", input_types, state_types.len(), TypeError);
-        check_types!(@same, "while input", [state_types, input_types]);
+        check_types!(@same, format!("{WHILE_OPERATION_NAME} input"), [state_types, input_types]);
         Ok(state_types.to_vec())
     }
 
@@ -806,7 +805,7 @@ where
     let known_state_indices = (0..state_count).filter(|&index| state_known[index]).collect::<Vec<_>>();
     if known_input_indices != known_state_indices || condition_known_input_indices != known_state_indices {
         return Err(ProgramError::MalformedProgram(format!(
-            "while body partition reported known input indices {known_input_indices:?} and its condition partition \
+            "{WHILE_OPERATION_NAME} body partition reported known input indices {known_input_indices:?} and its condition partition \
              reported {condition_known_input_indices:?} but the converged known state expects {known_state_indices:?}",
         )));
     }
@@ -826,12 +825,11 @@ where
         .map(|&index| match &partition_outputs[index] {
             PartialEvaluationOutput::Known(output) => known_program_outputs.get(*output).copied().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "while body partition output {index} references missing known-program output {output}",
+                    "{WHILE_OPERATION_NAME} body partition output {index} references missing known-program output {output}",
                 ))
             }),
             PartialEvaluationOutput::Unknown(_) => Err(ProgramError::MalformedProgram(
-                "while known-ness fixed point converged with an unknown next value for a known state element"
-                    .to_string(),
+                format!("{WHILE_OPERATION_NAME} known-ness fixed point converged with an unknown next value for a known state element"),
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -852,7 +850,7 @@ where
         known_condition_builder.splice_program(&condition_known_program, known_condition_inputs.as_slice())?;
     let predicate_atom = known_condition_outputs.get(predicate_output).copied().ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
-            "while condition partition references missing known-program output {predicate_output}",
+            "{WHILE_OPERATION_NAME} condition partition references missing known-program output {predicate_output}",
         ))
     })?;
     let known_condition = known_condition_builder.build::<Vec<V>, Vec<V>>(
@@ -884,7 +882,7 @@ where
         .map(|(index, residual_output)| match state_known[index] {
             true => known_outputs.next().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "while known loop is missing the final value of known state element {index}",
+                    "{WHILE_OPERATION_NAME} known loop is missing the final value of known state element {index}",
                 ))
             }),
             false => Ok(residual_output),
@@ -982,7 +980,7 @@ where
         let Some(mut batched_body) = batched_body else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "while loop batching failed to stabilize the loop state batch axes within {state_count} \
+                    "{WHILE_OPERATION_NAME} loop batching failed to stabilize the loop state batch axes within {state_count} \
                      widening passes",
                 ),
             });
@@ -1162,7 +1160,7 @@ where
         let Some(mut batched_body) = batched_body else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "while loop batching failed to stabilize the loop state batch axes within {state_count} \
+                    "{WHILE_OPERATION_NAME} loop batching failed to stabilize the loop state batch axes within {state_count} \
                      widening passes",
                 ),
             });
@@ -1222,7 +1220,7 @@ where
         // extent as loop state but returns only its predicate, so project the bookkeeping output from this boundary.
         if batched_condition.output_count() < 2 {
             return Err(ProgramError::MalformedProgram(
-                "a structurally batched while condition must return its threaded extent and predicate".to_string(),
+                format!("a structurally batched {WHILE_OPERATION_NAME} condition must return its threaded extent and predicate"),
             )
             .into());
         }
@@ -1722,7 +1720,7 @@ where
                 let (storage_input, storage_type) = storage_inputs.next().unwrap();
                 if storage_input.r#type().as_ref() != storage_type {
                     return Err(TypeError::invalid(format!(
-                        "bounded while residual stack item has type {} but expected {}",
+                        "bounded {WHILE_OPERATION_NAME} residual stack item has type {} but expected {}",
                         storage_input.r#type().as_ref(),
                         storage_type,
                     ))
@@ -2139,7 +2137,7 @@ where
         let storage_type = storage_type.array_type()?;
         if storage_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
-                "jvp of a bounded while loop requires statically shaped residual storage but got {storage_type}",
+                "jvp of a bounded {WHILE_OPERATION_NAME} loop requires statically shaped residual storage but got {storage_type}",
             ))
             .into());
         }
@@ -2166,12 +2164,12 @@ where
             let original_input_count = primal_body.input_ids().len();
             let mut extra_inputs = inputs[original_input_count..].iter();
             let counter_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram("bounded while body adapter is missing the counter input".to_string())
+                ProgramError::MalformedProgram(format!("bounded {WHILE_OPERATION_NAME} body adapter is missing the counter input"))
             })?;
             let stack_inputs = extra_inputs.by_ref().take(stack_types.len()).cloned().collect::<Vec<_>>();
             check_count!("input", stack_inputs, stack_types.len(), ProgramError);
             let mask_input = extra_inputs.next().cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram("bounded while body adapter is missing the mask input".to_string())
+                ProgramError::MalformedProgram(format!("bounded {WHILE_OPERATION_NAME} body adapter is missing the mask input"))
             })?;
             let mut body_outputs =
                 primal_body.interpret_in_context(&context, inputs[..original_input_count].to_vec())?;
@@ -2387,10 +2385,9 @@ where
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
-                      while loops is not supported; eager differentiation executes concrete duals, and loops built \
-                      with `with_iteration_bound` stage a transposable masked scan)"
-                .to_string(),
+            message: format!("{WHILE_OPERATION_NAME} does not support transposition (reverse-mode differentiation through staged unbounded \
+                      {WHILE_OPERATION_NAME} loops is not supported; eager differentiation executes concrete duals, and loops built \
+                      with `with_iteration_bound` stage a transposable masked scan)"),
         }
         .into())
     }

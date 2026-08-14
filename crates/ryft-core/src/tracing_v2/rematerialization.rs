@@ -64,6 +64,9 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
+/// Canonical operation name for [`RematerializeOperation`].
+pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
+
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
 /// [`RematerializeOperation`] has the same primal/forward/backward structure as
@@ -171,37 +174,44 @@ impl<T: Type> RematerializeOperation<T> {
         let input_types = primal_interface.input_types();
         let output_types = primal_interface.output_types();
         let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
-        check_types!(@same, "rematerialize forward input", [input_types, forward_interface.input_types()]);
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} forward input"), [
+            input_types,
+            forward_interface.input_types(),
+        ]);
         let forward_output_types = forward_interface.output_types();
         if forward_output_types.len() < output_types.len() {
             return Err(TypeError::invalid(format!(
-                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                "{} forward must produce at least the {} primal output(s) but produced {} value(s)",
+                REMATERIALIZE_OPERATION_NAME,
                 output_types.len(),
                 forward_output_types.len(),
             )));
         }
-        check_types!(@same, "rematerialize forward output", [
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} forward output"), [
             output_types,
             &forward_output_types[..output_types.len()],
         ]);
         let residual_types = &forward_output_types[output_types.len()..];
         let expected_backward_input_types: Vec<T> =
             non_differentiated_types.iter().chain(residual_types).chain(output_types.iter()).cloned().collect();
-        check_types!(@same, "rematerialize backward input", [
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} backward input"), [
             &expected_backward_input_types,
             backward_interface.input_types(),
         ]);
-        check_types!(@same, "rematerialize backward output", [
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} backward output"), [
             differentiated_types,
             backward_interface.output_types(),
         ]);
         let expected_tangent_input_types: Vec<T> =
             non_differentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
-        check_types!(@same, "rematerialize tangent input", [
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} tangent input"), [
             &expected_tangent_input_types,
             tangent_interface.input_types(),
         ]);
-        check_types!(@same, "rematerialize tangent output", [output_types, tangent_interface.output_types()]);
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} tangent output"), [
+            output_types,
+            tangent_interface.output_types(),
+        ]);
         Ok(primal_interface)
     }
 }
@@ -224,7 +234,7 @@ impl<T: Type> Operation for RematerializeOperation<T> {
 
     #[inline]
     fn name(&self) -> &'static str {
-        "rematerialize"
+        REMATERIALIZE_OPERATION_NAME
     }
 
     #[inline]
@@ -261,7 +271,8 @@ impl<T: Type> Operation for RematerializeOperation<T> {
             .collect::<Result<Vec<_>, _>>()?;
         if forward_output_types.len() < primal_output_types.len() {
             return Err(TypeError::invalid(format!(
-                "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                "{} forward must produce at least the {} primal output(s) but produced {} value(s)",
+                REMATERIALIZE_OPERATION_NAME,
                 primal_output_types.len(),
                 forward_output_types.len(),
             )));
@@ -290,7 +301,10 @@ impl<T: Type> Operation for RematerializeOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         let primal_interface = self.validated_interfaces(region_interfaces)?;
-        check_types!(@same, "rematerialize input", [primal_interface.input_types(), input_types]);
+        check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} input"), [
+            primal_interface.input_types(),
+            input_types,
+        ]);
         Ok(primal_interface.output_types().to_vec())
     }
 
@@ -384,9 +398,10 @@ where
         let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "rematerialize forward region produced {} outputs which is fewer than its {output_count} \
-                 primal output(s)",
+                "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
+                REMATERIALIZE_OPERATION_NAME,
                 forward_outputs.len(),
+                output_count,
             ))
             .into());
         }
@@ -491,7 +506,8 @@ where
         let forward_output_axes = naturally_batched_forward.output_axes();
         if forward_output_axes.len() < primal_output_axes.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "batched rematerialize forward region produced {} outputs which is fewer than its {} primal outputs",
+                "batched {} forward region produced {} outputs which is fewer than its {} primal outputs",
+                REMATERIALIZE_OPERATION_NAME,
                 forward_output_axes.len(),
                 primal_output_axes.len(),
             ))
@@ -572,8 +588,8 @@ where
         if backward_output_axes != differentiated_axes {
             return Err(BatchingError::MisalignedBatchAxes {
                 message: format!(
-                    "batched rematerialize backward output axes {backward_output_axes:?} do not match its \
-                     differentiated input axes {differentiated_axes:?}",
+                "batched {REMATERIALIZE_OPERATION_NAME} backward output axes {backward_output_axes:?} do not match \
+                 its differentiated input axes {differentiated_axes:?}",
                 ),
             });
         }
@@ -2051,7 +2067,9 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_tracers.first() else {
-            return Err(TypeError::invalid("rematerialization requires at least one input".to_string()).into());
+            return Err(
+                TypeError::invalid(format!("{REMATERIALIZE_OPERATION_NAME} requires at least one input")).into()
+            );
         };
         let input_types = structured_input_types.parameters().cloned().collect::<Vec<_>>();
 

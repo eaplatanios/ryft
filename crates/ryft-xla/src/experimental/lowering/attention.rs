@@ -2,8 +2,8 @@
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttentionBackwardOperation,
-    DotProductAttentionOperation,
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
+    DOT_PRODUCT_ATTENTION_OPERATION_NAME, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
 use ryft_core::{ArrayType, DataType, Dimension, Operation, ProgramError, ReductionKind, Shape};
 use ryft_mlir::dialects::stable_hlo::{self, CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -27,7 +27,11 @@ fn attention_dimensions(input_type: &ArrayType) -> Result<[Dimension; 4], Loweri
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         _ => Err(LoweringError::UnsupportedOp {
-            op: format!("dot_product_attention operand must have rank 3 or 4 but got rank {}", input_type.rank()),
+            op: format!(
+                "{} operand must have rank 3 or 4 but got rank {}",
+                DOT_PRODUCT_ATTENTION_OPERATION_NAME,
+                input_type.rank(),
+            ),
         }),
     }
 }
@@ -39,7 +43,10 @@ fn attention_physical_extent(dimension: &Dimension) -> Result<usize, LoweringErr
         Dimension::Dynamic(variable) => {
             variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
                 LoweringError::UnsupportedOp {
-                    op: format!("dot_product_attention dimension {variable} needs a finite positive physical bound"),
+                    op: format!(
+                        "{DOT_PRODUCT_ATTENTION_OPERATION_NAME} dimension {variable} needs a finite positive physical \
+                         bound",
+                    ),
                 }
             })
         }
@@ -385,7 +392,9 @@ pub(super) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
                 return Err(LoweringError::UnsupportedOp {
-                    op: "'dot_product_attention' dropout is only supported by the fused CUDA lowering".to_string(),
+                    op: format!(
+                        "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' dropout is only supported by the fused CUDA lowering",
+                    ),
                 });
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
@@ -406,10 +415,10 @@ pub(super) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
     let heads = heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: "dot_product_attention heads dimension must be static".to_string(),
+        op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} heads dimension must be static"),
     })?;
     let head_dimension = head_dimension.value().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: "dot_product_attention head dimension must be static".to_string(),
+        op: format!("{DOT_PRODUCT_ATTENTION_OPERATION_NAME} head dimension must be static"),
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
     let physical_query_sequence = attention_physical_extent(&query_sequence)?;
@@ -621,8 +630,10 @@ pub(super) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
         if configuration.implementation() == AttentionImplementation::Fused {
             if configuration.dropout().is_some() {
                 return Err(LoweringError::UnsupportedOp {
-                    op: "'dot_product_attention_backward' dropout is only supported by the fused CUDA lowering"
-                        .to_string(),
+                    op: format!(
+                        "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' dropout is only supported by the fused CUDA \
+                         lowering",
+                    ),
                 });
             }
             let FmhaEligibility::Ineligible(reason) = eligibility else { unreachable!() };
@@ -643,13 +654,13 @@ pub(super) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
     let [batch, query_sequence, heads, head_dimension] = attention_dimensions(&input_types[0])?;
     let [_, key_value_sequence, key_value_heads, _] = attention_dimensions(&input_types[1])?;
     let heads = heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: "dot_product_attention_backward heads dimension must be static".to_string(),
+        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} heads dimension must be static"),
     })?;
     let key_value_heads = key_value_heads.value().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: "dot_product_attention_backward key/value heads dimension must be static".to_string(),
+        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} key/value heads dimension must be static"),
     })?;
     let head_dimension = head_dimension.value().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: "dot_product_attention_backward head dimension must be static".to_string(),
+        op: format!("{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME} head dimension must be static"),
     })?;
     let physical_batch = attention_physical_extent(&batch)?;
     let physical_query_sequence = attention_physical_extent(&query_sequence)?;

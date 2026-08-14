@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use ryft_core::DYNAMIC_SHAPE_SLICE_OPERATION_NAME;
 #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
 use ryft_pjrt::extensions::ffi::FfiStream;
 use ryft_pjrt::extensions::ffi::{
@@ -415,21 +416,27 @@ fn validate_dynamic_shape_slice(
     start: i64,
     size: i64,
 ) -> Result<(), String> {
-    let stride = i64::try_from(stride)
-        .map_err(|_| format!("'dynamic_shape_slice' stride is outside the portable dimension range on axis {axis}"))?;
+    let stride = i64::try_from(stride).map_err(|_| {
+        format!(
+            "'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' stride is outside the portable dimension range on axis \
+                 {axis}",
+        )
+    })?;
     let span = if size == 0 {
         0
     } else {
         size.checked_sub(1)
             .and_then(|size| size.checked_mul(stride))
             .and_then(|span| span.checked_add(1))
-            .ok_or_else(|| format!("'dynamic_shape_slice' span overflows usize on axis {axis}"))?
+            .ok_or_else(|| format!("'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' span overflows usize on axis {axis}"))?
     };
     let limit = start
         .checked_add(span)
-        .ok_or_else(|| format!("'dynamic_shape_slice' limit overflows usize on axis {axis}"))?;
+        .ok_or_else(|| format!("'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' limit overflows usize on axis {axis}"))?;
     if limit > input_size {
-        return Err(format!("'dynamic_shape_slice' limit {limit} exceeds input axis {axis} extent {input_size}",));
+        return Err(format!(
+            "'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' limit {limit} exceeds input axis {axis} extent {input_size}",
+        ));
     }
     Ok(())
 }

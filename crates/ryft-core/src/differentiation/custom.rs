@@ -126,7 +126,7 @@ impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review from here onwards.
 
 impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     // `CustomJvpOperation`s carry two regions with one shared primal boundary. Writing the leading non-differentiated
@@ -181,14 +181,23 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
             .cloned()
             .chain(differentiated_input_types.iter().map(DifferentiableType::tangent))
             .collect::<Vec<_>>();
-        check_types!(@same, "custom_jvp rule input", [&expected_jvp_input_types, jvp_interface.input_types()]);
+        check_types!(@same, format!("{CUSTOM_JVP_OPERATION_NAME} rule input"), [
+            &expected_jvp_input_types,
+            jvp_interface.input_types(),
+        ]);
         let expected_jvp_output_types = primal_output_types
             .iter()
             .cloned()
             .chain(primal_output_types.iter().map(DifferentiableType::tangent))
             .collect::<Vec<_>>();
-        check_types!(@same, "custom_jvp rule output", [&expected_jvp_output_types, jvp_interface.output_types()]);
-        check_types!(@same, "custom_jvp input", [primal_interface.input_types(), input_types]);
+        check_types!(@same, format!("{CUSTOM_JVP_OPERATION_NAME} rule output"), [
+            &expected_jvp_output_types,
+            jvp_interface.output_types(),
+        ]);
+        check_types!(@same, format!("{CUSTOM_JVP_OPERATION_NAME} input"), [
+            primal_interface.input_types(),
+            input_types,
+        ]);
         Ok(primal_output_types.to_vec())
     }
 
@@ -455,7 +464,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError::invalid("custom_jvp requires at least one input".to_string()).into());
+            return Err(TypeError::invalid(format!("{CUSTOM_JVP_OPERATION_NAME} requires at least one input")).into());
         };
         let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let input_tangent_types =
@@ -525,6 +534,7 @@ where
 /// tangents, so deriving the primal from it would make every un-differentiated call pay for tangent computation.
 /// Interpretation, batching, and backend lowering replay the lean primal program, and the JVP program runs only under
 /// differentiation.
+#[inline]
 pub fn custom_jvp<Primal, Jvp, Inputs, Outputs>(primal: Primal, jvp: Jvp) -> CustomJvp<Primal, Jvp, Inputs, Outputs>
 where
     Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
@@ -643,16 +653,20 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
         let input_types = primal_interface.input_types();
         let output_types = primal_interface.output_types();
         let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
-        check_types!(@same, "custom_vjp forward input", [input_types, forward_interface.input_types()]);
+        check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} forward input"), [
+            input_types,
+            forward_interface.input_types(),
+        ]);
         let forward_output_types = forward_interface.output_types();
         if forward_output_types.len() < output_types.len() {
             return Err(TypeError::invalid(format!(
-                "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+                "{} forward must produce at least the {} primal output(s) but produced {} value(s)",
+                CUSTOM_VJP_OPERATION_NAME,
                 output_types.len(),
                 forward_output_types.len(),
             )));
         }
-        check_types!(@same, "custom_vjp forward output", [
+        check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} forward output"), [
             output_types,
             &forward_output_types[..output_types.len()],
         ]);
@@ -664,13 +678,13 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             .cloned()
             .chain(output_cotangent_types)
             .collect();
-        check_types!(@same, "custom_vjp backward input", [
+        check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} backward input"), [
             &expected_backward_input_types,
             backward_interface.input_types(),
         ]);
         let expected_backward_output_types =
             differentiated_types.iter().map(|r#type| r#type.cotangent()).collect::<Vec<_>>();
-        check_types!(@same, "custom_vjp backward output", [
+        check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} backward output"), [
             &expected_backward_output_types,
             backward_interface.output_types(),
         ]);
@@ -736,7 +750,8 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
             .collect::<Result<Vec<_>, _>>()?;
         if forward_output_types.len() < primal_output_types.len() {
             return Err(TypeError::invalid(format!(
-                "custom_vjp forward must produce at least the {} primal output(s) but produced {} value(s)",
+                "{} forward must produce at least the {} primal output(s) but produced {} value(s)",
+                CUSTOM_VJP_OPERATION_NAME,
                 primal_output_types.len(),
                 forward_output_types.len(),
             )));
@@ -754,7 +769,10 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
         let primal_interface = self.validated_interfaces(region_interfaces)?;
-        check_types!(@same, "custom_vjp input", [primal_interface.input_types(), input_types]);
+        check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} input"), [
+            primal_interface.input_types(),
+            input_types,
+        ]);
         Ok(primal_interface.output_types().to_vec())
     }
 
@@ -841,7 +859,8 @@ where
         let forward_output_axes = naturally_batched_forward.output_axes();
         if forward_output_axes.len() < primal_output_axes.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "batched custom_vjp forward region produced {} outputs which is fewer than its {} primal outputs",
+                "batched {} forward region produced {} outputs which is fewer than its {} primal outputs",
+                CUSTOM_VJP_OPERATION_NAME,
                 forward_output_axes.len(),
                 primal_output_axes.len(),
             ))
@@ -899,8 +918,8 @@ where
         if backward_output_axes != differentiated_axes {
             return Err(BatchingError::MisalignedBatchAxes {
                 message: format!(
-                    "batched custom_vjp backward output axes {backward_output_axes:?} do not match its differentiated \
-                     input axes {differentiated_axes:?}",
+                "batched {CUSTOM_VJP_OPERATION_NAME} backward output axes {backward_output_axes:?} do not match its \
+                 differentiated input axes {differentiated_axes:?}",
                 ),
             });
         }
@@ -960,9 +979,10 @@ where
         let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "custom_vjp forward region produced {} outputs which is fewer than its {output_count} primal \
-                 output(s)",
+                "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
+                CUSTOM_VJP_OPERATION_NAME,
                 forward_outputs.len(),
+                output_count,
             ))
             .into());
         }
@@ -1024,9 +1044,10 @@ where
         let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands).map_err(
             |error| match error {
                 ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
-                    message: "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
-                              reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')"
-                        .to_string(),
+                    message: format!(
+                        "cannot apply forward-mode differentiation to a {CUSTOM_VJP_OPERATION_NAME} call; it supports \
+                         only reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')",
+                    ),
                 },
                 error => error,
             },
@@ -1110,7 +1131,7 @@ where
             })
             .map_err(ProgramError::from)?;
         let Some(first) = input_values.first() else {
-            return Err(TypeError::invalid("custom_vjp requires at least one input".to_string()).into());
+            return Err(TypeError::invalid(format!("{CUSTOM_VJP_OPERATION_NAME} requires at least one input")).into());
         };
         let (output_types, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let (forward_output_types, forward) = D::trace(|xs| (self.forward)(xs), input_types.clone())?;

@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use ryft_core::differentiation::custom::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
     AttentionInputs, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -13,24 +14,26 @@ use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, CollectiveMode, PSumScatterOperation, PpermuteOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
-use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
+use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
 use ryft_core::operations::dot::{lhs_result_axes, rhs_result_axes};
 use ryft_core::operations::quantization::scaled_dot_ir_composition;
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
-use ryft_core::operations::sort::{SortDirection, SortOperation};
+use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperation};
 use ryft_core::{
-    AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AtomId,
-    AxisIndexOperation, BroadcastOperation, CaptureConstant, CaptureReference, CeilOperation, CollectiveKind,
-    CollectiveOperation, ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CoordinateBasisOperation,
-    CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
-    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotOperation,
-    Effect, Effects, ErfOperation, ExpOperation, FloorOperation, GatherOperation, GatherScatterMode, Instruction,
-    IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
-    MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation,
-    Program, ProgramError, ProjectedValue, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation,
-    RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape,
-    Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation,
-    SubOperation, TanhOperation, TransposeOperation, Type as RyftType, Typed, Value, WhileOperation,
+    AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
+    Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureConstant,
+    CaptureReference, CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
+    ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension, DimensionOperation,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
+    DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
+    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation,
+    LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation,
+    MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError,
+    ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation,
+    RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation,
+    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
+    TransposeOperation, Type as RyftType, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
@@ -58,6 +61,8 @@ use crate::experimental::lowering::attention::{
     lower_dot_product_attention_backward_to_mlir, lower_dot_product_attention_to_mlir,
 };
 use crate::experimental::ops::{FlatXlaProgram, XlaArrayConstant, XlaConstant, XlaOperation, XlaProgram};
+
+use crate::experimental::operations::SHARD_MAP_OPERATION_NAME;
 
 use super::shard_map::{ShardMap, ShardMapError};
 
@@ -2308,9 +2313,10 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if output_types.is_empty() {
-        return Err(
-            ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() }.into()
-        );
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!("'{SORT_OPERATION_NAME}' needs at least one input"),
+        }
+        .into());
     }
     let mut comparator_arguments = Vec::with_capacity(2 * output_types.len());
     for output_type in output_types {
@@ -2726,17 +2732,27 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, Lo
         return Ok(None);
     };
     let Layout::Tiled(layout) = layout else {
-        return Err(LoweringError::UnsupportedOp { op: format!("custom_call with strided array layout '{layout}'") });
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout '{layout}'"),
+        });
     };
     if !layout.tiles().is_empty() {
-        return Err(LoweringError::UnsupportedOp { op: format!("custom_call with tiled array layout '{layout}'") });
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout '{layout}'"),
+        });
     }
     if layout.rank() != r#type.rank()
         || layout.minor_to_major().iter().any(|axis| *axis >= r#type.rank())
         || layout.minor_to_major().iter().collect::<HashSet<_>>().len() != r#type.rank()
     {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("custom_call with invalid array layout '{layout}' for rank-{} type '{type}'", r#type.rank(), type = r#type),
+            op: format!(
+                "{} with invalid array layout '{}' for rank-{} type '{}'",
+                CUSTOM_CALL_OPERATION_NAME,
+                layout,
+                r#type.rank(),
+                r#type,
+            ),
         });
     }
     Ok(Some(layout.minor_to_major().to_vec()))
@@ -3979,7 +3995,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         let [body] = scan_regions else {
             return Err(LoweringError::UnsupportedOp {
-                op: format!("scan expected 1 attached region but got {}", scan_regions.len()),
+                op: format!("{} expected 1 attached region but got {}", SCAN_OPERATION_NAME, scan_regions.len()),
             });
         };
         lower_scan_to_while(
@@ -4801,13 +4817,18 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let [true_branch, false_branch] = branch_regions else {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("condition expected 2 attached regions but got {}", branch_regions.len()),
+            op: format!("{} expected 2 attached regions but got {}", CONDITION_OPERATION_NAME, branch_regions.len(),),
         });
     };
     let expected_input_count = true_branch.input_types().len() + 1;
     if input_values.len() != expected_input_count {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("condition expected {expected_input_count} lowered inputs but got {}", input_values.len()),
+            op: format!(
+                "{} expected {} lowered inputs but got {}",
+                CONDITION_OPERATION_NAME,
+                expected_input_count,
+                input_values.len(),
+            ),
         });
     }
     let branch_inputs = &input_values[1..];
@@ -4876,14 +4897,19 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     let [condition, body] = loop_regions else {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("while expected 2 attached regions but got {}", loop_regions.len()),
+            op: format!("{} expected 2 attached regions but got {}", WHILE_OPERATION_NAME, loop_regions.len()),
         });
     };
     let state_types = body.input_types();
     let state_count = state_types.len();
     if input_values.len() != state_count {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("while expected {state_count} lowered inputs but got {}", input_values.len()),
+            op: format!(
+                "{} expected {} lowered inputs but got {}",
+                WHILE_OPERATION_NAME,
+                state_count,
+                input_values.len(),
+            ),
         });
     }
     // A batched (non-scalar) predicate lowers with the masked semantics owned by this primitive, mirroring JAX's
@@ -4959,7 +4985,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         )?;
         if initial_predicate.len() != 1 {
             return Err(LoweringError::UnsupportedOp {
-                op: format!("while condition lowered to {} outputs", initial_predicate.len()),
+                op: format!("{} condition lowered to {} outputs", WHILE_OPERATION_NAME, initial_predicate.len(),),
             });
         }
         state_values.push(initial_predicate[0]);
@@ -5023,7 +5049,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             )?;
             if condition_outputs.len() != 1 {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("while condition lowered to {} outputs", condition_outputs.len()),
+                    op: format!("{} condition lowered to {} outputs", WHILE_OPERATION_NAME, condition_outputs.len(),),
                 });
             }
             condition_outputs[0]
@@ -5085,7 +5111,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         )?;
         if body_outputs.len() != state_count {
             return Err(LoweringError::UnsupportedOp {
-                op: format!("while body lowered to {} outputs", body_outputs.len()),
+                op: format!("{} body lowered to {} outputs", WHILE_OPERATION_NAME, body_outputs.len()),
             });
         }
         // For a batched predicate, mask each carry update under the carried (incoming-state) predicate so finished
@@ -5157,7 +5183,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             )?;
             if next_predicate.len() != 1 {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("while condition lowered to {} outputs", next_predicate.len()),
+                    op: format!("{} condition lowered to {} outputs", WHILE_OPERATION_NAME, next_predicate.len(),),
                 });
             }
             Some(next_predicate[0])
@@ -5250,7 +5276,8 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     if input_values.len() != body_input_types.len() + runtime_length_count {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "scan expected {} lowered inputs but got {}",
+                "{} expected {} lowered inputs but got {}",
+                SCAN_OPERATION_NAME,
                 body_input_types.len() + runtime_length_count,
                 input_values.len(),
             ),
@@ -5267,7 +5294,10 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         || (static_length.is_none() && unroll != 1)
     {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("scan unroll factor {unroll} must be at least 1 and evenly divide the scan length {length}"),
+            op: format!(
+                "{SCAN_OPERATION_NAME} unroll factor {unroll} must be at least 1 and evenly divide the scan length \
+                 {length}",
+            ),
         });
     }
     let carry_types = &body_input_types[..carry_count];
@@ -5287,39 +5317,41 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         Ok(ArrayType::new(slice_type.data_type(), ryft_core::arrays::Shape::new(dimensions)))
     };
 
-    let initialize_accumulator = |slice_type: &ArrayType,
-                                  block: &mut BlockRef<'b, 'c, 't>|
-     -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-        let stacked_type = stacked(slice_type)?;
-        let physical_length = match length {
-            Dimension::Static(length) => *length,
-            Dimension::Dynamic(_) => {
-                stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| LoweringError::UnsupportedOp {
-                    op: format!("scan length {length} needs a finite upper bound for physical accumulator allocation"),
-                })?
-            }
+    let initialize_accumulator =
+        |slice_type: &ArrayType, block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+            let stacked_type = stacked(slice_type)?;
+            let physical_length = match length {
+                Dimension::Static(length) => *length,
+                Dimension::Dynamic(_) => {
+                    stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| LoweringError::UnsupportedOp {
+                        op: format!(
+                            "{SCAN_OPERATION_NAME} length {length} needs a finite upper bound for physical accumulator \
+                         allocation",
+                        ),
+                    })?
+                }
+            };
+            let mut physical_dimensions = stacked_type.shape().dimensions().to_vec();
+            physical_dimensions[0] = Dimension::Static(physical_length);
+            let physical_type = stacked_type.clone().with_shape(Shape::new(physical_dimensions));
+            let accumulator =
+                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let Some(runtime_length) = runtime_length else {
+                return Ok(accumulator);
+            };
+            let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
+            let converted = block.append_operation(stable_hlo::convert(runtime_length, i32_scalar_type, location)?)?;
+            let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+            let tensor_type = lower_tensor_type(&stacked_type, context, location)?;
+            let refined = block.append_operation(stable_hlo::set_dimension_size(
+                accumulator,
+                converted,
+                tensor_type,
+                0,
+                location,
+            )?)?;
+            Ok(refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref())
         };
-        let mut physical_dimensions = stacked_type.shape().dimensions().to_vec();
-        physical_dimensions[0] = Dimension::Static(physical_length);
-        let physical_type = stacked_type.clone().with_shape(Shape::new(physical_dimensions));
-        let accumulator =
-            lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
-        let Some(runtime_length) = runtime_length else {
-            return Ok(accumulator);
-        };
-        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-        let converted = block.append_operation(stable_hlo::convert(runtime_length, i32_scalar_type, location)?)?;
-        let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
-        let tensor_type = lower_tensor_type(&stacked_type, context, location)?;
-        let refined = block.append_operation(stable_hlo::set_dimension_size(
-            accumulator,
-            converted,
-            tensor_type,
-            0,
-            location,
-        )?)?;
-        Ok(refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref())
-    };
 
     // A fully unrolled scan (`unroll == length`) needs no loop at all: the body copies inline as straight-line
     // operations at static iteration indices, reading and writing the same stacked inputs and zero accumulators the
@@ -5585,7 +5617,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
     )?;
     if body_outputs.len() != carry_count + y_slice_types.len() {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("scan body lowered to {} outputs", body_outputs.len()),
+            op: format!("{} body lowered to {} outputs", SCAN_OPERATION_NAME, body_outputs.len()),
         });
     }
 
@@ -6695,7 +6727,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::CustomJvp(_) => {
             let [primal, _jvp] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("custom_jvp expected 2 attached regions but got {}", regions.len()),
+                    op: format!("{} expected 2 attached regions but got {}", CUSTOM_JVP_OPERATION_NAME, regions.len(),),
                 });
             };
             lower_nested_program_inline(
@@ -6714,7 +6746,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::CustomVjp(_) => {
             let [primal, _forward, _backward] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("custom_vjp expected 3 attached regions but got {}", regions.len()),
+                    op: format!("{} expected 3 attached regions but got {}", CUSTOM_VJP_OPERATION_NAME, regions.len(),),
                 });
             };
             lower_nested_program_inline(
@@ -6733,7 +6765,11 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Rematerialize(_) => {
             let [primal, _forward, _backward, _tangent] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("rematerialize expected 4 attached regions but got {}", regions.len()),
+                    op: format!(
+                        "{} expected 4 attached regions but got {}",
+                        REMATERIALIZE_OPERATION_NAME,
+                        regions.len(),
+                    ),
                 });
             };
             lower_nested_program_inline(
@@ -6794,7 +6830,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::ShardMap(operation) => {
             let [body] = regions else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("shard_map expected 1 attached region but got {}", regions.len()),
+                    op: format!("{} expected 1 attached region but got {}", SHARD_MAP_OPERATION_NAME, regions.len(),),
                 });
             };
             // Only ordered effects need token threading, which `sdy.manual_computation` cannot express; a body
@@ -7092,14 +7128,13 @@ fn mesh_axis_replica_groups(
     axis_name: &str,
 ) -> Result<(Vec<Vec<usize>>, usize), LoweringError> {
     let Some(shard_map) = collective_state.manual_shard_map() else {
-        return Err(
-            ProgramError::UnsupportedOperation {
-                message: format!(
-                    "collective over axis '{axis_name}' can only be lowered inside a shard_map manual region",
-                ),
-            }
-            .into(),
-        );
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "collective over axis '{axis_name}' can only be lowered inside a \
+                     {SHARD_MAP_OPERATION_NAME} manual region",
+            ),
+        }
+        .into());
     };
     let mesh = shard_map.mesh();
     if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
@@ -7452,7 +7487,10 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     let axis_name = operation.axis_name();
     let Some(shard_map) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
-            message: format!("axis_index for axis '{axis_name}' can only be lowered inside a shard_map manual region"),
+            message: format!(
+                "{AXIS_INDEX_OPERATION_NAME} for axis '{axis_name}' can only be lowered inside a \
+                 {SHARD_MAP_OPERATION_NAME} manual region",
+            ),
         }
         .into());
     };
@@ -7698,7 +7736,9 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     if operation.mode() == GatherScatterMode::FillOrDrop {
-        return Err(LoweringError::UnsupportedOp { op: format!("gather with mode {}", operation.mode()) });
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("{} with mode {}", GATHER_OPERATION_NAME, operation.mode()),
+        });
     }
     let dimensions = operation.dimensions();
     let index_vector_dimension = output_types[0].rank() - dimensions.offset_dimensions().len();
@@ -7773,12 +7813,16 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 3, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
     if operation.mode() == GatherScatterMode::FillOrDrop {
-        return Err(LoweringError::UnsupportedOp { op: format!("scatter with mode {}", operation.mode()) });
+        return Err(LoweringError::UnsupportedOp {
+            op: format!("{} with mode {}", SCATTER_OPERATION_NAME, operation.mode()),
+        });
     }
     let indices_rank = input_values[1]
         .r#type()?
         .cast::<TensorTypeRef>()
-        .ok_or_else(|| LoweringError::UnsupportedOp { op: "scatter with non-tensor indices".to_string() })?
+        .ok_or_else(|| LoweringError::UnsupportedOp {
+            op: format!("{SCATTER_OPERATION_NAME} with non-tensor indices"),
+        })?
         .rank();
     let dimensions = operation.dimensions();
     let attribute = context.stable_hlo_scatter_dimensions(

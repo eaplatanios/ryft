@@ -97,14 +97,14 @@ pub use operations::logical::{
 pub use operations::manipulation::{
     BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, CONCATENATE_OPERATION_NAME,
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType,
-    ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSlice,
-    DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather,
-    GatherDimensionNumbers, GatherOperation, GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation,
-    RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, ReshapeParameters, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME,
-    Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
-    TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    ConvertElementTypeOperation, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DYNAMIC_SLICE_OPERATION_NAME,
+    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape,
+    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
+    GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, RESHAPE_OPERATION_NAME, Reshape,
+    ReshapeOperation, ReshapeParameters, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
+    ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation, TRANSPOSE_OPERATION_NAME,
+    Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use operations::math::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, Atan2,
@@ -169,7 +169,7 @@ pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
-pub use tracing_v2::rematerialization::RematerializeOperation;
+pub use tracing_v2::rematerialization::{REMATERIALIZE_OPERATION_NAME, RematerializeOperation};
 
 #[cfg(test)]
 pub(crate) mod tests {

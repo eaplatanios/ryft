@@ -222,7 +222,7 @@ fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Resul
     for (axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
         if dimension.value().is_none() {
             return Err(TypeError::invalid(format!(
-                "scan body {role} {index} must have a fully static type but axis {axis} of {type} has size \
+                "{SCAN_OPERATION_NAME} body {role} {index} must have a fully static type but axis {axis} of {type} has size \
                      {dimension}",
                 r#type = r#type,
             )));
@@ -237,17 +237,17 @@ fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Resul
 /// validation alone.
 pub(crate) fn validate_scan_unroll(unroll: usize, length: &Dimension) -> Result<(), TypeError> {
     if unroll == 0 {
-        return Err(TypeError::invalid("scan unroll factor must be at least 1".to_string()));
+        return Err(TypeError::invalid(format!("{SCAN_OPERATION_NAME} unroll factor must be at least 1")));
     }
     let Some(length) = length.value() else {
         if unroll == 1 {
             return Ok(());
         }
-        return Err(TypeError::invalid(format!("scan with dynamic length {length} only supports unroll factor 1",)));
+        return Err(TypeError::invalid(format!("{SCAN_OPERATION_NAME} with dynamic length {length} only supports unroll factor 1",)));
     };
     if length % unroll != 0 {
         return Err(TypeError::invalid(format!(
-            "scan unroll factor {unroll} must evenly divide the scan length {length}"
+            "{SCAN_OPERATION_NAME} unroll factor {unroll} must evenly divide the {SCAN_OPERATION_NAME} length {length}"
         )));
     }
     Ok(())
@@ -288,7 +288,7 @@ pub(crate) fn scan_output_types(
     for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
         if !expected.is_refined_by(actual) {
             return Err(TypeError::invalid(format!(
-                "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
+                "{SCAN_OPERATION_NAME} input {index} has type {actual} which is incompatible with the expected type {expected}",
             )));
         }
     }
@@ -375,23 +375,23 @@ impl ScanTypeSemantics for ArrayType {
     ) -> Result<(), TypeError> {
         if length.variable().is_some() {
             return Err(TypeError::invalid(format!(
-                "homogeneous array scan requires a static length but got {length}; use a composite scan with a \
+                "homogeneous array {SCAN_OPERATION_NAME} requires a static length but got {length}; use a composite {SCAN_OPERATION_NAME} with a \
                  trailing first-class dimension operand for a dynamic trip count",
             )));
         }
         if carry_count > body_input_types.len() {
             return Err(TypeError::invalid(format!(
-                "scan carry count {carry_count} exceeds the body input count {}",
+                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body input count {}",
                 body_input_types.len(),
             )));
         }
         if carry_count > body_output_types.len() {
             return Err(TypeError::invalid(format!(
-                "scan carry count {carry_count} exceeds the body output count {}",
+                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body output count {}",
                 body_output_types.len(),
             )));
         }
-        check_types!(@same, "scan body carry", [
+        check_types!(@same, format!("{SCAN_OPERATION_NAME} body carry"), [
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
         ]);
@@ -413,21 +413,21 @@ impl ScanTypeSemantics for ArrayType {
         check_count!("input", input_types, body_input_count, TypeError);
         if carry_count > body_input_count {
             return Err(TypeError::invalid(format!(
-                "scan carry count {carry_count} exceeds the body input count {body_input_count}",
+                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body input count {body_input_count}",
             )));
         }
         let mut body_input_types = input_types[..carry_count].to_vec();
         for (index, input_type) in input_types[carry_count..].iter().enumerate() {
             if input_type.rank() == 0 {
                 return Err(TypeError::invalid(format!(
-                    "scan stacked input {} must have rank at least 1",
+                    "{SCAN_OPERATION_NAME} stacked input {} must have rank at least 1",
                     carry_count + index,
                 )));
             }
             let (slice_type, leading_dimension) = input_type.without_dimension(0)?;
             if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
-                    "scan stacked input {} must have leading dimension {length} but has type {input_type}",
+                    "{SCAN_OPERATION_NAME} stacked input {} must have leading dimension {length} but has type {input_type}",
                     carry_count + index,
                 )));
             }
@@ -459,7 +459,7 @@ impl ScanTypeSemantics for ArrayType {
         let capture_type = capture.r#type();
         if capture_type.rank() == 0 || !length.is_refined_by(&capture_type.dimension(0)) {
             return Err(TypeError::invalid(format!(
-                "scan capture {index} must have leading dimension {length} but has type {capture_type}",
+                "{SCAN_OPERATION_NAME} capture {index} must have leading dimension {length} but has type {capture_type}",
                 capture_type = capture_type.as_ref(),
             )));
         }
@@ -477,7 +477,7 @@ fn composite_scan_boundary_types(
 ) -> Result<Vec<ArrayIrType>, TypeError> {
     if carry_count > body_types.len() {
         return Err(TypeError::invalid(format!(
-            "scan carry count {} exceeds the body {} count {}",
+            "{SCAN_OPERATION_NAME} carry count {} exceeds the body {} count {}",
             carry_count,
             role,
             body_types.len(),
@@ -487,7 +487,7 @@ fn composite_scan_boundary_types(
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let ArrayIrType::Array(r#type) = r#type else {
             return Err(TypeError::invalid(format!(
-                "scan stacked body {} {} must be an array but got {}",
+                "{SCAN_OPERATION_NAME} stacked body {} {} must be an array but got {}",
                 role,
                 carry_count + index,
                 r#type,
@@ -535,7 +535,7 @@ pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
         .filter(|_| DimensionType::new(variable.clone()).is_refined_by(runtime_length_type))
         .ok_or_else(|| {
             TypeError::invalid(format!(
-                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but scan length \
+                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but {SCAN_OPERATION_NAME} length \
                  requires {variable}",
             ))
         })?;
@@ -573,7 +573,7 @@ impl ScanTypeSemantics for ArrayIrType {
     ) -> Result<(), TypeError> {
         composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
         composite_scan_boundary_types("output", body_output_types, carry_count, length)?;
-        check_types!(@same, "scan body carry", [
+        check_types!(@same, format!("{SCAN_OPERATION_NAME} body carry"), [
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
         ]);
@@ -590,28 +590,28 @@ impl ScanTypeSemantics for ArrayIrType {
         check_count!("input", input_types, body_input_count + runtime_length_count, TypeError);
         if carry_count > body_input_count {
             return Err(TypeError::invalid(format!(
-                "scan carry count {carry_count} exceeds the body input count {body_input_count}",
+                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body input count {body_input_count}",
             )));
         }
         let mut body_input_types = input_types[..carry_count].to_vec();
         for (index, r#type) in input_types[carry_count..body_input_count].iter().enumerate() {
             let Self::Array(r#type) = r#type else {
                 return Err(TypeError::invalid(format!(
-                    "scan stacked input {} must be an array but got {}",
+                    "{SCAN_OPERATION_NAME} stacked input {} must be an array but got {}",
                     carry_count + index,
                     r#type,
                 )));
             };
             if r#type.rank() == 0 {
                 return Err(TypeError::invalid(format!(
-                    "scan stacked input {} must have rank at least 1",
+                    "{SCAN_OPERATION_NAME} stacked input {} must have rank at least 1",
                     carry_count + index,
                 )));
             }
             let (slice_type, leading_dimension) = r#type.without_dimension(0)?;
             if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
-                    "scan stacked input {} must have leading dimension {} but has type {}",
+                    "{SCAN_OPERATION_NAME} stacked input {} must have leading dimension {} but has type {}",
                     carry_count + index,
                     length,
                     r#type,
@@ -632,7 +632,7 @@ impl ScanTypeSemantics for ArrayIrType {
     ) -> Result<Vec<Self>, TypeError> {
         let expected_input_types = composite_scan_boundary_types("input", body_input_types, carry_count, length)?;
         let output_types = composite_scan_boundary_types("output", body_output_types, carry_count, length)?;
-        check_types!(@same, "scan body carry", [
+        check_types!(@same, format!("{SCAN_OPERATION_NAME} body carry"), [
             &body_input_types[..carry_count],
             &body_output_types[..carry_count],
         ]);
@@ -643,7 +643,7 @@ impl ScanTypeSemantics for ArrayIrType {
         {
             if !expected.is_refined_by(actual) {
                 return Err(TypeError::invalid(format!(
-                    "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
+                    "{SCAN_OPERATION_NAME} input {index} has type {actual} which is incompatible with the expected type {expected}",
                 )));
             }
         }
@@ -660,7 +660,7 @@ impl ScanTypeSemantics for ArrayIrType {
 
     fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
         let Self::Array(r#type) = r#type else {
-            return Err(TypeError::invalid(format!("scan cannot stack first-class dimension type {}", r#type)));
+            return Err(TypeError::invalid(format!("{SCAN_OPERATION_NAME} cannot stack first-class dimension type {}", r#type)));
         };
         Ok(Self::Array(stacked_scan_type(r#type, length)))
     }
@@ -673,12 +673,12 @@ impl ScanTypeSemantics for ArrayIrType {
         let capture_type = capture.r#type();
         let Self::Array(capture_type) = capture_type.as_ref() else {
             return Err(TypeError::invalid(format!(
-                "scan capture {index} must be a stacked array but got {capture_type}",
+                "{SCAN_OPERATION_NAME} capture {index} must be a stacked array but got {capture_type}",
             )));
         };
         if capture_type.rank() == 0 || !length.is_refined_by(&capture_type.dimension(0)) {
             return Err(TypeError::invalid(format!(
-                "scan capture {index} must have leading dimension {length} but has type {capture_type}",
+                "{SCAN_OPERATION_NAME} capture {index} must have leading dimension {length} but has type {capture_type}",
             )));
         }
         Ok(())
@@ -858,7 +858,7 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         let length = length.value().ok_or_else(|| ProgramError::UnsupportedOperation {
             message: format!(
-                "cannot eagerly interpret homogeneous array scan with dynamic length {length} without an explicit \
+                "cannot eagerly interpret homogeneous array {SCAN_OPERATION_NAME} with dynamic length {length} without an explicit \
                  first-class dimension operand",
             ),
         })?;
@@ -956,7 +956,7 @@ where
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
                 TypeError::invalid(format!(
-                    "scan iteration extraction requires a static stacked type but got {stack_type}"
+                    "{SCAN_OPERATION_NAME} iteration extraction requires a static stacked type but got {stack_type}"
                 ))
                 .into()
             })
@@ -1287,7 +1287,7 @@ where
         .collect::<Vec<_>>();
     if known_input_indices != expected_known_input_indices {
         return Err(ProgramError::MalformedProgram(format!(
-            "scan body partition reported known input indices {known_input_indices:?} but expected \
+            "{SCAN_OPERATION_NAME} body partition reported known input indices {known_input_indices:?} but expected \
              {expected_known_input_indices:?}",
         )));
     }
@@ -1319,8 +1319,7 @@ where
                 }
                 PartialEvaluationOutput::Unknown(_) => {
                     return Err(ProgramError::MalformedProgram(
-                        "scan known-ness fixed point converged with an unknown next value for a known carry"
-                            .to_string(),
+                        format!("{SCAN_OPERATION_NAME} known-ness fixed point converged with an unknown next value for a known carry"),
                     ));
                 }
             }
@@ -1342,13 +1341,13 @@ where
             PartialEvaluationInput::Known(edge) => {
                 if *edge != edge_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "scan body partition reported residual edge {edge} out of order",
+                        "{SCAN_OPERATION_NAME} body partition reported residual edge {edge} out of order",
                     )));
                 }
                 let output = known_result_count + edge;
                 let output_type = known_program_output_types.get(output).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "scan body partition residual edge {edge} has no known-program output",
+                        "{SCAN_OPERATION_NAME} body partition residual edge {edge} has no known-program output",
                     ))
                 })?;
                 let carry_source = (0..carry_count).find(|&index| {
@@ -1378,7 +1377,7 @@ where
             if let PartialEvaluationOutput::Known(output) = &partition_outputs[index] {
                 let output_type = known_program_output_types.get(*output).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "scan body partition output {index} references missing known-program output {output}",
+                        "{SCAN_OPERATION_NAME} body partition output {index} references missing known-program output {output}",
                     ))
                 })?;
                 instantiated_edge_positions[index] = Some((edge_types.len(), known_program_output_indices.len()));
@@ -1423,7 +1422,7 @@ where
         .iter()
         .map(|&index| {
             body_inputs.get(index).cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("scan body partition references missing scan input {index}",))
+                ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} body partition references missing {SCAN_OPERATION_NAME} input {index}",))
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1442,7 +1441,7 @@ where
         .map(|(&output, &edge)| -> Result<AtomId, ProgramError> {
             let output = known_program_outputs.get(output).copied().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "scan body partition references missing known-program output {output}",
+                    "{SCAN_OPERATION_NAME} body partition references missing known-program output {output}",
                 ))
             })?;
             let Some(edge) = edge else { return Ok(output) };
@@ -1524,13 +1523,13 @@ where
                 PartialEvaluationInput::Unknown(index) => {
                     spliced_inputs.push(unknown_body_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
                         ProgramError::MalformedProgram(
-                            "scan known-ness split saw a residual feeder for a known body input".to_string(),
+                            format!("{SCAN_OPERATION_NAME} known-ness split saw a residual feeder for a known body input"),
                         )
                     })?);
                 }
                 PartialEvaluationInput::Known(edge) => {
                     spliced_inputs.push(*edge_input_atoms.get(*edge).ok_or_else(|| {
-                        ProgramError::MalformedProgram("scan known-ness split lost a residual edge".to_string())
+                        ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} known-ness split lost a residual edge"))
                     })?)
                 }
             }
@@ -1553,7 +1552,7 @@ where
                 PartialEvaluationOutput::Known(_) => {
                     let (edge, _) = instantiated_edge_positions[index].ok_or_else(|| {
                         ProgramError::MalformedProgram(
-                            "scan known-ness split lost an instantiated carry edge".to_string(),
+                            format!("{SCAN_OPERATION_NAME} known-ness split lost an instantiated carry edge"),
                         )
                     })?;
                     unknown_output_atoms.push(edge_input_atoms[edge]);
@@ -1594,7 +1593,7 @@ where
         for (_, known_output_position) in edge_known_output_positions {
             unknown_scan_inputs.push(known_outputs.get(*known_output_position).cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(
-                    "scan known-ness split known scan produced no output for a residual edge".to_string(),
+                    format!("{SCAN_OPERATION_NAME} known-ness split known {SCAN_OPERATION_NAME} produced no output for a residual edge"),
                 )
             })?);
         }
@@ -1614,18 +1613,18 @@ where
             if let Some(position) = known_position {
                 return known_outputs.get(position).cloned().ok_or_else(|| {
                     ProgramError::MalformedProgram(
-                        "scan known-ness split known scan produced no output for a known result".to_string(),
+                        format!("{SCAN_OPERATION_NAME} known-ness split known {SCAN_OPERATION_NAME} produced no output for a known result"),
                     )
                 });
             }
             let ordinal = unknown_output_ordinals[index].ok_or_else(|| {
                 ProgramError::MalformedProgram(
-                    "scan known-ness split produced a result owned by neither side".to_string(),
+                    format!("{SCAN_OPERATION_NAME} known-ness split produced a result owned by neither side"),
                 )
             })?;
             residual_outputs.get(ordinal).cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(
-                    "scan known-ness split unknown scan produced no output for a residual result".to_string(),
+                    format!("{SCAN_OPERATION_NAME} known-ness split unknown {SCAN_OPERATION_NAME} produced no output for a residual result"),
                 )
             })
         })
@@ -1728,7 +1727,7 @@ where
             let Some((stabilized_body, y_axes)) = stabilized else {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
+                        "{SCAN_OPERATION_NAME} batching failed to stabilize the carry batch axes within {carry_count} widening passes",
                     ),
                 });
             };
@@ -1801,7 +1800,7 @@ where
             check_count!("output", output_axes, output_types.len(), ProgramError);
             if output_types.len() < self.carry_count() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "scan body has {} outputs but carry count is {}",
+                    "{SCAN_OPERATION_NAME} body has {} outputs but carry count is {}",
                     output_types.len(),
                     self.carry_count(),
                 ))
@@ -1829,7 +1828,7 @@ where
         let y_slice_types = body.output_types().split_off(self.carry_count());
         let length = self.length().value().ok_or_else(|| BatchingError::UnsupportedOperation {
             message: format!(
-                "eager homogeneous scan batching requires a concrete trip count but got {}",
+                "eager homogeneous {SCAN_OPERATION_NAME} batching requires a concrete trip count but got {}",
                 self.length(),
             ),
         })?;
@@ -1892,7 +1891,7 @@ where
                     if accumulator.batch_axis != batch_axis {
                         return Err(BatchingError::MisalignedBatchAxes {
                             message: format!(
-                                "scan body produced stacked output iterations at mismatched batch axes ({:?} vs \
+                                "{SCAN_OPERATION_NAME} body produced stacked output iterations at mismatched batch axes ({:?} vs \
                                  {batch_axis:?})",
                                 accumulator.batch_axis,
                             ),
@@ -1968,7 +1967,7 @@ where
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
                 BatchingError::UnsupportedOperation {
-                    message: format!("scan batching requires static stacked input types but got {stack_type}"),
+                    message: format!("{SCAN_OPERATION_NAME} batching requires static stacked input types but got {stack_type}"),
                 }
                 .into()
             })
@@ -2112,7 +2111,7 @@ where
         let Some((stabilized_body, output_slice_axes)) = stabilized else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "scan batching failed to stabilize the carry batch axes within {carry_count} widening passes",
+                    "{SCAN_OPERATION_NAME} batching failed to stabilize the carry batch axes within {carry_count} widening passes",
                 ),
             });
         };
@@ -2319,7 +2318,7 @@ fn live_scan_signature_permutation(has_tangent: &[bool], carry_count: usize) -> 
     let entry_count = has_tangent.len();
     if carry_count > entry_count {
         return Err(ProgramError::MalformedProgram(format!(
-            "scan carry count {carry_count} exceeds fused body signature size {entry_count}",
+            "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds fused body signature size {entry_count}",
         )));
     }
     let tangent_positions = has_tangent
@@ -2535,7 +2534,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     for (index, input) in runtime_length_inputs.iter().enumerate() {
         materialized.push(input.as_known().cloned().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("scan transpose runtime length operand {index} is not known"))
+            ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"))
         })?);
     }
     let cotangents = context.stage_operation(
@@ -2629,7 +2628,7 @@ where
     check_count!("input", operand_linear, body.input_types().len(), ProgramError);
     if carry_count > operand_linear.len() {
         return Err(ProgramError::MalformedProgram(format!(
-            "scan transpose found carry count {carry_count} exceeding its {} operands",
+            "{SCAN_OPERATION_NAME} transpose found carry count {carry_count} exceeding its {} operands",
             operand_linear.len(),
         )));
     }
@@ -2697,7 +2696,7 @@ where
         } else {
             operands.push(scan_inputs[index].as_known().cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "scan transpose carry operand {index} has no known residual value",
+                    "{SCAN_OPERATION_NAME} transpose carry operand {index} has no known residual value",
                 ))
             })?);
         }
@@ -2719,14 +2718,14 @@ where
         if index >= carry_count {
             // A known scanned operand is a residual stack; the dispatch guarantees it carries its pullback value.
             let residual = scan_inputs[index].as_known().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("scan transpose operand {index} has no known residual value"))
+                ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose operand {index} has no known residual value"))
             })?;
             operands.push(residual.clone());
         }
     }
     for (index, input) in runtime_length_inputs.iter().enumerate() {
         operands.push(input.as_known().cloned().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("scan transpose runtime length operand {index} is not known"))
+            ProgramError::MalformedProgram(format!("{SCAN_OPERATION_NAME} transpose runtime length operand {index} is not known"))
         })?);
     }
 
@@ -2812,7 +2811,7 @@ where
         .map(|&index| {
             program.input_ids().get(index).copied().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "scan transpose boundary references missing input position {index}",
+                    "{SCAN_OPERATION_NAME} transpose boundary references missing input position {index}",
                 ))
             })
         })
@@ -2823,7 +2822,7 @@ where
         program.into_filtered(selected_inputs.as_slice(), output_ids.as_slice(), selected_inputs.as_slice())?;
     if !live_inputs.iter().copied().eq(0..selected_input_count) {
         return Err(ProgramError::MalformedProgram(
-            "scan transpose boundary projection dropped a retained input".to_string(),
+            format!("{SCAN_OPERATION_NAME} transpose boundary projection dropped a retained input"),
         ));
     }
 
@@ -2839,7 +2838,7 @@ where
         if carry_is_linear {
             restored_outputs.push(linear_carry_outputs.next().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "scan transpose missing linear carry cotangent output {carry_index}",
+                    "{SCAN_OPERATION_NAME} transpose missing linear carry cotangent output {carry_index}",
                 ))
             })?);
         } else {

@@ -7,7 +7,7 @@ use num_complex::Complex;
 
 use crate::arrays::arrays::Array;
 use crate::arrays::types::data::DataType;
-use crate::operations::complex::{Conjugate, Imaginary, Real};
+use crate::operations::complex::{COMPLEX_OPERATION_NAME, Conjugate, Imaginary, Real};
 use crate::programs::{ProgramError, TypeError, Typed};
 
 // TODO(eaplatanios): Review this.
@@ -18,7 +18,8 @@ impl crate::operations::complex::Complex for Array {
         // the element data type maps to the complex data type with the parts' precision.
         if self.r#type() != imaginary.r#type() {
             return Err(TypeError::invalid(format!(
-                "'complex' requires identical part types but got {} and {}",
+                "'{}' requires identical part types but got {} and {}",
+                COMPLEX_OPERATION_NAME,
                 self.r#type(),
                 imaginary.r#type(),
             ))

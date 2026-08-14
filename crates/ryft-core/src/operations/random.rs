@@ -164,13 +164,14 @@ fn validate_rng_bit_generator_types(
     let expected_state_type = algorithm.state_type();
     if state_type.data_type() != expected_state_type.data_type() || state_type.shape() != expected_state_type.shape() {
         return Err(TypeError::invalid(format!(
-            "'rng_bit_generator' with the {algorithm} algorithm needs a {expected_state_type} state but got \
+            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' with the {algorithm} algorithm needs a {expected_state_type} state but got \
              {state_type}",
         )));
     }
     if !matches!(output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
         return Err(TypeError::invalid(format!(
-            "'rng_bit_generator' does not support output data type {}",
+            "'{}' does not support output data type {}",
+            RNG_BIT_GENERATOR_OPERATION_NAME,
             output_type.data_type(),
         )));
     }
@@ -180,11 +181,10 @@ fn validate_rng_bit_generator_types(
         })
     };
     if has_sharded_dimension(state_type) || has_sharded_dimension(output_type) {
-        return Err(TypeError::invalid(
-            "'rng_bit_generator' does not support sharded states or outputs; derive per-shard states inside shard_map \
-             instead"
-                .to_string(),
-        ));
+        return Err(TypeError::invalid(format!(
+            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support sharded states or outputs; derive per-shard \
+                 states inside shard_map instead",
+        )));
     }
     Ok(())
 }
@@ -207,9 +207,9 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
         check_count!("input", input_types, 1, TypeError);
         validate_rng_bit_generator_types(self.algorithm, &input_types[0], &self.output_type)?;
         if self.output_type.static_shape().is_none() {
-            return Err(TypeError::invalid(
-                "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
-            ));
+            return Err(TypeError::invalid(format!(
+                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support dynamically shaped outputs"
+            )));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
     }
@@ -305,7 +305,9 @@ where
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: "'rng_bit_generator' cannot be transposed because random bits are discrete".to_string(),
+            message: format!(
+                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot be transposed because random bits are discrete"
+            ),
         }
         .into())
     }
@@ -337,10 +339,11 @@ where
         check_count!("input", inputs, 1, ProgramError);
         if inputs[0].batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
-                          the same state; derive one state per batch item with `split_key` and map over the states \
-                          explicitly"
-                    .to_string(),
+                message: format!(
+                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot batch a replicated state because every batch item \
+                     would see the same state; derive one state per batch item with `split_key` and map over the \
+                     states explicitly",
+                ),
             });
         }
 
@@ -398,10 +401,11 @@ where
         }
         if state.batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
-                          the same state; derive one state per batch item with `split_key` and map over the states \
-                          explicitly"
-                    .to_string(),
+                message: format!(
+                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot batch a replicated state because every batch item \
+                     would see the same state; derive one state per batch item with `split_key` and map over the \
+                     states explicitly",
+                ),
             });
         }
 

@@ -87,7 +87,7 @@ impl PadOperation<ArrayType> {
     ) -> Result<Self, ProgramError> {
         if edge_padding_low.len() != edge_padding_high.len() || edge_padding_low.len() != interior_padding.len() {
             return Err(TypeError::invalid(format!(
-                "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
+                "'{PAD_OPERATION_NAME}' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
                     got lengths {}, {}, and {}",
                 edge_padding_low.len(),
                 edge_padding_high.len(),
@@ -451,7 +451,7 @@ where
                         .enumerate()
                         .map(|(axis, padding)| {
                             padding.checked_neg().ok_or_else(|| TypeError::invalid(format!(
-                                    "'pad' transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
+                                    "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
                                 )))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -462,7 +462,7 @@ where
                         .map(|(axis, padding)| {
                             padding.checked_neg().ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'pad' transpose cannot negate edge_padding_high at axis {axis} with value \
+                                    "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_high at axis {axis} with value \
                                      {padding}",
                                 ))
                             })
@@ -487,7 +487,7 @@ where
                         .enumerate()
                         .map(|(axis, padding)| {
                             padding.checked_add(1).ok_or_else(|| {
-                                TypeError::invalid(format!("'pad' transpose stride overflows usize on axis {axis}"))
+                                TypeError::invalid(format!("'{PAD_OPERATION_NAME}' transpose stride overflows usize on axis {axis}"))
                             })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -501,7 +501,7 @@ where
                         .map(|(axis, dimension)| {
                             dimension.value().ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'pad' transpose requires a static unpadded extent on axis {axis} but has \
+                                    "'{PAD_OPERATION_NAME}' transpose requires a static unpadded extent on axis {axis} but has \
                                      {dimension}",
                                 ))
                             })
@@ -1226,7 +1226,7 @@ fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                 .map_err(|error| {
-                    TypeError::invalid(format!("'pad' dependency scalar sharding construction failed: {error}"))
+                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' dependency scalar sharding construction failed: {error}"))
                 })
         })
         .transpose()?;
@@ -1246,20 +1246,20 @@ fn padded_extent(
 ) -> Result<i128, TypeError> {
     let gap_count = input_size.saturating_sub(1);
     let input_size = i128::try_from(input_size)
-        .map_err(|_| TypeError::invalid(format!("'pad' input size is too large on axis {axis}")))?;
+        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
     let gap_count = i128::try_from(gap_count)
-        .map_err(|_| TypeError::invalid(format!("'pad' input size is too large on axis {axis}")))?;
+        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
     let interior_padding = i128::try_from(interior_padding)
-        .map_err(|_| TypeError::invalid(format!("'pad' interior padding is too large on axis {axis}")))?;
+        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' interior padding is too large on axis {axis}")))?;
     let dilated_size = input_size
         .checked_add(
             gap_count
                 .checked_mul(interior_padding)
-                .ok_or_else(|| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))?,
+                .ok_or_else(|| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))?,
         )
         .and_then(|size| size.checked_add(i128::from(edge_padding_low)))
         .and_then(|size| size.checked_add(i128::from(edge_padding_high)))
-        .ok_or_else(|| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))?;
+        .ok_or_else(|| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))?;
     Ok(dilated_size)
 }
 
@@ -1273,10 +1273,10 @@ fn static_padded_extent(
 ) -> Result<usize, TypeError> {
     let output_size = padded_extent(input_size, edge_padding_low, edge_padding_high, interior_padding, axis)?;
     if output_size < 0 {
-        return Err(TypeError::invalid(format!("'pad' output size is negative ({output_size}) on axis {axis}")));
+        return Err(TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size is negative ({output_size}) on axis {axis}")));
     }
     usize::try_from(output_size)
-        .map_err(|_| TypeError::invalid(format!("'pad' output size overflows usize on axis {axis}")))
+        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))
 }
 
 /// Validates the operand types and padding-vector arity shared by both padding type contracts.
@@ -1289,7 +1289,7 @@ fn validate_pad_inputs(
 ) -> Result<(), ProgramError> {
     if input.data_type() != padding_value.data_type() {
         return Err(TypeError::invalid(format!(
-            "'pad' input data type {} does not match padding value data type {}",
+            "'{PAD_OPERATION_NAME}' input data type {} does not match padding value data type {}",
             input.data_type(),
             padding_value.data_type(),
         ))
@@ -1297,12 +1297,12 @@ fn validate_pad_inputs(
     }
     if padding_value.rank() != 0 {
         return Err(
-            TypeError::invalid(format!("'pad' padding value must be a scalar but has type {padding_value}")).into()
+            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' padding value must be a scalar but has type {padding_value}")).into()
         );
     }
     if input.memory() != padding_value.memory() {
         return Err(TypeError::invalid(format!(
-            "'pad' input and padding value must share one memory space but reside in {} and {}",
+            "'{PAD_OPERATION_NAME}' input and padding value must share one memory space but reside in {} and {}",
             input.memory(),
             padding_value.memory(),
         ))
@@ -1315,7 +1315,7 @@ fn validate_pad_inputs(
     ] {
         if length != input.rank() {
             return Err(TypeError::invalid(format!(
-                "'pad' {name} has length {length} but input has rank {}",
+                "'{PAD_OPERATION_NAME}' {name} has length {length} but input has rank {}",
                 input.rank(),
             ))
             .into());
@@ -1350,7 +1350,7 @@ fn padded_output_type(
             || input.reduced_axes() != padding_value.reduced_axes()
         {
             return Err(TypeError::invalid(format!(
-                "'pad' input and padding value must have matching reduced and unreduced mesh axes but got input type \
+                "'{PAD_OPERATION_NAME}' input and padding value must have matching reduced and unreduced mesh axes but got input type \
                  {input} and padding value type {padding_value}",
             ))
             .into());
@@ -1361,7 +1361,7 @@ fn padded_output_type(
             != padding_varying_manual_axes.cloned().unwrap_or_default()
         {
             return Err(TypeError::invalid(format!(
-                "'pad' input and padding value must have matching varying manual axes but got input type {input} and \
+                "'{PAD_OPERATION_NAME}' input and padding value must have matching varying manual axes but got input type {input} and \
                  padding value type {padding_value}",
             ))
             .into());
@@ -1374,7 +1374,7 @@ fn padded_output_type(
                 != padding_value.sharding().map(|sharding| sharding.mesh())
         {
             return Err(TypeError::invalid(
-                "'pad' input and padding value with distributed dependencies must use the same mesh".to_string(),
+                format!("'{PAD_OPERATION_NAME}' input and padding value with distributed dependencies must use the same mesh"),
             )
             .into());
         }
@@ -1421,14 +1421,14 @@ impl Pad for ArrayType {
                         )?;
                         if maximum_output_extent < 0 {
                             return Err(TypeError::invalid(format!(
-                                "'pad' output size is negative ({maximum_output_extent}) on dynamic axis {axis} \
+                                "'{PAD_OPERATION_NAME}' output size is negative ({maximum_output_extent}) on dynamic axis {axis} \
                                  even at its maximum input extent {maximum_input_extent}",
                             ))
                             .into());
                         }
                     }
                     return Err(TypeError::invalid(format!(
-                        "'pad' dynamic axis {axis} requires an explicit result-dimension operand",
+                        "'{PAD_OPERATION_NAME}' dynamic axis {axis} requires an explicit result-dimension operand",
                     ))
                     .into());
                 }

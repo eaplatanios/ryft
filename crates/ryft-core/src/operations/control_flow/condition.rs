@@ -129,11 +129,11 @@ fn validated_branch_interfaces<'i, T: Type>(
     check_count!("region", region_interfaces, 2, TypeError);
     let true_interface = &region_interfaces[0];
     let false_interface = &region_interfaces[1];
-    check_types!(@same, "condition branch input", [
+    check_types!(@same, format!("{CONDITION_OPERATION_NAME} branch input"), [
         true_interface.input_types(),
         false_interface.input_types(),
     ]);
-    check_types!(@same, "condition branch output", [
+    check_types!(@same, format!("{CONDITION_OPERATION_NAME} branch output"), [
         true_interface.output_types(),
         false_interface.output_types(),
     ]);
@@ -163,7 +163,7 @@ where
     ) -> Result<Vec<Option<Vec<F::Type>>>, TypeError> {
         check_count!("region", region_interfaces, 2, TypeError);
         if input_types.is_empty() {
-            return Err(TypeError::invalid("condition expects at least one input but got 0"));
+            return Err(TypeError::invalid(format!("{CONDITION_OPERATION_NAME} expects at least one input but got 0")));
         }
         if region_interfaces.iter().all(|interface| interface.input_types() == &input_types[1..]) {
             return Ok(vec![None, None]);
@@ -181,11 +181,14 @@ where
         check_count!("input", input_types, true_interface.input_types().len() + 1, TypeError);
         if !input_types[0].is_condition_predicate() {
             return Err(TypeError::invalid(format!(
-                "condition predicate type must be a scalar boolean, but got {}",
-                input_types[0]
+                "{} predicate type must be a scalar boolean, but got {}",
+                CONDITION_OPERATION_NAME, input_types[0],
             )));
         }
-        check_types!(@same, "condition input", [true_interface.input_types(), &input_types[1..]]);
+        check_types!(@same, format!("{CONDITION_OPERATION_NAME} input"), [
+            true_interface.input_types(),
+            &input_types[1..],
+        ]);
         Ok(true_interface.output_types().to_vec())
     }
 
@@ -213,9 +216,9 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         if inputs.is_empty() {
-            return Err(ProgramError::MalformedProgram(
-                "condition interpretation requires a predicate input".to_string(),
-            ));
+            return Err(ProgramError::MalformedProgram(format!(
+                "{CONDITION_OPERATION_NAME} interpretation requires a predicate input"
+            )));
         }
         let (predicate, branch_inputs) = (inputs[0].concretize()?, &inputs[1..]);
         driver.interpret_region(context, if predicate { 0 } else { 1 }, branch_inputs.to_vec())
@@ -441,7 +444,7 @@ where
             .collect::<Vec<_>>();
         if known_input_indices != expected_known_input_indices {
             return Err(ProgramError::MalformedProgram(format!(
-                "condition branch partition reported known input indices {known_input_indices:?} but expected \
+                "{CONDITION_OPERATION_NAME} branch partition reported known input indices {known_input_indices:?} but expected \
                  {expected_known_input_indices:?}",
             )));
         }
@@ -460,13 +463,13 @@ where
             if let PartialEvaluationInput::Known(edge) = input {
                 if *edge != edge_types.len() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "condition branch partition reported residual edge {edge} out of order",
+                        "{CONDITION_OPERATION_NAME} branch partition reported residual edge {edge} out of order",
                     )));
                 }
                 let output = known_result_count + edge;
                 let output_type = known_program_output_types.get(output).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "condition branch partition residual edge {edge} has no known-program output",
+                        "{CONDITION_OPERATION_NAME} branch partition residual edge {edge} has no known-program output",
                     ))
                 })?;
                 edge_types.push(output_type.clone());
@@ -479,7 +482,7 @@ where
                 if let PartialEvaluationOutput::Known(output) = output {
                     let output_type = known_program_output_types.get(*output).ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
-                            "condition branch partition output {index} references missing known-program output \
+                            "{CONDITION_OPERATION_NAME} branch partition output {index} references missing known-program output \
                              {output}",
                         ))
                     })?;
@@ -553,14 +556,15 @@ where
                     PartialEvaluationOutput::Known(output) => {
                         output_atoms.push(*known_outputs.get(*output).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
-                                "condition branch partition references missing known-program output {output}",
+                                "{CONDITION_OPERATION_NAME} branch partition references missing known-program output \
+                                 {output}",
                             ))
                         })?)
                     }
                     PartialEvaluationOutput::Unknown(_) => {
-                        return Err(ProgramError::MalformedProgram(
-                            "condition known-ness split lost a known output".to_string(),
-                        ));
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "{CONDITION_OPERATION_NAME} known-ness split lost a known output"
+                        )));
                     }
                 }
             }
@@ -577,7 +581,7 @@ where
             .map(|&output| {
                 known_outputs.get(output).copied().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "condition branch partition references missing edge output {output}",
+                        "{CONDITION_OPERATION_NAME} branch partition references missing edge output {output}",
                     ))
                 })
             })
@@ -668,16 +672,16 @@ where
                 match input {
                     PartialEvaluationInput::Unknown(index) => {
                         spliced_inputs.push(unknown_input_atoms.get(*index).copied().flatten().ok_or_else(|| {
-                            ProgramError::MalformedProgram(
-                                "condition known-ness split saw a residual feeder for a known input".to_string(),
-                            )
+                            ProgramError::MalformedProgram(format!(
+                                "{CONDITION_OPERATION_NAME} known-ness split saw a residual feeder for a known input",
+                            ))
                         })?);
                     }
                     PartialEvaluationInput::Known(edge) => {
                         spliced_inputs.push(*own_edge_atoms.get(*edge).ok_or_else(|| {
-                            ProgramError::MalformedProgram(
-                                "condition known-ness split lost a residual edge".to_string(),
-                            )
+                            ProgramError::MalformedProgram(format!(
+                                "{CONDITION_OPERATION_NAME} known-ness split lost a residual edge"
+                            ))
                         })?)
                     }
                 }
@@ -693,9 +697,9 @@ where
                     PartialEvaluationOutput::Unknown(spliced) => output_atoms.push(spliced_outputs[*spliced]),
                     PartialEvaluationOutput::Known(_) => {
                         let edge = own.instantiated_edge_ordinals[index].ok_or_else(|| {
-                            ProgramError::MalformedProgram(
-                                "condition known-ness split lost an instantiated output edge".to_string(),
-                            )
+                            ProgramError::MalformedProgram(format!(
+                                "{CONDITION_OPERATION_NAME} known-ness split lost an instantiated output edge",
+                            ))
                         })?;
                         output_atoms.push(own_edge_atoms[edge]);
                     }
@@ -726,16 +730,18 @@ where
         );
         for edge in 0..true_split.edge_types.len() {
             residual_condition_inputs.push(known_outputs.get(true_edge_offset + edge).cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(
-                    "condition known-ness split known side produced no output for a true-branch edge".to_string(),
-                )
+                ProgramError::MalformedProgram(format!(
+                    "{CONDITION_OPERATION_NAME} known-ness split known side produced no output for a true-branch \
+                         edge",
+                ))
             })?);
         }
         for edge in 0..false_split.edge_types.len() {
             residual_condition_inputs.push(known_outputs.get(false_edge_offset + edge).cloned().ok_or_else(|| {
-                ProgramError::MalformedProgram(
-                    "condition known-ness split known side produced no output for a false-branch edge".to_string(),
-                )
+                ProgramError::MalformedProgram(format!(
+                    "{CONDITION_OPERATION_NAME} known-ness split known side produced no output for a false-branch \
+                         edge",
+                ))
             })?);
         }
         context.residualize(
@@ -753,22 +759,24 @@ where
         .map(|index| {
             if out_known[index] {
                 let value = known_outputs.get(known_output_ordinal).cloned().ok_or_else(|| {
-                    ProgramError::MalformedProgram(
-                        "condition known-ness split known side produced no output for a known result".to_string(),
-                    )
+                    ProgramError::MalformedProgram(format!(
+                        "{CONDITION_OPERATION_NAME} known-ness split known side produced no output for a known \
+                             result",
+                    ))
                 });
                 known_output_ordinal += 1;
                 value
             } else {
                 let ordinal = residual_output_ordinals[index].ok_or_else(|| {
-                    ProgramError::MalformedProgram(
-                        "condition known-ness split produced a result owned by neither side".to_string(),
-                    )
+                    ProgramError::MalformedProgram(format!(
+                        "{CONDITION_OPERATION_NAME} known-ness split produced a result owned by neither side"
+                    ))
                 })?;
                 residual_outputs.get(ordinal).cloned().ok_or_else(|| {
-                    ProgramError::MalformedProgram(
-                        "condition known-ness split residual side produced no output for a residual result".to_string(),
-                    )
+                    ProgramError::MalformedProgram(format!(
+                        "{CONDITION_OPERATION_NAME} known-ness split residual side produced no output for a \
+                             residual result",
+                    ))
                 })
             }
         })
@@ -854,7 +862,7 @@ where
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
-                message: "cannot batch a condition operation with no predicate input".to_string(),
+                message: format!("cannot batch a {CONDITION_OPERATION_NAME} operation with no predicate input"),
             });
         };
         if !predicate_batch.batch_axis().is_replicated() {
@@ -862,9 +870,10 @@ where
             let false_region = driver.region(1)?;
             if !true_region.effects().is_pure() || !false_region.effects().is_pure() {
                 return Err(BatchingError::UnsupportedOperation {
-                    message: "cannot batch a condition with a batch-varying predicate and effectful branches because \
-                              observable effects cannot be selected per batch item"
-                        .to_string(),
+                    message: format!(
+                        "cannot batch a {CONDITION_OPERATION_NAME} with a batch-varying predicate and effectful \
+                         branches because observable effects cannot be selected per batch item",
+                    ),
                 });
             }
             // Batch-varying predicate: batch both branches item-agnostically through the region access and merge
@@ -1010,7 +1019,7 @@ where
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let Some((predicate, operands)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
-                message: "cannot batch a condition operation with no predicate input".to_string(),
+                message: format!("cannot batch a {CONDITION_OPERATION_NAME} operation with no predicate input"),
             });
         };
         <&ArrayType>::try_from(&predicate.unbatched_type())?;
@@ -1077,9 +1086,10 @@ where
         let false_region = driver.region(1)?;
         if !true_region.effects().is_pure() || !false_region.effects().is_pure() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "cannot batch a condition with a batch-varying predicate and effectful branches because \
-                          observable effects cannot be selected per batch item"
-                    .to_string(),
+                message: format!(
+                    "cannot batch a {CONDITION_OPERATION_NAME} with a batch-varying predicate and effectful branches \
+                     because observable effects cannot be selected per batch item",
+                ),
             });
         }
         let true_outputs = driver.batch_region(context, 0, operands.to_vec())?;
@@ -1276,7 +1286,7 @@ where
     let branch_tangent_count = operand_linear.iter().filter(|&&linear| linear).count();
     let residual_count = branch_input_count.checked_sub(branch_tangent_count).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
-            "condition transpose found {branch_tangent_count} linear operands but its branches take only \
+            "{CONDITION_OPERATION_NAME} transpose found {branch_tangent_count} linear operands but its branches take only \
              {branch_input_count} inputs",
         ))
     })?;
@@ -1288,7 +1298,9 @@ where
         inputs[index]
             .as_known()
             .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("condition transpose operand {index} has no known value"))
+                ProgramError::MalformedProgram(format!(
+                    "{CONDITION_OPERATION_NAME} transpose operand {index} has no known value",
+                ))
             })
             .cloned()
     };

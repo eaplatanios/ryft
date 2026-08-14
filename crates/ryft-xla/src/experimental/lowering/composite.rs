@@ -1,8 +1,9 @@
 //! StableHLO lowering for programs that mix arrays with first-class dimensions.
 
 use ryft_core::{
-    ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DataType, Dimension, DimensionOperation,
-    DimensionRequirementOperation, DimensionType, Effect, Operation, ProgramError, Shape,
+    ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
+    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, Effect, Operation, ProgramError,
+    Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -45,7 +46,7 @@ fn plan_dynamic_shape_slice_axis(
 ) -> Result<DynamicShapeSliceAxisPlan, LoweringError> {
     let Some(size_upper) = size_type.bounds().upper() else {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("dynamic_shape_slice size on axis {axis} needs a finite upper bound"),
+            op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
         });
     };
     let size = size_upper - 1;
@@ -53,7 +54,9 @@ fn plan_dynamic_shape_slice_axis(
         0
     } else {
         (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
-            LoweringError::UnsupportedOp { op: format!("dynamic_shape_slice physical span overflows on axis {axis}") }
+            LoweringError::UnsupportedOp {
+                op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
+            }
         })?
     };
     let (input_minimum, input_physical_size) = match input_dimension {
@@ -61,7 +64,7 @@ fn plan_dynamic_shape_slice_axis(
         Dimension::Dynamic(variable) => {
             let Some(upper) = variable.bounds().upper() else {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("dynamic_shape_slice input on axis {axis} needs a finite upper bound"),
+                    op: format!("{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
                 });
             };
             (variable.bounds().lower(), upper - 1)
@@ -70,7 +73,7 @@ fn plan_dynamic_shape_slice_axis(
     if span > input_physical_size {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "dynamic_shape_slice physical span {span} exceeds physical input axis {axis} size \
+                "{DYNAMIC_SHAPE_SLICE_OPERATION_NAME} physical span {span} exceeds physical input axis {axis} size \
                  {input_physical_size}",
             ),
         });

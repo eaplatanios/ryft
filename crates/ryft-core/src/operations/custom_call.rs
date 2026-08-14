@@ -15,6 +15,7 @@ use crate::batching::{
     batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
+use crate::differentiation::custom::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -705,9 +706,10 @@ impl_differentiable_operation! {
             // `ffi_call` differentiation.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \
-                     provide one",
+                    "custom call '{}' has no differentiation rule; wrap it with `{}` or `{}` to provide one",
                     operation.target_name,
+                    CUSTOM_JVP_OPERATION_NAME,
+                    CUSTOM_VJP_OPERATION_NAME,
                 ),
             }
             .into())

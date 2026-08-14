@@ -10,8 +10,8 @@ use crate::arrays::encoding::{ArrayElement, i1, i2, i4, u1, u2, u4};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::operations::sort::{
-    ArgMax, ArgMin, Sort, SortDirection, TopK, extremal_index_from_index_passenger, sort_permutation,
-    top_k_from_index_passenger, top_k_via_squeezed_view,
+    ArgMax, ArgMin, SORT_OPERATION_NAME, Sort, SortDirection, TopK, extremal_index_from_index_passenger,
+    sort_permutation, top_k_from_index_passenger, top_k_via_squeezed_view,
 };
 use crate::programs::{ProgramError, TypeError, Typed};
 
@@ -60,16 +60,19 @@ impl Sort for Array {
         key_count: usize,
     ) -> Result<Vec<Self>, ProgramError> {
         let Some(key) = operands.first() else {
-            return Err(ProgramError::UnsupportedOperation { message: "'sort' needs at least one input".to_string() });
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("'{SORT_OPERATION_NAME}' needs at least one input"),
+            });
         };
         if key_count == 0 {
             return Err(ProgramError::UnsupportedOperation {
-                message: "'sort' key_count must be at least 1".to_string(),
+                message: format!("'{SORT_OPERATION_NAME}' key_count must be at least 1"),
             });
         }
         if key_count > operands.len() {
             return Err(TypeError::invalid(format!(
-                "'sort' key_count {} exceeds operand count {}",
+                "'{}' key_count {} exceeds operand count {}",
+                SORT_OPERATION_NAME,
                 key_count,
                 operands.len(),
             ))
@@ -77,14 +80,19 @@ impl Sort for Array {
         }
         let shape = key.r#type().static_shape().unwrap();
         if axis >= shape.rank() {
-            return Err(
-                TypeError::invalid(format!("'sort' axis {axis} is out of bounds for rank {}", shape.rank())).into()
-            );
+            return Err(TypeError::invalid(format!(
+                "'{}' axis {} is out of bounds for rank {}",
+                SORT_OPERATION_NAME,
+                axis,
+                shape.rank(),
+            ))
+            .into());
         }
         for operand in operands {
             if operand.r#type().shape() != key.r#type().shape() {
                 return Err(TypeError::invalid(format!(
-                    "'sort' operands must agree on shape but got {} and {}",
+                    "'{}' operands must agree on shape but got {} and {}",
+                    SORT_OPERATION_NAME,
                     key.r#type().shape(),
                     operand.r#type().shape(),
                 ))
@@ -96,7 +104,9 @@ impl Sort for Array {
             .map(|key| {
                 let data_type = key.r#type().data_type();
                 let unsupported = || {
-                    ProgramError::from(TypeError::invalid(format!("'sort' does not support key data type {data_type}")))
+                    ProgramError::from(TypeError::invalid(format!(
+                        "'{SORT_OPERATION_NAME}' does not support key data type {data_type}",
+                    )))
                 };
                 let addressing = ArrayAddressing::new(key.r#type().into_owned())?;
                 (0..addressing.element_count())
@@ -128,9 +138,13 @@ fn eager_index_passenger(value: &Array, axis: usize) -> Result<(Array, Vec<usize
     let shape = value.r#type().static_shape().unwrap();
     let dimensions = shape.dimensions().to_vec();
     if axis >= dimensions.len() {
-        return Err(
-            TypeError::invalid(format!("'sort' axis {} is out of bounds for rank {}", axis, dimensions.len())).into()
-        );
+        return Err(TypeError::invalid(format!(
+            "'{}' axis {} is out of bounds for rank {}",
+            SORT_OPERATION_NAME,
+            axis,
+            dimensions.len(),
+        ))
+        .into());
     }
     let inner_stride: usize = dimensions[axis + 1..].iter().product();
     let axis_size = dimensions[axis];

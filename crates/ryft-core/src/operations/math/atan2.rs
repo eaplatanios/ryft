@@ -57,7 +57,7 @@ impl_differentiable_operation! {
             }
             if target.is_zero_space() {
                 return Err(ProgramError::UnsupportedOperation {
-                    message: format!("'atan2' output type {} has no tangent space", primal.r#type()),
+                    message: format!("'{}' output type {} has no tangent space", ATAN2_OPERATION_NAME, primal.r#type()),
                 }
                 .into());
             }

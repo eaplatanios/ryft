@@ -81,16 +81,16 @@ impl RngBitGenerator for Array {
         output_type: &ArrayType,
     ) -> Result<(Self, Self), ProgramError> {
         let Some(output_shape) = output_type.static_shape() else {
-            return Err(TypeError::invalid(
-                "'rng_bit_generator' does not support dynamically shaped outputs".to_string(),
-            )
+            return Err(TypeError::invalid(format!(
+                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support dynamically shaped outputs"
+            ))
             .into());
         };
         let count = output_shape.dimensions().iter().product::<usize>();
         let data_type = output_type.data_type();
         if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
             return Err(TypeError::invalid(format!(
-                "'rng_bit_generator' does not support output data type {data_type}",
+                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support output data type {data_type}",
             ))
             .into());
         }
@@ -99,7 +99,10 @@ impl RngBitGenerator for Array {
             || self.r#type().shape() != expected_state_type.shape()
         {
             return Err(TypeError::invalid(format!(
-                "'rng_bit_generator' with the {algorithm} algorithm needs a {expected_state_type} state but got {}",
+                "'{}' with the {} algorithm needs a {} state but got {}",
+                RNG_BIT_GENERATOR_OPERATION_NAME,
+                algorithm,
+                expected_state_type,
                 self.r#type().as_ref(),
             ))
             .into());
