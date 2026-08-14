@@ -469,8 +469,11 @@ impl ScanTypeSemantics for ArrayType {
         let capture_type = capture.r#type();
         if capture_type.rank() == 0 || !length.is_refined_by(&capture_type.dimension(0)) {
             return Err(TypeError::invalid(format!(
-                "{SCAN_OPERATION_NAME} capture {index} must have leading dimension {length} but has type {capture_type}",
-                capture_type = capture_type.as_ref(),
+                "{} capture {} must have leading dimension {} but has type {}",
+                SCAN_OPERATION_NAME,
+                index,
+                length,
+                capture_type.as_ref(),
             )));
         }
         Ok(())
@@ -562,10 +565,13 @@ pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
         };
         if leading_extent != Some(extent) {
             return Err(TypeError::invalid(format!(
-                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but stacked input \
-                 {index} has type {type} whose leading dimension is not refined to extent {extent}",
-                index = carry_count + index,
-                r#type = r#type,
+                "'{}' runtime length operand has type {} but stacked input {} has type {} whose leading dimension is \
+                 not refined to extent {}",
+                SCAN_OPERATION_NAME,
+                runtime_length_type,
+                carry_count + index,
+                r#type,
+                extent,
             )));
         }
     }

@@ -68,17 +68,22 @@ fn validate_start_index_types(
         }
         if index_type.memory() != operand_memory {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' operand and start indices must share one memory space but start index {index} \
-                     resides in {} and the operand resides in {operand_memory}",
+                "'{}' operand and start indices must share one memory space but start index {} resides in {} and the \
+                 operand resides in {}",
+                operation_name,
+                index,
                 index_type.memory(),
+                operand_memory,
             ))
             .into());
         }
         if index_type.data_type() != index_types[0].data_type() {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' start indices must share one integer type but index {index} has type \
-                    {index_type} and index 0 has type {first}",
-                first = index_types[0],
+                "'{}' start indices must share one integer type but index {} has type {} and index 0 has type {}",
+                operation_name,
+                index,
+                index_type,
+                index_types[0],
             ))
             .into());
         }
