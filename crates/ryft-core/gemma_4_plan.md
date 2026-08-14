@@ -3,9 +3,22 @@
 This document captures (1) the operation inventory needed to train Google's Gemma 4 family
 end-to-end inside `ryft`, marking which primitives are already in `ryft-core` / `ryft-xla` and
 which still need to be added, (2) the high-level implementation plan that would follow once the
-missing primitives land, and (3) an aspirational `ryft` model implementation written against
-that future API surface. The aspirational code does **not** compile against today's tree — it is
-a forward-looking design artifact.
+missing primitives land, and (3) a target `ryft` model implementation written against that API
+surface.
+
+> **Revision status.** This plan was originally written against the earlier `tracing_v2`-centric
+> architecture. The codebase has since been rebuilt around the typed `programs` IR,
+> context-based eager dispatch, the builder-style differentiation API (`differentiate_at`),
+> backend-neutral `compilation`/JIT with structural and disk caching, first-class dynamic
+> dimensions, and a hugely expanded operation set under `crates/ryft-core/src/operations/` —
+> and **nearly every primitive this plan listed as missing has landed**, including the fused
+> `DotProductAttentionOperation` (with causal masking, sliding windows, GQA, and a cuDNN FMHA
+> lowering), the complete `ScaledDotOperation` + `BlockQuantize` NVFP4/MX path from §4, device
+> RNG (ThreeFry/Philox), collectives, `ScanOperation`, and JAX-parity rematerialization
+> policies with offload support. The inventory tables and phase statuses below have been
+> updated in place. The remaining work is concentrated in §2's revised phase list — the model
+> crate itself, an optimizer module, a mixed-precision policy helper, and (for the multimodal
+> path only) a convolution primitive — rather than in IR primitives.
 
 The architecture reference is the published Gemma 4 family (E2B, E4B, 26B-A4B mixture-of-experts,
 31B dense flagship). The salient features that drive the inventory are: grouped-query attention
@@ -49,161 +62,200 @@ both are needed).
 
 ### 1.1 Elementwise arithmetic & scalar math
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.add` | residual stream, mask combination, AdamW first moment, gradient accumulation | ✅ | — | `AddOperation`, `SupportsAdd` |
-| `lax.sub` | softmax stabilization (`x - max`), KV-cache positional masks | ✅ | — | `SubOperation`, `SupportsSub` |
-| `lax.mul` | RMSNorm scale, mask × logits, attention `scale_factor`, AdamW second moment | ✅ | — | `MulOperation`, `SupportsMul` |
-| `lax.div` | softmax normalization (denominator), AdamW update | ✅ | — | `DivOperation`, `SupportsDiv` |
-| `lax.neg` | causal mask construction, sign of grads | ✅ | — | `NegOperation`, `SupportsNeg` |
-| `Scale` (captured factor) | RoPE base-frequency multiply, scale * sqrt(d_model) embedding multiply | ✅ | — | `ScaleOperation`, `SupportsScale` |
-| `lax.sin` | RoPE rotation | ✅ | — | `SinOperation`, `SupportsSin` |
-| `lax.cos` | RoPE rotation | ✅ | — | `CosOperation`, `SupportsCos` |
-| `lax.rsqrt` | RMSNorm `x * rsqrt(mean(x^2) + eps)` | ❌ | `ryft-core` + `ryft-xla` | New `RsqrtOperation` + StableHLO `stablehlo.rsqrt` |
-| `lax.sqrt` | AdamW `sqrt(v_hat) + eps`, gradient global norm | ❌ | `ryft-core` + `ryft-xla` | New `SqrtOperation` + `stablehlo.sqrt` |
-| `lax.exp` | softmax (`exp(x - max)`) | ❌ | `ryft-core` + `ryft-xla` | `ExpOperation` + `stablehlo.exponential` |
-| `lax.log` | `logsumexp` for cross-entropy | ❌ | `ryft-core` + `ryft-xla` | `LogOperation` + `stablehlo.log` |
-| `lax.tanh` | final logit softcap (`30 * tanh(logits / 30)`), GELU tanh-approx | ❌ | `ryft-core` + `ryft-xla` | `TanhOperation` + `stablehlo.tanh` |
-| `lax.erf` | exact GELU (`0.5 * x * (1 + erf(x / sqrt(2)))`) | ❌ | `ryft-core` + `ryft-xla` | `ErfOperation` + `stablehlo.erf`. Optional if tanh-approx is chosen instead |
-| `jax.nn.gelu` | GeGLU activation in MLP | ❌ | `ryft-core` | Composite — implementable as a value-level helper on top of `erf` (or `tanh`) + scale + add + mul. Adding it as a fused first-class op is also reasonable |
-| `lax.abs` | gradient global norm (`sqrt(sum(g^2))` — `g^2` works, but `abs` shows up in clip-by-norm sentinels) | ❌ | `ryft-core` + `ryft-xla` | `AbsOperation` + `stablehlo.abs` |
-| `lax.integer_pow` / `x*x` | `g^2` for variance/grad norm | ⚠️ | — | Achievable today via `Mul`; a fused `SquareOperation` is optional |
-| `lax.max` (binary) / `lax.min` | `min(1, clip / norm)` in gradient clipping, attention bias floor | ❌ | `ryft-core` + `ryft-xla` | `MaxOperation`, `MinOperation` + `stablehlo.maximum`, `stablehlo.minimum`. Worth introducing together |
-| `lax.clamp` | optional logit floor/ceil pre-softcap | ❌ | `ryft-core` + `ryft-xla` | Composite via `max`+`min`; first-class `ClampOperation` mirrors `stablehlo.clamp` |
-| `lax.convert_element_type` | bf16 ↔ fp32 casts between forward, accumulation, and optimizer state | ❌ | `ryft-core` + `ryft-xla` | `ConvertElementTypeOperation` + `stablehlo.convert`. Needs proper differentiation (identity on the matching-precision branch, otherwise composed cast) |
+All landed. Every op lives in `crates/ryft-core/src/operations/math/` following the
+`XxxOperation` struct + `Xxx` capability trait pattern, with blanket impls that give the
+reference `Array` backend and every transform tracer the same method surface, and StableHLO
+lowerings in `crates/ryft-xla/src/experimental/lowering.rs`.
+
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.add` / `sub` / `mul` / `div` / `neg` / `rem` | residual stream, masks, optimizer updates | ✅ | `AddOperation` … `RemOperation`; both `std::ops` sugar and fallible capability traits |
+| scalar scaling | RoPE base-frequency multiply, `sqrt(d_model)` embedding multiply | ✅ | plain `Mul` against a filled/broadcast scalar (the old dedicated `ScaleOperation` is gone) |
+| `lax.sin` / `cos` / `atan2` | RoPE rotation | ✅ | `SinOperation`, `CosOperation`, `Atan2Operation` |
+| `lax.rsqrt` | RMSNorm `x * rsqrt(mean(x^2) + eps)` | ✅ | `RsqrtOperation`, `Rsqrt::rsqrt` |
+| `lax.sqrt` | AdamW `sqrt(v_hat) + eps`, gradient global norm | ✅ | `SqrtOperation` |
+| `lax.exp` / `log` | softmax, `logsumexp` for cross-entropy | ✅ | `ExpOperation`, `LogOperation` (no `log1p`/`expm1` in core; not needed for Gemma) |
+| `lax.tanh` | final logit softcap (`30 * tanh(logits / 30)`), GELU tanh-approx | ✅ | `TanhOperation` |
+| `lax.erf` | exact GELU (`0.5 * x * (1 + erf(x / sqrt(2)))`) | ✅ | `ErfOperation`, lowered via `chlo.erf` |
+| `lax.logistic` | sigmoid (router gates in the MoE variant) | ✅ | `LogisticOperation` |
+| `jax.nn.gelu` | GeGLU activation in MLP | ⚠️ | still a model-level composition on `erf` (or `tanh`); all ingredients exist |
+| `lax.abs` / `sign` | gradient global norm, clip sentinels | ✅ | `AbsOperation`, `SignOperation` |
+| `lax.pow` | `g^2`, learning-rate schedules | ✅ | `PowOperation` (single op; no separate `integer_pow`) |
+| `lax.max` / `min` (binary) | gradient clipping `min(1, clip/norm)`, bias floors | ✅ | `MaxOperation`, `MinOperation` |
+| `lax.clamp` | logit floor/ceil, MX quantization clamping | ✅ | `Clamp` capability trait composed from `Max`+`Min` (no dedicated primitive — intentional) |
+| `lax.floor` / `ceil` / `round` | quantization recipes, schedules | ✅ | `FloorOperation`, `CeilOperation`, `RoundOperation` (round-to-nearest-even lowering) |
+| `lax.convert_element_type` | bf16 ↔ fp32 casts between forward, accumulation, and optimizer state | ✅ | `ConvertElementTypeOperation` + `promote_element_type`. **No rounding-mode parameter yet** — relevant only to §4's stochastic-rounding item |
+| complex ops | not needed by Gemma; listed for completeness | ✅ | `Complex`, `Conjugate`, `Real`, `Imaginary` |
 
 ### 1.2 Comparisons & boolean logic (mask construction)
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.eq`, `lax.ne` | padding masks (`tokens != pad_id`) | ❌ | `ryft-core` + `ryft-xla` | `EqOperation`, `NeOperation` + `stablehlo.compare` (EQ/NE) |
-| `lax.lt`, `lax.le`, `lax.gt`, `lax.ge` | causal mask (`q_pos >= k_pos`), sliding-window mask (`q_pos - k_pos < W`) | ❌ | `ryft-core` + `ryft-xla` | One `CompareOperation { direction }` carrier mapping to `stablehlo.compare` is cleaner than four ops |
-| `lax.bitwise_and` / `lax.bitwise_or` / `lax.bitwise_not` | mask combination (causal AND sliding), padding NOT, etc. | ❌ | `ryft-core` + `ryft-xla` | `AndOperation`, `OrOperation`, `NotOperation` + `stablehlo.and`, `stablehlo.or`, `stablehlo.not`. Boolean overloads with sensible promotion |
-| `lax.select_n` (a.k.a. `where`) | applying mask to logits (replace with large negative), padding loss-mask | ✅ | — | Already covered by `SelectOperation` |
+All landed, exactly in the single-carrier shape the original plan recommended.
+
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.eq`/`ne`/`lt`/`le`/`gt`/`ge` | padding masks, causal mask, sliding-window mask | ✅ | one `CompareOperation` with `ComparisonDirection::{Equal, NotEqual, LessThan, LessThanOrEqual, GreaterThan, GreaterThanOrEqual}` |
+| `lax.bitwise_and`/`or`/`not`/`xor` | mask combination (causal AND sliding), padding NOT | ✅ | `AndOperation`, `OrOperation`, `NotOperation`, `XorOperation` in `operations/logical/` |
+| `lax.select_n` (a.k.a. `where`) | applying mask to logits, padding loss-mask | ✅ | `SelectOperation` |
+
+Note that hand-built attention masks are now needed only for exotic cases: the fused
+`DotProductAttentionOperation` (§1.5) carries causal masking and sliding windows natively.
 
 ### 1.3 Reductions
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.reduce_sum` | RMSNorm `mean(x^2)`, softmax denominator, cross-entropy sum, grad norm | ❌ | `ryft-core` + `ryft-xla` | New `ReduceOperation { kind: Sum, axes, keepdims }` + lowering to `stablehlo.reduce` with the `add` body |
-| `lax.reduce_max` | softmax numerical stability (`max(x, axis=-1)`) | ❌ | `ryft-core` + `ryft-xla` | Same `ReduceOperation` carrier with `Max` kind |
-| `lax.reduce_min` | sliding-window bounds clamp (rare) | ❌ | `ryft-core` + `ryft-xla` | `ReduceOperation` with `Min` |
-| `lax.reduce_prod` | (not used by Gemma 4; optional) | ❌ | `ryft-core` + `ryft-xla` | Optional |
-| `mean` (composite) | RMSNorm | ⚠️ | `ryft-core` | Once `reduce_sum` + `Scale` exist, `mean` is a value-level helper |
-| `logsumexp` (composite) | cross-entropy denominator | ⚠️ | `ryft-core` | Helper on `reduce_max` + `sub` + `exp` + `reduce_sum` + `log` + `add` |
+Landed as the single-carrier `ReduceOperation` the original plan recommended, with `Mean` as a
+bonus first-class kind (so RMSNorm's `mean(x^2)` needs no helper).
 
-The recommended shape is a single `ReduceOperation` primitive that carries an axis list, a
-`keepdims` flag, and a small `ReduceKind` enum (`Sum`, `Max`, `Min`, optionally `Prod`). This
-matches how StableHLO's `reduce` op is parameterized and keeps the carrier compact. The JVP/transpose
-rules differ per kind, so the trait surface should still expose typed entry points
-(`SupportsReduceSum`, `SupportsReduceMax`).
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.reduce_sum` | softmax denominator, cross-entropy sum, grad norm | ✅ | `value.reduce(&axes, ReductionKind::Sum)`; also `reduce_with_output_sharding` |
+| `mean` | RMSNorm `mean(x^2)` | ✅ | first-class `ReductionKind::Mean` |
+| `lax.reduce_max` / `reduce_min` | softmax numerical stability | ✅ | `ReductionKind::Max` / `Min` |
+| `any` / `all` | mask diagnostics | ✅ | `ReductionKind::Any` / `All` |
+| `lax.reduce_prod` | (not used by Gemma 4) | ❌ | no `Prod` kind; not needed |
+| `argmax` / `argmin` | sampling, top-1 accuracy | ✅ | `ArgMax::argmax(axis)` / `ArgMin::argmin(axis)` in `operations/sort.rs`, composed from `Sort` |
+| cumulative ops (`cumsum`) | (not used by Gemma 4 training) | ❌ | absent; not needed |
+| `logsumexp` / `softmax` (composite) | cross-entropy; standalone softmax | ⚠️ | still model-level compositions (`reduce_max` + `sub` + `exp` + `reduce` + `log`); the fused attention op embeds its own softmax, so only the LM-head loss needs the composition |
 
 ### 1.4 Shape & data movement
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.reshape` | folding GQA group dim into head dim, flattening for `dot_general` | ✅ | — | `ReshapeOperation`, `SupportsReshape` |
-| `lax.transpose` / `lax.permute` | `[B,T,N,H] ↔ [B,N,T,H]`, RoPE half axis prep | ✅ | — | `TransposeOperation`, `SupportsTranspose` |
-| `lax.broadcast_in_dim` | RMSNorm scale broadcast, mask broadcast across heads, RoPE position broadcast | ✅ | — | `BroadcastInDimOperation`, `SupportsBroadcastInDim` |
-| `lax.concatenate` | RoPE half re-join, optional cache concat for prefill+decode | ❌ | `ryft-core` + `ryft-xla` | New `ConcatenateOperation { axis }` + `stablehlo.concatenate` |
-| `lax.slice` (static) | RoPE half split, KV-cache prefix slicing | ❌ | `ryft-core` + `ryft-xla` | `SliceOperation { start_indices, limit_indices, strides }` + `stablehlo.slice` |
-| `lax.dynamic_slice` | KV-cache reads at runtime offset, autoregressive decode | ❌ | `ryft-core` + `ryft-xla` | `DynamicSliceOperation { slice_sizes }` + `stablehlo.dynamic_slice` |
-| `lax.dynamic_update_slice` | KV-cache writes | ❌ | `ryft-core` + `ryft-xla` | `DynamicUpdateSliceOperation` + `stablehlo.dynamic_update_slice` |
-| `lax.gather` | token embedding lookup `table[input_ids]`, optional advanced indexing | ❌ | `ryft-core` + `ryft-xla` | `GatherOperation { dimension_numbers, slice_sizes }` + `stablehlo.gather`. Differentiated via a matching `scatter-add` |
-| `lax.scatter` / `scatter-add` | gradient of `gather` (embedding bwd), MoE expert dispatch | ❌ | `ryft-core` + `ryft-xla` | `ScatterOperation { dimension_numbers, update_computation }` + `stablehlo.scatter`. Needed both as a primitive and as the `gather` adjoint |
-| `lax.pad` | RoPE timescale padding with `+inf`, optional sequence padding | ❌ | `ryft-core` + `ryft-xla` | `PadOperation { padding_value, low, high, interior }` + `stablehlo.pad` |
-| `lax.iota` | position indices, RoPE arange | ❌ | `ryft-core` + `ryft-xla` | `IotaOperation { dimension, type_ }` + `stablehlo.iota` |
-| `lax.argmax` | inference sampling, top-1 accuracy metric | ❌ | `ryft-core` + `ryft-xla` | Lowers to `stablehlo.reduce` with a comparison body; first-class `ArgMaxOperation` keeps the IR readable |
-| `lax.bitcast_convert_type` | not strictly needed; mention only for completeness | — | — | — |
+All landed (in `operations/manipulation/` and `operations/constants/`), plus dynamic-shape
+variants the original plan never asked for (this branch adds first-class runtime dimensions —
+`DimensionOperation`, `ArrayIrOperation` — with `DynamicReshapeOperation`,
+`DynamicBroadcastOperation`, and `DynamicShapeSliceOperation`).
 
-### 1.5 Tensor contraction & matmul
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.reshape` | folding GQA group dim, flattening for `dot` | ✅ | `ReshapeOperation` (+ `DynamicReshapeOperation`) |
+| `lax.transpose` | layout permutations | ✅ | `TransposeOperation` + `Permutation` |
+| `lax.broadcast_in_dim` | scale/mask/position broadcasts | ✅ | `BroadcastOperation` (+ `DynamicBroadcastOperation`) |
+| `lax.concatenate` | RoPE half re-join, cache concat | ✅ | `ConcatenateOperation` |
+| `lax.slice` (static) | RoPE half split, KV-cache prefix slicing | ✅ | `SliceOperation` (+ `DynamicShapeSliceOperation`) |
+| `lax.dynamic_slice` / `dynamic_update_slice` | KV-cache reads/writes at runtime offsets | ✅ | `DynamicSliceOperation`, `DynamicUpdateSliceOperation` (+ static `UpdateSliceOperation`) |
+| `lax.gather` | token embedding lookup `table[input_ids]` | ✅ | `GatherOperation` with `GatherDimensionNumbers` and `GatherScatterMode::{PromiseInBounds, Clip, FillOrDrop}` |
+| `lax.scatter` / scatter-add | gradient of `gather` (embedding bwd), MoE dispatch | ✅ | `ScatterOperation` with `ScatterReductionKind::{Overwrite, Add, Mul, Min, Max}` |
+| `lax.pad` | RoPE timescale padding, sequence padding | ✅ | `PadOperation` |
+| `lax.iota` | position indices, RoPE arange | ✅ | `IotaOperation` (context-side constructor; + `DynamicIota` for dynamic shapes) |
+| `lax.sort` / `top_k` | sampling, MoE expert routing | ✅ | `SortOperation` (multi-key, `SortDirection`) + `TopK::top_k(k, axis)` |
+| `lax.rev` (reverse) | (not used by Gemma 4 training) | ❌ | absent as a standalone op (`ScanOperation` has `with_reverse`); not needed |
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.dot_general` | Q/K/V projections, attention logits, output projection, MLP gate/up/down, vocab head | ✅ | — | `DotOperation` with full `DotDimensionNumbers` |
-| `LeftDot` / `RightDot` (linearized factors) | transposition of `dot_general` in reverse-mode | ✅ | — | Already in `tracing_v2::operations::dot` |
-| `einsum` (Flax style) | not needed as a primitive; lowers to `dot_general` + `transpose` + `reshape` | ✅ | — | Build as a value-level helper at the model layer |
+### 1.5 Tensor contraction, matmul & fused attention
+
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.dot_general` | Q/K/V projections, MLP, vocab head | ✅ | `DotOperation` with `DotDimensionNumbers`, plus `dot_with_accumulation_type` and `dot_with_output_sharding` |
+| scaled (block-quantized) dot | FP8/NVFP4 matmuls (§4) | ✅ | `ScaledDotOperation` (`scaled_dot`), see §4 — implemented since the original plan |
+| fused dot-product attention | the entire attention core | ✅ | `DotProductAttentionOperation` + `DotProductAttentionBackwardOperation`: query `[batch, q_seq, heads, head_dim]` over key/value `[batch, kv_seq, kv_heads, head_dim]` with `kv_heads` dividing `heads` (**native GQA**), `AttentionMask::{None, Causal}`, `with_sliding_window`, `with_dropout(p, seed)`, optional bias and per-example sequence lengths, and `differentiable_dot_product_attention{,_with_bias,_with_sequence_lengths}` wiring the custom VJP. Lowers to cuDNN FMHA custom calls (`__cudnn$fmha…`) on GPU. This *subsumes* the hand-built logits→mask→softmax→context pipeline the original plan sketched |
+| `einsum` (string frontend) | ergonomics only | ❌ | still absent; `dot` + `reshape` + `transpose` cover everything, and the fused attention op removes the largest einsum consumer |
+| `lax.conv_general_dilated` | **vision encoder only** (SigLIP patch embedding) | ❌ | no convolution operation anywhere in `ryft-core`/`ryft-xla` (the raw `ryft-mlir` StableHLO bindings have it, but nothing emits it). Text-only training does not need it; the multimodal path does |
 
 ### 1.6 Random number generation
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `jax.random.split` (PRNG key plumbing) | reproducible streams per layer / per batch | ❌ | `ryft-core` | Needs a deterministic PRNG abstraction. Mirror JAX's threefry/Philox via a `PrngOperation` family |
-| `jax.random.normal` | weight initialization (truncated normal in Flax) | ❌ | `ryft-core` + `ryft-xla` | `RandomNormalOperation` + `stablehlo.rng` |
-| `jax.random.uniform` | dropout sampling, alternative inits | ❌ | `ryft-core` + `ryft-xla` | `RandomUniformOperation` + `stablehlo.rng` |
-| `jax.random.bernoulli` | dropout mask | ❌ | `ryft-core` + `ryft-xla` | Composite on top of `uniform` + `compare`; not training-critical for Gemma 4 since dropout is off in the reference recipe |
+Landed in `operations/random.rs`, in exactly the stateless-key shape the plan asked for.
 
-For first-class training support we need at least a `(key, shape, dtype) -> array` interface to
-`stablehlo.rng_bit_generator` together with stateless `split`. Weight initialization could be
-implemented host-side (NumPy → device transfer) as a stopgap, but bit-exact reproducibility under
-sharded data parallelism wants device-side RNG.
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `rng_bit_generator` | the base primitive | ✅ | `RngBitGeneratorOperation` with `RandomAlgorithm::{ThreeFry, Philox}`; lowers to `stablehlo.rng_bit_generator`; host reference kernels (`threefry2x32`, `philox4x32`) keep the CPU backend bit-compatible |
+| `jax.random.split` | reproducible streams per layer / per batch | ✅ | `Random::split_key(count) -> (advanced_state, fresh_states)`; keys are plain `u64` state arrays (no dedicated key type) |
+| `jax.random.normal` / `uniform` | weight initialization, sampling | ✅ | `Random::normal(shape, data_type)` / `Random::uniform(...)`, each returning `(advanced_state, samples)` |
+| `jax.random.categorical` | inference sampling | ✅ | `Random::categorical(logits, axis)` |
+| `jax.random.bernoulli` | dropout mask | ⚠️ | composite on `uniform` + `compare`; moreover the fused attention op carries its own `with_dropout(p, seed)`, which is the only dropout Gemma training would use |
+| truncated normal init | Flax-default weight init | ⚠️ | still a composition (uniform + erf-inverse or rejection); ordinary `normal` covers the practical need |
 
-### 1.7 Control flow
+### 1.7 Control flow & rematerialization
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `lax.cond` | optional logit softcap toggle, optional MoE-vs-dense branch | ✅ | — | `ConditionOperation` |
-| `lax.while_loop` | autoregressive decode loop, training-loop step | ✅ | — | `WhileOperation` |
-| `lax.scan` | layer-wise activation checkpointing, optional unrolled-vs-rolled choice | ❌ | `ryft-core` + `ryft-xla` | Can be desugared to `while_loop` + `dynamic_slice`/`dynamic_update_slice`; first-class `ScanOperation` keeps remat ergonomic |
-| `lax.fori_loop` | optimizer step over parameter tree | ⚠️ | — | Built on `while_loop`; can be a value-level helper |
-| `jax.checkpoint` (remat) | activation checkpointing per block | ❌ | `ryft-core` | A transform, not a primitive. Plumb a `CheckpointOperation` wrapper or a tracing-time policy that re-stages the inner program on the backward pass |
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| `lax.cond` | softcap toggle, MoE-vs-dense branch | ✅ | `ConditionOperation` |
+| `lax.while_loop` | autoregressive decode, training loop | ✅ | `WhileOperation` with `WhilePredicate` and `with_iteration_bound` |
+| `lax.scan` | layer stacking, remat-friendly loops | ✅ | `ScanOperation` with `carry_count`, `length`, `with_reverse`, `with_unroll`, `with_captures` |
+| `lax.fori_loop` | optimizer step over parameter tree | ⚠️ | express via `scan`/`while`; a trivial helper if wanted |
+| `jax.checkpoint` (remat) | activation checkpointing per block | ✅ | `rematerialize(body)` + `RematerializeOperation` with the full JAX policy family: `EverythingSaveable`, `NothingSaveable`, `DotsSaveable`, `DotsWithNoBatchDimsSaveable`, `SaveOnlyTheseNames`, `SaveAnyNamesButThese`, `SaveAnythingExceptTheseNames`, `SaveFromBothPolicies`, and `OffloadDotsWithNoBatchDims` with `ResidualStorage`/`MemoryTransferStorage` **offload support** — beyond what the plan asked for |
+| `jax.custom_jvp` / `custom_vjp` | custom derivative rules (fused attention uses this) | ✅ | `custom_jvp(primal, jvp)` / `custom_vjp` in `tracing_v2::custom_derivatives`, lowered as first-class program operations |
 
 ### 1.8 Parallelism & sharding
 
-| Primitive (JAX) | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `jax.pjit` / mesh sharding annotations | data-parallel + tensor-parallel training | ✅ | — | `WithShardingConstraintOperation`, `Sharding`, `DeviceMesh` |
-| `shard_map` | MoE expert dispatch, custom collective regions | ✅ | — | `ShardMapOperation`, `LinearShardMapOperation` |
-| `lax.psum` / `lax.all_gather` / `lax.ppermute` | inside `shard_map` bodies | ❌ | `ryft-core` + `ryft-xla` | Collective operations need IR primitives; today they exist only implicitly via `shard_map` lowering. Add `AllReduceOperation { kind }`, `AllGatherOperation { axis }`, `CollectivePermuteOperation`, mirroring StableHLO ops |
+All landed. The collective IR primitives the plan asked for now exist as named-axis operations
+in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, `all_gather`,
+`all_to_all`, `reduce_scatter`, `collective_permute`, and `partition_id`.
+
+| Primitive (JAX) | Used by | State | Notes |
+|---|---|---|---|
+| mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ShardingConstraintOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
+| `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/shard_map.rs`) |
+| `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `CollectiveOperation` with `CollectiveKind::{PSum, PMean, PMax}` (no `PMin`; not needed) |
+| `lax.all_gather` | tensor-parallel gathers | ✅ | `AllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
+| reduce-scatter | ZeRO-style gradient sharding | ✅ | `PSumScatterOperation` |
+| `lax.ppermute` | pipeline parallelism | ✅ | `PpermuteOperation` (+ `Pshuffle`, `PSwapAxes` conveniences) |
+| `lax.all_to_all` | MoE expert exchange | ✅ | `AllToAllOperation` |
 
 ### 1.9 Autodiff & training transforms
 
+The transform stack was rebuilt around a single builder entry point:
+`differentiate_at(primal).with_captures(..).with_auxiliary_output().value_and_gradient(f)`
+(likewise `.jvp`, `.linearize`, `.vjp`, `.gradient`, `.jacobian_forward`, `.jacobian_reverse`,
+`.hessian`), with nondifferentiated runtime captures as a first-class concept — see
+[crates/ryft/examples/mlp.rs](crates/ryft/examples/mlp.rs) for the canonical usage.
+
 | Capability | Used by | State | Notes |
 |---|---|---|---|
-| Forward-mode JVP (`jvp`) | per-op linearization | ✅ | `JvpContext`, `JvpTracer` |
-| Reverse-mode VJP (`vjp`) | training | ✅ | `vjp` in `tracing_v2::linear::reverse` |
-| `value_and_grad`, `grad` | optimizer step | ✅ | Same module |
-| Jacobian / Hessian | curvature-aware optimizers (optional) | ✅ | `Jacobian`, `Hessian` |
-| `vmap` | per-example losses, sharded data parallelism | ✅ | `tracing_v2::batching::vmap` |
-| Activation checkpointing (`remat`) | memory pressure at long context | ❌ | Needs a `Checkpoint` transform that re-traces the wrapped program during transpose |
-| `pjit` compile + execute | end-to-end JIT to PJRT | ✅ | XLA backend via `arrays_v0::execution` |
-| Stateful optimizer (Adam/AdamW) | training | ❌ | A pure-function pattern over a `Parameterized` tree; not a primitive, but a `ryft-core` module worth adding alongside the new reductions |
-| Gradient clip-by-global-norm | training stability | ❌ | Composes `reduce_sum` + `sqrt` + `min` + `mul`; lives in the optimizer module |
-| Mixed-precision policy (`bf16` activations, `fp32` master weights) | training | ⚠️ | Today `ryft` exposes all the data types but has no policy wrapper; add a `Policy` that inserts `convert_element_type` at module boundaries |
+| Forward-mode JVP / linearize | per-op linearization | ✅ | `differentiate_at(..).jvp(..)` / `.linearize(..)` → `Pushforward` |
+| Reverse-mode VJP | training | ✅ | `.vjp(..)` → `Pullback`; `Program::transpose()` underneath |
+| `value_and_gradient`, `gradient` | optimizer step | ✅ | builder terminals; gradients come back as `Input::To<V>` parameter trees |
+| Jacobian / Hessian | curvature-aware optimizers (optional) | ✅ | `.jacobian_forward` / `.jacobian_reverse` / `.hessian` |
+| `vmap` | per-example losses | ✅ | `batch(function, input, in_axes, out_axes, axis)` in `batching.rs`; nests and composes with staging |
+| Activation checkpointing (`remat`) | memory pressure at long context | ✅ | `rematerialize(body)` with the full policy family (§1.7) |
+| JIT compile + execute | end-to-end JIT to PJRT | ✅ | backend-neutral `jit`/`stage_function` in `compilation/` (structural + disk caching); XLA side: `compile`/`stage`/`jitted` returning `CompiledXlaFunction`/`JittedXlaFunction`, with `.gradient(&domain)` and `.jvp(&domain)` on compiled functions |
+| Batching a *compiled* function | vmap-of-jit | ⚠️ | `CompiledXlaFunction::batch` is a stub (`UnsupportedOperation`); direct `batch` of the uncompiled function works |
+| Stateful optimizer (Adam/AdamW) | training | ❌ | **still missing** — no optimizer module anywhere in the workspace |
+| Gradient clip-by-global-norm | training stability | ❌ | **still missing**; all ingredients (`reduce`, `sqrt`, `min`, `mul`) exist |
+| Mixed-precision policy | bf16 activations / fp32 master weights | ❌ | **still missing**; `ConvertElementType` + `dot_with_accumulation_type` are the ingredients |
 
 ### 1.10 Summary checklist
 
-- [x] `add`, `sub`, `mul`, `div`, `neg`, `scale`, `sin`, `cos`
-- [x] `dot_general` (with batching), `LeftDot`, `RightDot`
-- [x] `reshape`, `transpose`, `broadcast_in_dim`, `select`
-- [x] `condition`, `while_loop`
-- [x] `shard_map`, `with_sharding_constraint`
-- [x] `jvp`, `vjp`, `grad`, `value_and_grad`, `vmap`
-- [ ] `rsqrt`, `sqrt`, `exp`, `log`, `tanh`, `erf`, `abs`, `max`, `min`, `clamp`
-- [ ] `convert_element_type`
-- [ ] `compare` (EQ/NE/LT/LE/GT/GE), `and`, `or`, `not`
-- [ ] `reduce` (`Sum`, `Max`, `Min`) with axis list and `keepdims`
-- [ ] `concatenate`, `slice`, `dynamic_slice`, `dynamic_update_slice`
-- [ ] `gather`, `scatter` (including scatter-add for embedding gradients)
-- [ ] `pad`, `iota`, `argmax`
-- [ ] Device-side RNG (`split`, `normal`, `uniform`)
-- [ ] Collective IR ops (`all_reduce`, `all_gather`, `collective_permute`) for use inside `shard_map`
-- [ ] Activation checkpointing transform
-- [ ] Optimizer module (AdamW + clip-by-global-norm) with mixed-precision policy
+- [x] `add`, `sub`, `mul`, `div`, `neg`, `rem`, `pow`, `sin`, `cos`, `atan2`
+- [x] `rsqrt`, `sqrt`, `exp`, `log`, `tanh`, `erf`, `logistic`, `abs`, `sign`, `floor`, `ceil`, `round`, `max`, `min`, `clamp`
+- [x] `convert_element_type`
+- [x] `compare` (all six directions), `and`, `or`, `not`, `xor`, `select`
+- [x] `reduce` (`Sum`, `Mean`, `Max`, `Min`, `Any`, `All`) with axis lists
+- [x] `reshape`, `transpose`, `broadcast`, `concatenate`, `slice`, `dynamic_slice`, `dynamic_update_slice`, `pad`, `iota`
+- [x] `gather`, `scatter` (with `Add`/`Mul`/`Min`/`Max` reductions), `sort`, `top_k`, `argmax`, `argmin`
+- [x] `dot_general` (+ accumulation type and output sharding), `scaled_dot` (block-scaled, §4)
+- [x] fused `dot_product_attention` (+ backward) with causal mask, sliding window, GQA, dropout, bias, sequence lengths, cuDNN FMHA lowering
+- [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_key`, `normal`, `uniform`, `categorical`)
+- [x] `condition`, `while_loop`, `scan`
+- [x] Collectives (`psum`/`pmean`/`pmax`, `all_gather`, `psum_scatter`, `ppermute`, `all_to_all`) + `shard_map`, `reshard`, sharding constraints
+- [x] Activation checkpointing (`rematerialize` with JAX-parity policies and offload)
+- [x] `custom_jvp` / `custom_vjp`, `stop_gradient`, `tag`, `print`, `custom_call`, `transfer_to_memory`
+- [x] `jvp`, `linearize`, `vjp`, `gradient`, `value_and_gradient`, Jacobians/Hessians, `batch` (vmap), backend-neutral `jit`
+- [x] First-class dynamic dimensions (`DimensionOperation`, `ArrayIrOperation`) — beyond the original plan
+- [ ] **Optimizer module** (AdamW + clip-by-global-norm) — no optimizer code exists in the workspace
+- [ ] **Mixed-precision policy** helper inserting casts at module boundaries
+- [ ] **Model crate** (`RMSNorm`/RoPE/GeGLU helpers, Gemma 4 model, training harness) — §2 revised phases
+- [ ] Convolution (`conv_general_dilated`) — needed only for the multimodal vision encoder
+- [ ] `einsum` string frontend (optional ergonomics; not blocking)
+- [ ] Batching of *compiled* XLA functions (`CompiledXlaFunction::batch` stub)
+- [ ] §4 NVFP4 extras beyond the landed `scaled_dot`/`block_quantize`: stochastic rounding, RHT, delayed-scaling amax tracker
 
 ---
 
 ## 2. Implementation Plan
 
-The plan is organized so each phase produces something that can be run, tested, and benchmarked
-end-to-end against a reference (JAX, PyTorch, or both). The pre-existing `ryft` conventions for
-operation hierarchy (`SupportsXxx` capability traits, value-level entry points on `Tracer`, fused
-StableHLO lowerings in `ryft-xla::experimental::lowering`) apply uniformly. Each new primitive
-follows the same five-step contract: type/abstract-eval rule → carrier variant + `Supports`
-trait → forward (JVP) rule → transposition (cotangent) rule → StableHLO lowering. A primitive is
-not "done" until all five plus per-primitive unit tests are in.
+> **Status rollup.** The primitive-building phases of this plan are complete: Phases 1–5 and 7
+> are ✅ done (every op landed with type rules, transform rules, and StableHLO lowerings), and
+> Phase 6 is half done (rematerialization ✅ with the full JAX policy family; the optimizer
+> module is still ❌ missing). What remains is the model-level work: Phase 0 (model crate),
+> the optimizer half of Phase 6, and Phases 8–9. A revised phase list for the remaining work
+> follows the original phases below.
 
-### Phase 0 — Scaffolding the model crate
+The plan is organized so each phase produces something that can be run, tested, and benchmarked
+end-to-end against a reference (JAX, PyTorch, or both). Operation hierarchy conventions apply
+uniformly (per-op capability traits with blanket impls over `Value`, closed operation families
+like `ArrayOperation`, StableHLO lowerings in `ryft-xla::experimental::lowering`). Each new
+primitive follows the same five-step contract: type/abstract-eval rule → operation family
+variant + capability trait → forward (JVP) rule → transposition (cotangent) rule → StableHLO
+lowering. A primitive is not "done" until all five plus per-primitive unit tests are in.
+
+### Phase 0 — Scaffolding the model crate — ❌ OPEN (now the critical path)
 
 1. Add a new crate `crates/ryft-models` (depends on `ryft-core` and `ryft-xla`) to house the
    Gemma 4 implementation, configurations, and integration tests. Keeping models out of
@@ -214,7 +266,7 @@ not "done" until all five plus per-primitive unit tests are in.
    the primitives it uses) so it stages cleanly under any backend.
 3. Create `crates/ryft-models/examples/gemma_4_train.rs` as the end-to-end harness.
 
-### Phase 1 — Elementwise math primitives
+### Phase 1 — Elementwise math primitives — ✅ DONE
 
 Land the unary float primitives that block everything else: `rsqrt`, `sqrt`, `exp`, `log`, `tanh`,
 `erf`, `abs`. Each follows the established pattern of `XxxOperation`, `Xxx` value trait,
@@ -226,14 +278,14 @@ value-level argmax-style differentiation rule (`grad` flows only through the sel
 Land `convert_element_type` with `differentiation` that casts the cotangent back to the source
 dtype. This unlocks bf16 forward / fp32 master weights.
 
-### Phase 2 — Comparisons, masks, and `select`-driven masking
+### Phase 2 — Comparisons, masks, and `select`-driven masking — ✅ DONE
 
 Add a single `CompareOperation { direction: Eq | Ne | Lt | Le | Gt | Ge }` carrier with a
 `SupportsCompare` trait and a tiny value-level surface (`a.eq(b)`, `a.lt(b)`, …). Boolean ops
 (`and`, `or`, `not`) follow the same shape. Mask construction in attention (causal AND sliding) is
 already lower-bound on `select` — once compares exist, the full mask flow drops out.
 
-### Phase 3 — Reductions
+### Phase 3 — Reductions — ✅ DONE
 
 Implement `ReduceOperation { kind: ReduceKind, axes: Vec<usize>, keepdims: bool }`. The JVP rule
 is straightforward: `sum` is linear (its own pushforward), `max`/`min` are piecewise linear (route
@@ -247,7 +299,7 @@ softmax becomes a six-line helper. Add these as value-level convenience function
 `ryft-models::common::nn`, not as IR primitives, because their decomposition has good autodiff
 properties already.
 
-### Phase 4 — Shape ops & indexing
+### Phase 4 — Shape ops & indexing — ✅ DONE
 
 Land `ConcatenateOperation`, `SliceOperation` (static), and `PadOperation`. RoPE then drops out
 (split into halves, rotate, concatenate). Then land `IotaOperation` so position vectors stop being
@@ -263,7 +315,7 @@ explicit `scatter_kind: Replace | Add` knob — scatter-add must be commutative 
 Finally land `ArgMaxOperation`. It is not strictly required for training, but is needed for the
 top-1 accuracy metric we will report and for greedy sampling in the inference test.
 
-### Phase 5 — RNG & initialization
+### Phase 5 — RNG & initialization — ✅ DONE
 
 Pick a stateless PRNG (threefry-2x32 is the obvious choice, since it lowers cleanly to
 `stablehlo.rng_bit_generator`). Add a `PrngKey` value type, a `split(key, n) -> Vec<PrngKey>`
@@ -271,7 +323,7 @@ helper, and `random_normal(key, shape, dtype) -> Array` / `random_uniform(key, s
 hi])`. Truncated-normal initialization (Flax's default for Linen) can be built on top via
 rejection sampling inside a `while_loop`, or as a `pjit`-time host helper for the first cut.
 
-### Phase 6 — Activation checkpointing & optimizer
+### Phase 6 — Activation checkpointing & optimizer — ⚠️ HALF DONE (remat ✅, optimizer ❌)
 
 Add a `Checkpoint` transform that, when staged into the forward, marks the wrapped sub-program for
 re-tracing on the backward pass. Concretely: during `linearize`, the inside of a checkpointed
@@ -283,7 +335,7 @@ Add an `optimizer` module: `AdamWState<P: Parameter>`, `adamw_step(params, grads
 are value-level functions over `Parameterized` trees and stage into the same JIT graph as the
 forward+backward.
 
-### Phase 7 — Sharding & collectives
+### Phase 7 — Sharding & collectives — ✅ DONE
 
 Add `AllReduceOperation`, `AllGatherOperation`, `ReduceScatterOperation`, and
 `CollectivePermuteOperation` for use inside `shard_map` bodies. These are needed for tensor
@@ -292,7 +344,7 @@ MoE dispatch (`all_to_all` can be expressed as `reduce_scatter` + `all_gather` o
 primitive). The `Mesh` and `Sharding` machinery already exists; this phase only adds the
 IR primitives.
 
-### Phase 8 — Gemma 4 model code & training harness
+### Phase 8 — Gemma 4 model code & training harness — ❌ OPEN
 
 With all primitives and the optimizer in place, the model is built bottom-up in
 `crates/ryft-models/src/gemma_4/`:
@@ -312,20 +364,54 @@ With all primitives and the optimizer in place, the model is built bottom-up in
    forward logits within `1e-3` (bf16 tolerance), then check that one optimizer step on a
    fixed batch reproduces JAX's parameter delta within `5e-4`.
 
-### Phase 9 — Performance & validation
+### Phase 9 — Performance & validation — ❌ OPEN
 
 1. Microbenchmarks per primitive (`cargo bench -p ryft-core`).
 2. End-to-end throughput on a single GPU, then on a 2x2 mesh.
 3. Loss-curve parity vs. the Flax reference on a small mixture for ≥1k steps.
 
+### Revised remaining plan
+
+With the primitives done, the remaining work re-scopes to five focused phases:
+
+- **R1 — Optimizer module.** `AdamWState<P>` as a `Parameterized` tree, `adamw_step(params,
+  gradients, state, hyper)`, `clip_by_global_norm(gradients, max_norm)`, and a cosine/linear
+  learning-rate schedule helper. Pure functions over parameter trees; every ingredient
+  (`reduce`, `sqrt`, `min`, elementwise ops, `map_parameters`) exists. Follow the shape of
+  `gradient_descent_step` in [crates/ryft/examples/mlp.rs](crates/ryft/examples/mlp.rs).
+- **R2 — Model crate + NN helpers.** Create `crates/ryft-models` with `common::nn` (RMSNorm,
+  RoPE, GeGLU, `softmax`/`logsumexp`, one-hot/`take_along_axis` conveniences) written against
+  the `ArrayOperations` bundle so they run eagerly on the reference backend, eagerly on XLA,
+  and under every transform tracer unchanged.
+- **R3 — Gemma 4 model + training step.** The §3 implementation: config, `Parameterized`
+  parameter tree, blocks on the fused `dot_product_attention`, loss, `train_step` via
+  `differentiate_at(..).with_captures(..).value_and_gradient(..)` + R1's optimizer, JIT-compiled
+  through `ryft-xla`'s `jitted`. Wrap each block in `rematerialize(..)` with a
+  `DotsWithNoBatchDimsSaveable`-style policy for long-context memory.
+- **R4 — Validation.** Forward-logit parity against the DeepMind JAX reference on a published
+  E2B checkpoint; one-optimizer-step parameter-delta parity; short-run loss-curve parity; then
+  the §4.7 NVFP4 checks (the `scaled_dot` portable fallback and `__op$block_scaled_dot` CUDA
+  path already exist, so this is validation work, not implementation).
+- **R5 — Multimodal (optional).** A `ConvolutionOperation` (`stablehlo.convolution` lowering)
+  for the SigLIP patch embedding is the only missing primitive; the rest of the vision tower is
+  attention + MLP + norms, which all exist.
+
 ---
 
-## 3. Aspirational `ryft` Model Implementation
+## 3. Target `ryft` Model Implementation
 
-The code below is intentionally written against the **post-plan** API surface. It will not
-compile today; primitives noted as missing in §1 are used directly. The intent is to make the
-target ergonomics concrete so that, as each primitive lands, the public surface in
-`ryft-models::common::nn` can be shaped to land at exactly this call-site density.
+The code below is written in the **current** `ryft` idiom, modeled on
+[crates/ryft/examples/mlp.rs](crates/ryft/examples/mlp.rs): model code is generic over a value
+type `A: ArrayOperations` (the capability bundle in
+[crates/ryft-core/src/arrays/operations/mod.rs](crates/ryft-core/src/arrays/operations/mod.rs)),
+so the same functions run eagerly on the reference `Array` backend, eagerly op-by-op on
+`ryft_xla::Array`, and under every transform tracer. Every IR primitive used below exists
+today; what remains aspirational is the `ryft-models` crate itself — the `common::nn` helpers
+(`rms_norm`, `apply_rope`, `geglu`, `logsumexp`) and the R1 optimizer module (`adamw_step`,
+`clip_by_global_norm`). Scalar-constant plumbing (materializing `epsilon`, `1.0`, and RoPE
+timescales through the dispatch domain's `Fill`/`Iota` constructors, or passing them as
+nondifferentiated captures like `mean_scale` in the MLP example) is elided where it would
+obscure the structure; exact signatures of the not-yet-written helpers are indicative.
 
 The example targets the **Gemma 4 E2B** variant. Other variants drop in by changing the config.
 
@@ -461,16 +547,17 @@ pub struct EmbedderParams<P: Parameter> {
 
 #[derive(Clone, Debug, Parameterized)]
 pub struct AttentionParams<P: Parameter> {
-    /// Query projection, shape `[embed_dim, query_head_count, head_dim]`.
+    /// Query projection, shape `[embed_dim, query_head_count * head_dim]` (kept rank-2 so the
+    /// projection is a plain matmul `Dot`; the head axis is split out with one `Reshape`).
     pub q_proj: P,
 
-    /// Key projection, shape `[embed_dim, kv_head_count, head_dim]`.
+    /// Key projection, shape `[embed_dim, kv_head_count * head_dim]`.
     pub k_proj: P,
 
-    /// Value projection, shape `[embed_dim, kv_head_count, head_dim]`.
+    /// Value projection, shape `[embed_dim, kv_head_count * head_dim]`.
     pub v_proj: P,
 
-    /// Output projection, shape `[query_head_count, head_dim, embed_dim]`.
+    /// Output projection, shape `[query_head_count * head_dim, embed_dim]`.
     pub o_proj: P,
 
     /// QK-norm scale on queries.
@@ -482,12 +569,17 @@ pub struct AttentionParams<P: Parameter> {
 
 #[derive(Clone, Debug, Parameterized)]
 pub struct MlpParams<P: Parameter> {
-    /// Gating projection, shape `[2, embed_dim, mlp_hidden_dim]`. Index 0 is the GELU branch and
-    /// index 1 is the linear branch.
-    pub gating: P,
+    /// GELU-branch (gate) projection, shape `[embed_dim, mlp_hidden_dim]`. (The reference
+    /// implementation stacks gate and up into one `[2, embed_dim, mlp_hidden_dim]` einsum
+    /// parameter; two separate matrices are numerically identical and keep the `Dot` calls
+    /// rank-2.)
+    pub gate_proj: P,
+
+    /// Linear-branch (up) projection, shape `[embed_dim, mlp_hidden_dim]`.
+    pub up_proj: P,
 
     /// Down projection, shape `[mlp_hidden_dim, embed_dim]`.
-    pub down: P,
+    pub down_proj: P,
 }
 
 #[derive(Clone, Debug, Parameterized)]
@@ -532,329 +624,334 @@ pub struct Gemma4Params<P: Parameter> {
 ```rust
 // crates/ryft-models/src/common/nn.rs
 //
-// Helper functions consumed by the Gemma 4 model. They are generic over any tracing domain whose
-// operation type supports the relevant primitives. Once the missing primitives in §1 land,
-// these helpers compose entirely out of value-level traits like `Add`, `Mul`, `Reshape`, etc.
+// Helpers are generic over `A: ArrayOperations`, so they run eagerly on the reference `Array`
+// backend, eagerly on `ryft_xla::Array`, and under every transform tracer without change. Two
+// small conveniences are assumed and worth adding alongside them: `broadcast_like` (broadcast
+// a reduced value back over the reduced axes) and `constant_like` (fill a scalar constant of a
+// value's data type via the dispatch domain's `Fill`).
 
-use ryft_core::tracing::{Traceable, TracingError};
-use ryft_core::tracing_v2::operations::{
-    BroadcastInDim, Concatenate, Dot, DotDimensionNumbers, Gather, GatherDimensionNumbers, Iota,
-    Pad, Reduce, ReduceKind, Reshape, Select, Slice, Transpose,
-};
-use ryft_core::types::{ArrayType, DataType, Shape};
+use ryft::*;
 
-/// `x * rsqrt(mean(x*x, axis=-1, keepdims=true) + epsilon) * (1 + scale)`.
-pub fn rms_norm<V: Reduce + Mul + Rsqrt + Add + BroadcastInDim + Clone>(
-    x: V,
-    scale: Option<V>,
-    epsilon: V,
-) -> Result<V, TracingError> {
-    let last_axis = x.r#type().rank() - 1;
-    let square = x.clone() * x.clone();
-    let variance = square.reduce(ReduceKind::Sum, vec![last_axis], /*keepdims=*/ true)?;
-    let variance_mean = variance * V::scalar_like(&x, 1.0 / x.r#type().dimension(-1).value().unwrap() as f32)?;
-    let inv = (variance_mean + epsilon.broadcast_like(&variance_mean)?).rsqrt();
-    let normalized = x * inv.broadcast_like(&x)?;
-    match scale {
+/// `x * rsqrt(mean(x^2, axis=-1) + epsilon) * (1 + scale)`, with the moment computed in fp32
+/// regardless of the activation dtype (Gemma keeps norms in high precision), and the
+/// zero-centered scale applied as `1 + scale`.
+pub fn rms_norm<A: ArrayOperations>(x: &A, scale: Option<&A>, epsilon: f64) -> Result<A, ProgramError> {
+    let input_type = x.r#type().into_owned();
+    let last_axis = input_type.rank() - 1;
+    let wide = x.convert_element_type(DataType::F32)?;
+    let variance = (wide.clone() * wide.clone()).reduce(&[last_axis], ReductionKind::Mean);
+    let inverse = (variance + constant_like(&variance, epsilon)?).rsqrt()?;
+    let normalized = wide * broadcast_like(&inverse, &input_type)?;
+    let normalized = match scale {
         Some(scale) => {
-            let one_plus_scale = scale + V::scalar_like(&normalized, 1.0)?;
-            Ok(normalized * one_plus_scale.broadcast_like(&normalized)?)
+            let one_plus_scale = scale.clone() + constant_like(scale, 1.0)?;
+            normalized * broadcast_like(&one_plus_scale, &input_type)?
         }
-        None => Ok(normalized),
-    }
+        None => normalized,
+    };
+    normalized.convert_element_type(input_type.data_type())
 }
 
-/// GeGLU: `gelu(gate[..., 0, :]) * gate[..., 1, :]`, where `gate` is the result of the gating
-/// einsum and has shape `[..., 2, hidden_dim]`.
-pub fn geglu<V: Slice + Gelu + Mul>(gate: V) -> Result<V, TracingError> {
-    let inner = gate.r#type().rank() - 2;
-    let gelu_branch = gate.clone().slice_axis(inner, 0, 1)?.squeeze_axis(inner)?.gelu();
-    let linear_branch = gate.slice_axis(inner, 1, 2)?.squeeze_axis(inner)?;
-    Ok(gelu_branch * linear_branch)
+/// Exact GELU via `erf`: `0.5 * x * (1 + erf(x / sqrt(2)))`. The GeGLU MLP multiplies this
+/// against the linear branch of the gating projection.
+pub fn gelu<A: ArrayOperations>(x: &A) -> Result<A, ProgramError> {
+    let scaled = x.clone() * constant_like(x, std::f64::consts::FRAC_1_SQRT_2)?;
+    let one_plus_erf = scaled.erf()? + constant_like(x, 1.0)?;
+    Ok(x.clone() * one_plus_erf * constant_like(x, 0.5)?)
 }
 
-/// Stable softmax along the last axis.
-pub fn softmax_last<V: Reduce + Sub + Exp + Div + BroadcastInDim + Clone>(x: V) -> Result<V, TracingError> {
-    let last = x.r#type().rank() - 1;
-    let max = x.clone().reduce(ReduceKind::Max, vec![last], true)?;
-    let shifted = x - max.broadcast_like(&x)?;
-    let exp = shifted.exp();
-    let sum = exp.clone().reduce(ReduceKind::Sum, vec![last], true)?;
-    Ok(exp / sum.broadcast_like(&exp)?)
+/// Numerically stable `log(sum(exp(x)))` along the last axis. Only the LM-head cross-entropy
+/// needs this composition — attention's softmax lives inside the fused
+/// `dot_product_attention` primitive.
+pub fn logsumexp<A: ArrayOperations>(x: &A) -> Result<A, ProgramError> {
+    let last_axis = x.r#type().rank() - 1;
+    let max = x.reduce(&[last_axis], ReductionKind::Max);
+    let shifted = x.clone() - broadcast_like(&max, &x.r#type())?;
+    Ok(shifted.exp()?.reduce(&[last_axis], ReductionKind::Sum).log()? + max)
 }
 
-/// RoPE that rotates the leading `rotated_dim` head dimensions and leaves the trailing
-/// `head_dim - rotated_dim` dimensions untouched.
-pub fn apply_rope<V>(
-    x: V,
-    positions: V,
-    head_dim: usize,
+/// RoPE rotating the leading `rotated_dim` head dimensions (split-halves convention) and
+/// leaving the trailing `head_dim - rotated_dim` dimensions untouched. Gemma 4's partial RoPE
+/// passes `rotated_dim = head_dim` on local layers and `head_dim / 4` on global layers.
+pub fn apply_rope<A: ArrayOperations>(
+    x: &A,          // [batch, seq, heads, head_dim]
+    positions: &A,  // [batch, seq]
     rotated_dim: usize,
-    base_frequency: f32,
-) -> Result<V, TracingError>
-where
-    V: Iota + Scale + Sin + Cos + Slice + Concatenate + Mul + Sub + Add + Reshape + BroadcastInDim + Clone,
-{
-    assert!(rotated_dim % 2 == 0 && rotated_dim <= head_dim);
+    base_frequency: f64,
+) -> Result<A, ProgramError> {
+    let head_dim = x.r#type().shape().dimension(-1).value().unwrap();
     let half = rotated_dim / 2;
-    let exponents = V::iota(half, V::scalar_dtype())?
-        * V::scalar_like(&x, 2.0 / head_dim as f32)?;
-    let timescale = exponents.scale_constant(base_frequency, /*as_power_of=*/ true);
-    // Pad the trailing `head_dim/2 - half` dims with `+inf` so cos=1, sin=0 leave them unchanged.
-    let timescale = timescale.pad_high(0, head_dim / 2 - half, V::scalar_like(&x, f32::INFINITY)?)?;
-    let theta = positions.unsqueeze(-1) / timescale.broadcast_like(&positions.unsqueeze(-1))?;
-    let cos = theta.clone().cos();
-    let sin = theta.sin();
-    let first = x.clone().slice_axis(-1, 0, head_dim / 2)?;
-    let second = x.slice_axis(-1, head_dim / 2, head_dim)?;
-    let out_first = first.clone() * cos.broadcast_like(&first)? - second.clone() * sin.broadcast_like(&second)?;
-    let out_second = second * cos.broadcast_like(&first)? + first * sin.broadcast_like(&first)?;
-    out_first.concatenate(out_second, -1)
+    // timescale[i] = base_frequency ^ (2 i / head_dim) for i < half, then `Pad`ded with +inf
+    // over the "nope" tail so cos = 1, sin = 0 leave the unrotated dimensions unchanged;
+    // theta = positions / timescale, broadcast to [batch, seq, 1, head_dim / 2]. Built from
+    // `Iota` + `Pow` + `Pad` + `Broadcast` + `Div`; spelled out in `rope_angles` (elided).
+    let theta = rope_angles(positions, half, head_dim, base_frequency)?;
+    let (cos, sin) = (theta.cos()?, theta.sin()?);
+    let first = slice_last_axis(x, 0, head_dim / 2)?;
+    let second = slice_last_axis(x, head_dim / 2, head_dim)?;
+    let rotated_first = first.clone() * cos.clone() - second.clone() * sin.clone();
+    let rotated_second = second * cos + first * sin;
+    Concatenate::concatenate([&rotated_first, &rotated_second], 3)
 }
 ```
 
 ### 3.4 Attention, MLP, and block
 
+The attention core is now **one call to the fused `dot_product_attention` primitive**: it takes
+queries `[batch, seq, heads, head_dim]` over keys/values `[batch, kv_seq, kv_heads, head_dim]`
+with `kv_heads` dividing `heads` — Gemma's GQA layout natively, no group-axis reshapes — and
+carries the causal mask and sliding window itself, so the hand-built logits → mask → softmax →
+context pipeline from the original plan disappears entirely. On GPU it lowers to the cuDNN
+FMHA kernels; `differentiable_dot_product_attention` wires the fused backward operation in as
+a custom VJP.
+
 ```rust
 // crates/ryft-models/src/gemma_4/attention.rs
-use ryft_core::tracing_v2::operations::{Dot, DotDimensionNumbers};
-use ryft_core::types::DataType;
+use ryft::*;
 
-use crate::common::nn::{apply_rope, rms_norm, softmax_last};
+use crate::common::nn::{apply_rope, rms_norm};
 use crate::gemma_4::{AttentionKind, AttentionParams, Gemma4Config};
 
-const NEG_INF: f32 = -2.3819763e38;
-
-/// Attention forward over `[batch, seq_len, embed_dim]`. Returns activations of the same shape.
-pub fn attention<V>(
+/// Attention forward over `[batch, seq, embed_dim]`. Returns activations of the same shape.
+pub fn attention<A: ArrayOperations>(
     config: &Gemma4Config,
-    layer_kind: AttentionKind,
-    layer_rope_base_frequency: f32,
+    layer_rope_base_frequency: f64,
     layer_rotated_dim: usize,
-    params: &AttentionParams<V>,
-    x: V,
-    positions: V,
-    attention_mask: V,
-) -> Result<V, TracingError>
-where
-    V: /* the same trait bouquet plus `Compare`, `And`, `Select`, etc. */ Clone,
-{
-    let batch = x.r#type().dimension(0).value().unwrap();
-    let seq = x.r#type().dimension(1).value().unwrap();
-    let head_dim = config.head_dim;
-    let qh = config.query_head_count;
-    let kvh = config.kv_head_count;
-    let groups = qh / kvh;
+    sliding_window: Option<usize>,
+    params: &AttentionParams<A>,
+    x: &A,
+    positions: &A,
+) -> Result<A, ProgramError> {
+    let batch = x.r#type().shape().dimension(0);
+    let seq = x.r#type().shape().dimension(1);
+    let (head_dim, heads, kv_heads) = (config.head_dim, config.query_head_count, config.kv_head_count);
 
-    // Q/K/V projections via `dot_general` with reshape-folded head axes.
-    let queries = x.clone().einsum_3d("BTD,DNH->BTNH", &params.q_proj)?;
-    let keys = x.clone().einsum_3d("BTD,DKH->BTKH", &params.k_proj)?;
-    let values = x.einsum_3d("BTD,DKH->BTKH", &params.v_proj)?;
+    // Q/K/V projections: [B, T, D] @ [D, N * H] -> [B, T, N, H] (dot + reshape; no einsum needed).
+    let project = |input: &A, weights: &A, head_count: usize| -> Result<A, ProgramError> {
+        input
+            .dot(weights, &DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]))
+            .reshape(Shape::new(vec![batch, seq, Dimension::Static(head_count), Dimension::Static(head_dim)]))
+    };
+    let queries = project(x, &params.q_proj, heads)?;
+    let keys = project(x, &params.k_proj, kv_heads)?;
+    let values = project(x, &params.v_proj, kv_heads)?;
 
-    // QK-norm.
-    let queries = rms_norm(queries, Some(params.query_norm.scale.clone()), epsilon_v(config))?;
-    let keys = rms_norm(keys, Some(params.key_norm.scale.clone()), epsilon_v(config))?;
+    // QK-norm (learned zero-centered scales), then partial RoPE.
+    let queries = rms_norm(&queries, Some(&params.query_norm.scale), config.rms_norm_epsilon)?;
+    let keys = rms_norm(&keys, Some(&params.key_norm.scale), config.rms_norm_epsilon)?;
+    let queries = apply_rope(&queries, positions, layer_rotated_dim, layer_rope_base_frequency)?;
+    let keys = apply_rope(&keys, positions, layer_rotated_dim, layer_rope_base_frequency)?;
 
-    // Partial RoPE.
-    let queries = apply_rope(queries, positions.clone(), head_dim, layer_rotated_dim, layer_rope_base_frequency)?;
-    let keys = apply_rope(keys, positions, head_dim, layer_rotated_dim, layer_rope_base_frequency)?;
-
-    // Reshape Q to expose the GQA group axis: [B, T, K, G, H].
-    let queries = queries.reshape(shape![batch, seq, kvh, groups, head_dim])?;
-
-    // Logits via grouped `dot_general`: BTKGH,BSKH -> BTKGS.
-    let logits = queries.dot_general(
-        keys.clone(),
-        &DotDimensionNumbers::new(
-            /*lhs_contract=*/ vec![4],
-            /*rhs_contract=*/ vec![3],
-            /*lhs_batch=*/ vec![0, 2],
-            /*rhs_batch=*/ vec![0, 2],
-        ),
-    )? * V::scalar_like(&queries, (head_dim as f32).rsqrt())?;
-
-    // Mask: pre-built outside the attention block (causal AND, for local layers, sliding-window).
-    let masked = V::select(attention_mask, logits, V::scalar_like(&logits, NEG_INF)?)?;
-    let weights = softmax_last(masked)?;
-
-    // Weighted sum: BTKGS,BSKH -> BTKGH then reshape to BTNH.
-    let context = weights.dot_general(
-        values,
-        &DotDimensionNumbers::new(vec![4], vec![1], vec![0, 2], vec![0, 2]),
+    // Fused attention: native GQA ([B, T, N, H] over [B, S, K, H] with K dividing N), causal
+    // masking, and the sliding window all live inside the one primitive.
+    let context = queries.dot_product_attention(
+        &keys,
+        &values,
+        /*scale=*/ (head_dim as f64).powf(-0.5),
+        AttentionMask::Causal,
+        sliding_window,
     )?;
-    let context = context.reshape(shape![batch, seq, qh, head_dim])?;
 
-    // Output projection.
-    context.einsum_3d("BTNH,NHD->BTD", &params.o_proj)
+    // Output projection: [B, T, N, H] -> [B, T, N * H] @ [N * H, D] -> [B, T, D].
+    let context = context.reshape(Shape::new(vec![batch, seq, Dimension::Static(heads * head_dim)]))?;
+    Ok(context.dot(&params.o_proj, &DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![])))
 }
 ```
 
 ```rust
 // crates/ryft-models/src/gemma_4/mlp.rs
-pub fn mlp<V>(params: &MlpParams<V>, x: V) -> Result<V, TracingError> {
-    let gate = x.einsum_3d("...D,NHF->...NF", &params.gating)?; // [B, T, 2, hidden_dim]
-    let activations = geglu(gate)?;                              // [B, T, hidden_dim]
-    activations.einsum_2d("...H,HD->...D", &params.down)
+/// GeGLU MLP: gate/up projections, exact GELU on the gate branch, down projection.
+pub fn mlp<A: ArrayOperations>(params: &MlpParams<A>, x: &A) -> Result<A, ProgramError> {
+    let matmul = DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]);
+    let gate = gelu(&x.dot(&params.gate_proj, &matmul))?;
+    let linear = x.dot(&params.up_proj, &matmul);
+    Ok((gate * linear).dot(&params.down_proj, &matmul))
 }
 ```
 
 ```rust
 // crates/ryft-models/src/gemma_4/block.rs
-pub fn block<V>(
+pub fn block<A: ArrayOperations>(
     config: &Gemma4Config,
     layer_index: usize,
-    params: &BlockParams<V>,
-    x: V,
-    positions: V,
-    attention_mask: V,
-) -> Result<V, TracingError> {
-    let kind = config.attention_pattern[layer_index];
-    let (base, rotated_dim) = match kind {
-        AttentionKind::Local => (config.local_rope_base_frequency, config.head_dim),
+    params: &BlockParams<A>,
+    x: &A,
+    positions: &A,
+) -> Result<A, ProgramError> {
+    let (base, rotated_dim, sliding_window) = match config.attention_pattern[layer_index] {
+        AttentionKind::Local => {
+            (config.local_rope_base_frequency, config.head_dim, Some(config.sliding_window_size))
+        }
         AttentionKind::Global => (
             config.global_rope_base_frequency,
-            (config.head_dim as f32 * config.global_rope_proportion) as usize,
+            (config.head_dim as f64 * config.global_rope_proportion) as usize,
+            None,
         ),
     };
+    let epsilon = config.rms_norm_epsilon;
 
     let attended = {
-        let normed = rms_norm(x.clone(), Some(params.pre_attention_norm.scale.clone()), epsilon_v(config))?;
-        let attention_out = attention(
-            config, kind, base, rotated_dim, &params.attention, normed, positions.clone(), attention_mask.clone(),
-        )?;
-        rms_norm(attention_out, Some(params.post_attention_norm.scale.clone()), epsilon_v(config))?
+        let normed = rms_norm(x, Some(&params.pre_attention_norm.scale), epsilon)?;
+        let out = attention(config, base, rotated_dim, sliding_window, &params.attention, &normed, positions)?;
+        rms_norm(&out, Some(&params.post_attention_norm.scale), epsilon)?
     };
-    let x = x + attended * params.skip_scale.broadcast_like(&attended)?;
+    let x = x.clone() + attended * broadcast_like(&params.skip_scale, &x.r#type())?;
 
     let mlp_out = {
-        let normed = rms_norm(x.clone(), Some(params.pre_mlp_norm.scale.clone()), epsilon_v(config))?;
-        let mlp_out = mlp(&params.mlp, normed)?;
-        rms_norm(mlp_out, Some(params.post_mlp_norm.scale.clone()), epsilon_v(config))?
+        let normed = rms_norm(&x, Some(&params.pre_mlp_norm.scale), epsilon)?;
+        rms_norm(&mlp(&params.mlp, &normed)?, Some(&params.post_mlp_norm.scale), epsilon)?
     };
-    Ok(x + mlp_out * params.skip_scale.broadcast_like(&mlp_out)?)
+    Ok(x.clone() + mlp_out * broadcast_like(&params.skip_scale, &x.r#type())?)
 }
+```
+
+For long-context training, wrap each block in the rematerialization transform with a
+dots-saveable policy, mirroring the JAX `jax.checkpoint(..., policy=dots_with_no_batch_dims_saveable)`
+recipe:
+
+```rust
+let block_output = rematerialize(|(x, positions)| block(config, layer_index, params, &x, &positions))
+    .with_policy(DotsWithNoBatchDimsSaveable)
+    .apply((x, positions.clone()))?;
 ```
 
 ### 3.5 Forward, loss, and one training step
 
 ```rust
 // crates/ryft-models/src/gemma_4/forward.rs
-pub fn forward<V>(
+pub fn forward<A: ArrayOperations>(
     config: &Gemma4Config,
-    params: &Gemma4Params<V>,
-    tokens: V,        // [batch, seq] of int32
-    positions: V,     // [batch, seq] of int32
-) -> Result<V, TracingError> {
-    // Token embedding: gather + scale by sqrt(embed_dim).
-    let embeds = params.embedder.table.clone().gather_rows(tokens.clone())?;
-    let mut hidden = embeds * V::scalar_like(&embeds, (config.embed_dim as f32).sqrt())?;
+    params: &Gemma4Params<A>,
+    tokens: &A,       // [batch, seq] of i32
+    positions: &A,    // [batch, seq] of i32
+) -> Result<A, ProgramError> {
+    // Token embedding: `Gather` rows of the table, then scale by sqrt(embed_dim).
+    let embeds = gather_rows(&params.embedder.table, tokens)?; // GatherOperation wrapper
+    let mut hidden = embeds.clone() * constant_like(&embeds, (config.embed_dim as f64).sqrt())?;
 
     // Per-layer-input embeddings: [B, T, layer_count, ple_dim].
-    let ple = params.embedder.per_layer_inputs.clone().gather_rows(tokens.clone())?;
-
-    // Build the attention mask once. Causal for global, causal AND sliding window for local.
-    let mask = build_attention_mask(config, &positions);
+    let ple = gather_rows(&params.embedder.per_layer_inputs, tokens)?;
 
     for (layer_index, layer_params) in params.blocks.iter().enumerate() {
-        hidden = block(config, layer_index, layer_params, hidden, positions.clone(), mask.clone())?;
-        // Per-layer-input gating injection: take `ple[..., layer_index, :]`, project, norm, add.
-        let layer_ple = ple.clone().slice_axis(-2, layer_index, layer_index + 1)?.squeeze_axis(-2)?;
-        let projected = layer_ple.einsum_2d("...P,PD->...D", &params.embedder.per_layer_projection)?;
+        hidden = block(config, layer_index, layer_params, &hidden, positions)?;
+        // Per-layer-input injection: slice this layer's PLE stream ([B, T, 1, P], reshaped to
+        // [B, T, P]), project to the residual width, add.
+        let layer_ple = squeeze_axis(&slice_axis(&ple, 2, layer_index, layer_index + 1)?, 2)?;
+        let projected = layer_ple.dot(
+            &params.embedder.per_layer_projection,
+            &DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]),
+        );
         hidden = hidden + projected;
     }
 
-    // Final RMSNorm + tied output projection + softcap.
-    let normed = rms_norm(hidden, Some(params.final_norm.scale.clone()), epsilon_v(config))?;
-    let logits = normed.einsum_2d("...D,VD->...V", &params.embedder.table)?;
-    let cap = V::scalar_like(&logits, config.final_logit_softcap)?;
-    Ok((logits / cap.broadcast_like(&logits)?).tanh() * cap.broadcast_like(&logits)?)
+    // Final RMSNorm + tied output projection + final logit softcap `cap * tanh(logits / cap)`.
+    let normed = rms_norm(&hidden, Some(&params.final_norm.scale), config.rms_norm_epsilon)?;
+    let logits = normed.dot(
+        &params.embedder.table.transpose(&Permutation::new(vec![1, 0])?)?,
+        &DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]),
+    );
+    let cap = constant_like(&logits, config.final_logit_softcap)?;
+    Ok((logits / cap.clone())?.tanh()? * cap)
 }
 ```
 
 ```rust
 // crates/ryft-models/src/gemma_4/loss.rs
-pub fn loss<V>(
+/// Shifted next-token cross-entropy with a padding loss-mask, computed as
+/// `logsumexp(logits) - logits[target]` per token, then mask-averaged.
+pub fn loss<A: ArrayOperations>(
     config: &Gemma4Config,
-    params: &Gemma4Params<V>,
-    tokens: V,           // [batch, seq+1] int32
-    positions: V,        // [batch, seq] int32
-    loss_mask: V,        // [batch, seq] in {0.0, 1.0}
-) -> Result<V, TracingError> {
-    let inputs = tokens.clone().slice_axis(1, 0, tokens.r#type().dimension(1).value().unwrap() - 1)?;
-    let targets = tokens.slice_axis(1, 1, tokens.r#type().dimension(1).value().unwrap())?;
-    let logits = forward(config, params, inputs, positions)?;
+    params: &Gemma4Params<A>,
+    tokens: &A,       // [batch, seq + 1] i32
+    positions: &A,    // [batch, seq] i32
+    loss_mask: &A,    // [batch, seq] in {0.0, 1.0}
+) -> Result<A, ProgramError> {
+    let seq = positions.r#type().shape().dimension(1).value().unwrap();
+    let inputs = slice_axis(tokens, 1, 0, seq)?;
+    let targets = slice_axis(tokens, 1, 1, seq + 1)?;
+    let logits = forward(config, params, &inputs, positions)?;
 
-    // Stable cross-entropy via `logsumexp - target_logit`.
-    let max = logits.clone().reduce(ReduceKind::Max, vec![-1], true)?;
-    let shifted = logits.clone() - max.broadcast_like(&logits)?;
-    let logsumexp = max.squeeze_axis(-1)? + shifted.exp().reduce(ReduceKind::Sum, vec![-1], false)?.log();
-    let target_logit = logits.gather_along_last_axis(targets)?;
-    let per_token_loss = logsumexp - target_logit;
+    // Target logit via one-hot contraction (Iota + Compare + ConvertElementType + Mul + Reduce),
+    // which keeps the composition simple; a GatherOperation take-along-axis is the alternative.
+    let target_logit = take_along_last_axis(&logits, &targets)?;
+    let per_token_loss = logsumexp(&logits)? - target_logit;
     let masked_loss = per_token_loss * loss_mask.clone();
-    let total = masked_loss.reduce(ReduceKind::Sum, vec![0, 1], false)?;
-    let normalizer = loss_mask.reduce(ReduceKind::Sum, vec![0, 1], false)?;
-    Ok(total / normalizer)
+    let total = masked_loss.reduce(&[0, 1], ReductionKind::Sum);
+    Ok(total / loss_mask.reduce(&[0, 1], ReductionKind::Sum))
 }
 ```
 
+The training step follows the MLP example's pattern exactly: the model is the only active
+(differentiated) argument, and the batch rides along as nondifferentiated runtime captures.
+The bounds on `A` are the same ones `train` in
+[crates/ryft/examples/mlp.rs](crates/ryft/examples/mlp.rs) states —
+`A: ArrayOperations` with `A::ExecutionDomain: ReverseModeDifferentiate` and
+`LinearizationTracer<A::ExecutionDomain>: ArrayOperations`.
+
 ```rust
 // crates/ryft-models/src/gemma_4/train.rs
-use ryft_core::tracing_v2::linear::value_and_grad;
-
-pub fn train_step<V>(
+pub fn train_step<A: ArrayOperations>(
     config: &Gemma4Config,
-    params: Gemma4Params<V>,
-    optimizer_state: AdamWState<V>,
-    hyper: AdamWHyper,
-    batch: Batch<V>,
-) -> Result<(Gemma4Params<V>, AdamWState<V>, V), TracingError> {
-    // 1. value_and_grad: returns (scalar_loss, grad_tree_matching_params).
-    let (loss_value, gradients) = value_and_grad(
-        /*domain=*/ &xla_domain(),
-        |params| loss(config, &params, batch.tokens.clone(), batch.positions.clone(), batch.loss_mask.clone()),
-        params.clone(),
-    )?;
+    model: Gemma4Params<A>,
+    optimizer_state: AdamWState<A>,   // R1 optimizer module
+    hyper: &AdamWHyper,
+    batch: &Batch<A>,
+) -> Result<(Gemma4Params<A>, AdamWState<A>, A), ProgramError>
+where
+    A::ExecutionDomain: ReverseModeDifferentiate<Operation: From<OneOperation<ArrayType>>> + Zero<A>,
+    LinearizationTracer<A::ExecutionDomain>: ArrayOperations,
+{
+    // 1. Loss and gradients: the model is the active argument; the batch is captured.
+    let (loss_value, gradients) = differentiate_at(model.clone())
+        .with_captures((batch.tokens.clone(), batch.positions.clone(), batch.loss_mask.clone()))
+        .value_and_gradient(|model, (tokens, positions, loss_mask)| {
+            loss(config, &model, &tokens, &positions, &loss_mask)
+        })?;
 
-    // 2. Clip-by-global-norm.
+    // 2. Clip-by-global-norm, then AdamW (both R1; pure functions over `Parameterized` trees,
+    //    built with `map_parameters` / `into_parameters` like `gradient_descent_step` in the
+    //    MLP example).
     let gradients = clip_by_global_norm(gradients, hyper.max_global_norm)?;
+    let (model, optimizer_state) = adamw_step(model, gradients, optimizer_state, hyper)?;
 
-    // 3. AdamW step.
-    let (new_params, new_state) = adamw_step(params, gradients, optimizer_state, hyper)?;
-
-    Ok((new_params, new_state, loss_value))
+    Ok((model, optimizer_state, loss_value))
 }
 ```
 
 ### 3.6 End-to-end driver
 
+Because `ryft-xla`'s `Array` executes eagerly with a shared per-lineage executable cache, the
+training loop below already runs on-device without explicit JIT; wrapping the step with
+`ryft_xla::jitted` (or backend-neutral `ryft::jit`) fuses it into one compiled program with
+retained-cache dispatch.
+
 ```rust
 // crates/ryft-models/examples/gemma_4_train.rs
-use ryft_core::sharding::{DeviceMesh, MeshAxisType};
-use ryft_core::tracing_v2::operations::ShardMap;
-use ryft_models::gemma_4::{Gemma4Config, Gemma4Params, train_step, AdamWHyper, AdamWState};
-use ryft_xla::experimental::XlaDomain;
+use ryft::pjrt::{ClientOptions, load_cpu_plugin};
+use ryft::xla::{Array, FromPjrt};
+use ryft::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+use ryft_models::gemma_4::{AdamWHyper, AdamWState, Gemma4Config, Gemma4Params, train_step};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Gemma4Config::e2b();
-    let mesh = DeviceMesh::new(/* logical mesh: data×model */)?;
-    let domain = XlaDomain::new(&mesh)?;
 
-    // Initialize parameters via the device RNG (Phase 5 work).
-    let mut params: Gemma4Params<ArrayValue> = initialize_gemma_4(&domain, &config, /*seed=*/ 0)?;
-    let mut optimizer_state = AdamWState::zeros_like(&params);
-    let hyper = AdamWHyper { learning_rate: 1e-4, weight_decay: 0.1, b1: 0.9, b2: 0.95, eps: 1e-8, max_global_norm: 1.0 };
+    // PJRT client + mesh, following the mlp.rs xla_backend setup (CUDA plugin with CPU fallback).
+    let (plugin, client_options) = load_xla_plugin()?;
+    let client = plugin.client(client_options)?;
+    let mesh = single_axis_mesh(&client)?; // LogicalMesh::new(vec![MeshAxis::new("data", n, MeshAxisType::Auto)?])?
 
-    // JIT-compile train_step once.
-    let compiled = domain.jit(|inputs| {
-        let (params, opt_state, batch) = inputs;
-        train_step(&config, params, opt_state, hyper.clone(), batch)
-    })?;
+    // Initialize parameters with the device RNG (`Random::split_key` + `Random::normal` per leaf).
+    let mut model: Gemma4Params<Array> = initialize_gemma_4(&client, &mesh, &config, /*seed=*/ 0)?;
+    let mut optimizer_state = AdamWState::zeros_like(&model)?;
+    let hyper = AdamWHyper {
+        learning_rate: 1e-4, weight_decay: 0.1, b1: 0.9, b2: 0.95, eps: 1e-8, max_global_norm: 1.0,
+    };
 
-    for batch in data_loader()? {
-        let (new_params, new_state, loss) = compiled.run((params, optimizer_state, batch))?;
-        params = new_params;
+    for batch in data_loader(&client, &mesh)? {
+        let (new_model, new_state, loss) = train_step(&config, model, optimizer_state, &hyper, &batch)?;
+        model = new_model;
         optimizer_state = new_state;
-        println!("loss = {}", loss.to_host_scalar::<f32>()?);
+        println!("loss = {:?}", read_scalar(&loss)?);
     }
 
     Ok(())
@@ -891,38 +988,68 @@ the model stays in `bf16`.
 
 ### 4.1 What already exists in `ryft`
 
+> **Status: the core of this section is implemented.** Since this section was written, the
+> exact primitive set it proposed has landed: `ScaledDotOperation`
+> ([crates/ryft-core/src/operations/math/dot.rs](crates/ryft-core/src/operations/math/dot.rs))
+> with interpretation, partial-evaluation, forward-differentiation (bilinear with scales held
+> fixed), and batching rules; the `BlockQuantize` composition
+> ([crates/ryft-core/src/operations/math/block_quantize.rs](crates/ryft-core/src/operations/math/block_quantize.rs))
+> covering both the NVFP4 recipe (`f4e2m1fn` elements + `f8e4m3fn` scales, `max_abs / 6.0`)
+> and the OCP MX recipe (`f8e8m0fnu` power-of-two scales with the spec-prescribed clamping);
+> and the two-path XLA lowering (`lower_scaled_dot_to_mlir` in
+> [crates/ryft-xla/src/experimental/lowering.rs](crates/ryft-xla/src/experimental/lowering.rs)):
+> on a CUDA target with qualifying formats it emits the `__op$block_scaled_dot` custom call
+> (XLA's cuDNN block-scaled-dot target — the same kernel `jax.nn.scaled_matmul` reaches), and
+> everywhere else it falls back to a portable dequantize → upcast → `dot_general` expansion —
+> which is exactly the "A100 fallback" §4.7 asked for. The fused attention path similarly
+> lowers to cuDNN FMHA custom calls (`__cudnn$fmha…`). What remains open is listed in §4.2.
+
 - `DataType::F4E2M1FN` (NVFP4 data), `DataType::F8E4M3FN` (FP8 forward), `DataType::F8E5M2`
   (FP8 backward), `DataType::F8E8M0FNU` (UE8M0 microscale), `DataType::F8E4M3` (UE4M3
-  microscale) are all already in the enum at
-  [crates/ryft-core/src/types/data.rs:759](crates/ryft-core/src/types/data.rs:759).
-  These mirror the StableHLO type set — see the
+  microscale) are all in the enum at
+  [crates/ryft-core/src/arrays/types/data.rs:694](crates/ryft-core/src/arrays/types/data.rs:694)
+  (plus the MX FP6 types `F6E2M3FN`/`F6E3M2FN` and sub-byte integers). These mirror the
+  StableHLO type set — see the
   [StableHLO specification](https://openxla.org/stablehlo/spec), the
   [F8E4M3/F8E3M4 RFC](https://github.com/openxla/stablehlo/blob/main/rfcs/20240808-f8E4M3_f8E3M4.md),
   and the [Speccing StableHLO quantization](https://groups.google.com/a/openxla.org/g/openxla-discuss/c/iwE9is49SS4)
   thread for the upstream rationale. The promotion lattice intentionally excludes them, which is
   correct — they are conversion-only.
-- `ArrayType` already accepts any `DataType`, so the IR can carry FP4/FP8 tensors today; what is
-  missing is the operations that produce, consume, or compute with them.
+- `ArrayType` accepts any `DataType`, and with `ScaledDotOperation` + `BlockQuantize` the IR
+  now also has the operations that produce and consume FP4/FP8 tensors.
 
-### 4.2 Missing operation inventory
+### 4.2 Operation inventory (updated)
 
-| Capability | Used by | State | Crate target | Notes |
-|---|---|---|---|---|
-| `quantize_scaled(x, block_size, scale_dtype, value_dtype)` | producing FP8/NVFP4 weights & activations from bf16 input | ❌ | `ryft-core` + `ryft-xla` | New `QuantizeScaledOperation` returns a `(values, scales)` pair. Block reduction computes per-block `amax`, scale = `amax / fmax(value_dtype)`, then casts to `value_dtype` (rounded), and casts the scale to `scale_dtype`. For per-tensor FP8, set `block_size = -1` (whole-tensor reduction). |
-| `dequantize_scaled(values, scales, block_size)` | rare: recovery for debugging, mixed paths | ❌ | `ryft-core` + `ryft-xla` | New `DequantizeScaledOperation`; the inverse of the above. Lowers to broadcast + multiply + convert. |
-| `scaled_dot_general(lhs, lhs_scales, rhs, rhs_scales, dimensions, accumulator_dtype)` | every matmul in the model | ❌ | `ryft-core` + `ryft-xla` | New `ScaledDotGeneralOperation`. Carrier: same `DotDimensionNumbers` plus a `ScaledDotConfig { lhs_block_size, rhs_block_size, accumulator_dtype }`. JVP and transposition rules treat it as a generalized linear op (linear in both data operands; the scales come in as auxiliary captured tensors), which mirrors how Transformer-Engine's `fp8_gemm` is exposed. |
-| `reduce_max_abs` (per-block) | amax inside `quantize_scaled` | ❌ | `ryft-core` + `ryft-xla` | Once `abs` and `reduce_max` from Phase 1/3 land, this is a composite (`abs` + `reduce_max` over the block axis after reshape). A first-class fused variant pays off only if the lowering benefits from a single `stablehlo.reduce` — keep it composite by default. |
-| `convert_element_type` for FP4/FP8 → bf16 and back | the boundary of every scaled GEMM | ⚠️ | `ryft-core` + `ryft-xla` | Same primitive as Phase 1, but the lowering must hand off to `stablehlo.convert` with the correct rounding mode (RTE for forward, stochastic rounding optional for backward grads). |
-| Delayed-scaling amax history buffer | FP8 per-tensor scale tracker | ❌ | `ryft-models::optimizer` | A pure-function pattern: `(amax_history, current_amax) -> (new_amax_history, scale)`. No new IR primitive — needs `reduce_max`, `slice`, `dynamic_update_slice`, and `concatenate`, all of which appear in Phase 1/3/4 already. |
-| Stochastic rounding for backward gradients | optional, improves NVFP4 backward quality | ❌ | `ryft-core` + `ryft-xla` | A flag on `convert_element_type`. Needs the Phase 5 RNG primitive. |
+| Capability | Used by | State | Notes |
+|---|---|---|---|
+| block quantization `(values, scales)` from bf16/fp32 | producing FP8/NVFP4 weights & activations | ✅ | `BlockQuantize::block_quantize(block_size, element_type, scale_type)` — a pure composition of existing primitives (as this table originally recommended for `reduce_max_abs`, and better than the dedicated op it proposed: the recipe inherits its transform rules from its ingredients). NVFP4 recipe (`f8e4m3fn` scales, `max_abs / element_max`) and OCP MX recipe (`f8e8m0fnu` power-of-two scales with spec-prescribed clamping) both implemented |
+| block-scaled dot | every quantized matmul | ✅ | `ScaledDotOperation` / `ScaledDot::scaled_dot(lhs_scales, rhs, rhs_scales, block_size, accumulation_type)` (+ `scaled_dot_with_global_scale`); rank-2 or batched rank-3 operands; forward-mode rule treats it as bilinear with the scales held fixed |
+| dequantize | debugging, portable execution | ✅ | implemented inside the portable lowering fallback (broadcast-expand scales → multiply → convert → `dot_general`); no standalone op, none needed |
+| per-block `reduce_max_abs` | amax inside quantization | ✅ | composite (`Abs` + `Reshape` + `Reduce`), inside `block_quantize` |
+| FP4/FP8 ↔ bf16 casts | scaled-GEMM boundaries | ✅ | `ConvertElementTypeOperation` handles the narrow types |
+| Stochastic rounding for backward casts | NVFP4 backward quality | ❌ | still missing — `ConvertElementType` has no rounding-mode parameter; needs a `RoundingMode` knob (RNG-driven, via `RngBitGenerator`) |
+| Random Hadamard Transform (RHT) | TE-parity NVFP4 outlier smoothing | ❌ | still missing; composable from existing ops (block-diagonal `dot` with a fixed Hadamard matrix + sign flips) or a fused kernel later |
+| Delayed-scaling amax history buffer | FP8 per-tensor scale tracker | ❌ | still missing; a pure-function pattern over `reduce`/`slice`/`dynamic_update_slice` — belongs in the R1 optimizer/scaling module, no new IR primitive |
+| Fused row+column dual quantization | TE-parity training throughput | ❌ | forward and backward consume a tensor along different axes; TE produces both quantized copies in one fused kernel. `ryft` can start with two `block_quantize` calls and fuse later |
 
-The shape of the new IR primitive is intentionally small — three additions
-(`QuantizeScaled`, `DequantizeScaled`, `ScaledDotGeneral`) cover the entire FP8/NVFP4 surface
-that Gemma 4 training touches. Activation casts at the input and output of each scaled GEMM, the
-Transformer Engine-style amax tracker, and the mixed-precision boundary policy are all built on
-top of those three plus existing primitives.
+The original three-primitive proposal (`QuantizeScaled`, `DequantizeScaled`,
+`ScaledDotGeneral`) was realized as **one** primitive (`ScaledDotOperation`) plus **one
+composition** (`BlockQuantize`) — a strictly smaller IR surface than planned. The remaining
+rows are training-recipe refinements, not blockers: bf16-master-weight NVFP4 training runs
+with what exists today.
 
 ### 4.3 Lowering strategy
+
+> **Status: implemented.** `lower_scaled_dot_to_mlir` in
+> [crates/ryft-xla/src/experimental/lowering.rs](crates/ryft-xla/src/experimental/lowering.rs)
+> implements the recommendation below: when the target platform is CUDA and both operand
+> format pairs qualify for hardware block scaling, it emits a `stablehlo.custom_call` to
+> **`__op$block_scaled_dot`** (XLA's cuDNN block-scaled-dot target — the kernel
+> `jax.nn.scaled_matmul` reaches), handling operand reordering, physical padding, and
+> dynamic-dimension restoration; on every other platform (or non-qualifying formats) it
+> expands to the portable dequantize → upcast → `dot_general` fallback. The background below
+> is retained for the design rationale, including the FP8 `gemm-rewriter` alternative that
+> remains available if per-tensor-FP8 (rather than block-scaled) recipes are ever wanted.
 
 There is **no dedicated `stablehlo.scaled_dot_general` op today** — neither in the current spec
 nor as a finalized in-progress proposal. The two viable paths on Blackwell, both grounded in
@@ -1037,15 +1164,16 @@ so no custom call is needed in either path. cuDNN's fused quantize-then-GEMM ker
 opted into later as a peephole optimization on top of the FP8 pattern-match path; for MX, the
 fusion would need to live inside the custom-call kernel itself.
 
-#### 4.3.3 Why `ryft-core` still wants a `ScaledDotGeneralOperation`
+#### 4.3.3 Why `ryft-core` wants a first-class scaled-dot operation
 
-The IR-level `ScaledDotGeneralOperation` in `ryft-core` is justified independently of either
-lowering: it preserves the scaled-matmul shape through `ryft`'s autodiff and sharding
-transforms (both of which need to see the matmul as one node, not as an expanded sequence
-that's harder to differentiate and harder to shard). The lowering rule in `ryft-xla` is then
-the single place where the decision "FP8 → expand into the 6-op template; MX → emit a cuDNN
-custom call" lives, and that rule is small enough that swapping it for a future upstream HLO
-op is a one-day change.
+*(This argument won: the op landed as `ScaledDotOperation`.)* An IR-level scaled-dot primitive
+in `ryft-core` is justified independently of either lowering: it preserves the scaled-matmul
+shape through `ryft`'s autodiff and sharding transforms (both of which need to see the matmul
+as one node, not as an expanded sequence that's harder to differentiate and harder to shard).
+The lowering rule in `ryft-xla` is then the single place where the decision "qualifying CUDA
+target → `__op$block_scaled_dot` custom call; anything else → portable dequantized expansion"
+lives, and that rule is small enough that swapping it for a future upstream HLO op is a
+one-day change.
 
 #### 4.3.4 Reference: how efficient NVFP4 model implementations in JAX are built today
 
@@ -1284,144 +1412,93 @@ Rules of thumb:
   most tolerant of quantization noise). Use FP8 E4M3 for the attention projections, which carry
   smaller activations and need slightly tighter precision. Both run on `tcgen05.mma`.
 
-### 4.5 API surface (aspirational)
+### 4.5 API surface (as implemented)
 
-The model code from §3 changes only at matmul call sites. The helper takes the same
-`DotDimensionNumbers` plus a `ScaledDotConfig` describing the quantization regime; everything
-else (residual, normalization, mask) stays identical.
+The real API landed as two value-level capabilities that compose exactly as the aspirational
+sketch hoped, minus the config struct (quantization regime is expressed directly by the
+`(element_type, scale_type, block_size)` triple):
 
 ```rust
-// crates/ryft-models/src/common/nn.rs
-
-use ryft_core::types::DataType;
-
-/// Microscaling format for one operand of a scaled GEMM.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ScaledFormat {
-    /// Per-tensor FP8 E4M3, scale dtype = `F32` (Hopper-style).
-    Fp8E4m3PerTensor,
-
-    /// Per-tensor FP8 E5M2 — used for backward operands.
-    Fp8E5m2PerTensor,
-
-    /// NVFP4: 16-element blocks, scale dtype = `F8E4M3FN` (UE4M3), plus per-tensor `F32` scale.
-    Nvfp4Block16,
-
-    /// MXFP4: 32-element blocks, scale dtype = `F8E8M0FNU` (UE8M0).
-    Mxfp4Block32,
+// crates/ryft-core/src/operations/math/block_quantize.rs (implemented)
+pub trait BlockQuantize: Sized {
+    /// Quantizes `self` into `(elements, scales)` per block of `block_size` trailing-dimension
+    /// values. `f8e4m3fn` scales select the NVFP4 recipe; `f8e8m0fnu` scales select the OCP MX
+    /// power-of-two recipe (with the spec-prescribed clamping).
+    fn block_quantize(
+        &self,
+        block_size: usize,
+        element_type: DataType,
+        scale_type: DataType,
+    ) -> Result<(Self, Self), ProgramError>;
 }
 
-#[derive(Clone, Debug)]
-pub struct ScaledDotConfig {
-    /// Quantization of the LHS operand.
-    pub lhs_format: ScaledFormat,
-
-    /// Quantization of the RHS operand.
-    pub rhs_format: ScaledFormat,
-
-    /// Accumulator dtype. Almost always `DataType::F32` on Blackwell.
-    pub accumulator_dtype: DataType,
-
-    /// Output dtype. Typically `DataType::BF16` because the next consumer is a residual.
-    pub output_dtype: DataType,
-}
-
-/// Scaled `dot_general`. Quantizes both operands inline (computing block-amax → scale → cast),
-/// invokes `tcgen05.mma` via the configured lowering target, and downcasts the accumulator to
-/// `output_dtype`. Differentiation rules treat the scaled GEMM as a linear op in both data
-/// operands; the scales are captured at trace time and rebuilt per step in the backward pass.
-pub fn scaled_dot_general<V>(
-    lhs: V,
-    rhs: V,
-    dimensions: &DotDimensionNumbers,
-    config: &ScaledDotConfig,
-) -> Result<V, TracingError>
-where
-    V: QuantizeScaled + ScaledDotGeneral + ConvertElementType + Clone,
-{
-    let (lhs_values, lhs_scales) = lhs.quantize_scaled(config.lhs_format)?;
-    let (rhs_values, rhs_scales) = rhs.quantize_scaled(config.rhs_format)?;
-    V::scaled_dot_general(lhs_values, lhs_scales, rhs_values, rhs_scales, dimensions, config)
+// crates/ryft-core/src/operations/math/dot.rs (implemented)
+pub trait ScaledDot: Sized {
+    /// Block-scaled matrix product of `self` `[b?, m, k]` (scaled by `lhs_scales`
+    /// `[b?, m, k / block_size]`) and `rhs` `[b?, n, k]` (scaled by `rhs_scales`), dequantizing
+    /// both operands to `accumulation_type` and returning the `[b?, m, n]` product at that type.
+    fn scaled_dot(
+        &self,
+        lhs_scales: &Self,
+        rhs: &Self,
+        rhs_scales: &Self,
+        block_size: usize,
+        accumulation_type: DataType,
+    ) -> Result<Self, ProgramError>;
+    // plus `scaled_dot_with_global_scale(..)` carrying NVFP4's coarse per-tensor scale.
 }
 ```
 
-Inside the model, the only delta is replacing `einsum_3d` / `dot_general` calls with
-`scaled_dot_general`:
+A quantized matmul in the model is then a two-call composition (this is what the model crate's
+`Policy`-driven `maybe_scaled_dot` helper wraps):
 
 ```rust
-// crates/ryft-models/src/gemma_4/attention.rs (delta)
-
-let logits = scaled_dot_general(
-    queries,
-    keys,
-    &DotDimensionNumbers::new(vec![4], vec![3], vec![0, 2], vec![0, 2]),
-    &ScaledDotConfig {
-        lhs_format: ScaledFormat::Fp8E4m3PerTensor,
-        rhs_format: ScaledFormat::Fp8E4m3PerTensor,
-        accumulator_dtype: DataType::F32,
-        output_dtype: DataType::BF16,
-    },
-)? * V::scalar_like(&queries, (head_dim as f32).rsqrt())?;
+// NVFP4 MLP projection: quantize both sides on the fly, contract at fp32, downcast to bf16.
+let (x_q, x_scales) = x.block_quantize(16, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+let (w_q, w_scales) = weights.block_quantize(16, DataType::F4E2M1FN, DataType::F8E4M3FN)?;
+let product = x_q
+    .scaled_dot(&x_scales, &w_q, &w_scales, /*block_size=*/ 16, DataType::F32)?
+    .convert_element_type(DataType::BF16)?;
 ```
 
-```rust
-// crates/ryft-models/src/gemma_4/mlp.rs (delta)
-
-let gate = scaled_dot_general(
-    x,
-    &params.gating,
-    &DotDimensionNumbers::new(vec![2], vec![1], vec![], vec![]),
-    &ScaledDotConfig {
-        lhs_format: ScaledFormat::Nvfp4Block16,
-        rhs_format: ScaledFormat::Nvfp4Block16,
-        accumulator_dtype: DataType::F32,
-        output_dtype: DataType::BF16,
-    },
-)?;
-```
-
-A `Policy` struct on the model config (mentioned as a Phase 6 deliverable in §2) carries the
-default `ScaledDotConfig` for each role (attention, MLP, unembedding) so the call sites stay
-free of repeated boilerplate.
+Note the operand convention: `scaled_dot` contracts the **last** axis of both sides
+(`[m, k] × [n, k]`), so weight matrices feed it in `[n, k]` layout rather than the `[k, n]`
+layout plain `dot` uses — the model crate's helper owns that transpose. A `Policy` on the model
+config still earns its keep by carrying the per-role `(element_type, scale_type, block_size)`
+choices (attention projections FP8, MLP NVFP4, §4.4) so call sites stay clean.
 
 ### 4.6 Implementation phases (delta on top of §2)
 
-These slot in between existing phases without re-ordering them:
-
-- **Phase 1.5 — Conversion and quantization.** Land `ConvertElementTypeOperation` (already in
-  Phase 1) with explicit support for FP4/FP8 source/target plus rounding-mode metadata. Add
-  `QuantizeScaledOperation` and `DequantizeScaledOperation` on top of the Phase 3 `Reduce`. Unit
-  tests: round-trip `bf16 → NVFP4 → bf16` matches the Transformer Engine reference within
-  one ULP per block; `amax` lines up bitwise with cuBLASLt's helper.
-- **Phase 4.5 — Scaled GEMM lowering.** Introduce `ScaledDotGeneralOperation` plus
-  `SupportsScaledDotGeneral`. Wire two lowering paths chosen per `ScaledFormat`: (a) for FP8,
-  expand to `stablehlo.convert` + `stablehlo.multiply` + `stablehlo.dot_general` so XLA's
-  [`gemm-rewriter`](https://github.com/openxla/xla/blob/main/xla/service/gpu/transforms/gemm_rewriter.cc)
-  pattern-matches it into a `__cublas$lt$matmul$f8` custom call
+- **Phase 1.5 — Conversion and quantization — ✅ mostly done.** FP4/FP8 conversions work
+  through `ConvertElementTypeOperation`, and quantization landed as the `BlockQuantize`
+  composition (round-trip and amax tests live beside it). Remaining from this phase:
+  rounding-mode metadata on the conversion op (stochastic rounding for backward casts).
+- **Phase 4.5 — Scaled GEMM lowering — ✅ done (custom-call path).** Landed as
+  `ScaledDotOperation` with the `__op$block_scaled_dot` cuDNN custom call on CUDA and the
+  portable dequantize fallback elsewhere, plus interpretation/PE/JVP/batching rules. The
+  alternative FP8 `gemm-rewriter` pattern-match path
   ([RFC #22](https://github.com/openxla/xla/discussions/22),
-  [tensorflow#58720](https://github.com/tensorflow/tensorflow/pull/58720)); (b) for NVFP4/MXFP4,
-  emit a `stablehlo.custom_call` to the cuBLASLt scaled-matmul entry point with the operands
-  represented as `(elements, scales)` tuples
-  ([RFC #18085](https://github.com/openxla/xla/discussions/18085)). Add a unit test that golden
-  compares the FP8 lowering output against the [JAX FP8 fusion smoke
-  test](https://github.com/jax-ml/jax/issues/22313) shape so we catch any rewrite-breaking IR
-  drift early. Forward differentiation rule: linear in both data operands. Transpose rule:
-  produces two scaled GEMMs against the cotangent, with `E5M2`-flavored scales for the backward
-  operand pair.
-- **Phase 6.5 — Scale tracker.** Build a small `optimizer::scaling` module: a delayed-scaling
-  amax history buffer (`history: [steps, num_tensors]`), `update_scale_from_amax(history, amax)`
-  per training step, and a hook into `train_step` that wires the per-tensor scales into the
-  matmul call sites via the model's `Policy`.
-- **Phase 8.5 — End-to-end FP8/NVFP4 Gemma 4.** Re-trace `train_step` with the scaled GEMM path
-  selected by `Policy`. Validate against the bf16 baseline on a fixed batch: per-step parameter
-  delta should match within `1e-3` (FP8) or `5e-3` (NVFP4), and the 1k-step loss curve should
-  be statistically indistinguishable.
+  [`gemm_rewriter.cc`](https://github.com/openxla/xla/blob/main/xla/service/gpu/transforms/gemm_rewriter.cc),
+  [tensorflow#58720](https://github.com/tensorflow/tensorflow/pull/58720)) was not taken and
+  remains available if per-tensor FP8 (`__cublas$lt$matmul$f8`) recipes are wanted later.
+  Still open from the original description: an explicit transpose rule producing
+  `E5M2`-flavored backward GEMMs (today the backward of a quantized matmul re-quantizes
+  through the same forward recipe).
+- **Phase 6.5 — Scale tracker — ❌ open.** A small `optimizer::scaling` module: delayed-scaling
+  amax history buffer (`history: [steps, num_tensors]`), `update_scale_from_amax(history,
+  amax)` per training step, and a hook wiring per-tensor scales into matmul call sites via the
+  model's `Policy`. Belongs with the R1 optimizer work.
+- **Phase 8.5 — End-to-end FP8/NVFP4 Gemma 4 — ❌ open (validation, not implementation).**
+  Re-run `train_step` with the `Policy` selecting `block_quantize` + `scaled_dot` at the
+  §4.4-designated call sites. Validate against the bf16 baseline on a fixed batch: per-step
+  parameter delta within `1e-3` (FP8) / `5e-3` (NVFP4); 1k-step loss curves statistically
+  indistinguishable.
 
 ### 4.7 Verification plan
 
-1. **Per-op numerics.** For `QuantizeScaled`, `DequantizeScaled`, and `ScaledDotGeneral`, build
+1. **Per-op numerics.** For `BlockQuantize` and `ScaledDot` (both implemented), build
    reference NumPy/PyTorch implementations and check ULP-level agreement on randomized inputs.
-   The primary oracle for `ScaledDotGeneral` is
+   The primary oracle for `ScaledDot` is
    [`jax.nn.scaled_matmul`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_matmul.html)
    itself — we emit the same cuDNN custom call, so the outputs should be bit-identical on
    identical inputs. Secondary oracles: `torch.ops.aten._scaled_mm`, Transformer Engine's
@@ -1439,16 +1516,18 @@ These slot in between existing phases without re-ordering them:
 4. **Throughput sanity check.** On a single B200, expect ≥1.6× throughput for FP8 and ≥2.5× for
    NVFP4 vs bf16 on the MLP GEMMs. If the numbers are far below this, the lowering is
    misconfigured (most likely missing the cuBLASLt epilogue fusion).
-5. **A100 fallback.** When the device lacks FP8/NVFP4 hardware, the `ScaledDotGeneral` lowering
-   should fall back to a `dequantize → bf16 dot_general → quantize` chain transparently and emit
-   a warning. This keeps `ryft-models` portable for development on Hopper or Ampere.
+5. **Portable fallback — ✅ implemented.** The `ScaledDotOperation` lowering already falls back
+   to a transparent dequantize → upcast → `dot_general` expansion on any non-CUDA target (or
+   non-qualifying formats), which keeps model code portable for development on CPU, Hopper, or
+   Ampere. Remaining nicety: a one-time log line when the fallback is taken.
 
 ### 4.8 Open questions specific to Blackwell
 
 - **NVFP4 vs MXFP4.** NVIDIA's NVFP4 (16-element blocks, UE4M3 scale, plus per-tensor scale) and
   the [OCP MXFP4 standard](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
-  (32-element blocks, UE8M0 scale) coexist on Blackwell. We need both in `ScaledFormat`; default
-  to NVFP4 because the reference recipes target it and the loss-curve evidence in
+  (32-element blocks, UE8M0 scale) coexist on Blackwell. `BlockQuantize` already implements
+  both recipes (selected by the scale type); default to NVFP4 because the reference recipes
+  target it and the loss-curve evidence in
   [arXiv:2509.25149](https://arxiv.org/pdf/2509.25149) and
   [arXiv:2512.02010](https://arxiv.org/pdf/2512.02010) is stronger.
 - **Block alignment.** NVFP4's 16-element blocks must be aligned to the contracting axis. For
@@ -1478,30 +1557,54 @@ These slot in between existing phases without re-ordering them:
 
 ## 5. Risks & Open Questions
 
-- **Mixed-precision policy boundary.** The aspirational code does the bf16↔fp32 casts implicitly
-  inside RMSNorm and softmax. The actual lowering needs to make those casts explicit so XLA does
-  not silently downcast accumulators on GPU. Consider a `Policy` wrapper that traces the
-  conversions into the IR.
+- **The critical path moved from primitives to the model layer.** Everything blocking is now
+  concentrated in the missing optimizer module (R1), the model crate (R2/R3), and validation
+  (R4). The primitive-level risks the original list carried are resolved.
+- **Mixed-precision policy boundary.** §3's `rms_norm` does its bf16↔fp32 casts explicitly via
+  `ConvertElementType`, and `dot_with_accumulation_type` covers matmul accumulators — but there
+  is no `Policy` wrapper yet that applies a consistent regime across the model. Still open;
+  now purely model-crate work.
 - **KV-cache sharing & PLE during training.** The reference implementation conditionally reuses K
   and V from a donor layer (`kv_shared_cache`). During training (no decode), this collapses to
   "skip the K/V projection on the consuming layer and read from the donor's pre-RoPE K/V". The
   parameter tree captures this only implicitly via shared `Vec<BlockParams>` indices; a tagged
   `BlockKind` enum may be clearer.
-- **MoE variant (26B-A4B).** The aspirational code targets the dense E2B/E4B path. The MoE
-  variant needs `top_k`, ragged `gather`/`scatter` (Phase 4 already plans `scatter`, but `top_k`
-  itself is a new IR primitive), and a `shard_map` body that does an `all_to_all` exchange before
-  expert evaluation. Add this as a Phase 8b once the dense path is stable.
-- **`einsum` ergonomics.** The aspirational code uses an `einsum_2d` / `einsum_3d` helper. The
-  underlying primitive is already `dot_general`; the helper is a string-spec frontend. Decide
-  whether to make this a compile-time parsed macro (`einsum!("BTKGH,BSKH->BTKGS", q, k)`) or a
-  runtime-parsed builder.
-- **Determinism of dropout / init under sharding.** Bit-exact reproducibility across mesh shapes
-  requires the device RNG (Phase 5) to be stateless and sharding-aware. Punting to host-side
-  initialization for the first cut is acceptable, but training-time dropout (if ever enabled) must
-  be device-side.
-- **`erf` vs `tanh`-approx GELU.** Gemma's reference uses exact GELU on TPU and tanh-approx on
-  some GPUs. Plan to expose both with a config knob; the IR primitive of choice is `erf` because
-  it lowers more directly.
+- **Fused attention coverage for Gemma-specific details.** `DotProductAttentionOperation`
+  covers causal + sliding-window + GQA + bias, which is everything the dense text path needs.
+  Two details to verify during R3: soft-capping *inside* attention is not needed for Gemma 4
+  (only the final-logit softcap survives, outside attention — fine), and QK-norm happens
+  before the fused op (fine, it is outside the kernel in the reference too). If a future
+  variant needs per-attention logit transforms, the fallback is the unfused composition, which
+  all exists.
+- **MoE variant (26B-A4B).** The dense path is fully covered. For MoE, `top_k`, `scatter`, and
+  `all_to_all` all exist now; what remains is model-level routing code and (likely) a ragged /
+  grouped GEMM story for expert efficiency — flag as Phase 8b once the dense path is stable.
+- **Vision encoder needs convolution.** The only missing IR primitive in the whole plan:
+  `ConvolutionOperation` + `stablehlo.convolution` lowering for the SigLIP patch embedding
+  (R5). Text-only training is unaffected.
+- **`einsum` ergonomics.** §3 now avoids einsum entirely (rank-2 `dot` + `reshape`, fused
+  attention). A string-spec frontend remains a nice-to-have, not a blocker.
+- **Determinism of init under sharding.** The device RNG is stateless (ThreeFry/Philox) as
+  required; sharding-aware key derivation per shard still needs a convention in the model
+  crate. Training-time dropout, if ever enabled, rides the fused attention op's own
+  `with_dropout(p, seed)`.
+- **`erf` vs `tanh`-approx GELU.** Both primitives exist now; expose the choice as a config
+  knob in the model crate. Default to exact (`erf`) GELU.
+- **Batching a compiled function.** `CompiledXlaFunction::batch` is stubbed — deliberately, not
+  as an oversight (see the design note at [crates/ryft-xla/src/jit.rs:1031](crates/ryft-xla/src/jit.rs:1031)).
+  Derived compiled functions are retained through a structural transform cache, and on this
+  branch the batch extent is a first-class runtime `DimensionVariable` (batched sealed regions
+  carry the `[extent, inputs...] ↦ [extent, outputs...]` boundary). The open design decision is
+  the cache-key split: the extent's static type/identity contract (plus axis name, mapped
+  sharding, normalized input axes, and output policy) belongs in the structural transform key,
+  while the extent *value* should be a runtime operand — so `f.batch(32)` and `f.batch(64)`
+  share one retained artifact. A naive extent-specialized implementation (mirroring the ~70-line
+  `.jvp()` shape around the core `batch` transform, one compilation per axis size) is a few
+  days of work; the intended runtime-extent design is weeks, but overlaps the dynamic-shapes
+  work already in flight. Independent gap either way: `shard_map`/`linear_shard_map` have no
+  batching rules yet. Not on the training critical path (data batching is just the leading
+  axis inside the traced loss); it matters for vmap-of-jit workflows (ensembles, multi-seed,
+  per-example gradients).
 
 ---
 
@@ -1651,9 +1754,33 @@ A consolidated list of every external source cited in this document, grouped by 
 
 ### 6.6 In-repo references
 
-- [`crates/ryft-core/src/types/data.rs:759`](crates/ryft-core/src/types/data.rs:759) —
+- [`crates/ryft-core/src/operations/`](crates/ryft-core/src/operations/) — the complete
+  primitive set (`math/`, `manipulation/`, `compare.rs`, `logical/`, `random.rs`,
+  `collectives.rs`, `control_flow/`, `sort.rs`, `attention.rs`, `sharding.rs`, `dimensions/`).
+- [`crates/ryft-core/src/arrays/operations/mod.rs`](crates/ryft-core/src/arrays/operations/mod.rs) —
+  the `ArrayOperations` capability bundle and the closed `ArrayOperation` /
+  `ArrayIrOperation` / `DimensionOperation` families.
+- [`crates/ryft-core/src/operations/attention.rs`](crates/ryft-core/src/operations/attention.rs) —
+  the fused `DotProductAttentionOperation` (+ backward) with GQA, causal masking, sliding
+  windows, dropout, bias, and sequence lengths.
+- [`crates/ryft-core/src/operations/math/dot.rs`](crates/ryft-core/src/operations/math/dot.rs) —
+  `DotOperation` and the block-scaled `ScaledDotOperation` (§4).
+- [`crates/ryft-core/src/operations/math/block_quantize.rs`](crates/ryft-core/src/operations/math/block_quantize.rs) —
+  the `BlockQuantize` NVFP4/MX quantization recipes (§4).
+- [`crates/ryft-core/src/arrays/types/data.rs:694`](crates/ryft-core/src/arrays/types/data.rs:694) —
   the `DataType` enum entries for `F4E2M1FN`, `F8E4M3FN`, `F8E5M2`, `F8E8M0FNU`, and friends.
-- [`crates/ryft-core/src/tracing_v2/operations/`](crates/ryft-core/src/tracing_v2/operations/) —
-  existing operation types used as the template for new primitives in §1.
+- [`crates/ryft-core/src/differentiation/`](crates/ryft-core/src/differentiation/) — the
+  `differentiate_at` builder (jvp/linearize/vjp/value_and_gradient/jacobians/hessian).
+- [`crates/ryft-core/src/tracing_v2/rematerialization.rs`](crates/ryft-core/src/tracing_v2/rematerialization.rs) —
+  `rematerialize` and the JAX-parity checkpointing policy family.
+- [`crates/ryft-core/src/compilation/`](crates/ryft-core/src/compilation/) — backend-neutral
+  `jit`/`stage_function` with structural and disk caching.
 - [`crates/ryft-xla/src/experimental/lowering.rs`](crates/ryft-xla/src/experimental/lowering.rs) —
-  existing StableHLO lowering rules that the new ops in §1 will extend.
+  the StableHLO lowering rules, including `lower_scaled_dot_to_mlir`
+  (`__op$block_scaled_dot` + portable fallback) and the cuDNN FMHA attention custom calls.
+- [`crates/ryft-xla/src/jit.rs`](crates/ryft-xla/src/jit.rs) and
+  [`crates/ryft-xla/src/eager.rs`](crates/ryft-xla/src/eager.rs) — XLA compile/stage/jitted
+  surface and eager op-by-op dispatch with the shared executable cache.
+- [`crates/ryft/examples/mlp.rs`](crates/ryft/examples/mlp.rs) — the canonical end-to-end
+  training example whose idioms §3 follows (generic `A: ArrayOperations` model code,
+  `differentiate_at(..).with_captures(..).value_and_gradient(..)`, dual core/XLA runners).
