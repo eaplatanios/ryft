@@ -10,7 +10,7 @@ use crate::arrays::arrays::Array;
 use crate::arrays::batching::ReplicatedDimensionBatchingPolicy;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::DimensionOperation;
+use crate::arrays::operations::{ArrayIrOperation, DimensionOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{DimensionBounds, DimensionError, DimensionType, DimensionVariable};
@@ -49,6 +49,38 @@ where
         Ok(context.parent().bind(self.clone(), Vec::new(), inputs)?.into())
     }
 }
+
+/// Lifts one homogeneous first-class dimension operation directly into [`ArrayIrOperation`].
+macro_rules! impl_dimension_operation_lift {
+    // Each accepted item is a concrete homogeneous dimension operation type owned by `DimensionOperation`.
+    ($($operation:ident),+ $(,)?) => {
+        $(
+            impl<A: Value<Type = ArrayType>> From<$operation> for ArrayIrOperation<A> {
+                #[inline]
+                fn from(operation: $operation) -> Self {
+                    Self::Dimension(operation.into())
+                }
+            }
+        )+
+    };
+}
+
+// Every first-class dimension operation lifts directly into the composite family, so that generic composite code can
+// state a plain `From<DimensionMulOperation>`-style bound without naming this family's dimension member. Each lift
+// routes through the member family that owns the operation's payload, semantics, and rendering. `ConstantOperation`
+// has its own lift next to the other constant constructors.
+impl_dimension_operation_lift!(
+    DimensionAddOperation,
+    DimensionSubOperation,
+    DimensionSaturatingSubOperation,
+    DimensionMulOperation,
+    DimensionPowOperation,
+    DimensionDivFloorOperation,
+    DimensionRemOperation,
+    DimensionMinOperation,
+    DimensionMaxOperation,
+    DimensionRequirementOperation,
+);
 
 impl Add for DimensionValue {
     fn add(&self, right: &Self) -> Result<Self, ProgramError> {

@@ -535,7 +535,7 @@ where
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
                     MaybeZero::Value(input_tangent) => {
-                        let numeric_mask = mask.align_tangent(input_tangent.r#type().as_ref())?;
+                        let numeric_mask = mask.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                         let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
                         let masked_tangent = numeric_mask * input_tangent.clone();
                         MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)
@@ -813,6 +813,10 @@ where
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the element that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
+///
+/// Both replications need every reduced extent, so a reduced axis whose extent is only known at run time is rejected
+/// here and served by [`MemberDifferentiableOperation::jvp_in_parent`] instead: linearization retains those extents as
+/// first-class dimension residuals and stages the replication as a mixed broadcast against them.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
     O: Operation<Type = ArrayType>
@@ -835,22 +839,34 @@ where
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent())]),
             MaybeZero::Value(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
+                    // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
+                    // directly transposed program cannot observe as it holds no primal value that carries it.
+                    if let Some(axis) =
+                        self.axes.iter().find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
+                    {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "direct '{}' transposition over reduced axis {axis} of {input_shape} requires \
+                                 linearization so that the runtime extent can be retained as a residual",
+                                self.name(),
+                            ),
+                        }
+                        .into());
+                    }
+
                     let output_type = input_type.cotangent();
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {
                         ReductionKind::Sum => broadcasted,
                         ReductionKind::Mean => {
+                            // The check above rejected every runtime-sized reduced axis, so each reduced extent is
+                            // statically known here.
                             let reduced_extents = self
                                 .axes
                                 .iter()
-                                .map(|axis| {
-                                    input_shape.dimension(*axis).value().ok_or(TypeError::invalid(format!(
-                                        "mean transpose requires static reduced extents but axis {axis} of \
-                                            {input_shape} is dynamic",
-                                    )))
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
+                                .map(|axis| input_shape.dimension(*axis).value().unwrap())
+                                .collect::<Vec<_>>();
                             let element_count = if reduced_extents.contains(&0) {
                                 0
                             } else {
@@ -1031,12 +1047,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, Shape,
     };
     use crate::contexts::StagingContext;
-    use crate::differentiation::differentiate_at;
+    use crate::differentiation::{DifferentiationError, differentiate_at};
     use crate::macros::check_operation_batching;
-    use crate::programs::Typed;
+    use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
+    use crate::programs::{MaybeZero, ProgramBuilder, ProgramError, Typed};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -1498,6 +1518,85 @@ mod tests {
             .unwrap();
         assert_eq!(contributions.len(), 1);
         assert_eq!(contributions[0].r#type().as_ref(), &input_type);
+    }
+
+    #[test]
+    fn test_reduce_dynamic_reduced_axis_transposition() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+
+        // Direct transposition observes no primal value, so the reduced axis's runtime extent is unavailable and the
+        // replication cannot be staged. Both additive kinds report that instead of failing inside broadcast inference.
+        for kind in [ReductionKind::Sum, ReductionKind::Mean] {
+            let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let output_cotangent = {
+                let atom = context
+                    .builder()
+                    .borrow_mut()
+                    .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
+                context.tracer(atom, None)
+            };
+            assert!(matches!(
+                ReduceOperation::new(vec![0], kind).transpose(
+                    &mut context,
+                    &crate::programs::regions::EmptyRegionDriver,
+                    &[PartialValue::Unknown(input_type.clone())],
+                    &[MaybeZero::Value(output_cotangent)],
+                ),
+                Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                    if message == format!(
+                        "direct 'reduce_{kind}' transposition over reduced axis 0 of [batch, 2] requires \
+                         linearization so that the runtime extent can be retained as a residual",
+                    ),
+            ));
+        }
+
+        // Linearization retains that extent as a first-class dimension residual, so the same reductions transpose
+        // through the composite universe and their pullbacks replay at more than one concrete extent.
+        for (axes, cotangent) in [(vec![0], Array::vector(vec![1.0, 2.0])), (vec![0, 1], Array::scalar(3.0))] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(
+                        axes.clone(),
+                        ReductionKind::Sum,
+                    ))),
+                    Vec::new(),
+                    vec![input],
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+            let pullback = linearization.pullback().unwrap();
+
+            for rows in [4usize, 2] {
+                let values = (0..rows * 2).map(|index| index as f64).collect::<Vec<_>>();
+                let mut primal_outputs = linearization
+                    .primal()
+                    .interpret(vec![ArrayIrValue::Array(Array::matrix(rows, 2, values))])
+                    .unwrap();
+                let residuals = primal_outputs.split_off(1);
+                let mut pullback_inputs = vec![ArrayIrValue::Array(cotangent.clone())];
+                pullback_inputs.extend(residuals);
+
+                // A sum broadcasts each output cotangent back over every reduced position.
+                let expected = (0..rows * 2)
+                    .map(|index| if axes.len() == 1 { cotangent.to_f64s()[index % 2] } else { cotangent.to_f64s()[0] })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pullback.interpret(pullback_inputs),
+                    Ok(vec![ArrayIrValue::Array(Array::matrix(rows, 2, expected))]),
+                );
+            }
+        }
     }
 
     #[test]

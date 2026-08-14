@@ -2038,20 +2038,22 @@ macro_rules! impl_differentiable_elementwise_operation {
                 // is load-bearing and not a consolidation candidate.
                 let tangent = match (left, right) {
                     (Some(left), Some(right)) => {
-                        let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target)?;
-                        let right = $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target)?;
+                        let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target, &primal)?;
+                        let right = $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target, &primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                                     @combine_linear_tangents [$left_sign, $right_sign], left, right
                         ))
                     }
                     (Some(tangent), None) => {
-                        let tangent = $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target)?;
+                        let tangent =
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                             @apply_tangent_sign $left_sign, tangent
                         ))
                     }
                     (None, Some(tangent)) => {
-                        let tangent = $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target)?;
+                        let tangent =
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                             @apply_tangent_sign $right_sign, tangent
                         ))
@@ -2210,6 +2212,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                                 let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
                                     inputs[1].as_known().unwrap(),
                                     $crate::Typed::r#type($left_output_cotangent).as_ref(),
+                                    $left_output_cotangent,
                                 )?;
                                 let contribution = $left_contribution;
                                 $crate::MaybeZero::Value(
@@ -2243,6 +2246,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                                 let $transpose_left_again = $crate::ElementwiseDerivativeAlignment::align_tangent(
                                     inputs[0].as_known().unwrap(),
                                     $crate::Typed::r#type($right_output_cotangent).as_ref(),
+                                    $right_output_cotangent,
                                 )?;
                                 let contribution = $right_contribution;
                                 $crate::MaybeZero::Value(
@@ -2353,6 +2357,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         let $transpose_right = $crate::ElementwiseDerivativeAlignment::align_tangent(
                             inputs[1].as_known().unwrap(),
                             $crate::Typed::r#type($output_cotangent).as_ref(),
+                            $output_cotangent,
                         )?;
                         let contribution = $contribution;
                         $crate::MaybeZero::Value(

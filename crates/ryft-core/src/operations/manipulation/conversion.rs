@@ -134,7 +134,7 @@ impl_differentiable_operation! {
             let tangent = match inputs[0].tangent() {
                 _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
                 MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
-                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.align_tangent(&output_tangent_type)?),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.align_tangent(&output_tangent_type, &primal)?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }

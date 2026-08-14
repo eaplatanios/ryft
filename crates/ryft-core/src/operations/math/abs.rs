@@ -85,7 +85,7 @@ impl_differentiable_operation! {
                 }
                 MaybeZero::Value(tangent) => {
                     if input.primal().r#type().is_complex() {
-                        let denominator = primal.align_tangent(&primal_tangent_type)?;
+                        let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = denominator.zero_like();
                         let one = denominator.one_like();
                         let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
@@ -98,11 +98,11 @@ impl_differentiable_operation! {
                         let imaginary = conjugate.imaginary()? / denominator.clone();
                         let coefficient = real.complex(&imaginary)?;
                         let input_tangent_type = input.primal().r#type().tangent();
-                        let tangent = tangent.align_tangent(&input_tangent_type)?;
-                        MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type)?)
+                        let tangent = tangent.align_tangent(&input_tangent_type, input.primal())?;
+                        MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type, &primal)?)
                     } else {
-                        let input = input.primal().align_tangent(&primal_tangent_type)?;
-                        let tangent = tangent.align_tangent(&primal_tangent_type)?;
+                        let input = input.primal().align_tangent(&primal_tangent_type, &primal)?;
+                        let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = input.zero_like();
                         let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
                         MaybeZero::Value(C::Value::select(&non_negative, &tangent, &-tangent.clone())?)

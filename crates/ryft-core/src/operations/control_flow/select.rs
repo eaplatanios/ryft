@@ -217,7 +217,7 @@ impl_select_differentiation! {
                 )?;
                 check_count!("output", tangents, 1, ProgramError);
                 let output_tangent_type = primal.r#type().tangent();
-                MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type)?)
+                MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type, &primal)?)
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }

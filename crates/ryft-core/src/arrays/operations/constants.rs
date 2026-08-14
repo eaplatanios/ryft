@@ -242,6 +242,28 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperat
     }
 }
 
+impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    #[inline]
+    fn from(operation: OneOperation<ArrayIrType>) -> Self {
+        // A composite one names its complete output type, so it needs no composite carrier of its own: it normalizes
+        // into the same canonical member encodings that the homogeneous lift above selects. This conversion exists so
+        // that type-generic transform drivers can name the multiplicative identity in the composite universe with a
+        // plain `From<OneOperation<C::Type>>` bound, which is what reverse-mode gradient seeding requires.
+        match operation.r#type() {
+            ArrayIrType::Array(r#type) => Self::from(OneOperation::new(r#type.clone())),
+            // A first-class dimension is a shape quantity rather than numerical data, so it has no one value. The
+            // composite universe already represents a dimension's differential space as the zero-space array member
+            // (refer to [`DifferentiableType::cotangent`](crate::DifferentiableType::cotangent)), and that member is
+            // where this request is routed: it materializes no value, because constructing a one of data type zero is
+            // rejected. Reverse-mode seeding never reaches this arm, because it rejects a zero-space output before
+            // constructing its seed.
+            ArrayIrType::Dimension(_) => {
+                Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
+            }
+        }
+    }
+}
+
 impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: IotaOperation<ArrayType>) -> Self {
@@ -536,11 +558,14 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiableType, ForwardModeDifferentiate, ReverseModeDifferentiate, TransposableOperation,
+        DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
+        TransposableOperation, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{DynamicBroadcastOperation, Fill, StopGradientOperation, ZeroOperation};
+    use crate::operations::{
+        DynamicBroadcastOperation, Fill, Mul, Reduce, ReductionKind, StopGradientOperation, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
@@ -967,6 +992,50 @@ mod tests {
             .unwrap();
         assert_eq!(primal, ArrayIrValue::Array(Array::vector(vec![1.0_f64, 1.0, 1.0])));
         assert_eq!(tangent, ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 0.0])));
+    }
+
+    #[test]
+    fn test_array_ir_gradient_terminals_seed_a_composite_one() {
+        // A composite one carries its complete output type and therefore normalizes into the same canonical member
+        // encodings as the homogeneous lift: the static array member, or the mixed dynamic constructor.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(OneOperation::new(ArrayIrType::Array(ArrayType::scalar(DataType::F64)))),
+            ArrayIrOperation::Array(ArrayOperation::One(_)),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(OneOperation::new(ArrayIrType::Array(dynamic_type))),
+            ArrayIrOperation::DynamicOne(_),
+        ));
+
+        // A first-class dimension has no one value, so the conversion stays total by routing to the zero-space array
+        // member that represents a dimension's differential space, which materializes nothing.
+        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent));
+        let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
+            ArrayIrOperation::from(OneOperation::new(dimension_type))
+        else {
+            panic!("expected the zero-space array member encoding");
+        };
+        assert_eq!(operation.r#type(), &ArrayType::scalar(DataType::Zero));
+
+        // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the composite cotangent
+        // type, which the composite family normalizes into its canonical array member encoding. The differentiated
+        // function reaches ordinary array math through the array member projection, because homogeneous array
+        // capabilities deliberately do not exist at the composite level.
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));
+        let squared_sum = |input: LinearizationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
+            let input = <_ as ValueProjection<ArrayType>>::into_projected(input)?;
+            let squared = input.mul(&input)?;
+            Ok::<_, ProgramError>(ValueProjection::<ArrayType>::from_projected(
+                squared.reduce(&[0], ReductionKind::Sum),
+            ))
+        };
+
+        let (value, gradient) = differentiate_at(input.clone()).value_and_gradient(squared_sum).unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(14.0_f64)));
+        assert_eq!(gradient, ArrayIrValue::Array(Array::vector(vec![2.0_f64, 4.0, 6.0])));
+        assert_eq!(differentiate_at(input).gradient(squared_sum).unwrap(), gradient);
     }
 
     #[test]

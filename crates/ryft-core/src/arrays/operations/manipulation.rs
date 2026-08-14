@@ -29,9 +29,9 @@ use crate::macros::check_count;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::{
     Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode,
-    PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters, Scatter, ScatterOperation,
-    ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
+    DynamicBroadcastOperation, DynamicReshape, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation,
+    GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters, Scatter,
+    ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -87,6 +87,34 @@ impl<A: Value<Type = ArrayType> + DimensionSize<usize> + Broadcast> DynamicBroad
         let operation = DynamicBroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
         let output_type = infer_explicit_broadcast_output_type(input.r#type().as_ref(), output_shape, &operation)?;
         Ok(Self::Array(input.broadcast(output_type, output_axes)?))
+    }
+}
+
+impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
+    fn dynamic_reshape_with_parameters(
+        &self,
+        output_dimensions: &[Self],
+        dimensions: Option<Permutation>,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        // Concrete composite values resolve every explicit extent operand to its runtime value, so the mixed reshape
+        // executes as the ordinary member reshape of the fully resolved output shape.
+        let input = <Self as ValueProjection<ArrayType>>::projected(self)?;
+        let output_shape = Shape::new(
+            output_dimensions
+                .iter()
+                .map(<Self as ValueProjection<DimensionType>>::projected)
+                .map(|result| result.map(|dimension| Dimension::Static(dimension.extent())))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let mut parameters = ReshapeParameters::new(output_shape);
+        if let Some(dimensions) = dimensions {
+            parameters = parameters.with_dimensions(dimensions);
+        }
+        if let Some(output_sharding) = output_sharding {
+            parameters = parameters.with_output_sharding(output_sharding);
+        }
+        Ok(Self::Array(input.reshape(parameters)?))
     }
 }
 

@@ -38,10 +38,11 @@ use crate::operations::{
     Ceil, CeilOperation, CollectiveOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation,
     ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, CoordinateBasisOperation,
     Cos, CosOperation, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
-    DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSaturatingSubOperation,
-    DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div,
-    DivOperation, Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
+    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
+    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
     DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
     Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log,
     LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
@@ -416,22 +417,66 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///
 ///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
-///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], and [`DynamicBroadcast`].
+///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
+///     [`DynamicReshape`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
-///     them through their [`ValueProjection`] view onto [`ArrayType`], whose projected value satisfies
-///     [`ArrayOperations`].
-///     Bounding them here would demand `From<AddOperation<ArrayIrType>>`-style conversions that the composite family
+///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand
+///     `From<AddOperation<ArrayIrType>>`-style conversions of every array operation, which the composite family
 ///     intentionally does not provide.
+///
+/// # Member Profiles
+///
+/// The two member projections are themselves supertraits, so one bound carries the complete surface: the array member
+/// satisfies [`ArrayOperations`] and the first-class-dimension member satisfies the checked dimension arithmetic
+/// capabilities. Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
+/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
+///
+/// Both member surfaces are reached the same way: project the composite value, use the member capability, and inject
+/// the member result back. For first-class dimension arithmetic that reads
+/// `value.into_projected()?.mul(&other.into_projected()?)`, followed by `from_projected`:
+///
+/// ```rust
+/// use ryft_core::arrays::{DimensionType, DimensionValue};
+/// use ryft_core::{Array, ArrayIrValue, Mul, ProgramError, ValueProjection};
+///
+/// # fn main() -> Result<(), ProgramError> {
+/// let rows: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
+/// let columns: ArrayIrValue<Array> = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+/// let elements = ValueProjection::<DimensionType>::into_projected(rows)?
+///     .mul(&ValueProjection::<DimensionType>::into_projected(columns)?)?;
+/// let elements = <ArrayIrValue<Array> as ValueProjection<DimensionType>>::from_projected(elements);
+/// let ArrayIrValue::Dimension(elements) = elements else {
+///     unreachable!("dimension arithmetic returns a first-class dimension");
+/// };
+/// assert_eq!(elements.extent(), 6);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`project_parameters`](crate::project_parameters) and [`lift_parameters`](crate::lift_parameters) apply the same
+/// projection to a whole [`Parameterized`](crate::parameters::Parameterized) tree at a boundary, which is how
+/// hand-written composite code computes with ordinary array capabilities without projecting leaf by leaf. Dense
+/// derivative terminals ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that same route, because
+/// their coordinate machinery is defined on [`ArrayType`].
 ///
 /// As with [`ArrayOperations`], this bundle never implies anything about the tracers derived from an implementing
 /// value; a tracer requirement stays a separate explicit bound.
 pub trait ArrayIrOperations:
     Value<Type = ArrayIrType>
+    // Array member profile.
+    + ValueProjection<ArrayType, Projected: ArrayOperations>
+    // First-class-dimension member profile.
+    + ValueProjection<
+        DimensionType,
+        Projected: Value<Type = DimensionType>
+                       + Add + Sub + Mul + Div + Rem + DimensionSaturatingSub + DimensionPow
+                       + DimensionMin + DimensionMax + DimensionRequirement,
+    >
     // Comparison of first-class dimensions, producing ordinary Boolean array data.
     + Compare
     // First-class dimensions.
-    + DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast
+    + DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast + DynamicReshape
 {
 }
 
@@ -440,7 +485,22 @@ pub trait ArrayIrOperations:
 impl<V> ArrayIrOperations for V
 where
     V: Value<Type = ArrayIrType> + Compare,
-    V: DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast,
+    V: DimensionSize + DimensionFromScalar + DimensionToScalar + DynamicBroadcast + DynamicReshape,
+    V: ValueProjection<ArrayType, Projected: ArrayOperations>,
+    V: ValueProjection<
+            DimensionType,
+            Projected: Value<Type = DimensionType>
+                           + Add
+                           + Sub
+                           + Mul
+                           + Div
+                           + Rem
+                           + DimensionSaturatingSub
+                           + DimensionPow
+                           + DimensionMin
+                           + DimensionMax
+                           + DimensionRequirement,
+        >,
 {
 }
 
@@ -504,6 +564,10 @@ impl<A: Value<Type = ArrayType>> From<PadOperation<ArrayType>> for ArrayIrOperat
     }
 }
 
+// Cotangent accumulation adds two composite cotangents by binding an `AddOperation<ArrayIrType>` (refer to
+// `Linearization::pullback` and the reverse-mode `From<AddOperation<C::Type>>` bounds), so the composite family lifts
+// the type-generic add into the homogeneous array member that owns elementwise addition. The source payload is
+// stateless, so no operand type survives the conversion, and member type inference rejects a dimension operand.
 impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_operation: AddOperation<ArrayIrType>) -> Self {
@@ -663,6 +727,27 @@ mod tests {
         requires_array_ir_operations::<ArrayIrValue<Array>>();
         requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
         requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
+
+        // The bundle's member profiles make one bound enough to reach both surfaces: ordinary array math on the array
+        // member and checked arithmetic on the first-class dimension member, with no projection bounds restated here.
+        fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
+            // The array member carries both the fallible capability and its panicking operator sugar, so the
+            // capability is named explicitly here.
+            let array = <V as ValueProjection<ArrayType>>::into_projected(value.clone())?;
+            let square = <V as ValueProjection<ArrayType>>::from_projected(Mul::mul(&array, &array)?);
+            let rows = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(0)?)?;
+            let columns = <V as ValueProjection<DimensionType>>::into_projected(value.dimension_size(1)?)?;
+            let elements = <V as ValueProjection<DimensionType>>::from_projected(rows.mul(&columns)?);
+            Ok((square, elements))
+        }
+
+        let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let (square, elements) = square_and_element_count(&input).unwrap();
+        assert_eq!(square, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 4.0, 9.0, 16.0, 25.0, 36.0])));
+        let ArrayIrValue::Dimension(elements) = elements else {
+            panic!("expected a first-class dimension member");
+        };
+        assert_eq!(elements.extent(), 6);
     }
 
     #[test]
@@ -768,6 +853,11 @@ mod tests {
             DimensionRequirementOperation::equal(&left_type, &right_type),
         ));
         assert_eq!(requirement.effects(), Effects::single(Effect::OrderedAssertion));
+
+        // Each dimension operation also lifts directly, so generic composite code never has to name the member family.
+        let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left_type, &right_type).unwrap());
+        assert!(matches!(product, ArrayIrOperation::Dimension(DimensionOperation::Mul(_))));
+        assert_eq!(product.name(), "dimension_mul");
 
         // Every wrong-kind path uses the same checked type projection and therefore reports the canonical diagnostic.
         assert_eq!(

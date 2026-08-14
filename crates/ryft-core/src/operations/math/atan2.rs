@@ -61,15 +61,15 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            let x_primal = x.primal().align_tangent(&target)?;
-            let y_primal = y.primal().align_tangent(&target)?;
+            let x_primal = x.primal().align_tangent(&target, &primal)?;
+            let y_primal = y.primal().align_tangent(&target, &primal)?;
             let denominator = x_primal.clone() * x_primal.clone() + y_primal.clone() * y_primal.clone();
             let y_term = y
                 .tangent()
                 .as_value()
                 .map(|tangent| {
                     Ok::<_, DifferentiationError>(
-                        (x_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
+                        (x_primal.clone() / denominator.clone()) * tangent.align_tangent(&target, &primal)?,
                     )
                 })
                 .transpose()?;
@@ -78,7 +78,7 @@ impl_differentiable_operation! {
                 .as_value()
                 .map(|tangent| {
                     Ok::<_, DifferentiationError>(
-                        -(y_primal.clone() / denominator.clone()) * tangent.align_tangent(&target)?,
+                        -(y_primal.clone() / denominator.clone()) * tangent.align_tangent(&target, &primal)?,
                     )
                 })
                 .transpose()?;

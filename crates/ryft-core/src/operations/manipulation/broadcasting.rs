@@ -17,12 +17,14 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
+use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::{
     DynamicReshapeOperation, ReshapeOperation, lift_output_sharding_for_leading_batch_axis,
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::operations::math::add::AddOperation;
 use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::operations::sharding::ReshardOperation;
 use crate::partial::{
@@ -426,12 +428,14 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
+            + From<AddOperation<ArrayType>>
             + From<BroadcastOperation>
             + From<ConvertElementTypeOperation<ArrayType>>
             + From<ReduceOperation>
             + From<TransposeOperation>
             + From<ReshapeOperation>
-            + From<ReshardOperation>,
+            + From<ReshardOperation>
+            + From<ZeroLikeOperation<ArrayType>>,
     {
         |operation, _context, _driver, inputs, outputs| {
             // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum-reduction over
