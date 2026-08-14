@@ -4040,6 +4040,9 @@ fn execute_pjrt_buffers<'c>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-13")]
+    use std::time::Instant;
+
     use pretty_assertions::assert_eq;
 
     use ryft_core::operations::attention::{
@@ -6465,14 +6468,20 @@ mod tests {
                 [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
             );
             assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
-            assert_eq!(
-                read_bf16s(&client, &at_bound[3]),
-                [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-            );
-            assert_eq!(
-                read_bf16s(&client, &at_bound[4]),
-                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
-            );
+            let actual_query_gradient = read_bf16s(&client, &at_bound[3]);
+            let expected_query_gradient =
+                [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            // cuDNN's fused BF16 backward-attention kernel is not bit-identical to the unfused reference
+            // composition, so compare its gradients with an explicit reduced-precision tolerance.
+            actual_query_gradient.iter().zip(&expected_query_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
+            let actual_value_gradient = read_bf16s(&client, &at_bound[4]);
+            let expected_value_gradient =
+                [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>();
+            actual_value_gradient.iter().zip(&expected_value_gradient).for_each(|(actual, expected)| {
+                assert!((actual - expected).abs() <= 0.25, "expected {expected} within 0.25, but found {actual}");
+            });
 
             let zero =
                 Array::from_host_buffer(&client, size_type, mesh.clone(), 0_i64.to_ne_bytes().as_slice()).unwrap();
@@ -6484,6 +6493,90 @@ mod tests {
                 "{error}",
             );
         }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "hardware throughput benchmark; run explicitly on a CUDA system"]
+    fn bench_cuda_fused_attention_throughput() {
+        let plugin = load_cuda_13_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let [batch, sequence, heads, head_dimension] = [4, 2048, 32, 128];
+        let r#type = ArrayType::new(
+            DataType::BF16,
+            Shape::new(vec![
+                Dimension::Static(batch),
+                Dimension::Static(sequence),
+                Dimension::Static(heads),
+                Dimension::Static(head_dimension),
+            ]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 4))
+        .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let query = builder.add_input(r#type.clone().into());
+        let key = builder.add_input(r#type.clone().into());
+        let value = builder.add_input(r#type.clone().into());
+        let output = builder
+            .add_instruction(
+                attention_operation(
+                    1.0 / (head_dimension as f64).sqrt(),
+                    false,
+                    false,
+                    None,
+                    AttentionOperandSignature::default(),
+                ),
+                Vec::new(),
+                vec![query, key, value],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
+        let compilation_start = Instant::now();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let compilation_duration = compilation_start.elapsed();
+
+        let one = 0x3f80_u16.to_ne_bytes();
+        let mut bytes = vec![0_u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
+        bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
+        let input = Array::from_host_buffer(&client, r#type, mesh, bytes.as_slice()).unwrap();
+        input.block_until_ready().unwrap();
+        let execute = || {
+            let outputs = domain.execute_xla_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
+            outputs[0].block_until_ready()?;
+            Ok::<_, XlaDomainError>(())
+        };
+        // The Spark idles at its lowest power state, so warm the fused kernel long enough for clocks to stabilize
+        // before collecting synchronized samples.
+        (0..20).for_each(|_| execute().unwrap());
+        let mut samples = (0..20)
+            .map(|_| {
+                let start = Instant::now();
+                execute().unwrap();
+                start.elapsed().as_nanos()
+            })
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        let median_nanoseconds = samples[samples.len() / 2];
+        let floating_point_operations =
+            4.0 * batch as f64 * heads as f64 * sequence as f64 * sequence as f64 * head_dimension as f64;
+        let throughput_teraflops = floating_point_operations / (median_nanoseconds as f64 * 1e3);
+
+        eprintln!(
+            "fused attention b{batch} h{heads} s{sequence} d{head_dimension}: compile={compilation_duration:?}, median={:.3} ms, throughput={throughput_teraflops:.2} TFLOP/s",
+            median_nanoseconds as f64 / 1e6,
+        );
     }
 
     #[test]

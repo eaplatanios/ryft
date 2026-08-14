@@ -14,7 +14,7 @@ use ryft_core::operations::collectives::{
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CustomCallAttribute, CustomCallOperation};
-use ryft_core::operations::math::dot::scaled_dot_ir_composition;
+use ryft_core::operations::math::dot::{lhs_result_axes, rhs_result_axes, scaled_dot_ir_composition};
 use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SortDirection, SortOperation};
 use ryft_core::{
@@ -2504,6 +2504,62 @@ fn scaled_dot_composite_input_types(
     Ok(vec![input_types[0].clone(), input_types[1].clone(), lhs_scale, rhs_scale])
 }
 
+/// Returns whether scaled dot can use a physical CUDA composite boundary without losing a runtime contracting-axis
+/// requirement. Dynamic contracting element or scale dimensions retain the logical portable decomposition, whose
+/// ordinary dimension SSA proves their block ratio before computing the result.
+fn scaled_dot_uses_cuda_physical_boundary(
+    operation: &ScaledDotOperation,
+    input_types: &[ArrayType],
+    target_platform: Option<&str>,
+) -> Result<bool, LoweringError> {
+    if target_platform != Some("cuda") {
+        return Ok(false);
+    }
+    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
+    check_count!("input", input_types, expected_input_count, ProgramError);
+    let mut scale_index = 2;
+    for (element_index, has_scale, contracting_dimensions) in [
+        (0, operation.has_lhs_scale(), operation.dimensions().lhs_contracting_dimensions()),
+        (1, operation.has_rhs_scale(), operation.dimensions().rhs_contracting_dimensions()),
+    ] {
+        if contracting_dimensions
+            .iter()
+            .any(|axis| matches!(input_types[element_index].dimension(*axis), Dimension::Dynamic(_)))
+        {
+            return Ok(false);
+        }
+        if has_scale {
+            if contracting_dimensions
+                .iter()
+                .any(|axis| matches!(input_types[scale_index].dimension(*axis), Dimension::Dynamic(_)))
+            {
+                return Ok(false);
+            }
+            scale_index += 1;
+        }
+    }
+    Ok(true)
+}
+
+/// Returns the typed scaled-dot composition boundary used for the target platform. XLA's CUDA block-scaled-dot
+/// replacement cannot propagate dynamic-dimension annotations through its fused HLO, so eligible CUDA calls use the
+/// bounded static carriers while the caller masks physical suffix lanes and restores the logical result dimensions.
+/// Other calls retain the logical boundary consumed by the portable decomposition.
+fn scaled_dot_composition_types(
+    operation: &ScaledDotOperation,
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    target_platform: Option<&str>,
+) -> Result<(Vec<ArrayType>, Vec<ArrayType>), LoweringError> {
+    if !scaled_dot_uses_cuda_physical_boundary(operation, input_types, target_platform)? {
+        return Ok((input_types.to_vec(), output_types.to_vec()));
+    }
+    Ok((
+        input_types.iter().map(physical_bound_type).collect::<Result<Vec<_>, _>>()?,
+        output_types.iter().map(physical_bound_type).collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
 /// Calls one emitted typed decomposition function at its registered array boundary.
 fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
     function: &NamedCompositionFunction,
@@ -2555,43 +2611,57 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, expected_input_count, ProgramError);
     check_count!("input", input_types, input_values.len(), ProgramError);
     check_count!("output", output_types, 1, ProgramError);
+    let uses_physical_boundary =
+        scaled_dot_uses_cuda_physical_boundary(operation, input_types, collective_state.target_platform())?;
+    let (composition_input_types, composition_output_types) =
+        scaled_dot_composition_types(operation, input_types, output_types, collective_state.target_platform())?;
     let decomposition = match collective_state.named_compositions.as_ref() {
-        Some(functions) => functions.get(operation, input_types, output_types)?,
+        Some(functions) => functions.get(operation, &composition_input_types, &composition_output_types)?,
         None => None,
     };
     if let Some(function) = decomposition {
-        let mut composite_values = vec![input_values[0], input_values[1]];
+        if collective_state.target_platform() == Some("cuda") && !uses_physical_boundary {
+            return lower_decomposition_call(function, input_values, output_types, block, context, location);
+        }
+        let composition_input_values = if uses_physical_boundary {
+            input_values
+                .iter()
+                .zip(input_types)
+                .map(|(value, r#type)| lower_static_custom_call_input(*value, r#type, 0.0, block, context, location))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            input_values.to_vec()
+        };
+        let mut composite_values = vec![composition_input_values[0], composition_input_values[1]];
         let mut scale_index = 2;
-        for (present, elements, contracting_dimensions) in [
-            (
-                operation.has_lhs_scale(),
-                (input_values[0], &input_types[0]),
-                operation.dimensions().lhs_contracting_dimensions(),
-            ),
-            (
-                operation.has_rhs_scale(),
-                (input_values[1], &input_types[1]),
-                operation.dimensions().rhs_contracting_dimensions(),
-            ),
+        for (present, element_index, contracting_dimensions) in [
+            (operation.has_lhs_scale(), 0, operation.dimensions().lhs_contracting_dimensions()),
+            (operation.has_rhs_scale(), 1, operation.dimensions().rhs_contracting_dimensions()),
         ] {
             if present {
-                composite_values.push(input_values[scale_index]);
+                composite_values.push(composition_input_values[scale_index]);
                 scale_index += 1;
                 continue;
             }
-            let dummy_type = scaled_dot_dummy_scale_type(elements.1, contracting_dimensions);
+            let dummy_type =
+                scaled_dot_dummy_scale_type(&composition_input_types[element_index], contracting_dimensions);
             let physical_type = physical_bound_type(&dummy_type)?;
             let physical_tensor_type = lower_tensor_type(&physical_type, context, location)?;
             let dummy = lower_f64_constant_splat(1.0, &physical_type, physical_tensor_type, block, context, location)?;
-            let sources = (0..dummy_type.rank()).map(|axis| (elements.0, axis)).collect::<Vec<_>>();
-            composite_values.push(lower_restore_dynamic_dimensions(
-                dummy,
-                &dummy_type,
-                sources.as_slice(),
-                block,
-                context,
-                location,
-            )?);
+            if uses_physical_boundary {
+                composite_values.push(dummy);
+            } else {
+                let sources =
+                    (0..dummy_type.rank()).map(|axis| (input_values[element_index], axis)).collect::<Vec<_>>();
+                composite_values.push(lower_restore_dynamic_dimensions(
+                    dummy,
+                    &dummy_type,
+                    sources.as_slice(),
+                    block,
+                    context,
+                    location,
+                )?);
+            }
         }
         let render_axes = |axes: &[usize]| axes.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
         let dimensions = format!(
@@ -2608,7 +2678,7 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
                 context.type_attribute(lower_element_type(operation.preferred_element_type(), context)?).as_ref(),
             ),
         ]);
-        let result_types = output_types
+        let result_types = composition_output_types
             .iter()
             .map(|r#type| lower_tensor_type(r#type, context, location).map(|r#type| r#type.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
@@ -2622,7 +2692,28 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             result_types.as_slice(),
             location,
         )?)?;
-        return Ok((0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect());
+        let results =
+            (0..output_types.len()).map(|index| composite.result(index).unwrap().as_ref()).collect::<Vec<_>>();
+        if !uses_physical_boundary {
+            return Ok(results);
+        }
+        let dimensions = operation.dimensions();
+        let output_sources = dimensions
+            .lhs_batching_dimensions()
+            .iter()
+            .copied()
+            .map(|axis| (input_values[0], axis))
+            .chain(lhs_result_axes(dimensions, input_types[0].rank()).into_iter().map(|axis| (input_values[0], axis)))
+            .chain(rhs_result_axes(dimensions, input_types[1].rank()).into_iter().map(|axis| (input_values[1], axis)))
+            .collect::<Vec<_>>();
+        return Ok(vec![lower_restore_dynamic_dimensions(
+            results[0],
+            &output_types[0],
+            output_sources.as_slice(),
+            block,
+            context,
+            location,
+        )?]);
     }
 
     Err(LoweringError::UnsupportedOp { op: format!("missing typed decomposition for '{}'", operation.name()) })
@@ -4123,7 +4214,7 @@ where
 
     // Trace each distinct named semantic decomposition once and retain it in the module-scoped lowering state so
     // entry and nested function bodies resolve the same private symbol.
-    let named_compositions = Rc::new(collect_named_composition_functions(program)?);
+    let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
 
     // Module-scoped collective lowering state, shared between the entry function body and private functions below so
     // channel ids stay unique module-wide and target/composition information reaches nested bodies.
@@ -5526,6 +5617,7 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
 /// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
 fn collect_named_composition_functions<Input, Output>(
     program: &XlaProgram<Input, Output>,
+    target_platform: Option<&str>,
 ) -> Result<NamedCompositionFunctionMap, LoweringError>
 where
     Input: Parameterized<XlaConstant>,
@@ -5535,13 +5627,14 @@ where
         region: RegionRef<'_, XlaConstant, XlaOperation>,
         map: &mut NamedCompositionFunctionMap,
         visited: &mut HashSet<RegionId>,
+        target_platform: Option<&str>,
     ) -> Result<(), LoweringError> {
         if !visited.insert(region.id()) {
             return Ok(());
         }
         for instruction in region.instructions() {
             for nested in instruction.regions() {
-                walk(RegionRef::new(region.arena(), *nested)?, map, visited)?;
+                walk(RegionRef::new(region.arena(), *nested)?, map, visited, target_platform)?;
             }
             let XlaOperation::Array(operation) = instruction.operation() else {
                 continue;
@@ -5571,10 +5664,22 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             match operation {
-                ArrayOperation::ScaledDot(operation) => map.register(
-                    scaled_dot_composition_key(operation, input_types.as_slice(), output_types.as_slice())?,
-                    || trace_scaled_dot_composition(operation, input_types.as_slice()),
-                )?,
+                ArrayOperation::ScaledDot(operation) => {
+                    let (composition_input_types, composition_output_types) = scaled_dot_composition_types(
+                        operation,
+                        input_types.as_slice(),
+                        output_types.as_slice(),
+                        target_platform,
+                    )?;
+                    map.register(
+                        scaled_dot_composition_key(
+                            operation,
+                            composition_input_types.as_slice(),
+                            composition_output_types.as_slice(),
+                        )?,
+                        || trace_scaled_dot_composition(operation, composition_input_types.as_slice()),
+                    )?;
+                }
                 ArrayOperation::DotProductAttention(operation) if operation.configuration().dropout().is_none() => {
                     map.register(
                         attention_composition_key(operation, input_types.as_slice(), output_types.as_slice()),
@@ -5596,7 +5701,7 @@ where
     }
 
     let mut map = NamedCompositionFunctionMap::default();
-    walk(program.entry_region_ref(), &mut map, &mut HashSet::new())?;
+    walk(program.entry_region_ref(), &mut map, &mut HashSet::new(), target_platform)?;
     Ok(map)
 }
 
@@ -11685,6 +11790,118 @@ mod tests {
         assert!(module.contains("func.func private @xla.scaled_dot"));
         assert!(module.contains("stablehlo.composite \"xla.scaled_dot\" %arg0, %arg1, %arg2, %arg3"));
         assert!(!module.contains("stablehlo.custom_call @__op$block_scaled_dot"));
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_physicalizes_dynamic_scaled_dot_on_cuda() {
+        // CUDA's fused scaled-dot HLO requires a static boundary. Ryft masks the bounded physical operands, keeps the
+        // named composite and its decomposition static, and restores the logical row extent on the result.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
+        let lhs_type = ArrayType::new(
+            DataType::F8E4M3FN,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(32)]),
+        );
+        let rhs_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(1), Dimension::Static(32)]));
+        let lhs_scale_type = ArrayType::new(
+            DataType::F8E8M0FNU,
+            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(1)]),
+        );
+        let rhs_scale_type =
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(1)]));
+        let input_types = vec![lhs_type, rhs_type, lhs_scale_type, rhs_scale_type];
+        let output_types = vec![output_type];
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let output = builder
+            .add_instruction(
+                ScaledDotOperation::new(
+                    DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                    DataType::F32,
+                    true,
+                    true,
+                ),
+                Vec::new(),
+                inputs,
+            )
+            .unwrap()[0];
+        let program = unproject_plain_program(
+            builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder; 4],
+                    vec![Placeholder],
+                )
+                .unwrap(),
+        );
+        let module =
+            lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
+                .unwrap()
+                .stable_hlo;
+
+        assert!(module.contains(
+            "func.func private @xla.scaled_dot(%arg0: tensor<4x32xf8E4M3FN>, %arg1: tensor<1x32xf8E4M3FN>, %arg2: tensor<4x1xf8E8M0FNU>, %arg3: tensor<1x1xf8E8M0FNU>) -> tensor<4x1xf32>",
+        ));
+        assert!(module.contains("stablehlo.composite \"xla.scaled_dot\"",));
+        assert!(module.contains(
+            ": (tensor<4x32xf8E4M3FN>, tensor<1x32xf8E4M3FN>, tensor<4x1xf8E8M0FNU>, tensor<1x1xf8E8M0FNU>) -> tensor<4x1xf32>",
+        ));
+        assert!(module.contains("stablehlo.set_dimension_size"));
+    }
+
+    #[test]
+    fn test_lower_mlir_module_for_program_retains_dynamic_scaled_dot_requirements_on_cuda() {
+        // A dynamic contracting block ratio is a runtime semantic requirement. Keep that case on the logical
+        // decomposition instead of erasing its dimension checks merely to reach CUDA's static fused boundary.
+        let elements = DimensionVariable::new("elements", DimensionBounds::new(32, Some(65)).unwrap());
+        let blocks = DimensionVariable::new("blocks", DimensionBounds::new(1, Some(3)).unwrap());
+        let element_type =
+            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(elements)]));
+        let scale_type =
+            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Dynamic(blocks)]));
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(1)]));
+        let input_types = vec![element_type.clone(), element_type, scale_type.clone(), scale_type];
+        let mut builder = XlaProgramBuilder::new();
+        let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let output = builder
+            .add_instruction(
+                ScaledDotOperation::new(
+                    DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                    DataType::F32,
+                    true,
+                    true,
+                ),
+                Vec::new(),
+                inputs,
+            )
+            .unwrap()[0];
+        let program = unproject_plain_program(
+            builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder; 4],
+                    vec![Placeholder],
+                )
+                .unwrap(),
+        );
+        let module = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &input_types,
+            &[output_type],
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap()
+        .stable_hlo;
+
+        assert!(module.contains("call @xla.scaled_dot"));
+        assert!(module.contains("stablehlo.custom_call @ryft.assert"));
+        assert!(!module.contains("stablehlo.composite \"xla.scaled_dot\""));
     }
 
     #[test]
