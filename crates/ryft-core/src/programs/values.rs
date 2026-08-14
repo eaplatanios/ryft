@@ -8,7 +8,7 @@ use crate::batching::{BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::DifferentiationTracer;
-use crate::parameters::Parameter;
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
@@ -247,6 +247,69 @@ pub trait ValueProjection<T: Type>: Value {
     fn into_projected(self) -> Result<Self::Projected, TypeError>;
 }
 
+/// Extension trait applying [`ValueProjection`] to a whole [`Parameterized`] tree at a boundary, rather than value by
+/// value. Code that receives a tree of composite values (e.g., a model, a batch of inputs, a tuple of intermediates)
+/// projects it once with [`project_parameters`](Self::project_parameters), computes with ordinary member capabilities,
+/// and lifts the result back with [`lift_parameters`](Self::lift_parameters). Both directions preserve the tree's
+/// structure exactly, and projection fails with the member-kind [`TypeError`] as soon as any leaf holds a different
+/// member kind.
+///
+/// This trait is blanket-implemented for every [`Parameterized`] tree and has no items of its own to implement. Its
+/// parameter `P` is the tree's leaf type, which plays a different role in each direction: it is the composite [`Value`]
+/// being projected for [`project_parameters`](Self::project_parameters), and the member representation being lifted for
+/// [`lift_parameters`](Self::lift_parameters). Each method's `where` clause carries the remaining requirements, so
+/// whether a particular direction is available for a particular tree is decided per method at the call site. The
+/// member [`Type`] is a method-level parameter, which keeps each call site down to a single turbofish: the projected
+/// member type for one direction and the composite value type for the other.
+///
+/// # Examples
+///
+/// ```rust
+/// # use ryft_core::{Array, ArrayIrValue, ArrayType, Mul, ParameterProjection, ProgramError};
+/// #
+/// # fn main() -> Result<(), ProgramError> {
+/// let model = vec![ArrayIrValue::Array(Array::vector(vec![1.0, 2.0]))];
+/// let arrays = model.project_parameters::<ArrayType>()?;
+/// let squared = arrays.iter().map(|array| array.mul(array)).collect::<Result<Vec<_>, _>>()?;
+/// let squared = squared.lift_parameters::<ArrayIrValue<Array>>()?;
+/// assert_eq!(squared, vec![ArrayIrValue::Array(Array::vector(vec![1.0, 4.0]))]);
+/// # Ok(())
+/// # }
+/// ```
+pub trait ParameterProjection<P: Parameter>: Parameterized<P> {
+    /// Projects every composite value [`Parameter`] of this [`Parameterized`] instance onto its `T`-typed member,
+    /// preserving the [`Parameterized`] structure. This corresponds to [`ValueProjection::into_projected`] applied to
+    /// every parameter, and it fails with that method's member-kind [`TypeError`] as soon as any parameter holds a
+    /// different member kind.
+    fn project_parameters<T: Type>(self) -> Result<Self::To<P::Projected>, ProgramError>
+    where
+        P: ValueProjection<T, Projected: Parameter>,
+        Self::Family: ParameterizedFamily<P::Projected>,
+    {
+        let structure = self.parameter_structure();
+        let parameters =
+            self.into_parameters().map(ValueProjection::<T>::into_projected).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::To::<P::Projected>::from_parameters(structure, parameters)?)
+    }
+
+    /// Lifts every member representation [`Parameter`] of this [`Parameterized`] instance back into the
+    /// composite value type `V`, preserving the [`Parameterized`] structure. This function is the inverse
+    /// of [`project_parameters`](Self::project_parameters) and is infallible per parameter, since
+    /// [`ValueProjection::from_projected`] always accepts a member representation. The member [`Type`] is recovered
+    /// from the parameters themselves (i.e., `P::Type`), so only the composite value type has to be named.
+    fn lift_parameters<V: ValueProjection<P::Type, Projected = P>>(self) -> Result<Self::To<V>, ProgramError>
+    where
+        P: Typed,
+        Self::Family: ParameterizedFamily<V>,
+    {
+        let structure = self.parameter_structure();
+        let parameters = self.into_parameters().map(V::from_projected);
+        Ok(Self::To::<V>::from_parameters(structure, parameters)?)
+    }
+}
+
+impl<P: Parameter, Values: Parameterized<P>> ParameterProjection<P> for Values {}
+
 /// A [`Value`] whose reported [`Type`] has been narrowed to one member kind of its composite type, as returned by
 /// [`ValueProjection::projected`] and [`ValueProjection::into_projected`]. This wrapper exists for values that refer
 /// to a program rather than containing a member payload, such as a [`Tracer`] naming a Single Static Assignment (SSA)
@@ -339,8 +402,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::{
+        Array, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        Shape,
+    };
     use crate::contexts::EagerContext;
+    use crate::operations::{Add, Mul};
 
     use super::*;
 
@@ -396,6 +463,43 @@ mod tests {
                  implementation",
             )),
         );
+    }
+
+    #[test]
+    fn test_parameter_projection() {
+        // A handwritten composite boundary projects its whole parameter tree once, computes with ordinary array
+        // capabilities, and lifts the result back. The following example uses the Multi-Layer Perceptron (MLP) shape
+        // where a model tree of weights and biases enters as composite values, and the layer arithmetic is homogeneous
+        // array math.
+        let model = (
+            ArrayIrValue::<Array>::Array(Array::matrix(2, 2, vec![1.0_f64, 2.0, 3.0, 4.0])),
+            vec![ArrayIrValue::<Array>::Array(Array::vector(vec![5.0_f64, 6.0]))],
+        );
+        let (weights, biases) = model.project_parameters::<ArrayType>().unwrap();
+        let weights = weights.mul(&weights).unwrap();
+        let biases = biases.iter().map(|bias| bias.add(bias)).collect::<Result<Vec<_>, _>>().unwrap();
+        let scaled = (weights, biases).lift_parameters::<ArrayIrValue<Array>>().unwrap();
+        assert_eq!(
+            scaled,
+            (
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f64, 4.0, 9.0, 16.0])),
+                vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0]))],
+            ),
+        );
+
+        // A leaf holding a different member kind fails the projection with the canonical member diagnostic,
+        // and the tree structure itself is preserved exactly across a projection round trip.
+        let mixed = vec![
+            ArrayIrValue::<Array>::Array(Array::scalar(1.0_f64)),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        ];
+        assert_eq!(
+            mixed.clone().project_parameters::<ArrayType>(),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+        let dimensions = vec![mixed[1].clone()].project_parameters::<DimensionType>().unwrap();
+        let lifted = dimensions.lift_parameters::<ArrayIrValue<Array>>().unwrap();
+        assert_eq!(lifted, vec![mixed[1].clone()]);
     }
 
     #[test]

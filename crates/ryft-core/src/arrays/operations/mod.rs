@@ -454,8 +454,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// # }
 /// ```
 ///
-/// [`project_parameters`](crate::project_parameters) and [`lift_parameters`](crate::lift_parameters) apply the same
-/// projection to a whole [`Parameterized`](crate::parameters::Parameterized) tree at a boundary, which is how
+/// The [`ParameterProjection`](crate::ParameterProjection) extension trait applies the same projection to a whole
+/// [`Parameterized`](crate::parameters::Parameterized) tree at a boundary (i.e.,
+/// `model.project_parameters::<ArrayType>()?` and `projected.lift_parameters::<ArrayIrValue<A>>()?`), which is how
 /// hand-written composite code computes with ordinary array capabilities without projecting leaf by leaf. Dense
 /// derivative terminals ([`Jacobian`](crate::Jacobian) and [`Hessian`](crate::Hessian)) use that same route, because
 /// their coordinate machinery is defined on [`ArrayType`].
