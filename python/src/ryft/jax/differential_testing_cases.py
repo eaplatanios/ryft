@@ -24,16 +24,17 @@ from ryft.jax.differential_testing import (
 class DifferentialCase:
     """One registered workload and the relationship expected between Ryft and JAX.
 
-    `collectives` is the collective projection both frameworks must produce, in module order. An exact-parity case
-    must declare a non-empty expectation, because comparing the two projections against each other alone would pass
-    vacuously if a printer or lowering regression emptied both of them symmetrically. Capability cases that compare
-    no module declare no collectives.
+    `collectives` is the collective projection both frameworks must produce, in module order. `stablehlo_patterns`
+    lists semantic operation or attribute spellings that must occur in both modules. An exact-parity case must declare
+    at least one of these contracts, because comparing two unconstrained modules would pass vacuously. Capability
+    cases that compare no module declare neither contract.
     """
 
     case_id: str
     relationship: str
     build_jax: Callable[[Any, Any, Any], DifferentialObservation]
     collectives: tuple[StableHloCollective, ...] = ()
+    stablehlo_patterns: tuple[str, ...] = ()
 
 
 def _configure_jax_devices() -> None:
@@ -55,6 +56,12 @@ def _observation_values(array: Any, numpy: Any) -> tuple[tuple[float, ...], ...]
     return tuple(
         tuple(float(value) for value in device_values) for device_values in values.reshape(values.shape[0], -1)
     )
+
+
+def _single_observation_values(array: Any, numpy: Any) -> tuple[tuple[float, ...], ...]:
+    """Returns one flattened logical output vector for a non-collective execution."""
+
+    return (tuple(float(value) for value in numpy.asarray(array).reshape(-1)),)
 
 
 def _build_grouped_collectives(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
@@ -146,6 +153,159 @@ def _build_data_dependent_prefix_take(jax: Any, jax_numpy: Any, numpy: Any) -> D
     )
 
 
+def _build_scaled_dot_and_matmul(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds generalized scaled-dot values and the named-composite lowering used by scaled matmul."""
+
+    lhs = jax_numpy.arange(1, 9, dtype=jax_numpy.float32).reshape(2, 4)
+    rhs = jax_numpy.arange(1, 13, dtype=jax_numpy.float32).reshape(4, 3)
+    lhs_scale = jax_numpy.array([[1.0, 2.0], [0.5, 1.0]], dtype=jax_numpy.float32)
+    rhs_scale = jax_numpy.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]], dtype=jax_numpy.float32)
+    dimensions = (((1,), (0,)), ((), ()))
+
+    def scaled_dot(lhs_value: Any, rhs_value: Any, lhs_scale_value: Any, rhs_scale_value: Any) -> Any:
+        return jax.lax.scaled_dot(
+            lhs_value,
+            rhs_value,
+            lhs_scale=lhs_scale_value,
+            rhs_scale=rhs_scale_value,
+            dimension_numbers=dimensions,
+            preferred_element_type=jax_numpy.float32,
+        )
+
+    # `scaled_matmul` has no CPU lowering in pinned JAX. Its public rank-three contract is nevertheless exactly the
+    # corresponding `scaled_dot` dimension arrangement, so evaluate that semantic composition after asking JAX to
+    # validate the wrapper's abstract output signature.
+    matmul_lhs = jax_numpy.ones((1, 1, 4), dtype=jax_numpy.float32)
+    matmul_rhs = jax_numpy.ones((1, 2, 4), dtype=jax_numpy.float32)
+    matmul_lhs_scale = jax_numpy.ones((1, 1, 2), dtype=jax_numpy.float32)
+    matmul_rhs_scale = jax_numpy.ones((1, 2, 2), dtype=jax_numpy.float32)
+    matmul_output = jax.lax.scaled_dot(
+        matmul_lhs,
+        matmul_rhs,
+        lhs_scale=matmul_lhs_scale,
+        rhs_scale=matmul_rhs_scale,
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+        preferred_element_type=jax_numpy.float32,
+    )
+    abstract_output = jax.eval_shape(
+        jax.nn.scaled_matmul,
+        matmul_lhs,
+        matmul_rhs,
+        matmul_lhs_scale,
+        matmul_rhs_scale,
+    )
+    if abstract_output.shape != matmul_output.shape or abstract_output.dtype != matmul_output.dtype:
+        raise AssertionError("scaled_matmul and its scaled_dot composition disagree on the abstract output")
+
+    observations = {
+        "both_scales": _single_observation_values(scaled_dot(lhs, rhs, lhs_scale, rhs_scale), numpy),
+        "lhs_scale": _single_observation_values(
+            jax.lax.scaled_dot(
+                lhs,
+                rhs,
+                lhs_scale=lhs_scale,
+                dimension_numbers=dimensions,
+                preferred_element_type=jax_numpy.float32,
+            ),
+            numpy,
+        ),
+        "rhs_scale": _single_observation_values(
+            jax.lax.scaled_dot(
+                lhs,
+                rhs,
+                rhs_scale=rhs_scale,
+                dimension_numbers=dimensions,
+                preferred_element_type=jax_numpy.float32,
+            ),
+            numpy,
+        ),
+        "unscaled": _single_observation_values(
+            jax.lax.scaled_dot(
+                lhs,
+                rhs,
+                dimension_numbers=dimensions,
+                preferred_element_type=jax_numpy.float32,
+            ),
+            numpy,
+        ),
+        "scaled_matmul": _single_observation_values(matmul_output, numpy),
+    }
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="scaled_dot_and_matmul",
+        observations=observations,
+        stablehlo=str(jax.jit(scaled_dot).lower(lhs, rhs, lhs_scale, rhs_scale).compiler_ir("stablehlo")),
+    )
+
+
+def _build_dot_product_attention(jax: Any, jax_numpy: Any, numpy: Any) -> DifferentialObservation:
+    """Builds portable rank-three MQA attention with every structural option represented."""
+
+    query = jax_numpy.zeros((2, 2, 1), dtype=jax_numpy.float32)
+    key = jax_numpy.zeros((2, 1, 1), dtype=jax_numpy.float32)
+    value = jax_numpy.array([[[3.0]], [[9.0]]], dtype=jax_numpy.float32)
+    bias = jax_numpy.array(0.0, dtype=jax_numpy.float32)
+    mask = jax_numpy.array([[True, False], [False, True]])
+    query_sequence_lengths = jax_numpy.array([2], dtype=jax_numpy.int32)
+    key_value_sequence_lengths = jax_numpy.array([2], dtype=jax_numpy.int32)
+
+    def attention(
+        query_value: Any,
+        key_value: Any,
+        value_value: Any,
+        bias_value: Any,
+        mask_value: Any,
+        query_lengths_value: Any,
+        key_value_lengths_value: Any,
+    ) -> tuple[Any, Any]:
+        return jax.nn.dot_product_attention(
+            query_value,
+            key_value,
+            value_value,
+            bias=bias_value,
+            mask=mask_value,
+            scale=1.0,
+            is_causal=True,
+            query_seq_lengths=query_lengths_value,
+            key_value_seq_lengths=key_value_lengths_value,
+            local_window_size=(1, 0),
+            implementation="xla",
+            return_residual=True,
+        )
+
+    output, residual = attention(
+        query,
+        key,
+        value,
+        bias,
+        mask,
+        query_sequence_lengths,
+        key_value_sequence_lengths,
+    )
+    gqa_output = jax.nn.dot_product_attention(
+        jax_numpy.zeros((1, 2, 4, 1), dtype=jax_numpy.float32),
+        jax_numpy.zeros((1, 3, 2, 1), dtype=jax_numpy.float32),
+        jax_numpy.array([[[[1.0], [10.0]], [[2.0], [20.0]], [[4.0], [40.0]]]], dtype=jax_numpy.float32),
+        key_value_seq_lengths=key_value_sequence_lengths,
+        local_window_size=(1, 1),
+        implementation="xla",
+    )
+    return DifferentialObservation(
+        schema=SCHEMA,
+        case_id="dot_product_attention",
+        observations={
+            "output": _single_observation_values(output, numpy),
+            "rank_four_gqa": _single_observation_values(gqa_output, numpy),
+            "residual": _single_observation_values(residual, numpy),
+        },
+        stablehlo=str(
+            jax.jit(attention)
+            .lower(query, key, value, bias, mask, query_sequence_lengths, key_value_sequence_lengths)
+            .compiler_ir("stablehlo")
+        ),
+    )
+
+
 # Ordered participant groups both frameworks emit for the `[[0, 2], [3, 1]]` grouping of the grouped collectives.
 _GROUPED_COLLECTIVE_GROUPS = ((0, 2), (3, 1))
 
@@ -184,6 +344,18 @@ DIFFERENTIAL_CASES = (
         ),
     ),
     DifferentialCase("data_dependent_prefix_take", "ryft_exceeds_jax", _build_data_dependent_prefix_take),
+    DifferentialCase(
+        "scaled_dot_and_matmul",
+        "parity",
+        _build_scaled_dot_and_matmul,
+        stablehlo_patterns=('stablehlo.composite "xla.scaled_dot"', "dimension_numbers", "preferred_element_type"),
+    ),
+    DifferentialCase(
+        "dot_product_attention",
+        "parity",
+        _build_dot_product_attention,
+        stablehlo_patterns=("stablehlo.dot_general", "stablehlo.select", "stablehlo.exponential", "stablehlo.reduce"),
+    ),
 )
 
 

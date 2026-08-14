@@ -217,7 +217,10 @@ mod tests {
         );
 
         // Round trip: the quantized operands contract through `scaled_dot` to the exact full-precision dot.
-        let product = elements.scaled_dot(&scales, &elements, &scales, 4, DataType::F32).unwrap();
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let product = elements
+            .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
+            .unwrap();
         let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
         assert_eq!(product.to_f64s(), expected.to_f64s());
 
@@ -277,7 +280,10 @@ mod tests {
         );
 
         // Round trip: the quantized operands contract through `scaled_dot` to the exact full-precision dot.
-        let product = elements.scaled_dot(&scales, &elements, &scales, 4, DataType::F32).unwrap();
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let product = elements
+            .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
+            .unwrap();
         let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
         assert_eq!(product.to_f64s(), expected.to_f64s());
     }
@@ -296,7 +302,10 @@ mod tests {
             scales.r#type().as_ref(),
             &ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)])),
         );
-        let product = elements.scaled_dot(&scales, &elements, &scales, 4, DataType::F32).unwrap();
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let product = elements
+            .scaled_dot(&elements, Some(&scales), Some(&scales), Some(&dimensions), Some(DataType::F32))
+            .unwrap();
         let expected = input.dot(&input, &DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()));
         let expected_value = expected.to_f64s()[0];
         let actual_value = product.to_f64s()[0];

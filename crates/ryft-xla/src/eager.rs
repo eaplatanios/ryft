@@ -1185,12 +1185,12 @@ mod tests {
     }
 
     /// A block-scaled (NVFP4-style) dot agrees between the XLA-backed eager array backend and the reference array
-    /// backend on CPU, where the operation lowers to the portable dequantization composition (the CUDA fast path
-    /// emits the `__op$block_scaled_dot` custom call instead). Every element and scale is exactly representable,
-    /// so both backends are exact.
+    /// backend on CPU, where XLA executes the portable decomposition attached to the `xla.scaled_dot` composite.
+    /// CUDA may replace the same composite with a native implementation. Every element and scale is exactly
+    /// representable, so both reference and CPU-XLA backends are exact.
     #[test]
     fn test_eager_scaled_dot_parity_with_reference_backend() {
-        use ryft_core::ScaledDot;
+        use ryft_core::{DotDimensionNumbers, ScaledDot};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1230,382 +1230,126 @@ mod tests {
             Array::from_host_buffer(&client, device_scale_type, mesh.clone(), bits(&reference_rhs_scales).as_slice())
                 .unwrap();
 
-        let device_product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 16, DataType::F32).unwrap();
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let device_product = lhs
+            .scaled_dot(&rhs, Some(&lhs_scales), Some(&rhs_scales), Some(&dimensions), Some(DataType::F32))
+            .unwrap();
         let reference_product = reference_lhs
-            .scaled_dot(&reference_lhs_scales, &reference_rhs, &reference_rhs_scales, 16, DataType::F32)
+            .scaled_dot(
+                &reference_rhs,
+                Some(&reference_lhs_scales),
+                Some(&reference_rhs_scales),
+                Some(&dimensions),
+                Some(DataType::F32),
+            )
             .unwrap();
         assert_eq!(device_product.r#type().data_type(), DataType::F32);
         let device_value_f64s = read_f32s(&device_product).iter().map(|value| f64::from(*value)).collect::<Vec<_>>();
         assert_eq!(device_value_f64s, reference_product.to_f64s());
     }
 
-    /// Dot-product attention agrees between the XLA-backed eager array backend and the reference array backend on
-    /// CPU, where the operation lowers to the portable StableHLO composition (the CUDA fast path emits the
-    /// `__cudnn$fmhaSoftmax` custom call instead), for both the unmasked and the causal variants.
     #[test]
     fn test_eager_dot_product_attention_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionMask, DotProductAttention};
+        use ryft_core::operations::attention::{AttentionConfiguration, AttentionInputs, DotProductAttention};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
-
-        // Small `BTNH` shape `[1, 4, 2, 3]` in `f32` with deterministic pseudo-random operand values.
-        let dimensions = [1usize, 4, 2, 3];
-        let operand_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect()),
-        );
+        let dimensions = [1usize, 3, 2, 2];
+        let host_type =
+            ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()));
         let device_type = replicated_type(&mesh, DataType::F32, &dimensions);
-        let query_values: Vec<f64> = (0..24).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
-        let key_values: Vec<f64> = (0..24).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
-        let value_values: Vec<f64> = (0..24).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
-        let device = |values: &[f64]| {
-            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
-            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+        let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
+        let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
+        let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
+        let device = |values: &[f32]| {
+            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
                 .unwrap()
         };
-        let reference = |values: &[f64]| CpuArray::from_f64s(operand_type.clone(), values.to_vec());
-        let scale = 0.5;
+        let reference = |values: &[f32]| {
+            CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect())
+        };
 
-        for mask in [AttentionMask::None, AttentionMask::Causal] {
-            let device_output = device(&query_values)
-                .dot_product_attention(&device(&key_values), &device(&value_values), scale, mask, None)
-                .unwrap();
-            let reference_output = reference(&query_values)
-                .dot_product_attention(&reference(&key_values), &reference(&value_values), scale, mask, None)
-                .unwrap();
-            assert_eq!(device_output.r#type().data_type(), DataType::F32);
-            assert_eq!(device_output.shape().dimensions(), &dimensions);
-            for (device_value, reference_value) in
-                read_f32s(&device_output).iter().map(|value| f64::from(*value)).zip(reference_output.to_f64s())
-            {
-                assert!(
-                    (device_value - reference_value).abs() < 1e-5,
-                    "mask {mask}: expected {reference_value} but got {device_value}",
-                );
-            }
+        for configuration in [
+            AttentionConfiguration::new().with_scale(0.5),
+            AttentionConfiguration::new().with_scale(0.5).with_causal(true).with_local_window((1, 0)),
+        ] {
+            let device_output = Array::dot_product_attention(
+                AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)),
+                configuration,
+            )
+            .unwrap()
+            .0;
+            let reference_output = CpuArray::dot_product_attention(
+                AttentionInputs::new(reference(&query_values), reference(&key_values), reference(&value_values)),
+                configuration,
+            )
+            .unwrap()
+            .0;
+
+            read_f32s(&device_output).iter().zip(reference_output.to_f64s()).for_each(|(actual, expected)| {
+                assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");
+            });
         }
-    }
 
-    /// The extended attention features — grouped-query heads, a broadcast bias, and a sliding window — agree
-    /// between the XLA-backed eager array backend (the portable StableHLO composition on CPU) and the reference
-    /// array backend, together with the activation (log-sum-exp) statistic.
-    #[test]
-    fn test_eager_dot_product_attention_extensions_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionMask, DotProductAttention};
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_mesh(&client);
-
-        // Grouped-query `BTNH` shapes: `query [1, 4, 4, 3]` over `key`/`value [1, 5, 2, 3]` with a broadcast bias
-        // `[1, 1, 4, 5]` and a sliding window of 2 under the causal mask.
-        let query_dimensions = [1usize, 4, 4, 3];
-        let key_value_dimensions = [1usize, 5, 2, 3];
-        let bias_dimensions = [1usize, 1, 4, 5];
-        let query_values: Vec<f64> = (0..48).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
-        let key_values: Vec<f64> = (0..30).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
-        let value_values: Vec<f64> = (0..30).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
-        let bias_values: Vec<f64> = (0..20).map(|i| ((i * 11 % 17) as f64 - 8.0) * 0.125).collect();
-        let device = |values: &[f64], dimensions: &[usize]| {
-            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
-            let r#type = replicated_type(&mesh, DataType::F32, dimensions);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
-        };
-        let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
-            CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
-        };
-        let scale = 0.5;
-        let mask = AttentionMask::Causal;
-        let window = Some(2);
-
-        let (device_output, device_activation) = device(&query_values, &query_dimensions)
-            .dot_product_attention_with_activation(
-                &device(&key_values, &key_value_dimensions),
-                &device(&value_values, &key_value_dimensions),
-                Some(&device(&bias_values, &bias_dimensions)),
-                None,
-                scale,
-                mask,
-                window,
-                None,
+        // The compiled composition also preserves the complete structural surface: a broadcast scalar bias, an
+        // arbitrary mask, independent length vectors, the default scale, an asymmetric window, and the residual.
+        let reference_bias = CpuArray::from_f64s(ArrayType::scalar(DataType::F32), vec![0.25]);
+        let reference_mask = CpuArray::from_elements(
+            ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3), Dimension::Static(3)])),
+            &[true, false, false, true, true, false, true, true, true],
+        )
+        .unwrap();
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(1)]));
+        let reference_query_lengths = CpuArray::from_elements(lengths_type.clone(), &[2_i32]).unwrap();
+        let reference_key_value_lengths = CpuArray::from_elements(lengths_type, &[3_i32]).unwrap();
+        let device_value = |value: &CpuArray, dimensions: &[usize]| {
+            Array::from_host_buffer(
+                &client,
+                replicated_type(&mesh, value.r#type().data_type(), dimensions),
+                mesh.clone(),
+                value.logical_bytes().as_slice(),
             )
-            .unwrap();
-        let (reference_output, reference_activation) = reference(&query_values, &query_dimensions)
-            .dot_product_attention_with_activation(
-                &reference(&key_values, &key_value_dimensions),
-                &reference(&value_values, &key_value_dimensions),
-                Some(&reference(&bias_values, &bias_dimensions)),
-                None,
-                scale,
-                mask,
-                window,
-                None,
-            )
-            .unwrap();
-        for (device_values, reference_values) in [
+            .unwrap()
+        };
+        let configuration =
+            AttentionConfiguration::new().with_causal(true).with_local_window((2, 1)).with_residual(true);
+        let device_inputs = AttentionInputs {
+            query: device(&query_values),
+            key: device(&key_values),
+            value: device(&value_values),
+            bias: Some(device_value(&reference_bias, &[])),
+            mask: Some(device_value(&reference_mask, &[3, 3])),
+            query_sequence_lengths: Some(device_value(&reference_query_lengths, &[1])),
+            key_value_sequence_lengths: Some(device_value(&reference_key_value_lengths, &[1])),
+        };
+        let reference_inputs = AttentionInputs {
+            query: reference(&query_values),
+            key: reference(&key_values),
+            value: reference(&value_values),
+            bias: Some(reference_bias),
+            mask: Some(reference_mask),
+            query_sequence_lengths: Some(reference_query_lengths),
+            key_value_sequence_lengths: Some(reference_key_value_lengths),
+        };
+        let (device_output, device_residual) = Array::dot_product_attention(device_inputs, configuration).unwrap();
+        let (reference_output, reference_residual) =
+            CpuArray::dot_product_attention(reference_inputs, configuration).unwrap();
+        for (actual, expected) in [
             (read_f32s(&device_output), reference_output.to_f64s()),
-            (read_f32s(&device_activation), reference_activation.to_f64s()),
+            (read_f32s(&device_residual.unwrap()), reference_residual.unwrap().to_f64s()),
         ] {
-            for (device_value, reference_value) in device_values.iter().zip(reference_values) {
-                assert!(
-                    (f64::from(*device_value) - reference_value).abs() < 1e-5,
-                    "expected {reference_value} but got {device_value}",
-                );
-            }
+            actual.iter().zip(expected).for_each(|(actual, expected)| {
+                assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");
+            });
         }
     }
 
-    /// Variable-sequence-length (padded) attention agrees between the XLA-backed eager array backend and the
-    /// reference array backend, including the exact zeros in the out-of-range query rows of both the attended
-    /// output and the activation statistic.
-    #[test]
-    fn test_eager_dot_product_attention_padding_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionMask, DotProductAttention};
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_mesh(&client);
-
-        let dimensions = [2usize, 4, 2, 3];
-        let key_value_dimensions = [2usize, 5, 2, 3];
-        let query_values: Vec<f64> = (0..48).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
-        let key_values: Vec<f64> = (0..60).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
-        let value_values: Vec<f64> = (0..60).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
-        let query_lengths = [3i32, 2];
-        let key_value_lengths = [4i32, 2];
-        let device = |values: &[f64], dimensions: &[usize]| {
-            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
-            let r#type = replicated_type(&mesh, DataType::F32, dimensions);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
-        };
-        let device_lengths = |values: &[i32]| {
-            let r#type = replicated_type(&mesh, DataType::I32, &[values.len()]);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
-        };
-        let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
-            CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
-        };
-        let reference_lengths = |values: &[i32]| {
-            let shape = Shape::new(vec![Dimension::Static(values.len())]);
-            CpuArray::from_f64s(
-                ArrayType::new(DataType::I32, shape),
-                values.iter().map(|&value| f64::from(value)).collect(),
-            )
-        };
-        let scale = 0.5;
-        let mask = AttentionMask::Causal;
-
-        let (device_output, device_activation) = device(&query_values, &dimensions)
-            .dot_product_attention_with_activation(
-                &device(&key_values, &key_value_dimensions),
-                &device(&value_values, &key_value_dimensions),
-                None,
-                Some((&device_lengths(&query_lengths), &device_lengths(&key_value_lengths))),
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        let (reference_output, reference_activation) = reference(&query_values, &dimensions)
-            .dot_product_attention_with_activation(
-                &reference(&key_values, &key_value_dimensions),
-                &reference(&value_values, &key_value_dimensions),
-                None,
-                Some((&reference_lengths(&query_lengths), &reference_lengths(&key_value_lengths))),
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        let device_output_values = read_f32s(&device_output);
-        let device_activation_values = read_f32s(&device_activation);
-        for (device_values, reference_values) in [
-            (&device_output_values, reference_output.to_f64s()),
-            (&device_activation_values, reference_activation.to_f64s()),
-        ] {
-            for (device_value, reference_value) in device_values.iter().zip(reference_values) {
-                assert!(
-                    (f64::from(*device_value) - reference_value).abs() < 1e-5,
-                    "expected {reference_value} but got {device_value}",
-                );
-            }
-        }
-        // Out-of-range query rows are exact zeros on the device path, mirroring the fused kernels' memzeroed
-        // outputs.
-        for b in 0..2 {
-            for i in (query_lengths[b] as usize)..4 {
-                for n in 0..2 {
-                    for d in 0..3 {
-                        assert_eq!(device_output_values[((b * 4 + i) * 2 + n) * 3 + d], 0.0);
-                    }
-                    assert_eq!(device_activation_values[(b * 2 + n) * 4 + i], 0.0);
-                }
-            }
-        }
-    }
-
-    /// The attention backward operation agrees between the XLA-backed eager array backend (the backward composition
-    /// fallback on CPU) and the reference array backend, including the bias cotangent and the padded
-    /// (variable-sequence-length) gradient zeroing.
-    #[test]
-    fn test_eager_dot_product_attention_backward_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionMask, DotProductAttention, DotProductAttentionBackward};
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = cpu_mesh(&client);
-
-        // Grouped-query `BTNH` shapes with a broadcast bias and per-item sequence lengths, exercising the group
-        // sums, the bias cotangent, and the padded-gradient zeroing all at once.
-        let query_dimensions = [2usize, 3, 2, 3];
-        let key_value_dimensions = [2usize, 4, 1, 3];
-        let bias_dimensions = [1usize, 2, 3, 4];
-        let query_values: Vec<f64> = (0..36).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
-        let key_values: Vec<f64> = (0..24).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
-        let value_values: Vec<f64> = (0..24).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
-        let bias_values: Vec<f64> = (0..24).map(|i| ((i * 11 % 17) as f64 - 8.0) * 0.125).collect();
-        let seed_values: Vec<f64> = (0..36).map(|i| ((i * 13 % 19) as f64 - 9.0) * 0.125).collect();
-        let query_lengths = [3i32, 2];
-        let key_value_lengths = [4i32, 2];
-        let device = |values: &[f64], dimensions: &[usize]| {
-            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
-            let r#type = replicated_type(&mesh, DataType::F32, dimensions);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
-        };
-        let device_lengths = |values: &[i32]| {
-            let r#type = replicated_type(&mesh, DataType::I32, &[values.len()]);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
-        };
-        let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
-            CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
-        };
-        let reference_lengths = |values: &[i32]| {
-            let shape = Shape::new(vec![Dimension::Static(values.len())]);
-            CpuArray::from_f64s(
-                ArrayType::new(DataType::I32, shape),
-                values.iter().map(|&value| f64::from(value)).collect(),
-            )
-        };
-        let scale = 0.5;
-        let mask = AttentionMask::Causal;
-
-        let device_query = device(&query_values, &query_dimensions);
-        let device_key = device(&key_values, &key_value_dimensions);
-        let device_value = device(&value_values, &key_value_dimensions);
-        let device_bias = device(&bias_values, &bias_dimensions);
-        let device_query_lengths = device_lengths(&query_lengths);
-        let device_key_value_lengths = device_lengths(&key_value_lengths);
-        let device_sequence_lengths = Some((&device_query_lengths, &device_key_value_lengths));
-        let (device_output, device_activation) = device_query
-            .dot_product_attention_with_activation(
-                &device_key,
-                &device_value,
-                Some(&device_bias),
-                device_sequence_lengths,
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        let (device_dq, device_dk, device_dv, device_dbias) = device_query
-            .dot_product_attention_backward_with_options(
-                &device_key,
-                &device_value,
-                Some(&device_bias),
-                device_sequence_lengths,
-                &device_output,
-                &device_activation,
-                &device(&seed_values, &query_dimensions),
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        let reference_query = reference(&query_values, &query_dimensions);
-        let reference_key = reference(&key_values, &key_value_dimensions);
-        let reference_value = reference(&value_values, &key_value_dimensions);
-        let reference_bias = reference(&bias_values, &bias_dimensions);
-        let reference_query_lengths = reference_lengths(&query_lengths);
-        let reference_key_value_lengths = reference_lengths(&key_value_lengths);
-        let reference_sequence_lengths = Some((&reference_query_lengths, &reference_key_value_lengths));
-        let (reference_output, reference_activation) = reference_query
-            .dot_product_attention_with_activation(
-                &reference_key,
-                &reference_value,
-                Some(&reference_bias),
-                reference_sequence_lengths,
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        let (reference_dq, reference_dk, reference_dv, reference_dbias) = reference_query
-            .dot_product_attention_backward_with_options(
-                &reference_key,
-                &reference_value,
-                Some(&reference_bias),
-                reference_sequence_lengths,
-                &reference_output,
-                &reference_activation,
-                &reference(&seed_values, &query_dimensions),
-                scale,
-                mask,
-                None,
-                None,
-            )
-            .unwrap();
-        for (device_cotangent, reference_cotangent) in [
-            (&device_dq, &reference_dq),
-            (&device_dk, &reference_dk),
-            (&device_dv, &reference_dv),
-            (&device_dbias.unwrap(), &reference_dbias.unwrap()),
-        ] {
-            for (device_value, reference_value) in read_f32s(device_cotangent).iter().zip(reference_cotangent.to_f64s())
-            {
-                assert!(
-                    (f64::from(*device_value) - reference_value).abs() < 1e-5,
-                    "expected {reference_value} but got {device_value}",
-                );
-            }
-        }
-        // Out-of-range gradient regions are exact zeros on the device path: query-cotangent rows at or beyond
-        // `query_lengths[b]` and key/value-cotangent positions at or beyond `key_value_lengths[b]`.
-        let device_dq_values = read_f32s(&device_dq);
-        let device_dk_values = read_f32s(&device_dk);
-        let device_dv_values = read_f32s(&device_dv);
-        for b in 0..2 {
-            for i in (query_lengths[b] as usize)..3 {
-                for n in 0..2 {
-                    for d in 0..3 {
-                        assert_eq!(device_dq_values[((b * 3 + i) * 2 + n) * 3 + d], 0.0);
-                    }
-                }
-            }
-            for s in (key_value_lengths[b] as usize)..4 {
-                for d in 0..3 {
-                    assert_eq!(device_dk_values[(b * 4 + s) * 3 + d], 0.0);
-                    assert_eq!(device_dv_values[(b * 4 + s) * 3 + d], 0.0);
-                }
-            }
-        }
-    }
-
-    /// Reverse-mode differentiation through the `custom_vjp` attention training entry point on the XLA CPU eager
-    /// path matches the reference backend's gradients (the primal executes the composition while the gradient
-    /// replays the staged backward operation).
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
-        use ryft_core::operations::attention::{AttentionMask, differentiable_dot_product_attention};
+        use ryft_core::operations::attention::{
+            AttentionConfiguration, AttentionInputs, differentiable_dot_product_attention,
+        };
         use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
 
         use crate::XlaDomain;
@@ -1613,63 +1357,46 @@ mod tests {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = cpu_mesh(&client);
-
-        let query_dimensions = [1usize, 2, 2, 3];
-        let key_value_dimensions = [1usize, 3, 1, 3];
-        let query_values: Vec<f64> = (0..12).map(|i| ((i * 7 % 11) as f64 - 5.0) * 0.25).collect();
-        let key_values: Vec<f64> = (0..9).map(|i| ((i * 5 % 13) as f64 - 6.0) * 0.25).collect();
-        let value_values: Vec<f64> = (0..9).map(|i| ((i * 3 % 7) as f64 - 3.0) * 0.5).collect();
-        let device = |values: &[f64], dimensions: &[usize]| {
-            let values = values.iter().map(|&value| value as f32).collect::<Vec<_>>();
-            let r#type = replicated_type(&mesh, DataType::F32, dimensions);
-            Array::from_host_buffer(&client, r#type, mesh.clone(), values_to_bytes(&values).as_slice()).unwrap()
+        let dimensions = [1usize, 2, 1, 2];
+        let values = [0.25_f32, -0.5, 0.75, 1.0];
+        let device_type = replicated_type(&mesh, DataType::F32, &dimensions);
+        let device = || {
+            Array::from_host_buffer(&client, device_type.clone(), mesh.clone(), values_to_bytes(&values).as_slice())
+                .unwrap()
         };
-        let reference = |values: &[f64], dimensions: &[usize]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| Dimension::Static(dimension)).collect());
-            CpuArray::from_f64s(ArrayType::new(DataType::F32, shape), values.to_vec())
-        };
-        let scale = 0.5;
-        let mask = AttentionMask::Causal;
+        let host_type =
+            ArrayType::new(DataType::F32, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()));
+        let reference =
+            || CpuArray::from_f64s(host_type.clone(), values.iter().map(|value| f64::from(*value)).collect());
+        let configuration = AttentionConfiguration::new().with_scale(0.5).with_causal(true);
 
-        let query = device(&query_values, &query_dimensions);
-        let key = device(&key_values, &key_value_dimensions);
-        let value = device(&value_values, &key_value_dimensions);
-        let domain = query.execution_domain();
         type ArrayXlaDomain<'c> = ProjectedContext<XlaDomain<'c>, ArrayType>;
-        let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(scale, mask, None, None);
-        let (loss, (query_gradient, key_gradient, value_gradient)) = domain
-            .differentiate_at((query, key, value))
-            .value_and_gradient(|(query, key, value)| {
-                function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+        let function = differentiable_dot_product_attention::<ArrayXlaDomain<'_>>(configuration);
+        let inputs = AttentionInputs::new(device(), device(), device());
+        let domain = inputs.query.execution_domain();
+        let (loss, gradients) = domain
+            .differentiate_at(inputs)
+            .value_and_gradient(|inputs| function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .unwrap();
+
+        let reference_function =
+            differentiable_dot_product_attention::<EagerContext<CpuArray, ArrayOperation<CpuArray>>>(configuration);
+        let (reference_loss, reference_gradients) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
+            .differentiate_at(AttentionInputs::new(reference(), reference(), reference()))
+            .value_and_gradient(|inputs| {
+                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
             })
             .unwrap();
 
-        let reference_function = differentiable_dot_product_attention::<EagerContext<CpuArray, ArrayOperation<CpuArray>>>(
-            scale, mask, None, None,
-        );
-        let (reference_loss, (reference_query_gradient, reference_key_gradient, reference_value_gradient)) =
-            EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-                .differentiate_at((
-                    reference(&query_values, &query_dimensions),
-                    reference(&key_values, &key_value_dimensions),
-                    reference(&value_values, &key_value_dimensions),
-                ))
-                .value_and_gradient(|(query, key, value)| {
-                    reference_function.call((query, key, value)).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-                })
-                .unwrap();
         assert!((f64::from(read_f32s(&loss)[0]) - reference_loss.to_f64s()[0]).abs() < 1e-5);
-        for (device_gradient, reference_gradient) in [
-            (&query_gradient, &reference_query_gradient),
-            (&key_gradient, &reference_key_gradient),
-            (&value_gradient, &reference_value_gradient),
+        for (actual, expected) in [
+            (&gradients.query, &reference_gradients.query),
+            (&gradients.key, &reference_gradients.key),
+            (&gradients.value, &reference_gradients.value),
         ] {
-            for (device_value, reference_value) in read_f32s(device_gradient).iter().zip(reference_gradient.to_f64s()) {
-                assert!(
-                    (f64::from(*device_value) - reference_value).abs() < 1e-5,
-                    "expected {reference_value} but got {device_value}",
-                );
-            }
+            read_f32s(actual).iter().zip(expected.to_f64s()).for_each(|(actual, expected)| {
+                assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");
+            });
         }
     }
 

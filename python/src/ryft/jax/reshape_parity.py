@@ -45,7 +45,7 @@ def load_expected_mlir() -> dict[str, str]:
         for match in FUNCTION_MLIR_PATTERN.finditer(source)
     }
     required_cases = {
-        "test_trace_reshape_with_sharding_constraint_renders_stablehlo_and_shardy",
+        "test_trace_reshape_and_reshard_render_stablehlo_and_shardy",
         "test_shard_map_reshape_renders_singleton_axis_sharding_propagation",
         "test_shard_map_reshape_renders_replicated_merge_sharding_propagation",
         "test_shard_map_reshape_renders_replicated_split_sharding_propagation",
@@ -93,7 +93,7 @@ def build_reshape_cases(mesh: Mesh) -> list[ProgramCase]:
     sharding = NamedSharding(mesh, P("x"))
     return [
         ProgramCase(
-            name="test_trace_reshape_with_sharding_constraint_renders_stablehlo_and_shardy",
+            name="test_trace_reshape_and_reshard_render_stablehlo_and_shardy",
             description="Plain reshape with a Shardy sharding constraint.",
             function=lambda x: jnp.reshape(jax.lax.with_sharding_constraint(x, sharding), (1, 8, 1)),
             abstract_args=(jax.ShapeDtypeStruct((8,), jnp.float32),),

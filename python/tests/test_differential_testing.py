@@ -64,12 +64,17 @@ class DifferentialTestingTest(unittest.TestCase):
 
     def test_registry(self) -> None:
         self.assertEqual(
-            [(case.case_id, case.relationship, bool(case.collectives)) for case in differential_cases()],
             [
-                ("grouped_shape_changing_collectives", "parity", True),
-                ("pshuffle", "parity", True),
-                ("pswapaxes", "parity", True),
-                ("data_dependent_prefix_take", "ryft_exceeds_jax", False),
+                (case.case_id, case.relationship, bool(case.collectives), bool(case.stablehlo_patterns))
+                for case in differential_cases()
+            ],
+            [
+                ("grouped_shape_changing_collectives", "parity", True, False),
+                ("pshuffle", "parity", True, False),
+                ("pswapaxes", "parity", True, False),
+                ("data_dependent_prefix_take", "ryft_exceeds_jax", False, False),
+                ("scaled_dot_and_matmul", "parity", False, True),
+                ("dot_product_attention", "parity", False, True),
             ],
         )
 
@@ -153,6 +158,22 @@ class DifferentialTestingTest(unittest.TestCase):
             (
                 f"StableHLO collectives: ryft module is missing expected collective families {MISSING_ALL_FAMILIES}",
                 f"StableHLO collectives: jax module is missing expected collective families {MISSING_ALL_FAMILIES}",
+            ),
+        )
+
+    def test_exact_parity_comparison_checks_semantic_patterns(self) -> None:
+        observation = DifferentialObservation(
+            schema=SCHEMA,
+            case_id="semantic",
+            observations={"output": ((1.0,),)},
+            stablehlo='"stablehlo.composite"() {name = "xla.scaled_dot"}',
+        )
+        self.assertTrue(compare_case("parity", (), observation, observation, ("xla.scaled_dot",)).passed())
+        self.assertEqual(
+            compare_case("parity", (), observation, observation, ("dimension_numbers",)).differences,
+            (
+                "StableHLO: Ryft module is missing semantic patterns ('dimension_numbers',)",
+                "StableHLO: JAX module is missing semantic patterns ('dimension_numbers',)",
             ),
         )
 

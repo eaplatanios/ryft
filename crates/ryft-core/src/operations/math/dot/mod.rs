@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, MeshAxisType,
-    RaggedArrayBatchingPolicy, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, Dimension,
+    DimensionType, DimensionValue, LogicalMesh, MeshAxisType, RaggedArrayBatchingPolicy, Shape, Sharding,
+    ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -17,18 +18,19 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
+use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
+use crate::operations::dimensions::dimension_size::DimensionSize;
+use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
 use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
-use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
+use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::math::mul::{Mul, MulOperation};
+use crate::operations::math::div::Div;
+use crate::operations::math::mul::Mul;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-
-// TODO(eaplatanios): Review this module.
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
 ///
@@ -1098,635 +1100,9 @@ pub fn adjoint_dimensions_for_right_dot(
     }
 }
 
-/// Canonical operation name for [`ScaledDotOperation`].
-pub const SCALED_DOT_OPERATION_NAME: &str = "scaled_dot";
+mod scaled;
 
-/// Primitive representing a block-scaled ("microscaling") matrix product — the analogue of
-/// [JAX's `jax.nn.scaled_matmul`](https://docs.jax.dev/en/latest/_autosummary/jax.nn.scaled_matmul.html). Each
-/// operand pairs a narrow element tensor with a tensor of per-block scales along the contracting dimension,
-/// covering the [OCP MX formats](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
-/// (e.g., MXFP8: `f8e4m3fn` elements with `f8e8m0fnu` scales over blocks of 32) and NVIDIA's NVFP4 (`f4e2m1fn`
-/// elements with `f8e4m3fn` scales over blocks of 16; fold any additional per-tensor scale into one scale tensor
-/// or the result). The contracting dimension is the last dimension of *both* element operands, matching the
-/// hardware block-scaled gemm convention: the operands are `lhs [m, k]` with scales `[m, k / block_size]` and
-/// `rhs [n, k]` with scales `[n, k / block_size]`, and the result is `[m, n]` at the accumulation type. All four
-/// operands may instead carry one shared leading batch dimension (`lhs [b, m, k]`, `rhs [b, n, k]`, scales
-/// `[b, ·, k / block_size]`, result `[b, m, n]`), matching the custom call's 3D form; mixed ranks are rejected. An
-/// optional fifth operand supplies a scalar global scale at the accumulation type that is multiplied into the
-/// result (the custom call's per-tensor scale); its presence is inferred from the operand count.
-///
-/// Semantically the operation dequantizes both operands (upcasting elements and scales to the accumulation type
-/// and expanding each scale across its block) and contracts them — which is exactly how the reference array
-/// backend and the portable XLA lowering evaluate it (see [`scaled_dot_composition`]). On CUDA targets, the XLA
-/// lowering instead emits the `__op$block_scaled_dot` custom call for the standard MXFP8/NVFP4 format and block
-/// combinations, which XLA's GPU block-scaling rewriter lowers to cuDNN's native block-scaled tensor-core dot
-/// (cuDNN 9.10+) or to expanded reference HLO.
-///
-/// The operation differentiates as a bilinear contraction of its element operands with the scales (and the optional
-/// global scale) held fixed — refer to the forward-mode and transpose rule documentation on this operation.
-/// Batching lifts the rank-2 form to the rank-3 batched form (preserving the native fast path under `vmap`); only
-/// batching an already-batched rank-3 operation is rejected, because no rank-4 form exists — refer to the batching
-/// rule documentation on this operation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ScaledDotOperation {
-    /// Number of contracting-dimension elements sharing one scale.
-    block_size: usize,
-
-    /// Element type at which the operands are dequantized and the contraction accumulates.
-    accumulation_type: DataType,
-}
-
-impl ScaledDotOperation {
-    /// Creates a new [`ScaledDotOperation`] with the provided block size and accumulation type.
-    #[inline]
-    pub fn new(block_size: usize, accumulation_type: DataType) -> Self {
-        Self { block_size, accumulation_type }
-    }
-
-    /// Returns the number of contracting-dimension elements sharing one scale.
-    #[inline]
-    pub fn block_size(&self) -> usize {
-        self.block_size
-    }
-
-    /// Returns the element type at which the operands are dequantized and the contraction accumulates.
-    #[inline]
-    pub fn accumulation_type(&self) -> DataType {
-        self.accumulation_type
-    }
-}
-
-impl Display for ScaledDotOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl Operation for ScaledDotOperation {
-    type Type = ArrayType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        SCALED_DOT_OPERATION_NAME
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        if input_types.len() != 4 && input_types.len() != 5 {
-            return Err(TypeError::invalid(format!(
-                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                input_types.len(),
-            )));
-        }
-        let lhs = scaled_dot_dimensions("'scaled_dot' left operand", &input_types[0])?;
-        let lhs_scales = scaled_dot_dimensions("'scaled_dot' left scales", &input_types[1])?;
-        let rhs = scaled_dot_dimensions("'scaled_dot' right operand", &input_types[2])?;
-        let rhs_scales = scaled_dot_dimensions("'scaled_dot' right scales", &input_types[3])?;
-        let rank = lhs.len();
-        for (descriptor, dimensions) in
-            [("left scales", &lhs_scales), ("right operand", &rhs), ("right scales", &rhs_scales)]
-        {
-            if dimensions.len() != rank {
-                return Err(TypeError::invalid(format!(
-                    "'scaled_dot' operands must share one rank, but got rank {rank} for the left operand and \
-                         rank {} for the {descriptor}",
-                    dimensions.len(),
-                )));
-            }
-        }
-        if rank == 3 && lhs[0] != rhs[0] {
-            return Err(TypeError::invalid(format!(
-                "'scaled_dot' batch dimension sizes do not match: {} versus {}",
-                lhs[0], rhs[0]
-            )));
-        }
-        let contracting = rank - 1;
-        if lhs[contracting] != rhs[contracting] {
-            return Err(TypeError::invalid(format!(
-                "'scaled_dot' contracting dimension sizes do not match: {} versus {}",
-                lhs[contracting], rhs[contracting],
-            )));
-        }
-        let Dimension::Static(contracting_size) = &lhs[contracting] else {
-            return Err(TypeError::invalid(format!(
-                "'scaled_dot' contracting dimension must be static but got {}",
-                lhs[contracting],
-            )));
-        };
-        if self.block_size == 0 || contracting_size % self.block_size != 0 {
-            return Err(TypeError::invalid(format!(
-                "'scaled_dot' contracting dimension size {} is not divisible by block size {}",
-                contracting_size, self.block_size,
-            )));
-        }
-        for (descriptor, elements, scales) in [("left", &lhs, &lhs_scales), ("right", &rhs, &rhs_scales)] {
-            let mut expected = elements.clone();
-            expected[contracting] = Dimension::Static(contracting_size / self.block_size);
-            if *scales != expected {
-                return Err(TypeError::invalid(format!(
-                    "'scaled_dot' {descriptor} scales must have shape {} but got {}",
-                    Shape::new(expected),
-                    Shape::new(scales.clone()),
-                )));
-            }
-        }
-        if let Some(global_scale) = input_types.get(4) {
-            if global_scale.static_shape().is_none_or(|shape| shape.rank() != 0) {
-                return Err(TypeError::invalid(format!(
-                    "'scaled_dot' global scale must be a static scalar but got shape {}",
-                    global_scale.shape(),
-                )));
-            }
-            if global_scale.data_type() != self.accumulation_type {
-                return Err(TypeError::invalid(format!(
-                    "'scaled_dot' global scale data type {} must match the accumulation type {}",
-                    global_scale.data_type(),
-                    self.accumulation_type,
-                )));
-            }
-        }
-        for input_type in input_types {
-            if !accumulation_type_is_compatible(input_type.data_type(), self.accumulation_type) {
-                return Err(TypeError::invalid(format!(
-                    "'scaled_dot' operand data type {} cannot accumulate at data type {}",
-                    input_type.data_type(),
-                    self.accumulation_type,
-                )));
-            }
-            if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError::invalid("'scaled_dot' does not support unreduced operands".to_string()));
-            }
-        }
-        let mut output_dimensions = Vec::with_capacity(rank);
-        if rank == 3 {
-            output_dimensions.push(lhs[0].clone());
-        }
-        output_dimensions.push(lhs[rank - 2].clone());
-        output_dimensions.push(rhs[rank - 2].clone());
-        Ok(vec![ArrayType::new(self.accumulation_type, Shape::new(output_dimensions))])
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, SCALED_DOT_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("block_size", &self.block_size)?;
-            operation.field("accumulation_type", &self.accumulation_type)
-        })
-    }
-}
-
-impl<C: Domain<Type = ArrayType, Value: ScaledDot>> InterpretableOperation<C> for ScaledDotOperation {
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        match inputs {
-            [lhs, lhs_scales, rhs, rhs_scales] => {
-                Ok(vec![lhs.scaled_dot(lhs_scales, rhs, rhs_scales, self.block_size, self.accumulation_type)?])
-            }
-            [lhs, lhs_scales, rhs, rhs_scales, global_scale] => Ok(vec![lhs.scaled_dot_with_global_scale(
-                lhs_scales,
-                rhs,
-                rhs_scales,
-                global_scale,
-                self.block_size,
-                self.accumulation_type,
-            )?]),
-            inputs => Err(TypeError::invalid(format!(
-                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                inputs.len(),
-            ))
-            .into()),
-        }
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDotOperation where
-    C::Operation: From<ScaledDotOperation>
-{
-}
-
-/// Forward-mode rule for [`ScaledDotOperation`]: with the scales held fixed the operation is the bilinear
-/// contraction of its dequantized element operands, so
-/// `d(scaled_dot(lhs, rhs)) = scaled_dot(d_lhs, rhs) + scaled_dot(lhs, d_rhs)` with both tangent products reusing
-/// the primal scales (and the primal global scale, when present). Each tangent term stays a `scaled_dot`, so the
-/// output tangent lives at the accumulation type exactly like the primal output. Scale and global-scale
-/// perturbations do not propagate: the scales are quantization parameters that gradients flow *through* rather than
-/// *into* (the straight-through convention JAX's `scaled_matmul` uses), so their tangent inputs are ignored and
-/// their transpose cotangents are structural zeros.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
-where
-    C::Operation: From<ScaledDotOperation>,
-    C::Value: ScaledDot + std::ops::Add<Output = C::Value>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if inputs.len() != 4 && inputs.len() != 5 {
-            return Err(ProgramError::from(TypeError::invalid(format!(
-                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                inputs.len(),
-            )))
-            .into());
-        }
-        let lhs_scales = inputs[1].primal();
-        let rhs_scales = inputs[3].primal();
-        let global_scale = inputs.get(4).map(|dual| dual.primal());
-        let stage = |lhs: &C::Value, rhs: &C::Value| -> Result<C::Value, DifferentiationError> {
-            match global_scale {
-                Some(global_scale) => lhs
-                    .scaled_dot_with_global_scale(
-                        lhs_scales,
-                        rhs,
-                        rhs_scales,
-                        global_scale,
-                        self.block_size,
-                        self.accumulation_type,
-                    )
-                    .map_err(DifferentiationError::from),
-                None => lhs
-                    .scaled_dot(lhs_scales, rhs, rhs_scales, self.block_size, self.accumulation_type)
-                    .map_err(DifferentiationError::from),
-            }
-        };
-        let primal = stage(inputs[0].primal(), inputs[2].primal())?;
-        let left_term = inputs[0].tangent().as_value().map(|tangent| stage(tangent, inputs[2].primal())).transpose()?;
-        let right_term =
-            inputs[2].tangent().as_value().map(|tangent| stage(inputs[0].primal(), tangent)).transpose()?;
-        let tangent = left_term
-            .into_iter()
-            .chain(right_term)
-            .reduce(|left_term, right_term| left_term + right_term)
-            .map_or_else(|| MaybeZero::Zero(primal.r#type().tangent()), MaybeZero::Value);
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Partition-aware transpose rule for [`ScaledDotOperation`]. With the scales (and the optional global scale) held
-/// fixed as known values, the operation is the bilinear contraction of its two dequantized element operands, so in
-/// a valid pushforward exactly one element operand is linear and the other is known. The linear operand's adjoint
-/// stages the dequantization composition of the known element operand (see [`dequantize_block_scaled`]) and
-/// contracts it with the output cotangent at the accumulation type:
-///
-///   - linear LHS: `dot(cotangent [b?, m, n], dequantize(rhs) [b?, n, k])` contracting `n` yields `[b?, m, k]`, and
-///   - linear RHS: `dot(cotangent [b?, m, n], dequantize(lhs) [b?, m, k])` contracting `m` yields `[b?, n, k]`,
-///
-/// with a known global scale multiplied into the cotangent first (the forward map scales linearly by it) and a
-/// final element-type conversion when the linear operand's cotangent representation differs from the accumulation
-/// type (e.g., back down to `f4e2m1fn` elements). The scales are quantization parameters that gradients flow
-/// *through* rather than *into*, so their cotangents are structural zeros and transposing with respect to a scale
-/// (or the global scale) is rejected. A zero output cotangent stays a structural zero, and two linear element
-/// operands are rejected exactly like the bilinear [`DotOperation`] case.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScaledDotOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<BroadcastOperation>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<DotOperation>
-        + From<MulOperation<ArrayType>>
-        + From<ReshapeOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TracingContext<V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        if inputs.len() != 4 && inputs.len() != 5 {
-            return Err(ProgramError::from(TypeError::invalid(format!(
-                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got {}",
-                inputs.len(),
-            )))
-            .into());
-        }
-        check_count!("output", outputs, 1, ProgramError);
-        if inputs[1].is_unknown() || inputs[3].is_unknown() || inputs.get(4).is_some_and(PartialValue::is_unknown) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "'{SCALED_DOT_OPERATION_NAME}' scales are held fixed under differentiation and cannot be \
-                     transposed with respect to; differentiate an explicit dequantization composition instead"
-                ),
-            }
-            .into());
-        }
-        if inputs[0].is_unknown() && inputs[2].is_unknown() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "bilinear `{SCALED_DOT_OPERATION_NAME}` with two linear element operands cannot be transposed"
-                ),
-            }
-            .into());
-        }
-        // Exactly one element operand is linear: dequantize the known one, contract it with the output cotangent
-        // (scaled by a known global scale first), and emit structural zeros for every held-fixed operand.
-        let left_is_linear = inputs[0].is_unknown();
-        let (linear_index, known_index, known_scales_index) = if left_is_linear { (0, 2, 3) } else { (2, 0, 1) };
-        let linear_cotangent_type = inputs[linear_index].r#type().cotangent();
-        let contribution = match &outputs[0] {
-            MaybeZero::Zero(_) => MaybeZero::Zero(linear_cotangent_type),
-            MaybeZero::Value(output_cotangent) => {
-                // The dispatch guarantees a `Known` operand carries its pullback value, so read it directly.
-                let known_value = |index: usize| {
-                    inputs[index].as_known().expect("dispatch guarantees a known operand carries its pullback value")
-                };
-                let dequantized = dequantize_block_scaled(
-                    known_value(known_index),
-                    known_value(known_scales_index),
-                    self.block_size,
-                    self.accumulation_type,
-                )?;
-                let cotangent = match inputs.get(4) {
-                    Some(_) => {
-                        let cotangent_type = output_cotangent.r#type().into_owned();
-                        output_cotangent.mul(&known_value(4).broadcast(cotangent_type, &[])?)?
-                    }
-                    None => output_cotangent.clone(),
-                };
-                let rank = inputs[linear_index].r#type().rank();
-                let dimensions = match (left_is_linear, rank) {
-                    // Linear LHS: `cotangent [m, n] × dequantize(rhs) [n, k]` contracting `n`.
-                    (true, 2) => DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
-                    (true, _) => DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
-                    // Linear RHS: `cotangent [m, n] × dequantize(lhs) [m, k]` contracting `m`.
-                    (false, 2) => DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()),
-                    (false, _) => DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-                };
-                let operands = [cotangent, dequantized];
-                let mut adjoint_outputs =
-                    context.stage_operation(DotOperation::new(dimensions), Vec::new(), &operands)?;
-                check_count!("output", adjoint_outputs, 1, ProgramError);
-                let adjoint = adjoint_outputs.remove(0);
-                // The adjoint contraction runs at the accumulation type; convert the result to the linear element
-                // operand's cotangent representation when the two differ.
-                let adjoint = if adjoint.r#type().data_type() == linear_cotangent_type.data_type() {
-                    adjoint
-                } else {
-                    adjoint.convert_element_type(linear_cotangent_type.data_type())?
-                };
-                MaybeZero::Value(adjoint)
-            }
-        };
-        let mut contributions =
-            inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect::<Vec<_>>();
-        contributions[linear_index] = contribution;
-        Ok(contributions)
-    }
-}
-
-/// Batching rule for [`ScaledDotOperation`]: one mapped batch level lifts the rank-2 form to the operation's own
-/// rank-3 batched form. Every element and scale operand is aligned to a physical batch axis at position 0 (mapped
-/// operands are realigned, replicated operands are broadcast into `axis_size` copies), and the lifted operation is
-/// the same `scaled_dot`, whose type inference already accepts one shared leading batch dimension. A replicated
-/// global scale stays on the lifted operation as its scalar fifth operand (so the native block-scaled fast path is
-/// preserved under `vmap`), while a mapped global scale cannot ride the rank-3 form's scalar operand: it is dropped
-/// from the lifted operation and multiplied into the `[b, m, n]` result per batch item instead. The rank-3 form has
-/// no rank-4 analogue, so batching an already-batched `scaled_dot` reports an error directing users to batch an
-/// explicit dequantization composition instead.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Mul + Transpose>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for ScaledDotOperation
-where
-    ScaledDotOperation: InterpretableOperation<C>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        if inputs.len() != 4 && inputs.len() != 5 {
-            return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() }.into());
-        }
-        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            // Every operand is replicated: the lifted operation is the unbatched operation itself.
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
-        };
-        let lhs_primal_rank = inputs[0].r#type().rank() - usize::from(inputs[0].batch_axis_position().is_some());
-        if lhs_primal_rank != 2 {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "'{SCALED_DOT_OPERATION_NAME}' has no rank-4 block-scaled form, so a batched rank-{lhs_primal_rank} \
-                     operation cannot be batched again; batch an explicit dequantization composition instead"
-                ),
-            });
-        }
-        let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
-        let mut aligned_inputs = inputs[..4]
-            .iter()
-            .map(|input| input.match_axis(0, axis_size, axis_sharding.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mapped_global_scale = match inputs.get(4) {
-            Some(global_scale) if global_scale.batch_axis().is_replicated() => {
-                aligned_inputs.push(global_scale.clone());
-                None
-            }
-            Some(global_scale) => Some(global_scale.move_axis(0)?),
-            None => None,
-        };
-        let mut outputs = self.interpret_with_batch_axes(context, aligned_inputs.as_slice(), &[BatchAxis::new(0)])?;
-        let Some(global_scale) = mapped_global_scale else {
-            return Ok(outputs.into());
-        };
-        // A mapped global scale is a per-item `[b]` factor of the `[b, m, n]` result: broadcast it along the batch
-        // axis and multiply it into the lifted output.
-        let output = outputs.remove(0);
-        let output_type = output.r#type().into_owned();
-        let broadcast_global_scale = global_scale.value().broadcast(output_type.clone(), &[0])?;
-        let scaled_value = output.value().mul(&broadcast_global_scale)?;
-        Ok(vec![ArrayBatch::new(scaled_value, BatchAxis::new(0))?].into())
-    }
-}
-
-/// Value-level block-scaled ("microscaling") dot capability. Refer to the documentation of [`ScaledDotOperation`]
-/// for the operand convention (the contracting dimension is last on *both* element operands, with an optional
-/// shared leading batch dimension), the supported formats, and the transform rules.
-pub trait ScaledDot: Sized {
-    /// Computes the block-scaled matrix product of `self` (shape `[b?, m, k]`, scaled by `lhs_scales` of shape
-    /// `[b?, m, k / block_size]`) and `rhs` (shape `[b?, n, k]`, scaled by `rhs_scales` of shape
-    /// `[b?, n, k / block_size]`), dequantizing both operands to `accumulation_type` and returning the `[b?, m, n]`
-    /// product at that type, and a [`ProgramError`] if something goes wrong.
-    fn scaled_dot(
-        &self,
-        lhs_scales: &Self,
-        rhs: &Self,
-        rhs_scales: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError>;
-
-    /// Computes the block-scaled matrix product exactly like [`Self::scaled_dot`] and multiplies the scalar
-    /// `global_scale` (which must carry `accumulation_type`) into the result, matching the optional per-tensor
-    /// scale operand of the `__op$block_scaled_dot` custom call. Returns a [`ProgramError`] if something goes
-    /// wrong.
-    fn scaled_dot_with_global_scale(
-        &self,
-        lhs_scales: &Self,
-        rhs: &Self,
-        rhs_scales: &Self,
-        global_scale: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError>;
-}
-
-/// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
-/// context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
-/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
-/// transform tracers and backend-owned values without conflicting with concrete implementations.
-impl<V: Value<Type = ArrayType>> ScaledDot for V
-where
-    V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
-{
-    fn scaled_dot(
-        &self,
-        lhs_scales: &Self,
-        rhs: &Self,
-        rhs_scales: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(
-            ScaledDotOperation::new(block_size, accumulation_type),
-            Vec::new(),
-            &[self.clone(), lhs_scales.clone(), rhs.clone(), rhs_scales.clone()],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    fn scaled_dot_with_global_scale(
-        &self,
-        lhs_scales: &Self,
-        rhs: &Self,
-        rhs_scales: &Self,
-        global_scale: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(
-            ScaledDotOperation::new(block_size, accumulation_type),
-            Vec::new(),
-            &[self.clone(), lhs_scales.clone(), rhs.clone(), rhs_scales.clone(), global_scale.clone()],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
-/// Evaluates a block-scaled dot as the portable dequantization composition: both operands (whose contracting
-/// dimension is last) are upcast to the accumulation type, their scales are expanded across the blocks (a
-/// broadcast inserting the block axis, merged back by a reshape), multiplied in, and contracted over the last
-/// dimension of both sides — over the shared leading batch dimension for rank-3 operands. A present `global_scale`
-/// scalar is broadcast and multiplied into the product. This is the shared semantics behind the concrete
-/// [`ScaledDot`] implementations and the portable XLA lowering.
-pub(crate) fn scaled_dot_composition<V>(
-    lhs: &V,
-    lhs_scales: &V,
-    rhs: &V,
-    rhs_scales: &V,
-    global_scale: Option<&V>,
-    block_size: usize,
-    accumulation_type: DataType,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Dot + Mul + Reshape,
-{
-    let rank = lhs.r#type().rank();
-    let lhs = dequantize_block_scaled(lhs, lhs_scales, block_size, accumulation_type)?;
-    let rhs = dequantize_block_scaled(rhs, rhs_scales, block_size, accumulation_type)?;
-    let dimensions = match rank {
-        3 => DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![0]),
-        _ => DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
-    };
-    let product = lhs.dot(&rhs, &dimensions);
-    match global_scale {
-        Some(global_scale) => {
-            let product_type = product.r#type().into_owned();
-            product.mul(&global_scale.broadcast(product_type, &[])?)
-        }
-        None => Ok(product),
-    }
-}
-
-/// Dequantizes one block-scaled operand whose contracting dimension is last: converts the elements and scales to
-/// `accumulation_type`, expands each scale across its block of `block_size` contracting elements (a broadcast
-/// appending the block axis, merged back by a reshape), and multiplies. Any static rank works, so the helper serves
-/// both the rank-2 and rank-3 `scaled_dot` forms.
-fn dequantize_block_scaled<V>(
-    elements: &V,
-    scales: &V,
-    block_size: usize,
-    accumulation_type: DataType,
-) -> Result<V, ProgramError>
-where
-    V: Value<Type = ArrayType> + Broadcast + ConvertElementType + Mul + Reshape,
-{
-    let element_type = elements.r#type().into_owned();
-    let Some(element_shape) = element_type.static_shape() else {
-        return Err(TypeError::invalid("'scaled_dot' operand must have a static shape".to_string()).into());
-    };
-    let element_dimensions = element_shape.dimensions().to_vec();
-    let Some(scale_shape) = scales.r#type().static_shape() else {
-        return Err(TypeError::invalid("'scaled_dot' scales must have a static shape".to_string()).into());
-    };
-    let scale_dimensions = scale_shape.dimensions().to_vec();
-    let Some(&contracting_size) = element_dimensions.last() else {
-        return Err(TypeError::invalid("'scaled_dot' operand must have rank at least 1".to_string()).into());
-    };
-    if block_size == 0 || contracting_size % block_size != 0 {
-        return Err(TypeError::invalid(format!(
-            "'scaled_dot' contracting dimension size {contracting_size} is not divisible by block size \
-                 {block_size}"
-        ))
-        .into());
-    }
-    let mut expected_scale_dimensions = element_dimensions.clone();
-    *expected_scale_dimensions.last_mut().unwrap() = contracting_size / block_size;
-    if scale_dimensions != expected_scale_dimensions {
-        return Err(TypeError::invalid(format!(
-            "'scaled_dot' scales must have shape {expected_scale_dimensions:?} but got {scale_dimensions:?}"
-        ))
-        .into());
-    }
-    let expanded_type = ArrayType::new(
-        accumulation_type,
-        Shape::new(
-            scale_dimensions
-                .iter()
-                .map(|&size| Dimension::Static(size))
-                .chain(std::iter::once(Dimension::Static(block_size)))
-                .collect(),
-        ),
-    );
-    let scale_axes = (0..scale_dimensions.len()).collect::<Vec<_>>();
-    let element_sizes = element_dimensions.iter().map(|&size| Dimension::Static(size)).collect::<Vec<_>>();
-    let expanded_scales = scales
-        .convert_element_type(accumulation_type)?
-        .broadcast(expanded_type, scale_axes.as_slice())?
-        .reshape(Shape::new(element_sizes))?;
-    elements.convert_element_type(accumulation_type)?.mul(&expanded_scales)
-}
-
-/// Returns the dimensions of a [`ScaledDot`] operand type, rejecting any rank other than 2 or 3. The rank-3 form
-/// carries one leading batch dimension shared by all operands.
-fn scaled_dot_dimensions(descriptor: &str, value_type: &ArrayType) -> Result<Vec<Dimension>, TypeError> {
-    match value_type.shape().dimensions() {
-        dimensions @ (&[_, _] | &[_, _, _]) => Ok(dimensions.to_vec()),
-        dimensions => Err(TypeError::invalid(format!(
-            "{descriptor} must have rank 2 or rank 3 but got rank {}",
-            dimensions.len()
-        ))),
-    }
-}
+pub use scaled::*;
 
 /// Value-level generalized dot capability.
 ///
@@ -1857,616 +1233,180 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot() {
-        // NVFP4-flavored case (with a compact block size of 2 instead of 16): `f4e2m1fn` elements with `f8e4m3fn`
-        // per-block scales along the trailing contracting dimension of BOTH operands (`lhs [m, k]`, `rhs [n, k]`).
-        // Every element, scale, product, and partial sum below is exactly representable, so the `f32` result is
-        // exact.
-        let lhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let rhs_type = ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let lhs = Array::from_f64s(lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
-        let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
-        let rhs = Array::from_f64s(rhs_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
-        let rhs_scales = Array::from_f64s(scale_type.clone(), vec![2.0, 0.5, 1.0, 2.0]);
-        let product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 2, DataType::F32).unwrap();
+    fn test_scaled_dot_jax_contract() {
+        // This fixture uses JAX's rank-2 default convention: the left trailing axis contracts with the right leading
+        // axis. The two sides infer independent block ratios of two from different scale-axis positions.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)])),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4), Dimension::Static(3)])),
+            (1..=12).map(|value| value as f64).collect(),
+        );
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            vec![1.0, 2.0, 0.5, 1.0],
+        );
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
+            vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+        );
+        let product = lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), None, Some(DataType::F32)).unwrap();
         assert_eq!(
             product.r#type().as_ref(),
-            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+            &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)])),
         );
-        assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
+        assert_eq!(product.to_f64s(), vec![253.0, 284.0, 315.0, 272.5, 308.0, 343.5]);
 
-        // MXFP8-flavored case: `f8e4m3fn` elements with power-of-two `f8e8m0fnu` scales.
-        let f8_lhs_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let mx_scale_type =
-            ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let f8_lhs = Array::from_f64s(f8_lhs_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
-        let f8_lhs_scales = Array::from_f64s(mx_scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
-        let f8_rhs = Array::from_f64s(f8_lhs_type, vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
-        let f8_rhs_scales = Array::from_f64s(mx_scale_type, vec![2.0, 0.5, 1.0, 2.0]);
-        let product = f8_lhs.scaled_dot(&f8_lhs_scales, &f8_rhs, &f8_rhs_scales, 2, DataType::F32).unwrap();
-        assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
-
-        // The staged operation renders its payload.
-        let operation = ScaledDotOperation::new(2, DataType::F32);
-        assert_eq!(operation.block_size(), 2);
-        assert_eq!(operation.accumulation_type(), DataType::F32);
-        assert_eq!(operation.name(), SCALED_DOT_OPERATION_NAME);
-        assert_eq!(operation.to_string(), "scaled_dot [block_size=2, accumulation_type=f32]");
+        // Each scale is independently optional. Missing scales are the multiplicative identity, and omitting both
+        // therefore reduces to a `bf16`-intermediate generalized dot with an `f32` result.
         assert_eq!(
-            operation.infer_output_types(
-                &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))]),
+            lhs.scaled_dot(&rhs, None, None, None, Some(DataType::F32)).unwrap().to_f64s(),
+            vec![70.0, 80.0, 90.0, 158.0, 184.0, 210.0],
+        );
+        assert_eq!(
+            lhs.scaled_dot(&rhs, Some(&lhs_scale), None, None, Some(DataType::F32)).unwrap().to_f64s(),
+            vec![131.0, 148.0, 165.0, 143.5, 164.0, 184.5],
         );
 
-        // Bounded dynamic non-contracting dimensions propagate to the result and must be shared exactly by the
-        // corresponding scale operands. The contracting dimension remains static because its scale relationship is
-        // defined by the block size.
-        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(5)).unwrap());
-        let columns = DimensionVariable::new("columns", DimensionBounds::non_negative(Some(7)).unwrap());
-        let dynamic_lhs_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(4)]),
-        );
-        let dynamic_lhs_scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(2)]),
-        );
-        let dynamic_rhs_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Dynamic(columns.clone()), Dimension::Static(4)]),
-        );
-        let dynamic_rhs_scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Dynamic(columns.clone()), Dimension::Static(2)]),
-        );
+        let dimensions = ScaledDotOperation::default_dimensions(2).unwrap();
+        let operation = ScaledDotOperation::new(dimensions.clone(), DataType::F32, true, true);
+        assert_eq!(operation.dimensions(), &dimensions);
+        assert_eq!(operation.preferred_element_type(), DataType::F32);
+        assert!(operation.has_lhs_scale());
+        assert!(operation.has_rhs_scale());
         assert_eq!(
-            operation.infer_output_types(
-                &[dynamic_lhs_type.clone(), dynamic_lhs_scale_type, dynamic_rhs_type, dynamic_rhs_scale_type,],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(columns)]),
-            )]),
-        );
-        let other_rows = DimensionVariable::new("other_rows", rows.bounds().clone());
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    dynamic_lhs_type.clone(),
-                    ArrayType::new(
-                        DataType::F8E4M3FN,
-                        Shape::new(vec![Dimension::Dynamic(other_rows), Dimension::Static(2)]),
-                    ),
-                    rhs_type.clone(),
-                    scale_type.clone(),
-                ],
-                &[],
-            ),
-            Err(TypeError::invalid(
-                "'scaled_dot' left scales must have shape [rows, 2] but got [other_rows, 2]".to_string(),
-            )),
-        );
-
-        // Contract violations report clear errors through type inference.
-        assert_eq!(
-            ScaledDotOperation::new(3, DataType::F32).infer_output_types(
-                &[lhs_type.clone(), scale_type.clone(), rhs_type.clone(), scale_type.clone()],
-                &[],
-            ),
-            Err(TypeError::invalid("'scaled_dot' contracting dimension size 4 is not divisible by block size 3".to_string())),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[lhs_type.clone(), rhs_type.clone(), rhs_type, scale_type.clone()], &[]),
-            Err(TypeError::invalid("'scaled_dot' left scales must have shape [2, 2] but got [2, 4]".to_string())),
-        );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    lhs_type.clone(),
-                    scale_type.clone(),
-                    ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(4)])),
-                    scale_type.clone(),
-                ],
-                &[],
-            ),
-            Err(TypeError::invalid("'scaled_dot' right operand must have rank 2 or rank 3 but got rank 1".to_string())),
-        );
-        let contracting = DimensionVariable::new("contracting", DimensionBounds::non_negative(Some(5)).unwrap());
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    ArrayType::new(
-                        DataType::F4E2M1FN,
-                        Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Dynamic(contracting.clone())]),
-                    ),
-                    ArrayType::new(
-                        DataType::F8E4M3FN,
-                        Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(2)]),
-                    ),
-                    ArrayType::new(
-                        DataType::F4E2M1FN,
-                        Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(contracting)]),
-                    ),
-                    scale_type.clone(),
-                ],
-                &[],
-            ),
-            Err(TypeError::invalid(
-                "'scaled_dot' contracting dimension must be static but got contracting".to_string(),
-            )),
-        );
-
-        // Batching lifts the rank-2 form to the operation's own rank-3 batched form, so the batched program stays a
-        // single `scaled_dot` instruction (preserving the native block-scaled fast path under `vmap`).
-        let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let inputs = vec![
-            builder.add_input(lhs_type),
-            builder.add_input(scale_type.clone()),
-            builder.add_input(ArrayType::new(
-                DataType::F4E2M1FN,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
-            )),
-            builder.add_input(scale_type),
-        ];
-        let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![output],
-                vec![crate::parameters::Placeholder; 4],
-                vec![crate::parameters::Placeholder],
-            )
-            .unwrap();
-        let (batched, output_axes) = program
-            .batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0); 4],
-                crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
-        assert_eq!(
-            batched.to_string(),
+            operation.to_string(),
             indoc! {"
-                lambda %0:f4e2m1fn[2, 2, 4], %1:f8e4m3fn[2, 2, 2], %2:f4e2m1fn[2, 2, 4], %3:f8e4m3fn[2, 2, 2] .
-                let %4:f32[2, 2, 2] = scaled_dot [block_size=2, accumulation_type=f32] %0 %1 %2 %3
-                in (%4)
+                scaled_dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    preferred_element_type=f32,
+                    lhs_scale=true,
+                    rhs_scale=true,
+                ]
             "}
             .trim_end(),
         );
     }
 
     #[test]
-    fn test_scaled_dot_rank_3() {
-        // The rank-3 form carries one leading batch dimension shared by all four operands. Stacking the rank-2
-        // fixture from `test_scaled_dot` twice must reproduce its exact result per batch item.
-        let element_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(4)]),
-        );
-        let scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-        );
-        let item_lhs = vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5];
-        let item_lhs_scales = vec![0.5, 2.0, 1.0, 0.5];
-        let item_rhs = vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0];
-        let item_rhs_scales = vec![2.0, 0.5, 1.0, 2.0];
-        let stack = |item: &[f64]| item.iter().chain(item.iter()).copied().collect::<Vec<_>>();
-        let lhs = Array::from_f64s(element_type.clone(), stack(&item_lhs));
-        let lhs_scales = Array::from_f64s(scale_type.clone(), stack(&item_lhs_scales));
-        let rhs = Array::from_f64s(element_type.clone(), stack(&item_rhs));
-        let rhs_scales = Array::from_f64s(scale_type.clone(), stack(&item_rhs_scales));
-        let product = lhs.scaled_dot(&lhs_scales, &rhs, &rhs_scales, 2, DataType::F32).unwrap();
+    fn test_scaled_dot_inference() {
+        let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
+        let operation = ScaledDotOperation::new(dimensions, DataType::BF16, true, true);
+        let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 3.into(), 4.into(), 6.into()]));
+        let rhs = ArrayType::new(DataType::F8E5M2, Shape::new(vec![2.into(), 4.into(), 6.into(), 5.into()]));
+        let lhs_scale = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 3.into(), 2.into(), 2.into()]));
+        let rhs_scale = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 2.into(), 2.into(), 5.into()]));
         assert_eq!(
-            product.r#type().as_ref(),
-            &ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)])
-            ),
+            operation.infer_output_types(&[lhs.clone(), rhs.clone(), lhs_scale.clone(), rhs_scale.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::BF16, Shape::new(vec![2.into(), 3.into(), 5.into()]))]),
         );
-        assert_eq!(product.to_f64s(), vec![6.75, 11.25, 10.375, 7.0, 6.75, 11.25, 10.375, 7.0]);
-
-        // Type inference accepts the rank-3 form and rejects mixed ranks and mismatched batch dimensions.
-        let operation = ScaledDotOperation::new(2, DataType::F32);
+        assert_eq!(
+            ScaledDotOperation::new(operation.dimensions().clone(), DataType::F64, true, true)
+                .infer_output_types(&[lhs.clone(), rhs.clone(), lhs_scale.clone(), rhs_scale.clone()], &[]),
+            Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into(), 5.into()]))]),
+        );
         assert_eq!(
             operation.infer_output_types(
-                &[element_type.clone(), scale_type.clone(), element_type.clone(), scale_type.clone()],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-            )]),
-        );
-        let rank_2_element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        assert_eq!(
-            operation.infer_output_types(
-                &[element_type.clone(), scale_type.clone(), rank_2_element_type, scale_type.clone()],
+                &[
+                    lhs,
+                    rhs,
+                    lhs_scale.with_shape(Shape::new(vec![2.into(), 3.into(), 4.into(), 2.into()])),
+                    ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![2.into(), 2.into(), 2.into(), 5.into()]),),
+                ],
                 &[],
             ),
             Err(TypeError::invalid(
-                "'scaled_dot' operands must share one rank, but got rank 3 for the left operand and rank 2 \
-                          for the right operand"
-                    .to_string()
+                "'scaled_dot' left contracting axis 2 to scale ratio must be at least 2 but got 1".to_string(),
             )),
-        );
-        let mismatched_batch_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Static(3), Dimension::Static(2), Dimension::Static(4)]),
-        );
-        assert_eq!(
-            operation.infer_output_types(&[element_type, scale_type.clone(), mismatched_batch_type, scale_type], &[],),
-            Err(TypeError::invalid("'scaled_dot' batch dimension sizes do not match: 2 versus 3".to_string())),
         );
     }
 
     #[test]
-    fn test_scaled_dot_global_scale() {
-        // The optional fifth operand is a scalar at the accumulation type that is multiplied into the result, so
-        // the `test_scaled_dot` fixture with a global scale of 2 exactly doubles.
-        let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let lhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
-        let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
-        let rhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
-        let rhs_scales = Array::from_f64s(scale_type.clone(), vec![2.0, 0.5, 1.0, 2.0]);
-        let global_scale = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0]);
-        let product = lhs
-            .scaled_dot_with_global_scale(&lhs_scales, &rhs, &rhs_scales, &global_scale, 2, DataType::F32)
+    fn test_scaled_dot_composition_supports_multiple_contracting_dimensions() {
+        // Both contracting axes carry independent block ratios. Expanding all scale axes in one broadcast preserves
+        // their original axis positions before the final reshape; every dequantized element is one in this fixture.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into(), 6.into()])),
+            vec![1.0; 48],
+        );
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 4.into(), 6.into(), 3.into()])),
+            vec![1.0; 72],
+        );
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 2.into()])),
+            vec![1.0; 8],
+        );
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into(), 3.into()])),
+            vec![1.0; 12],
+        );
+        let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
+        let output = lhs
+            .scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
             .unwrap();
-        assert_eq!(product.to_f64s(), vec![13.5, 22.5, 20.75, 14.0]);
+        assert_eq!(output.r#type().shape(), &Shape::new(vec![1.into(), 2.into(), 3.into()]));
+        assert_eq!(output.to_f64s(), vec![24.0; 6]);
 
-        // Type inference validates the fifth operand: it must be a static scalar at the accumulation type.
-        let operation = ScaledDotOperation::new(2, DataType::F32);
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    element_type.clone(),
-                    scale_type.clone(),
-                    element_type.clone(),
-                    scale_type.clone(),
-                    ArrayType::scalar(DataType::F32),
-                ],
-                &[],
-            ),
-            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))]),
+        // The ergonomic wrapper follows JAX's `[B, M, K] x [B, N, K]` convention and defaults to an `f32` result.
+        let lhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 4.into()])),
+            vec![1.0; 4],
         );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    element_type.clone(),
-                    scale_type.clone(),
-                    element_type.clone(),
-                    scale_type.clone(),
-                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])),
-                ],
-                &[],
-            ),
-            Err(TypeError::invalid("'scaled_dot' global scale must be a static scalar but got shape [2]".to_string())),
+        let rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 4.into()])),
+            vec![1.0; 8],
         );
-        assert_eq!(
-            operation.infer_output_types(
-                &[
-                    element_type.clone(),
-                    scale_type.clone(),
-                    element_type.clone(),
-                    scale_type.clone(),
-                    ArrayType::scalar(DataType::F64),
-                ],
-                &[],
-            ),
-            Err(TypeError::invalid(
-                "'scaled_dot' global scale data type f64 must match the accumulation type f32".to_string()
-            )),
+        let lhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 1.into(), 2.into()])),
+            vec![1.0; 2],
         );
-        assert_eq!(
-            operation.infer_output_types(&[element_type, scale_type.clone(), scale_type], &[]),
-            Err(TypeError::invalid(
-                "'scaled_dot' expects 4 inputs plus an optional scalar global scale, but got 3".to_string()
-            )),
+        let rhs_scale = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 2.into()])),
+            vec![1.0; 4],
         );
+        let output = lhs.scaled_matmul(&rhs, &lhs_scale, &rhs_scale, None).unwrap();
+        assert_eq!(output.r#type().data_type(), DataType::F32);
+        assert_eq!(output.r#type().shape(), &Shape::new(vec![1.into(), 1.into(), 2.into()]));
+        assert_eq!(output.to_f64s(), vec![4.0; 2]);
+
+        // Ryft honors the wrapper's documented independent block-ratio semantics even though pinned JAX's wrapper
+        // currently rejects unequal scale contracting dimensions before reaching `lax.scaled_dot`.
+        let independently_scaled_rhs = Array::from_f64s(
+            ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 2.into(), 1.into()])),
+            vec![1.0; 2],
+        );
+        let output = lhs.scaled_matmul(&rhs, &lhs_scale, &independently_scaled_rhs, None).unwrap();
+        assert_eq!(output.to_f64s(), vec![4.0; 2]);
     }
 
     #[test]
     fn test_scaled_dot_batching() {
-        use crate::batching::BatchingContext;
-        use crate::programs::EmptyRegionDriver;
+        // Batching moves each mapped axis to the front and lifts it into the generalized-dot batch dimensions. Scale
+        // operands follow the same rule, so each example retains its own block scales.
+        let elements = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 4.into()]));
+        let scales = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into()]));
+        let lhs = ArrayBatch::new(Array::from_f64s(elements.clone(), vec![1.0; 8]), BatchAxis::new(0)).unwrap();
+        let rhs = ArrayBatch::new(Array::from_f64s(elements, vec![1.0; 8]), BatchAxis::new(0)).unwrap();
+        let lhs_scale = ArrayBatch::new(Array::from_f64s(scales.clone(), vec![1.0; 4]), BatchAxis::new(0)).unwrap();
+        let rhs_scale = ArrayBatch::new(Array::from_f64s(scales, vec![1.0; 4]), BatchAxis::new(0)).unwrap();
+        let operation = ScaledDotOperation::new(DotDimensionNumbers::inner_product(), DataType::F32, true, true);
 
-        // Two batch items built from the `test_scaled_dot` NVFP4 fixture: item 0 is the fixture itself and item 1
-        // swaps its operand sides, so the per-item expectations come from unbatched `scaled_dot` calls.
-        let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let item_lhs = [1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5];
-        let item_lhs_scales = [0.5, 2.0, 1.0, 0.5];
-        let item_rhs = [1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0];
-        let item_rhs_scales = [2.0, 0.5, 1.0, 2.0];
-        let element = |values: &[f64]| Array::from_f64s(element_type.clone(), values.to_vec());
-        let scales = |values: &[f64]| Array::from_f64s(scale_type.clone(), values.to_vec());
-        let expected_item_0 = element(&item_lhs)
-            .scaled_dot(&scales(&item_lhs_scales), &element(&item_rhs), &scales(&item_rhs_scales), 2, DataType::F32)
-            .unwrap();
-        let expected_item_1 = element(&item_rhs)
-            .scaled_dot(&scales(&item_rhs_scales), &element(&item_lhs), &scales(&item_lhs_scales), 2, DataType::F32)
-            .unwrap();
-        let expected: Vec<f64> = expected_item_0.to_f64s().into_iter().chain(expected_item_1.to_f64s()).collect();
-
-        let stacked_element_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(4)]),
-        );
-        let stacked_scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-        );
-        let stack = |element_values: bool, first: &[f64], second: &[f64]| {
-            let values = first.iter().chain(second.iter()).copied().collect::<Vec<_>>();
-            let r#type = if element_values { stacked_element_type.clone() } else { stacked_scale_type.clone() };
-            let value = Array::from_f64s(r#type, values);
-            ArrayBatch::new(value, Some(0)).unwrap()
-        };
-        let operation = ScaledDotOperation::new(2, DataType::F32);
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-
-        // All four operands mapped at axis 0: the lifted operation is the rank-3 form and the output is mapped.
         let outputs = operation
             .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    stack(true, &item_lhs, &item_rhs),
-                    stack(false, &item_lhs_scales, &item_rhs_scales),
-                    stack(true, &item_rhs, &item_lhs),
-                    stack(false, &item_rhs_scales, &item_lhs_scales),
-                ],
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &crate::EmptyRegionDriver,
+                &[lhs, rhs, lhs_scale, rhs_scale],
             )
             .unwrap()
             .into_parts()
             .0;
+
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), expected);
-
-        // Mixed mapped/replicated operands: the replicated right-hand pair is broadcast into per-item copies, so
-        // every batch item multiplies against the same right-hand side.
-        let replicated = |value: Array| ArrayBatch::new(value, BatchAxis::replicated());
-        let outputs = operation
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    stack(true, &item_lhs, &item_rhs),
-                    stack(false, &item_lhs_scales, &item_rhs_scales),
-                    replicated(element(&item_rhs)).unwrap(),
-                    replicated(scales(&item_rhs_scales)).unwrap(),
-                ],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        let expected_item_1_shared_rhs = element(&item_rhs)
-            .scaled_dot(&scales(&item_rhs_scales), &element(&item_rhs), &scales(&item_rhs_scales), 2, DataType::F32)
-            .unwrap();
-        let expected_shared_rhs: Vec<f64> =
-            expected_item_0.to_f64s().into_iter().chain(expected_item_1_shared_rhs.to_f64s()).collect();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), expected_shared_rhs);
-
-        // A replicated global scale stays on the lifted operation as its scalar fifth operand.
-        let outputs = operation
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    stack(true, &item_lhs, &item_rhs),
-                    stack(false, &item_lhs_scales, &item_rhs_scales),
-                    stack(true, &item_rhs, &item_lhs),
-                    stack(false, &item_rhs_scales, &item_lhs_scales),
-                    replicated(Array::from_f64s(ArrayType::scalar(DataType::F32), vec![2.0])).unwrap(),
-                ],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), expected.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-
-        // A mapped global scale is multiplied into the result per batch item instead of riding the lifted
-        // operation's scalar operand.
-        let mapped_global_scales =
-            Array::from_f64s(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])), vec![2.0, 0.5]);
-        let outputs = operation
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    stack(true, &item_lhs, &item_rhs),
-                    stack(false, &item_lhs_scales, &item_rhs_scales),
-                    stack(true, &item_rhs, &item_lhs),
-                    stack(false, &item_rhs_scales, &item_lhs_scales),
-                    ArrayBatch::new(mapped_global_scales, Some(0)).unwrap(),
-                ],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        let expected_per_item_scales: Vec<f64> = expected_item_0
-            .to_f64s()
-            .into_iter()
-            .map(|value| value * 2.0)
-            .chain(expected_item_1.to_f64s().into_iter().map(|value| value * 0.5))
-            .collect();
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().to_f64s(), expected_per_item_scales);
-
-        // The rank-3 form has no rank-4 analogue: batching an already-batched operation is rejected.
-        let stacked_rank_3 = |values: &[f64], r#type: &ArrayType| {
-            let dimensions: Vec<Dimension> =
-                std::iter::once(Dimension::Static(2)).chain(r#type.shape().dimensions().iter().cloned()).collect();
-            let value = Array::from_f64s(
-                ArrayType::new(r#type.data_type(), Shape::new(dimensions)),
-                values.iter().chain(values.iter()).copied().collect(),
-            );
-            ArrayBatch::new(value, Some(0)).unwrap()
-        };
-        let rank_3_element_type = ArrayType::new(
-            DataType::F4E2M1FN,
-            Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(4)]),
-        );
-        let rank_3_scale_type = ArrayType::new(
-            DataType::F8E4M3FN,
-            Shape::new(vec![Dimension::Static(1), Dimension::Static(2), Dimension::Static(2)]),
-        );
-        let error = operation
-            .batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    stacked_rank_3(&item_lhs, &rank_3_element_type),
-                    stacked_rank_3(&item_lhs_scales, &rank_3_scale_type),
-                    stacked_rank_3(&item_rhs, &rank_3_element_type),
-                    stacked_rank_3(&item_rhs_scales, &rank_3_scale_type),
-                ],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "'scaled_dot' has no rank-4 block-scaled form, so a batched rank-3 operation cannot be batched again; \
-             batch an explicit dequantization composition instead",
-        );
-    }
-
-    #[test]
-    fn test_scaled_dot_differentiation() {
-        // Forward mode: `scaled_dot` is linear in each element operand with the scales held fixed, so the tangent
-        // is the sum of two `scaled_dot`s reusing the primal scales, and the (nonzero) scale tangents supplied
-        // below are ignored by design (straight-through with respect to the elements). Every value is exactly
-        // representable in its storage format, so the `f32` results are exact.
-        let element_type =
-            ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]));
-        let scale_type =
-            ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-        let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let inputs = vec![
-            builder.add_input(element_type.clone()),
-            builder.add_input(scale_type.clone()),
-            builder.add_input(element_type.clone()),
-            builder.add_input(scale_type.clone()),
-        ];
-        let output = builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![output],
-                vec![crate::parameters::Placeholder; 4],
-                vec![crate::parameters::Placeholder],
-            )
-            .unwrap();
-        let jvp = program.jvp().unwrap();
-        assert_eq!(
-            jvp.to_string(),
-            indoc! {"
-                lambda %0:f4e2m1fn[2, 4], %1:f8e4m3fn[2, 2], %2:f4e2m1fn[2, 4], %3:f8e4m3fn[2, 2], %4:f4e2m1fn[2, 4], %5:f8e4m3fn[2, 2], %6:f4e2m1fn[2, 4], %7:f8e4m3fn[2, 2] .
-                let %8:f32[2, 2] = scaled_dot [block_size=2, accumulation_type=f32] %0 %1 %2 %3
-                    %9:f32[2, 2] = scaled_dot [block_size=2, accumulation_type=f32] %4 %1 %2 %3
-                    %10:f32[2, 2] = scaled_dot [block_size=2, accumulation_type=f32] %0 %1 %6 %3
-                    %11:f32[2, 2] = add %9 %10
-                in (%8, %11)
-            "}
-            .trim_end(),
-        );
-        let lhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
-        let lhs_scales = Array::from_f64s(scale_type.clone(), vec![0.5, 2.0, 1.0, 0.5]);
-        let rhs = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
-        let rhs_scales = Array::from_f64s(scale_type.clone(), vec![2.0, 0.5, 1.0, 2.0]);
-        let lhs_tangent = Array::from_f64s(element_type.clone(), vec![1.0; 8]);
-        let rhs_tangent = Array::from_f64s(element_type.clone(), vec![0.5; 8]);
-        let scale_tangent = Array::from_f64s(scale_type.clone(), vec![1.0; 4]);
-        let jvp_outputs = jvp
-            .interpret(vec![
-                lhs,
-                lhs_scales.clone(),
-                rhs,
-                rhs_scales.clone(),
-                lhs_tangent,
-                scale_tangent.clone(),
-                rhs_tangent,
-                scale_tangent,
-            ])
-            .unwrap();
-        assert_eq!(jvp_outputs[0].to_f64s(), vec![6.75, 11.25, 10.375, 7.0]);
-        // Tangent = scaled_dot(d_lhs, rhs) + scaled_dot(lhs, d_rhs) with the primal scales held fixed.
-        assert_eq!(jvp_outputs[1].to_f64s(), vec![7.0, 17.5, 10.6875, 7.75]);
-
-        // Transposition stages the dequantization-composition adjoint of the known element operand and converts
-        // the accumulation-typed contraction back to the linear operand's element type. Unit scales keep the
-        // dequantized operands on the `f4e2m1fn` grid, so with an identity output cotangent the linear LHS adjoint
-        // is exactly the dequantized RHS and the linear RHS adjoint is exactly the dequantized LHS.
-        let unit_scales = Array::from_f64s(scale_type.clone(), vec![1.0; 4]);
-        let lhs_values = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.5, 3.0, 1.0, 2.0, 0.5]);
-        let rhs_values = Array::from_f64s(element_type.clone(), vec![1.0, 2.0, 0.5, 1.0, 0.5, 1.0, 2.0, 1.0]);
-        let identity_cotangent = Array::from_f64s(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-            vec![1.0, 0.0, 0.0, 1.0],
-        );
-        check_operation_transposition!(
-            @exact,
-            operation = ScaledDotOperation::new(2, DataType::F32),
-            cases = [
-                {
-                    inputs = [
-                        (@linear(type = element_type.clone())),
-                        (@known, unit_scales.clone()),
-                        (@known, rhs_values.clone()),
-                        (@known, unit_scales.clone()),
-                    ],
-                    output_cotangents = [identity_cotangent.clone()],
-                    input_cotangents = [rhs_values.clone()],
-                },
-                {
-                    inputs = [
-                        (@known, lhs_values.clone()),
-                        (@known, unit_scales.clone()),
-                        (@linear(type = element_type.clone())),
-                        (@known, unit_scales.clone()),
-                    ],
-                    output_cotangents = [identity_cotangent],
-                    input_cotangents = [lhs_values],
-                },
-            ],
-        );
-
-        // Transposing with respect to a scale operand is rejected: the scales are held fixed under differentiation.
-        let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let inputs = vec![
-            builder.add_input(element_type.clone()),
-            builder.add_input(scale_type.clone()),
-            builder.add_input(element_type),
-            builder.add_input(scale_type),
-        ];
-        let output = builder.add_instruction(ScaledDotOperation::new(2, DataType::F32), Vec::new(), inputs).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(
-                vec![output],
-                vec![crate::parameters::Placeholder; 4],
-                vec![crate::parameters::Placeholder],
-            )
-            .unwrap();
-        assert!(matches!(
-            program.transpose_with_respect_to(&[1]),
-            Err(error) if error.to_string().contains("'scaled_dot' scales are held fixed under differentiation"),
-        ));
+        assert_eq!(outputs[0].value().to_f64s(), vec![4.0, 4.0]);
     }
 
     #[test]

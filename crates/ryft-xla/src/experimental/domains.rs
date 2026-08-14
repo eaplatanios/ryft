@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use prost::Message;
 use ryft_core::macros::check_count;
-use ryft_core::operations::attention::AttentionMask;
 use ryft_core::operations::sort::SortDirection;
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BatchingError,
@@ -2513,7 +2512,7 @@ impl<'c> XlaDomain<'c> {
             use_shardy_partitioner,
             options.feedback_directed_profile.as_ref(),
         );
-        // The target platform gates platform-specific lowerings (e.g., the block-scaled dot fast path); a failed
+        // The target platform gates platform-specific lowerings such as fused attention; a failed
         // platform query degrades to the portable lowerings instead of failing compilation.
         let target_platform =
             self.client.and_then(|client| client.platform_name().ok()).map(|platform| platform.into_owned());
@@ -3279,41 +3278,6 @@ fn references_data_derived_dimension(r#type: &ArrayIrType, variables: &HashSet<D
     r#type.identities().any(|(_, identity)| variables.contains(identity))
 }
 
-/// Validates the configuration-specific bounded-dynamic attention contract proven by the CPU and CUDA execution
-/// fixtures. The physical kernels receive explicit sequence lengths, batch and sequence dimensions may be bounded
-/// dynamic, and the head geometry remains static.
-fn validate_data_dependent_attention(
-    operation: &XlaOperation,
-    input_types: &[ArrayIrType],
-) -> Result<(), &'static str> {
-    let (mask, dropout, sliding_window, expected_input_count) = match operation {
-        XlaOperation::Array(ArrayOperation::DotProductAttention(operation)) => {
-            (operation.mask(), operation.dropout(), operation.sliding_window(), 5)
-        }
-        XlaOperation::Array(ArrayOperation::DotProductAttentionBackward(operation)) => {
-            (operation.mask(), operation.dropout(), operation.sliding_window(), 8)
-        }
-        _ => return Ok(()),
-    };
-    if input_types.len() != expected_input_count {
-        return Err("bounded-dynamic attention requires no bias and explicit query and key/value sequence lengths");
-    }
-    if dropout.is_some() || sliding_window.is_some() {
-        return Err("bounded-dynamic attention does not yet support dropout or a sliding window");
-    }
-    if mask != AttentionMask::None {
-        return Err("bounded-dynamic attention currently supports only the explicit sequence-length mask");
-    }
-    let query = <&ArrayType>::try_from(&input_types[0])
-        .map_err(|_| "bounded-dynamic attention requires array query, key, and value operands")?;
-    let key = <&ArrayType>::try_from(&input_types[1])
-        .map_err(|_| "bounded-dynamic attention requires array query, key, and value operands")?;
-    if query.dimension(2).value().is_none() || query.dimension(2) != key.dimension(2) {
-        return Err("bounded-dynamic attention currently requires one shared static query/key-value head count");
-    }
-    Ok(())
-}
-
 /// Validates the bounded-dynamic compilation contract for dimensions produced by `dimension_from_scalar`.
 ///
 /// `XlaMasked` and `XlaZeroPadded` are explicit delegation decisions: the bounded-dynamic XLA legalizer owns those
@@ -3373,18 +3337,9 @@ fn validate_data_dependent_compilation(program: &FlatXlaProgram) -> Result<(), X
                 references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
             });
             if consumes_data_derived_extent {
-                let reason = match data_dependent_padding_discipline(instruction.operation()) {
-                    DataDependentPaddingDiscipline::Unsupported { reason } => Some(reason),
-                    _ => {
-                        let input_types = instruction
-                            .inputs()
-                            .iter()
-                            .map(|input| region.atoms()[input.index()].r#type().into_owned())
-                            .collect::<Vec<_>>();
-                        validate_data_dependent_attention(instruction.operation(), input_types.as_slice()).err()
-                    }
-                };
-                if let Some(reason) = reason {
+                if let DataDependentPaddingDiscipline::Unsupported { reason } =
+                    data_dependent_padding_discipline(instruction.operation())
+                {
                     return Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
@@ -4087,7 +4042,10 @@ fn execute_pjrt_buffers<'c>(
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
+    use ryft_core::operations::attention::{
+        AttentionConfiguration, AttentionImplementation, AttentionOperandSignature,
+        DotProductAttentionBackwardOperation, DotProductAttentionOperation,
+    };
     use ryft_core::operations::custom_call::CustomCallOperation;
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
@@ -4110,6 +4068,48 @@ mod tests {
     use crate::tests::{values_from_bytes, values_to_bytes};
 
     use super::*;
+
+    fn attention_operation(
+        scale: f64,
+        causal: bool,
+        residual: bool,
+        dropout: Option<(f64, u64)>,
+        signature: AttentionOperandSignature,
+    ) -> DotProductAttentionOperation {
+        DotProductAttentionOperation::new(
+            AttentionConfiguration::new()
+                .with_scale(scale)
+                .with_causal(causal)
+                .with_residual(residual)
+                .with_dropout(dropout)
+                .with_implementation(if dropout.is_some() {
+                    AttentionImplementation::Fused
+                } else {
+                    AttentionImplementation::Automatic
+                }),
+            signature,
+        )
+    }
+
+    fn attention_backward_operation(
+        scale: f64,
+        causal: bool,
+        dropout: Option<(f64, u64)>,
+        signature: AttentionOperandSignature,
+    ) -> DotProductAttentionBackwardOperation {
+        DotProductAttentionBackwardOperation::new(
+            AttentionConfiguration::new()
+                .with_scale(scale)
+                .with_causal(causal)
+                .with_dropout(dropout)
+                .with_implementation(if dropout.is_some() {
+                    AttentionImplementation::Fused
+                } else {
+                    AttentionImplementation::Automatic
+                }),
+            signature,
+        )
+    }
 
     fn domain_mesh(client: &Client<'_>, axis: &str, axis_size: usize) -> DeviceMesh {
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new(axis, axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -4416,9 +4416,14 @@ mod tests {
             builder.add_instruction(OneOperation::new(scaled_rhs_scale_type), Vec::new(), Vec::new()).unwrap()[0];
         let scaled_dot = builder
             .add_instruction(
-                ScaledDotOperation::new(scaled_block_size, DataType::F32),
+                ScaledDotOperation::new(
+                    DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+                    DataType::F32,
+                    true,
+                    true,
+                ),
                 Vec::new(),
-                vec![scaled_lhs, scaled_lhs_scales, scaled_rhs, scaled_rhs_scales],
+                vec![scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
             )
             .unwrap()[0];
 
@@ -4455,7 +4460,7 @@ mod tests {
             .unwrap()[0];
         let forward = builder
             .add_instruction(
-                DotProductAttentionOperation::new(1.0, AttentionMask::None).with_activation_output(),
+                attention_operation(1.0, false, true, None, AttentionOperandSignature::new(false, false, true, true)),
                 Vec::new(),
                 vec![query, key, value, lengths, lengths],
             )
@@ -4463,9 +4468,14 @@ mod tests {
             .to_vec();
         let backward = builder
             .add_instruction(
-                DotProductAttentionBackwardOperation::new(1.0, AttentionMask::None),
+                attention_backward_operation(
+                    1.0,
+                    false,
+                    None,
+                    AttentionOperandSignature::new(false, false, true, true),
+                ),
                 Vec::new(),
-                vec![query, key, value, forward[0], forward[1], output_cotangent, lengths, lengths],
+                vec![query, key, value, lengths, lengths, forward[0], forward[1], output_cotangent],
             )
             .unwrap()
             .to_vec();
@@ -6128,81 +6138,30 @@ mod tests {
 
         assert_eq!(
             array_data_dependent_padding_discipline(&ArrayOperation::ScaledDot(ScaledDotOperation::new(
-                16,
+                DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
                 DataType::F32,
+                true,
+                true,
             ))),
             RyftMasked,
         );
         for operation in [
-            ArrayOperation::DotProductAttention(DotProductAttentionOperation::new(1.0, AttentionMask::None)),
-            ArrayOperation::DotProductAttentionBackward(DotProductAttentionBackwardOperation::new(
+            ArrayOperation::DotProductAttention(attention_operation(
                 1.0,
-                AttentionMask::None,
+                false,
+                false,
+                None,
+                AttentionOperandSignature::default(),
+            )),
+            ArrayOperation::DotProductAttentionBackward(attention_backward_operation(
+                1.0,
+                false,
+                None,
+                AttentionOperandSignature::default(),
             )),
         ] {
             assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
         }
-
-        let sequence = DimensionVariable::new("sequence", DimensionBounds::new(1, Some(5)).unwrap());
-        let operand_type = ArrayType::new(
-            DataType::BF16,
-            Shape::new(vec![
-                Dimension::Static(1),
-                Dimension::Dynamic(sequence),
-                Dimension::Static(1),
-                Dimension::Static(8),
-            ]),
-        );
-        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(1)]));
-        let operation = XlaOperation::Array(ArrayOperation::DotProductAttention(DotProductAttentionOperation::new(
-            1.0,
-            AttentionMask::None,
-        )));
-        let supported_input_types = vec![
-            operand_type.clone().into(),
-            operand_type.clone().into(),
-            operand_type.clone().into(),
-            lengths_type.clone().into(),
-            lengths_type.clone().into(),
-        ];
-        assert_eq!(validate_data_dependent_attention(&operation, supported_input_types.as_slice()), Ok(()),);
-        assert_eq!(
-            validate_data_dependent_attention(
-                &operation,
-                &[operand_type.clone().into(), operand_type.clone().into(), operand_type.clone().into(),],
-            ),
-            Err("bounded-dynamic attention requires no bias and explicit query and key/value sequence lengths"),
-        );
-        let causal = XlaOperation::Array(ArrayOperation::DotProductAttention(DotProductAttentionOperation::new(
-            1.0,
-            AttentionMask::Causal,
-        )));
-        assert_eq!(
-            validate_data_dependent_attention(&causal, supported_input_types.as_slice()),
-            Err("bounded-dynamic attention currently supports only the explicit sequence-length mask"),
-        );
-        let dropout = XlaOperation::Array(ArrayOperation::DotProductAttention(
-            DotProductAttentionOperation::new(1.0, AttentionMask::None).with_dropout((0.5, 42)),
-        ));
-        assert_eq!(
-            validate_data_dependent_attention(&dropout, supported_input_types.as_slice()),
-            Err("bounded-dynamic attention does not yet support dropout or a sliding window"),
-        );
-        let grouped_query = ArrayType::new(
-            DataType::BF16,
-            Shape::new(vec![
-                Dimension::Static(1),
-                operand_type.dimension(1).clone(),
-                Dimension::Static(2),
-                Dimension::Static(8),
-            ]),
-        );
-        let mut grouped_input_types = supported_input_types;
-        grouped_input_types[0] = grouped_query.into();
-        assert_eq!(
-            validate_data_dependent_attention(&operation, grouped_input_types.as_slice()),
-            Err("bounded-dynamic attention currently requires one shared static query/key-value head count"),
-        );
     }
 
     #[test]
@@ -6297,7 +6256,7 @@ mod tests {
         let program =
             data_derived_scaled_dot_attention_fixture(size_type.clone(), extent, DataType::F32, DataType::F32);
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-        assert!(!lowered.stable_hlo().contains("__op$block_scaled_dot"));
+        assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
         assert!(!lowered.stable_hlo().contains("__cudnn$fmha"));
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let execute = |size: i64| {
@@ -6366,11 +6325,21 @@ mod tests {
         assert_eq!(read_bf16s(&client, &at_bound[2]), vec![0.0; 128]);
         assert_eq!(
             read_bf16s(&client, &at_bound[3]),
-            [-8.0, 0.0, 8.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            [-7.78125, 0.0, 7.78125, 0.0]
+                .into_iter()
+                .cycle()
+                .take(16)
+                .flat_map(|value| [value; 8])
+                .collect::<Vec<_>>(),
         );
         assert_eq!(
             read_bf16s(&client, &at_bound[4]),
-            [1.0, 1.0, 1.0, 0.0].into_iter().cycle().take(16).flat_map(|value| [value; 8]).collect::<Vec<_>>(),
+            [0.97265625, 0.97265625, 0.97265625, 0.0]
+                .into_iter()
+                .cycle()
+                .take(16)
+                .flat_map(|value| [value; 8])
+                .collect::<Vec<_>>(),
         );
 
         let zero = Array::from_host_buffer(&client, size_type, mesh, 0_i64.to_ne_bytes().as_slice()).unwrap();
@@ -6464,7 +6433,7 @@ mod tests {
                 scaled_scale_type,
             );
             let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
-            assert!(lowered.stable_hlo().contains("__op$block_scaled_dot"));
+            assert!(lowered.stable_hlo().contains("stablehlo.composite \"xla.scaled_dot\""));
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
             assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmaxBackward"));
             let compiled = domain.compile_xla_program(&lowered).unwrap();

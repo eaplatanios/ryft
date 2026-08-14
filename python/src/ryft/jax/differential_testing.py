@@ -2,9 +2,9 @@
 
 The Rust side is emitted by `cargo run -p ryft-xla --features differential-testing --bin differential_testing`.
 The JAX side runs in a fresh Python process so that four host devices are configured before JAX is imported. Exact
-parity cases compare named values and a semantic projection of collective StableHLO. The bounded data-dependent case
-instead encodes an explicit capability relation: eager values agree, Ryft stages the bounded result, and pinned JAX
-rejects staging because the result extent depends on traced data.
+parity cases compare named values and declared semantic StableHLO contracts. The bounded data-dependent case instead
+encodes an explicit capability relation: eager values agree, Ryft stages the bounded result, and pinned JAX rejects
+staging because the result extent depends on traced data.
 
 This module intentionally does not import JAX at module load time.
 """
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 SCHEMA = "ryft-jax-differential-v1"
-PINNED_JAX_VERSION = "0.6.2"
+PINNED_JAX_VERSION = "0.10.0"
 BUILD_HINT = "cargo build -p ryft-xla --features differential-testing --bin differential_testing"
 SUBPROCESS_TIMEOUT_SECONDS = 1800
 
@@ -255,6 +255,7 @@ def compare_case(
     collectives: tuple[StableHloCollective, ...],
     ryft: DifferentialObservation,
     jax: DifferentialObservation,
+    stablehlo_patterns: tuple[str, ...] = (),
 ) -> CaseComparison:
     """Compares one Ryft/JAX record pair according to its declared capability relationship.
 
@@ -264,6 +265,7 @@ def compare_case(
       - `collectives`: Collective projection the registry entry expects from both frameworks.
       - `ryft`: Ryft-side observation.
       - `jax`: JAX-side observation.
+      - `stablehlo_patterns`: Semantic operation or attribute spellings that both StableHLO modules must contain.
     """
 
     differences = []
@@ -274,19 +276,24 @@ def compare_case(
     if relationship == "parity":
         if ryft.staging != jax.staging:
             differences.append(f"staging: ryft {ryft.staging!r} != jax {jax.staging!r}")
-        if not collectives:
-            differences.append("StableHLO collectives: exact-parity case must declare its expected projection")
+        if not collectives and not stablehlo_patterns:
+            differences.append("StableHLO: exact-parity case must declare a semantic contract")
         if ryft.stablehlo is None or jax.stablehlo is None:
             differences.append("StableHLO: exact-parity case requires modules from both frameworks")
         else:
-            differences.extend(
-                difference
-                for difference in (
-                    _compare_projection("ryft", ryft.stablehlo, collectives),
-                    _compare_projection("jax", jax.stablehlo, collectives),
+            if collectives:
+                differences.extend(
+                    difference
+                    for difference in (
+                        _compare_projection("ryft", ryft.stablehlo, collectives),
+                        _compare_projection("jax", jax.stablehlo, collectives),
+                    )
+                    if difference is not None
                 )
-                if difference is not None
-            )
+            for side, module in (("Ryft", ryft.stablehlo), ("JAX", jax.stablehlo)):
+                missing = tuple(pattern for pattern in stablehlo_patterns if pattern not in module)
+                if missing:
+                    differences.append(f"StableHLO: {side} module is missing semantic patterns {missing!r}")
     elif relationship == "ryft_exceeds_jax":
         if ryft.staging != StagingObservation(status="supported", output_type="f32[count]"):
             differences.append(f"Ryft staging: expected bounded symbolic support but got {ryft.staging!r}")
@@ -401,7 +408,14 @@ def run_comparison(root: Path, case_ids: Sequence[str]) -> tuple[CaseComparison,
     if set(jax) != set(selected_ids):
         raise ValueError(f"JAX case set {sorted(jax)} does not match selected cases {sorted(selected_ids)}")
     return tuple(
-        compare_case(case.relationship, case.collectives, ryft[case.case_id], jax[case.case_id]) for case in cases
+        compare_case(
+            case.relationship,
+            case.collectives,
+            ryft[case.case_id],
+            jax[case.case_id],
+            case.stablehlo_patterns,
+        )
+        for case in cases
     )
 
 

@@ -17,8 +17,9 @@ use super::{
     lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dimension_requirement_to_assertion, lower_dynamic_shape_slice_assertion, lower_pad_to_mlir,
     lower_psum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
-    lower_sharding_constraint, lower_static_index_constants, lower_tensor_type, reshape_dimension_i32,
-    reshape_dimension_i64, stable_hlo_dynamic_dimension_bound, static_dimensions,
+    lower_sharding_constraint, lower_static_custom_call_input, lower_static_index_constants, lower_tensor_type,
+    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
+    static_dimensions,
 };
 
 /// Physical lowering plan for one axis of a first-class dynamic shape slice.
@@ -642,10 +643,10 @@ where
                     location,
                 )?)?;
                 broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()
-            } else if input_type.static_shape().is_some() {
-                // A statically shaped input can be broadcast to the finite physical upper-bound shape and then
-                // refined directly from the explicit extent operands. This avoids dynamic_broadcast_in_dim, which
-                // some XLA importers cannot legalize, without recovering geometry from array data.
+            } else if physical_bound_type(input_type).is_ok() && physical_bound_type(output_type).is_ok() {
+                // Finite bounded inputs can be materialized at their physical shape, broadcast statically, and then
+                // refined from the explicit result extents. This avoids `dynamic_broadcast_in_dim`, which the XLA
+                // importer cannot legalize when an intermediate shape includes a computed dynamic ratio.
                 let dynamic_extents = output_type
                     .shape()
                     .dimensions()
@@ -655,9 +656,10 @@ where
                     .collect::<Vec<_>>();
                 let (declared_type, physical_type) =
                     dynamic_constructor_types(operation.name(), dynamic_extents.len(), output_types)?;
+                let input = lower_static_custom_call_input(*input, input_type, 0.0, block, context, location)?;
                 let output_tensor_type = lower_tensor_type(&physical_type, context, location)?;
                 let broadcast = block.append_operation(stable_hlo::broadcast(
-                    *input,
+                    input,
                     output_tensor_type,
                     operation.output_axes(),
                     location,

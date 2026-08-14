@@ -2,7 +2,7 @@
 //!
 //! This binary is deliberately a test tool rather than library API. It executes a fixed case registry and writes one
 //! versioned JSON record per case. `python/scripts/compare_behavior_with_jax.py` builds matching JAX records and
-//! compares values, staging capabilities, and the semantic collective subset of each emitted StableHLO module.
+//! compares values, staging capabilities, and declared semantic contracts in each emitted StableHLO module.
 
 use std::collections::{BTreeMap, HashMap};
 use std::env;
@@ -10,15 +10,18 @@ use std::error::Error;
 
 use serde::Serialize;
 
+use ryft_core::operations::attention::{
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
+};
 use ryft_core::operations::collectives::{
     AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, PSumScatter, PSwapAxes, Pshuffle,
 };
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
     BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
-    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicShapeSliceOperation,
-    EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder, ProgramError, ReduceOperation,
-    ReductionKind, Shape, Sharding, ShardingDimension,
+    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
+    DynamicShapeSliceOperation, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder,
+    ProgramError, ReduceOperation, ReductionKind, ScaledDot, Shape, Sharding, ShardingDimension,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
@@ -52,7 +55,7 @@ struct DifferentialObservation {
     #[serde(skip_serializing_if = "Option::is_none")]
     staging: Option<StagingObservation>,
 
-    /// Raw StableHLO module. The Python harness compares only its semantic collective projection.
+    /// Raw StableHLO module interpreted through the semantic contract declared by the shared case registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     stablehlo: Option<String>,
 }
@@ -74,6 +77,8 @@ fn registry() -> Vec<DifferentialCase> {
         DifferentialCase { case_id: "pshuffle", emit: emit_pshuffle },
         DifferentialCase { case_id: "pswapaxes", emit: emit_pswapaxes },
         DifferentialCase { case_id: "data_dependent_prefix_take", emit: emit_data_dependent_prefix_take },
+        DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul },
+        DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention },
     ];
     for (index, case) in cases.iter().enumerate() {
         assert!(
@@ -430,6 +435,156 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
     })
 }
 
+/// Returns a dense array type with static dimensions.
+fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
+    ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
+}
+
+/// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
+fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let lhs = CpuArray::from_f64s(array_type(DataType::F32, &[2, 4]), (1..=8).map(f64::from).collect());
+    let rhs = CpuArray::from_f64s(array_type(DataType::F32, &[4, 3]), (1..=12).map(f64::from).collect());
+    let lhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[2, 2]), vec![1.0, 2.0, 0.5, 1.0]);
+    let rhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
+    let values = |value: CpuArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
+
+    let matmul_lhs = CpuArray::from_f64s(array_type(DataType::F32, &[1, 1, 4]), vec![1.0; 4]);
+    let matmul_rhs = CpuArray::from_f64s(array_type(DataType::F32, &[1, 2, 4]), vec![1.0; 8]);
+    let matmul_lhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[1, 1, 2]), vec![1.0; 2]);
+    let matmul_rhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[1, 2, 2]), vec![1.0; 4]);
+    let observations = BTreeMap::from([
+        (
+            "both_scales",
+            vec![values(lhs.scaled_dot(
+                &rhs,
+                Some(&lhs_scale),
+                Some(&rhs_scale),
+                Some(&dimensions),
+                Some(DataType::F32),
+            )?)],
+        ),
+        (
+            "lhs_scale",
+            vec![values(lhs.scaled_dot(&rhs, Some(&lhs_scale), None, Some(&dimensions), Some(DataType::F32))?)],
+        ),
+        (
+            "rhs_scale",
+            vec![values(lhs.scaled_dot(&rhs, None, Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))?)],
+        ),
+        ("unscaled", vec![values(lhs.scaled_dot(&rhs, None, None, Some(&dimensions), Some(DataType::F32))?)]),
+        (
+            "scaled_matmul",
+            vec![values(matmul_lhs.scaled_matmul(&matmul_rhs, &matmul_lhs_scale, &matmul_rhs_scale, None)?)],
+        ),
+    ]);
+    let traced: TracedXlaProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
+        {
+            let dimensions = dimensions.clone();
+            move |(lhs, rhs, lhs_scale, rhs_scale): (ShardMapTracer, ShardMapTracer, ShardMapTracer, ShardMapTracer)| {
+                lhs.scaled_dot(&rhs, Some(&lhs_scale), Some(&rhs_scale), Some(&dimensions), Some(DataType::F32))
+                    .unwrap()
+            }
+        },
+        (
+            array_type(DataType::F32, &[2, 4]),
+            array_type(DataType::F32, &[4, 3]),
+            array_type(DataType::F32, &[2, 2]),
+            array_type(DataType::F32, &[2, 3]),
+        ),
+    )?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "scaled_dot_and_matmul",
+        observations,
+        staging: None,
+        stablehlo: Some(traced.to_mlir_module("main")?),
+    })
+}
+
+/// Emits the portable rank-three MQA attention surface plus its semantic StableHLO composition.
+fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let query_type = array_type(DataType::F32, &[2, 2, 1]);
+    let key_value_type = array_type(DataType::F32, &[2, 1, 1]);
+    let bias_type = ArrayType::scalar(DataType::F32);
+    let mask_type = array_type(DataType::Boolean, &[2, 2]);
+    let lengths_type = array_type(DataType::I32, &[1]);
+    let configuration = AttentionConfiguration::new()
+        .with_scale(1.0)
+        .with_causal(true)
+        .with_local_window((1, 0))
+        .with_residual(true);
+    let inputs = AttentionInputs {
+        query: CpuArray::from_f64s(query_type.clone(), vec![0.0; 4]),
+        key: CpuArray::from_f64s(key_value_type.clone(), vec![0.0; 2]),
+        value: CpuArray::from_f64s(key_value_type.clone(), vec![3.0, 9.0]),
+        bias: Some(CpuArray::from_f64s(bias_type.clone(), vec![0.0])),
+        mask: Some(CpuArray::from_elements(mask_type.clone(), &[true, false, false, true])?),
+        query_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
+        key_value_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
+    };
+    let (output, residual) = CpuArray::dot_product_attention(inputs, configuration)?;
+    let values = |value: CpuArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
+    let gqa_query_type = array_type(DataType::F32, &[1, 2, 4, 1]);
+    let gqa_key_value_type = array_type(DataType::F32, &[1, 3, 2, 1]);
+    let (gqa_output, _) = CpuArray::dot_product_attention(
+        AttentionInputs {
+            query: CpuArray::from_f64s(gqa_query_type, vec![0.0; 8]),
+            key: CpuArray::from_f64s(gqa_key_value_type.clone(), vec![0.0; 6]),
+            value: CpuArray::from_f64s(gqa_key_value_type, vec![1.0, 10.0, 2.0, 20.0, 4.0, 40.0]),
+            bias: None,
+            mask: None,
+            query_sequence_lengths: None,
+            key_value_sequence_lengths: Some(CpuArray::from_elements(lengths_type.clone(), &[2_i32])?),
+        },
+        AttentionConfiguration::new()
+            .with_local_window((1, 1))
+            .with_implementation(AttentionImplementation::Portable),
+    )?;
+    let observations = BTreeMap::from([
+        ("output", values(output)),
+        ("residual", values(residual.expect("the configuration requests a residual"))),
+        ("rank_four_gqa", values(gqa_output)),
+    ]);
+    let traced: TracedXlaProgram<
+        (ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType, ArrayType),
+        (ArrayType, ArrayType),
+    > = trace(
+        move |(query, key, value, bias, mask, query_sequence_lengths, key_value_sequence_lengths): (
+            ShardMapTracer,
+            ShardMapTracer,
+            ShardMapTracer,
+            ShardMapTracer,
+            ShardMapTracer,
+            ShardMapTracer,
+            ShardMapTracer,
+        )| {
+            let (output, residual) = ShardMapTracer::dot_product_attention(
+                AttentionInputs {
+                    query,
+                    key,
+                    value,
+                    bias: Some(bias),
+                    mask: Some(mask),
+                    query_sequence_lengths: Some(query_sequence_lengths),
+                    key_value_sequence_lengths: Some(key_value_sequence_lengths),
+                },
+                configuration,
+            )
+            .unwrap();
+            (output, residual.expect("the configuration requests a residual"))
+        },
+        (query_type, key_value_type.clone(), key_value_type, bias_type, mask_type, lengths_type.clone(), lengths_type),
+    )?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "dot_product_attention",
+        observations,
+        staging: None,
+        stablehlo: Some(traced.to_mlir_module("main")?),
+    })
+}
+
 /// Parses selected case IDs, emits deterministic JSON records, and returns an error for an unknown case.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let cases = registry();
@@ -495,7 +650,14 @@ mod tests {
     fn test_registry() {
         assert_eq!(
             registry().into_iter().map(|case| case.case_id).collect::<Vec<_>>(),
-            vec!["grouped_shape_changing_collectives", "pshuffle", "pswapaxes", "data_dependent_prefix_take",],
+            vec![
+                "grouped_shape_changing_collectives",
+                "pshuffle",
+                "pswapaxes",
+                "data_dependent_prefix_take",
+                "scaled_dot_and_matmul",
+                "dot_product_attention",
+            ],
         );
     }
 

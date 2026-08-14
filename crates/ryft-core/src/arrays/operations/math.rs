@@ -28,8 +28,8 @@ use crate::operations::math::erf::erf_f64;
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
     Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, ScaledDot, Sign, Sin, Sqrt, Sub, Tanh,
-    scaled_dot_composition,
+    Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, ScaledDot, ScaledDotOperation, Sign,
+    Sin, Sqrt, Sub, Tanh, scaled_dot_composition,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
@@ -1790,25 +1790,24 @@ impl_array_binary_arithmetic!(@real Rem, rem, ElementRem, "remainder");
 impl ScaledDot for Array {
     fn scaled_dot(
         &self,
-        lhs_scales: &Self,
         rhs: &Self,
-        rhs_scales: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
+        lhs_scale: Option<&Self>,
+        rhs_scale: Option<&Self>,
+        dimensions: Option<&DotDimensionNumbers>,
+        preferred_element_type: Option<DataType>,
     ) -> Result<Self, ProgramError> {
-        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, None, block_size, accumulation_type)
-    }
-
-    fn scaled_dot_with_global_scale(
-        &self,
-        lhs_scales: &Self,
-        rhs: &Self,
-        rhs_scales: &Self,
-        global_scale: &Self,
-        block_size: usize,
-        accumulation_type: DataType,
-    ) -> Result<Self, ProgramError> {
-        scaled_dot_composition(self, lhs_scales, rhs, rhs_scales, Some(global_scale), block_size, accumulation_type)
+        let dimensions = dimensions
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| ScaledDotOperation::default_dimensions(self.r#type().rank()))?;
+        scaled_dot_composition(
+            self,
+            rhs,
+            lhs_scale,
+            rhs_scale,
+            &dimensions,
+            preferred_element_type.unwrap_or(DataType::BF16),
+        )
     }
 }
 

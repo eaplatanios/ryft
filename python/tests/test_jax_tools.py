@@ -67,7 +67,7 @@ class JaxToolsTest(unittest.TestCase):
     def test_load_expected_mlir_reads_current_reshape_expectations(self) -> None:
         expected_mlir = load_expected_mlir()
 
-        self.assertIn("test_trace_reshape_with_sharding_constraint_renders_stablehlo_and_shardy", expected_mlir)
+        self.assertIn("test_trace_reshape_and_reshard_render_stablehlo_and_shardy", expected_mlir)
         self.assertIn(
             "test_shard_map_reshape_renders_replicated_split_sharding_propagation",
             expected_mlir,
