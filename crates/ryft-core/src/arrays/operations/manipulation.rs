@@ -28,10 +28,10 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::manipulation::broadcasting::infer_explicit_broadcast_output_type;
 use crate::operations::{
-    Broadcast, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize, DynamicBroadcast,
-    DynamicBroadcastOperation, DynamicReshape, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation,
-    GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters, Scatter,
-    ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
+    Broadcast, CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, ConvertElementType, DimensionSize,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicSlice, DynamicUpdateSlice, Gather,
+    GatherOperation, GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters,
+    Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
 use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -408,7 +408,10 @@ impl Concatenate for Array {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(
-                TypeError::invalid("'concatenate' expects at least one operand but got none".to_string()).into()
+                TypeError::invalid(format!(
+                    "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none",
+                ))
+                .into()
             );
         };
         if inputs.len() == 1 {

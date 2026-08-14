@@ -61,9 +61,10 @@ impl Operation for SelectOperation<DataType> {
         check_count!("input", input_types, 3, TypeError);
         if !input_types[0].is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'select' condition data type {} is not {}",
+                "'{}' condition data type {} is not {}",
+                SELECT_OPERATION_NAME,
                 input_types[0],
-                DataType::Boolean
+                DataType::Boolean,
             )));
         }
 

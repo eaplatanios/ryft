@@ -7498,8 +7498,9 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "axis_index for axis '{axis_name}' cannot lower inside this shard_map manual region because the \
-                region does not bind that axis as a manual mesh axis",
+                "{AXIS_INDEX_OPERATION_NAME} for axis '{axis_name}' cannot lower inside this \
+                 {SHARD_MAP_OPERATION_NAME} manual region because the region does not bind that axis as a manual mesh \
+                 axis",
             ),
         }
         .into());

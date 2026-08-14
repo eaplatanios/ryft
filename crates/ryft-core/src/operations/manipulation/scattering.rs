@@ -517,7 +517,8 @@ where
         if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "transposition of scatter with the {} combiner is not yet implemented (only scatter-add is linear)",
+                    "transposition of {} with the {} combiner is not yet implemented (only scatter-add is linear)",
+                    SCATTER_OPERATION_NAME,
                     self.kind(),
                 ),
             }

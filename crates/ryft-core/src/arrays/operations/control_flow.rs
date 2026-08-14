@@ -20,7 +20,8 @@ use crate::contexts::EagerContext;
 use crate::interpretation::InterpretationDriver;
 use crate::macros::check_count;
 use crate::operations::control_flow::scan::{
-    ScanInterpretation, read_scan_iteration, stacked_scan_type, validate_scan_runtime_length, write_scan_iteration,
+    SCAN_OPERATION_NAME, ScanInterpretation, read_scan_iteration, stacked_scan_type, validate_scan_runtime_length,
+    write_scan_iteration,
 };
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
@@ -226,9 +227,12 @@ where
                             })
                             .ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "cannot eagerly allocate scan output {type} because its dynamic dimension \
-                                     {variable} is not supplied as a first-class scan input",
-                                    r#type = r#type,
+                                    "cannot eagerly allocate {} output {} because its dynamic dimension {} is not \
+                                     supplied as a first-class {} input",
+                                    SCAN_OPERATION_NAME,
+                                    r#type,
+                                    variable,
+                                    SCAN_OPERATION_NAME,
                                 ))
                             }),
                     })
