@@ -21,41 +21,41 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, Trace};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 
-/// Higher-order [`Operation`] pairing a primal program with a user-supplied Jacobian-Vector Product (JVP) program. This
-/// is the direct analogue of JAX's [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
+/// Higher-order [`Operation`] pairing a primal program with a user-supplied Jacobian-Vector Product (JVP) program.
+/// This is an analogue to JAX's [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
+/// The two [`Program`](crate::Program)s are supplied as the operation's attached regions (i.e., via the
+/// [`RegionDriver`](crate::RegionDriver) passed to [`Context::bind`]) in the region order `["primal", "jvp"]`, and
+/// [`Operation::infer_output_types`] validates the interface contract between them: the JVP region's inputs are the
+/// primal inputs followed by one tangent per _differentiated_ primal input, and its outputs are the primal outputs
+/// followed by one tangent per primal output. Keeping the primal program separate from the JVP program means that
+/// un-differentiated calls never pay for tangent computation.
 ///
-/// The two [`Program`](crate::Program)s are supplied as the operation's attached regions (via the region driver passed
-/// to [`Context::bind`]) in the region order `["primal", "jvp"]`, and [`Operation::infer_output_types`] validates the
-/// interface contract between them: the JVP region's inputs are the primal inputs followed by one tangent per
-/// *differentiated* primal input, and its outputs are the primal outputs followed by one tangent per primal output.
-/// Keeping the primal program separate from the JVP program means un-differentiated calls never pay for tangent
-/// computation.
+/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without
+/// being differentiated. Every attached region receives them in the same leading positions, but they contribute no
+/// tangent to the JVP region's input signature and receive no cotangent. Batching is its canonical producer as a
+/// batching policy that threads batching state through a structurally batched region's boundary (e.g., a composite
+/// universe's first-class mapped extent) reintroduces that state as additional leading non-differentiated operands
+/// of the batched call.
 ///
-/// The leading [`non_differentiated_count`](Self::non_differentiated_count) operands parameterize the call without being
-/// differentiated: every attached region receives them in the same leading positions, but they contribute no tangent
-/// to the JVP region's input signature and receive no cotangent. This is the same operand split
-/// [`LinearCallOperation`] draws with its residual count, and the direct analogue of JAX's `nondiff_argnums`. Batching
-/// is its canonical producer: a policy that threads batching state through a structurally batched region's boundary
-/// (e.g., a composite universe's first-class mapped extent) reintroduces that state as additional leading
-/// non-differentiated operands of the batched call.
+/// The transforms treat a staged call as follows:
 ///
-/// The transforms treat a staged call as follows: interpretation replays the primal region; partial evaluation folds a
-/// call whose operands are all known and otherwise residualizes it unchanged; batching preserves the call around
-/// axis-reconciled copies of both regions so the custom derivative survives a `batch` applied *before*
-/// differentiation; and differentiation replays the user JVP region instead of differentiating the primal body, so
-/// the user-supplied derivative governs both forward and reverse mode. Refer to the documentation of [`custom_jvp`]
-/// for the full semantics and for when to reach for a custom JVP.
+///   - _interpretation_ replays the primal region,
+///   - _partial evaluation_ folds a call whose operands are all known and otherwise residualizes it unchanged,
+///   - _batching_ preserves the call around axis-reconciled copies of both regions so that the custom derivative
+///     survives batching applied _before_ differentiation, and
+///   - _differentiation_ replays the user JVP region instead of differentiating the primal body, so the user-supplied
+///     derivative governs both forward and reverse mode differentiation.
+/// 
+/// Refer to the documentation of [`custom_jvp`] for the full semantics and for when to reach for a custom JVP.
 ///
-/// This operation is deliberately non-transposable, which does not restrict reverse-mode differentiation. Reverse mode
-/// linearizes first, and the `jvp` rule replays the user JVP program as plain primitive operations, so the operation
-/// itself is gone from the tangent program long before transposition runs (which is also why the JVP program must be
-/// linear in its tangent arguments). Transposition can therefore only reach the operation when transposing a raw,
-/// un-linearized program directly, which JAX rejects for its `custom_jvp_call` primitive in exactly the same way.
+/// Note that this operation is deliberately non-transposable, which does not restrict reverse-mode differentiation.
+/// Reverse mode differentiation linearizes first, and the JVP rule replays the user JVP program as plain primitive
+/// operations, so the operation itself is gone from the tangent program long before transposition runs. This is also
+/// (at least partially) why the JVP program must be linear in its tangent arguments. Transposition can therefore only
+/// reach the operation when transposing a raw, un-linearized program directly, which is not supported.
 ///
 /// The `T` parameter fixes the type universe of both attached regions and the call boundary, so each concrete payload
 /// has exactly one [`Operation<Type = T>`](Operation) contract while the semantic and transform implementations remain
@@ -65,42 +65,36 @@ pub struct CustomJvpOperation<T: DifferentiableType> {
     /// Number of leading operands that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
-    /// Type universe in which this custom-JVP call is valid.
+    /// Type universe in which this [`CustomJvpOperation`] is valid.
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: DifferentiableType> Copy for CustomJvpOperation<T> {}
-
-impl<T: DifferentiableType> Default for CustomJvpOperation<T> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T: DifferentiableType> CustomJvpOperation<T> {
-    /// Creates a custom-JVP call operation whose attached regions operate on `T` values and whose operands are all
-    /// differentiated.
+    /// Creates a new [`CustomJvpOperation`] whose attached regions operate on `T` values and whose operands are all
+    /// participating in the differentiation transform.
     #[inline]
     pub const fn new() -> Self {
         Self { non_differentiated_count: 0, marker: PhantomData }
     }
 
-    /// Sets the number of leading operands that parameterize this call without being differentiated. Refer to the
-    /// documentation of [`CustomJvpOperation`] for the resulting region interfaces.
+    /// Sets the number of leading inputs/operands that parameterize this call without participating in the
+    /// differentiation transform. Refer to the documentation of [`CustomJvpOperation`] for the impact of this property
+    /// on the resulting region interfaces for the attached regions.
     #[inline]
     pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
         self.non_differentiated_count = non_differentiated_count;
         self
     }
 
-    /// Returns the number of leading operands that parameterize this call without being differentiated.
+    /// Returns the number of leading inputs/operands that parameterize this call without participating in the
+    /// differentiation transform.
     #[inline]
     pub fn non_differentiated_count(&self) -> usize {
         self.non_differentiated_count
     }
 
-    /// Splits `values` into the leading non-differentiated group and the trailing differentiated group.
+    /// Splits the provided in put `values` into the leading non-differentiated group and the trailing differentiated
+    /// group, based on the value of [`Self::non_differentiated_count`].
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
         let input_count = values.len();
@@ -116,6 +110,15 @@ impl<T: DifferentiableType> CustomJvpOperation<T> {
     }
 }
 
+impl<T: DifferentiableType> Copy for CustomJvpOperation<T> {}
+
+impl<T: DifferentiableType> Default for CustomJvpOperation<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -123,16 +126,19 @@ impl<T: DifferentiableType> Display for CustomJvpOperation<T> {
     }
 }
 
+// TODO(eaplatanios): Review this module.
+
 impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
-    // The operation carries two regions with one shared primal boundary. Writing the leading non-differentiated
-    // operands as `p`, the differentiated operands as `x`, and the primal outputs as `y`, their contracts are
+    // `CustomJvpOperation`s carry two regions with one shared primal boundary. Writing the leading non-differentiated
+    // operands as `p`, the differentiated operands as `x`, and the primal outputs as `y`, their contracts are:
     //
-    //   primal: (p, x)    → y
-    //   jvp:    (p, x, ẋ) → (y, ẏ).
+    //   - Primal: (p, x)    → y
+    //   - JVP:    (p, x, ẋ) → (y, ẏ).
     //
-    // Inference declares those region inputs independently of the concrete programs and then checks that the supplied
-    // interfaces realize the declaration exactly. Keeping `p` explicit but omitting `ṗ` distinguishes an operand
-    // that parameterizes the rule from an ordinary input whose tangent merely happens to be zero.
+    // Type inference declares those region inputs independently of the concrete programs and then checks that the
+    // supplied interfaces realize the declaration exactly. Keeping `p` explicit but omitting `ṗ` distinguishes an
+    // operand that parameterizes the rule from an ordinary input whose tangent merely happens to be zero.
+
     type Type = T;
 
     #[inline]
@@ -152,7 +158,8 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
         if region_interfaces.len() != 2 {
             return Err(TypeError::invalid(format!(
-                "custom_jvp expects 2 attached regions but got {}",
+                "`{}` expects 2 attached regions but got {}",
+                CUSTOM_JVP_OPERATION_NAME,
                 region_interfaces.len(),
             )));
         }
