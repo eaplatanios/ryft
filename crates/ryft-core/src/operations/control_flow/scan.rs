@@ -383,13 +383,17 @@ impl ScanTypeSemantics for ArrayType {
         }
         if carry_count > body_input_types.len() {
             return Err(TypeError::invalid(format!(
-                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body input count {}",
+                "{} carry count {} exceeds the body input count {}",
+                SCAN_OPERATION_NAME,
+                carry_count,
                 body_input_types.len(),
             )));
         }
         if carry_count > body_output_types.len() {
             return Err(TypeError::invalid(format!(
-                "{SCAN_OPERATION_NAME} carry count {carry_count} exceeds the body output count {}",
+                "{} carry count {} exceeds the body output count {}",
+                SCAN_OPERATION_NAME,
+                carry_count,
                 body_output_types.len(),
             )));
         }
@@ -422,15 +426,19 @@ impl ScanTypeSemantics for ArrayType {
         for (index, input_type) in input_types[carry_count..].iter().enumerate() {
             if input_type.rank() == 0 {
                 return Err(TypeError::invalid(format!(
-                    "{SCAN_OPERATION_NAME} stacked input {} must have rank at least 1",
+                    "{} stacked input {} must have rank at least 1",
+                    SCAN_OPERATION_NAME,
                     carry_count + index,
                 )));
             }
             let (slice_type, leading_dimension) = input_type.without_dimension(0)?;
             if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
-                    "{SCAN_OPERATION_NAME} stacked input {} must have leading dimension {length} but has type {input_type}",
+                    "{} stacked input {} must have leading dimension {} but has type {}",
+                    SCAN_OPERATION_NAME,
                     carry_count + index,
+                    length,
+                    input_type,
                 )));
             }
             body_input_types.push(slice_type);
@@ -479,7 +487,8 @@ fn composite_scan_boundary_types(
 ) -> Result<Vec<ArrayIrType>, TypeError> {
     if carry_count > body_types.len() {
         return Err(TypeError::invalid(format!(
-            "{SCAN_OPERATION_NAME} carry count {} exceeds the body {} count {}",
+            "{} carry count {} exceeds the body {} count {}",
+            SCAN_OPERATION_NAME,
             carry_count,
             role,
             body_types.len(),
@@ -489,7 +498,8 @@ fn composite_scan_boundary_types(
     for (index, r#type) in body_types[carry_count..].iter().enumerate() {
         let ArrayIrType::Array(r#type) = r#type else {
             return Err(TypeError::invalid(format!(
-                "{SCAN_OPERATION_NAME} stacked body {} {} must be an array but got {}",
+                "{} stacked body {} {} must be an array but got {}",
+                SCAN_OPERATION_NAME,
                 role,
                 carry_count + index,
                 r#type,
@@ -599,21 +609,24 @@ impl ScanTypeSemantics for ArrayIrType {
         for (index, r#type) in input_types[carry_count..body_input_count].iter().enumerate() {
             let Self::Array(r#type) = r#type else {
                 return Err(TypeError::invalid(format!(
-                    "{SCAN_OPERATION_NAME} stacked input {} must be an array but got {}",
+                    "{} stacked input {} must be an array but got {}",
+                    SCAN_OPERATION_NAME,
                     carry_count + index,
                     r#type,
                 )));
             };
             if r#type.rank() == 0 {
                 return Err(TypeError::invalid(format!(
-                    "{SCAN_OPERATION_NAME} stacked input {} must have rank at least 1",
+                    "{} stacked input {} must have rank at least 1",
+                    SCAN_OPERATION_NAME,
                     carry_count + index,
                 )));
             }
             let (slice_type, leading_dimension) = r#type.without_dimension(0)?;
             if !length.is_refined_by(&leading_dimension) {
                 return Err(TypeError::invalid(format!(
-                    "{SCAN_OPERATION_NAME} stacked input {} must have leading dimension {} but has type {}",
+                    "{} stacked input {} must have leading dimension {} but has type {}",
+                    SCAN_OPERATION_NAME,
                     carry_count + index,
                     length,
                     r#type,
@@ -663,8 +676,9 @@ impl ScanTypeSemantics for ArrayIrType {
     fn stacked_scan_type(r#type: &Self, length: &Dimension) -> Result<Self, TypeError> {
         let Self::Array(r#type) = r#type else {
             return Err(TypeError::invalid(format!(
-                "{SCAN_OPERATION_NAME} cannot stack first-class dimension type {}",
-                r#type
+                "{} cannot stack first-class dimension type {}",
+                SCAN_OPERATION_NAME,
+                r#type,
             )));
         };
         Ok(Self::Array(stacked_scan_type(r#type, length)))
@@ -1809,7 +1823,8 @@ where
             check_count!("output", output_axes, output_types.len(), ProgramError);
             if output_types.len() < self.carry_count() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "{SCAN_OPERATION_NAME} body has {} outputs but carry count is {}",
+                    "{} body has {} outputs but carry count is {}",
+                    SCAN_OPERATION_NAME,
                     output_types.len(),
                     self.carry_count(),
                 ))
@@ -1837,7 +1852,8 @@ where
         let y_slice_types = body.output_types().split_off(self.carry_count());
         let length = self.length().value().ok_or_else(|| BatchingError::UnsupportedOperation {
             message: format!(
-                "eager homogeneous {SCAN_OPERATION_NAME} batching requires a concrete trip count but got {}",
+                "eager homogeneous {} batching requires a concrete trip count but got {}",
+                SCAN_OPERATION_NAME,
                 self.length(),
             ),
         })?;
@@ -2641,7 +2657,9 @@ where
     check_count!("input", operand_linear, body.input_types().len(), ProgramError);
     if carry_count > operand_linear.len() {
         return Err(ProgramError::MalformedProgram(format!(
-            "{SCAN_OPERATION_NAME} transpose found carry count {carry_count} exceeding its {} operands",
+            "{} transpose found carry count {} exceeding its {} operands",
+            SCAN_OPERATION_NAME,
+            carry_count,
             operand_linear.len(),
         )));
     }

@@ -291,8 +291,9 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
     let condition_output_types = condition_interface.output_types();
     if condition_output_types.len() != 1 {
         return Err(TypeError::invalid(format!(
-            "{WHILE_OPERATION_NAME} condition must return exactly one predicate leaf but returned {}",
-            condition_output_types.len()
+            "{} condition must return exactly one predicate leaf but returned {}",
+            WHILE_OPERATION_NAME,
+            condition_output_types.len(),
         )));
     }
     T::validate_while_condition_output(&condition_output_types[0], state_types)?;
@@ -1720,7 +1721,8 @@ where
                 let (storage_input, storage_type) = storage_inputs.next().unwrap();
                 if storage_input.r#type().as_ref() != storage_type {
                     return Err(TypeError::invalid(format!(
-                        "bounded {WHILE_OPERATION_NAME} residual stack item has type {} but expected {}",
+                        "bounded {} residual stack item has type {} but expected {}",
+                        WHILE_OPERATION_NAME,
                         storage_input.r#type().as_ref(),
                         storage_type,
                     ))

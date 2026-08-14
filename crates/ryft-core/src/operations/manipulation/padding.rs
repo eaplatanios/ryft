@@ -1296,7 +1296,8 @@ fn validate_pad_inputs(
 ) -> Result<(), ProgramError> {
     if input.data_type() != padding_value.data_type() {
         return Err(TypeError::invalid(format!(
-            "'{PAD_OPERATION_NAME}' input data type {} does not match padding value data type {}",
+            "'{}' input data type {} does not match padding value data type {}",
+            PAD_OPERATION_NAME,
             input.data_type(),
             padding_value.data_type(),
         ))
@@ -1310,7 +1311,8 @@ fn validate_pad_inputs(
     }
     if input.memory() != padding_value.memory() {
         return Err(TypeError::invalid(format!(
-            "'{PAD_OPERATION_NAME}' input and padding value must share one memory space but reside in {} and {}",
+            "'{}' input and padding value must share one memory space but reside in {} and {}",
+            PAD_OPERATION_NAME,
             input.memory(),
             padding_value.memory(),
         ))
@@ -1323,7 +1325,10 @@ fn validate_pad_inputs(
     ] {
         if length != input.rank() {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' {name} has length {length} but input has rank {}",
+                "'{}' {} has length {} but input has rank {}",
+                PAD_OPERATION_NAME,
+                name,
+                length,
                 input.rank(),
             ))
             .into());

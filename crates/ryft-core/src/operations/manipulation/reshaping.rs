@@ -916,7 +916,8 @@ fn validate_requested_reshape_sharding(
 ) -> Result<Sharding, TypeError> {
     if requested.rank() != output_shape.rank() {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding rank ({}) does not match the output rank ({})",
+            "'{}' requested output sharding rank ({}) does not match the output rank ({})",
+            RESHAPE_OPERATION_NAME,
             requested.rank(),
             output_shape.rank(),
         )));
