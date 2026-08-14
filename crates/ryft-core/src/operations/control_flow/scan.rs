@@ -683,8 +683,7 @@ impl ScanTypeSemantics for ArrayIrType {
         let Self::Array(r#type) = r#type else {
             return Err(TypeError::invalid(format!(
                 "{} cannot stack first-class dimension type {}",
-                SCAN_OPERATION_NAME,
-                r#type,
+                SCAN_OPERATION_NAME, r#type,
             )));
         };
         Ok(Self::Array(stacked_scan_type(r#type, length)))

@@ -1480,10 +1480,7 @@ mod tests {
         assert_eq!(operation.name(), JIT_CALL_OPERATION_NAME);
         assert_eq!(
             operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid(format!(
-                "{} expects 1 attached callee region but got 0",
-                JIT_CALL_OPERATION_NAME,
-            ))),
+            Err(TypeError::invalid(format!("{} expects 1 attached callee region but got 0", JIT_CALL_OPERATION_NAME,))),
         );
         assert_eq!(
             operation

@@ -80,10 +80,7 @@ fn validate_start_index_types(
         if index_type.data_type() != index_types[0].data_type() {
             return Err(TypeError::invalid(format!(
                 "'{}' start indices must share one integer type but index {} has type {} and index 0 has type {}",
-                operation_name,
-                index,
-                index_type,
-                index_types[0],
+                operation_name, index, index_type, index_types[0],
             ))
             .into());
         }
