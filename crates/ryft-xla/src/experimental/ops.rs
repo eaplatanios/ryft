@@ -657,14 +657,16 @@ pub type XlaProgramBuilder = ProgramBuilder<XlaConstant, XlaOperation>;
 /// Flat XLA program over the backend-owned operation universe, used for materialized regions and shared callees.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
+/// Canonical operation name for [`JitCallOperation`].
+pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
+
 /// Staged call to a flat jitted XLA program. The callee program is not part of this payload: it is a shared
 /// callee root [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the
 /// operation (the single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
 /// [`BindingRegionDriver`](ryft_core::BindingRegionDriver) passed to [`Context::bind`], so repeated calls staged from
 /// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 /// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
-/// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract
-/// each.
+/// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation<T: Type> {
     /// Type universe of the callee boundary.
@@ -727,7 +729,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     #[inline]
     fn name(&self) -> &'static str {
-        "jit_call"
+        JIT_CALL_OPERATION_NAME
     }
 
     #[inline]
@@ -742,7 +744,8 @@ impl<T: Type> Operation for JitCallOperation<T> {
     ) -> Result<Vec<T>, TypeError> {
         if region_interfaces.len() != 1 {
             return Err(TypeError::invalid(format!(
-                "jit_call expects 1 attached callee region but got {}",
+                "{} expects 1 attached callee region but got {}",
+                JIT_CALL_OPERATION_NAME,
                 region_interfaces.len()
             )));
         }

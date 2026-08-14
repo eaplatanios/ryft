@@ -635,8 +635,8 @@ where
                             let actual_type = <&ArrayType>::try_from(cotangent_type.as_ref())?;
                             if actual_type != &transpose_target_type {
                                 return Err(TypeError::invalid(format!(
-                                    "inverse reshape cotangent type {actual_type} does not match input cotangent type \
-                                     {transpose_target_type}",
+                                    "inverse {RESHAPE_OPERATION_NAME} cotangent type {actual_type} does not match \
+                                     input cotangent type {transpose_target_type}",
                                 ))
                                 .into());
                             }
