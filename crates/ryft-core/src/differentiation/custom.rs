@@ -21,6 +21,8 @@ use crate::programs::{
 };
 use crate::tracing::{DomainTracer, Trace};
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 
@@ -471,10 +473,29 @@ where
     }
 }
 
-/// Creates a [`CustomJvp`] function from a primal closure and a JVP-rule closure over trees of [`DomainTracer`]s —
-/// the ergonomic analogue of JAX's
+/// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP) closure over trees of
+/// [`DomainTracer`]s. This is the ergonomic analogue of JAX's
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
+///
+/// Mathematically, let the primal function be
+///
+/// ```text
+/// f : X → Y,    x ↦ y = f(x).
+/// ```
+///
+/// Its differential at `x` is the linear map `D f(x) : T_x X → T_y Y`. Applied to an input tangent `ẋ`, this map
+/// produces the output tangent `ẏ = D f(x)[ẋ]`. The supplied JVP closure implements the lifted map
+///
+/// ```text
+/// j_f : X × T_x X → Y × T_y Y,
+///       (x, ẋ)   ↦ (f(x), D f(x)[ẋ]) = (y, ẏ).
+/// ```
+///
+/// The `primal` argument implements `f`: it receives the input tracer tree `x` and returns the output tracer tree `y`.
+/// The `jvp` argument implements `j_f`: it receives `x` and a tangent tree `ẋ` with the same parameter structure, and
+/// returns `(y, ẏ)`, where `ẏ` has the same parameter structure as `y`. Ryft validates these structural and type
+/// relationships when the closures are traced.
 ///
 /// # When to use
 ///
@@ -489,15 +510,19 @@ where
 ///
 /// # Calling convention
 ///
-/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
-/// inputs and outputs can be single tracers, tuples, or any other parameterized structure. `primal` maps the input
-/// tree to the output tree, and `jvp` maps `(inputs, input_tangents)` to `(outputs, output_tangents)`, exactly like a
-/// JAX `defjvp` rule. Ryft does not expose JAX's `nondiff_argnums` calling convention at this level. Static
-/// non-differentiated configuration should be captured by both closures. A dynamic typed value should remain an
-/// explicit input; its tangent is consequently present in `input_tangents`, and a rule that treats the value as a
-/// parameter ignores that tangent when constructing `output_tangents`. Transform-injected runtime metadata uses the
-/// lower-level [`CustomJvpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand
-/// while contributing no tangent slot.
+/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so `X`
+/// and `Y` can each be represented by a single tracer, a tuple, or any other parameterized structure. Ryft does not
+/// expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration should be
+/// captured by both closures. A dynamic typed value should remain an explicit input; its tangent is consequently
+/// present in `ẋ`, and a rule that treats the value as a parameter ignores that tangent when constructing `ẏ`.
+/// Transform-injected runtime metadata uses the lower-level
+/// [`CustomJvpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand while
+/// contributing no tangent slot.
+///
+/// # Parameters
+///
+///   - `primal`: Closure implementing `f(x) = y`.
+///   - `jvp`: Closure implementing `j_f(x, ẋ) = (y, ẏ)`, where `ẏ = D f(x)[ẋ]`.
 ///
 /// # Tracing semantics
 ///
@@ -1128,10 +1153,31 @@ where
     }
 }
 
-/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of [`DomainTracer`]s —
-/// the ergonomic analogue of JAX's
+/// Creates a [`CustomVjp`] function from primal, forward, and backward closures over trees of [`DomainTracer`]s. This
+/// is the ergonomic analogue of JAX's
 /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
 /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
+///
+/// Mathematically, let the primal function be
+///
+/// ```text
+/// f : X → Y,    x ↦ y = f(x).
+/// ```
+///
+/// Reverse mode applies the transpose of the differential, also called the pullback,
+/// `D f(x)^T : T_y^* Y → T_x^* X`. Applied to an output cotangent `ȳ`, it produces the input cotangent
+/// `x̄ = D f(x)^T[ȳ]`. A custom VJP factors this computation through an arbitrary residual space `R`:
+///
+/// ```text
+/// f_fwd : X → Y × R,               x      ↦ (f(x), r) = (y, r),
+/// f_bwd : R × T_y^* Y → T_x^* X,  (r, ȳ) ↦ D f(x)^T[ȳ] = x̄.
+/// ```
+///
+/// The `primal` argument implements `f` and is used for ordinary evaluation. The `forward` argument implements
+/// `f_fwd`; it recomputes `y` and saves exactly the residual tree `r` needed by the reverse rule. The `backward`
+/// argument implements `f_bwd`; it receives `r` and the output-cotangent tree `ȳ`, then returns the input-cotangent
+/// tree `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and that `x̄` is the
+/// cotangent of `x` when the closures are traced.
 ///
 /// # When to use
 ///
@@ -1155,14 +1201,18 @@ where
 /// # Calling convention
 ///
 /// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
-/// inputs, outputs, and residuals can be single tracers, tuples, or any other parameterized structure. `primal` maps
-/// the input tree to the output tree, `forward` maps the input tree to `(outputs, residuals)` (the same structural
-/// split as a JAX `f_fwd`), and `backward` maps `(residuals, output_cotangents)` to the input cotangent tree. Ryft does
-/// not expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration should
-/// be captured by all three closures. A dynamic typed value should remain an explicit input; preserve it as a residual
-/// when `backward` needs it and return a zero cotangent for it. Transform-injected runtime metadata uses the lower-level
-/// [`CustomVjpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand while
-/// contributing no cotangent output.
+/// `X`, `Y`, and `R` can each be represented by a single tracer, a tuple, or any other parameterized structure. Ryft
+/// does not expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration
+/// should be captured by all three closures. A dynamic typed value should remain an explicit input; preserve it as a
+/// residual in `r` when `backward` needs it and return a zero cotangent for it in `x̄`. Transform-injected runtime
+/// metadata uses the lower-level [`CustomVjpOperation::non_differentiated_count`] contract instead, because it must
+/// remain an SSA operand while contributing no cotangent output.
+///
+/// # Parameters
+///
+///   - `primal`: Closure implementing `f(x) = y` for ordinary evaluation.
+///   - `forward`: Closure implementing `f_fwd(x) = (y, r)` for reverse-mode residual production.
+///   - `backward`: Closure implementing `f_bwd(r, ȳ) = x̄ = D f(x)^T[ȳ]`.
 ///
 /// # Tracing semantics
 ///

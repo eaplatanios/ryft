@@ -67,7 +67,7 @@ use crate::tracing::{DomainTracer, Trace, TracingContext};
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
 /// [`RematerializeOperation`] has the same primal/forward/backward structure as
-/// [`CustomVjpOperation`](crate::tracing_v2::custom_derivatives::CustomVjpOperation), but it also carries
+/// [`CustomVjpOperation`](crate::differentiation::CustomVjpOperation), but it also carries
 /// a derived tangent program. That extra program is not user-authored custom-VJP state: it is produced by
 /// [`Rematerialize`] so forward-mode differentiation can replay the rematerialized pushforward while reverse mode
 /// replays the rematerialized pullback.
@@ -2781,7 +2781,7 @@ mod tests {
 
     #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
-        use crate::tracing_v2::custom_derivatives::custom_vjp;
+        use crate::differentiation::custom_vjp;
 
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
@@ -4100,7 +4100,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_residual_candidates_expose_the_replayed_forward_producer() {
-        use crate::tracing_v2::custom_derivatives::custom_vjp;
+        use crate::differentiation::custom_vjp;
 
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the

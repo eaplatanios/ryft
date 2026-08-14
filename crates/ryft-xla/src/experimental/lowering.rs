@@ -9340,8 +9340,7 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_lowering_inlines_only_the_primal_program() {
-        use ryft_core::PrintOperation;
-        use ryft_core::tracing_v2::custom_derivatives::CustomJvpOperation;
+        use ryft_core::{CustomJvpOperation, PrintOperation};
 
         // A retained `custom_jvp` call lowers only its primal program and threads its effects onto the enclosing
         // ordered-I/O chain. Nothing from the user-supplied JVP program (marked here by the multiply on the tangent

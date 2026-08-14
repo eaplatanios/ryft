@@ -20,8 +20,9 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, ResidualZeroProvider, jvp_projected_operation,
+    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, LinearCallOperation, MemberDifferentiableOperation,
+    ResidualZeroProvider, jvp_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -60,7 +61,6 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
-use crate::tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 
 mod attention;
 mod collectives;
@@ -85,7 +85,7 @@ mod tag;
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
 /// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
-/// [`crate::tracing_v2::custom_derivatives`].
+/// [`crate::differentiation::custom`].
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and

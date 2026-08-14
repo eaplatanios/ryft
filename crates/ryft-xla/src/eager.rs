@@ -805,9 +805,8 @@ mod tests {
     /// (the bare operation rejects differentiation).
     #[test]
     fn test_eager_custom_call_differentiates_through_custom_vjp() {
-        use ryft_core::DomainTracer;
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
-        use ryft_core::tracing_v2::custom_vjp;
+        use ryft_core::{DomainTracer, custom_vjp};
 
         use crate::XlaDomain;
 

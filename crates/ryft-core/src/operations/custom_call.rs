@@ -216,8 +216,8 @@ impl Display for CustomCallBatching {
 /// The reference array backend cannot execute foreign kernels, so eager interpretation on it reports an error.
 ///
 /// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error
-/// directing users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
-/// [`custom_vjp`](crate::tracing_v2::CustomVjp), which supply the missing derivative. Those wrappers do *not* supply
+/// directing users to wrap the call with [`custom_jvp`](crate::differentiation::custom_jvp) or
+/// [`custom_vjp`](crate::differentiation::custom_vjp), which supply the missing derivative. Those wrappers do *not* supply
 /// a batching rule: each of them structurally batches its own primal region, so a mapped operand reaches this same
 /// operation and meets this same batching contract. Batching a call whose operands are all replicated binds it
 /// unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand is
@@ -701,8 +701,8 @@ impl_differentiable_operation! {
     {
         |operation, _context, _driver, _inputs| {
             // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
-            // directing users to wrap the call with [`custom_jvp`](crate::tracing_v2::CustomJvp) or
-            // [`custom_vjp`](crate::tracing_v2::CustomVjp), which is also how JAX handles `ffi_call` differentiation.
+            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
+            // `ffi_call` differentiation.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "custom call '{}' has no differentiation rule; wrap it with `custom_jvp` or `custom_vjp` to \

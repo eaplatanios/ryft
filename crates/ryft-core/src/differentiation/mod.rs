@@ -144,6 +144,7 @@ use crate::programs::{ProgramError, TypeError, Value};
 use crate::tracing::TracingContext;
 
 pub mod batching;
+pub mod custom;
 pub mod elementwise;
 pub mod forward;
 pub mod hessian;
@@ -153,6 +154,7 @@ pub mod reverse;
 pub mod types;
 
 pub use batching::CotangentBatchingPolicy;
+pub use custom::{CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation, custom_jvp, custom_vjp};
 pub use elementwise::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
     UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,

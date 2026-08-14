@@ -55,17 +55,18 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, DenseDifferentiableType,
-    DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBuilder,
-    DifferentiationBuilderContext, DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate,
-    Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization,
-    LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CustomJvp, CustomJvpOperation,
+    CustomVjp, CustomVjpOperation, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation,
+    DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationBuilderContext,
+    DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
+    DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock,
+    HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization, LinearizationTracer,
+    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
     ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
     WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
-    binary_elementwise_jvp, differentiate_at, jvp_projected_operation, transpose_mixed_operation,
-    transpose_projected_operation, unary_elementwise_jvp,
+    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation,
+    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -168,7 +169,6 @@ pub use tracing::{
     DomainTracer, DomainTracingContext, NestedTracer, NestedTracingContext, Trace, Tracer, TracerState, TracingContext,
     infer_output_type, trace,
 };
-pub use tracing_v2::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use tracing_v2::rematerialization::RematerializeOperation;
 
 #[cfg(test)]
