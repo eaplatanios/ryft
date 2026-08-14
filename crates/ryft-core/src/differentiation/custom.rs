@@ -127,8 +127,8 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     // The operation carries two regions with one shared primal boundary. Writing the leading non-differentiated
     // operands as `p`, the differentiated operands as `x`, and the primal outputs as `y`, their contracts are
     //
-    //   primal: (p, x)    -> y
-    //   jvp:    (p, x, ẋ) -> (y, ẏ).
+    //   primal: (p, x)    → y
+    //   jvp:    (p, x, ẋ) → (y, ẏ).
     //
     // Inference declares those region inputs independently of the concrete programs and then checks that the supplied
     // interfaces realize the declaration exactly. Keeping `p` explicit but omitting `ṗ` distinguishes an operand
@@ -242,8 +242,8 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         // Batch the two region contracts without opening the custom derivative:
         //
-        //   primal: (p, x)        -> y
-        //   jvp:    (p, x, ẋ) -> (y_jvp, ẏ).
+        //   primal: (p, x)    → y
+        //   jvp:    (p, x, ẋ) → (y_jvp, ẏ).
         //
         // Each `ẋ` follows the batch axis of its corresponding `x`, while `p` has no tangent counterpart. The
         // ordinary primal, JVP-primal, and JVP-tangent computations may independently choose replicated or mapped
@@ -343,7 +343,7 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // Apply the user-supplied pushforward directly. For `f(p, x) = y`, region 1 implements
         //
-        //   j(p, x, ẋ) = (f(p, x), D_x f(p, x)[ẋ]) = (y, ẏ).
+        //   j(p, x, ẋ) = (f(p, x), (∂f/∂x)(p, x) · ẋ) = (y, ẏ).
         //
         // Feed every primal value, followed only by the differentiated inputs' tangents; a live tangent for `p` would
         // violate the declared non-differentiated boundary and is rejected below. Replay stages the rule's ordinary
@@ -398,7 +398,7 @@ where
 }
 
 // The raw carrier is intentionally non-transposable. Differentiation first replaces `f(p, x)` with the ordinary
-// primitive program computing the linear map `ẋ -> D_x f(p, x)[ẋ]`; reverse mode transposes that replayed
+// primitive program computing the linear map `ẋ ↦ (∂f/∂x)(p, x) · ẋ`; reverse mode transposes that replayed
 // program, not `CustomJvpOperation`. Therefore only an invalid direct transpose of an un-linearized carrier can reach
 // this rejection path.
 impl_non_transposable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
@@ -478,24 +478,17 @@ where
 /// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html) /
 /// [`defjvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.defjvp.html) decorator pair.
 ///
-/// Mathematically, let the primal function be
+/// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The two closure arguments implement
 ///
 /// ```text
-/// f : X → Y,    x ↦ y = f(x).
+/// primal: x      ↦ y = f(x)
+/// jvp:    (x, ẋ) ↦ (y, ẏ) = (f(x), J_f(x) · ẋ)
 /// ```
 ///
-/// Its differential at `x` is the linear map `D f(x) : T_x X → T_y Y`. Applied to an input tangent `ẋ`, this map
-/// produces the output tangent `ẏ = D f(x)[ẋ]`. The supplied JVP closure implements the lifted map
-///
-/// ```text
-/// j_f : X × T_x X → Y × T_y Y,
-///       (x, ẋ)   ↦ (f(x), D f(x)[ẋ]) = (y, ẏ).
-/// ```
-///
-/// The `primal` argument implements `f`: it receives the input tracer tree `x` and returns the output tracer tree `y`.
-/// The `jvp` argument implements `j_f`: it receives `x` and a tangent tree `ẋ` with the same parameter structure, and
-/// returns `(y, ẏ)`, where `ẏ` has the same parameter structure as `y`. Ryft validates these structural and type
-/// relationships when the closures are traced.
+/// Thus, `primal` receives the input tracer tree `x` and returns the output tracer tree `y`. `jvp` receives `x` and an
+/// input-tangent tree `ẋ`, then returns the primal output `y` together with the Jacobian-vector product
+/// `ẏ = J_f(x) · ẋ`. The tangent trees have the same parameter structures as their corresponding primal trees, and
+/// Ryft validates these structural and type relationships when it traces the closures.
 ///
 /// # When to use
 ///
@@ -510,19 +503,19 @@ where
 ///
 /// # Calling convention
 ///
-/// Both closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so `X`
-/// and `Y` can each be represented by a single tracer, a tuple, or any other parameterized structure. Ryft does not
-/// expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration should be
-/// captured by both closures. A dynamic typed value should remain an explicit input; its tangent is consequently
-/// present in `ẋ`, and a rule that treats the value as a parameter ignores that tangent when constructing `ẏ`.
-/// Transform-injected runtime metadata uses the lower-level
+/// Both closures operate on [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so `x`
+/// and `y` may each be a single tracer, a tuple, or any other parameterized structure. This high-level API does not
+/// expose JAX's `nondiff_argnums` calling convention. Static non-differentiated configuration should be captured by
+/// both closures. A dynamic typed value should remain an explicit input; its tangent is consequently present in `ẋ`,
+/// and a rule that treats the value as a parameter ignores that tangent when constructing `ẏ`. Transform-injected
+/// runtime metadata uses the lower-level
 /// [`CustomJvpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand while
 /// contributing no tangent slot.
 ///
 /// # Parameters
 ///
 ///   - `primal`: Closure implementing `f(x) = y`.
-///   - `jvp`: Closure implementing `j_f(x, ẋ) = (y, ẏ)`, where `ẏ = D f(x)[ẋ]`.
+///   - `jvp`: Closure implementing `(x, ẋ) ↦ (y, ẏ)`, where `ẏ = J_f(x) · ẋ`.
 ///
 /// # Tracing semantics
 ///
@@ -704,9 +697,9 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
     // operands as `x`, primal outputs as `y`, forward residuals as `r`, and cotangents using an overbar, their contracts
     // are
     //
-    //   primal:   (p, x)        -> y
-    //   forward:  (p, x)        -> (y, r)
-    //   backward: (p, r, ȳ)  -> x̄.
+    //   primal:   (p, x)    → y
+    //   forward:  (p, x)    → (y, r)
+    //   backward: (p, r, ȳ) → x̄.
     //
     // Inference renames the independently traced primal and forward identities into the call boundary, derives the
     // backward signature from their resulting `y` and `r` types, and validates that no cotangent is produced for `p`.
@@ -824,13 +817,13 @@ where
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         // Batch all three region contracts while retaining the opaque custom-VJP carrier:
         //
-        //   primal:   (p, x)       -> y
-        //   forward:  (p, x)       -> (y_fwd, r)
-        //   backward: (p, r, ȳ)    -> x̄.
+        //   primal:   (p, x)    → y
+        //   forward:  (p, x)    → (y_fwd, r)
+        //   backward: (p, r, ȳ) → x̄.
         //
         // Reconcile each `y` with its corresponding `y_fwd` so the wrapper exposes one physical output axis, but keep
         // every residual's naturally produced axis because residuals are internal edges between the forward and
-        // backward rules. Batch the backward region with `(p, r, ȳ)` on those exact axes and align each `x̄`
+        // backward rules. Batch the backward region with `(p, r, ȳ)` on those exact axes and align each `x̄`
         // with its corresponding differentiated input `x`. When a replicated `x` receives a mapped cotangent, the
         // batching policy sums that mapped axis, which is the transpose of broadcasting `x` across the batch.
         //
@@ -954,16 +947,16 @@ where
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        // A custom VJP specifies the transpose `ȳ -> x̄`, not the pushforward `ẋ -> ẏ`. Replay
+        // A custom VJP specifies the pullback `ȳ ↦ x̄`, not the pushforward `ẋ ↦ ẏ`. Replay
         //
         //   forward(p, x) = (y, r)
         //
         // to recover the primal outputs and residuals, then stage an opaque linear call representing the unknown map
         //
-        //   L_(p,r): ẋ -> ẏ.
+        //   L_(p,r): ẋ ↦ ẏ.
         //
         // `LinearCallOperation` knows only how to transpose that map: its transpose replays
-        // `backward(p, r, ȳ) = x̄`. An eager forward-mode use attempts to execute `L_(p,r)` and is therefore
+        // `backward(p, r, ȳ) = x̄`. An eager forward-mode use attempts to execute `L_(p,r)` and is therefore
         // rejected, while reverse mode transposes it without execution. Passing `p` and `r` as the carrier's leading
         // residual operands keeps the path capture-free and exposes every dependency as an ordinary SSA edge.
         //
@@ -1061,8 +1054,8 @@ where
 }
 
 // The raw carrier is intentionally non-transposable. Differentiation first replaces `f(p, x)` with the opaque linear
-// map `L_(p,r): ẋ -> ẏ`; reverse mode transposes that `LinearCallOperation`, whose rule evaluates
-// `backward(p, r, ȳ) = x̄`. Therefore only an invalid direct transpose of an un-linearized custom-VJP carrier
+// map `L_(p,r): ẋ ↦ ẏ`; reverse mode transposes that `LinearCallOperation`, whose rule evaluates
+// `backward(p, r, ȳ) = x̄`. Therefore only an invalid direct transpose of an un-linearized custom-VJP carrier
 // can reach this rejection path.
 impl_non_transposable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
@@ -1158,26 +1151,20 @@ where
 /// [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html) /
 /// [`defvjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.defvjp.html) decorator pair.
 ///
-/// Mathematically, let the primal function be
+/// For `y = f(x)`, let `J_f(x) = ∂f/∂x` denote the Jacobian of `f` at `x`. The Vector-Jacobian Product (VJP), or
+/// pullback, maps an output cotangent `ȳ` to the input cotangent `x̄ = J_f(x)ᵀ · ȳ`. The three closure arguments factor
+/// that computation through a residual tree `r`:
 ///
 /// ```text
-/// f : X → Y,    x ↦ y = f(x).
+/// primal:   x      ↦ y = f(x)
+/// forward:  x      ↦ (y, r) = (f(x), r)
+/// backward: (r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ
 /// ```
 ///
-/// Reverse mode applies the transpose of the differential, also called the pullback,
-/// `D f(x)^T : T_y^* Y → T_x^* X`. Applied to an output cotangent `ȳ`, it produces the input cotangent
-/// `x̄ = D f(x)^T[ȳ]`. A custom VJP factors this computation through an arbitrary residual space `R`:
-///
-/// ```text
-/// f_fwd : X → Y × R,               x      ↦ (f(x), r) = (y, r),
-/// f_bwd : R × T_y^* Y → T_x^* X,  (r, ȳ) ↦ D f(x)^T[ȳ] = x̄.
-/// ```
-///
-/// The `primal` argument implements `f` and is used for ordinary evaluation. The `forward` argument implements
-/// `f_fwd`; it recomputes `y` and saves exactly the residual tree `r` needed by the reverse rule. The `backward`
-/// argument implements `f_bwd`; it receives `r` and the output-cotangent tree `ȳ`, then returns the input-cotangent
-/// tree `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and that `x̄` is the
-/// cotangent of `x` when the closures are traced.
+/// Thus, `primal` implements `f` for ordinary evaluation. `forward` recomputes `y` and saves exactly the residual tree
+/// `r` needed by the reverse rule. `backward` receives `r` and the output-cotangent tree `ȳ`, then returns the
+/// input-cotangent tree `x̄`. Ryft validates that both occurrences of `y` agree, that `ȳ` is the cotangent of `y`, and
+/// that `x̄` is the cotangent of `x` when it traces the closures.
 ///
 /// # When to use
 ///
@@ -1200,19 +1187,19 @@ where
 ///
 /// # Calling convention
 ///
-/// All three closures range over [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
-/// `X`, `Y`, and `R` can each be represented by a single tracer, a tuple, or any other parameterized structure. Ryft
-/// does not expose JAX's `nondiff_argnums` calling convention at this level. Static non-differentiated configuration
-/// should be captured by all three closures. A dynamic typed value should remain an explicit input; preserve it as a
-/// residual in `r` when `backward` needs it and return a zero cotangent for it in `x̄`. Transform-injected runtime
-/// metadata uses the lower-level [`CustomVjpOperation::non_differentiated_count`] contract instead, because it must
-/// remain an SSA operand while contributing no cotangent output.
+/// All three closures operate on [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so
+/// `x`, `y`, and `r` may each be a single tracer, a tuple, or any other parameterized structure. This high-level API
+/// does not expose JAX's `nondiff_argnums` calling convention. Static non-differentiated configuration should be
+/// captured by all three closures. A dynamic typed value should remain an explicit input; preserve it as a residual in
+/// `r` when `backward` needs it and return a zero cotangent for it in `x̄`. Transform-injected runtime metadata uses the
+/// lower-level [`CustomVjpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand
+/// while contributing no cotangent output.
 ///
 /// # Parameters
 ///
 ///   - `primal`: Closure implementing `f(x) = y` for ordinary evaluation.
-///   - `forward`: Closure implementing `f_fwd(x) = (y, r)` for reverse-mode residual production.
-///   - `backward`: Closure implementing `f_bwd(r, ȳ) = x̄ = D f(x)^T[ȳ]`.
+///   - `forward`: Closure implementing `x ↦ (y, r)` for reverse-mode residual production.
+///   - `backward`: Closure implementing `(r, ȳ) ↦ x̄ = J_f(x)ᵀ · ȳ`.
 ///
 /// # Tracing semantics
 ///
@@ -1419,7 +1406,7 @@ mod tests {
             Ok(vec![primal_type]),
         );
 
-        // The JVP interface must be `(inputs..., input tangents...) -> (outputs..., output tangents...)`; a
+        // The JVP interface must be `(inputs..., input tangents...) → (outputs..., output tangents...)`; a
         // primal-shaped rule signature is rejected.
         assert_eq!(
             operation.infer_output_types(
