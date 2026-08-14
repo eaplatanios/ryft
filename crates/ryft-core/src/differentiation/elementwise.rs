@@ -525,9 +525,8 @@ mod tests {
         ));
     }
 
-    // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_dynamic_output_axis_tangent_alignment() {
+    fn test_array_elementwise_derivative_alignment_with_dynamic_output_axes() {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
@@ -539,12 +538,12 @@ mod tests {
         assert!(matches!(
             value.align_tangent(&dynamic_type, &Array::scalar(0.0)),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "cannot align tangent type f64[2] to output type f64[batch, 2] because the geometry \
-                               exemplar type f64[] has a different shape",
+                if message == "cannot align tangent type f64[2] to output type f64[batch, 2] because the exemplar \
+                               type f64[] has a different shape",
         ));
 
         // Aligning the narrow operand's tangent with an implicitly broadcasting result that has a runtime extent takes
-        // its geometry from the primal result instead of from the metadata-only broadcast, whose payload output type
+        // its shape from the primal result instead of from the metadata-only broadcast, whose payload output type
         // program replay would never refine.
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(dynamic_type.into());
@@ -573,83 +572,6 @@ mod tests {
                     %7:f64[batch, 2] = add %2 %6
                 in (%4, %7)"},
         );
-    }
-
-    // TODO(eaplatanios): Review this test.
-    #[test]
-    fn test_dynamic_output_axis_elementwise_differentiation() {
-        // `tanh(x + b)` summed over both axes, with a runtime-sized leading axis: the implicitly broadcasting `add`
-        // and the reduction over the runtime-sized axis must both differentiate, and the resulting pullback must
-        // replay at more than one concrete extent.
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let dynamic_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(dynamic_type.into());
-        let bias = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
-        let sum = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
-                Vec::new(),
-                vec![input, bias],
-            )
-            .unwrap()[0];
-        let activated = builder
-            .add_instruction(ArrayIrOperation::Array(ArrayOperation::Tanh(TanhOperation::new())), Vec::new(), vec![sum])
-            .unwrap()[0];
-        let loss = builder
-            .add_instruction(
-                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
-                Vec::new(),
-                vec![activated],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![loss],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let linearization = program.linearize().unwrap();
-        let pullback = linearization.pullback().unwrap();
-        let bias_values = vec![0.5, -0.25];
-        for rows in [4usize, 2] {
-            let values = (0..rows * 2).map(|index| index as f64 * 0.1).collect::<Vec<_>>();
-            let mut primal_outputs = linearization
-                .primal()
-                .interpret(vec![
-                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone())),
-                    ArrayIrValue::Array(Array::vector(bias_values.clone())),
-                ])
-                .unwrap();
-            let residuals = primal_outputs.split_off(1);
-
-            // `d loss / d x_ij = 1 - tanh(x_ij + b_j)²` and `d loss / d b_j` sums that derivative over the batch.
-            let expected_input_cotangents = values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| 1.0 - (value + bias_values[index % 2]).tanh().powi(2))
-                .collect::<Vec<_>>();
-            let expected_bias_cotangents = vec![
-                expected_input_cotangents.iter().step_by(2).sum::<f64>(),
-                expected_input_cotangents.iter().skip(1).step_by(2).sum::<f64>(),
-            ];
-            let expected_loss =
-                values.iter().enumerate().map(|(index, value)| (value + bias_values[index % 2]).tanh()).sum::<f64>();
-            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_loss)));
-
-            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0))];
-            pullback_inputs.extend(residuals);
-            assert_eq!(
-                pullback.interpret(pullback_inputs),
-                Ok(vec![
-                    ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents)),
-                    ArrayIrValue::Array(Array::vector(expected_bias_cotangents)),
-                ]),
-            );
-        }
     }
 
     #[test]
@@ -952,5 +874,81 @@ mod tests {
         let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
         assert_eq!(left.r#type().as_ref(), &sharded_type);
         assert_eq!(right.r#type().as_ref(), &replicated_type);
+    }
+
+    #[test]
+    fn test_elementwise_differentiation_with_dynamic_output_axes() {
+        // `tanh(x + b)` summed over both axes, with a runtime-sized leading axis: the implicitly broadcasting `add`
+        // and the reduction over the runtime-sized axis must both differentiate, and the resulting pullback must
+        // replay at more than one concrete extent.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type.into());
+        let bias = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])).into());
+        let sum = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
+                Vec::new(),
+                vec![input, bias],
+            )
+            .unwrap()[0];
+        let activated = builder
+            .add_instruction(ArrayIrOperation::Array(ArrayOperation::Tanh(TanhOperation::new())), Vec::new(), vec![sum])
+            .unwrap()[0];
+        let loss = builder
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
+                Vec::new(),
+                vec![activated],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![loss],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        let bias_values = vec![0.5, -0.25];
+        for rows in [4usize, 2] {
+            let values = (0..rows * 2).map(|index| index as f64 * 0.1).collect::<Vec<_>>();
+            let mut primal_outputs = linearization
+                .primal()
+                .interpret(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, values.clone())),
+                    ArrayIrValue::Array(Array::vector(bias_values.clone())),
+                ])
+                .unwrap();
+            let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
+
+            // `d loss / d x_ij = 1 - tanh(x_ij + b_j)²` and `d loss / d b_j` sums that derivative over the batch.
+            let expected_input_cotangents = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| 1.0 - (value + bias_values[index % 2]).tanh().powi(2))
+                .collect::<Vec<_>>();
+            let expected_bias_cotangents = vec![
+                expected_input_cotangents.iter().step_by(2).sum::<f64>(),
+                expected_input_cotangents.iter().skip(1).step_by(2).sum::<f64>(),
+            ];
+            let expected_loss =
+                values.iter().enumerate().map(|(index, value)| (value + bias_values[index % 2]).tanh()).sum::<f64>();
+            assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(expected_loss)));
+
+            let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(1.0))];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(vec![
+                    ArrayIrValue::Array(Array::matrix(rows, 2, expected_input_cotangents)),
+                    ArrayIrValue::Array(Array::vector(expected_bias_cotangents)),
+                ]),
+            );
+        }
     }
 }

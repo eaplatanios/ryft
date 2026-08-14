@@ -414,6 +414,9 @@ nondifferentiated captures like `mean_scale` in the MLP example) is elided where
 obscure the structure; exact signatures of the not-yet-written helpers are indicative.
 
 The example targets the **Gemma 4 E2B** variant. Other variants drop in by changing the config.
+A companion plan for Meta's Muse Glimmer 30B — which shares this plan's R1/R2 infrastructure
+and delta-references its inventory and NVFP4 sections — lives in
+[muse_glimmer_30b_plan.md](muse_glimmer_30b_plan.md).
 
 ### 3.1 Configuration
 

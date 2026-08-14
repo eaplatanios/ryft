@@ -1177,22 +1177,145 @@ where
     }
 }
 
+/// Reshapes an array using one explicit first-class dimension value per output axis.
+///
+/// This is the shape-polymorphic counterpart of [`Reshape`], which reads its complete output geometry from
+/// [`ReshapeParameters`]. Exact dimension values describe static axes and computed dimension values describe dynamic
+/// axes. Both forms bind the same [`DynamicReshapeOperation`], so runtime shape arithmetic stays an ordinary graph
+/// computation instead of a type-level side condition; backend lowering chooses the appropriate static, bounded, or
+/// dynamic representation from the inferred result type.
+///
+/// Exact host sizes can use [`DynamicReshape::dynamic_reshape_to_sizes`]:
+///
+/// ```rust
+/// use ryft_core::operations::manipulation::DynamicReshape;
+/// use ryft_core::{Array, ArrayIrValue};
+///
+/// let input = ArrayIrValue::Array(Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+/// let output = input.dynamic_reshape_to_sizes(&[2, 3]).unwrap();
+/// assert_eq!(output, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])));
+/// ```
+///
+/// Computed or input dimensions remain ordinary SSA operands, which is what makes a runtime-derived output shape
+/// expressible. Here a `[batch, 6]` input is reshaped so that its dynamic leading extent is read off the input while
+/// its trailing extent is an exact lifted dimension. Extents derived by first-class dimension arithmetic work the
+/// same way; refer to [`ArrayIrOperations`](crate::ArrayIrOperations) for that projection path.
+///
+/// ```rust
+/// use ryft_core::operations::manipulation::DynamicReshape;
+/// use ryft_core::arrays::{
+///     ArrayIrType, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Shape,
+/// };
+/// use ryft_core::{
+///     Array, ArrayIrOperation, ArrayIrValue, Context, DimensionSize, StagingContext, TracingContext, Typed,
+/// };
+///
+/// type C = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+///
+/// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+/// let input_type =
+///     ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(6)]));
+/// let context = C::new();
+/// let input = context.input(ArrayIrType::Array(input_type));
+/// let rows = input.dimension_size(0).unwrap();
+/// let columns = context.lift(DimensionValue::constant(2).unwrap().into()).unwrap();
+/// let depth = context.lift(DimensionValue::constant(3).unwrap().into()).unwrap();
+/// let output = input.dynamic_reshape(&[rows, columns, depth]).unwrap();
+/// assert_eq!(output.r#type().to_string(), "f32[batch, 2, 3]");
+/// ```
+pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
+    /// Reshapes `self` to the output shape described by `output_dimensions`, one first-class value per output axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_dimensions`: Ordered output extents, one per result axis.
+    fn dynamic_reshape(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
+        self.dynamic_reshape_with_parameters(output_dimensions, None, None)
+    }
+
+    /// Reshapes `self` with an optional permutation applied to the input dimensions before the reshape and an
+    /// explicit requested output sharding.
+    ///
+    /// # Parameters
+    ///
+    ///   - `output_dimensions`: Ordered output extents, one per result axis.
+    ///   - `dimensions`: Permutation applied to the input dimensions before reshaping, if any.
+    ///   - `output_sharding`: Requested output [`Sharding`], if any.
+    fn dynamic_reshape_with_parameters(
+        &self,
+        output_dimensions: &[Self],
+        dimensions: Option<Permutation>,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError>;
+
+    /// Reshapes `self` to an exact static shape.
+    fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
+    where
+        Self::DispatchDomain: Context<Type = ArrayIrType>,
+        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    {
+        let output_dimensions = output_sizes
+            .iter()
+            .map(|extent| self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.dynamic_reshape(output_dimensions.as_slice())
+    }
+}
+
+impl<
+    V: Value<Type = ArrayIrType, DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>>,
+> DynamicReshape for V
+{
+    fn dynamic_reshape_with_parameters(
+        &self,
+        output_dimensions: &[Self],
+        dimensions: Option<Permutation>,
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        let input_type = self.r#type();
+        let input_type = <&ArrayType>::try_from(input_type.as_ref())?;
+        let output_shape =
+            Shape::new(ArrayIrType::extents(output_dimensions.iter().map(|dimension| dimension.r#type()))?);
+        let mut operation = DynamicReshapeOperation::new().with_output_sharding(output_sharding);
+        if let Some(dimensions) = dimensions {
+            operation = operation.with_dimensions(dimensions);
+        }
+        let output_type = infer_explicit_reshape_output_type(input_type, output_shape, &operation)?;
+
+        // A static identity reshape cannot observe its exact extent operands, so it stages nothing. Dynamic geometry
+        // keeps the instruction because its operands assert the runtime element-count relation.
+        if operation.has_identity_dimensions(input_type.rank())
+            && input_type.static_shape().is_some()
+            && &output_type == input_type
+        {
+            return Ok(self.clone());
+        }
+
+        let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
+        inputs.push(self.clone());
+        inputs.extend_from_slice(output_dimensions);
+        Ok(self.dispatch_domain().bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, StridedLayout,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, StridedLayout,
     };
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::{DimensionSize, Mul};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
+    use crate::tracing::Trace;
 
     use super::*;
 
@@ -1815,5 +1938,62 @@ mod tests {
             )
             .unwrap()),
         );
+    }
+
+    #[test]
+    fn test_dynamic_reshape() {
+        // A concrete composite value resolves every explicit extent operand and reshapes its array member directly.
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let rows = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let columns = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            input.dynamic_reshape(&[rows, columns]).unwrap(),
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0])),
+        );
+        assert_eq!(input.dynamic_reshape_to_sizes(&[3, 2]).unwrap().r#type().to_string(), "f64[3, 2]");
+        assert_eq!(input.dynamic_reshape_to_sizes(&[6]).unwrap(), input);
+
+        // A staged reshape whose output shape is runtime-derived keeps each extent an ordinary operand: the leading
+        // extent is read off the input and the trailing one is first-class dimension arithmetic.
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2), Dimension::Static(3)]),
+        );
+        let (output_type, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| {
+                // Dimension arithmetic lives in the first-class-dimension member, so the two static extents are
+                // multiplied through the dimension projection and the product is injected back.
+                let rows = input.dimension_size(0)?;
+                let width = ValueProjection::<DimensionType>::into_projected(input.dimension_size(1)?)?;
+                let height = ValueProjection::<DimensionType>::into_projected(input.dimension_size(2)?)?;
+                let columns = ValueProjection::<DimensionType>::from_projected(width.mul(&height)?);
+                input.dynamic_reshape(&[rows, columns])
+            },
+            ArrayIrType::Array(input_type),
+        )
+        .unwrap();
+        assert_eq!(output_type.to_string(), "f64[batch, 6]");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[batch, 2, 3] .
+                let %1:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
+                    %2:dimension<2> = dimension_size [axis=1] %0
+                    %3:dimension<3> = dimension_size [axis=2] %0
+                    %4:dimension<6> = dimension_mul %2 %3
+                    %5:f64[batch, 6] = reshape %0 %1 %4
+                in (%5)
+            "}
+            .trim_end(),
+        );
+
+        // A static identity reshape observes none of its extent operands and therefore stages no instruction.
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |input| input.dynamic_reshape_to_sizes(&[6]),
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]))),
+        )
+        .unwrap();
+        assert!(program.instructions().is_empty());
     }
 }
