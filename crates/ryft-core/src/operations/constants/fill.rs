@@ -86,17 +86,13 @@ impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>> Fill<L, Differ
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Internal recipe for implementing [`Fill`] by embedding a typed host literal in the active [`Context`].
-///
-/// For arrays, the implementation converts `value` into a rank-zero [`Array`] and binds it as a
-/// [`ConstantOperation`], then broadcasts that scalar to the requested type. The [`Array`] is only a portable literal
-/// payload: a backend context interprets or lowers the constant into its own runtime value. It is distinct from the
-/// context's [`Domain::Constant`](crate::Domain::Constant) representation, which stores lifted constants and program
-/// captures.
+/// Internal trait used for implementing [`Fill`] by embedding a typed host literal in the active [`Context`]. For
+/// arrays, the implementation converts `value` into a rank-zero [`Array`] and binds it as a [`ConstantOperation`],
+/// then broadcasts that scalar to the requested type. The [`Array`] is only a portable literal payload that a backend
+/// context interprets or lowers the constant into its own runtime value. It is distinct from the context's
+/// [`Domain::Constant`](crate::Domain::Constant) representation, which stores lifted constants and program captures.
 trait FillLiteral<L, T: Type>: Context<Type = T> {
-    /// Embeds `value` as a host literal and expands it to a value of `type` in this context.
+    /// Embeds `value` as a host literal and expands it to a value of `type` in this [`Context`].
     fn fill_literal(&self, r#type: &T, value: L) -> Result<Self::Value, ProgramError>;
 }
 
@@ -106,12 +102,12 @@ where
     C::Operation: From<ConstantOperation<Array>> + From<BroadcastOperation>,
 {
     fn fill_literal(&self, r#type: &ArrayType, value: L) -> Result<Self::Value, ProgramError> {
-        let literal =
-            Array::scalar(value).convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
-        let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
-        scalar.broadcast(r#type.clone(), &[])
+        let value = Array::scalar(value).convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+        self.bind(ConstantOperation::new(value), Vec::new(), &[])?.remove(0).broadcast(r#type.clone(), &[])
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
