@@ -451,7 +451,7 @@ where
     if configuration.dropout().is_some() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' dropout is only supported by the fused CUDA lowering"
+                "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout is only supported by the fused CUDA lowering"
             ),
         });
     }
@@ -584,7 +584,7 @@ where
     if configuration.dropout().is_some() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' dropout is only supported by the fused CUDA \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout is only supported by the fused CUDA \
                  lowering"
             ),
         });

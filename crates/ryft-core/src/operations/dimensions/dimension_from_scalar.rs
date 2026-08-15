@@ -136,7 +136,7 @@ impl DimensionFromScalarOperation {
     pub(crate) fn validate_input_type(input_type: &ArrayType) -> Result<(), TypeError> {
         if input_type.rank() != 0 || !input_type.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
-                "'{DIMENSION_FROM_SCALAR_OPERATION_NAME}' input must be a rank-0 integer array but has type \
+                "`{DIMENSION_FROM_SCALAR_OPERATION_NAME}` input must be a rank-0 integer array but has type \
                  {input_type}",
             )));
         }
@@ -357,12 +357,12 @@ mod tests {
                 &[],
             ),
             Err(
-                TypeError::invalid("'dimension_from_scalar' input must be a rank-0 integer array but has type i32[1]",)
+                TypeError::invalid("`dimension_from_scalar` input must be a rank-0 integer array but has type i32[1]",)
             ),
         );
         assert_eq!(
             operation.infer_output_types(&[ArrayType::scalar(DataType::F32).into()], &[]),
-            Err(TypeError::invalid("'dimension_from_scalar' input must be a rank-0 integer array but has type f32[]",)),
+            Err(TypeError::invalid("`dimension_from_scalar` input must be a rank-0 integer array but has type f32[]",)),
         );
         assert_eq!(
             operation.infer_output_types(&[operation.result_type().clone().into()], &[]),
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(
             Array::scalar(-1_i32).to_dimension(variable.clone()),
             Err(ProgramError::InvalidArgument {
-                message: "'dimension_from_scalar' scalar input must be a nonnegative host-representable extent but is \
+                message: "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is \
                           -1"
                 .to_string(),
             }),

@@ -128,7 +128,7 @@ pub(crate) fn ensure_assertion_handler_registered(client: &Client<'_>) -> Result
             .clone();
     }
     Err(Error::unimplemented(format!(
-        "compiled runtime assertions are not supported on XLA platform '{platform_name}'",
+        "compiled runtime assertions are not supported on XLA platform `{platform_name}`",
     )))
 }
 
@@ -203,7 +203,7 @@ fn scalar_bytes<const BYTE_COUNT: usize>(
     let source = unsafe { buffer.data() };
     if source.is_null() {
         return Err(FfiError::invalid_argument(format!(
-            "encountered a null scalar buffer in '{ASSERT_CUSTOM_CALL_TARGET}'",
+            "encountered a null scalar buffer in `{ASSERT_CUSTOM_CALL_TARGET}`",
         )));
     }
     let mut bytes = [0; BYTE_COUNT];
@@ -230,7 +230,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     }
     if buffers.len() < 2 {
         return Err(FfiError::invalid_argument(format!(
-            "expected the '{ASSERT_CUSTOM_CALL_TARGET}' custom call to receive a predicate and observed extents"
+            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` custom call to receive a predicate and observed extents"
         )));
     }
     let actor = string_attribute(call_frame, ASSERT_ACTOR_ATTRIBUTE)?;
@@ -240,7 +240,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         // relying on a fixed-arity predicate produced in StableHLO.
         if buffers.len() < 3 {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' concatenate assertion to receive a result extent and at \
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` concatenate assertion to receive a result extent and at \
                  least one input extent"
             )));
         }
@@ -253,24 +253,24 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     if kind == ASSERT_DYNAMIC_SHAPE_SLICE_KIND {
         if buffers.len() != 4 {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice assertion to receive the input \
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` dynamic-shape-slice assertion to receive the input \
                  extent, start, and size"
             )));
         }
         let detail = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
         let (axis, stride) = detail.split_once(':').ok_or_else(|| {
             FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice detail to contain 'axis:stride'"
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` dynamic-shape-slice detail to contain `axis:stride`"
             ))
         })?;
         let axis = axis.parse::<usize>().map_err(|_| {
             FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice axis to be an unsigned integer"
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` dynamic-shape-slice axis to be an unsigned integer"
             ))
         })?;
         let stride = stride.parse::<usize>().map_err(|_| {
             FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' dynamic-shape-slice stride to be an unsigned integer"
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` dynamic-shape-slice stride to be an unsigned integer"
             ))
         })?;
         let input_size = scalar_i64(&buffers[1], memory)?;
@@ -286,7 +286,7 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
     if arithmetic {
         if buffers.len() != 3 {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ASSERT_CUSTOM_CALL_TARGET}' arithmetic assertion to receive two extents"
+                "expected the `{ASSERT_CUSTOM_CALL_TARGET}` arithmetic assertion to receive two extents"
             )));
         }
         let left_name = string_attribute(call_frame, ASSERT_LEFT_ATTRIBUTE)?;
@@ -301,13 +301,13 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
         ASSERT_BOUNDS_KIND => 1,
         _ => {
             return Err(FfiError::invalid_argument(format!(
-                "unsupported '{ASSERT_KIND_ATTRIBUTE}' value '{kind}' for '{ASSERT_CUSTOM_CALL_TARGET}'"
+                "unsupported `{ASSERT_KIND_ATTRIBUTE}` value `{kind}` for `{ASSERT_CUSTOM_CALL_TARGET}`"
             )));
         }
     };
     if buffers.len() != expected_extent_count + 1 {
         return Err(FfiError::invalid_argument(format!(
-            "expected the '{ASSERT_CUSTOM_CALL_TARGET}' requirement assertion to receive {expected_extent_count} \
+            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` requirement assertion to receive {expected_extent_count} \
              extent(s)"
         )));
     }
@@ -327,11 +327,11 @@ fn handle_assertion_call_frame(call_frame: &FfiCallFrame<'_>, memory: AssertionB
                 ASSERT_DIVISIBLE_BY_KIND => format!("{left_name} % {right_name} == 0"),
                 _ => unreachable!(),
             };
-            format!("'{actor}' failed: {requirement}; observed {left_name}={left}, {right_name}={right}")
+            format!("`{actor}` failed: {requirement}; observed {left_name}={left}, {right_name}={right}")
         }
         ASSERT_BOUNDS_KIND => {
             let bounds = string_attribute(call_frame, ASSERT_DETAIL_ATTRIBUTE)?;
-            format!("'{actor}' failed: input dimension `{left_name}` = {left} is outside its declared bounds {bounds}")
+            format!("`{actor}` failed: input dimension `{left_name}` = {left} is outside its declared bounds {bounds}")
         }
         _ => unreachable!(),
     };
@@ -366,7 +366,7 @@ fn validate_arithmetic(kind: &str, left_name: &str, left: i64, right_name: &str,
         ASSERT_MUL_KIND => left.checked_mul(right).is_some(),
         ASSERT_POW_KIND => checked_power(left, right).is_some(),
         ASSERT_DIV_FLOOR_KIND | ASSERT_REM_KIND => right > 0,
-        _ => return Err(format!("unsupported arithmetic assertion kind '{kind}'")),
+        _ => return Err(format!("unsupported arithmetic assertion kind `{kind}`")),
     };
     if valid {
         return Ok(());
@@ -397,12 +397,12 @@ fn validate_concatenate(actor: &str, axis: &str, actual: i64, input_extents: &[i
     let expected = input_extents
         .iter()
         .try_fold(0_i64, |sum, extent| sum.checked_add(*extent))
-        .ok_or_else(|| format!("'{actor}' input axis {axis} extent sum overflows the portable dimension range"))?;
+        .ok_or_else(|| format!("`{actor}` input axis {axis} extent sum overflows the portable dimension range"))?;
     if expected == actual {
         Ok(())
     } else {
         Err(format!(
-            "'{actor}' result extent must equal the sum of input axis {axis} extents; expected {expected} but got \
+            "`{actor}` result extent must equal the sum of input axis {axis} extents; expected {expected} but got \
              {actual}",
         ))
     }
@@ -428,14 +428,14 @@ fn validate_dynamic_shape_slice(
         size.checked_sub(1)
             .and_then(|size| size.checked_mul(stride))
             .and_then(|span| span.checked_add(1))
-            .ok_or_else(|| format!("'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' span overflows usize on axis {axis}"))?
+            .ok_or_else(|| format!("`{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` span overflows usize on axis {axis}"))?
     };
     let limit = start
         .checked_add(span)
-        .ok_or_else(|| format!("'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' limit overflows usize on axis {axis}"))?;
+        .ok_or_else(|| format!("`{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` limit overflows usize on axis {axis}"))?;
     if limit > input_size {
         return Err(format!(
-            "'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' limit {limit} exceeds input axis {axis} extent {input_size}",
+            "`{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` limit {limit} exceeds input axis {axis} extent {input_size}",
         ));
     }
     Ok(())
@@ -449,13 +449,13 @@ fn string_attribute<'o>(call_frame: &FfiCallFrame<'o>, expected_name: &str) -> R
             return match attribute {
                 FfiAttribute::String { string } => Ok(string),
                 _ => Err(FfiError::invalid_argument(format!(
-                    "expected the '{expected_name}' attribute of '{ASSERT_CUSTOM_CALL_TARGET}' to be a string"
+                    "expected the `{expected_name}` attribute of `{ASSERT_CUSTOM_CALL_TARGET}` to be a string"
                 ))),
             };
         }
     }
     Err(FfiError::invalid_argument(format!(
-        "missing required '{expected_name}' attribute in the '{ASSERT_CUSTOM_CALL_TARGET}' custom call"
+        "missing required `{expected_name}` attribute in the `{ASSERT_CUSTOM_CALL_TARGET}` custom call"
     )))
 }
 
@@ -463,7 +463,7 @@ fn string_attribute<'o>(call_frame: &FfiCallFrame<'o>, expected_name: &str) -> R
 fn scalar_predicate(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<bool, FfiError> {
     if buffer.element_type() != FfiBufferType::Predicate || buffer.rank() != 0 {
         return Err(FfiError::invalid_argument(format!(
-            "expected the '{ASSERT_CUSTOM_CALL_TARGET}' predicate to be a rank-zero predicate buffer"
+            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` predicate to be a rank-zero predicate buffer"
         )));
     }
     Ok(scalar_bytes::<1>(buffer, memory)?[0] != 0)
@@ -473,7 +473,7 @@ fn scalar_predicate(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Re
 fn scalar_i64(buffer: &FfiBuffer<'_>, memory: AssertionBufferMemory) -> Result<i64, FfiError> {
     if buffer.element_type() != FfiBufferType::I64 || buffer.rank() != 0 {
         return Err(FfiError::invalid_argument(format!(
-            "expected the '{ASSERT_CUSTOM_CALL_TARGET}' observed extent to be a rank-zero i64 buffer"
+            "expected the `{ASSERT_CUSTOM_CALL_TARGET}` observed extent to be a rank-zero i64 buffer"
         )));
     }
     Ok(i64::from_ne_bytes(scalar_bytes(buffer, memory)?))
@@ -583,7 +583,7 @@ mod tests {
         );
         assert_eq!(
             validate_arithmetic("unknown", "left", 1, "right", 1),
-            Err("unsupported arithmetic assertion kind 'unknown'".to_string()),
+            Err("unsupported arithmetic assertion kind `unknown`".to_string()),
         );
     }
 
@@ -592,12 +592,12 @@ mod tests {
         assert_eq!(validate_concatenate("concatenate", "1", 7, &[2, 3, 2]), Ok(()));
         assert_eq!(
             validate_concatenate("concatenate", "1", 8, &[2, 3, 2]),
-            Err("'concatenate' result extent must equal the sum of input axis 1 extents; expected 7 but got 8"
+            Err("`concatenate` result extent must equal the sum of input axis 1 extents; expected 7 but got 8"
                 .to_string(),),
         );
         assert_eq!(
             validate_concatenate("concatenate", "1", 0, &[i64::MAX, 1]),
-            Err("'concatenate' input axis 1 extent sum overflows the portable dimension range".to_string()),
+            Err("`concatenate` input axis 1 extent sum overflows the portable dimension range".to_string()),
         );
     }
 
@@ -607,19 +607,19 @@ mod tests {
         assert_eq!(validate_dynamic_shape_slice(1, 2, 8, 8, 0), Ok(()));
         assert_eq!(
             validate_dynamic_shape_slice(1, 2, 8, 3, 4),
-            Err("'dynamic_shape_slice' limit 10 exceeds input axis 1 extent 8".to_string()),
+            Err("`dynamic_shape_slice` limit 10 exceeds input axis 1 extent 8".to_string()),
         );
         assert_eq!(
             validate_dynamic_shape_slice(1, usize::MAX, 8, 0, 2),
-            Err("'dynamic_shape_slice' stride is outside the portable dimension range on axis 1".to_string()),
+            Err("`dynamic_shape_slice` stride is outside the portable dimension range on axis 1".to_string()),
         );
         assert_eq!(
             validate_dynamic_shape_slice(1, i64::MAX as usize, i64::MAX, 0, 3),
-            Err("'dynamic_shape_slice' span overflows usize on axis 1".to_string()),
+            Err("`dynamic_shape_slice` span overflows usize on axis 1".to_string()),
         );
         assert_eq!(
             validate_dynamic_shape_slice(1, 1, i64::MAX, i64::MAX, 1),
-            Err("'dynamic_shape_slice' limit overflows usize on axis 1".to_string()),
+            Err("`dynamic_shape_slice` limit overflows usize on axis 1".to_string()),
         );
     }
 }

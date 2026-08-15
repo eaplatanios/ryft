@@ -21,7 +21,7 @@ define_elementwise_operation!(
         let input_type = input_types[0];
         if input_type == DataType::F8E8M0FNU {
             return Err(TypeError::invalid(format!(
-                "'{NEG_OPERATION_NAME}' does not support input data type f8e8m0fnu",
+                "`{NEG_OPERATION_NAME}` does not support input data type f8e8m0fnu",
             )));
         }
         Ok(vec![input_type])
@@ -56,7 +56,7 @@ macro_rules! impl_capability_for_primitive {
         impl Neg for $type {
             fn neg(&self) -> Result<Self, ProgramError> {
                 self.checked_neg().ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'{}' result does not fit in {}", NEG_OPERATION_NAME, stringify!($type)),
+                    message: format!("`{}` result does not fit in {}", NEG_OPERATION_NAME, stringify!($type)),
                 })
             }
         }
@@ -153,7 +153,7 @@ mod tests {
             }],
         );
         for input_type in [DataType::Token, DataType::Zero, DataType::Boolean, DataType::F8E8M0FNU] {
-            let message = format!("'{NEG_OPERATION_NAME}' does not support input data type {input_type}");
+            let message = format!("`{NEG_OPERATION_NAME}` does not support input data type {input_type}");
             check_operation_type_inference!(
                 @elementwise @unary,
                 operation = NegOperation,
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(Neg::neg(&5_i32), Ok(-5));
         assert_eq!(
             Neg::neg(&i8::MIN),
-            Err(ProgramError::InvalidArgument { message: "'neg' result does not fit in i8".to_string() }),
+            Err(ProgramError::InvalidArgument { message: "`neg` result does not fit in i8".to_string() }),
         );
         assert_eq!(Neg::neg(&2.5_f64), Ok(-2.5));
     }

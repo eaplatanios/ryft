@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(
             t11.without_dimension(0),
             Err(TypeError::invalid(
-                "cannot remove dimension 0 because it is sharded over the non-manual mesh axis 'x'".to_string(),
+                "cannot remove dimension 0 because it is sharded over the non-manual mesh axis `x`".to_string(),
             )),
         );
     }

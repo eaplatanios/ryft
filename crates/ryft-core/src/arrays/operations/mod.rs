@@ -732,7 +732,7 @@ where
                 });
                 let Some((index, input_axis)) = source else {
                     return Err(TypeError::invalid(format!(
-                        "cannot replicate '{}' operands into result shape {output_shape} because no operand carries \
+                        "cannot replicate `{}` operands into result shape {output_shape} because no operand carries \
                          its runtime axis {axis}",
                         operation.name(),
                     ))
@@ -1147,14 +1147,14 @@ mod tests {
         assert_eq!(
             dynamic_one.infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "'one' expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`one` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
             )),
         );
         let other = DimensionVariable::new("other", bounds);
         assert_eq!(
             dynamic_one.infer_output_types(&[DimensionType::new(other).into()], &[]),
             Err(TypeError::invalid(
-                "'one' operand 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
+                "`one` operand 0 has type dimension<other ∈ [1, 9)> but the output shape requires \
                  dimension<source ∈ [1, 9)>",
             )),
         );
@@ -1163,7 +1163,7 @@ mod tests {
                 &[DimensionType::new(source.clone()).into()],
                 &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
             ),
-            Err(TypeError::invalid("'one' expects no regions but got 1")),
+            Err(TypeError::invalid("`one` expects no regions but got 1")),
         );
 
         // Iota follows the same static-versus-dynamic routing while retaining and validating its varying axis.
@@ -1181,7 +1181,7 @@ mod tests {
         );
         assert_eq!(
             IotaOperation::new(dynamic_iota_type, 2).unwrap_err(),
-            TypeError::invalid("'iota' dimension 2 is out of bounds for rank 2"),
+            TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"),
         );
 
         let renamed_left = DimensionVariable::new("renamed_left", bounds);
@@ -1403,7 +1403,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'one' with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
+                "`one` with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
                  constructor instead",
             )
             .into()),

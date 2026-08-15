@@ -267,7 +267,7 @@ impl DimensionRequirementOperation {
                     Ok(())
                 } else {
                     Err(TypeError::invalid(format!(
-                        "'{}' input {index} has type {actual} but the operation was constructed for type {expected}",
+                        "`{}` input {index} has type {actual} but the operation was constructed for type {expected}",
                         self.operation_name(),
                     )))
                 }

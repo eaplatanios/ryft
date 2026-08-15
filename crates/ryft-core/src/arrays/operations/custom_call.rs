@@ -27,7 +27,7 @@ impl CustomCall for Array {
     ) -> Result<Vec<Self>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "the reference array backend cannot execute the foreign kernel '{}'",
+                "the reference array backend cannot execute the foreign kernel `{}`",
                 operation.target_name(),
             ),
         })
@@ -74,7 +74,7 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
                     if actual_extent != expected_extent {
                         return Err(ProgramError::InvalidArgument {
                             message: format!(
-                                "'{CUSTOM_CALL_OPERATION_NAME}' output {output_index} axis {axis} has extent \
+                                "`{CUSTOM_CALL_OPERATION_NAME}` output {output_index} axis {axis} has extent \
                                  {actual_extent}, but its explicit extent operand is {expected_extent}",
                             ),
                         });

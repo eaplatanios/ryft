@@ -84,7 +84,7 @@ where
         .count();
     if expected == 0 {
         return Err(TypeError::invalid(format!(
-            "'{name}' with static output type {type} has no dynamic dimensions; use the homogeneous nullary \
+            "`{name}` with static output type {type} has no dynamic dimensions; use the homogeneous nullary \
              constructor instead",
             r#type = r#type,
         ))
@@ -497,7 +497,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
         if !r#type.data_type().is_numeric() {
             return Err(TypeError::invalid(format!(
-                "'{}' requires a numeric element type but has {}",
+                "`{}` requires a numeric element type but has {}",
                 IOTA_OPERATION_NAME,
                 r#type.data_type(),
             ))
@@ -511,7 +511,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
                 dimension.value().ok_or_else(|| {
                     TypeError::invalid(format!(
                         "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
-                         over 'ArrayIrOperation', whose 'DynamicIota' constructor consumes one dimension operand per \
+                         over `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per \
                          dynamic axis",
                     ))
                 })
@@ -543,7 +543,7 @@ mod tests {
 
     use crate::arrays::arrays::{Array, array_type};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::encoding::{f6e2m3fn, f8e8m0fnu, i4, u4};
+    use crate::arrays::encoding::{f8e8m0fnu, i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::arrays::ArrayType;
@@ -564,7 +564,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        DynamicBroadcastOperation, Fill, Mul, Reduce, ReductionKind, StopGradientOperation, ZeroOperation,
+        DynamicBroadcastOperation, Mul, Reduce, ReductionKind, StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1433,29 +1433,6 @@ mod tests {
             context.one(&r#type),
             Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!())
         );
-        assert_eq!(
-            context.fill(&r#type, 2.5f32),
-            Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
-        );
-        // Explicit output types use ordinary element conversion, including narrowing.
-        assert_eq!(
-            context.fill(&r#type, 2.5f64),
-            Array::from_elements(r#type.clone(), &[2.5f32; 4]).map_err(|_| unreachable!()),
-        );
-        assert_eq!(
-            context.fill(&r#type, ComplexNumber::new(1.0f32, 2.0)),
-            Array::from_elements(r#type.clone(), &[1.0f32; 4]).map_err(|_| unreachable!()),
-        );
-        let integer_type = array_type(DataType::I32, &[2]);
-        assert_eq!(
-            context.fill(&integer_type, 2.5f64),
-            Array::from_elements(integer_type, &[2i32; 2]).map_err(|_| unreachable!()),
-        );
-        let boolean_type = array_type(DataType::Boolean, &[2]);
-        assert_eq!(
-            context.fill(&boolean_type, ComplexNumber::new(0.0f32, 2.0)),
-            Array::from_elements(boolean_type, &[true; 2]).map_err(|_| unreachable!()),
-        );
         // Iota materializes coordinates along the requested dimension in the declared element data type.
         assert_eq!(
             context.iota(&array_type(DataType::I32, &[2, 3]), 1).unwrap().elements::<i32>(),
@@ -1485,19 +1462,9 @@ mod tests {
                 u4::new(2).unwrap(),
             ]),
         );
-        assert_eq!(
-            context.fill(&array_type(DataType::F6E2M3FN, &[2]), f6e2m3fn::from_bits(0x08).unwrap()),
-            Array::from_elements(array_type(DataType::F6E2M3FN, &[2]), &[f6e2m3fn::from_bits(0x08).unwrap(); 2],),
-        );
-        assert_eq!(
-            context.fill(&array_type(DataType::U4, &[2]), 2.5f64).unwrap().elements::<u4>(),
-            Ok(vec![u4::new(2).unwrap(); 2]),
-        );
-
-        // Kernels that materialize a payload from a type reject dynamically sized types, and each diagnostic names
-        // the canonical array-program route that does admit dynamic extents. `zero` and `one` share the storage-level
-        // rejection raised by `ArrayAddressing::new`, while `fill` and `iota` carry their own constructor-specific
-        // guards and therefore name their exact replacements.
+        // Kernels that materialize a payload from a type reject dynamically sized types. `zero` and `one` share the
+        // storage-level rejection raised by `ArrayAddressing::new`, while `iota` names the array-program route that
+        // admits dynamic extents.
         let dynamic_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![
@@ -1506,7 +1473,7 @@ mod tests {
             ]),
         );
         let expected_message = "cannot materialize a value of dynamically sized type f64[dynamic, 3]; dynamically \
-                                shaped values exist only in array programs over 'ArrayIrOperation'";
+                                shaped values exist only in array programs over `ArrayIrOperation`";
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
@@ -1516,14 +1483,9 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == expected_message,
         ));
         assert_eq!(
-            context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(),
-            "cannot materialize a value of dynamically sized type f64[dynamic, 3]; stage a rank-zero fill and expand \
-             it with a dynamic 'broadcast' operation instead",
-        );
-        assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),
             "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
-             'ArrayIrOperation', whose 'DynamicIota' constructor consumes one dimension operand per dynamic axis",
+             `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
         );
     }
 

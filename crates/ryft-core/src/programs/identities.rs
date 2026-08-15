@@ -65,7 +65,7 @@ impl<I: TypeIdentity> TypeIdentityRenaming<I> {
         if let Some((_, existing)) = self.replacements.iter().find(|(candidate, _)| candidate == &source) {
             if existing != &target {
                 return Err(TypeError::invalid(format!(
-                    "type identity '{source}' is renamed to both '{existing}' and '{target}'",
+                    "type identity `{source}` is renamed to both `{existing}` and `{target}`",
                 )));
             }
             return Ok(());
@@ -80,7 +80,7 @@ impl<I: TypeIdentity> TypeIdentityRenaming<I> {
         let target = source.fresh();
         if unavailable.contains(&target) {
             return Err(TypeError::invalid(format!(
-                "fresh replacement for type identity '{source}' collides with an existing type identity",
+                "fresh replacement for type identity `{source}` collides with an existing type identity",
             )));
         }
         self.insert(source, target.clone())?;
@@ -232,7 +232,7 @@ mod tests {
         assert!(matches!(
             renaming.insert(first, TestIdentity::new("third")),
             Err(TypeError::Invalid { message })
-                if message == "type identity 'first' is renamed to both 'second' and 'third'",
+                if message == "type identity `first` is renamed to both `second` and `third`",
         ));
     }
 
@@ -261,7 +261,7 @@ mod tests {
         assert_eq!(
             TypeIdentityRenaming::new().insert_fresh(identity.clone(), std::slice::from_ref(&identity)),
             Err(TypeError::invalid(
-                "fresh replacement for type identity 'identity' collides with an existing type identity",
+                "fresh replacement for type identity `identity` collides with an existing type identity",
             )),
         );
     }

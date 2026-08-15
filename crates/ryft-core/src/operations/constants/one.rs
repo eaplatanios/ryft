@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             OneOperation::new(dynamic_type).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "'one' cannot construct type f32[rows, 3] without operands because it references identity rows",
+                "`one` cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::new(rows);

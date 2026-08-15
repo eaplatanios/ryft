@@ -21,7 +21,7 @@ where
             {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "'{DOT_OPERATION_NAME}' does not support bounded ragged dimension `{}` on a replicated operand",
+                        "`{DOT_OPERATION_NAME}` does not support bounded ragged dimension `{}` on a replicated operand",
                         ragged_axis.dimension(),
                     ),
                 });
@@ -41,7 +41,7 @@ where
                         // TODO(eaplatanios): Are backticks conventional in Rust for these kinds of error messages?
                         //  If so, can we use them conssitently in the codebase (e.g., replacing single quotes where
                         //  this same convention would apply)?
-                        "'{DOT_OPERATION_NAME}' operands map different batch extents `{left}` and `{right}`"
+                        "`{DOT_OPERATION_NAME}` operands map different batch extents `{left}` and `{right}`"
                     ),
                 },
             });
@@ -59,7 +59,7 @@ where
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(self.dimensions(), aligned_axes[0], aligned_axes[1])
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
                 message: format!(
-                    "'{DOT_OPERATION_NAME}' batching failed to lift its dimension numbers for the aligned batch axes",
+                    "`{DOT_OPERATION_NAME}` batching failed to lift its dimension numbers for the aligned batch axes",
                 ),
             })?;
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
@@ -115,7 +115,7 @@ where
             {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
-                        "'{DOT_OPERATION_NAME}' does not support bounded ragged dimension `{}` on a batching dimension",
+                        "`{DOT_OPERATION_NAME}` does not support bounded ragged dimension `{}` on a batching dimension",
                         ragged_axis.dimension(),
                     ),
                 });

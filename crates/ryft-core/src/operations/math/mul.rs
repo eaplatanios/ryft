@@ -36,13 +36,13 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
         (false, false) => {
             return Err(TypeError::invalid(format!(
-                "'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced",
+                "`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced",
             )));
         }
         (false, true) => {
             if left_unreduced != right_reduced {
                 return Err(TypeError::invalid(format!(
-                    "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
+                    "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes \
                              the first is unreduced over",
                 )));
             }
@@ -51,7 +51,7 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
         (true, false) => {
             if right_unreduced != left_reduced {
                 return Err(TypeError::invalid(format!(
-                    "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
+                    "`{MUL_OPERATION_NAME}` requires the first operand to be reduced over the axes \
                              the second is unreduced over",
                 )));
             }
@@ -70,7 +70,7 @@ fn infer_mul_output_array_types(input_types: &[ArrayType]) -> Result<Vec<ArrayTy
     } else if right_reduced.is_empty() && left_reduced == &output_unreduced {
         left_reduced.clone()
     } else {
-        return Err(TypeError::invalid(format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes")));
+        return Err(TypeError::invalid(format!("`{MUL_OPERATION_NAME}` operands must be reduced over the same axes")));
     };
     output_reduced.retain(|axis| !output_unreduced.contains(axis));
 
@@ -146,7 +146,7 @@ macro_rules! impl_capability_for_primitive {
         impl Mul for $type {
             fn mul(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_mul(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'{}' result does not fit in {}", MUL_OPERATION_NAME, stringify!($type)),
+                    message: format!("`{}` result does not fit in {}", MUL_OPERATION_NAME, stringify!($type)),
                 })
             }
         }
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
         assert_eq!(
             Mul::mul(&usize::MAX, &2),
-            Err(ProgramError::InvalidArgument { message: "'mul' result does not fit in usize".to_string() }),
+            Err(ProgramError::InvalidArgument { message: "`mul` result does not fit in usize".to_string() }),
         );
     }
 
@@ -249,7 +249,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F8E3M4, DataType::F32],
-                    error = format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
+                    error = format!("`{MUL_OPERATION_NAME}` input types are not broadcast-compatible"),
                 },
             ],
         );
@@ -297,7 +297,7 @@ mod tests {
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [unreduced("x"), unreduced("x")],
-                error = format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
+                error = format!("`{MUL_OPERATION_NAME}` cannot multiply two operands that are both unreduced"),
             }],
         );
 
@@ -307,7 +307,7 @@ mod tests {
             cases = [{
                 input_types = [unreduced("x"), reduced("y")],
                 error = format!(
-                    "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes the first is \
+                    "`{MUL_OPERATION_NAME}` requires the second operand to be reduced over the axes the first is \
                      unreduced over",
                 ),
             }],
@@ -329,7 +329,7 @@ mod tests {
             operation = MulOperation::<ArrayType>::new(),
             cases = [{
                 input_types = [reduced("x"), vector_type()],
-                error = format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
+                error = format!("`{MUL_OPERATION_NAME}` operands must be reduced over the same axes"),
             }],
         );
     }
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(Mul::mul(&3_usize, &4), Ok(12));
         assert_eq!(
             Mul::mul(&i8::MAX, &2),
-            Err(ProgramError::InvalidArgument { message: "'mul' result does not fit in i8".to_string() }),
+            Err(ProgramError::InvalidArgument { message: "`mul` result does not fit in i8".to_string() }),
         );
         assert_eq!(Mul::mul(&2.5_f64, &4.0), Ok(10.0));
     }

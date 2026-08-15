@@ -61,7 +61,7 @@ fn test_dot_accumulation_type() {
         operation = narrowing,
         cases = [{
             input_types = [f32_operand.clone(), f32_operand],
-            error = "'dot' operand data type f32 cannot accumulate at data type f16",
+            error = "`dot` operand data type f32 cannot accumulate at data type f16",
         }],
     );
     let mesh = test_mesh();
@@ -72,7 +72,7 @@ fn test_dot_accumulation_type() {
         operation = sharded,
         cases = [{
             input_types = [lhs.clone(), rhs.clone()],
-            error = "'dot' does not support combining an accumulation type with a requested output sharding yet",
+            error = "`dot` does not support combining an accumulation type with a requested output sharding yet",
         }],
     );
 
@@ -223,7 +223,7 @@ fn test_dot_inference_with_dynamic_dimensions() {
     );
     assert_eq!(
         operation.infer_output_types(&[lhs.clone(), static_rhs], &[]),
-        Err(TypeError::invalid("'dot' contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string())),
+        Err(TypeError::invalid("`dot` contracting dimension sizes do not match (LHS axis 2, RHS axis 1)".to_string())),
     );
     let mismatched_batch_rhs = ArrayType::new(
         DataType::F64,
@@ -235,7 +235,7 @@ fn test_dot_inference_with_dynamic_dimensions() {
     );
     assert_eq!(
         operation.infer_output_types(&[lhs, mismatched_batch_rhs], &[]),
-        Err(TypeError::invalid("'dot' batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string())),
+        Err(TypeError::invalid("`dot` batching dimension sizes do not match (LHS axis 0, RHS axis 0)".to_string())),
     );
 }
 
@@ -338,7 +338,7 @@ fn test_dot_inference_batch_sharding_conflict() {
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
         Err(TypeError::invalid(
-            "'dot' batching dimensions must have consistent shardings, but got {'b'} and {'m'}".to_string()
+            "`dot` batching dimensions must have consistent shardings, but got {'b'} and {'m'}".to_string()
         )),
     );
 }
@@ -353,7 +353,7 @@ fn test_dot_inference_contracting_sharding_errors() {
     assert_eq!(
         operation.infer_output_types(&[lhs.clone(), rhs], &[]),
         Err(TypeError::invalid(
-            "'dot' contracting dimensions are sharded, making the output sharding ambiguous; request an \
+            "`dot` contracting dimensions are sharded, making the output sharding ambiguous; request an \
                           explicit output sharding (e.g., one with unreduced axes) to resolve it"
                 .to_string()
         )),
@@ -364,7 +364,7 @@ fn test_dot_inference_contracting_sharding_errors() {
     assert_eq!(
         operation.infer_output_types(&[lhs.clone(), mismatched_rhs], &[]),
         Err(TypeError::invalid(
-            "'dot' contracting dimensions must have consistent shardings, but got {'k'} and {'m'}".to_string()
+            "`dot` contracting dimensions must have consistent shardings, but got {'k'} and {'m'}".to_string()
         )),
     );
     // A contracting dimension sharded on only one operand is allowed, and its sharding is dropped.
@@ -390,7 +390,7 @@ fn test_dot_inference_mesh_mismatch() {
         sharded_array(&other_mesh, &[8, 16], vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]);
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
-        Err(TypeError::invalid("'dot' operand shardings must use the same mesh".to_string())),
+        Err(TypeError::invalid("`dot` operand shardings must use the same mesh".to_string())),
     );
 }
 
@@ -409,7 +409,7 @@ fn test_dot_inference_unreduced_and_reduced_operands() {
         .unwrap();
     assert_eq!(
         operation.infer_output_types(&[unreduced_lhs, plain_array(&[8, 16])], &[]),
-        Err(TypeError::invalid("'dot' operands cannot be unreduced".to_string())),
+        Err(TypeError::invalid("`dot` operands cannot be unreduced".to_string())),
     );
 
     // Reduced operands are legal (this is what lets adjoint dots consume reduced cotangents), and their reduced
@@ -489,7 +489,7 @@ fn test_dot_inference_output_sharding_bypass_and_validation() {
         .with_output_sharding(rank_mismatched);
     assert_eq!(
         operation.infer_output_types(&[lhs.clone(), rhs.clone()], &[]),
-        Err(TypeError::invalid("'dot' output sharding rank (1) does not match the output rank (3)".to_string())),
+        Err(TypeError::invalid("`dot` output sharding rank (1) does not match the output rank (3)".to_string())),
     );
 
     // Mesh validation.
@@ -499,7 +499,7 @@ fn test_dot_inference_output_sharding_bypass_and_validation() {
         .with_output_sharding(other_mesh_sharding);
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
-        Err(TypeError::invalid("'dot' output sharding must use the same mesh as the operands".to_string())),
+        Err(TypeError::invalid("`dot` output sharding must use the same mesh as the operands".to_string())),
     );
 
     // Auto mesh axes cannot be requested explicitly.
@@ -509,7 +509,7 @@ fn test_dot_inference_output_sharding_bypass_and_validation() {
     let operation = DotOperation::matmul().with_output_sharding(auto_sharding);
     assert_eq!(
         operation.infer_output_types(&[plain_array(&[4, 8]), plain_array(&[8, 16])], &[]),
-        Err(TypeError::invalid("'dot' output sharding cannot reference auto mesh axes".to_string())),
+        Err(TypeError::invalid("`dot` output sharding cannot reference auto mesh axes".to_string())),
     );
 }
 
@@ -536,7 +536,7 @@ fn test_dot_inference_unreduced_output_sharding() {
     assert_eq!(
         operation.infer_output_types(&[lhs.clone(), replicated_rhs.clone()], &[]),
         Err(TypeError::invalid(
-            "'dot' contracting dimensions must be sharded identically when the output sharding is unreduced"
+            "`dot` contracting dimensions must be sharded identically when the output sharding is unreduced"
                 .to_string()
         )),
     );
@@ -551,7 +551,7 @@ fn test_dot_inference_unreduced_output_sharding() {
     assert_eq!(
         operation.infer_output_types(&[lhs, rhs], &[]),
         Err(TypeError::invalid(
-            "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+            "`dot` output sharding unreduced axes must equal the axes that shard the contracting dimensions"
                 .to_string()
         )),
     );
@@ -567,7 +567,7 @@ fn test_dot_inference_unreduced_output_sharding() {
             &[]
         ),
         Err(TypeError::invalid(
-            "'dot' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+            "`dot` output sharding unreduced axes must equal the axes that shard the contracting dimensions"
                 .to_string()
         )),
     );
@@ -803,7 +803,7 @@ fn test_dot_batching_validates_mapped_extents() {
             .map(|outputs| outputs.into_parts().0)
             .unwrap_err(),
         BatchingError::MisalignedBatchAxes {
-            message: "'dot' operands map different batch extents `batch` and `other`".to_string(),
+            message: "`dot` operands map different batch extents `batch` and `other`".to_string(),
         },
     );
 }
@@ -874,7 +874,7 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
             .map(|outputs| outputs.into_parts().0)
             .unwrap_err(),
         BatchingError::UnsupportedOperation {
-            message: "'dot' does not support bounded ragged dimension `length` on a batching dimension".to_string(),
+            message: "`dot` does not support bounded ragged dimension `length` on a batching dimension".to_string(),
         },
     );
 
@@ -896,7 +896,7 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
             .map(|outputs| outputs.into_parts().0)
             .unwrap_err(),
         BatchingError::UnsupportedOperation {
-            message: "'dot' does not support bounded ragged dimension `length` on a replicated operand".to_string(),
+            message: "`dot` does not support bounded ragged dimension `length` on a replicated operand".to_string(),
         },
     );
 }

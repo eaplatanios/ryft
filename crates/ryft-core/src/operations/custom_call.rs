@@ -311,8 +311,8 @@ impl<T: Type> CustomCallOperation<T> {
             .find(|alias| alias.input_index == input_index || alias.output_index == output_index)
         {
             return Err(TypeError::invalid(format!(
-                "'{CUSTOM_CALL_OPERATION_NAME}' cannot add alias {input_index}->{output_index} because alias \
-                 '{alias}' already uses the same input or output",
+                "`{CUSTOM_CALL_OPERATION_NAME}` cannot add alias {input_index}->{output_index} because alias \
+                 `{alias}` already uses the same input or output",
             )));
         }
         self.input_output_aliases.push(CustomCallInputOutputAlias::new(input_index, output_index));
@@ -457,8 +457,8 @@ impl<T: Type> CustomCallOperation<T> {
                     Some(layout @ Layout::Strided(_)) => {
                         return Err(BatchingError::UnsupportedOperation {
                             message: format!(
-                                "custom call '{}' cannot batch output {output_index} because its strided layout \
-                                 '{layout}' does not determine the byte stride of the inserted batch axis",
+                                "custom call `{}` cannot batch output {output_index} because its strided layout \
+                                 `{layout}` does not determine the byte stride of the inserted batch axis",
                                 self.target_name,
                             ),
                         });
@@ -473,7 +473,7 @@ impl<T: Type> CustomCallOperation<T> {
     fn mapped_operand_error(&self, index: usize, batch_axis: BatchAxis) -> BatchingError {
         BatchingError::UnsupportedOperation {
             message: format!(
-                "custom call '{}' has no batching rule for operand {index} mapped at batch axis {}; invoke a kernel \
+                "custom call `{}` has no batching rule for operand {index} mapped at batch axis {}; invoke a kernel \
                  that understands the batch axis, or select an explicit batching behavior with \
                  `CustomCallOperation::with_batching`",
                 self.target_name,
@@ -551,15 +551,15 @@ impl<T: Type> CustomCallOperation<T> {
             };
             let Some(output_type) = self.output_types.get(alias.output_index) else {
                 return Err(TypeError::invalid(format!(
-                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' refers to output {} but the call has {} outputs",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to output {} but the call has {} outputs",
                     alias.output_index,
                     self.output_types.len(),
                 )));
             };
             if *input_type != output_type {
                 return Err(TypeError::invalid(format!(
-                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' requires matching input and output types but \
-                     input {} has type '{}' and output {} has type '{}'",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` requires matching input and output types but \
+                     input {} has type `{}` and output {} has type `{}`",
                     alias.input_index, input_type, alias.output_index, output_type,
                 )));
             }
@@ -589,7 +589,7 @@ impl Operation for CustomCallOperation<ArrayType> {
         for output_type in &self.output_types {
             if output_type.static_shape().is_none() {
                 return Err(TypeError::invalid(format!(
-                    "'{CUSTOM_CALL_OPERATION_NAME}' requires explicit result-extent operands for dynamic output type \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` requires explicit result-extent operands for dynamic output type \
                      {output_type}",
                 )));
             }
@@ -636,7 +636,7 @@ impl Operation for CustomCallOperation<ArrayIrType> {
             .collect::<Vec<_>>();
         let Some(array_input_count) = input_types.len().checked_sub(dynamic_output_dimensions.len()) else {
             return Err(TypeError::invalid(format!(
-                "'{CUSTOM_CALL_OPERATION_NAME}' expects {} trailing output-extent dimensions but only {} inputs were \
+                "`{CUSTOM_CALL_OPERATION_NAME}` expects {} trailing output-extent dimensions but only {} inputs were \
                  provided",
                 dynamic_output_dimensions.len(),
                 input_types.len(),
@@ -649,9 +649,9 @@ impl Operation for CustomCallOperation<ArrayIrType> {
             let actual_variable = <&crate::arrays::DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
                 return Err(TypeError::invalid(format!(
-                    "'{CUSTOM_CALL_OPERATION_NAME}' output-extent operand defines dimension variable \
-                     '{actual_variable}', but the corresponding declared output axis refers to \
-                     '{expected_variable}'",
+                    "`{CUSTOM_CALL_OPERATION_NAME}` output-extent operand defines dimension variable \
+                     `{actual_variable}`, but the corresponding declared output axis refers to \
+                     `{expected_variable}`",
                 )));
             }
         }
@@ -706,7 +706,7 @@ impl_differentiable_operation! {
             // `ffi_call` differentiation.
             Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "custom call '{}' has no differentiation rule; wrap it with `{}` or `{}` to provide one",
+                    "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
                     operation.target_name,
                     CUSTOM_JVP_OPERATION_NAME,
                     CUSTOM_VJP_OPERATION_NAME,
@@ -1128,13 +1128,13 @@ mod tests {
         assert!(matches!(
             operation.clone().with_input_output_alias(0, 1),
             Err(TypeError::Invalid { message })
-                if message == "'custom_call' cannot add alias 0->1 because alias '0->0' already uses the same input \
+                if message == "`custom_call` cannot add alias 0->1 because alias `0->0` already uses the same input \
                                or output",
         ));
         assert!(matches!(
             operation.clone().with_input_output_alias(1, 0),
             Err(TypeError::Invalid { message })
-                if message == "'custom_call' cannot add alias 1->0 because alias '0->0' already uses the same input \
+                if message == "`custom_call` cannot add alias 1->0 because alias `0->0` already uses the same input \
                                or output",
         ));
         assert_eq!(
@@ -1142,14 +1142,14 @@ mod tests {
                 .with_input_output_alias(1, 0)
                 .unwrap()
                 .infer_output_types(&[vector_type()], &[]),
-            Err(TypeError::invalid("'custom_call' alias '1->0' refers to input 1 but the call has 1 array inputs",)),
+            Err(TypeError::invalid("`custom_call` alias `1->0` refers to input 1 but the call has 1 array inputs",)),
         );
         assert_eq!(
             CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
                 .with_input_output_alias(0, 1)
                 .unwrap()
                 .infer_output_types(&[vector_type()], &[]),
-            Err(TypeError::invalid("'custom_call' alias '0->1' refers to output 1 but the call has 1 outputs",)),
+            Err(TypeError::invalid("`custom_call` alias `0->1` refers to output 1 but the call has 1 outputs",)),
         );
         assert_eq!(
             CustomCallOperation::new("ryft.test.add_one", vec![ArrayType::scalar(DataType::F32)])
@@ -1157,8 +1157,8 @@ mod tests {
                 .unwrap()
                 .infer_output_types(&[vector_type()], &[]),
             Err(TypeError::invalid(
-                "'custom_call' alias '0->0' requires matching input and output types but input 0 has type 'f32[2]' \
-                 and output 0 has type 'f32[]'",
+                "`custom_call` alias '0->0' requires matching input and output types but input 0 has type `f32[2]` \
+                 and output 0 has type `f32[]`",
             )),
         );
 
@@ -1216,7 +1216,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'custom_call' expects 2 trailing output-extent dimensions but only 1 inputs were provided",
+                "`custom_call` expects 2 trailing output-extent dimensions but only 1 inputs were provided",
             )),
         );
     }
@@ -1255,7 +1255,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[vector_type()], &[]),
             Err(TypeError::invalid(
-                "'custom_call' requires explicit result-extent operands for dynamic output type f32[rows, 3]",
+                "`custom_call` requires explicit result-extent operands for dynamic output type f32[rows, 3]",
             )),
         );
     }
@@ -1272,7 +1272,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "the reference array backend cannot execute the foreign kernel 'ryft.test.add_one'",
+                if message == "the reference array backend cannot execute the foreign kernel `ryft.test.add_one`",
         ));
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         assert!(matches!(
             program.jvp(),
             Err(error)
-                if error.to_string().contains("custom call 'ryft.test.add_one' has no differentiation rule"),
+                if error.to_string().contains("custom call `ryft.test.add_one` has no differentiation rule"),
         ));
         assert!(matches!(
             program.batched(
@@ -1300,7 +1300,7 @@ mod tests {
             ),
             Err(error)
                 if error.to_string()
-                    == "custom call 'ryft.test.add_one' has no batching rule for operand 0 mapped at batch axis 0; \
+                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));
@@ -1407,7 +1407,7 @@ mod tests {
             program.jvp(),
             Err(error)
                 if error.to_string()
-                    == "custom call 'ryft.test.add_one' has no differentiation rule; wrap it with `custom_jvp` or \
+                    == "custom call `ryft.test.add_one` has no differentiation rule; wrap it with `custom_jvp` or \
                         `custom_vjp` to provide one",
         ));
 
@@ -1424,7 +1424,7 @@ mod tests {
             operation.batch(&batching_context, &EmptyRegionDriver, &[mapped]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
-                    == "custom call 'ryft.test.add_one' has no batching rule for operand 0 mapped at batch axis 0; \
+                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));
@@ -1644,8 +1644,8 @@ mod tests {
             program.batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural),
             Err(BatchingError::UnsupportedOperation { message })
                 if message
-                    == "custom call 'ryft.test.add_one' cannot batch output 0 because its strided layout \
-                        'strided{4}' does not determine the byte stride of the inserted batch axis",
+                    == "custom call `ryft.test.add_one` cannot batch output 0 because its strided layout \
+                        `strided{4}` does not determine the byte stride of the inserted batch axis",
         ));
     }
 

@@ -85,11 +85,11 @@ pub(crate) enum LoweringError {
     MlirError(#[from] ryft_mlir::Error),
 
     /// Error returned when a lowered function name is empty or contains whitespace.
-    #[error("invalid function name '{function_name}' used during XLA lowering")]
+    #[error("invalid function name `{function_name}` used during XLA lowering")]
     InvalidFunctionName { function_name: String },
 
     /// Error returned when lowering encounters a traced tensor type that MLIR rejects.
-    #[error("invalid tensor type '{array_type}' used during XLA lowering")]
+    #[error("invalid tensor type `{array_type}` used during XLA lowering")]
     InvalidTensorType { array_type: ArrayType },
 
     /// Error returned when a reshape dimension cannot be represented by StableHLO's signed shape element type.
@@ -101,7 +101,7 @@ pub(crate) enum LoweringError {
     PadInteriorPaddingOutOfRange { value: usize },
 
     /// Error returned when lowering encounters a staged op that does not yet have StableHLO support.
-    #[error("unsupported staged op '{op}' during XLA lowering")]
+    #[error("unsupported staged op `{op}` during XLA lowering")]
     UnsupportedOp { op: String },
 
     /// Error returned when a shard-map body carries ordered effects, whose tokens `sdy.manual_computation` cannot
@@ -117,7 +117,7 @@ pub(crate) enum LoweringError {
     MissingCapturedConstant { index: usize },
 
     /// Error returned when lowering tries to materialize abstract XLA type metadata as a literal value.
-    #[error("abstract XLA value '{array_type}' cannot be materialized as a StableHLO literal")]
+    #[error("abstract XLA value `{array_type}` cannot be materialized as a StableHLO literal")]
     AbstractValueLiteral { array_type: ArrayType },
 
     /// Error returned when signature sharding metadata does not match the lowered function signature.
@@ -134,11 +134,11 @@ pub(crate) enum LoweringError {
     },
 
     /// Error returned when lowering encounters a type that does not have StableHLO support yet.
-    #[error("unsupported data type '{data_type}' during XLA lowering")]
+    #[error("unsupported data type `{data_type}` during XLA lowering")]
     UnsupportedDataType { data_type: DataType },
 
     /// Error returned when MLIR rejects the constructed dense-elements attribute.
-    #[error("invalid dense elements attribute for data type '{data_type}' during XLA lowering")]
+    #[error("invalid dense elements attribute for data type `{data_type}` during XLA lowering")]
     InvalidDenseElementsAttribute { data_type: DataType },
 
     /// Error returned when the constructed MLIR module fails verification.
@@ -592,7 +592,7 @@ where
 {
     let input_type = input.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: format!("elementwise operand has non-tensor MLIR type '{input_type}'"),
+        op: format!("elementwise operand has non-tensor MLIR type `{input_type}`"),
     })?;
     let output_tensor_type = lower_tensor_type(output_type, context, location)?;
     let output_element_type = output_tensor_type.element_type()?;
@@ -2314,7 +2314,7 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     if output_types.is_empty() {
         return Err(ProgramError::UnsupportedOperation {
-            message: format!("'{SORT_OPERATION_NAME}' needs at least one input"),
+            message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
         }
         .into());
     }
@@ -2723,7 +2723,7 @@ fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?]);
     }
 
-    Err(LoweringError::UnsupportedOp { op: format!("missing typed decomposition for '{}'", operation.name()) })
+    Err(LoweringError::UnsupportedOp { op: format!("missing typed decomposition for `{}`", operation.name()) })
 }
 
 /// Returns the minor-to-major layout required by one custom-call array type.
@@ -2733,12 +2733,12 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, Lo
     };
     let Layout::Tiled(layout) = layout else {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout '{layout}'"),
+            op: format!("{CUSTOM_CALL_OPERATION_NAME} with strided array layout `{layout}`"),
         });
     };
     if !layout.tiles().is_empty() {
         return Err(LoweringError::UnsupportedOp {
-            op: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout '{layout}'"),
+            op: format!("{CUSTOM_CALL_OPERATION_NAME} with tiled array layout `{layout}`"),
         });
     }
     if layout.rank() != r#type.rank()
@@ -2747,7 +2747,7 @@ fn lower_custom_call_layout(r#type: &ArrayType) -> Result<Option<Vec<usize>>, Lo
     {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
-                "{} with invalid array layout '{}' for rank-{} type '{}'",
+                "{} with invalid array layout `{}` for rank-{} type `{}`",
                 CUSTOM_CALL_OPERATION_NAME,
                 layout,
                 r#type.rank(),
@@ -6430,7 +6430,7 @@ where
             if !instruction.regions().is_empty() {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "plain-program lowering does not support attached regions for '{}'; use the production \
+                        "plain-program lowering does not support attached regions for `{}`; use the production \
                          composite XLA lowerer",
                         instruction.operation().name(),
                     ),
@@ -7140,7 +7140,7 @@ fn mesh_axis_replica_groups(
     if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "collective over axis '{axis_name}' cannot lower inside this shard_map manual region because the \
+                "collective over axis `{axis_name}` cannot lower inside this shard_map manual region because the \
                 region does not bind that axis as a manual mesh axis",
             ),
         }
@@ -7172,7 +7172,7 @@ fn collective_replica_groups(
     let (mesh_groups, mesh_axis_size) = mesh_axis_replica_groups(collective_state, axis_name)?;
     if axis_size != mesh_axis_size {
         return Err(ProgramError::MalformedProgram(format!(
-            "collective over axis '{axis_name}' records size {axis_size}, but the enclosing mesh axis has size \
+            "collective over axis `{axis_name}` records size {axis_size}, but the enclosing mesh axis has size \
              {mesh_axis_size}",
         ))
         .into());
@@ -7417,7 +7417,7 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
             operation.axis_name(),
             operation.axis_size().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "grouped '{}' over axis '{}' does not record the full axis size",
+                    "grouped `{}` over axis `{}` does not record the full axis size",
                     operation.name(),
                     operation.axis_name(),
                 ))
@@ -7498,7 +7498,7 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     if !shard_map.manual_axes().iter().any(|manual_axis| manual_axis == axis_name) {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "{AXIS_INDEX_OPERATION_NAME} for axis '{axis_name}' cannot lower inside this \
+                "{AXIS_INDEX_OPERATION_NAME} for axis `{axis_name}` cannot lower inside this \
                  {SHARD_MAP_OPERATION_NAME} manual region because the region does not bind that axis as a manual mesh \
                  axis",
             ),
@@ -7699,7 +7699,7 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     // eager reference backend.
     let input_type = input_value.r#type()?;
     let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
-        op: format!("'reduce' operand has non-tensor MLIR type '{input_type}'"),
+        op: format!("`reduce` operand has non-tensor MLIR type `{input_type}`"),
     })?;
     let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
     let mut count = 1usize;
@@ -7708,7 +7708,7 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
             Some(MlirSize::Static(size)) => count *= size,
             _ => {
                 return Err(LoweringError::UnsupportedOp {
-                    op: format!("'reduce' mean over dynamically sized axis {axis}"),
+                    op: format!("`reduce` mean over dynamically sized axis {axis}"),
                 });
             }
         }
@@ -9945,7 +9945,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             to_mlir_module_for_plain_program(&program, "main"),
-            Err(LoweringError::UnsupportedOp { op: "'reduce' mean over dynamically sized axis 0".to_string() }),
+            Err(LoweringError::UnsupportedOp { op: "`reduce` mean over dynamically sized axis 0".to_string() }),
         );
     }
 
@@ -11439,7 +11439,7 @@ mod tests {
                 None,
             ),
             Err(LoweringError::UnsupportedOp {
-                op: "custom_call with strided array layout 'strided{12,4}'".to_string(),
+                op: "custom_call with strided array layout `strided{12,4}`".to_string(),
             }),
         );
         let invalid_permutation_type =
@@ -11457,7 +11457,7 @@ mod tests {
         assert_eq!(
             lower_custom_call_layout(&tiled_type),
             Err(LoweringError::UnsupportedOp {
-                op: "custom_call with tiled array layout 'tiled{1,0:T(2)}'".to_string(),
+                op: "custom_call with tiled array layout `tiled{1,0:T(2)}`".to_string(),
             }),
         );
     }
@@ -12424,7 +12424,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(error) if error.to_string().contains(
-                    "'dot_product_attention' dropout is only supported by the fused CUDA lowering",
+                    "`dot_product_attention` dropout is only supported by the fused CUDA lowering",
                 ),
             ));
         }
@@ -12447,7 +12447,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(error) if error.to_string().contains(
-                "'dot_product_attention_backward' dropout is only supported by the fused CUDA lowering",
+                "`dot_product_attention_backward` dropout is only supported by the fused CUDA lowering",
             ),
         ));
     }
@@ -13693,7 +13693,7 @@ mod tests {
         assert_eq!(
             builder.add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![first, second]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'concatenate' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`concatenate` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
             ))),
         );
 
@@ -13808,7 +13808,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program.transpose().unwrap_err().to_string(),
-            "'concatenate' transpose requires a static size on axis 1 but operand 0 has size columns",
+            "`concatenate` transpose requires a static size on axis 1 but operand 0 has size columns",
         );
     }
 
@@ -13916,7 +13916,7 @@ mod tests {
                 vec![input, padding_value],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
             ))),
         );
     }

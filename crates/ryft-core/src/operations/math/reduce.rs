@@ -120,10 +120,10 @@ pub fn reduce_abstract(
     let mut reduce_mask = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
-            return Err(TypeError::invalid(format!("'{op}' axis {axis} is out of bounds for rank {rank}")));
+            return Err(TypeError::invalid(format!("`{op}` axis {axis} is out of bounds for rank {rank}")));
         }
         if reduce_mask[*axis] {
-            return Err(TypeError::invalid(format!("'{op}' contains duplicate axis {axis}")));
+            return Err(TypeError::invalid(format!("`{op}` contains duplicate axis {axis}")));
         }
         reduce_mask[*axis] = true;
     }
@@ -138,7 +138,7 @@ pub fn reduce_abstract(
     };
     if !supports_kind {
         return Err(TypeError::invalid(format!(
-            "'{op}' kind {kind} requires {requirement} inputs but got {data_type}"
+            "`{op}` kind {kind} requires {requirement} inputs but got {data_type}"
         )));
     }
 
@@ -176,7 +176,7 @@ fn reduce_sharding(
                 .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                .map_err(|error| TypeError::invalid(format!("'{op}' output sharding construction failed: {error}")))
+                .map_err(|error| TypeError::invalid(format!("`{op}` output sharding construction failed: {error}")))
         })
         .transpose()
 }
@@ -846,7 +846,7 @@ where
                     {
                         return Err(ProgramError::UnsupportedOperation {
                             message: format!(
-                                "direct '{}' transposition over reduced axis {axis} of {input_shape} requires \
+                                "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
                                  linearization so that the runtime extent can be retained as a residual",
                                 self.name(),
                             ),
@@ -1157,7 +1157,7 @@ mod tests {
         let token = array_type(&[2, 3], DataType::Token);
         assert_eq!(
             reduce_abstract(&token, &[1], ReductionKind::Sum, "reduce_sum"),
-            Err(TypeError::invalid("'reduce_sum' kind sum requires numeric inputs but got token".to_string())),
+            Err(TypeError::invalid("`reduce_sum` kind sum requires numeric inputs but got token".to_string())),
         );
         // The structural-zero element type represents an already-known zero tangent and remains closed under numeric
         // reductions even though it has no numeric payload bytes.
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![array_type(&[3], DataType::F64)]));
         assert_eq!(
             operation.infer_output_types(&[array_type(&[3], DataType::F64)], &[]),
-            Err(TypeError::invalid("'reduce_sum' axis 1 is out of bounds for rank 1".to_string())),
+            Err(TypeError::invalid("`reduce_sum` axis 1 is out of bounds for rank 1".to_string())),
         );
     }
 
@@ -1545,7 +1545,7 @@ mod tests {
                 ),
                 Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                     if message == format!(
-                        "direct 'reduce_{kind}' transposition over reduced axis 0 of [batch, 2] requires \
+                        "direct `reduce_{kind}` transposition over reduced axis 0 of [batch, 2] requires \
                          linearization so that the runtime extent can be retained as a residual",
                     ),
             ));

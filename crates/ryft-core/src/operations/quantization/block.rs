@@ -88,7 +88,7 @@ where
             DataType::F8E5M2 => (57344.0, 15.0),
             element_type => {
                 return Err(TypeError::invalid(format!(
-                    "'block_quantize' does not support element data type {element_type}"
+                    "`block_quantize` does not support element data type {element_type}"
                 ))
                 .into());
             }
@@ -97,17 +97,17 @@ where
         let compute_type = input_type.data_type();
         if !matches!(compute_type, DataType::F32 | DataType::F64) {
             return Err(TypeError::invalid(format!(
-                "'block_quantize' expects an f32 or f64 input but got {compute_type}"
+                "`block_quantize` expects an f32 or f64 input but got {compute_type}"
             ))
             .into());
         }
         let Some(shape) = input_type.static_shape() else {
-            return Err(TypeError::invalid("'block_quantize' input must have a static shape".to_string()).into());
+            return Err(TypeError::invalid("`block_quantize` input must have a static shape".to_string()).into());
         };
         let dimensions = shape.dimensions().to_vec();
         if dimensions.is_empty() || dimensions.len() > 3 {
             return Err(TypeError::invalid(format!(
-                "'block_quantize' input must have rank between 1 and 3 but got rank {}",
+                "`block_quantize` input must have rank between 1 and 3 but got rank {}",
                 dimensions.len(),
             ))
             .into());
@@ -115,7 +115,7 @@ where
         let trailing_size = *dimensions.last().unwrap();
         if block_size == 0 || trailing_size % block_size != 0 {
             return Err(TypeError::invalid(format!(
-                "'block_quantize' trailing dimension size {trailing_size} is not divisible by block size \
+                "`block_quantize` trailing dimension size {trailing_size} is not divisible by block size \
                      {block_size}"
             ))
             .into());
@@ -153,7 +153,7 @@ where
             }
             scale_type => {
                 return Err(TypeError::invalid(format!(
-                    "'block_quantize' does not support scale data type {scale_type}"
+                    "`block_quantize` does not support scale data type {scale_type}"
                 ))
                 .into());
             }
@@ -232,17 +232,17 @@ mod tests {
         ));
         assert!(matches!(
             input.block_quantize(4, DataType::F16, DataType::F8E4M3FN),
-            Err(error) if error.to_string().contains("'block_quantize' does not support element data type f16"),
+            Err(error) if error.to_string().contains("`block_quantize` does not support element data type f16"),
         ));
         assert!(matches!(
             input.block_quantize(4, DataType::F4E2M1FN, DataType::F16),
-            Err(error) if error.to_string().contains("'block_quantize' does not support scale data type f16"),
+            Err(error) if error.to_string().contains("`block_quantize` does not support scale data type f16"),
         ));
         let integer_input =
             Array::from_f64s(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(8)])), vec![1.0; 8]);
         assert!(matches!(
             integer_input.block_quantize(4, DataType::F4E2M1FN, DataType::F8E4M3FN),
-            Err(error) if error.to_string().contains("'block_quantize' expects an f32 or f64 input but got i32"),
+            Err(error) if error.to_string().contains("`block_quantize` expects an f32 or f64 input but got i32"),
         ));
         let scalar_input = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![1.0]);
         assert!(matches!(

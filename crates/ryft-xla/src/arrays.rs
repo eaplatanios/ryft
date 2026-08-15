@@ -1679,7 +1679,7 @@ mod tests {
                 actual: actual_mesh.clone(),
             })),
         );
-        let expected_message = format!("mesh mismatch; expected '{expected_mesh:?}' but got '{actual_mesh:?}'");
+        let expected_message = format!("mesh mismatch; expected `{expected_mesh:?}` but got `{actual_mesh:?}`");
         assert_eq!(error.to_string(), expected_message);
     }
 

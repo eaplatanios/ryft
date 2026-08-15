@@ -2008,12 +2008,12 @@ mod tests {
         assert!(matches!(
             Array::scalar(1i32).atan2(&Array::scalar(1.0f64)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'atan2' does not support input data type i32",
+                if message == "`atan2` does not support input data type i32",
         ));
         assert!(matches!(
             Array::scalar(2.0f64).pow(&Array::scalar(3i32)),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'pow' does not support input data type i32",
+                if message == "`pow` does not support input data type i32",
         ));
 
         // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.

@@ -83,7 +83,7 @@ fn registry() -> Vec<DifferentialCase> {
     for (index, case) in cases.iter().enumerate() {
         assert!(
             cases[..index].iter().all(|previous| previous.case_id != case.case_id),
-            "duplicate differential-testing case ID '{}'",
+            "duplicate differential-testing case ID `{}`",
             case.case_id,
         );
     }
@@ -601,12 +601,12 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 requested.push(arguments[index + 1].as_str());
                 index += 2;
             }
-            argument => return Err(format!("expected '--list' or '--case CASE_ID' but got '{argument}'").into()),
+            argument => return Err(format!("expected `--list` or `--case CASE_ID` but got `{argument}`").into()),
         }
     }
     if list {
         if !requested.is_empty() {
-            return Err("'--list' cannot be combined with '--case'".into());
+            return Err("`--list` cannot be combined with `--case`".into());
         }
         for case in cases {
             println!("{}", case.case_id);
@@ -623,7 +623,7 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     .iter()
                     .copied()
                     .find(|case| case.case_id == case_id)
-                    .ok_or_else(|| format!("unknown differential-testing case '{case_id}'"))
+                    .ok_or_else(|| format!("unknown differential-testing case `{case_id}`"))
             })
             .collect::<Result<Vec<_>, _>>()?
     };

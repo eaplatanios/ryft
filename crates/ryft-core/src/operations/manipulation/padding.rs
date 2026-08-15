@@ -87,7 +87,7 @@ impl PadOperation<ArrayType> {
     ) -> Result<Self, ProgramError> {
         if edge_padding_low.len() != edge_padding_high.len() || edge_padding_low.len() != interior_padding.len() {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
+                "`{PAD_OPERATION_NAME}` expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
                     got lengths {}, {}, and {}",
                 edge_padding_low.len(),
                 edge_padding_high.len(),
@@ -209,7 +209,7 @@ impl Operation for PadOperation<ArrayIrType> {
         let expected_input_count = input.rank() + 2;
         if input_types.len() != expected_input_count {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' expects an operand, a padding value, and one output extent per axis \
+                "`{PAD_OPERATION_NAME}` expects an operand, a padding value, and one output extent per axis \
                  ({expected_input_count} inputs total) but got {}",
                 input_types.len(),
             )));
@@ -230,7 +230,7 @@ impl Operation for PadOperation<ArrayIrType> {
         if is_effective_identity(input, self.edge_padding_low(), self.edge_padding_high(), self.interior_padding()) {
             if output_dimensions != input.shape().dimensions() {
                 return Err(TypeError::invalid(format!(
-                    "'{PAD_OPERATION_NAME}' identity padding requires output extents to preserve the input shape \
+                    "`{PAD_OPERATION_NAME}` identity padding requires output extents to preserve the input shape \
                      exactly, but got {}",
                     Shape::new(output_dimensions),
                 )));
@@ -251,13 +251,13 @@ impl Operation for PadOperation<ArrayIrType> {
                 )?;
                 let Some(output_extent) = output_dimension.value() else {
                     return Err(TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' output extent on axis {axis} must be the exact constant \
+                        "`{PAD_OPERATION_NAME}` output extent on axis {axis} must be the exact constant \
                          {expected_extent} because the input extent is static, but is {output_dimension}",
                     )));
                 };
                 if output_extent != expected_extent {
                     return Err(TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' output extent on axis {axis} must be {expected_extent} but is \
+                        "`{PAD_OPERATION_NAME}` output extent on axis {axis} must be {expected_extent} but is \
                          {output_extent}",
                     )));
                 }
@@ -276,13 +276,13 @@ impl Operation for PadOperation<ArrayIrType> {
                         )?;
                         if maximum_output_extent < 0 {
                             return Err(TypeError::invalid(format!(
-                                "'{PAD_OPERATION_NAME}' output size is negative ({maximum_output_extent}) on dynamic \
+                                "`{PAD_OPERATION_NAME}` output size is negative ({maximum_output_extent}) on dynamic \
                                  axis {axis} even at its maximum input extent {maximum_input_extent}",
                             )));
                         }
                         usize::try_from(maximum_output_extent).map_err(|_| {
                             TypeError::invalid(format!(
-                                "'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"
+                                "`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}"
                             ))
                         })
                     })
@@ -296,13 +296,13 @@ impl Operation for PadOperation<ArrayIrType> {
                 )?;
                 if minimum_output_extent < 0 {
                     return Err(TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' output size is negative ({minimum_output_extent}) on dynamic axis \
+                        "`{PAD_OPERATION_NAME}` output size is negative ({minimum_output_extent}) on dynamic axis \
                          {axis} at its minimum input extent {}",
                         input_bounds.lower(),
                     )));
                 }
                 let minimum_output_extent = usize::try_from(minimum_output_extent).map_err(|_| {
-                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"))
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}"))
                 })?;
                 let possible_output_bounds = DimensionBounds::new(
                     minimum_output_extent,
@@ -310,7 +310,7 @@ impl Operation for PadOperation<ArrayIrType> {
                         .map(|extent| {
                             extent.checked_add(1).ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}",
+                                    "`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}",
                                 ))
                             })
                         })
@@ -319,7 +319,7 @@ impl Operation for PadOperation<ArrayIrType> {
                 let declared_output_bounds = output_dimension.bounds();
                 if !declared_output_bounds.contains_bounds(possible_output_bounds) {
                     return Err(TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' output bounds {declared_output_bounds} on axis {axis} do not contain \
+                        "`{PAD_OPERATION_NAME}` output bounds {declared_output_bounds} on axis {axis} do not contain \
                          every possible padded extent {possible_output_bounds} derived from input bounds \
                          {input_bounds}",
                     )));
@@ -451,7 +451,7 @@ where
                         .enumerate()
                         .map(|(axis, padding)| {
                             padding.checked_neg().ok_or_else(|| TypeError::invalid(format!(
-                                    "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
+                                    "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
                                 )))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
@@ -462,7 +462,7 @@ where
                         .map(|(axis, padding)| {
                             padding.checked_neg().ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_high at axis {axis} with value \
+                                    "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_high at axis {axis} with value \
                                      {padding}",
                                 ))
                             })
@@ -488,7 +488,7 @@ where
                         .map(|(axis, padding)| {
                             padding.checked_add(1).ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'{PAD_OPERATION_NAME}' transpose stride overflows usize on axis {axis}"
+                                    "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis {axis}"
                                 ))
                             })
                         })
@@ -503,7 +503,7 @@ where
                         .map(|(axis, dimension)| {
                             dimension.value().ok_or_else(|| {
                                 TypeError::invalid(format!(
-                                    "'{PAD_OPERATION_NAME}' transpose requires a static unpadded extent on axis {axis} but has \
+                                    "`{PAD_OPERATION_NAME}` transpose requires a static unpadded extent on axis {axis} but has \
                                      {dimension}",
                                 ))
                             })
@@ -705,7 +705,7 @@ where
                             .map(|(axis, padding)| {
                                 padding.checked_neg().ok_or_else(|| {
                                     TypeError::invalid(format!(
-                                        "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_low at axis \
+                                        "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_low at axis \
                                          {axis} with value {padding}",
                                     ))
                                 })
@@ -718,7 +718,7 @@ where
                             .map(|(axis, padding)| {
                                 padding.checked_neg().ok_or_else(|| {
                                     TypeError::invalid(format!(
-                                        "'{PAD_OPERATION_NAME}' transpose cannot negate edge_padding_high at axis \
+                                        "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_high at axis \
                                          {axis} with value {padding}",
                                     ))
                                 })
@@ -761,7 +761,7 @@ where
                             .map(|(axis, padding)| {
                                 padding.checked_add(1).ok_or_else(|| {
                                     TypeError::invalid(format!(
-                                        "'{PAD_OPERATION_NAME}' transpose stride overflows usize on axis {axis}",
+                                        "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis {axis}",
                                     ))
                                 })
                             })
@@ -886,7 +886,7 @@ where
         }) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "direct '{PAD_OPERATION_NAME}' transposition with dynamic extents requires linearization so that \
+                    "direct `{PAD_OPERATION_NAME}` transposition with dynamic extents requires linearization so that \
                      the primal geometry can be retained as residuals",
                 ),
             }
@@ -1229,7 +1229,7 @@ fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
                 .map_err(|error| {
                     TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' dependency scalar sharding construction failed: {error}"
+                        "`{PAD_OPERATION_NAME}` dependency scalar sharding construction failed: {error}"
                     ))
                 })
         })
@@ -1250,20 +1250,20 @@ fn padded_extent(
 ) -> Result<i128, TypeError> {
     let gap_count = input_size.saturating_sub(1);
     let input_size = i128::try_from(input_size)
-        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
+        .map_err(|_| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` input size is too large on axis {axis}")))?;
     let gap_count = i128::try_from(gap_count)
-        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input size is too large on axis {axis}")))?;
+        .map_err(|_| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` input size is too large on axis {axis}")))?;
     let interior_padding = i128::try_from(interior_padding).map_err(|_| {
-        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' interior padding is too large on axis {axis}"))
+        TypeError::invalid(format!("`{PAD_OPERATION_NAME}` interior padding is too large on axis {axis}"))
     })?;
     let dilated_size = input_size
         .checked_add(gap_count.checked_mul(interior_padding).ok_or_else(|| {
-            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"))
+            TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}"))
         })?)
         .and_then(|size| size.checked_add(i128::from(edge_padding_low)))
         .and_then(|size| size.checked_add(i128::from(edge_padding_high)))
         .ok_or_else(|| {
-            TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}"))
+            TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}"))
         })?;
     Ok(dilated_size)
 }
@@ -1279,11 +1279,11 @@ fn static_padded_extent(
     let output_size = padded_extent(input_size, edge_padding_low, edge_padding_high, interior_padding, axis)?;
     if output_size < 0 {
         return Err(TypeError::invalid(format!(
-            "'{PAD_OPERATION_NAME}' output size is negative ({output_size}) on axis {axis}"
+            "`{PAD_OPERATION_NAME}` output size is negative ({output_size}) on axis {axis}"
         )));
     }
     usize::try_from(output_size)
-        .map_err(|_| TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output size overflows usize on axis {axis}")))
+        .map_err(|_| TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output size overflows usize on axis {axis}")))
 }
 
 /// Validates the operand types and padding-vector arity shared by both padding type contracts.
@@ -1296,7 +1296,7 @@ fn validate_pad_inputs(
 ) -> Result<(), ProgramError> {
     if input.data_type() != padding_value.data_type() {
         return Err(TypeError::invalid(format!(
-            "'{}' input data type {} does not match padding value data type {}",
+            "`{}` input data type {} does not match padding value data type {}",
             PAD_OPERATION_NAME,
             input.data_type(),
             padding_value.data_type(),
@@ -1305,13 +1305,13 @@ fn validate_pad_inputs(
     }
     if padding_value.rank() != 0 {
         return Err(TypeError::invalid(format!(
-            "'{PAD_OPERATION_NAME}' padding value must be a scalar but has type {padding_value}"
+            "`{PAD_OPERATION_NAME}` padding value must be a scalar but has type {padding_value}"
         ))
         .into());
     }
     if input.memory() != padding_value.memory() {
         return Err(TypeError::invalid(format!(
-            "'{}' input and padding value must share one memory space but reside in {} and {}",
+            "`{}` input and padding value must share one memory space but reside in {} and {}",
             PAD_OPERATION_NAME,
             input.memory(),
             padding_value.memory(),
@@ -1325,7 +1325,7 @@ fn validate_pad_inputs(
     ] {
         if length != input.rank() {
             return Err(TypeError::invalid(format!(
-                "'{}' {} has length {} but input has rank {}",
+                "`{}` {} has length {} but input has rank {}",
                 PAD_OPERATION_NAME,
                 name,
                 length,
@@ -1363,7 +1363,7 @@ fn padded_output_type(
             || input.reduced_axes() != padding_value.reduced_axes()
         {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' input and padding value must have matching reduced and unreduced mesh axes but got input type \
+                "`{PAD_OPERATION_NAME}` input and padding value must have matching reduced and unreduced mesh axes but got input type \
                  {input} and padding value type {padding_value}",
             ))
             .into());
@@ -1374,7 +1374,7 @@ fn padded_output_type(
             != padding_varying_manual_axes.cloned().unwrap_or_default()
         {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' input and padding value must have matching varying manual axes but got input type {input} and \
+                "`{PAD_OPERATION_NAME}` input and padding value must have matching varying manual axes but got input type {input} and \
                  padding value type {padding_value}",
             ))
             .into());
@@ -1387,7 +1387,7 @@ fn padded_output_type(
                 != padding_value.sharding().map(|sharding| sharding.mesh())
         {
             return Err(TypeError::invalid(format!(
-                "'{PAD_OPERATION_NAME}' input and padding value with distributed dependencies must use the same mesh"
+                "`{PAD_OPERATION_NAME}` input and padding value with distributed dependencies must use the same mesh"
             ))
             .into());
         }
@@ -1434,14 +1434,14 @@ impl Pad for ArrayType {
                         )?;
                         if maximum_output_extent < 0 {
                             return Err(TypeError::invalid(format!(
-                                "'{PAD_OPERATION_NAME}' output size is negative ({maximum_output_extent}) on dynamic axis {axis} \
+                                "`{PAD_OPERATION_NAME}` output size is negative ({maximum_output_extent}) on dynamic axis {axis} \
                                  even at its maximum input extent {maximum_input_extent}",
                             ))
                             .into());
                         }
                     }
                     return Err(TypeError::invalid(format!(
-                        "'{PAD_OPERATION_NAME}' dynamic axis {axis} requires an explicit result-dimension operand",
+                        "`{PAD_OPERATION_NAME}` dynamic axis {axis} requires an explicit result-dimension operand",
                     ))
                     .into());
                 }
@@ -1540,11 +1540,11 @@ mod tests {
                 },
                 {
                     input_types = [input_type.clone(), ArrayType::scalar(DataType::F32)],
-                    error = "'pad' input data type f64 does not match padding value data type f32",
+                    error = "`pad` input data type f64 does not match padding value data type f32",
                 },
                 {
                     input_types = [input_type.clone(), input_type.clone()],
-                    error = "'pad' padding value must be a scalar but has type f64[3]",
+                    error = "`pad` padding value must be a scalar but has type f64[3]",
                 },
                 {
                     input_types = [
@@ -1554,7 +1554,7 @@ mod tests {
                         ))])),
                         padding_value_type.clone(),
                     ],
-                    error = "'pad' dynamic axis 0 requires an explicit result-dimension operand",
+                    error = "`pad` dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [
@@ -1564,14 +1564,14 @@ mod tests {
                         ))])),
                         padding_value_type.clone(),
                     ],
-                    error = "'pad' dynamic axis 0 requires an explicit result-dimension operand",
+                    error = "`pad` dynamic axis 0 requires an explicit result-dimension operand",
                 },
                 {
                     input_types = [
                         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(usize::MAX)])),
                         padding_value_type.clone(),
                     ],
-                    error = "'pad' output size overflows usize on axis 0",
+                    error = "`pad` output size overflows usize on axis 0",
                 },
             ],
         );
@@ -1599,7 +1599,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError::invalid("'pad' output extent on axis 0 must be 8 but is 7")),
+            Err(TypeError::invalid("`pad` output extent on axis 0 must be 8 but is 7")),
         );
         assert_eq!(
             composite_operation.infer_output_types(
@@ -1612,7 +1612,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'pad' output extent on axis 0 must be the exact constant 8 because the input extent is static, but \
+                "`pad` output extent on axis 0 must be the exact constant 8 because the input extent is static, but \
                  is dynamic",
             )),
         );
@@ -1649,7 +1649,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'pad' output bounds [3, 6) on axis 0 do not contain every possible padded extent [3, 7) derived \
+                "`pad` output bounds [3, 6) on axis 0 do not contain every possible padded extent [3, 7) derived \
                  from input bounds [1, 5)",
             )),
         );
@@ -1675,25 +1675,25 @@ mod tests {
                     &[],
                 ),
             Err(TypeError::invalid(
-                "'pad' output size is negative (-1) on dynamic axis 0 at its minimum input extent 0",
+                "`pad` output size is negative (-1) on dynamic axis 0 at its minimum input extent 0",
             )),
         );
         assert_eq!(
             input_type.pad(&padding_value_type, &[], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' edge_padding_low has length 0 but input has rank 1".to_string()
+                "`pad` edge_padding_low has length 0 but input has rank 1".to_string()
             ))),
         );
         assert_eq!(
             input_type.pad(&padding_value_type, &[0], &[], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' edge_padding_high has length 0 but input has rank 1".to_string()
+                "`pad` edge_padding_high has length 0 but input has rank 1".to_string()
             ))),
         );
         assert_eq!(
             input_type.pad(&padding_value_type, &[0], &[0], &[]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' interior_padding has length 0 but input has rank 1".to_string()
+                "`pad` interior_padding has length 0 but input has rank 1".to_string()
             ))),
         );
         // Negative inverse edges still validate their abstract extent. A valid derived dynamic extent requires the
@@ -1709,7 +1709,7 @@ mod tests {
             )
             .pad(&padding_value_type, &[-1], &[-2], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
             ))),
         );
         assert_eq!(
@@ -1719,7 +1719,7 @@ mod tests {
             )
             .pad(&padding_value_type, &[-1], &[-2], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
             ))),
         );
         assert_eq!(
@@ -1732,7 +1732,7 @@ mod tests {
             )
             .pad(&padding_value_type, &[-5], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1".to_string()
+                "`pad` output size is negative (-4) on dynamic axis 0 even at its maximum input extent 1".to_string()
             ))),
         );
 
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(
             PadOperation::new(vec![1], vec![2, 0], vec![1]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
+                "`pad` expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
                     but got lengths 1, 2, and 1"
                     .to_string()
             ))),
@@ -1782,7 +1782,7 @@ mod tests {
             PadOperation::new(vec![1, 0], vec![2, 0], vec![1, 0])
                 .unwrap()
                 .infer_output_types(&[input_type.clone(), padding_value_type.clone()], &[]),
-            Err(TypeError::invalid("'pad' edge_padding_low has length 2 but input has rank 1".to_string())),
+            Err(TypeError::invalid("`pad` edge_padding_low has length 2 but input has rank 1".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -2036,7 +2036,7 @@ mod tests {
                 vec![dynamic_input, dynamic_padding],
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' dynamic axis 0 requires an explicit result-dimension operand".to_string(),
+                "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),
             ))),
         );
 
@@ -2121,7 +2121,7 @@ mod tests {
         );
         assert_eq!(
             Array::vector(vec![1.0]).pad(&Array::scalar(0.0), &[-2], &[0], &[0]),
-            Err(ProgramError::Type(TypeError::invalid("'pad' output size is negative (-1) on axis 0".to_string()))),
+            Err(ProgramError::Type(TypeError::invalid("`pad` output size is negative (-1) on axis 0".to_string()))),
         );
 
         // Interior padding is an effective identity on singleton axes. The eager and abstract fast paths preserve
@@ -2137,7 +2137,7 @@ mod tests {
         assert_eq!(
             Array::vector(vec![1.0, 2.0]).pad(&Array::vector(vec![0.0]), &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' padding value must be a scalar but has type f64[1]".to_string()
+                "`pad` padding value must be a scalar but has type f64[1]".to_string()
             ))),
         );
     }
@@ -2172,7 +2172,7 @@ mod tests {
         assert_eq!(
             host_input.pad(&pad_value, &[0], &[1], &[0]),
             Err(ProgramError::Type(TypeError::invalid(
-                "'pad' input and padding value must share one memory space but reside in Host[Pinned] and \
+                "`pad` input and padding value must share one memory space but reside in Host[Pinned] and \
                           Device"
                     .to_string()
             ))),

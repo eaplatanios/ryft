@@ -63,7 +63,7 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
                 if actual_extent != expected_extent {
                     return Err(ProgramError::InvalidArgument {
                         message: format!(
-                            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' bits output axis {axis} has extent {actual_extent}, \
+                            "`{RNG_BIT_GENERATOR_OPERATION_NAME}` bits output axis {axis} has extent {actual_extent}, \
                              but its explicit extent operand is {expected_extent}",
                         ),
                     });
@@ -82,7 +82,7 @@ impl RngBitGenerator for Array {
     ) -> Result<(Self, Self), ProgramError> {
         let Some(output_shape) = output_type.static_shape() else {
             return Err(TypeError::invalid(format!(
-                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support dynamically shaped outputs"
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support dynamically shaped outputs"
             ))
             .into());
         };
@@ -90,7 +90,7 @@ impl RngBitGenerator for Array {
         let data_type = output_type.data_type();
         if !matches!(data_type, DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
             return Err(TypeError::invalid(format!(
-                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support output data type {data_type}",
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support output data type {data_type}",
             ))
             .into());
         }
@@ -99,7 +99,7 @@ impl RngBitGenerator for Array {
             || self.r#type().shape() != expected_state_type.shape()
         {
             return Err(TypeError::invalid(format!(
-                "'{}' with the {} algorithm needs a {} state but got {}",
+                "`{}` with the {} algorithm needs a {} state but got {}",
                 RNG_BIT_GENERATOR_OPERATION_NAME,
                 algorithm,
                 expected_state_type,
@@ -187,7 +187,7 @@ mod tests {
         assert!(matches!(
             invalid_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'rng_bit_generator' with the three_fry algorithm needs a u64[2] state but got u64[3]",
+                if message == "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got u64[3]",
         ));
     }
 }

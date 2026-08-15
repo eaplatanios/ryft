@@ -28,7 +28,7 @@ fn part_to_complex_data_type(part: DataType, op: &'static str) -> Result<DataTyp
     match part {
         DataType::F32 => Ok(DataType::C64),
         DataType::F64 => Ok(DataType::C128),
-        other => Err(TypeError::invalid(format!("'{op}' requires f32 or f64 parts but got {other}"))),
+        other => Err(TypeError::invalid(format!("`{op}` requires f32 or f64 parts but got {other}"))),
     }
 }
 
@@ -38,7 +38,7 @@ fn complex_to_part_data_type(complex: DataType, op: &'static str) -> Result<Data
     match complex {
         DataType::C64 => Ok(DataType::F32),
         DataType::C128 => Ok(DataType::F64),
-        other => Err(TypeError::invalid(format!("'{op}' requires a complex operand but got {other}"))),
+        other => Err(TypeError::invalid(format!("`{op}` requires a complex operand but got {other}"))),
     }
 }
 
@@ -57,7 +57,7 @@ define_elementwise_operation!(
     infer_data_types = |input_types: &[DataType]| {
         if input_types[0] != input_types[1] {
             return Err(TypeError::invalid(format!(
-                    "'{}' requires identical part types but got {} and {}",
+                    "`{}` requires identical part types but got {} and {}",
                     COMPLEX_OPERATION_NAME,
                     input_types[0],
                 input_types[1],
@@ -68,7 +68,7 @@ define_elementwise_operation!(
     infer_array_types = |input_types: &[ArrayType]| {
         if input_types[0] != input_types[1] {
             return Err(TypeError::invalid(format!(
-                    "'{}' requires identical part types but got {} and {}",
+                    "`{}` requires identical part types but got {} and {}",
                     COMPLEX_OPERATION_NAME,
                     input_types[0],
                     input_types[1],
@@ -402,11 +402,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F32, DataType::F64],
-                    error = "'complex' requires identical part types but got f32 and f64",
+                    error = "`complex` requires identical part types but got f32 and f64",
                 },
                 {
                     input_data_types = [DataType::I32, DataType::I32],
-                    error = "'complex' requires f32 or f64 parts but got i32",
+                    error = "`complex` requires f32 or f64 parts but got i32",
                 },
             ],
         );
@@ -437,7 +437,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F64],
-                    error = "'conjugate' requires a complex operand but got f64",
+                    error = "`conjugate` requires a complex operand but got f64",
                 },
             ],
         );
@@ -472,7 +472,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F32],
-                    error = "'real' requires a complex operand but got f32",
+                    error = "`real` requires a complex operand but got f32",
                 },
             ],
         );
@@ -503,7 +503,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::Boolean],
-                    error = "'imaginary' requires a complex operand but got bool",
+                    error = "`imaginary` requires a complex operand but got bool",
                 },
             ],
         );

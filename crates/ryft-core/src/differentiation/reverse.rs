@@ -1561,7 +1561,7 @@ where
     {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "direct '{}' transposition with runtime-dependent type metadata requires linearization so that the \
+                "direct `{}` transposition with runtime-dependent type metadata requires linearization so that the \
                  relevant primal information can be retained as residuals",
                 operation.name(),
             ),
@@ -1786,7 +1786,7 @@ mod tests {
             match value {
                 TestLinearOperation::Zero(zero) => Ok(zero),
                 _ => Err(TypeError::invalid(format!(
-                    "cannot project operation '{}' into a 'ZeroOperation<ArrayType>' payload",
+                    "cannot project operation `{}` into a `ZeroOperation<ArrayType>` payload",
                     value.name(),
                 ))),
             }

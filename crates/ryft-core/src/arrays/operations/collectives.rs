@@ -106,7 +106,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .to_string(),
-            "'all_gather' output axis 0 extent must equal observed result extent 3 but got 4",
+            "`all_gather` output axis 0 extent must equal observed result extent 3 but got 4",
         );
         assert_eq!(
             context
@@ -123,7 +123,7 @@ mod tests {
                 )
                 .unwrap_err(),
             ProgramError::UnsupportedOperation {
-                message: "cannot interpret 'all_gather' over axis 'x' of size 2 without an enclosing binder"
+                message: "cannot interpret `all_gather` over axis `x` of size 2 without an enclosing binder"
                     .to_string(),
             },
         );
@@ -135,7 +135,7 @@ mod tests {
                     &[input.clone(), extent.clone()],
                 )
                 .unwrap_err(),
-            ProgramError::Type(TypeError::invalid("'psum_scatter' axis size must be greater than zero")),
+            ProgramError::Type(TypeError::invalid("`psum_scatter` axis size must be greater than zero")),
         );
 
         check_operation_partial_evaluation!(
@@ -224,7 +224,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct 'all_gather' transposition with runtime-dependent type metadata requires \
+                if message == "direct `all_gather` transposition with runtime-dependent type metadata requires \
                     linearization so that the relevant primal information can be retained as residuals",
         ));
     }
@@ -306,7 +306,7 @@ mod tests {
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of invariant 'all_gather' cannot represent the participant-indexed \
+                if message == "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
                     slice; linearize so that the current participant can select its gathered chunk",
         ));
         let pullback = program.linearize().unwrap().pullback().unwrap().to_string();

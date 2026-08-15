@@ -393,7 +393,7 @@ pub(super) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
             if configuration.dropout().is_some() {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' dropout is only supported by the fused CUDA lowering",
+                        "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout is only supported by the fused CUDA lowering",
                     ),
                 });
             }
@@ -407,7 +407,7 @@ pub(super) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
             .as_ref()
             .and_then(|functions| functions.get_attention(operation, input_types, output_types))
             .ok_or_else(|| LoweringError::UnsupportedOp {
-                op: format!("missing typed decomposition for '{}'", operation.name()),
+                op: format!("missing typed decomposition for `{}`", operation.name()),
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
     }
@@ -631,7 +631,7 @@ pub(super) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
             if configuration.dropout().is_some() {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!(
-                        "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' dropout is only supported by the fused CUDA \
+                        "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout is only supported by the fused CUDA \
                          lowering",
                     ),
                 });
@@ -646,7 +646,7 @@ pub(super) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
             .as_ref()
             .and_then(|functions| functions.get_attention_backward(operation, input_types, output_types))
             .ok_or_else(|| LoweringError::UnsupportedOp {
-                op: format!("missing typed decomposition for '{}'", operation.name()),
+                op: format!("missing typed decomposition for `{}`", operation.name()),
             })?;
         return lower_decomposition_call(decomposition, input_values, output_types, block, context, location);
     }

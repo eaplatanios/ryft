@@ -558,7 +558,7 @@ where
                         let update_axis = update_window_dimensions[window_position];
                         let extent = updates_type.dimension(update_axis).value().ok_or_else(|| {
                             ProgramError::from(TypeError::invalid(format!(
-                                "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
+                                "`{SCATTER_OPERATION_NAME}` transpose requires a static update shape but update axis \
                                      {update_axis} has a dynamic size",
                             )))
                         })?;
@@ -627,7 +627,7 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
         && other.mesh() != mesh
     {
         return Err(TypeError::invalid(format!(
-            "'{SCATTER_OPERATION_NAME}' operand, indices, and updates shardings must use one mesh"
+            "`{SCATTER_OPERATION_NAME}` operand, indices, and updates shardings must use one mesh"
         )));
     }
     Ok(())
@@ -683,19 +683,19 @@ impl Scatter for ArrayType {
 
         if indices_rank == 0 {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
+                "`{SCATTER_OPERATION_NAME}` indices must have rank at least 1 (the trailing index vector)"
             ))
             .into());
         }
         if !indices.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"
+                "`{SCATTER_OPERATION_NAME}` indices must be integer-typed but have type {indices}"
             ))
             .into());
         }
         if operand.memory() != indices.memory() || operand.memory() != updates.memory() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' operand, indices, and updates must share one memory space but reside \
+                "`{SCATTER_OPERATION_NAME}` operand, indices, and updates must share one memory space but reside \
                      in {}, {}, and {}",
                 operand.memory(),
                 indices.memory(),
@@ -705,7 +705,7 @@ impl Scatter for ArrayType {
         }
         if updates.data_type() != operand.data_type() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' updates data type {} does not match operand data type {}",
+                "`{SCATTER_OPERATION_NAME}` updates data type {} does not match operand data type {}",
                 updates.data_type(),
                 operand.data_type(),
             ))
@@ -718,7 +718,7 @@ impl Scatter for ArrayType {
                 if !data_type.is_numeric() && data_type != DataType::Zero =>
             {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' kind {} requires numeric operand and update elements but got \
+                    "`{SCATTER_OPERATION_NAME}` kind {} requires numeric operand and update elements but got \
                      {data_type}",
                     operation.kind(),
                 ))
@@ -728,7 +728,7 @@ impl Scatter for ArrayType {
                 if !data_type.is_boolean() && !data_type.is_numeric() && data_type != DataType::Zero =>
             {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' kind {} requires Boolean or numeric operand and update elements but got \
+                    "`{SCATTER_OPERATION_NAME}` kind {} requires Boolean or numeric operand and update elements but got \
                      {data_type}",
                     operation.kind(),
                 ))
@@ -739,7 +739,7 @@ impl Scatter for ArrayType {
         let index_vector_dimension = indices_rank - 1;
         let Dimension::Static(index_vector_extent) = indices.dimension(index_vector_dimension) else {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"
+                "`{SCATTER_OPERATION_NAME}` indices index vector dimension must have a static extent"
             ))
             .into());
         };
@@ -764,7 +764,7 @@ impl Scatter for ArrayType {
         )?;
         if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' scatter_dimensions_to_operand_dimensions has length {} but the index \
+                "`{SCATTER_OPERATION_NAME}` scatter_dimensions_to_operand_dimensions has length {} but the index \
                      vector extent is {index_vector_extent}",
                 dimensions.scatter_dimensions_to_operand_dimensions().len(),
             ))
@@ -778,7 +778,7 @@ impl Scatter for ArrayType {
         )?;
         if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' operand and scatter-indices batching dimensions must align 1:1, but got \
+                "`{SCATTER_OPERATION_NAME}` operand and scatter-indices batching dimensions must align 1:1, but got \
                      {} and {}",
                 dimensions.operand_batching_dimensions().len(),
                 dimensions.scatter_indices_batching_dimensions().len(),
@@ -788,7 +788,7 @@ impl Scatter for ArrayType {
         for &dimension in dimensions.scatter_indices_batching_dimensions() {
             if dimension >= indices_rank || dimension == index_vector_dimension {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' scatter_indices_batching_dimensions entry {dimension} is out of \
+                    "`{SCATTER_OPERATION_NAME}` scatter_indices_batching_dimensions entry {dimension} is out of \
                          range or names the index vector dimension"
                 ))
                 .into());
@@ -799,7 +799,7 @@ impl Scatter for ArrayType {
         let operand_batching: BTreeSet<usize> = dimensions.operand_batching_dimensions().iter().copied().collect();
         if inserted.intersection(&operand_batching).next().is_some() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' inserted_window_dimensions and operand_batching_dimensions must be \
+                "`{SCATTER_OPERATION_NAME}` inserted_window_dimensions and operand_batching_dimensions must be \
                      disjoint"
             ))
             .into());
@@ -810,14 +810,14 @@ impl Scatter for ArrayType {
         // vector).
         if operand_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' operand rank {operand_rank} must equal update_window + inserted_window + \
+                "`{SCATTER_OPERATION_NAME}` operand rank {operand_rank} must equal update_window + inserted_window + \
                      operand_batching dimension counts"
             ))
             .into());
         }
         if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
             return Err(TypeError::invalid(format!(
-                "'{SCATTER_OPERATION_NAME}' updates rank {updates_rank} must equal (indices rank - 1) + the update \
+                "`{SCATTER_OPERATION_NAME}` updates rank {updates_rank} must equal (indices rank - 1) + the update \
                      window dimension count"
             ))
             .into());
@@ -835,7 +835,7 @@ impl Scatter for ArrayType {
                 && update_extent > operand_extent
             {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' update window axis {update_axis} extent {update_extent} exceeds \
+                    "`{SCATTER_OPERATION_NAME}` update window axis {update_axis} extent {update_extent} exceeds \
                          the operand window axis {operand_axis} extent {operand_extent}"
                 ))
                 .into());
@@ -850,7 +850,7 @@ impl Scatter for ArrayType {
         for (&update_axis, &indices_axis) in update_scatter_axes.iter().zip(&indices_batch_axes) {
             if updates.dimension(update_axis) != indices.dimension(indices_axis) {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' updates scatter axis {update_axis} must match indices batch axis \
+                    "`{SCATTER_OPERATION_NAME}` updates scatter axis {update_axis} must match indices batch axis \
                          {indices_axis} in extent"
                 ))
                 .into());
@@ -865,7 +865,7 @@ impl Scatter for ArrayType {
         {
             if operand.dimension(operand_axis) != indices.dimension(indices_axis) {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
+                    "`{SCATTER_OPERATION_NAME}` batching dimensions must have equal extents, but operand axis \
                          {operand_axis} and indices axis {indices_axis} differ"
                 ))
                 .into());
@@ -880,7 +880,7 @@ impl Scatter for ArrayType {
         let sharding = if let Some(requested) = operation.output_sharding() {
             if requested.rank() != operand.rank() {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' output sharding rank ({}) does not match the operand rank ({})",
+                    "`{SCATTER_OPERATION_NAME}` output sharding rank ({}) does not match the operand rank ({})",
                     requested.rank(),
                     operand.rank(),
                 ))
@@ -888,7 +888,7 @@ impl Scatter for ArrayType {
             }
             if requested.references_auto_axis() {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
+                    "`{SCATTER_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
                 ))
                 .into());
             }
@@ -906,7 +906,7 @@ impl Scatter for ArrayType {
             for &axis in &replicated_operand_axes {
                 if dimension_has_explicit_axis(&mesh, &operand_sharding.dimensions()[axis]) {
                     return Err(TypeError::invalid(format!(
-                        "'{SCATTER_OPERATION_NAME}' operand axis {axis} is targeted by the start indices and must be \
+                        "`{SCATTER_OPERATION_NAME}` operand axis {axis} is targeted by the start indices and must be \
                              replicated over explicit mesh axes; request an explicit output sharding to resolve \
                              placement"
                     ))
@@ -917,7 +917,7 @@ impl Scatter for ArrayType {
                 && dimension_has_explicit_axis(&mesh, &indices_sharding.dimensions()[index_vector_dimension])
             {
                 return Err(TypeError::invalid(format!(
-                    "'{SCATTER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
+                    "`{SCATTER_OPERATION_NAME}` indices index vector dimension must be replicated over explicit \
                          mesh axes"
                 ))
                 .into());
@@ -1018,15 +1018,15 @@ mod tests {
                 },
                 {
                     input_types = [operand.clone(), indices.clone(), indices_type(vec![2, 2])],
-                    error = "'scatter' updates data type i32 does not match operand data type f32",
+                    error = "`scatter` updates data type i32 does not match operand data type f32",
                 },
                 {
                     input_types = [operand.clone(), float_type(vec![2, 1]), updates.clone()],
-                    error = "'scatter' indices must be integer-typed but have type f32[2, 1]",
+                    error = "`scatter` indices must be integer-typed but have type f32[2, 1]",
                 },
                 {
                     input_types = [boolean_operand, indices.clone(), boolean_updates],
-                    error = "'scatter' kind add requires numeric operand and update elements but got bool",
+                    error = "`scatter` kind add requires numeric operand and update elements but got bool",
                 },
                 {
                     input_types = [host_operand.clone(), host_indices, host_updates],
@@ -1034,7 +1034,7 @@ mod tests {
                 },
                 {
                     input_types = [host_operand, indices.clone(), updates.clone()],
-                    error = "'scatter' operand, indices, and updates must share one memory space but reside in \
+                    error = "`scatter` operand, indices, and updates must share one memory space but reside in \
                              Host[Pinned], Device, and Device",
                 },
             ],
@@ -1150,7 +1150,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[operand.clone(), indices.clone(), float_type(vec![2])], &[]),
             Err(TypeError::invalid(
-                "'scatter' update_window_dimensions entry 1 is out of range for bound 1".to_string()
+                "`scatter` update_window_dimensions entry 1 is out of range for bound 1".to_string()
             )),
         );
     }

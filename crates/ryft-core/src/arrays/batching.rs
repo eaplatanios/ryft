@@ -340,7 +340,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     {
         if !self.batch_axis().is_replicated() {
             return Err(BatchingError::MisalignedBatchAxes {
-                message: "'ArrayBatch::broadcast' expects a replicated operand but received a batched value"
+                message: "`ArrayBatch::broadcast` expects a replicated operand but received a batched value"
                     .to_string(),
             });
         }
@@ -6966,7 +6966,7 @@ mod tests {
         assert_eq!(
             static_rng.batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(ArrayIrValue::Array(states))],),
             Err(BatchingError::UnsupportedOperation {
-                message: "'rng_bit_generator' cannot batch a replicated state because every batch item would see \
+                message: "`rng_bit_generator` cannot batch a replicated state because every batch item would see \
                           the same state; derive one state per batch item with `split_key` and map over the states \
                           explicitly"
                     .to_string(),

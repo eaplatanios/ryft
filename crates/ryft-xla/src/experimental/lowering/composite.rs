@@ -204,7 +204,7 @@ fn dynamic_constructor_types(
                 .map(Dimension::Static)
                 .ok_or_else(|| LoweringError::UnsupportedOp {
                     op: format!(
-                        "{name} output dimension '{}' needs a finite upper bound for physical buffer allocation",
+                        "{name} output dimension `{}` needs a finite upper bound for physical buffer allocation",
                         variable,
                     ),
                 }),
@@ -798,7 +798,7 @@ where
                                 .map(Dimension::Static)
                                 .ok_or_else(|| LoweringError::UnsupportedOp {
                                     op: format!(
-                                        "custom-call output dimension '{}' needs a finite upper bound for physical \
+                                        "custom-call output dimension `{}` needs a finite upper bound for physical \
                                          buffer allocation",
                                         variable,
                                     ),

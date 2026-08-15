@@ -77,7 +77,7 @@ pub enum AxisError {
     #[error("axes contain duplicate axis {axis}")]
     DuplicateAxis { axis: usize },
 
-    #[error("axis name '{name}' is not bound by any enclosing transform")]
+    #[error("axis name `{name}` is not bound by any enclosing transform")]
     UnboundAxisName { name: String },
 }
 
@@ -541,7 +541,7 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperati
         check_count!("input", inputs, 0, ProgramError);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{}` for the device mesh axis '{}' has no eager value; \
+                "`{}` for the device mesh axis `{}` has no eager value; \
                 it is only defined inside a `shard_map` manual region",
                 AXIS_INDEX_OPERATION_NAME, self.axis_name,
             ),
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn test_axis_error_renders_unbound_axis_name() {
         let error = AxisError::UnboundAxisName { name: "batch".to_string() };
-        assert_eq!(error.to_string(), "axis name 'batch' is not bound by any enclosing transform");
+        assert_eq!(error.to_string(), "axis name `batch` is not bound by any enclosing transform");
         assert_eq!(format!("{error:?}"), "UnboundAxisName { name: \"batch\" }");
         assert_eq!(error, AxisError::UnboundAxisName { name: "batch".to_string() });
         assert_ne!(error, AxisError::UnboundAxisName { name: "device".to_string() });

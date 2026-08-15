@@ -35,7 +35,7 @@ enum StatisticsError {
     ShardMapTrace(#[from] ShardMapTraceError),
 
     /// Error returned when a requested case ID is unknown.
-    #[error("unknown program statistics case '{case_id}'")]
+    #[error("unknown program statistics case `{case_id}`")]
     UnknownCase {
         /// Unknown case identifier.
         case_id: String,
@@ -129,7 +129,7 @@ fn registry() -> Vec<ProgramStatisticsCase> {
     for (index, case) in cases.iter().enumerate() {
         assert!(
             cases[..index].iter().all(|previous| previous.case_id != case.case_id),
-            "duplicate program statistics case ID '{}'",
+            "duplicate program statistics case ID `{}`",
             case.case_id,
         );
     }
@@ -406,7 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 case_ids.push(case_id);
             }
             other => {
-                return Err(format!("unknown argument '{other}'").into());
+                return Err(format!("unknown argument `{other}`").into());
             }
         }
     }
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn test_collect_records_rejects_unknown_case() {
         let error = collect_records(&["missing_case".to_string()]).unwrap_err();
-        assert_eq!(error.to_string(), "unknown program statistics case 'missing_case'");
+        assert_eq!(error.to_string(), "unknown program statistics case `missing_case`");
     }
 
     /// Verifies the exact expected statistics for every scalar case. These values are the primary structural

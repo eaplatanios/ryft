@@ -52,7 +52,7 @@ macro_rules! impl_capability_for_primitive {
         impl Add for $type {
             fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
                 self.checked_add(*rhs).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'{}' result does not fit in {}", ADD_OPERATION_NAME, stringify!($type)),
+                    message: format!("`{}` result does not fit in {}", ADD_OPERATION_NAME, stringify!($type)),
                 })
             }
         }
@@ -145,7 +145,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F8E3M4, DataType::F32],
-                    error = format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible"),
+                    error = format!("`{ADD_OPERATION_NAME}` input types are not broadcast-compatible"),
                 },
             ],
         );
@@ -171,11 +171,11 @@ mod tests {
                 },
                 {
                     input_types = [unreduced(), plain()],
-                    error = "'add' operands must be unreduced over the same axes",
+                    error = "`add` operands must be unreduced over the same axes",
                 },
                 {
                     input_types = [plain(), unreduced()],
-                    error = "'add' operands must be unreduced over the same axes",
+                    error = "`add` operands must be unreduced over the same axes",
                 },
             ],
         );
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(Add::add(&-2_i32, &3), Ok(1));
         assert_eq!(
             Add::add(&i8::MAX, &1),
-            Err(ProgramError::InvalidArgument { message: "'add' result does not fit in i8".to_string() }),
+            Err(ProgramError::InvalidArgument { message: "`add` result does not fit in i8".to_string() }),
         );
         assert_eq!(Add::add(&2.5_f64, &0.5), Ok(3.0));
     }

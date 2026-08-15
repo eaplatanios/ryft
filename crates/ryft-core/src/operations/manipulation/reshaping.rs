@@ -114,7 +114,7 @@ impl Operation for DynamicReshapeOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid(format!(
-                "'{RESHAPE_OPERATION_NAME}' expects an array followed by its output extents"
+                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
@@ -155,7 +155,7 @@ where
         }
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(TypeError::invalid(format!(
-                "'{RESHAPE_OPERATION_NAME}' expects an array followed by its output extents"
+                "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"
             ))
             .into());
         };
@@ -689,7 +689,7 @@ where
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "direct transposition of a dynamic '{RESHAPE_OPERATION_NAME}' requires linearization so its input \
+                    "direct transposition of a dynamic `{RESHAPE_OPERATION_NAME}` requires linearization so its input \
                      extents are available as explicit residuals",
                 ),
             }
@@ -825,7 +825,7 @@ impl Reshape for ArrayType {
         if permuted_input.shape() != &shape {
             if shape.dimensions().iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
                 return Err(TypeError::invalid(format!(
-                    "'{RESHAPE_OPERATION_NAME}' requires explicit result-dimension operands for a dynamic output shape"
+                    "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension operands for a dynamic output shape"
                 ))
                 .into());
             }
@@ -833,20 +833,20 @@ impl Reshape for ArrayType {
                 permuted_input.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
             else {
                 return Err(TypeError::invalid(format!(
-                    "'{RESHAPE_OPERATION_NAME}' requires explicit result-dimension operands for a dynamic input shape"
+                    "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension operands for a dynamic input shape"
                 ))
                 .into());
             };
             let Some(output_elements) = shape.element_count().map_err(|error| TypeError::invalid(error.to_string()))?
             else {
                 return Err(TypeError::invalid(format!(
-                    "'{RESHAPE_OPERATION_NAME}' requires explicit result-dimension operands for a dynamic output shape"
+                    "`{RESHAPE_OPERATION_NAME}` requires explicit result-dimension operands for a dynamic output shape"
                 ))
                 .into());
             };
             if input_elements != output_elements {
                 return Err(
-                    TypeError::invalid(format!("'{RESHAPE_OPERATION_NAME}' changes the number of elements")).into()
+                    TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements")).into()
                 );
             }
         }
@@ -887,7 +887,7 @@ fn infer_explicit_reshape_output_type(
         (permuted_input.element_count()?, output_shape.element_count()?)
         && input_elements != output_elements
     {
-        return Err(TypeError::invalid(format!("'{RESHAPE_OPERATION_NAME}' changes the number of elements")));
+        return Err(TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` changes the number of elements")));
     }
 
     let sharding = match operation.output_sharding() {
@@ -916,7 +916,7 @@ fn validate_requested_reshape_sharding(
 ) -> Result<Sharding, TypeError> {
     if requested.rank() != output_shape.rank() {
         return Err(TypeError::invalid(format!(
-            "'{}' requested output sharding rank ({}) does not match the output rank ({})",
+            "`{}` requested output sharding rank ({}) does not match the output rank ({})",
             RESHAPE_OPERATION_NAME,
             requested.rank(),
             output_shape.rank(),
@@ -924,12 +924,12 @@ fn validate_requested_reshape_sharding(
     }
     if input.sharding().is_some_and(|input| input.mesh() != requested.mesh()) {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding uses a different mesh"
+            "`{RESHAPE_OPERATION_NAME}` requested output sharding uses a different mesh"
         )));
     }
     if requested.references_auto_axis() {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding cannot reference auto mesh axes"
+            "`{RESHAPE_OPERATION_NAME}` requested output sharding cannot reference auto mesh axes"
         )));
     }
     let input_unreduced = input.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
@@ -937,17 +937,17 @@ fn validate_requested_reshape_sharding(
     let input_varying = input.sharding().map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
     if requested.unreduced_axes() != &input_unreduced {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding changes the unreduced mesh axes"
+            "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the unreduced mesh axes"
         )));
     }
     if requested.reduced_axes() != &input_reduced {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding changes the reduced mesh axes"
+            "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the reduced mesh axes"
         )));
     }
     if requested.varying_manual_axes() != &input_varying {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requested output sharding changes the varying manual mesh axes"
+            "`{RESHAPE_OPERATION_NAME}` requested output sharding changes the varying manual mesh axes"
         )));
     }
     Ok(requested.clone())
@@ -1001,7 +1001,7 @@ fn infer_reshape_sharding(input: &ArrayType, output_shape: &Shape, sharding: &Sh
     }
 
     let alignment_error =
-        || TypeError::invalid(format!("'{RESHAPE_OPERATION_NAME}' could not align reshape dimension groups"));
+        || TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` could not align reshape dimension groups"));
     let mut input_start = 0usize;
     let mut output_start = 0usize;
     while input_start < input_dimensions.len() || output_start < output_dimensions.len() {
@@ -1042,7 +1042,7 @@ fn static_positive_size(size: Dimension) -> Result<usize, TypeError> {
     match size {
         Dimension::Static(value) if value > 0 => Ok(value),
         Dimension::Static(_) | Dimension::Dynamic(_) => Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requires explicit output sharding for unaligned zero or dynamic dimensions"
+            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned zero or dynamic dimensions"
         ))),
     }
 }
@@ -1081,14 +1081,14 @@ fn propagate_zero_reshape_sharding(
         .any(|(axis, _)| sharding.dimensions()[*axis] != ShardingDimension::Replicated)
     {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requires explicit output sharding for an ambiguous zero-sized reshape"
+            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for an ambiguous zero-sized reshape"
         )));
     }
     if input_dimensions[prefix..input_end].iter().any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
         || output_dimensions[prefix..output_end].iter().any(|(_, size)| matches!(size, Dimension::Dynamic(_)))
     {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' requires explicit output sharding for unaligned dynamic dimensions"
+            "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unaligned dynamic dimensions"
         )));
     }
     Ok(())
@@ -1113,13 +1113,13 @@ fn propagate_static_reshape_group(
             ShardingDimension::Replicated => saw_replicated = true,
             ShardingDimension::Unconstrained => {
                 return Err(TypeError::invalid(format!(
-                    "'{RESHAPE_OPERATION_NAME}' requires explicit output sharding for unconstrained dimensions"
+                    "`{RESHAPE_OPERATION_NAME}` requires explicit output sharding for unconstrained dimensions"
                 )));
             }
             ShardingDimension::Sharded(axis_names) => {
                 if saw_replicated {
                     return Err(TypeError::invalid(format!(
-                        "'{RESHAPE_OPERATION_NAME}' cannot preserve non-contiguous sharding across a merge"
+                        "`{RESHAPE_OPERATION_NAME}` cannot preserve non-contiguous sharding across a merge"
                     )));
                 }
                 mesh_axes.extend(axis_names.iter().cloned());
@@ -1134,11 +1134,11 @@ fn propagate_static_reshape_group(
         while remaining > 1 && mesh_axis_index < mesh_axes.len() {
             let mesh_axis = &mesh_axes[mesh_axis_index];
             let mesh_axis_size = sharding.mesh().axis_size(mesh_axis).ok_or_else(|| {
-                TypeError::invalid(format!("'{RESHAPE_OPERATION_NAME}' references unknown mesh axis '{mesh_axis}'"))
+                TypeError::invalid(format!("`{RESHAPE_OPERATION_NAME}` references unknown mesh axis `{mesh_axis}`"))
             })?;
             if remaining % mesh_axis_size != 0 {
                 return Err(TypeError::invalid(format!(
-                    "'{RESHAPE_OPERATION_NAME}' cannot distribute sharding across the requested split factors"
+                    "`{RESHAPE_OPERATION_NAME}` cannot distribute sharding across the requested split factors"
                 )));
             }
             remaining /= mesh_axis_size;
@@ -1151,7 +1151,7 @@ fn propagate_static_reshape_group(
     }
     if mesh_axis_index != mesh_axes.len() {
         return Err(TypeError::invalid(format!(
-            "'{RESHAPE_OPERATION_NAME}' cannot distribute all input mesh axes across the output dimensions"
+            "`{RESHAPE_OPERATION_NAME}` cannot distribute all input mesh axes across the output dimensions"
         )));
     }
     Ok(())
@@ -1356,7 +1356,7 @@ mod tests {
                 },
                 {
                     input_types = [ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(5)]))],
-                    error = "'reshape' changes the number of elements",
+                    error = "`reshape` changes the number of elements",
                 },
             ],
         );
@@ -1377,7 +1377,7 @@ mod tests {
         assert_eq!(
             input.reshape(ReshapeParameters::new(Shape::new(vec![Dimension::Static(6)])).with_dimensions([1, 0]),),
             Err(ProgramError::Type(TypeError::invalid(
-                "'transpose' permutation has length 2 but input has rank 1".to_string()
+                "`transpose` permutation has length 2 but input has rank 1".to_string()
             ))),
         );
         assert_eq!(
@@ -1555,25 +1555,25 @@ mod tests {
         assert_eq!(
             dynamic_type.reshape(Shape::new(vec![Dimension::Static(6)])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires explicit result-dimension operands for a dynamic input shape".to_string()
+                "`reshape` requires explicit result-dimension operands for a dynamic input shape".to_string()
             ))),
         );
         assert_eq!(
             static_type.reshape(dynamic_shape.clone()),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
+                "`reshape` requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
         assert_eq!(
             ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type), &[]),
             Err(TypeError::invalid(
-                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string(),
+                "`reshape` requires explicit result-dimension operands for a dynamic output shape".to_string(),
             )),
         );
         assert_eq!(
             Array::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
+                "`reshape` requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
 
@@ -1591,7 +1591,7 @@ mod tests {
                 Dimension::Static(0)
             ])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires explicit result-dimension operands for a dynamic output shape".to_string()
+                "`reshape` requires explicit result-dimension operands for a dynamic output shape".to_string()
             ))),
         );
         assert_eq!(
@@ -1773,7 +1773,7 @@ mod tests {
         assert_eq!(
             input_type.reshape(Shape::new(vec![Dimension::Static(8)])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' cannot preserve non-contiguous sharding across a merge".to_string()
+                "`reshape` cannot preserve non-contiguous sharding across a merge".to_string()
             ))),
         );
 
@@ -1842,7 +1842,7 @@ mod tests {
                     .with_output_sharding(other_requested),
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requested output sharding uses a different mesh".to_string()
+                "`reshape` requested output sharding uses a different mesh".to_string()
             ))),
         );
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1855,7 +1855,7 @@ mod tests {
                     .with_output_sharding(auto_requested),
             ),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requested output sharding cannot reference auto mesh axes".to_string()
+                "`reshape` requested output sharding cannot reference auto mesh axes".to_string()
             ))),
         );
         let auto_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1915,7 +1915,7 @@ mod tests {
         assert_eq!(
             sharded_dynamic_input.reshape(Shape::new(vec![Dimension::Static(0)])),
             Err(ProgramError::Type(TypeError::invalid(
-                "'reshape' requires explicit output sharding for an ambiguous zero-sized reshape".to_string()
+                "`reshape` requires explicit output sharding for an ambiguous zero-sized reshape".to_string()
             ))),
         );
         let zero_requested = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();

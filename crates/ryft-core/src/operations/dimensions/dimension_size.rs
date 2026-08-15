@@ -112,7 +112,7 @@ impl DimensionSizeOperation {
         let axis = axis.into();
         let position = axis.normalize(input_type.rank()).map_err(|_| {
             TypeError::invalid(format!(
-                "'{DIMENSION_SIZE_OPERATION_NAME}' axis {axis} is out of bounds for rank {}",
+                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {axis} is out of bounds for rank {}",
                 input_type.rank(),
             ))
         })?;
@@ -155,7 +155,7 @@ impl DimensionSizeOperation {
         let input_type = <&ArrayType>::try_from(input_type)?;
         let actual_dimension = input_type.shape().dimensions().get(self.axis).ok_or_else(|| {
             TypeError::invalid(format!(
-                "'{DIMENSION_SIZE_OPERATION_NAME}' axis {} is out of bounds for rank {}",
+                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {} is out of bounds for rank {}",
                 self.axis,
                 input_type.rank(),
             ))
@@ -182,7 +182,7 @@ impl DimensionSizeOperation {
             .into());
         }
         Err(TypeError::invalid(format!(
-            "'{DIMENSION_SIZE_OPERATION_NAME}' input axis {} dimension {actual_dimension} does not refine declared \
+            "`{DIMENSION_SIZE_OPERATION_NAME}` input axis {} dimension {actual_dimension} does not refine declared \
              dimension {}",
             self.axis, self.input_dimension,
         )))
@@ -368,11 +368,11 @@ mod tests {
 
         assert_eq!(
             DimensionSizeOperation::new(&static_type, 1),
-            Err(TypeError::invalid("'dimension_size' axis 1 is out of bounds for rank 1")),
+            Err(TypeError::invalid("`dimension_size` axis 1 is out of bounds for rank 1")),
         );
         assert_eq!(
             DimensionSizeOperation::new(&static_type, -2),
-            Err(TypeError::invalid("'dimension_size' axis -2 is out of bounds for rank 1")),
+            Err(TypeError::invalid("`dimension_size` axis -2 is out of bounds for rank 1")),
         );
         if let Some(unrepresentable) = MAX_DIMENSION_EXTENT.checked_add(1) {
             let unrepresentable_type =
@@ -421,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[ArrayType::scalar(DataType::F32).into()], &[]),
-            Err(TypeError::invalid("'dimension_size' axis 0 is out of bounds for rank 0")),
+            Err(TypeError::invalid("`dimension_size` axis 0 is out of bounds for rank 0")),
         );
         assert_eq!(
             operation.infer_output_types(
@@ -440,7 +440,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'dimension_size' input axis 0 dimension other does not refine declared dimension extent",
+                "`dimension_size` input axis 0 dimension other does not refine declared dimension extent",
             )),
         );
         assert_eq!(
@@ -448,7 +448,7 @@ mod tests {
                 &[ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])).into()],
                 &[],
             ),
-            Err(TypeError::invalid("'dimension_size' input axis 0 dimension 4 does not refine declared dimension 3",)),
+            Err(TypeError::invalid("`dimension_size` input axis 0 dimension 4 does not refine declared dimension 3",)),
         );
 
         // Renaming preserves the relationship between the selected dynamic input dimension and the result.
@@ -638,7 +638,7 @@ mod tests {
                 for (position, identity) in r#type.identities() {
                     assert!(
                         position != TypeIdentityPosition::Reference || operand_identities.contains(identity),
-                        "instruction '{}' result type {} references identity {identity} that no operand carries",
+                        "instruction `{}` result type {} references identity {identity} that no operand carries",
                         instruction.operation().name(),
                         r#type.as_ref(),
                     );

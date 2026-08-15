@@ -106,7 +106,7 @@ pub enum ParameterError {
             None => "got more parameters than expected".to_string(),
             Some(paths) => format!(
                 "got more parameters than expected; unused parameter paths: {}",
-                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+                paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", "),
             ),
         }
     )]
@@ -118,7 +118,7 @@ pub enum ParameterError {
             None => format!("got fewer parameters than expected; expected at least {expected_count}"),
             Some(paths) => format!(
                 "got fewer parameters than expected; expected at least {expected_count}; missing parameter paths: {}",
-                paths.iter().map(|path| format!("'{path}'")).collect::<Vec<_>>().join(", "),
+                paths.iter().map(|path| format!("`{path}`")).collect::<Vec<_>>().join(", "),
             ),
         }
     )]
@@ -126,7 +126,7 @@ pub enum ParameterError {
 
     #[error(
         "got ambiguous parameter values while combining parameterized values: {}",
-        values.iter().map(|value| format!("'{value}'")).collect::<Vec<_>>().join(", "),
+        values.iter().map(|value| format!("`{value}`")).collect::<Vec<_>>().join(", "),
     )]
     AmbiguousParameterCombination { values: Vec<String> },
 

@@ -86,7 +86,7 @@ impl Operation for DotProductAttentionOperation {
         let signature = self.signature;
         if input_types.len() != 3 + signature.count() {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' expects {} inputs for its optional-operand signature but \
+                "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` expects {} inputs for its optional-operand signature but \
                  got {}",
                 3 + signature.count(),
                 input_types.len(),
@@ -112,13 +112,13 @@ impl Operation for DotProductAttentionOperation {
             && self.configuration.implementation() != AttentionImplementation::Fused
         {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' dropout requires the fused implementation"
+                "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` dropout requires the fused implementation"
             )));
         }
         for input_type in input_types {
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "'{DOT_PRODUCT_ATTENTION_OPERATION_NAME}' does not support unreduced operands"
+                    "`{DOT_PRODUCT_ATTENTION_OPERATION_NAME}` does not support unreduced operands"
                 )));
             }
         }
@@ -230,7 +230,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         let signature = self.signature;
         if input_types.len() != 6 + signature.count() {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects {} inputs for its optional-operand \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` expects {} inputs for its optional-operand \
                  signature but got {}",
                 6 + signature.count(),
                 input_types.len(),
@@ -256,7 +256,7 @@ impl Operation for DotProductAttentionBackwardOperation {
             && self.configuration.implementation() != AttentionImplementation::Fused
         {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' dropout requires the fused implementation"
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` dropout requires the fused implementation"
             )));
         }
         // The forward-output-shaped operands compare by data type and shape only, so operand-level metadata such as
@@ -266,7 +266,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         };
         if !matches_expected(operands.output.unwrap(), operands.query) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' output type {} does not match the expected \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` output type {} does not match the expected \
                  forward output type {}",
                 operands.output.unwrap(),
                 operands.query,
@@ -275,7 +275,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         let expected_output_cotangent_type = operands.query.cotangent();
         if !matches_expected(operands.output_cotangent.unwrap(), &expected_output_cotangent_type) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' output cotangent type {} does not match the \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` output cotangent type {} does not match the \
                  expected cotangent type {expected_output_cotangent_type}",
                 operands.output_cotangent.unwrap(),
             )));
@@ -283,7 +283,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         let expected_activation_type = attention_activation_type(&dimensions, &input_types[0])?;
         if !matches_expected(operands.activation.unwrap(), &expected_activation_type) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' activation type {} does not match the \
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` activation type {} does not match the \
                      expected activation type {expected_activation_type}",
                 operands.activation.unwrap(),
             )));
@@ -291,7 +291,7 @@ impl Operation for DotProductAttentionBackwardOperation {
         for input_type in input_types {
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' does not support unreduced operands"
+                    "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` does not support unreduced operands"
                 )));
             }
         }
@@ -359,7 +359,7 @@ impl<C: Domain<Type = ArrayType, Value: DotProductAttentionBackward>> Interpreta
         let (forward_inputs, suffix) = inputs.split_at(forward_input_count.min(inputs.len()));
         let [output, residual, output_cotangent] = suffix else {
             return Err(TypeError::invalid(format!(
-                "'{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}' expects {} inputs but got {}",
+                "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` expects {} inputs but got {}",
                 forward_input_count + 3,
                 inputs.len(),
             ))

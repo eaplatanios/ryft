@@ -14,34 +14,34 @@ pub enum ShardingError {
     #[error("mesh axis names must not be empty")]
     EmptyMeshAxisName,
 
-    #[error("unknown mesh axis name: '{name}'")]
+    #[error("unknown mesh axis name: `{name}`")]
     UnknownMeshAxisName { name: String },
 
-    #[error("mesh axis name '{name}' appears more than once")]
+    #[error("mesh axis name `{name}` appears more than once")]
     DuplicateMeshAxisName { name: String },
 
-    #[error("mesh axis '{name}' must have size > 0")]
+    #[error("mesh axis `{name}` must have size > 0")]
     EmptyMeshAxis { name: String },
 
-    #[error("mesh axis '{name}' must have type manual")]
+    #[error("mesh axis `{name}` must have type manual")]
     ExpectedManualMeshAxis { name: String },
 
-    #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis '{name}'")]
+    #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis `{name}`")]
     NonManualShardedDimensionRemoval { dimension: usize, name: String },
 
-    #[error("manual axis '{name}' cannot be both varying and unreduced")]
+    #[error("manual axis `{name}` cannot be both varying and unreduced")]
     ConflictingVaryingAndUnreducedMeshAxis { name: String },
 
-    #[error("manual axis '{name}' cannot be both varying and reduced")]
+    #[error("manual axis `{name}` cannot be both varying and reduced")]
     ConflictingVaryingAndReducedMeshAxis { name: String },
 
-    #[error("device ID '{id}' appears more than once")]
+    #[error("device ID `{id}` appears more than once")]
     DuplicateDeviceId { id: DeviceId },
 
     #[error("mesh has {actual} device(s), but its axis sizes imply {expected} device(s)")]
     DeviceCountMismatch { expected: usize, actual: usize },
 
-    #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
+    #[error("mesh mismatch; expected `{expected:?}` but got `{actual:?}`")]
     MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
 
     #[error("sharding dimension #{dimension} has no axes")]

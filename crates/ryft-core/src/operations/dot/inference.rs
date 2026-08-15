@@ -110,18 +110,18 @@ pub(crate) fn dot_abstract(
     output_sharding: Option<&Sharding>,
 ) -> Result<ArrayType, TypeError> {
     if lhs.data_type() != rhs.data_type() {
-        return Err(TypeError::invalid(format!("'{DOT_OPERATION_NAME}' input element types are incompatible")));
+        return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` input element types are incompatible")));
     }
     if let Some(accumulation_type) = accumulation_type {
         if output_sharding.is_some() {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' does not support combining an accumulation type with a requested \
+                "`{DOT_OPERATION_NAME}` does not support combining an accumulation type with a requested \
                      output sharding yet",
             )));
         }
         if !accumulation_type_is_compatible(lhs.data_type(), accumulation_type) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' operand data type {} cannot accumulate at data type {accumulation_type}",
+                "`{DOT_OPERATION_NAME}` operand data type {} cannot accumulate at data type {accumulation_type}",
                 lhs.data_type(),
             )));
         }
@@ -135,32 +135,32 @@ pub(crate) fn dot_abstract(
 
     if lhs_batching.len() != rhs_batching.len() {
         return Err(TypeError::invalid(format!(
-            "'{DOT_OPERATION_NAME}' batching dimensions have different lengths on the two operands"
+            "`{DOT_OPERATION_NAME}` batching dimensions have different lengths on the two operands"
         )));
     }
     if lhs_contracting.len() != rhs_contracting.len() {
         return Err(TypeError::invalid(format!(
-            "'{DOT_OPERATION_NAME}' contracting dimensions have different lengths on the two operands"
+            "`{DOT_OPERATION_NAME}` contracting dimensions have different lengths on the two operands"
         )));
     }
     if lhs_batching.iter().any(|axis| *axis >= lhs_rank) || lhs_contracting.iter().any(|axis| *axis >= lhs_rank) {
-        return Err(TypeError::invalid(format!("'{DOT_OPERATION_NAME}' LHS dimension index out of bounds")));
+        return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` LHS dimension index out of bounds")));
     }
     if rhs_batching.iter().any(|axis| *axis >= rhs_rank) || rhs_contracting.iter().any(|axis| *axis >= rhs_rank) {
-        return Err(TypeError::invalid(format!("'{DOT_OPERATION_NAME}' RHS dimension index out of bounds")));
+        return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` RHS dimension index out of bounds")));
     }
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching.iter()) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                "`{DOT_OPERATION_NAME}` batching dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
             )));
         }
     }
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting.iter()) {
         if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
+                "`{DOT_OPERATION_NAME}` contracting dimension sizes do not match (LHS axis {lhs_axis}, RHS axis {rhs_axis})"
             )));
         }
     }
@@ -192,13 +192,13 @@ pub(crate) fn dot_abstract(
             .iter()
             .any(|axis_name| sharding.mesh().axis_type(axis_name) == Some(MeshAxisType::Explicit))
         {
-            return Err(TypeError::invalid(format!("'{DOT_OPERATION_NAME}' operands cannot be unreduced")));
+            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` operands cannot be unreduced")));
         }
     }
 
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
-            return Err(TypeError::invalid(format!("'{DOT_OPERATION_NAME}' operand shardings must use the same mesh")));
+            return Err(TypeError::invalid(format!("`{DOT_OPERATION_NAME}` operand shardings must use the same mesh")));
         }
         (Some(left), _) => Some(left.mesh()),
         (_, Some(right)) => Some(right.mesh()),
@@ -214,7 +214,7 @@ pub(crate) fn dot_abstract(
         let output_rank = dimensions.lhs_batching_dimensions().len() + lhs_result.len() + rhs_result.len();
         if output_sharding.rank() != output_rank {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' output sharding rank ({}) does not match the output rank ({output_rank})",
+                "`{DOT_OPERATION_NAME}` output sharding rank ({}) does not match the output rank ({output_rank})",
                 output_sharding.rank(),
             )));
         }
@@ -222,7 +222,7 @@ pub(crate) fn dot_abstract(
             && output_sharding.mesh() != mesh
         {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' output sharding must use the same mesh as the operands"
+                "`{DOT_OPERATION_NAME}` output sharding must use the same mesh as the operands"
             )));
         }
         let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
@@ -237,7 +237,7 @@ pub(crate) fn dot_abstract(
             .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
         {
             return Err(TypeError::invalid(format!(
-                "'{DOT_OPERATION_NAME}' output sharding cannot reference auto mesh axes"
+                "`{DOT_OPERATION_NAME}` output sharding cannot reference auto mesh axes"
             )));
         }
         // A requested unreduced output is a deferred all-reduce: contracting over a dimension sharded across mesh axes
@@ -258,7 +258,7 @@ pub(crate) fn dot_abstract(
                 .collect();
             if lhs_contracting_spec != rhs_contracting_spec {
                 return Err(TypeError::invalid(format!(
-                    "'{DOT_OPERATION_NAME}' contracting dimensions must be sharded identically when the output sharding is unreduced"
+                    "`{DOT_OPERATION_NAME}` contracting dimensions must be sharded identically when the output sharding is unreduced"
                 )));
             }
             let mut contracting_axes = BTreeSet::new();
@@ -269,7 +269,7 @@ pub(crate) fn dot_abstract(
             }
             if output_sharding.unreduced_axes() != &contracting_axes {
                 return Err(TypeError::invalid(format!(
-                    "'{DOT_OPERATION_NAME}' output sharding unreduced axes must equal the axes that shard the contracting dimensions"
+                    "`{DOT_OPERATION_NAME}` output sharding unreduced axes must equal the axes that shard the contracting dimensions"
                 )));
             }
         }
@@ -291,7 +291,7 @@ pub(crate) fn dot_abstract(
                 };
                 if left_axes != right_axes {
                     return Err(TypeError::invalid(format!(
-                        "'{DOT_OPERATION_NAME}' contracting dimensions must have consistent shardings, but got {left} and {right}"
+                        "`{DOT_OPERATION_NAME}` contracting dimensions must have consistent shardings, but got {left} and {right}"
                     )));
                 }
                 return Err(TypeError::invalid(format!(
@@ -316,7 +316,7 @@ pub(crate) fn dot_abstract(
                 // Manual/Auto axes drops to `Replicated` and is left to `shard_map` / the compiler.
                 None if dimension_has_explicit_axis(mesh, &left) || dimension_has_explicit_axis(mesh, &right) => {
                     return Err(TypeError::invalid(format!(
-                        "'{DOT_OPERATION_NAME}' batching dimensions must have consistent shardings, but got {left} and {right}"
+                        "`{DOT_OPERATION_NAME}` batching dimensions must have consistent shardings, but got {left} and {right}"
                     )));
                 }
                 None => ShardingDimension::Replicated,
@@ -340,7 +340,7 @@ pub(crate) fn dot_abstract(
             .and_then(|output| output.with_reduced_axes(reduced_axes))
             .and_then(|output| output.with_varying_manual_axes(varying_manual_axes))
             .map_err(|error| {
-                TypeError::invalid(format!("'{DOT_OPERATION_NAME}' output sharding construction failed: {error}"))
+                TypeError::invalid(format!("`{DOT_OPERATION_NAME}` output sharding construction failed: {error}"))
             })?;
         Some(sharding.without_auto_axes())
     } else {

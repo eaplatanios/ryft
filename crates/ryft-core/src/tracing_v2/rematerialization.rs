@@ -824,7 +824,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
             let region_id = instruction.regions().get(origin.region_index).copied().ok_or_else(|| {
                 RematerializationError::UnsupportedProvenance {
                     message: format!(
-                        "operation '{}' reported provenance into region index {} but the instruction carries {} \
+                        "operation `{}` reported provenance into region index {} but the instruction carries {} \
                          attached regions",
                         instruction.operation().name(),
                         origin.region_index,
@@ -838,7 +838,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
             let atom = region.output_ids().get(origin.output_index).copied().ok_or_else(|| {
                 RematerializationError::UnsupportedProvenance {
                     message: format!(
-                        "operation '{}' reported provenance selecting output {} from a region with {} outputs",
+                        "operation `{}` reported provenance selecting output {} from a region with {} outputs",
                         instruction.operation().name(),
                         origin.output_index,
                         region.output_ids().len(),
@@ -1528,20 +1528,20 @@ fn validate_storage_operation<T: Type, O: Operation<Type = T>>(
     let operation_name = operation.name();
     if !operation.effects().is_pure() {
         return Err(RematerializationError::InvalidStorageOperation {
-            message: format!("storage operation '{operation_name}' must be pure but declares effects"),
+            message: format!("storage operation `{operation_name}` must be pure but declares effects"),
         });
     }
     let mut output_types = operation.infer_output_types(std::slice::from_ref(input_type), &[]).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
             message: format!(
-                "storage operation '{operation_name}' rejected its single input of type {input_type}: {error}",
+                "storage operation `{operation_name}` rejected its single input of type {input_type}: {error}",
             ),
         }
     })?;
     if output_types.len() != 1 {
         return Err(RematerializationError::InvalidStorageOperation {
             message: format!(
-                "storage operation '{operation_name}' must produce exactly one output but produced {}",
+                "storage operation `{operation_name}` must produce exactly one output but produced {}",
                 output_types.len(),
             ),
         });
@@ -1561,13 +1561,13 @@ fn stage_storage_operation<V: Value, O: Operation<Type = V::Type>>(
     let operation_name = operation.name();
     let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
-            message: format!("storage operation '{operation_name}' could not be staged: {error}"),
+            message: format!("storage operation `{operation_name}` could not be staged: {error}"),
         }
     })?;
     if outputs.len() != 1 {
         return Err(RematerializationError::InvalidStorageOperation {
             message: format!(
-                "storage operation '{operation_name}' must produce exactly one output but produced {}",
+                "storage operation `{operation_name}` must produce exactly one output but produced {}",
                 outputs.len(),
             ),
         }
@@ -1729,7 +1729,7 @@ impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
                 self.primal.instruction_effects(InstructionId::new(self.primal.entry(), instruction_index)).unwrap();
             if !effects.is_pure() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "rematerialization attempted to recompute the non-pure operation '{}'",
+                    "rematerialization attempted to recompute the non-pure operation `{}`",
                     instruction.operation().name(),
                 )));
             }
@@ -3987,24 +3987,24 @@ mod tests {
         assert!(matches!(
             error(InvalidStorageTestOperation::ZeroOutputs),
             RematerializationError::InvalidStorageOperation { message }
-                if message == "storage operation 'zero_outputs' must produce exactly one output but produced 0",
+                if message == "storage operation `zero_outputs` must produce exactly one output but produced 0",
         ));
         assert!(matches!(
             error(InvalidStorageTestOperation::TwoOutputs),
             RematerializationError::InvalidStorageOperation { message }
-                if message == "storage operation 'two_outputs' must produce exactly one output but produced 2",
+                if message == "storage operation `two_outputs` must produce exactly one output but produced 2",
         ));
         assert!(matches!(
             error(InvalidStorageTestOperation::RejectsInput),
             RematerializationError::InvalidStorageOperation { message }
                 if message == format!(
-                    "storage operation 'rejects_input' rejected its single input of type {scalar_type}: unsupported storage input",
+                    "storage operation `rejects_input` rejected its single input of type {scalar_type}: unsupported storage input",
                 ),
         ));
         assert!(matches!(
             error(InvalidStorageTestOperation::Effectful),
             RematerializationError::InvalidStorageOperation { message }
-                if message == "storage operation 'effectful' must be pure but declares effects",
+                if message == "storage operation `effectful` must be pure but declares effects",
         ));
 
         let restored_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(1)]));

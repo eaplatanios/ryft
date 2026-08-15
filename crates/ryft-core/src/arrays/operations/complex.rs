@@ -18,7 +18,7 @@ impl crate::operations::complex::Complex for Array {
         // the element data type maps to the complex data type with the parts' precision.
         if self.r#type() != imaginary.r#type() {
             return Err(TypeError::invalid(format!(
-                "'{}' requires identical part types but got {} and {}",
+                "`{}` requires identical part types but got {} and {}",
                 COMPLEX_OPERATION_NAME,
                 self.r#type(),
                 imaginary.r#type(),

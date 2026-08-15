@@ -1031,7 +1031,7 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
         if self.is_transpose_only() {
             return Err(ProgramError::UnsupportedOperation {
                 message: "a transpose-only linear call has no forward program to execute; it supports only \
-                          reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')"
+                          reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)"
                     .to_string(),
             });
         }
@@ -1758,8 +1758,8 @@ mod tests {
             program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "a transpose-only linear call has no forward program to execute; it supports only \
-                               reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or \
-                               'jacobian_reverse')",
+                               reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                               `jacobian_reverse`)",
         ));
         assert!(matches!(
             program.batched(
@@ -1937,7 +1937,7 @@ mod tests {
 
         // Batching must therefore rewrite both regions instead of taking the all-replicated fast path, which would bind
         // the call unchanged and leave the `axis_index` unresolved (it then reaches eager interpretation and reports
-        // "`axis_index` for the device mesh axis 'items' has no eager value").
+        // "`axis_index` for the device mesh axis `items` has no eager value").
         let outputs = LinearCallOperation::new(0)
             .batch(&context, &driver, &[ArrayBatch::replicated(Array::scalar(2.0))])
             .unwrap()

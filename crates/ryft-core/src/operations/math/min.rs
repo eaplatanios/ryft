@@ -158,11 +158,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "'min' does not support input data type c64",
+                    error = "`min` does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'min' does not support input data type bool",
+                    error = "`min` does not support input data type bool",
                 },
             ],
         );

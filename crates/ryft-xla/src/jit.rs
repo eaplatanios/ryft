@@ -4162,7 +4162,7 @@ mod tests {
         let mut next_buffer = |name: &str| match inputs.next() {
             Some(Ok(FfiInput::Buffer { buffer })) => Ok(buffer),
             _ => Err(FfiError::invalid_argument(format!(
-                "expected the '{name}' input buffer of the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call"
+                "expected the `{name}` input buffer of the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call"
             ))),
         };
         let keys = next_buffer("keys")?;
@@ -4172,12 +4172,12 @@ mod tests {
         let mut outputs = call_frame.outputs();
         let Some(Ok(FfiOutput::Buffer { buffer: output })) = outputs.next() else {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call to have one output buffer"
+                "expected the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call to have one output buffer"
             )));
         };
         let &[steps, dimension] = keys.dimensions() else {
             return Err(FfiError::invalid_argument(format!(
-                "expected the 'keys' input of the '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call to have rank 2"
+                "expected the `keys` input of the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call to have rank 2"
             )));
         };
         if keys.element_type() != FfiBufferType::F32
@@ -4190,7 +4190,7 @@ mod tests {
             || output.dimensions() != [dimension]
         {
             return Err(FfiError::invalid_argument(format!(
-                "unexpected '{DECODE_ATTENTION_CUSTOM_CALL_TARGET}' custom call buffer types or shapes"
+                "unexpected `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call buffer types or shapes"
             )));
         }
         let steps = steps.max(0) as usize;

@@ -50,7 +50,7 @@ macro_rules! impl_capability_for_primitive {
         impl Sub for $type {
             fn sub(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_sub(*right).ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("'{}' result does not fit in {}", SUB_OPERATION_NAME, stringify!($type)),
+                    message: format!("`{}` result does not fit in {}", SUB_OPERATION_NAME, stringify!($type)),
                 })
             }
         }
@@ -145,7 +145,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F8E3M4, DataType::F32],
-                    error = format!("'{SUB_OPERATION_NAME}' input types are not broadcast-compatible"),
+                    error = format!("`{SUB_OPERATION_NAME}` input types are not broadcast-compatible"),
                 },
             ],
         );
@@ -171,11 +171,11 @@ mod tests {
                 },
                 {
                     input_types = [unreduced(), plain()],
-                    error = "'sub' operands must be unreduced over the same axes",
+                    error = "`sub` operands must be unreduced over the same axes",
                 },
                 {
                     input_types = [plain(), unreduced()],
-                    error = "'sub' operands must be unreduced over the same axes",
+                    error = "`sub` operands must be unreduced over the same axes",
                 },
             ],
         );
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(Sub::sub(&5_usize, &3), Ok(2));
         assert_eq!(
             Sub::sub(&0_usize, &1),
-            Err(ProgramError::InvalidArgument { message: "'sub' result does not fit in usize".to_string() }),
+            Err(ProgramError::InvalidArgument { message: "`sub` result does not fit in usize".to_string() }),
         );
         assert_eq!(Sub::sub(&2.5_f32, &0.5), Ok(2.0));
     }

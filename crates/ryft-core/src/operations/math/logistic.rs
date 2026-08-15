@@ -107,7 +107,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "'logistic' does not support input data type i32",
+                    error = "`logistic` does not support input data type i32",
                 },
             ],
         );

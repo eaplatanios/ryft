@@ -209,7 +209,7 @@ impl WhileTypeSemantics for ArrayType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         if !condition_output.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
+                "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got {condition_output}"
             )));
         }
         let predicate_shape = condition_output.shape();
@@ -219,7 +219,7 @@ impl WhileTypeSemantics for ArrayType {
                 && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
             if !is_prefix {
                 return Err(TypeError::invalid(format!(
-                    "'{WHILE_OPERATION_NAME}' condition predicate shape must be a prefix of every state shape, but predicate \
+                    "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every state shape, but predicate \
                          {condition_output} is not a prefix of state {state_type}",
                 )));
             }
@@ -236,12 +236,12 @@ impl WhileTypeSemantics for ArrayIrType {
     fn validate_while_condition_output(condition_output: &Self, state_types: &[Self]) -> Result<(), TypeError> {
         let Self::Array(condition_output) = condition_output else {
             return Err(TypeError::invalid(format!(
-                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
+                "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got {condition_output}"
             )));
         };
         if !condition_output.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'{WHILE_OPERATION_NAME}' condition output type must be a Boolean array, but got {condition_output}"
+                "`{WHILE_OPERATION_NAME}` condition output type must be a Boolean array, but got {condition_output}"
             )));
         }
         let predicate_shape = condition_output.shape();
@@ -260,7 +260,7 @@ impl WhileTypeSemantics for ArrayIrType {
                 && predicate_shape.dimensions().iter().zip(state_shape.dimensions()).all(|(p, s)| p == s);
             if !is_prefix {
                 return Err(TypeError::invalid(format!(
-                    "'{WHILE_OPERATION_NAME}' condition predicate shape must be a prefix of every array state shape, but predicate \
+                    "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but predicate \
                      {condition_output} is not a prefix of state {state_type}",
                 )));
             }
@@ -302,7 +302,7 @@ fn validated_while_interfaces<'i, T: WhileTypeSemantics>(
         && (!condition_interface.effects().is_pure() || !body_interface.effects().is_pure())
     {
         return Err(TypeError::invalid(format!(
-            "'{WHILE_OPERATION_NAME}' loop with a batched predicate must be pure because observable effects cannot be \
+            "`{WHILE_OPERATION_NAME}` loop with a batched predicate must be pure because observable effects cannot be \
                       masked for finished batch items"
         )));
     }
@@ -2547,7 +2547,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(state_types.as_slice(), &[mismatched_condition_interface, body_interface]),
             Err(TypeError::invalid(
-                "'while' condition predicate shape must be a prefix of every array state shape, but predicate bool[2] \
+                "`while` condition predicate shape must be a prefix of every array state shape, but predicate bool[2] \
                  is not a prefix of state f32[extent]"
                     .to_string(),
             )),
@@ -2630,7 +2630,7 @@ mod tests {
                 std::slice::from_ref(&state_type),
                 &[region_interface(&subtract_one_body()), region_interface(&body)],
             ),
-            Err(TypeError::invalid("'while' condition output type must be a Boolean array, but got f64[]".to_string())),
+            Err(TypeError::invalid("`while` condition output type must be a Boolean array, but got f64[]".to_string())),
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3136,7 +3136,7 @@ mod tests {
                 &[region_interface(&condition), region_interface(&effectful_body)],
             ),
             Err(TypeError::invalid(
-                "'while' loop with a batched predicate must be pure because observable effects cannot be \
+                "`while` loop with a batched predicate must be pure because observable effects cannot be \
                           masked for finished batch items"
                     .to_string()
             )),
@@ -3168,7 +3168,7 @@ mod tests {
                 &[region_interface(&condition), region_interface(&body)],
             ),
             Err(TypeError::invalid(
-                "'while' condition predicate shape must be a prefix of every state shape, but predicate \
+                "`while` condition predicate shape must be a prefix of every state shape, but predicate \
                           bool[3] is not a prefix of state f64[2]"
                     .to_string()
             )),

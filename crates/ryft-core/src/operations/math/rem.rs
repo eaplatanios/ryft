@@ -77,7 +77,7 @@ macro_rules! impl_capability_for_primitive {
             fn rem(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_rem(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!(
-                        "'{}' divisor is zero or the result does not fit in {}",
+                        "`{}` divisor is zero or the result does not fit in {}",
                         REM_OPERATION_NAME,
                         stringify!($type),
                     ),
@@ -162,11 +162,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64, DataType::C64],
-                    error = "'rem' does not support input data type c64",
+                    error = "`rem` does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'rem' does not support input data type bool",
+                    error = "`rem` does not support input data type bool",
                 },
             ],
         );
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(
             Rem::rem(&7_usize, &0),
             Err(ProgramError::InvalidArgument {
-                message: "'rem' divisor is zero or the result does not fit in usize".to_string(),
+                message: "`rem` divisor is zero or the result does not fit in usize".to_string(),
             }),
         );
         assert!(Rem::rem(&1.0_f64, &0.0).unwrap().is_nan());

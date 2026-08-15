@@ -56,7 +56,7 @@ impl ScaledDotOperation {
     pub fn default_dimensions(rank: usize) -> Result<DotDimensionNumbers, TypeError> {
         if rank < 2 {
             return Err(TypeError::invalid(format!(
-                "'{SCALED_DOT_OPERATION_NAME}' does not support rank-{rank} operands"
+                "`{SCALED_DOT_OPERATION_NAME}` does not support rank-{rank} operands"
             )));
         }
         Ok(DotDimensionNumbers::new(vec![rank - 1], vec![rank - 2], (0..rank - 2).collect(), (0..rank - 2).collect()))
@@ -96,7 +96,7 @@ impl ScaledDotOperation {
     fn inputs<'a, T>(&self, inputs: &'a [T]) -> Result<(&'a T, &'a T, Option<&'a T>, Option<&'a T>), TypeError> {
         if inputs.len() != self.input_count() {
             return Err(TypeError::invalid(format!(
-                "'{SCALED_DOT_OPERATION_NAME}' expects {} inputs but got {}",
+                "`{SCALED_DOT_OPERATION_NAME}` expects {} inputs but got {}",
                 self.input_count(),
                 inputs.len(),
             )));
@@ -139,18 +139,18 @@ impl Operation for ScaledDotOperation {
             || lhs_scale.is_some_and(|scale| scale.rank() != rank)
             || rhs_scale.is_some_and(|scale| scale.rank() != rank)
         {
-            return Err(TypeError::invalid(format!("'{SCALED_DOT_OPERATION_NAME}' inputs must have the same rank")));
+            return Err(TypeError::invalid(format!("`{SCALED_DOT_OPERATION_NAME}` inputs must have the same rank")));
         }
         for (descriptor, input_type) in input_types.iter().enumerate() {
             if !input_type.data_type().is_numeric() && input_type.data_type() != DataType::Boolean {
                 return Err(TypeError::invalid(format!(
-                    "'{SCALED_DOT_OPERATION_NAME}' input {descriptor} must have a numeric or Boolean element type but got {}",
+                    "`{SCALED_DOT_OPERATION_NAME}` input {descriptor} must have a numeric or Boolean element type but got {}",
                     input_type.data_type(),
                 )));
             }
             if !input_type.unreduced_axes().is_empty() {
                 return Err(TypeError::invalid(format!(
-                    "'{SCALED_DOT_OPERATION_NAME}' does not support unreduced inputs"
+                    "`{SCALED_DOT_OPERATION_NAME}` does not support unreduced inputs"
                 )));
             }
         }
@@ -170,25 +170,25 @@ impl Operation for ScaledDotOperation {
                     match (operand_dimension.value(), scale_dimension.value()) {
                         (Some(operand_size), Some(scale_size)) if scale_size == 0 || operand_size % scale_size != 0 => {
                             return Err(TypeError::invalid(format!(
-                                "'{SCALED_DOT_OPERATION_NAME}' {side} contracting axis {axis} of size {operand_size} must be divisible by its scale size {scale_size}",
+                                "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} of size {operand_size} must be divisible by its scale size {scale_size}",
                             )));
                         }
                         (Some(operand_size), Some(scale_size)) if operand_size / scale_size < 2 => {
                             return Err(TypeError::invalid(format!(
-                                "'{SCALED_DOT_OPERATION_NAME}' {side} contracting axis {axis} to scale ratio must be at least 2 but got {}",
+                                "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} to scale ratio must be at least 2 but got {}",
                                 operand_size / scale_size,
                             )));
                         }
                         _ if operand_dimension == scale_dimension => {
                             return Err(TypeError::invalid(format!(
-                                "'{SCALED_DOT_OPERATION_NAME}' {side} contracting axis {axis} to scale ratio must be at least 2"
+                                "`{SCALED_DOT_OPERATION_NAME}` {side} contracting axis {axis} to scale ratio must be at least 2"
                             )));
                         }
                         _ => {}
                     }
                 } else if operand_dimension != scale_dimension {
                     return Err(TypeError::invalid(format!(
-                        "'{SCALED_DOT_OPERATION_NAME}' {side} axis {axis} has size {operand_dimension} but its scale has size {scale_dimension}",
+                        "`{SCALED_DOT_OPERATION_NAME}` {side} axis {axis} has size {operand_dimension} but its scale has size {scale_dimension}",
                     )));
                 }
             }
@@ -246,7 +246,7 @@ where
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("'{SCALED_DOT_OPERATION_NAME}' does not support differentiation"),
+            message: format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
         }
         .into())
     }
@@ -280,7 +280,7 @@ where
             .collect::<Vec<_>>();
         if mapped_dimensions.windows(2).any(|pair| pair[0] != pair[1]) {
             return Err(BatchingError::MisalignedBatchAxes {
-                message: format!("'{SCALED_DOT_OPERATION_NAME}' inputs map different batch extents"),
+                message: format!("`{SCALED_DOT_OPERATION_NAME}` inputs map different batch extents"),
             });
         }
         let aligned_inputs = inputs
@@ -332,7 +332,7 @@ pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
         preferred_element_type: Option<DataType>,
     ) -> Result<Self, ProgramError> {
         if [self, rhs, lhs_scale, rhs_scale].iter().any(|value| value.r#type().rank() != 3) {
-            return Err(TypeError::invalid("'scaled_matmul' expects rank-3 inputs".to_string()).into());
+            return Err(TypeError::invalid("`scaled_matmul` expects rank-3 inputs".to_string()).into());
         }
         self.scaled_dot(
             rhs,
@@ -604,7 +604,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'scaled_dot' left contracting axis 2 to scale ratio must be at least 2 but got 1".to_string(),
+                "`scaled_dot` left contracting axis 2 to scale ratio must be at least 2 but got 1".to_string(),
             )),
         );
     }

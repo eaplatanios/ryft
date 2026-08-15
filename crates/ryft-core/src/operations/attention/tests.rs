@@ -90,7 +90,7 @@ fn test_dot_product_attention_type_inference() {
         DotProductAttentionOperation::new(dropout, AttentionOperandSignature::default())
             .infer_output_types(&backward_input_types[..3], &[]),
         Err(TypeError::Invalid { message, .. })
-            if message == "'dot_product_attention' dropout requires the fused implementation",
+            if message == "`dot_product_attention` dropout requires the fused implementation",
     ));
 }
 

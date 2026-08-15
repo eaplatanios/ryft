@@ -148,7 +148,7 @@ fn handle_print_call_frame(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError
     }
     let Some(value) = value else {
         return Err(FfiError::invalid_argument(format!(
-            "expected the '{PRINT_CUSTOM_CALL_TARGET}' custom call to have one non-token input buffer"
+            "expected the `{PRINT_CUSTOM_CALL_TARGET}` custom call to have one non-token input buffer"
         )));
     };
     emit_print_line(format!("{label}: {}", render_buffer(&value)?));
@@ -163,14 +163,14 @@ fn decode_label<'o>(call_frame: &FfiCallFrame<'o>) -> Result<&'o str, FfiError> 
             return match attribute {
                 FfiAttribute::String { string } => Ok(string),
                 _ => Err(FfiError::invalid_argument(format!(
-                    "expected the '{PRINT_LABEL_ATTRIBUTE}' attribute of the '{PRINT_CUSTOM_CALL_TARGET}' custom \
+                    "expected the `{PRINT_LABEL_ATTRIBUTE}` attribute of the `{PRINT_CUSTOM_CALL_TARGET}` custom \
                      call to be a string"
                 ))),
             };
         }
     }
     Err(FfiError::invalid_argument(format!(
-        "missing required '{PRINT_LABEL_ATTRIBUTE}' string attribute in the '{PRINT_CUSTOM_CALL_TARGET}' custom call"
+        "missing required `{PRINT_LABEL_ATTRIBUTE}` string attribute in the `{PRINT_CUSTOM_CALL_TARGET}` custom call"
     )))
 }
 
@@ -223,7 +223,7 @@ fn render_buffer(buffer: &FfiBuffer<'_>) -> Result<String, FfiError> {
     let data = unsafe { buffer.data() };
     if count > 0 && data.is_null() {
         return Err(FfiError::internal(format!(
-            "encountered null data pointer for a non-empty '{PRINT_CUSTOM_CALL_TARGET}' input buffer"
+            "encountered null data pointer for a non-empty `{PRINT_CUSTOM_CALL_TARGET}` input buffer"
         )));
     }
     if element_type == FfiBufferType::F64 {
@@ -264,13 +264,13 @@ fn copy_value_to_outputs(call_frame: &FfiCallFrame<'_>, value: &FfiBuffer<'_>) -
         }
         if output.element_type() != value.element_type() || output.dimensions() != value.dimensions() {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{PRINT_CUSTOM_CALL_TARGET}' custom call outputs to be tokens or to match the \
+                "expected the `{PRINT_CUSTOM_CALL_TARGET}` custom call outputs to be tokens or to match the \
                  printed value buffer"
             )));
         }
         let Some(element_size) = element_size_in_bytes(value.element_type()) else {
             return Err(FfiError::invalid_argument(format!(
-                "cannot copy a '{PRINT_CUSTOM_CALL_TARGET}' value buffer with element type '{}' to an output",
+                "cannot copy a `{PRINT_CUSTOM_CALL_TARGET}` value buffer with element type `{}` to an output",
                 value.element_type(),
             )));
         };
@@ -286,7 +286,7 @@ fn copy_value_to_outputs(call_frame: &FfiCallFrame<'_>, value: &FfiBuffer<'_>) -
             let destination = output.data() as *mut u8;
             if source.is_null() || destination.is_null() {
                 return Err(FfiError::internal(format!(
-                    "encountered null data pointer while copying a '{PRINT_CUSTOM_CALL_TARGET}' value to an output"
+                    "encountered null data pointer while copying a `{PRINT_CUSTOM_CALL_TARGET}` value to an output"
                 )));
             }
             std::ptr::copy_nonoverlapping(source, destination, byte_count);

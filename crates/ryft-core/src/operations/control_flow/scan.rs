@@ -550,7 +550,7 @@ pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
         .filter(|_| DimensionType::new(variable.clone()).is_refined_by(runtime_length_type))
         .ok_or_else(|| {
             TypeError::invalid(format!(
-                "'{SCAN_OPERATION_NAME}' runtime length operand has type {runtime_length_type} but {SCAN_OPERATION_NAME} length \
+                "`{SCAN_OPERATION_NAME}` runtime length operand has type {runtime_length_type} but {SCAN_OPERATION_NAME} length \
                  requires {variable}",
             ))
         })?;
@@ -565,7 +565,7 @@ pub(crate) fn validate_scan_runtime_length<T: std::borrow::Borrow<ArrayIrType>>(
         };
         if leading_extent != Some(extent) {
             return Err(TypeError::invalid(format!(
-                "'{}' runtime length operand has type {} but stacked input {} has type {} whose leading dimension is \
+                "`{}` runtime length operand has type {} but stacked input {} has type {} whose leading dimension is \
                  not refined to extent {}",
                 SCAN_OPERATION_NAME,
                 runtime_length_type,
@@ -3052,7 +3052,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "'scan' runtime length operand has type dimension<unrelated ∈ [1, 5)> but scan length requires length"
+                "`scan` runtime length operand has type dimension<unrelated ∈ [1, 5)> but scan length requires length"
                     .to_string(),
             )),
         );
@@ -3062,7 +3062,7 @@ mod tests {
                 std::slice::from_ref(&body_interface),
             ),
             Err(TypeError::invalid(
-                "'scan' runtime length operand has type dimension<3> but stacked input 1 has type f32[length, extent] \
+                "`scan` runtime length operand has type dimension<3> but stacked input 1 has type f32[length, extent] \
                  whose leading dimension is not refined to extent 3"
                     .to_string(),
             )),

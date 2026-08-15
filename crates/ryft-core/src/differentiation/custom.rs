@@ -1046,7 +1046,7 @@ where
                 ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
                     message: format!(
                         "cannot apply forward-mode differentiation to a {CUSTOM_VJP_OPERATION_NAME} call; it supports \
-                         only reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or 'jacobian_reverse')",
+                         only reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
                     ),
                 },
                 error => error,
@@ -1899,8 +1899,8 @@ mod tests {
             result,
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
-                               reverse-mode differentiation (e.g., 'vjp', 'value_and_gradient', or \
-                               'jacobian_reverse')",
+                               reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
+                               `jacobian_reverse`)",
         ));
     }
 

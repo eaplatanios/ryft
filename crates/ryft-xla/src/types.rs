@@ -60,7 +60,7 @@ impl ToPjrt for TiledLayout {
                 .map(|dimension| {
                     u64::try_from(dimension).map_err(|_| LayoutError::InvalidLayout {
                         message: format!(
-                            "invalid minor-to-major dimension index for PJRT: '{dimension}' is out of range",
+                            "invalid minor-to-major dimension index for PJRT: `{dimension}` is out of range",
                         ),
                     })
                 })
@@ -83,7 +83,7 @@ impl FromPjrt<PjrtTiledLayout> for TiledLayout {
                 .map(|dimension| {
                     usize::try_from(dimension).map_err(|_| LayoutError::InvalidLayout {
                         message: format!(
-                            "invalid minor-to-major dimension index from PJRT: '{dimension}' is out of range",
+                            "invalid minor-to-major dimension index from PJRT: `{dimension}` is out of range",
                         ),
                     })
                 })
@@ -104,7 +104,7 @@ impl ToPjrt for StridedLayout {
                 .copied()
                 .map(|stride| {
                     i64::try_from(stride).map_err(|_| LayoutError::InvalidLayout {
-                        message: format!("invalid stride for PJRT: '{stride}' is out of range"),
+                        message: format!("invalid stride for PJRT: `{stride}` is out of range"),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -124,7 +124,7 @@ impl FromPjrt<PjrtStridedLayout> for StridedLayout {
                 .copied()
                 .map(|stride| {
                     isize::try_from(stride).map_err(|_| LayoutError::InvalidLayout {
-                        message: format!("invalid stride from PJRT: '{stride}' is out of range"),
+                        message: format!("invalid stride from PJRT: `{stride}` is out of range"),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -209,7 +209,7 @@ impl FromPjrt<BufferType> for DataType {
     fn from_pjrt(value: BufferType) -> Result<Self, DataTypeError> {
         match value {
             BufferType::Invalid => Err(DataTypeError::InvalidDataType {
-                message: format!("invalid data type from PJRT: '{value}'"),
+                message: format!("invalid data type from PJRT: `{value}`"),
                 backtrace: std::backtrace::Backtrace::capture().to_string(),
             }),
             BufferType::Token => Ok(Self::Token),
@@ -301,7 +301,7 @@ mod tests {
     fn test_data_type_from_and_to_pjrt_buffer_type() {
         assert!(matches!(
             DataType::from_pjrt(BufferType::Invalid),
-            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: 'invalid'",
+            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
         ));
         // `Zero` uses predicate as a private physical carrier, but predicate buffers are interpreted as ordinary
         // Booleans when no retained Ryft signature supplies the logical type.

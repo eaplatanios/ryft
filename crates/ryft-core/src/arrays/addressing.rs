@@ -27,7 +27,7 @@ impl ArrayAddressing {
         if r#type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) {
             return Err(TypeError::invalid(format!(
                 "cannot materialize a value of dynamically sized type {}; dynamically shaped values exist only in \
-                 array programs over 'ArrayIrOperation'",
+                 array programs over `ArrayIrOperation`",
                 r#type,
             ))
             .into());
@@ -849,7 +849,7 @@ mod tests {
             ArrayAddressing::new(dynamic),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot materialize a value of dynamically sized type f32[dynamic]; dynamically \
-                               shaped values exist only in array programs over 'ArrayIrOperation'",
+                               shaped values exist only in array programs over `ArrayIrOperation`",
         ));
         let oversized = ArrayType::new(DataType::C128, Shape::new(vec![Dimension::Static(usize::MAX)]));
         assert!(matches!(

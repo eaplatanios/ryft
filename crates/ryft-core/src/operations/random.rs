@@ -164,13 +164,13 @@ fn validate_rng_bit_generator_types(
     let expected_state_type = algorithm.state_type();
     if state_type.data_type() != expected_state_type.data_type() || state_type.shape() != expected_state_type.shape() {
         return Err(TypeError::invalid(format!(
-            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' with the {algorithm} algorithm needs a {expected_state_type} state but got \
+            "`{RNG_BIT_GENERATOR_OPERATION_NAME}` with the {algorithm} algorithm needs a {expected_state_type} state but got \
              {state_type}",
         )));
     }
     if !matches!(output_type.data_type(), DataType::U8 | DataType::U16 | DataType::U32 | DataType::U64) {
         return Err(TypeError::invalid(format!(
-            "'{}' does not support output data type {}",
+            "`{}` does not support output data type {}",
             RNG_BIT_GENERATOR_OPERATION_NAME,
             output_type.data_type(),
         )));
@@ -182,7 +182,7 @@ fn validate_rng_bit_generator_types(
     };
     if has_sharded_dimension(state_type) || has_sharded_dimension(output_type) {
         return Err(TypeError::invalid(format!(
-            "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support sharded states or outputs; derive per-shard \
+            "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support sharded states or outputs; derive per-shard \
                  states inside shard_map instead",
         )));
     }
@@ -208,7 +208,7 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
         validate_rng_bit_generator_types(self.algorithm, &input_types[0], &self.output_type)?;
         if self.output_type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
-                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' does not support dynamically shaped outputs"
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` does not support dynamically shaped outputs"
             )));
         }
         Ok(vec![input_types[0].clone(), self.output_type.clone()])
@@ -250,8 +250,8 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
             let actual_variable = <&DimensionType>::try_from(input_type)?.variable();
             if actual_variable != expected_variable {
                 return Err(TypeError::invalid(format!(
-                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' output-extent operand defines dimension variable \
-                     '{actual_variable}', but the corresponding declared bits axis refers to '{expected_variable}'",
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` output-extent operand defines dimension variable \
+                     `{actual_variable}`, but the corresponding declared bits axis refers to `{expected_variable}`",
                 )));
             }
         }
@@ -306,7 +306,7 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot be transposed because random bits are discrete"
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot be transposed because random bits are discrete"
             ),
         }
         .into())
@@ -340,7 +340,7 @@ where
         if inputs[0].batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot batch a replicated state because every batch item \
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot batch a replicated state because every batch item \
                      would see the same state; derive one state per batch item with `split_key` and map over the \
                      states explicitly",
                 ),
@@ -402,7 +402,7 @@ where
         if state.batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
-                    "'{RNG_BIT_GENERATOR_OPERATION_NAME}' cannot batch a replicated state because every batch item \
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot batch a replicated state because every batch item \
                      would see the same state; derive one state per batch item with `split_key` and map over the \
                      states explicitly",
                 ),
@@ -581,7 +581,7 @@ where
             }
             data_type => {
                 return Err(
-                    TypeError::invalid(format!("'uniform' does not support output data type {data_type}")).into()
+                    TypeError::invalid(format!("`uniform` does not support output data type {data_type}")).into()
                 );
             }
         };
@@ -606,7 +606,7 @@ where
         let data_type = logits_type.data_type();
         if !matches!(data_type, DataType::F32 | DataType::F64) {
             return Err(
-                TypeError::invalid(format!("'categorical' does not support logits data type {data_type}")).into()
+                TypeError::invalid(format!("`categorical` does not support logits data type {data_type}")).into()
             );
         }
         let shape = Shape::new(logits_type.shape().dimensions().to_vec());
@@ -969,11 +969,11 @@ mod tests {
             cases = [
                 {
                     input_types = [ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]))],
-                    error = "'rng_bit_generator' with the three_fry algorithm needs a u64[2] state but got u64[3]",
+                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got u64[3]",
                 },
                 {
                     input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))],
-                    error = "'rng_bit_generator' with the three_fry algorithm needs a u64[2] state but got f32[2]",
+                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got f32[2]",
                 },
             ],
         );
@@ -984,7 +984,7 @@ mod tests {
             operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type),
             cases = [{
                 input_types = [RandomAlgorithm::ThreeFry.state_type()],
-                error = "'rng_bit_generator' does not support output data type f32",
+                error = "`rng_bit_generator` does not support output data type f32",
             }],
         );
         for data_type in [DataType::U8, DataType::U16, DataType::U64] {

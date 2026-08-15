@@ -107,7 +107,7 @@ impl Operation for DynamicBroadcastOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let Some((input_type, output_extent_types)) = input_types.split_first() else {
             return Err(TypeError::invalid(format!(
-                "'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents"
+                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents"
             )));
         };
         let input_type = <&ArrayType>::try_from(input_type)?;
@@ -143,7 +143,7 @@ where
         }
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(TypeError::invalid(format!(
-                "'{BROADCAST_OPERATION_NAME}' expects an array followed by its output extents"
+                "`{BROADCAST_OPERATION_NAME}` expects an array followed by its output extents"
             ))
             .into());
         };
@@ -664,7 +664,7 @@ where
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "direct transposition of a dynamic '{BROADCAST_OPERATION_NAME}' requires linearization so its \
+                    "direct transposition of a dynamic `{BROADCAST_OPERATION_NAME}` requires linearization so its \
                      input extents can be retained as residuals",
                 ),
             }

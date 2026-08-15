@@ -79,7 +79,7 @@ pub trait ArithmeticDimensionOperation: Operation<Type = DimensionType> {
                     Ok(())
                 } else {
                     Err(TypeError::invalid(format!(
-                        "'{}' input {index} has type {actual} but the operation was constructed for type {expected}",
+                        "`{}` input {index} has type {actual} but the operation was constructed for type {expected}",
                         self.name(),
                     )))
                 }
@@ -287,7 +287,7 @@ pub(crate) fn positive_divisor_lower_bound(divisor: &DimensionType, maximum: usi
 pub(crate) fn bounds_overflow(operation_name: &str, left: &DimensionType, right: &DimensionType) -> DimensionError {
     DimensionError::ArithmeticOverflow {
         message: format!(
-            "dimension arithmetic overflow while deriving '{operation_name}' result bounds with operands {left}, \
+            "dimension arithmetic overflow while deriving `{operation_name}` result bounds with operands {left}, \
              {right}",
         ),
     }
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(
             Operation::infer_output_types(&operation, &[unexpected.clone(), right.clone()], &[]),
             Err(TypeError::invalid(format!(
-                "'dimension_add' input 0 has type {unexpected} but the operation was constructed for type {left}",
+                "`dimension_add` input 0 has type {unexpected} but the operation was constructed for type {left}",
             ))),
         );
 

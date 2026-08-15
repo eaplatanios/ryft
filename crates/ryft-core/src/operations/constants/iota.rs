@@ -61,14 +61,14 @@ impl IotaOperation<ArrayType> {
     pub fn new(r#type: ArrayType, dimension: usize) -> Result<Self, TypeError> {
         if !r#type.data_type().is_numeric() {
             return Err(TypeError::invalid(format!(
-                "'{}' requires a numeric element type but has {}",
+                "`{}` requires a numeric element type but has {}",
                 IOTA_OPERATION_NAME,
                 r#type.data_type(),
             )));
         }
         if dimension >= r#type.rank() {
             return Err(TypeError::invalid(format!(
-                "'{}' dimension {} is out of bounds for rank {}",
+                "`{}` dimension {} is out of bounds for rank {}",
                 IOTA_OPERATION_NAME,
                 dimension,
                 r#type.rank(),
@@ -241,12 +241,12 @@ mod tests {
         assert!(matches!(context.iota(&r#type, 2), Err(ProgramError::Type(_))));
         assert_eq!(
             IotaOperation::new(r#type.clone(), 2).unwrap_err(),
-            TypeError::invalid("'iota' dimension 2 is out of bounds for rank 2"),
+            TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"),
         );
         assert_eq!(
             IotaOperation::new(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])), 0,)
                 .unwrap_err(),
-            TypeError::invalid("'iota' requires a numeric element type but has bool"),
+            TypeError::invalid("`iota` requires a numeric element type but has bool"),
         );
         let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
         assert_eq!(
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(
             IotaOperation::new(dynamic_type, 0).unwrap().infer_output_types(&[], &[]),
             Err(TypeError::invalid(format!(
-                "'iota' cannot construct type f64[extent] without operands because it references identity {variable}",
+                "`iota` cannot construct type f64[extent] without operands because it references identity {variable}",
             ))),
         );
 

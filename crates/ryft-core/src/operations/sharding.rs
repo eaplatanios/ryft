@@ -359,7 +359,7 @@ impl Operation for ShardingConstraintOperation {
                     if self.sharding.mesh().axis_type(axis_name) != Some(crate::arrays::MeshAxisType::Auto) {
                         return Err(TypeError::invalid(format!(
                             "{SHARDING_CONSTRAINT_OPERATION_NAME} can only hint placement over auto mesh axes, \
-                                 but '{axis_name}' is not auto; use reshard for explicit or manual axes"
+                                 but `{axis_name}` is not auto; use reshard for explicit or manual axes"
                         )));
                     }
                 }
@@ -605,7 +605,7 @@ mod tests {
         assert_eq!(
             ShardingConstraintOperation::new(explicit_hint).infer_output_types(&[vector_type(8)], &[]),
             Err(TypeError::invalid(
-                "sharding_constraint can only hint placement over auto mesh axes, but 'x' is not auto; use \
+                "sharding_constraint can only hint placement over auto mesh axes, but `x` is not auto; use \
                           reshard for explicit or manual axes"
                     .to_string()
             )),

@@ -92,7 +92,7 @@ pub enum XlaDomainError {
     InvalidCompilationAnalysis { reason: String },
 
     /// Runtime assertion host callbacks currently require host-accessible scalar buffers.
-    #[error("compiled runtime assertions are not supported on XLA platform '{platform}'")]
+    #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
     UnsupportedRuntimeAssertionPlatform { platform: String },
 }
 
@@ -3003,7 +3003,7 @@ fn numeric_analysis_property(
     match value {
         XlaAnalysisValue::Integer(value) => Ok(Some(*value as f64)),
         XlaAnalysisValue::Float(value) => Ok(Some(*value)),
-        _ => Err(XlaDomainError::InvalidCompilationAnalysis { reason: format!("property '{name}' is not numeric") }),
+        _ => Err(XlaDomainError::InvalidCompilationAnalysis { reason: format!("property `{name}` is not numeric") }),
     }
 }
 
@@ -4733,7 +4733,7 @@ mod tests {
         let error = domain.execute_xla_program(&compiled, vec![invalid]).unwrap_err();
         assert!(
             error.to_string().contains(
-                "'dimension_from_scalar' failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)"
+                "`dimension_from_scalar` failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)"
             ),
             "{error}",
         );
@@ -4809,7 +4809,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("'dimension_require_less_than_or_equal' failed: first <= second; observed first=4, second=3"),
+                .contains("`dimension_require_less_than_or_equal` failed: first <= second; observed first=4, second=3"),
             "{error}",
         );
         assert!(!error.to_string().contains("second <= third"), "{error}");
@@ -4867,19 +4867,19 @@ mod tests {
             DimensionRequirementOperation::equal(&left_type, &right_type),
             3,
             4,
-            "'dimension_require_equal' failed: left == right; observed left=3, right=4",
+            "`dimension_require_equal` failed: left == right; observed left=3, right=4",
         );
         check(
             DimensionRequirementOperation::divisible_by(&left_type, &right_type),
             7,
             3,
-            "'dimension_require_divisible_by' failed: left % right == 0; observed left=7, right=3",
+            "`dimension_require_divisible_by` failed: left % right == 0; observed left=7, right=3",
         );
         check(
             DimensionRequirementOperation::divisible_by(&left_type, &right_type),
             7,
             0,
-            "'dimension_require_divisible_by' failed: right > 0 for divisibility; observed left=7, right=0",
+            "`dimension_require_divisible_by` failed: right > 0 for divisibility; observed left=7, right=0",
         );
     }
 
@@ -5292,7 +5292,7 @@ mod tests {
         let error = program_array(&invalid).block_until_ready().unwrap_err();
         assert!(
             error.to_string().contains(
-                "'dimension_from_scalar' failed: input dimension `data_extent` = 8 is outside its declared bounds [1, 8)"
+                "`dimension_from_scalar` failed: input dimension `data_extent` = 8 is outside its declared bounds [1, 8)"
             ),
             "{error}",
         );
@@ -6349,7 +6349,7 @@ mod tests {
         let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
         assert!(
             error.to_string().contains(
-                "'dimension_from_scalar' failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+                "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
             ),
             "{error}",
         );
@@ -6488,7 +6488,7 @@ mod tests {
             let error = domain.execute_xla_program(&compiled, vec![zero]).unwrap_err();
             assert!(
                 error.to_string().contains(
-                    "'dimension_from_scalar' failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
+                    "`dimension_from_scalar` failed: input dimension `extent` = 0 is outside its declared bounds [1, 5)"
                 ),
                 "{error}",
             );
@@ -6699,7 +6699,7 @@ mod tests {
             Ok(invalid) => invalid[0].block_until_ready().unwrap_err().to_string(),
             Err(error) => error.to_string(),
         };
-        assert_eq!(error, "'dynamic_shape_slice' limit 4 exceeds input axis 0 extent 2");
+        assert_eq!(error, "`dynamic_shape_slice` limit 4 exceeds input axis 0 extent 2");
     }
 
     #[test]
@@ -8061,7 +8061,7 @@ mod tests {
         assert!(matches!(
             domain.bind(CollectiveOperation::new("i".to_string(), CollectiveKind::PSum), Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })
-                if message == "collective over axis 'i' can only be lowered inside a shard_map manual region",
+                if message == "collective over axis `i` can only be lowered inside a shard_map manual region",
         ));
     }
 
@@ -8117,7 +8117,7 @@ mod tests {
         assert!(matches!(
             domain.bind(AddOperation::new(), Vec::new(), &[left, right]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'add' input types are not broadcast-compatible",
+                if message == "`add` input types are not broadcast-compatible",
         ));
     }
 

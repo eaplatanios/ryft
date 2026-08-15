@@ -2412,7 +2412,7 @@ mod tests {
                 Ok(())
             } else {
                 Err(BatchingError::UnsupportedOperation {
-                    message: format!("operation '{operation_name}' supplied no batching evidence"),
+                    message: format!("operation `{operation_name}` supplied no batching evidence"),
                 })
             }
         }
@@ -2490,7 +2490,7 @@ mod tests {
         assert_eq!(
             BatchingError::from(silent),
             BatchingError::UnsupportedOperation {
-                message: "operation 'neg' supplied no batching evidence".to_string(),
+                message: "operation `neg` supplied no batching evidence".to_string(),
             },
         );
     }

@@ -90,7 +90,7 @@ where
         match value_type.static_shape() {
             Some(shape) => Ok(shape.dimensions().to_vec()),
             None => Err(ProgramError::from(TypeError::invalid(format!(
-                "'{}' batching requires statically shaped operands",
+                "`{}` batching requires statically shaped operands",
                 operation.name()
             )))
             .into()),

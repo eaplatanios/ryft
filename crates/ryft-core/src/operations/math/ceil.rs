@@ -83,11 +83,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "'ceil' does not support input data type i32",
+                    error = "`ceil` does not support input data type i32",
                 },
                 {
                     input_data_types = [DataType::C64],
-                    error = "'ceil' does not support input data type c64",
+                    error = "`ceil` does not support input data type c64",
                 },
             ],
         );

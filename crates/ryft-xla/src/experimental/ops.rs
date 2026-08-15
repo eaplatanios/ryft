@@ -709,7 +709,7 @@ fn ensure_call_input_types<T: Type>(
 ) -> Result<(), TypeError> {
     if expected_types.len() != input_types.len() {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' expected {} input(s) but got {}",
+            "`{operation_name}` expected {} input(s) but got {}",
             expected_types.len(),
             input_types.len(),
         )));
@@ -717,7 +717,7 @@ fn ensure_call_input_types<T: Type>(
     for (index, (expected, actual)) in expected_types.iter().zip(input_types).enumerate() {
         if expected != actual {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' input #{index} expected {expected} but got {actual}",
+                "`{operation_name}` input #{index} expected {expected} but got {actual}",
             )));
         }
     }
@@ -1029,7 +1029,7 @@ pub(crate) fn materialize_transpose_cotangent<
                         .ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "cannot materialize dynamic transpose cotangent of type {output_type} because no known \
-                                 dimension input defines '{variable}'",
+                                 dimension input defines `{variable}`",
                             ))
                         })
                 })

@@ -86,11 +86,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "'round' does not support input data type i32",
+                    error = "`round` does not support input data type i32",
                 },
                 {
                     input_data_types = [DataType::C64],
-                    error = "'round' does not support input data type c64",
+                    error = "`round` does not support input data type c64",
                 },
             ],
         );

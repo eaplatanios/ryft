@@ -61,7 +61,7 @@ impl Operation for SelectOperation<DataType> {
         check_count!("input", input_types, 3, TypeError);
         if !input_types[0].is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'{}' condition data type {} is not {}",
+                "`{}` condition data type {} is not {}",
                 SELECT_OPERATION_NAME,
                 input_types[0],
                 DataType::Boolean,
@@ -71,7 +71,7 @@ impl Operation for SelectOperation<DataType> {
         // The two branch data types are promoted together (the Boolean condition is a mask, not a value that promotes
         // into the result), so `select` supports mixed-but-promotable branch data types like JAX's `jnp.where`.
         input_types[1].broadcast(&input_types[2]).map(|output| vec![output]).map_err(|_| {
-            TypeError::invalid(format!("'{SELECT_OPERATION_NAME}' input types are not broadcast-compatible"))
+            TypeError::invalid(format!("`{SELECT_OPERATION_NAME}` input types are not broadcast-compatible"))
         })
     }
 
@@ -124,7 +124,7 @@ impl ElementwiseOperation for SelectOperation<ArrayType> {
         let (condition, on_true, on_false) = (&input_types[0], &input_types[1], &input_types[2]);
         if !condition.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'{}' condition data type {} is not {}",
+                "`{}` condition data type {} is not {}",
                 SELECT_OPERATION_NAME,
                 condition.data_type(),
                 DataType::Boolean,
@@ -398,7 +398,7 @@ mod tests {
                 },
                 {
                     input_types = [branch_type.clone(), branch_type.clone(), branch_type.clone()],
-                    error = "'select' condition data type f64 is not bool",
+                    error = "`select` condition data type f64 is not bool",
                 },
                 {
                     input_types = [
@@ -406,7 +406,7 @@ mod tests {
                         branch_type.clone(),
                         branch_type.clone(),
                     ],
-                    error = "'select' input types are not broadcast-compatible",
+                    error = "`select` input types are not broadcast-compatible",
                 },
                 {
                     input_types = [

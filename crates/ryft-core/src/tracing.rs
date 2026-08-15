@@ -1281,12 +1281,12 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'add' input types are not broadcast-compatible",
+                if message == "`add` input types are not broadcast-compatible",
         ));
         assert!(matches!(
             builder.borrow().error().cloned(),
             Some(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'add' input types are not broadcast-compatible",
+                if message == "`add` input types are not broadcast-compatible",
         ));
 
         // Test staging program constants through the context without requiring the context itself to be a domain.
@@ -1377,7 +1377,7 @@ mod tests {
                 (ArrayType::scalar(DataType::F8E3M4), ArrayType::scalar(DataType::F32)),
             ),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'add' input types are not broadcast-compatible",
+                if message == "`add` input types are not broadcast-compatible",
         ));
     }
 

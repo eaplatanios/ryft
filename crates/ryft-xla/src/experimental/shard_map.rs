@@ -146,7 +146,7 @@ pub enum ShardMapTraceError {
 
     /// Error returned when `check_vma=true` and one output still varies along an omitted manual axis.
     #[error(
-        "output type #{output_index} still varies along manual axis '{axis_name}', but out_specs does not mention it"
+        "output type #{output_index} still varies along manual axis `{axis_name}`, but out_specs does not mention it"
     )]
     OutputVaryingManualAxisNotInOutSpecs { output_index: usize, axis_name: String },
 

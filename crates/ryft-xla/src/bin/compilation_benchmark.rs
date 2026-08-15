@@ -70,7 +70,7 @@ fn parse_arguments() -> Result<Option<Arguments>, String> {
                     Some(PathBuf::from(values.next().ok_or("expected a path after --cache-dir")?));
             }
             "--smoke" => arguments.smoke = true,
-            other => return Err(format!("unknown argument '{other}'\n\n{}", usage())),
+            other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
         }
     }
     if arguments.smoke {

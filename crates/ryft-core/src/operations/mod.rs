@@ -98,7 +98,7 @@ pub trait ElementwiseOperation: Operation<Type = ArrayType> {
                     sharding.clear_varying_manual_axes();
                 }
                 let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| {
-                    TypeError::invalid(format!("'{}' input types are not broadcast-compatible", self.name()))
+                    TypeError::invalid(format!("`{}` input types are not broadcast-compatible", self.name()))
                 })?;
                 if let Some(sharding) = &mut output.sharding {
                     sharding.set_varying_manual_axes(original_varying_manual_axes).map_err(TypeError::custom)?;
@@ -184,7 +184,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError::invalid("'elementwise_test' input types are not broadcast-compatible".to_string())),
+            Err(TypeError::invalid("`elementwise_test` input types are not broadcast-compatible".to_string())),
         );
 
         let operation = TestElementwiseArrayOperation { input_count: 3 };
@@ -262,7 +262,7 @@ mod tests {
                 ],
                 &[],
             ),
-            Err(TypeError::invalid("'elementwise_test' input types are not broadcast-compatible".to_string())),
+            Err(TypeError::invalid("`elementwise_test` input types are not broadcast-compatible".to_string())),
         );
     }
 }

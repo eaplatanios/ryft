@@ -85,7 +85,7 @@ macro_rules! check_types {
         let types = &$types[..];
         if types.iter().any(|r#type| !r#type.unreduced_axes().is_empty()) {
             return Err(
-                $crate::TypeError::invalid(format!("'{descriptor}' does not support unreduced operands")).into()
+                $crate::TypeError::invalid(format!("`{descriptor}` does not support unreduced operands")).into()
             );
         }
     }};
@@ -98,7 +98,7 @@ macro_rules! check_types {
             return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].unreduced_axes() != types[1].unreduced_axes() {
-            return Err($crate::TypeError::invalid(format!("'{descriptor}' operands must be unreduced over the same axes"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` operands must be unreduced over the same axes"))
             .into());
         }
     }};
@@ -111,7 +111,7 @@ macro_rules! check_types {
             return Err($crate::TypeError::invalid(format!("expected 2 inputs but got {}", types.len())).into());
         }
         if types[0].reduced_axes() != types[1].reduced_axes() {
-            return Err($crate::TypeError::invalid(format!("'{descriptor}' operands must be reduced over the same axes"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` operands must be reduced over the same axes"))
             .into());
         }
     }};
@@ -123,7 +123,7 @@ macro_rules! check_types {
         if let Some(input_type) = types.iter().find(|input_type| {
             !$crate::check_types!(@matches_data_type input_type; $(@$selector)+)
         }) {
-            return Err($crate::TypeError::invalid(format!("'{descriptor}' does not support input data type {input_type}"))
+            return Err($crate::TypeError::invalid(format!("`{descriptor}` does not support input data type {input_type}"))
             .into());
         }
     }};
@@ -846,7 +846,7 @@ macro_rules! define_elementwise_operation {
     (@infer_data_types [] @binary $input_types:expr, $name:ident $(,)?) => {
         $crate::arrays::Broadcastable::broadcast(&$input_types[0], &$input_types[1])
             .map(|output| vec![output])
-            .map_err(|_| $crate::TypeError::invalid(format!("'{}' input types are not broadcast-compatible", $name)))
+            .map_err(|_| $crate::TypeError::invalid(format!("`{}` input types are not broadcast-compatible", $name)))
     };
 
     // This internal branch invokes caller-provided array-type inference instead of structural lifting.
@@ -2023,7 +2023,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 if $crate::DifferentiableType::is_zero_space(&target) && (left.is_some() || right.is_some()) {
                     return Err($crate::ProgramError::UnsupportedOperation {
                         message: format!(
-                            "'{}' output type {} has no tangent space",
+                            "`{}` output type {} has no tangent space",
                             $crate::Operation::name(operation),
                             $crate::Typed::r#type(&primal),
                         ),
@@ -2143,7 +2143,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
         if $crate::DifferentiableType::is_zero_space(&target) {
             return Err($crate::ProgramError::UnsupportedOperation {
-                message: format!("'{}' input has no cotangent space", $operation_name),
+                message: format!("`{}` input has no cotangent space", $operation_name),
             }
             .into());
         }
@@ -3078,7 +3078,7 @@ macro_rules! define_tracer_operator {
 ///         },
 ///         {
 ///             input_data_types = [DataType::Boolean, DataType::Boolean],
-///             error = "'add' does not support input data type bool",
+///             error = "`add` does not support input data type bool",
 ///         },
 ///     ],
 /// );
@@ -3181,7 +3181,7 @@ macro_rules! check_operation_type_inference {
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(&operation, input_types.as_slice(), &[]),
             Err($crate::programs::types::TypeError::invalid(format!(
-                "'{descriptor}' does not support unreduced operands",
+                "`{descriptor}` does not support unreduced operands",
             ))),
         );
     }};
@@ -3216,7 +3216,7 @@ macro_rules! check_operation_type_inference {
             .with_sharding(right.sharding().unwrap().clone().with_reduced_axes(["x"]).unwrap())
             .unwrap();
         let expected = Err($crate::programs::types::TypeError::invalid(format!(
-            "'{descriptor}' operands must be reduced over the same axes",
+            "`{descriptor}` operands must be reduced over the same axes",
         )));
         assert_eq!(
             $crate::programs::operations::Operation::infer_output_types(
@@ -5127,38 +5127,38 @@ mod tests {
         for r#type in [DataType::Boolean, DataType::Token, DataType::Zero] {
             assert_eq!(
                 check_numeric(&[DataType::F32, r#type]),
-                Err(TypeError::invalid(format!("'test' does not support input data type {type}", type = r#type))),
+                Err(TypeError::invalid(format!("`test` does not support input data type {type}", type = r#type))),
             );
         }
         assert_eq!(check_real(&[DataType::I64, DataType::F32]), Ok(()));
         assert_eq!(
             check_real(&[DataType::C64]),
-            Err(TypeError::invalid("'test' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type c64".to_string())),
         );
         assert_eq!(check_float(&[DataType::BF16, DataType::F64, DataType::C64]), Ok(()));
         assert_eq!(
             check_float(&[DataType::I64]),
-            Err(TypeError::invalid("'test' does not support input data type i64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type i64".to_string())),
         );
         assert_eq!(check_numeric_then_real(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_numeric(&[DataType::I32, DataType::F64]), Ok(()));
         assert_eq!(
             check_numeric_then_real(&[DataType::C128]),
-            Err(TypeError::invalid("'test' does not support input data type c128".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type c128".to_string())),
         );
         assert_eq!(
             check_numeric_then_real(&[DataType::Boolean]),
-            Err(TypeError::invalid("'test' does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type bool".to_string())),
         );
         assert_eq!(check_float_then_real(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(check_real_then_float(&[DataType::BF16, DataType::F64]), Ok(()));
         assert_eq!(
             check_float_then_real(&[DataType::C64]),
-            Err(TypeError::invalid("'test' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type c64".to_string())),
         );
         assert_eq!(
             check_float_then_real(&[DataType::I64]),
-            Err(TypeError::invalid("'test' does not support input data type i64".to_string())),
+            Err(TypeError::invalid("`test` does not support input data type i64".to_string())),
         );
     }
 
@@ -5201,12 +5201,12 @@ mod tests {
         assert_eq!(check_no_unreduced(std::slice::from_ref(&plain)), Ok(()));
         assert_eq!(
             check_no_unreduced(std::slice::from_ref(&unreduced_x)),
-            Err(TypeError::invalid("'test' does not support unreduced operands".to_string())),
+            Err(TypeError::invalid("`test` does not support unreduced operands".to_string())),
         );
         assert_eq!(check_unreduced_axes(&[unreduced_x.clone(), unreduced_x.clone()]), Ok(()));
         assert_eq!(
             check_unreduced_axes(&[unreduced_x, unreduced_y]),
-            Err(TypeError::invalid("'test' operands must be unreduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test` operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             check_unreduced_axes(std::slice::from_ref(&plain)),
@@ -5215,7 +5215,7 @@ mod tests {
         assert_eq!(check_reduced_axes(&[reduced_x.clone(), reduced_x.clone()]), Ok(()));
         assert_eq!(
             check_reduced_axes(&[reduced_x, reduced_y]),
-            Err(TypeError::invalid("'test' operands must be reduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test` operands must be reduced over the same axes".to_string())),
         );
         assert_eq!(
             check_reduced_axes(std::slice::from_ref(&plain)),
@@ -5403,7 +5403,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'add' does not support input data type bool",
+                    error = "`add` does not support input data type bool",
                 },
             ],
         );
@@ -5422,7 +5422,7 @@ mod tests {
                 },
                 {
                     input_types = [DataType::Boolean, DataType::Boolean],
-                    error = "'add' does not support input data type bool",
+                    error = "`add` does not support input data type bool",
                 },
             ],
         );
@@ -5734,12 +5734,12 @@ mod tests {
         );
         assert_eq!(
             data_operation.infer_output_types(&[DataType::Boolean], &[]),
-            Err(TypeError::invalid("'test_unary' does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type bool".to_string())),
         );
         assert_eq!(data_operation.infer_output_types(&[DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
             data_operation.infer_output_types(&[DataType::C64], &[]),
-            Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type c64".to_string())),
         );
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::F32)], &[]),
@@ -5752,7 +5752,7 @@ mod tests {
         );
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
-            Err(TypeError::invalid("'test_unary' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
@@ -5760,7 +5760,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[unreduced_type], &[]),
-            Err(TypeError::invalid("'test_unary' does not support unreduced operands".to_string())),
+            Err(TypeError::invalid("`test_unary` does not support unreduced operands".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, TestUnaryOperation<ArrayType>>>::interpret(
@@ -5806,12 +5806,12 @@ mod tests {
         );
         assert_eq!(
             data_operation.infer_output_types(&[DataType::Boolean, DataType::Boolean], &[]),
-            Err(TypeError::invalid("'test_binary' does not support input data type bool".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type bool".to_string())),
         );
         assert_eq!(data_operation.infer_output_types(&[DataType::I64, DataType::I64], &[]), Ok(vec![DataType::I64]),);
         assert_eq!(
             data_operation.infer_output_types(&[DataType::C64, DataType::C64], &[]),
-            Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type c64".to_string())),
         );
         let scalar_type = ArrayType::scalar(DataType::F32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]));
@@ -5825,7 +5825,7 @@ mod tests {
                 &[ArrayType::scalar(DataType::C64), ArrayType::scalar(DataType::C64)],
                 &[],
             ),
-            Err(TypeError::invalid("'test_binary' does not support input data type c64".to_string())),
+            Err(TypeError::invalid("`test_binary` does not support input data type c64".to_string())),
         );
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
@@ -5840,7 +5840,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             Operation::infer_output_types(&array_operation, &[unreduced_x, unreduced_y], &[]),
-            Err(TypeError::invalid("'test_binary' operands must be unreduced over the same axes".to_string())),
+            Err(TypeError::invalid("`test_binary` operands must be unreduced over the same axes".to_string())),
         );
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, TestBinaryOperation<ArrayType>>>::interpret(

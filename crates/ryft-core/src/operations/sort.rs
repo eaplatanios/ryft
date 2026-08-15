@@ -84,7 +84,7 @@ impl SortOperation {
     pub fn with_key_count(self, key_count: usize) -> Result<Self, ProgramError> {
         if key_count == 0 {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{SORT_OPERATION_NAME}' key_count must be at least 1"),
+                message: format!("`{SORT_OPERATION_NAME}` key_count must be at least 1"),
             });
         }
         Ok(Self { key_count, ..self })
@@ -129,11 +129,11 @@ impl Operation for SortOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         let Some(key_type) = input_types.first() else {
-            return Err(TypeError::invalid(format!("'{SORT_OPERATION_NAME}' needs at least one input")));
+            return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` needs at least one input")));
         };
         if self.key_count > input_types.len() {
             return Err(TypeError::invalid(format!(
-                "'{}' key_count {} exceeds operand count {}",
+                "`{}` key_count {} exceeds operand count {}",
                 SORT_OPERATION_NAME,
                 self.key_count,
                 input_types.len(),
@@ -143,13 +143,13 @@ impl Operation for SortOperation {
             let data_type = input_type.data_type();
             if data_type.is_token() || data_type.is_zero() || data_type.is_complex() {
                 return Err(TypeError::invalid(format!(
-                    "'{SORT_OPERATION_NAME}' does not support key data type {data_type}",
+                    "`{SORT_OPERATION_NAME}` does not support key data type {data_type}",
                 )));
             }
         }
         if self.axis >= key_type.rank() {
             return Err(TypeError::invalid(format!(
-                "'{}' axis {} is out of bounds for rank {}",
+                "`{}` axis {} is out of bounds for rank {}",
                 SORT_OPERATION_NAME,
                 self.axis,
                 key_type.rank(),
@@ -158,19 +158,19 @@ impl Operation for SortOperation {
         for input_type in input_types {
             if input_type.shape() != key_type.shape() {
                 return Err(TypeError::invalid(format!(
-                    "'{}' operands must agree on shape but got {} and {}",
+                    "`{}` operands must agree on shape but got {} and {}",
                     SORT_OPERATION_NAME,
                     key_type.shape(),
                     input_type.shape(),
                 )));
             }
             if !input_type.unreduced_axes().is_empty() {
-                return Err(TypeError::invalid(format!("'{SORT_OPERATION_NAME}' does not support unreduced operands")));
+                return Err(TypeError::invalid(format!("`{SORT_OPERATION_NAME}` does not support unreduced operands")));
             }
             if let Some(sharding) = input_type.sharding() {
                 if matches!(sharding.dimensions()[self.axis], ShardingDimension::Sharded(_)) {
                     return Err(TypeError::invalid(format!(
-                        "'{}' cannot sort along sharded axis {}",
+                        "`{}` cannot sort along sharded axis {}",
                         SORT_OPERATION_NAME, self.axis,
                     )));
                 }
@@ -342,7 +342,7 @@ where
     ) -> Result<Vec<Self>, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{SORT_OPERATION_NAME}' needs at least one input"),
+                message: format!("`{SORT_OPERATION_NAME}` needs at least one input"),
             });
         };
         let operation = SortOperation::new(axis, direction).with_key_count(key_count)?;
@@ -480,7 +480,7 @@ pub(crate) fn top_k_from_index_passenger<V: Clone + Sort + Slice>(
 ) -> Result<(V, V), ProgramError> {
     if k > dimensions[axis] {
         return Err(ProgramError::UnsupportedOperation {
-            message: format!("'top_k' k {k} exceeds axis {axis} size {}", dimensions[axis]),
+            message: format!("`top_k` k {k} exceeds axis {axis} size {}", dimensions[axis]),
         });
     }
     let mut sorted = Sort::sort(&[value.clone(), indices], axis, SortDirection::Descending)?;
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(multi_key.with_key_count(1).unwrap().to_string(), "sort [axis=0, direction=ascending]");
         assert!(matches!(
             operation.with_key_count(0),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "'sort' key_count must be at least 1",
+            Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` key_count must be at least 1",
         ));
 
         // An ascending key-value sort co-permutes the passenger by the key's order, and the sort is stable: both
@@ -690,15 +690,15 @@ mod tests {
                 {
                     type = ArrayType,
                     input_types = [],
-                    error = "'sort' needs at least one input",
+                    error = "`sort` needs at least one input",
                 },
                 {
                     input_types = [complex],
-                    error = "'sort' does not support key data type c64",
+                    error = "`sort` does not support key data type c64",
                 },
                 {
                     input_types = [vector_type(4), vector_type(3)],
-                    error = "'sort' operands must agree on shape but got [4] and [3]",
+                    error = "`sort` operands must agree on shape but got [4] and [3]",
                 },
                 {
                     input_types = [vector_type(4), passenger.clone()],
@@ -710,7 +710,7 @@ mod tests {
             operation = SortOperation::new(1, SortDirection::Ascending),
             cases = [{
                 input_types = [vector_type(4)],
-                error = "'sort' axis 1 is out of bounds for rank 1",
+                error = "`sort` axis 1 is out of bounds for rank 1",
             }],
         );
 
@@ -726,11 +726,11 @@ mod tests {
                 {
                     type = ArrayType,
                     input_types = [vector_type(4)],
-                    error = "'sort' key_count 2 exceeds operand count 1",
+                    error = "`sort` key_count 2 exceeds operand count 1",
                 },
                 {
                     input_types = [vector_type(4), complex],
-                    error = "'sort' does not support key data type c64",
+                    error = "`sort` does not support key data type c64",
                 },
                 {
                     input_types = [vector_type(4), vector_type(4), passenger.clone()],
@@ -787,11 +787,11 @@ mod tests {
         // The eager implementation validates the key count like type inference does.
         assert!(matches!(
             Sort::sort_with_key_count(&operands[..1], 0, SortDirection::Ascending, 2),
-            Err(ProgramError::Type(TypeError::Invalid { message })) if message == "'sort' key_count 2 exceeds operand count 1",
+            Err(ProgramError::Type(TypeError::Invalid { message })) if message == "`sort` key_count 2 exceeds operand count 1",
         ));
         assert!(matches!(
             Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 0),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "'sort' key_count must be at least 1",
+            Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` key_count must be at least 1",
         ));
     }
 
@@ -976,7 +976,7 @@ mod tests {
         );
         assert!(matches!(
             input.top_k(7, 0),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "'top_k' k 7 exceeds axis 0 size 6",
+            Err(ProgramError::UnsupportedOperation { message }) if message == "`top_k` k 7 exceeds axis 0 size 6",
         ));
     }
 
@@ -1024,7 +1024,7 @@ mod tests {
         let input = f64_array(vec![1, 6], vec![3.0, 1.0, 3.0, -0.0, 0.0, 2.0]);
         assert!(matches!(
             input.top_k(7, 1),
-            Err(ProgramError::UnsupportedOperation { message }) if message == "'top_k' k 7 exceeds axis 1 size 6",
+            Err(ProgramError::UnsupportedOperation { message }) if message == "`top_k` k 7 exceeds axis 1 size 6",
         ));
     }
 

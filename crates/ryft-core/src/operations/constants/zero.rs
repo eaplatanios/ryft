@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(
             ZeroOperation::new(dynamic_type.clone()).infer_output_types(&[], &[]),
             Err(TypeError::invalid(
-                "'zero' cannot construct type f32[rows, 3] without operands because it references identity rows",
+                "`zero` cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
         let dimension_type = DimensionType::new(rows);

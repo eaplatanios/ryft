@@ -27,7 +27,7 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
 ) -> Result<(), TypeError> {
     match r#type.identities().find(|(position, _)| *position == TypeIdentityPosition::Reference) {
         Some((_, reference)) => Err(TypeError::invalid(format!(
-            "'{}' cannot construct type {} without operands because it references identity {}",
+            "`{}` cannot construct type {} without operands because it references identity {}",
             name, r#type, reference,
         ))),
         None => Ok(()),
@@ -50,19 +50,19 @@ pub(crate) fn infer_dynamic_constructor_output_types(
     region_interfaces: &[RegionInterface<ArrayIrType>],
 ) -> Result<Vec<ArrayIrType>, TypeError> {
     if !region_interfaces.is_empty() {
-        return Err(TypeError::invalid(format!("'{}' expects no regions but got {}", name, region_interfaces.len())));
+        return Err(TypeError::invalid(format!("`{}` expects no regions but got {}", name, region_interfaces.len())));
     }
     let variables = r#type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
     if variables.is_empty() {
         return Err(TypeError::invalid(format!(
-            "'{}' with static output type {} has no dynamic dimensions; use the homogeneous nullary \
+            "`{}` with static output type {} has no dynamic dimensions; use the homogeneous nullary \
             constructor instead",
             name, r#type,
         )));
     }
     if input_types.len() != variables.len() {
         return Err(TypeError::invalid(format!(
-            "'{}' expects one dimension operand per dynamic output dimension ({}) but got {} operands",
+            "`{}` expects one dimension operand per dynamic output dimension ({}) but got {} operands",
             name,
             variables.len(),
             input_types.len(),
@@ -70,12 +70,12 @@ pub(crate) fn infer_dynamic_constructor_output_types(
     }
     for (index, (input_type, variable)) in input_types.iter().zip(variables).enumerate() {
         let dimension_type = <&DimensionType>::try_from(input_type).map_err(|_| {
-            TypeError::invalid(format!("'{name}' operand {index} must be a dimension but has type {input_type}"))
+            TypeError::invalid(format!("`{name}` operand {index} must be a dimension but has type {input_type}"))
         })?;
         if dimension_type.variable() != variable {
             let required_type = DimensionType::new(variable.clone());
             return Err(TypeError::invalid(format!(
-                "'{name}' operand {index} has type {dimension_type} but the output shape requires {required_type}",
+                "`{name}` operand {index} has type {dimension_type} but the output shape requires {required_type}",
             )));
         }
     }
@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(
             infer_dynamic_constructor_output_types("zero", &dynamic_type, &[], &[]),
             Err(TypeError::invalid(
-                "'zero' expects one dimension operand per dynamic output dimension (1) but got 0 operands",
+                "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
             )),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -122,7 +122,7 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'zero' operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
+                "`zero` operand 0 has type dimension<other ∈ [0, 8)> but the output shape requires \
                  dimension<rows ∈ [0, 8)>",
             )),
         );
@@ -133,14 +133,14 @@ mod tests {
                 &[ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
                 &[],
             ),
-            Err(TypeError::invalid("'zero' operand 0 must be a dimension but has type i64[]")),
+            Err(TypeError::invalid("`zero` operand 0 must be a dimension but has type i64[]")),
         );
 
         // Reference-free static construction has one canonical encoding: the homogeneous nullary constructor.
         assert_eq!(
             infer_dynamic_constructor_output_types("zero", &ArrayType::scalar(DataType::F32), &[], &[]),
             Err(TypeError::invalid(
-                "'zero' with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
+                "`zero` with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
                  constructor instead",
             )),
         );

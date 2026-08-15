@@ -349,7 +349,7 @@ pub fn unary_elementwise_jvp<
         MaybeZero::Zero(_) => MaybeZero::Zero(target),
         MaybeZero::Value(_) if target.is_zero_space() => {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' output type {} has no tangent space", operation.name(), output_primal.r#type()),
+                message: format!("`{}` output type {} has no tangent space", operation.name(), output_primal.r#type()),
             }
             .into());
         }
@@ -436,7 +436,7 @@ pub fn binary_elementwise_jvp<
     if target.is_zero_space() {
         if left.tangent().as_value().is_some() || right.tangent().as_value().is_some() {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("'{}' output type {} has no tangent space", operation.name(), primal.r#type()),
+                message: format!("`{}` output type {} has no tangent space", operation.name(), primal.r#type()),
             }
             .into());
         }
@@ -727,7 +727,7 @@ mod tests {
                 |_| -> Result<Array, DifferentiationError> { panic!("zero-space output invoked its tangent function") },
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "'boolean_output' output type bool[] has no tangent space",
+                if message == "`boolean_output` output type bool[] has no tangent space",
         ));
         assert!(matches!(
             unary_elementwise_jvp(
@@ -865,7 +865,7 @@ mod tests {
                 },
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "'compare' output type bool[] has no tangent space",
+                if message == "`compare` output type bool[] has no tangent space",
         ));
         assert!(matches!(
             binary_elementwise_jvp(

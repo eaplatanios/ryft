@@ -388,7 +388,7 @@ impl DimensionFromScalar<DimensionValue> for Array {
         };
         let extent = extent.map_err(|_| ProgramError::InvalidArgument {
             message: format!(
-                "'{}' scalar input must be a nonnegative host-representable extent but is {scalar}",
+                "`{}` scalar input must be a nonnegative host-representable extent but is {scalar}",
                 operation.name(),
             ),
         })?;
@@ -418,7 +418,7 @@ impl DimensionSize<usize> for Array {
         let axis = axis.into();
         let position = axis.normalize(self.r#type().rank()).map_err(|_| {
             TypeError::invalid(format!(
-                "'{DIMENSION_SIZE_OPERATION_NAME}' axis {axis} is out of bounds for rank {}",
+                "`{DIMENSION_SIZE_OPERATION_NAME}` axis {axis} is out of bounds for rank {}",
                 self.r#type().rank(),
             ))
         })?;

@@ -773,7 +773,7 @@ mod tests {
             Array::from_elements(dynamic_type, &[1.0f64]),
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "cannot materialize a value of dynamically sized type f64[dynamic]; dynamically \
-                               shaped values exist only in array programs over 'ArrayIrOperation'",
+                               shaped values exist only in array programs over `ArrayIrOperation`",
         ));
         // Well-formed logical elements construct successfully and round-trip through typed and byte accessors.
         let array = Array::from_elements(array_type(DataType::F64, &[2]), &[1.0f64, 2.0]).unwrap();

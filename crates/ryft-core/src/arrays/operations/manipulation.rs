@@ -59,7 +59,7 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
             if actual_extent != expected_extent {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "'{PAD_OPERATION_NAME}' output axis {axis} has extent {actual_extent}, but its explicit \
+                        "`{PAD_OPERATION_NAME}` output axis {axis} has extent {actual_extent}, but its explicit \
                          extent operand is {expected_extent}",
                     ),
                 });
@@ -370,21 +370,21 @@ impl Pad for Array {
         'elements: while written < input_addressing.element_count() {
             for axis in 0..rank {
                 let input_coordinate = i128::try_from(input_index[axis]).map_err(|_| {
-                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' input index is too large on axis {axis}"))
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` input index is too large on axis {axis}"))
                 })?;
                 let stride =
                     i128::try_from(interior_padding[axis]).ok().and_then(|padding| padding.checked_add(1)).ok_or_else(
-                        || TypeError::invalid(format!("'{PAD_OPERATION_NAME}' stride is too large on axis {axis}")),
+                        || TypeError::invalid(format!("`{PAD_OPERATION_NAME}` stride is too large on axis {axis}")),
                     )?;
                 let output_coordinate = i128::from(edge_padding_low[axis])
                     .checked_add(input_coordinate.checked_mul(stride).ok_or_else(|| {
-                        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index overflows on axis {axis}"))
+                        TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index overflows on axis {axis}"))
                     })?)
                     .ok_or_else(|| {
-                        TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index overflows on axis {axis}"))
+                        TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index overflows on axis {axis}"))
                     })?;
                 let output_extent = i128::try_from(output_shape[axis]).map_err(|_| {
-                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output extent is too large on axis {axis}"))
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output extent is too large on axis {axis}"))
                 })?;
                 if output_coordinate < 0 || output_coordinate >= output_extent {
                     written += 1;
@@ -392,7 +392,7 @@ impl Pad for Array {
                     continue 'elements;
                 }
                 output_index[axis] = usize::try_from(output_coordinate).map_err(|_| {
-                    TypeError::invalid(format!("'{PAD_OPERATION_NAME}' output index is too large on axis {axis}"))
+                    TypeError::invalid(format!("`{PAD_OPERATION_NAME}` output index is too large on axis {axis}"))
                 })?;
             }
             bytes[output_addressing.byte_range_unchecked(&output_index)]
@@ -412,7 +412,7 @@ impl Concatenate for Array {
         let inputs = inputs.into_iter().collect::<Vec<_>>();
         let Some(first) = inputs.first() else {
             return Err(TypeError::invalid(format!(
-                "'{CONCATENATE_OPERATION_NAME}' expects at least one operand but got none",
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
             ))
             .into());
         };
@@ -2266,7 +2266,7 @@ in (%4)
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation 'dynamic_shape_slice' does not yet support reverse-mode differentiation",
+                if message == "operation `dynamic_shape_slice` does not yet support reverse-mode differentiation",
         ));
 
         Ok(())
@@ -2519,7 +2519,7 @@ in (%4)
             ),
             Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "'{}' result extent must equal the sum of input axis 0 extents; expected 3 but got 4",
+                    "`{}` result extent must equal the sum of input axis 0 extents; expected 3 but got 4",
                     CONCATENATE_OPERATION_NAME,
                 ),
             }),
@@ -2864,7 +2864,7 @@ in (%4)
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "direct transposition of a dynamic 'concatenate' requires linearization so its input \
+                if message == "direct transposition of a dynamic `concatenate` requires linearization so its input \
                                extents can be retained as residuals",
         ));
         assert!(program.linearize().unwrap().pullback().is_ok());

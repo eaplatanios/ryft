@@ -138,7 +138,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::I32, DataType::I32],
-                    error = "'pow' does not support input data type i32",
+                    error = "`pow` does not support input data type i32",
                 },
             ],
         );

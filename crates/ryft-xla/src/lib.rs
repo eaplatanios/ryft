@@ -156,7 +156,7 @@ pub(crate) mod tests {
             if name == "increment" {
                 let FfiAttribute::Scalar { scalar: FfiScalar::F64(value) } = attribute else {
                     return Err(FfiError::invalid_argument(format!(
-                        "expected the 'increment' attribute of the '{ADD_ONE_CUSTOM_CALL_TARGET}' custom call to \
+                        "expected the `increment` attribute of the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to \
                          be an f64 scalar"
                     )));
                 };
@@ -166,13 +166,13 @@ pub(crate) mod tests {
         let mut inputs = call_frame.inputs();
         let Some(Ok(FfiInput::Buffer { buffer: input })) = inputs.next() else {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ADD_ONE_CUSTOM_CALL_TARGET}' custom call to have one input buffer"
+                "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to have one input buffer"
             )));
         };
         let mut outputs = call_frame.outputs();
         let Some(Ok(FfiOutput::Buffer { buffer: output })) = outputs.next() else {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ADD_ONE_CUSTOM_CALL_TARGET}' custom call to have one output buffer"
+                "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to have one output buffer"
             )));
         };
         if input.element_type() != FfiBufferType::F32
@@ -180,7 +180,7 @@ pub(crate) mod tests {
             || input.dimensions() != output.dimensions()
         {
             return Err(FfiError::invalid_argument(format!(
-                "expected the '{ADD_ONE_CUSTOM_CALL_TARGET}' custom call input and output to be f32 buffers with \
+                "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call input and output to be f32 buffers with \
                  matching shapes"
             )));
         }
@@ -194,7 +194,7 @@ pub(crate) mod tests {
             let destination = output.data() as *mut f32;
             if count > 0 && (source.is_null() || destination.is_null()) {
                 return Err(FfiError::internal(format!(
-                    "encountered null data pointer in the '{ADD_ONE_CUSTOM_CALL_TARGET}' custom call"
+                    "encountered null data pointer in the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call"
                 )));
             }
             for index in 0..count {

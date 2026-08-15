@@ -74,7 +74,7 @@ macro_rules! impl_capability_for_primitive {
             fn div(&self, right: &Self) -> Result<Self, ProgramError> {
                 self.checked_div(*right).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!(
-                        "'{}' divisor is zero or the result does not fit in {}",
+                        "`{}` divisor is zero or the result does not fit in {}",
                         DIV_OPERATION_NAME,
                         stringify!($type),
                     ),
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(
             Div::div(&7_usize, &0),
             Err(ProgramError::InvalidArgument {
-                message: "'div' divisor is zero or the result does not fit in usize".to_string(),
+                message: "`div` divisor is zero or the result does not fit in usize".to_string(),
             }),
         );
         assert_abs_diff_eq!(
@@ -187,7 +187,7 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::F8E3M4, DataType::F32],
-                    error = format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible"),
+                    error = format!("`{DIV_OPERATION_NAME}` input types are not broadcast-compatible"),
                 },
             ],
         );
@@ -212,7 +212,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let unreduced_error = || "'div' does not support unreduced operands";
+        let unreduced_error = || "`div` does not support unreduced operands";
         check_operation_type_inference!(
             operation = DivOperation::<ArrayType>::new(),
             cases = [
@@ -363,13 +363,13 @@ mod tests {
         assert_eq!(
             Div::div(&7_usize, &0),
             Err(ProgramError::InvalidArgument {
-                message: "'div' divisor is zero or the result does not fit in usize".to_string(),
+                message: "`div` divisor is zero or the result does not fit in usize".to_string(),
             }),
         );
         assert_eq!(
             Div::div(&i8::MIN, &-1),
             Err(ProgramError::InvalidArgument {
-                message: "'div' divisor is zero or the result does not fit in i8".to_string(),
+                message: "`div` divisor is zero or the result does not fit in i8".to_string(),
             }),
         );
         assert_eq!(Div::div(&1.0_f64, &0.0), Ok(f64::INFINITY));

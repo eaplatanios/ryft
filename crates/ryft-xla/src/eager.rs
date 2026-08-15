@@ -103,7 +103,7 @@ impl DimensionFromScalar<DimensionValue> for Array<'_> {
         let bytes = shard_host_bytes(shard)?;
         let invalid_extent = |value: String| ProgramError::InvalidArgument {
             message: format!(
-                "'{}' scalar input must be a nonnegative host-representable extent but is {value}",
+                "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
                 operation.name(),
             ),
         };
@@ -561,7 +561,7 @@ mod tests {
         for kind in [ReductionKind::Sum, ReductionKind::Mean, ReductionKind::Max, ReductionKind::Min] {
             let device_values = read_i32s(&integer.reduce(&[0], kind));
             let reference_values = reference_integer.reduce(&[0], kind).elements::<i32>().unwrap();
-            assert_eq!(device_values, reference_values, "integer '{kind}' reduction disagrees");
+            assert_eq!(device_values, reference_values, "integer `{kind}` reduction disagrees");
         }
 
         // Complex multiplication agrees.
@@ -1540,7 +1540,7 @@ mod tests {
         assert!(matches!(
             matrix.dimension_size(2),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "'dimension_size' axis 2 is out of bounds for rank 2",
+                if message == "`dimension_size` axis 2 is out of bounds for rank 2",
         ));
 
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1561,7 +1561,7 @@ mod tests {
             negative.to_dimension(variable),
             Err(ProgramError::InvalidArgument { message })
                 if message
-                    == "'dimension_from_scalar' scalar input must be a nonnegative host-representable extent but is -1",
+                    == "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is -1",
         ));
     }
 

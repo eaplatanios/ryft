@@ -269,11 +269,11 @@ mod tests {
                 },
                 {
                     input_data_types = [DataType::C64],
-                    error = "'erf' does not support input data type c64",
+                    error = "`erf` does not support input data type c64",
                 },
                 {
                     input_data_types = [DataType::I32],
-                    error = "'erf' does not support input data type i32",
+                    error = "`erf` does not support input data type i32",
                 },
             ],
         );

@@ -101,7 +101,7 @@ fn attention_dimensions(
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         dimensions => Err(TypeError::invalid(format!(
-            "'{operation_name}' {descriptor} must have rank 3 or 4 but got rank {}",
+            "`{operation_name}` {descriptor} must have rank 3 or 4 but got rank {}",
             dimensions.len(),
         ))),
     }
@@ -146,26 +146,26 @@ pub(super) fn validated_attention_operands(
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' requires floating-point operands but got data type {data_type}"
+            "`{operation_name}` requires floating-point operands but got data type {data_type}"
         )));
     }
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
         if input_type.data_type() != data_type {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} data type {} does not match the query data type {data_type}",
+                "`{operation_name}` {descriptor} data type {} does not match the query data type {data_type}",
                 input_type.data_type(),
             )));
         }
         if dimensions[0] != query[0] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} batch dimension ({}) does not match the query batch dimension \
+                "`{operation_name}` {descriptor} batch dimension ({}) does not match the query batch dimension \
                      ({})",
                 dimensions[0], query[0],
             )));
         }
         if dimensions[3] != query[3] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} head dimension ({}) does not match the query head dimension \
+                "`{operation_name}` {descriptor} head dimension ({}) does not match the query head dimension \
                      ({})",
                 dimensions[3], query[3],
             )));
@@ -173,37 +173,37 @@ pub(super) fn validated_attention_operands(
     }
     if value[1] != key[1] {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' value sequence dimension ({}) does not match the key sequence dimension ({})",
+            "`{operation_name}` value sequence dimension ({}) does not match the key sequence dimension ({})",
             value[1], key[1],
         )));
     }
     if value[2] != key[2] {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' value heads dimension ({}) does not match the key heads dimension ({})",
+            "`{operation_name}` value heads dimension ({}) does not match the key heads dimension ({})",
             value[2], key[2],
         )));
     }
     let Dimension::Static(query_heads) = &query[2] else {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' query heads dimension must be static but got {}",
+            "`{operation_name}` query heads dimension must be static but got {}",
             query[2],
         )));
     };
     let Dimension::Static(key_value_heads) = &key[2] else {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' key/value heads dimension must be static but got {}",
+            "`{operation_name}` key/value heads dimension must be static but got {}",
             key[2],
         )));
     };
     let Dimension::Static(head_dimension) = &query[3] else {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' head dimension must be static but got {}",
+            "`{operation_name}` head dimension must be static but got {}",
             query[3],
         )));
     };
     if *key_value_heads == 0 || *query_heads % *key_value_heads != 0 {
         return Err(TypeError::invalid(format!(
-            "'{operation_name}' key/value heads dimension ({}) must divide the query heads dimension ({})",
+            "`{operation_name}` key/value heads dimension ({}) must divide the query heads dimension ({})",
             key_value_heads, query_heads,
         )));
     }
@@ -216,7 +216,7 @@ pub(super) fn validated_attention_operands(
         let operand_dimensions = operand_type.shape().dimensions();
         if operand_dimensions.len() > 4 {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} must have rank at most 4 but got rank {}",
+                "`{operation_name}` {descriptor} must have rank at most 4 but got rank {}",
                 operand_dimensions.len(),
             )));
         }
@@ -229,40 +229,40 @@ pub(super) fn validated_attention_operands(
         if let Some(expected_data_type) = expected_data_type {
             if operand_type.data_type() != expected_data_type {
                 return Err(TypeError::invalid(format!(
-                    "'{operation_name}' {descriptor} must have data type {expected_data_type} but got {}",
+                    "`{operation_name}` {descriptor} must have data type {expected_data_type} but got {}",
                     operand_type.data_type(),
                 )));
             }
         } else if !operand_type.data_type().is_numeric() && !operand_type.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' bias must have a numeric or Boolean data type but got {}",
+                "`{operation_name}` bias must have a numeric or Boolean data type but got {}",
                 operand_type.data_type(),
             )));
         }
         if operand_batch != &Dimension::Static(1) && operand_batch != &query[0] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} batch dimension ({operand_batch}) must be 1 or match the query \
+                "`{operation_name}` {descriptor} batch dimension ({operand_batch}) must be 1 or match the query \
                  batch dimension ({})",
                 query[0],
             )));
         }
         if operand_heads != &Dimension::Static(1) && operand_heads != &query[2] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} heads dimension ({operand_heads}) must be 1 or match the query \
+                "`{operation_name}` {descriptor} heads dimension ({operand_heads}) must be 1 or match the query \
                  heads dimension ({})",
                 query[2],
             )));
         }
         if operand_rows != &Dimension::Static(1) && operand_rows != &query[1] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} query-sequence dimension ({operand_rows}) must be 1 or match the \
+                "`{operation_name}` {descriptor} query-sequence dimension ({operand_rows}) must be 1 or match the \
                  query sequence dimension ({})",
                 query[1],
             )));
         }
         if operand_columns != &Dimension::Static(1) && operand_columns != &key[1] {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} key/value-sequence dimension ({operand_columns}) must be 1 or \
+                "`{operation_name}` {descriptor} key/value-sequence dimension ({operand_columns}) must be 1 or \
                  match the key sequence dimension ({})",
                 key[1],
             )));
@@ -295,7 +295,7 @@ pub(super) fn validated_sequence_length_operands(
         };
         if value_type.data_type() != DataType::I32 {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' {descriptor} must have data type i32 but got {}",
+                "`{operation_name}` {descriptor} must have data type i32 but got {}",
                 value_type.data_type(),
             )));
         }
@@ -303,12 +303,12 @@ pub(super) fn validated_sequence_length_operands(
             [size] if size == batch => {}
             [size] => {
                 return Err(TypeError::invalid(format!(
-                    "'{operation_name}' {descriptor} size ({size}) does not match the batch dimension ({batch})",
+                    "`{operation_name}` {descriptor} size ({size}) does not match the batch dimension ({batch})",
                 )));
             }
             ref dimensions => {
                 return Err(TypeError::invalid(format!(
-                    "'{operation_name}' {descriptor} must have rank 1 but got rank {}",
+                    "`{operation_name}` {descriptor} must have rank 1 but got rank {}",
                     dimensions.len(),
                 )));
             }
@@ -323,7 +323,7 @@ pub(super) fn validated_dropout(operation_name: &str, dropout: Option<(f64, u64)
     if let Some((rate, _)) = dropout {
         if !(rate > 0.0 && rate < 1.0) {
             return Err(TypeError::invalid(format!(
-                "'{operation_name}' dropout rate must lie in the open interval (0, 1) but got {rate}",
+                "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
             )));
         }
     }
