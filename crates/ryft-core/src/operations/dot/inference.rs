@@ -295,7 +295,7 @@ pub(crate) fn dot_abstract(
                     )));
                 }
                 return Err(TypeError::invalid(format!(
-                    "'{DOT_OPERATION_NAME}' contracting dimensions are sharded, making the output sharding ambiguous; request an \
+                    "`{DOT_OPERATION_NAME}` contracting dimensions are sharded, making the output sharding ambiguous; request an \
                          explicit output sharding (e.g., one with unreduced axes) to resolve it"
                 )));
             }

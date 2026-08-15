@@ -543,7 +543,7 @@ impl<T: Type> CustomCallOperation<T> {
         for alias in &self.input_output_aliases {
             let Some(input_type) = input_types.get(alias.input_index) else {
                 return Err(TypeError::invalid(format!(
-                    "'{CUSTOM_CALL_OPERATION_NAME}' alias '{alias}' refers to input {} but the call has {} array \
+                    "`{CUSTOM_CALL_OPERATION_NAME}` alias `{alias}` refers to input {} but the call has {} array \
                      inputs",
                     alias.input_index,
                     input_types.len(),
@@ -1157,7 +1157,7 @@ mod tests {
                 .unwrap()
                 .infer_output_types(&[vector_type()], &[]),
             Err(TypeError::invalid(
-                "`custom_call` alias '0->0' requires matching input and output types but input 0 has type `f32[2]` \
+                "`custom_call` alias `0->0` requires matching input and output types but input 0 has type `f32[2]` \
                  and output 0 has type `f32[]`",
             )),
         );
