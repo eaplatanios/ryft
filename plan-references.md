@@ -221,6 +221,10 @@ operation universe. `ArrayIrValue<A>` remains the actual `Value`; its `ValueProj
 projects to `Reference<A>`. A standalone `Value` implementation can be added later only if an independent reference
 domain has real use.
 
+The generic carriers are reusable representation, not a promise that every `T` or `V` is a supported referent. Each
+composite universe chooses its admitted specialization. Array IR admits only `ReferenceType<ArrayType>` and
+`Reference<A>`; it remains structurally unable to contain a reference to a dimension, another reference, or a List.
+
 ### 5.3 Operations
 
 Start with whole-array operations:
@@ -508,6 +512,11 @@ targeted rejection if one does. The same principle applies to any representation
 Advanced external-reference AD, including caller-provided gradient accumulator references analogous to JAX's current
 `vjp.with_refs`, is a later design milestone after functionalized local-reference AD is correct.
 
+Discharge does not expand the capabilities of the underlying pure transform. Local-reference AD inherits every
+existing pure-program restriction. In particular, bounded while-loop reverse mode may be a positive conformance case,
+while the currently unsupported unbounded while-loop transpose remains a targeted error until first-class List/tape or
+another residual-storage strategy exists.
+
 ## 10. Public API staging
 
 ### Stage A: local references inside array-only functions
@@ -527,6 +536,10 @@ closure makes the call externally stateful. Captures remain typed side-table val
 
 Add a heterogeneous compiled-function facade over `ArrayIrType`/`ArrayIrValue<Array>` or another typed boundary that
 preserves existing array-only APIs. Do not weaken the current array projection merely to accept references.
+
+Externally stateful calls return a completion-bearing wrapper conceptually like `ReferenceExecution<Output>`, even
+when `Output` has no leaves. A synchronous convenience method awaits it. The existing output-only execution path may
+remain for ordinary pure calls, but it must not discard the only fence/error carrier for an externally stateful call.
 
 No stage returns reference handles from compiled code.
 
@@ -549,9 +562,10 @@ Keep core discharge metadata logical. Extend `XlaExecutableSignature`, or add a 
 pub struct XlaReferenceStateSignature {
     slot: usize,
     source: ReferenceSource,
+    access: ExternalReferenceAccess,
     logical_input_index: usize,
     logical_output_index: Option<usize>,
-    physical_input_index: usize,
+    physical_input_index: Option<usize>,
     physical_output_index: Option<usize>,
     referent_type: ArrayType,
 }
@@ -565,6 +579,15 @@ Physical indices are computed only after composing with:
 - public, hidden state, and hidden dynamic-extent result ordering.
 
 Never derive physical indices by adding counts or assuming one logical value maps to one physical value.
+
+Initially admit only these combinations:
+
+- `(physical_input = Some, physical_output = None, access = ReadOnly)`;
+- `(physical_input = Some, physical_output = Some, access = Mutated)`.
+
+Reject any external reference whose physical input is erased, including zero-space references, until Phase 11 defines
+another representation. A read-only slot is never donated or aliased. A mutated slot has exactly one hidden output and
+one may-alias relation.
 
 Entry lowering attaches `tf.aliasing_output = <physical output index>` to each mutated physical external-state input,
 merged with existing argument attributes such as sharding. Read-only slots carry no alias. Aliases must be injective,
@@ -582,33 +605,51 @@ The runtime must define state transitions, concurrency, and failure behavior bef
 For each invocation:
 
 1. Resolve public and captured logical roots to runtime holders.
-2. Reject duplicate holders before extracting any state.
+2. Reject duplicate holders before snapshotting or extracting any state.
 3. Acquire multiple holders in stable `ReferenceId` order.
-4. Obtain each current array and its readiness/failure dependency.
+4. For a read-only slot, clone/snapshot the current array and its dependency without taking ownership. For a mutated
+   slot, transactionally take the current array and dependency.
 5. Build ordinary physical arguments through `XlaExecutableSignature`.
-6. Request internal donation for reference inputs when safe; retain current donation downgrade/copy-protection behavior
-   when storage is shared.
-7. Launch the executable.
+6. Construct logical donation flags in flattened capture-plus-public-input order, then project them through
+   `XlaExecutableSignature`: ordinary captures and dimensions are `false`; ordinary public arrays use the user's flag;
+   read-only reference inputs are `false`; mutated reference inputs are internally `true` subject to safe uniqueness
+   downgrade; hidden extent carriers are `false`.
+7. Cross one explicit irreversibility boundary when donatable inputs are handed to the PJRT execute call.
 8. Split public results, hidden state results, and hidden dynamic extents.
-9. Install all hidden states, with their readiness events, before reporting successful submission/completion according
-   to the API's async contract.
-10. Reconstruct and expose only public outputs.
+9. Install all mutated hidden states, with their readiness events and generation/dependency information, before
+   reporting successful submission.
+10. Register the execution fence as a read lease on every read-only holder so a later donating mutation waits or
+    dependency-chains until the read is finished.
+11. Reconstruct and expose only public outputs through the completion-bearing stateful-call wrapper.
 
 Required failure semantics:
 
-- Failure before launch restores every extracted state.
-- Synchronous launch failure restores every state.
-- Once execution is successfully submitted, dropping the caller's future does not cancel or roll back the mutation.
-- Asynchronous execution failure poisons affected holders with the execution error; later reads/writes fail until an
-  explicit replacement/reset API exists.
+- Before the PJRT irreversibility boundary, every extracted mutated state is restored.
+- After that boundary, Ryft does not claim it can restore a potentially donated input. If all hidden final states can be
+  constructed, it installs them even when later public-output reconstruction or refinement fails. If any hidden state
+  cannot be constructed or validated, it poisons every mutated holder in the invocation.
+- If future PJRT APIs can prove that a failed submission did not accept donation and return recoverable inputs, a
+  narrower restore path may be added. Until then, execute-call failure after handoff conservatively poisons mutated
+  holders.
+- Asynchronous execution failure poisons mutated holders with the execution error; later reads/writes fail until an
+  explicit replacement/reset API exists. Read-only participants are not poisoned by this invocation's failure.
+- The completion-bearing call reports launch, public reconstruction, read-only execution, and asynchronous errors even
+  when the public output structure is empty.
+- Once execution crosses the irreversibility boundary, dropping its completion handle does not cancel or roll back the
+  mutation.
 - A holder never exposes potentially donated stale storage as its current state.
-- State installation for a multi-reference call is logically atomic: all affected holders become pending on the same
-  submitted execution or all are restored.
-- Calls involving the same holder serialize through its state/dependency chain. Independent holders may execute
-  concurrently.
+- State installation for a multi-reference call is logically atomic: all mutated holders become pending on the same
+  submitted execution, all are restored before handoff, or all are poisoned after an unrecoverable post-handoff
+  failure.
+- Calls involving the same holder serialize through its state/dependency chain. Read-only calls may overlap only when
+  the holder tracks all outstanding read leases; a mutation waits/dependency-chains them before donation. Independent
+  holders may execute concurrently.
+- Pending states use generation-safe cumulative dependency/error chains. If call B consumes call A's pending result
+  and A later fails, B cannot overwrite or hide that failure; the holder remains poisoned. Older completion callbacks
+  cannot mutate a newer generation.
 
-Do not hold a host mutex for device execution duration. Install a pending array/event state and let later accesses
-await or dependency-chain it.
+Do not hold a host mutex for device execution duration. Install pending generation/event state and read leases, then
+let later accesses await or dependency-chain them.
 
 ### 11.4 Compilation identity and persistence
 
@@ -718,13 +759,14 @@ broad trait-solver migration.
 
 ### Phase 1: Add the array IR reference member
 
-- [ ] Add a focused core references module with generic `ReferenceType<T: Type>` and
-      `ReferenceTypeRefinements<T>` as required by the `Type` contract.
+- [ ] Add `crates/ryft-core/src/programs/references.rs` with generic `ReferenceType<T: Type>` and
+      `ReferenceTypeRefinements<T>` as required by the `Type` contract, re-exported through the programs facade and
+      crate root.
 - [ ] Add `ArrayIrType::Reference` and checked `From`/`TryFrom` projections.
 - [ ] Extend display, identity traversal/renaming, compatibility, refinement, scalar/complex classification, and
       `ArrayIrTypeRefinements`.
 - [ ] Route reference/referent dimension refinements through the existing shared `ArrayTypeRefinements` state.
-- [ ] Add generic `Reference<V: Value>` and `ReferenceId` in the same focused core references module.
+- [ ] Add generic `Reference<V: Value>` and `ReferenceId` in the same core references module.
 - [ ] Implement `Typed<Type = ReferenceType<V::Type>>`, identity-based traits, opaque `Parameter` leaf behavior, and
       the storage/lifecycle primitives without adding a standalone `Value` implementation.
 - [ ] Add `ArrayIrValue::Reference(Reference<A>)` and
@@ -766,12 +808,18 @@ invalid programs fail before any mutation or replay.
 - [ ] Support local references in straight-line programs.
 - [ ] Add eager/staged equivalence tests and all lifecycle/type errors.
 - [ ] Verify that a retained read snapshot is unchanged by every later write/update path.
+- [ ] Verify that the retained initializer and two distinct roots initialized from storage-sharing values remain
+      unchanged/independent under later mutation.
+- [ ] Test explicit freeze, implicit scope-exit discard, a never-frozen local root, nested-region local discard, and
+      invalid branch/loop lifecycle paths.
 
 **Exit criterion:** the whole-array reference language has one observable meaning in eager and staged execution.
 
 ### Phase 4: Implement straight-line discharge
 
 - [ ] Add a core discharge module and result metadata types.
+- [ ] Integrate discharge after `ClosedProgram::to_program_with_lifted_captures` and return the canonical
+      capture/public-holder binding recipe without rewriting concrete capture tables.
 - [ ] Validate the complete program before constructing output.
 - [ ] Track one immutable current array per root.
 - [ ] Rewrite each whole-array operation according to the state-passing semantics.
@@ -833,11 +881,19 @@ representation or changing the executable ABI.
 - [ ] Define and implement the eager/XLA holder state machine, including ready, pending, poisoned, and frozen/invalid
       states as applicable.
 - [ ] Extend logical and physical executable-signature metadata.
+- [ ] Record `ReadOnly` versus `Mutated` disposition and represent physical input/output indices as optional mappings;
+      reject erased physical reference inputs in this phase.
 - [ ] Derive physical indices only after zero-space and dynamic-extent mappings are complete.
 - [ ] Emit and verify `tf.aliasing_output` on the correct entry argument.
 - [ ] Implement hidden final-state result splitting and holder installation.
-- [ ] Add internal reference donation while preserving copy-protection fallback.
-- [ ] Define pre-launch, synchronous-launch, asynchronous-execution, and dropped-future behavior.
+- [ ] Construct donation flags in logical ABI order: ordinary capture/dimension/read-only reference `false`, ordinary
+      public array from the user flag, and mutated reference internally `true` with uniqueness downgrade.
+- [ ] Mark the PJRT handoff irreversibility boundary and implement restore-before-handoff versus
+      install-or-poison-after-handoff behavior.
+- [ ] Add a completion-bearing stateful-call wrapper so zero-output calls cannot lose execution errors.
+- [ ] Add internal mutated-reference donation while preserving copy-protection fallback; never donate read-only slots.
+- [ ] Define pre-handoff, execute-call, post-submission reconstruction, asynchronous-execution, and dropped-completion
+      behavior.
 - [ ] Keep hidden results out of public reconstruction.
 - [ ] Start with one static, unsharded, device-memory external reference.
 
@@ -847,7 +903,10 @@ holder restored or explicitly poisoned; semantics remain correct when physical a
 ### Phase 9: Complete external/captured runtime integration
 
 - [ ] Support multiple unique holders with stable lock order and logically atomic pending-state installation.
-- [ ] Serialize same-holder calls while allowing independent-holder concurrency.
+- [ ] Track read-only execution leases and require later mutations to wait or dependency-chain them before donation.
+- [ ] Use generation-safe cumulative dependency/error state so a failure in an earlier pending mutation cannot be
+      hidden by a later chained call or stale callback.
+- [ ] Serialize conflicting same-holder calls while allowing safe read overlap and independent-holder concurrency.
 - [ ] Support captured references with reference-specific internal donation policy.
 - [ ] Add explicit external reference arguments through a heterogeneous boundary without breaking array-only APIs.
 - [ ] Reject public/capture duplicate identities before state extraction.
@@ -912,8 +971,8 @@ support for deferred aliases, transforms, dynamic shapes, or kernel operations.
 
 ### `ryft-core`
 
-- a focused core references module: generic `ReferenceType<T>`, `ReferenceTypeRefinements<T>`, `Reference<V>`, and
-  `ReferenceId`; choose its exact owner during Phase 0 based on whether any program family beyond Array IR consumes it.
+- `src/programs/references.rs`: generic `ReferenceType<T>`, `ReferenceTypeRefinements<T>`, `Reference<V>`, and
+  `ReferenceId`.
 - `src/arrays/types/ir.rs`: third member, projection, identities, refinements, classifications.
 - `src/arrays/ir.rs`: third value member and `ValueProjection`.
 - `src/arrays/operations/mod.rs`: mixed reference operation variants and capability membership.
@@ -971,10 +1030,10 @@ Use named families rather than an uncontrolled Cartesian product.
 | Nested call | argument/capture read/write; two-level call; caller observes state | argument-plus-capture alias; reference result; inconsistent summary |
 | Partial evaluation | discharged local refs with known/mixed inputs | trace-time external mutation; split unresolved state chain |
 | Batching | discharged local function equals per-example loop | external/mapped/captured ref; replicated write; lane conflict |
-| JVP/VJP | local read/overwrite/swap/accumulate; condition/while/scan; pure oracle | external ref; tangent ref; custom-rule ref; silent zero derivative |
+| JVP/VJP | local read/overwrite/swap/accumulate; condition/bounded while/scan; pure oracle | external ref; tangent ref; custom-rule ref; silent zero derivative; unbounded while transpose |
 | Rematerialization | discharged local result matches baseline | preserved mutation recomputed or duplicated |
 | XLA lowering | local refs; external state; aliases with zero-space index shifts | surviving ref; out-of-range/wrong alias; unsupported dynamic/sharded ref |
-| XLA runtime | consecutive calls; retained snapshot; unique/shared buffer; captures | duplicate holder; launch failure; async failure; stale donated state |
+| XLA runtime | consecutive calls; retained initializer/read snapshots; distinct roots sharing initial storage; unique/shared buffer; captures; read lease before mutation | duplicate holder; pre/post-handoff failure; async failure; chained earlier failure; stale callback/generation; stale donated state |
 | Persistence | new-schema round trip; replacement compatibility | old/corrupt schema; duplicate alias; type/sharding mismatch |
 | Pallas contract | same root/view/access summary under preservation | preserved ref accepted by ordinary XLA; kernel metadata in core type |
 
