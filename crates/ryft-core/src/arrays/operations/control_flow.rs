@@ -378,7 +378,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::{Array, array_type};
+    use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
@@ -389,10 +389,11 @@ mod tests {
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::ForwardModeDifferentiate;
+    use crate::differentiation::StopGradientOperation;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ScanOperation, Select, StopGradientOperation, WhileOperation, ZeroOperation,
+        ScanOperation, Select, WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -1467,17 +1468,17 @@ mod tests {
 
         // General broadcasting reads every input through its physical layout and writes one dense output without
         // converting equal-typed branch elements through an intermediate representation.
-        let condition_type =
-            array_type(DataType::Boolean, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1])));
+        let condition_type = ArrayType::new_static(DataType::Boolean, [2, 1])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![-3, 1])));
         let condition = Array::from_elements(condition_type, &[true, false]).unwrap();
         let true_type =
-            array_type(DataType::U16, &[1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, -2])));
+            ArrayType::new_static(DataType::U16, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, -2])));
         let on_true = Array::from_elements(true_type, &[0x1111u16, 0x2222, 0x3333]).unwrap();
         let false_type =
-            array_type(DataType::U16, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 2])));
+            ArrayType::new_static(DataType::U16, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-4, 2])));
         let on_false = Array::from_elements(false_type, &[0xaaaau16, 0xbbbb]).unwrap();
         let selected = Array::select(&condition, &on_true, &on_false).unwrap();
-        assert_eq!(selected.r#type().as_ref(), &array_type(DataType::U16, &[2, 3]));
+        assert_eq!(selected.r#type().as_ref(), &ArrayType::new_static(DataType::U16, [2, 3]));
         assert_eq!(selected.elements::<u16>(), Ok(vec![0x1111, 0x2222, 0x3333, 0xbbbb, 0xbbbb, 0xbbbb]),);
         assert_eq!(selected.storage_bytes(), [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb],);
     }
@@ -1491,21 +1492,21 @@ mod tests {
         assert_eq!(Array::vector(vec![false, false]).any_true(), Ok(false));
         assert!(Array::vector(vec![1.0]).any_true().is_err());
         // Predicate item `i` masks the contiguous per-item block of operand elements it governs.
-        let on_true = Array::from_f64s(array_type(DataType::F64, &[2, 2]), vec![1.0, 2.0, 3.0, 4.0]);
-        let on_false = Array::from_f64s(array_type(DataType::F64, &[2, 2]), vec![-1.0, -2.0, -3.0, -4.0]);
+        let on_true = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let on_false = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, -3.0, -4.0]);
         assert_eq!(
             predicate.mask_select(&on_true, &on_false).unwrap(),
-            Array::from_f64s(array_type(DataType::F64, &[2, 2]), vec![-1.0, -2.0, 3.0, 4.0]),
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2]), vec![-1.0, -2.0, 3.0, 4.0]),
         );
 
         // Predicate and branch layouts are independent of logical masking. The output preserves the congruent branch
         // layout, including its hole, while selecting exact element bytes in logical order.
         let predicate_type =
-            array_type(DataType::Boolean, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+            ArrayType::new_static(DataType::Boolean, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
         let predicate = Array::from_elements(predicate_type, &[false, true]).unwrap();
         assert_eq!(predicate.any_true(), Ok(true));
         let branch_type =
-            array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
         let on_true = Array::from_elements(branch_type.clone(), &[0x1111u16, 0x2222, 0x3333, 0x4444]).unwrap();
         let on_false = Array::from_elements(branch_type.clone(), &[0xaaaau16, 0xbbbb, 0xcccc, 0xdddd]).unwrap();
         let selected = predicate.mask_select(&on_true, &on_false).unwrap();

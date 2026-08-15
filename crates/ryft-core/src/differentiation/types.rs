@@ -3,11 +3,10 @@ use crate::arrays::{
 };
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
+use crate::differentiation::operations::CoordinateBasisOperation;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::{
-    Broadcast, BroadcastOperation, CoordinateBasisOperation, Reshape, Slice, Transpose, TransposeOperation,
-};
+use crate::operations::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, TransposeOperation};
 use crate::parameters::ParameterPath;
 use crate::programs::{ProgramError, RegionRef, Type, TypeError, Typed, Value};
 use crate::tracing::TracingContext;

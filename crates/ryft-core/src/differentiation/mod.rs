@@ -1,10 +1,10 @@
 //! Contains machinery for forward and reverse mode automatic _differentiation_.
 //!
-//! Differentiation is expressed as [`Context`](crate::Context) composition and [`Program`](crate::Program)
-//! transformation rather than as a backend-specific facility. Values flowing through a [`DifferentiationContext`]
-//! carry a primal and a tangent, operation-owned Jacobian-Vector Product (JVP) rules propagate those duals, partial
-//! evaluation splits primal work from reusable linear work, and transposition turns the resulting linear program into
-//! a pullback for reverse mode differentiation.
+//! Differentiation is expressed as [`Context`] composition and [`Program`](crate::Program) transformation rather than
+//! as a backend-specific facility. Values flowing through a [`DifferentiationContext`] carry a primal and a tangent,
+//! operation-owned Jacobian-Vector Product (JVP) rules propagate those duals, partial evaluation splits primal work
+//! from reusable linear work, and transposition turns the resulting linear program into a pullback for reverse mode
+//! differentiation.
 //!
 //! # Entry Points
 //!
@@ -144,17 +144,16 @@ use crate::programs::{ProgramError, TypeError, Value};
 use crate::tracing::TracingContext;
 
 pub mod batching;
-pub mod custom;
 pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
-pub mod linear;
+pub mod operations;
 pub mod reverse;
 pub mod types;
+pub mod zeros;
 
 pub use batching::CotangentBatchingPolicy;
-pub use custom::{CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation, custom_jvp, custom_vjp};
 pub use elementwise::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, ElementwiseDerivativeAlignment,
     UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,
@@ -166,12 +165,17 @@ pub use forward::{
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
-pub use linear::{LinearCallOperation, ResidualZeroProvider};
+pub use operations::{
+    COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOperation, CustomJvp, CustomJvpOperation, CustomVjp,
+    CustomVjpOperation, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
+    custom_jvp, custom_vjp, stop_gradient,
+};
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, transpose_mixed_operation,
     transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
+pub use zeros::ResidualZeroProvider;
 
 /// Represents differentiation-related errors.
 ///

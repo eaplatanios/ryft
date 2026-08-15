@@ -541,7 +541,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::{Array, array_type};
+    use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::encoding::{f8e8m0fnu, i4, u4};
     use crate::arrays::ir::ArrayIrValue;
@@ -557,15 +557,14 @@ mod tests {
         StagedFunction, try_jit,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::differentiation::StopGradientOperation;
     use crate::differentiation::{
         DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
         TransposableOperation, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{
-        DynamicBroadcastOperation, Mul, Reduce, ReductionKind, StopGradientOperation, ZeroOperation,
-    };
+    use crate::operations::{DynamicBroadcastOperation, Mul, Reduce, ReductionKind, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
@@ -1424,7 +1423,7 @@ mod tests {
     #[test]
     fn test_array_constants() {
         let context = EagerContext::<Array>::new();
-        let r#type = array_type(DataType::F32, &[2, 2]);
+        let r#type = ArrayType::new_static(DataType::F32, [2, 2]);
         assert_eq!(
             context.zero(&r#type),
             Array::from_elements(r#type.clone(), &[0.0f32; 4]).map_err(|_| unreachable!())
@@ -1435,16 +1434,20 @@ mod tests {
         );
         // Iota materializes coordinates along the requested dimension in the declared element data type.
         assert_eq!(
-            context.iota(&array_type(DataType::I32, &[2, 3]), 1).unwrap().elements::<i32>(),
+            context.iota(&ArrayType::new_static(DataType::I32, [2, 3]), 1).unwrap().elements::<i32>(),
             Ok(vec![0, 1, 2, 0, 1, 2]),
         );
-        assert_eq!(context.iota(&array_type(DataType::F64, &[3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
+        assert_eq!(context.iota(&ArrayType::new_static(DataType::F64, [3]), 0).unwrap().to_f64s(), vec![0.0, 1.0, 2.0]);
         assert_eq!(
-            context.iota(&array_type(DataType::C64, &[3]), 0).unwrap().elements::<ComplexNumber<f32>>(),
+            context
+                .iota(&ArrayType::new_static(DataType::C64, [3]), 0)
+                .unwrap()
+                .elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(0.0, 0.0), ComplexNumber::new(1.0, 0.0), ComplexNumber::new(2.0, 0.0),]),
         );
         // Constructors dispatch over element codecs that have no scalar representation and honor physical layout.
-        let strided_type = array_type(DataType::I4, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let strided_type =
+            ArrayType::new_static(DataType::I4, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
         let zero = context.zero(&strided_type).unwrap();
         assert_eq!(zero.elements::<i4>(), Ok(vec![i4::new(0).unwrap(); 3]));
         assert_eq!(zero.storage_bytes(), [0, 0, 0]);
@@ -1452,7 +1455,7 @@ mod tests {
         assert_eq!(one.elements::<i4>(), Ok(vec![i4::new(1).unwrap(); 3]));
         assert_eq!(one.storage_bytes(), [1, 1, 1]);
         assert_eq!(
-            context.iota(&array_type(DataType::U4, &[2, 3]), 1).unwrap().elements::<u4>(),
+            context.iota(&ArrayType::new_static(DataType::U4, [2, 3]), 1).unwrap().elements::<u4>(),
             Ok(vec![
                 u4::new(0).unwrap(),
                 u4::new(1).unwrap(),
@@ -1494,11 +1497,11 @@ mod tests {
         let array = Array::vector(vec![1.5f32, -2.5]);
         assert_eq!(array.zero_like().elements::<f32>(), Ok(vec![0.0, 0.0]));
         assert_eq!(array.one_like().elements::<f32>(), Ok(vec![1.0, 1.0]));
-        assert_eq!(array.zero_like().r#type().into_owned(), array_type(DataType::F32, &[2]));
+        assert_eq!(array.zero_like().r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
 
         // `f8e8m0fnu` cannot represent zero, so zero-like retains each value while one-like produces exact ones.
         let array = Array::from_elements(
-            array_type(DataType::F8E8M0FNU, &[2]),
+            ArrayType::new_static(DataType::F8E8M0FNU, [2]),
             &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
         )
         .unwrap();

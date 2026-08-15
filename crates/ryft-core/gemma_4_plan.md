@@ -170,7 +170,7 @@ Landed in `operations/random.rs`, in exactly the stateless-key shape the plan as
 | `lax.scan` | layer stacking, remat-friendly loops | ✅ | `ScanOperation` with `carry_count`, `length`, `with_reverse`, `with_unroll`, `with_captures` |
 | `lax.fori_loop` | optimizer step over parameter tree | ⚠️ | express via `scan`/`while`; a trivial helper if wanted |
 | `jax.checkpoint` (remat) | activation checkpointing per block | ✅ | `rematerialize(body)` + `RematerializeOperation` with the full JAX policy family: `EverythingSaveable`, `NothingSaveable`, `DotsSaveable`, `DotsWithNoBatchDimsSaveable`, `SaveOnlyTheseNames`, `SaveAnyNamesButThese`, `SaveAnythingExceptTheseNames`, `SaveFromBothPolicies`, and `OffloadDotsWithNoBatchDims` with `ResidualStorage`/`MemoryTransferStorage` **offload support** — beyond what the plan asked for |
-| `jax.custom_jvp` / `custom_vjp` | custom derivative rules (fused attention uses this) | ✅ | `custom_jvp(primal, jvp)` / `custom_vjp` in `differentiation::custom`, lowered as first-class program operations |
+| `jax.custom_jvp` / `custom_vjp` | custom derivative rules (fused attention uses this) | ✅ | `custom_jvp(primal, jvp)` / `custom_vjp` in `differentiation::operations`, lowered as first-class program operations |
 
 ### 1.8 Parallelism & sharding
 

@@ -4,7 +4,7 @@
 //! operation, so a concrete array simply carries itself through.
 
 use crate::arrays::arrays::Array;
-use crate::operations::StopGradient;
+use crate::differentiation::StopGradient;
 
 // TODO(eaplatanios): Review this.
 

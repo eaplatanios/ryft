@@ -55,17 +55,18 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CustomJvp, CustomJvpOperation,
-    CustomVjp, CustomVjpOperation, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation,
-    DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationBuilderContext,
-    DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
-    DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock,
-    HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization, LinearizationTracer,
-    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
-    ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, COORDINATE_BASIS_OPERATION_NAME,
+    CoordinateBasisOperation, CotangentBatchingPolicy, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
+    DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate,
+    DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderExecutionContext,
+    DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment,
+    ForwardModeDifferentiate, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock,
+    LinearCallOperation, Linearization, LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward,
+    RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, STOP_GRADIENT_OPERATION_NAME, StopGradient,
+    StopGradientOperation, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
     WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
-    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation,
+    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation, stop_gradient,
     transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
@@ -84,10 +85,6 @@ pub use operations::control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
     SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
     transpose_primal_condition, transpose_primal_scan,
-};
-pub use operations::differentiation::{
-    COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient,
-    StopGradientOperation, stop_gradient,
 };
 pub use operations::dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use operations::logical::{

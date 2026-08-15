@@ -157,8 +157,8 @@ impl std::ops::BitXor for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
     use crate::arrays::encoding::{i2, u4};
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;
 
@@ -196,7 +196,7 @@ mod tests {
         );
         // Physical layouts are traversed through addressing, so holes stay zero rather than being complemented.
         let strided_type =
-            array_type(DataType::Boolean, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+            ArrayType::new_static(DataType::Boolean, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
         let strided = Array::new(strided_type.clone(), vec![1, 0, 0]).unwrap().not().unwrap();
         assert_eq!(strided.r#type().as_ref(), &strided_type);
         assert_eq!(strided.storage_bytes(), [0, 0, 1]);

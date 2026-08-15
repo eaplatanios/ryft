@@ -1060,20 +1060,16 @@ mod tests {
 
     use super::*;
 
-    fn array_type(dimensions: &[usize], data_type: DataType) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
-    }
-
     #[test]
     fn test_reduce_abstract_drops_reduced_axes_and_keeps_remaining_order() {
-        let input = array_type(&[2, 3, 4], DataType::F64);
+        let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
         assert_eq!(
             reduce_abstract(&input, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(array_type(&[2, 4], DataType::F64))
+            Ok(ArrayType::new_static(DataType::F64, [2, 4]))
         );
         assert_eq!(
             reduce_abstract(&input, &[0, 2], ReductionKind::Max, "reduce_max"),
-            Ok(array_type(&[3], DataType::F64))
+            Ok(ArrayType::new_static(DataType::F64, [3]))
         );
     }
 
@@ -1088,7 +1084,7 @@ mod tests {
             MeshAxis::new("r", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let input = array_type(&[2, 3], DataType::F64)
+        let input = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap()
@@ -1098,7 +1094,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             reduce_abstract(&input, &[0], ReductionKind::Sum, "reduce_sum"),
-            Ok(array_type(&[3], DataType::F64)
+            Ok(ArrayType::new_static(DataType::F64, [3])
                 .with_sharding(
                     Sharding::new(mesh, vec![ShardingDimension::replicated()])
                         .unwrap()
@@ -1135,54 +1131,54 @@ mod tests {
 
     #[test]
     fn test_reduce_abstract_rejects_out_of_bounds_and_duplicate_axes() {
-        let input = array_type(&[2, 3], DataType::F64);
+        let input = ArrayType::new_static(DataType::F64, [2, 3]);
         assert!(reduce_abstract(&input, &[2], ReductionKind::Sum, "reduce_sum").is_err());
         assert!(reduce_abstract(&input, &[0, 0], ReductionKind::Sum, "reduce_sum").is_err());
     }
 
     #[test]
     fn test_reduce_abstract_enforces_reduction_data_types() {
-        let numeric = array_type(&[2, 3], DataType::F64);
+        let numeric = ArrayType::new_static(DataType::F64, [2, 3]);
         assert!(reduce_abstract(&numeric, &[1], ReductionKind::Any, "reduce_any").is_err());
-        let boolean = array_type(&[2, 3], DataType::Boolean);
+        let boolean = ArrayType::new_static(DataType::Boolean, [2, 3]);
         assert!(reduce_abstract(&boolean, &[1], ReductionKind::Sum, "reduce_sum").is_err());
         assert_eq!(
             reduce_abstract(&boolean, &[1], ReductionKind::Any, "reduce_any"),
-            Ok(array_type(&[2], DataType::Boolean))
+            Ok(ArrayType::new_static(DataType::Boolean, [2]))
         );
         assert_eq!(
             reduce_abstract(&boolean, &[1], ReductionKind::Max, "reduce_max"),
-            Ok(array_type(&[2], DataType::Boolean)),
+            Ok(ArrayType::new_static(DataType::Boolean, [2])),
         );
-        let token = array_type(&[2, 3], DataType::Token);
+        let token = ArrayType::new_static(DataType::Token, [2, 3]);
         assert_eq!(
             reduce_abstract(&token, &[1], ReductionKind::Sum, "reduce_sum"),
             Err(TypeError::invalid("`reduce_sum` kind sum requires numeric inputs but got token".to_string())),
         );
         // The structural-zero element type represents an already-known zero tangent and remains closed under numeric
         // reductions even though it has no numeric payload bytes.
-        let zero = array_type(&[2, 3], DataType::Zero);
+        let zero = ArrayType::new_static(DataType::Zero, [2, 3]);
         assert_eq!(
             reduce_abstract(&zero, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(array_type(&[2], DataType::Zero)),
+            Ok(ArrayType::new_static(DataType::Zero, [2])),
         );
     }
 
     #[test]
     fn test_reduce_abstract_accepts_lexicographic_complex_extrema() {
         // Complex minimum and maximum use JAX's lexicographic `(real, imaginary)` ordering.
-        let complex = array_type(&[2, 3], DataType::C64);
+        let complex = ArrayType::new_static(DataType::C64, [2, 3]);
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Max, "reduce_max"),
-            Ok(array_type(&[2], DataType::C64)),
+            Ok(ArrayType::new_static(DataType::C64, [2])),
         );
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min"),
-            Ok(array_type(&[2], DataType::C64)),
+            Ok(ArrayType::new_static(DataType::C64, [2])),
         );
         assert_eq!(
             reduce_abstract(&complex, &[1], ReductionKind::Sum, "reduce_sum"),
-            Ok(array_type(&[2], DataType::C64)),
+            Ok(ArrayType::new_static(DataType::C64, [2])),
         );
     }
 
@@ -1191,10 +1187,10 @@ mod tests {
         // The operation carries no input shape; the output type is derived from the actual staged
         // input type, and out-of-range axes are rejected against it.
         let operation = ReduceOperation::new(vec![1], ReductionKind::Sum);
-        let input = array_type(&[3, 2], DataType::F64);
-        assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![array_type(&[3], DataType::F64)]));
+        let input = ArrayType::new_static(DataType::F64, [3, 2]);
+        assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![ArrayType::new_static(DataType::F64, [3])]));
         assert_eq!(
-            operation.infer_output_types(&[array_type(&[3], DataType::F64)], &[]),
+            operation.infer_output_types(&[ArrayType::new_static(DataType::F64, [3])], &[]),
             Err(TypeError::invalid("`reduce_sum` axis 1 is out of bounds for rank 1".to_string())),
         );
     }
@@ -1210,7 +1206,7 @@ mod tests {
         ])
         .unwrap();
         // Input: dimension 0 sharded over `x`, dimension 1 replicated; reducing over the `x`-sharded dimension 0.
-        let input = array_type(&[2, 3], DataType::F64)
+        let input = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap(),
@@ -1225,7 +1221,7 @@ mod tests {
         assert_eq!(operation.output_sharding(), Some(&unreduced));
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&input), &[]),
-            Ok(vec![array_type(&[3], DataType::F64).with_sharding(unreduced.clone()).unwrap()]),
+            Ok(vec![ArrayType::new_static(DataType::F64, [3]).with_sharding(unreduced.clone()).unwrap()]),
         );
         // The output sharding renders only when present.
         assert!(operation.to_string().contains(&format!("output_sharding={unreduced}")));
@@ -1266,7 +1262,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = array_type(&[2, 3], DataType::F64)
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3])
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true })
             .with_sharding(
@@ -1282,7 +1278,7 @@ mod tests {
         // preserves memory placement, and clears the rank-specific layout.
         assert_eq!(
             output.r#type().as_ref(),
-            &array_type(&[2], DataType::F64)
+            &ArrayType::new_static(DataType::F64, [2])
                 .with_memory(Memory::Host { pinned: true })
                 .with_sharding(output_sharding)
                 .unwrap(),
@@ -1299,7 +1295,7 @@ mod tests {
         use crate::tracing::TracingContext;
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let input_type = array_type(&[2, 3], DataType::F64)
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3])
             .with_sharding(
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
                     .unwrap(),
@@ -1331,7 +1327,7 @@ mod tests {
         // primal reduction and the same reduction applied to the tangent. Otherwise differentiation silently turns
         // a requested per-shard partial sum into the default reduced result.
         let linearization = program.linearize().unwrap();
-        let expected_output_type = array_type(&[3], DataType::F64).with_sharding(unreduced.clone()).unwrap();
+        let expected_output_type = ArrayType::new_static(DataType::F64, [3]).with_sharding(unreduced.clone()).unwrap();
         assert_eq!(linearization.primal().output_types()[0], expected_output_type);
         assert_eq!(linearization.tangent().output_types()[0], expected_output_type);
         assert!(linearization.primal().to_string().contains(&format!("output_sharding={unreduced}")));
@@ -1363,7 +1359,7 @@ mod tests {
                 inputs = [(@mapped(
                     axis = 0
                 ), Array::from_f64s(
-                    array_type(&[3, 2, 3], DataType::F64),
+                    ArrayType::new_static(DataType::F64, [3, 2, 3]),
                     (0..18).map(|index| index as f64).collect(),
                 ))],
                 outputs = [(@mapped(

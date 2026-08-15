@@ -4,9 +4,9 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::Context;
 use crate::differentiation::forward::{DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer};
-use crate::differentiation::linear::ResidualZeroProvider;
 use crate::differentiation::reverse::{ReverseModeDifferentiate, TransposableOperation};
 use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType};
+use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
 use crate::operations::AddOperation;

@@ -1,8 +1,7 @@
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::{ArrayIrType, DimensionType, DimensionValue};
-use crate::differentiation::DifferentiableType;
+use crate::differentiation::{DifferentiableType, StopGradient};
 use crate::operations::constants::iota::IotaOperation;
-use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::DimensionSize;
 use crate::operations::manipulation::{DynamicBroadcast, DynamicReshape};
 use crate::programs::ValueProjection;

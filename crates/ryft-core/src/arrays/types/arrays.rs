@@ -41,7 +41,7 @@ static EMPTY_BATCH_AXES: BTreeSet<String> = BTreeSet::new();
 ///
 /// // 32-bit floating-point number vector with 42 elements residing in pinned host memory.
 /// assert_eq!(
-///   ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(42)]))
+///   ArrayType::new_static(DataType::F32, [42])
 ///       .with_memory(Memory::Host { pinned: true })
 ///       .to_string(),
 ///   "f32[42]@Host[Pinned]",
@@ -49,7 +49,7 @@ static EMPTY_BATCH_AXES: BTreeSet<String> = BTreeSet::new();
 ///
 /// // 64-bit unsigned integer vector with 42 elements.
 /// assert_eq!(
-///   ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(42)])).to_string(),
+///   ArrayType::new_static(DataType::U64, [42]).to_string(),
 ///   "u64[42]",
 /// );
 ///
@@ -93,6 +93,14 @@ impl ArrayType {
     #[inline]
     pub fn new(data_type: DataType, shape: Shape) -> Self {
         Self { data_type, shape, layout: None, sharding: None, memory: Memory::Device }
+    }
+
+    /// Constructs a new [`ArrayType`] whose dimensions are all statically known, with no [`Layout`] or [`Sharding`]
+    /// information, and residing in the default [`Memory::Device`] memory space. Use [`Self::with_layout`],
+    /// [`Self::with_sharding`], and [`Self::with_memory`] to attach optional metadata.
+    #[inline]
+    pub fn new_static<Dimensions: Into<Vec<usize>>>(data_type: DataType, dimensions: Dimensions) -> Self {
+        Self::new(data_type, StaticShape::new(dimensions.into()).into())
     }
 
     /// Returns a copy of this [`ArrayType`] with its [`DataType`] replaced by the provided one, keeping its [`Shape`],
@@ -749,6 +757,13 @@ mod tests {
     use crate::arrays::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
+
+    #[test]
+    fn test_array_type_new_static() {
+        let dimensions = &[2, 3][..];
+        assert_eq!(ArrayType::new_static(Boolean, []), ArrayType::new(Boolean, Shape::scalar()));
+        assert_eq!(ArrayType::new_static(F32, dimensions), ArrayType::new(F32, StaticShape::new(vec![2, 3]).into()));
+    }
 
     #[test]
     fn test_array_type_static_shape() {

@@ -149,7 +149,7 @@ impl RngBitGenerator for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;
 
@@ -162,7 +162,8 @@ mod tests {
         let state_type =
             RandomAlgorithm::ThreeFry.state_type().with_layout(Layout::Strided(StridedLayout::new(vec![-8])));
         let state = Array::from_elements(state_type.clone(), &[42u64, 7]).unwrap();
-        let output_type = array_type(DataType::U16, &[5]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let output_type =
+            ArrayType::new_static(DataType::U16, [5]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let (advanced_state, bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
         let (expected_words, expected_counter) = threefry_u32_words(42, 7, 5);
         let expected_words = expected_words.into_iter().map(|word| word as u16).collect::<Vec<_>>();
@@ -177,7 +178,7 @@ mod tests {
         assert_eq!(bits.storage_bytes(), expected_storage);
 
         // Eight-bit outputs retain the low byte of each generated `u32` word.
-        let output_type = array_type(DataType::U8, &[5]);
+        let output_type = ArrayType::new_static(DataType::U8, [5]);
         let (_, bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
         let (expected_words, _) = threefry_u32_words(42, 7, 5);
         assert_eq!(bits.elements::<u8>(), Ok(expected_words.into_iter().map(|word| word as u8).collect()));

@@ -182,7 +182,7 @@ impl ArgMin for Array {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
 
     use super::*;
@@ -193,7 +193,7 @@ mod tests {
         // representation) ride an f32 key without being decoded.
         let key = Array::vector(vec![3.0f32, 1.0, 2.0]);
         let passenger = Array::from_elements(
-            array_type(DataType::I4, &[3]),
+            ArrayType::new_static(DataType::I4, [3]),
             &[i4::new(-8).unwrap(), i4::new(0).unwrap(), i4::new(7).unwrap()],
         )
         .unwrap();
@@ -203,7 +203,8 @@ mod tests {
 
         // Sub-byte keys decode directly through arbitrary physical layouts and therefore sort like every other
         // ordered element type.
-        let key_type = array_type(DataType::I4, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let key_type =
+            ArrayType::new_static(DataType::I4, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
         let key =
             Array::from_elements(key_type, &[i4::new(3).unwrap(), i4::new(-2).unwrap(), i4::new(1).unwrap()]).unwrap();
         let output = Array::sort_with_key_count(&[key], 0, SortDirection::Ascending, 1).unwrap().remove(0);

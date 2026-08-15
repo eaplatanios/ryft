@@ -4273,7 +4273,7 @@ mod tests {
             .collect();
 
         let replicated = |data_type: DataType, dimensions: &[usize]| {
-            ArrayType::new(data_type, static_shape(dimensions))
+            ArrayType::new_static(data_type, dimensions)
                 .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
                 .unwrap()
         };
@@ -4314,19 +4314,24 @@ mod tests {
         let device_cache_keys = read_f32_array(&client, &outputs[1]);
         let device_cache_values = read_f32_array(&client, &outputs[2]);
 
-        let unsharded = |data_type: DataType, dimensions: &[usize]| ArrayType::new(data_type, static_shape(dimensions));
         let mut reference_state = vec![
-            CpuArray::from_elements(unsharded(DataType::I32, &[]), &[0_i32]).unwrap(),
-            CpuArray::from_elements(unsharded(DataType::I32, &[]), &[3_i32]).unwrap(),
-            CpuArray::from_elements(unsharded(DataType::F32, &[steps, dimension]), &vec![0.0_f32; steps * dimension])
-                .unwrap(),
-            CpuArray::from_elements(unsharded(DataType::F32, &[steps, dimension]), &vec![0.0_f32; steps * dimension])
-                .unwrap(),
-            CpuArray::from_elements(unsharded(DataType::I32, &[steps]), &vec![0_i32; steps]).unwrap(),
-            CpuArray::from_elements(unsharded(DataType::U64, &[2]), &[42_u64, 0]).unwrap(),
+            CpuArray::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap(),
+            CpuArray::from_elements(ArrayType::new_static(DataType::I32, []), &[3_i32]).unwrap(),
+            CpuArray::from_elements(
+                ArrayType::new_static(DataType::F32, [steps, dimension]),
+                &vec![0.0_f32; steps * dimension],
+            )
+            .unwrap(),
+            CpuArray::from_elements(
+                ArrayType::new_static(DataType::F32, [steps, dimension]),
+                &vec![0.0_f32; steps * dimension],
+            )
+            .unwrap(),
+            CpuArray::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0_i32; steps]).unwrap(),
+            CpuArray::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42_u64, 0]).unwrap(),
         ];
         reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
-            CpuArray::from_elements(unsharded(DataType::F32, dimensions), values).unwrap()
+            CpuArray::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
         }));
         let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
         let reference_tokens = reference_state[4].elements::<i32>().unwrap();

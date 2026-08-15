@@ -7,12 +7,12 @@ use ryft_macros::Parameter;
 
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::DifferentiationError;
-use crate::differentiation::linear::{
+use crate::differentiation::reverse::TransposableOperation;
+use crate::differentiation::types::DifferentiableType;
+use crate::differentiation::zeros::{
     ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole,
     capture_and_validate_zero_residual_values,
 };
-use crate::differentiation::reverse::TransposableOperation;
-use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -2268,9 +2268,10 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
+    use crate::differentiation::operations::{StopGradient, StopGradientOperation};
     use crate::operations::{
         CollectiveKind, CollectiveOperation, ConditionOperation, CosOperation, Dot, DotDimensionNumbers, MulOperation,
-        Sin, SinOperation, StopGradient, StopGradientOperation,
+        Sin, SinOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{Concretizable, Operation, ProgramBuilder, RegionId};

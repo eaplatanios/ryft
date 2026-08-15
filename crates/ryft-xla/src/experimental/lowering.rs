@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ryft_core::differentiation::custom::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
+use ryft_core::differentiation::operations::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
     AttentionInputs, DotProductAttentionBackwardOperation, DotProductAttentionOperation,

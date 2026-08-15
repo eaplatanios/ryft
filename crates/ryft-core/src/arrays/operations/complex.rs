@@ -108,7 +108,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
+    use crate::arrays::types::arrays::ArrayType;
     use crate::operations::Neg;
     use crate::operations::complex::Complex;
     use crate::programs::Typed;
@@ -120,7 +120,7 @@ mod tests {
         let real = Array::vector(vec![1.0, 2.0]);
         let imaginary = Array::vector(vec![3.0, -4.0]);
         let complex = real.complex(&imaginary).unwrap();
-        assert_eq!(complex.r#type().into_owned(), array_type(DataType::C128, &[2]));
+        assert_eq!(complex.r#type().into_owned(), ArrayType::new_static(DataType::C128, [2]));
         assert_eq!(
             complex.elements::<ComplexNumber<f64>>(),
             Ok(vec![ComplexNumber::new(1.0, 3.0), ComplexNumber::new(2.0, -4.0)]),

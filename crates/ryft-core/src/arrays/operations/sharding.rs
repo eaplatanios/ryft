@@ -35,9 +35,9 @@ impl crate::operations::sharding::ConstrainSharding for Array {}
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::{Sharding, ShardingDimension};
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::memories::Memory;
     use crate::operations::{ConstrainSharding, Reshard, TransferToMemory};
@@ -65,8 +65,10 @@ mod tests {
         // Resharding records the requested distribution metadata on the type, carrying the input's varying manual
         // axes over to the target sharding exactly like the `ReshardOperation` type-inference rule.
         let input_sharding = Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap();
-        let input =
-            Array::from_f64s(array_type(DataType::F64, &[2]).with_sharding(input_sharding).unwrap(), vec![1.0, 2.0]);
+        let input = Array::from_f64s(
+            ArrayType::new_static(DataType::F64, [2]).with_sharding(input_sharding).unwrap(),
+            vec![1.0, 2.0],
+        );
         let target = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let resharded = input.reshard(&target);
         assert_eq!(resharded.r#type().sharding(), Some(&target.clone().with_varying_manual_axes(["m"]).unwrap()),);

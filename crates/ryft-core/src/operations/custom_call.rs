@@ -15,7 +15,7 @@ use crate::batching::{
     batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::custom::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
+use crate::differentiation::operations::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::constant::ConstantOperation;

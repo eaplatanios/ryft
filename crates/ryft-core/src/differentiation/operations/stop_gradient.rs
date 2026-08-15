@@ -1,6 +1,8 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+// TODO(eaplatanios): Review this module.
+
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};

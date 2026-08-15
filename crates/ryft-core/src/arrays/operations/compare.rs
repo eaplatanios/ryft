@@ -124,8 +124,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
     use crate::arrays::encoding::{f8e5m2, i2};
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::programs::Typed;
 
@@ -136,7 +136,7 @@ mod tests {
         let left = Array::vector(vec![1.0, 2.0, 3.0]);
         let right = Array::vector(vec![2.0, 2.0, 2.0]);
         let less_than = left.compare(&right, ComparisonDirection::LessThan).unwrap();
-        assert_eq!(less_than.r#type().into_owned(), array_type(DataType::Boolean, &[3]));
+        assert_eq!(less_than.r#type().into_owned(), ArrayType::new_static(DataType::Boolean, [3]));
         assert_eq!(less_than, Array::vector(vec![true, false, false]));
         // Operands broadcast and promote before comparing.
         let mixed = Array::vector(vec![1.0f32, 3.0]).compare(&Array::scalar(2.0f64), ComparisonDirection::GreaterThan);
@@ -152,7 +152,8 @@ mod tests {
 
         // Addressed input and output layouts remain physical contracts; comparison writes only the Boolean element
         // ranges and leaves output holes zero.
-        let strided_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let strided_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let left = Array::from_elements(strided_type.clone(), &[1u16, 3]).unwrap();
         let right = Array::from_elements(strided_type, &[2u16, 2]).unwrap();
         let compared = left.compare(&right, ComparisonDirection::LessThan).unwrap();
@@ -172,12 +173,12 @@ mod tests {
 
         // Empty payload-free comparisons are vacuous because they evaluate no unsupported element comparison; a
         // nonempty token array retains the established scalar-backend error.
-        let empty_token = Array::from_logical_bytes(array_type(DataType::Token, &[0]), &[]).unwrap();
+        let empty_token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [0]), &[]).unwrap();
         assert_eq!(
             empty_token.compare(&empty_token, ComparisonDirection::Equal).unwrap().elements::<bool>(),
             Ok(vec![]),
         );
-        let token = Array::from_logical_bytes(array_type(DataType::Token, &[1]), &[]).unwrap();
+        let token = Array::from_logical_bytes(ArrayType::new_static(DataType::Token, [1]), &[]).unwrap();
         assert!(matches!(
             token.compare(&token, ComparisonDirection::Equal),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == "cannot compare token scalars",

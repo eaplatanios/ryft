@@ -735,7 +735,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::{Array, array_type};
+    use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::encoding::i4;
@@ -2936,17 +2936,18 @@ in (%4)
     #[test]
     fn test_array_broadcast() {
         let vector = Array::vector(vec![1.0, 2.0]);
-        let output_type = array_type(DataType::F64, &[3, 2]);
+        let output_type = ArrayType::new_static(DataType::F64, [3, 2]);
         let broadcast = Broadcast::broadcast(&vector, output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().into_owned(), output_type);
         assert_eq!(broadcast.to_f64s(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
 
         // Broadcasting reads a reversed input layout and writes the output's requested physical layout, retaining
         // zero in its holes.
-        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let input = Array::from_elements(input_type, &[0x1122u16, 0x3344]).unwrap();
         let output_type =
-            array_type(DataType::U16, &[2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
+            ArrayType::new_static(DataType::U16, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![6, 2])));
         let broadcast = input.broadcast(output_type.clone(), &[1]).unwrap();
         assert_eq!(broadcast.r#type().as_ref(), &output_type);
         assert_eq!(broadcast.elements::<u16>(), Ok(vec![0x1122, 0x3344, 0x1122, 0x3344]));
@@ -2976,24 +2977,24 @@ in (%4)
     fn test_array_transpose() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let transposed = matrix.transpose([1, 0]).unwrap();
-        assert_eq!(transposed.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
+        assert_eq!(transposed.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(transposed.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert!(matrix.transpose([0, 0]).is_err());
 
         // Transposition traverses the input's physical layout while producing the canonical layout-free output type.
         let input_type =
-            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
         let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
         let transposed = matrix.transpose([1, 0]).unwrap();
-        assert_eq!(transposed.r#type().into_owned(), array_type(DataType::U16, &[3, 2]));
+        assert_eq!(transposed.r#type().into_owned(), ArrayType::new_static(DataType::U16, [3, 2]));
         assert_eq!(transposed.elements::<u16>(), Ok(vec![1, 4, 2, 5, 3, 6]));
         assert_eq!(transposed.storage_bytes(), [1, 0, 4, 0, 2, 0, 5, 0, 3, 0, 6, 0]);
 
         // Empty arrays transpose without calculating strides that may overflow for otherwise irrelevant dimensions.
-        let empty = Array::new(array_type(DataType::F64, &[0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
+        let empty = Array::new(ArrayType::new_static(DataType::F64, [0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
         assert_eq!(
             empty.transpose([1, 2, 0]).unwrap(),
-            Array::new(array_type(DataType::F64, &[usize::MAX, usize::MAX, 0]), Vec::new()).unwrap(),
+            Array::new(ArrayType::new_static(DataType::F64, [usize::MAX, usize::MAX, 0]), Vec::new()).unwrap(),
         );
     }
 
@@ -3001,13 +3002,13 @@ in (%4)
     fn test_array_reshape() {
         let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
-        assert_eq!(reshaped.r#type().into_owned(), array_type(DataType::F64, &[3, 2]));
+        assert_eq!(reshaped.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
         assert_eq!(reshaped.to_f64s(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(matrix.reshape(Shape::new(vec![Dimension::Static(4)])).is_err());
 
         // Reshaping preserves logical order independently of the input's physical placement.
         let input_type =
-            array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
         let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
         let reshaped = matrix.reshape(Shape::new(vec![Dimension::Static(3), Dimension::Static(2)])).unwrap();
         assert_eq!(reshaped.elements::<u16>(), Ok(vec![1, 2, 3, 4, 5, 6]));
@@ -3035,10 +3036,12 @@ in (%4)
 
         // Static slicing and updating traverse arbitrary source and update layouts while preserving the destination
         // layout for updates.
-        let input_type = array_type(DataType::U16, &[5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input_type =
+            ArrayType::new_static(DataType::U16, [5]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let vector = Array::from_elements(input_type.clone(), &[1u16, 2, 3, 4, 5]).unwrap();
         assert_eq!(vector.slice(&[1], &[5], &[2]).unwrap().elements::<u16>(), Ok(vec![2, 4]));
-        let update_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let update_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let update = Array::from_elements(update_type, &[10u16, 20]).unwrap();
         let updated = vector.update_slice(&update, &[1]).unwrap();
         assert_eq!(updated.r#type().as_ref(), &input_type);
@@ -3053,10 +3056,11 @@ in (%4)
         assert_eq!(padded, Array::vector(vec![0.5, 1.0, 0.5, 2.0, 0.5, 0.5]));
 
         // Padding copies both the reversed input layout and the rank-zero padding element by their exact bytes.
-        let input_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let vector = Array::from_elements(input_type, &[1u16, 2]).unwrap();
         let padded = vector.pad(&Array::scalar(9u16), &[1], &[1], &[1]).unwrap();
-        assert_eq!(padded.r#type().into_owned(), array_type(DataType::U16, &[5]));
+        assert_eq!(padded.r#type().into_owned(), ArrayType::new_static(DataType::U16, [5]));
         assert_eq!(padded.elements::<u16>(), Ok(vec![9, 1, 9, 2, 9]));
         assert_eq!(padded.storage_bytes(), [9, 0, 1, 0, 9, 0, 2, 0, 9, 0]);
     }
@@ -3072,32 +3076,36 @@ in (%4)
         assert_eq!(concatenated, Array::vector(vec![1.0, 2.0, 3.0, 4.0]));
 
         // A rank-3 middle-axis concatenation exercises the row-major block odometer.
-        let first = Array::from_f64s(array_type(DataType::F64, &[2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
-        let second =
-            Array::from_f64s(array_type(DataType::F64, &[2, 2, 2]), vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let first = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 2]), vec![1.0, 2.0, 3.0, 4.0]);
+        let second = Array::from_f64s(
+            ArrayType::new_static(DataType::F64, [2, 2, 2]),
+            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        );
         let concatenated = Array::concatenate([&first, &second], 1).unwrap();
-        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::F64, &[2, 3, 2]));
+        assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3, 2]));
         assert_eq!(concatenated.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0],);
 
         // Concatenation traverses each input's physical layout and emits the canonical layout-free result.
-        let first_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
-        let second_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let first_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let second_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let first = Array::from_elements(first_type, &[1u16, 2]).unwrap();
         let second = Array::from_elements(second_type, &[3u16, 4]).unwrap();
         let concatenated = Array::concatenate([&first, &second], 0).unwrap();
-        assert_eq!(concatenated.r#type().into_owned(), array_type(DataType::U16, &[4]));
+        assert_eq!(concatenated.r#type().into_owned(), ArrayType::new_static(DataType::U16, [4]));
         assert_eq!(concatenated.elements::<u16>(), Ok(vec![1, 2, 3, 4]));
         assert_eq!(concatenated.storage_bytes(), [1, 0, 2, 0, 3, 0, 4, 0]);
 
         // Concatenation does not require an artificial additive zero, including when the output itself is empty.
-        let element_type = array_type(DataType::F8E8M0FNU, &[1]);
+        let element_type = ArrayType::new_static(DataType::F8E8M0FNU, [1]);
         let first = Array::new(element_type.clone(), vec![1]).unwrap();
         let second = Array::new(element_type, vec![2]).unwrap();
         assert_eq!(
             Array::concatenate([&first, &second], 0),
-            Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![1, 2]),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![1, 2]),
         );
-        let empty_type = array_type(DataType::F8E8M0FNU, &[0]);
+        let empty_type = ArrayType::new_static(DataType::F8E8M0FNU, [0]);
         let empty = Array::new(empty_type.clone(), Vec::new()).unwrap();
         assert_eq!(Array::concatenate([&empty, &empty], 0), Array::new(empty_type, Vec::new()));
     }
@@ -3109,22 +3117,26 @@ in (%4)
         let indices = Array::matrix(2, 1, vec![2i64, 0]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
         let gathered = operand.gather(&indices, &operation).unwrap();
-        assert_eq!(gathered.r#type().into_owned(), array_type(DataType::F64, &[2, 2]));
+        assert_eq!(gathered.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
         assert_eq!(gathered.to_f64s(), vec![5.0, 6.0, 1.0, 2.0]);
 
         // In-bounds and clipping modes do not materialize an unused zero fill, so they work for formats that cannot
         // represent zero.
-        let operand = Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x7f, 0x80]).unwrap();
+        let operand = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
         let indices = Array::matrix(1, 1, vec![1i64]);
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]);
-        assert_eq!(operand.gather(&indices, &operation), Array::new(array_type(DataType::F8E8M0FNU, &[1]), vec![0x80]));
+        assert_eq!(
+            operand.gather(&indices, &operation),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x80])
+        );
 
         // Gather reads both a reversed operand and reversed sub-byte indices through their physical addressing. An
         // out-of-bounds query in fill-or-drop mode writes the element type's zero encoding into the dense result.
-        let operand_type = array_type(DataType::U16, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let operand_type =
+            ArrayType::new_static(DataType::U16, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let operand = Array::from_elements(operand_type, &[10u16, 20, 30]).unwrap();
         let indices_type =
-            array_type(DataType::I4, &[3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+            ArrayType::new_static(DataType::I4, [3, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
         let indices =
             Array::from_elements(indices_type, &[i4::new(2).unwrap(), i4::new(-1).unwrap(), i4::new(1).unwrap()])
                 .unwrap();
@@ -3139,7 +3151,7 @@ in (%4)
     fn test_array_scatter() {
         // Scatter-add updates 10 and 20 into elements 3 and 0 of a vector.
         let operand = Array::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let indices = Array::from_f64s(array_type(DataType::I64, &[2, 1]), vec![3.0, 0.0]);
+        let indices = Array::from_f64s(ArrayType::new_static(DataType::I64, [2, 1]), vec![3.0, 0.0]);
         let updates = Array::vector(vec![10.0, 20.0]);
         let operation =
             ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
@@ -3148,14 +3160,16 @@ in (%4)
 
         // Scatter decodes sub-byte indices through their physical layout without materializing a scalar index vector.
         let indices_type =
-            array_type(DataType::I4, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
+            ArrayType::new_static(DataType::I4, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-1, 1])));
         let indices = Array::from_elements(indices_type, &[i4::new(3).unwrap(), i4::new(0).unwrap()]).unwrap();
         assert_eq!(operand.scatter(&indices, &updates, &operation).unwrap(), Array::vector(vec![21.0, 2.0, 3.0, 14.0]),);
 
         // Operand and update payloads are decoded and written through their independent physical layouts.
-        let operand_type = array_type(DataType::U16, &[4]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let operand_type =
+            ArrayType::new_static(DataType::U16, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let operand = Array::from_elements(operand_type.clone(), &[1u16, 2, 3, 4]).unwrap();
-        let updates_type = array_type(DataType::U16, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
+        let updates_type =
+            ArrayType::new_static(DataType::U16, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-2])));
         let updates = Array::from_elements(updates_type, &[10u16, 20]).unwrap();
         assert_eq!(
             operand.scatter(&indices, &updates, &operation),
@@ -3172,8 +3186,8 @@ in (%4)
         );
 
         // Overwrite moves encodings without requiring arithmetic identities, including for formats without zero.
-        let operand = Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x7f, 0x80]).unwrap();
-        let updates = Array::new(array_type(DataType::F8E8M0FNU, &[1]), vec![0x81]).unwrap();
+        let operand = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x7f, 0x80]).unwrap();
+        let updates = Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [1]), vec![0x81]).unwrap();
         let indices = Array::matrix(1, 1, vec![0i32]);
         let operation = ScatterOperation::new(
             ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
@@ -3181,7 +3195,7 @@ in (%4)
         );
         assert_eq!(
             operand.scatter(&indices, &updates, &operation),
-            Array::new(array_type(DataType::F8E8M0FNU, &[2]), vec![0x81, 0x80]),
+            Array::new(ArrayType::new_static(DataType::F8E8M0FNU, [2]), vec![0x81, 0x80]),
         );
 
         // Extrema follow JAX for floating-point NaNs and signed zero and for lexicographically ordered complex values.

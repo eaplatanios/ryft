@@ -435,24 +435,20 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
     })
 }
 
-/// Returns a dense array type with static dimensions.
-fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
-}
-
 /// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let lhs = CpuArray::from_f64s(array_type(DataType::F32, &[2, 4]), (1..=8).map(f64::from).collect());
-    let rhs = CpuArray::from_f64s(array_type(DataType::F32, &[4, 3]), (1..=12).map(f64::from).collect());
-    let lhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[2, 2]), vec![1.0, 2.0, 0.5, 1.0]);
-    let rhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    let lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 4]), (1..=8).map(f64::from).collect());
+    let rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [4, 3]), (1..=12).map(f64::from).collect());
+    let lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 2]), vec![1.0, 2.0, 0.5, 1.0]);
+    let rhs_scale =
+        CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [2, 3]), vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
     let values = |value: CpuArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
 
-    let matmul_lhs = CpuArray::from_f64s(array_type(DataType::F32, &[1, 1, 4]), vec![1.0; 4]);
-    let matmul_rhs = CpuArray::from_f64s(array_type(DataType::F32, &[1, 2, 4]), vec![1.0; 8]);
-    let matmul_lhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[1, 1, 2]), vec![1.0; 2]);
-    let matmul_rhs_scale = CpuArray::from_f64s(array_type(DataType::F32, &[1, 2, 2]), vec![1.0; 4]);
+    let matmul_lhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 4]), vec![1.0; 4]);
+    let matmul_rhs = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 4]), vec![1.0; 8]);
+    let matmul_lhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 2]), vec![1.0; 2]);
+    let matmul_rhs_scale = CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2]), vec![1.0; 4]);
     let observations = BTreeMap::from([
         (
             "both_scales",
@@ -487,10 +483,10 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
             }
         },
         (
-            array_type(DataType::F32, &[2, 4]),
-            array_type(DataType::F32, &[4, 3]),
-            array_type(DataType::F32, &[2, 2]),
-            array_type(DataType::F32, &[2, 3]),
+            ArrayType::new_static(DataType::F32, [2, 4]),
+            ArrayType::new_static(DataType::F32, [4, 3]),
+            ArrayType::new_static(DataType::F32, [2, 2]),
+            ArrayType::new_static(DataType::F32, [2, 3]),
         ),
     )?;
     Ok(DifferentialObservation {
@@ -504,11 +500,11 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
 
 /// Emits the portable rank-three MQA attention surface plus its semantic StableHLO composition.
 fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let query_type = array_type(DataType::F32, &[2, 2, 1]);
-    let key_value_type = array_type(DataType::F32, &[2, 1, 1]);
+    let query_type = ArrayType::new_static(DataType::F32, [2, 2, 1]);
+    let key_value_type = ArrayType::new_static(DataType::F32, [2, 1, 1]);
     let bias_type = ArrayType::scalar(DataType::F32);
-    let mask_type = array_type(DataType::Boolean, &[2, 2]);
-    let lengths_type = array_type(DataType::I32, &[1]);
+    let mask_type = ArrayType::new_static(DataType::Boolean, [2, 2]);
+    let lengths_type = ArrayType::new_static(DataType::I32, [1]);
     let configuration = AttentionConfiguration::new()
         .with_scale(1.0)
         .with_causal(true)
@@ -525,8 +521,8 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     };
     let (output, residual) = CpuArray::dot_product_attention(inputs, configuration)?;
     let values = |value: CpuArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
-    let gqa_query_type = array_type(DataType::F32, &[1, 2, 4, 1]);
-    let gqa_key_value_type = array_type(DataType::F32, &[1, 3, 2, 1]);
+    let gqa_query_type = ArrayType::new_static(DataType::F32, [1, 2, 4, 1]);
+    let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
     let (gqa_output, _) = CpuArray::dot_product_attention(
         AttentionInputs {
             query: CpuArray::from_f64s(gqa_query_type, vec![0.0; 8]),

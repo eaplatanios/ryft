@@ -10,14 +10,10 @@ use crate::tracing::TracingContext;
 
 use super::*;
 
-fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-    ArrayType::new(data_type, static_shape(dimensions))
-}
-
 #[test]
 fn test_attention_inputs() {
     let signature = AttentionOperandSignature::new(true, true, true, true);
-    let values = (0..7).map(|size| array_type(DataType::F32, &[size])).collect::<Vec<_>>();
+    let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
     let inputs = AttentionInputs::from_values(signature, values.as_slice()).unwrap();
 
     assert_eq!(inputs.signature(), signature);
@@ -50,12 +46,12 @@ fn test_attention_configuration() {
 
 #[test]
 fn test_dot_product_attention_type_inference() {
-    let query = array_type(DataType::F32, &[2, 2, 2]);
-    let key_value = array_type(DataType::F32, &[3, 1, 2]);
-    let bias = array_type(DataType::F64, &[3]);
-    let mask = array_type(DataType::Boolean, &[2, 3]);
-    let lengths = array_type(DataType::I32, &[1]);
-    let residual = array_type(DataType::F32, &[2, 2]);
+    let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
+    let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
+    let bias = ArrayType::new_static(DataType::F64, [3]);
+    let mask = ArrayType::new_static(DataType::Boolean, [2, 3]);
+    let lengths = ArrayType::new_static(DataType::I32, [1]);
+    let residual = ArrayType::new_static(DataType::F32, [2, 2]);
     let signature = AttentionOperandSignature::new(true, true, true, true);
     let configuration = AttentionConfiguration::new().with_local_window((0, 0)).with_residual(true);
     let operation = DotProductAttentionOperation::new(configuration, signature);
@@ -72,10 +68,10 @@ fn test_dot_product_attention_type_inference() {
     );
 
     // A non-differentiable bias remains a legal forward input but contributes no live backward result.
-    let query = array_type(DataType::F32, &[2, 2, 2]);
-    let key_value = array_type(DataType::F32, &[3, 1, 2]);
-    let bias = array_type(DataType::I32, &[3]);
-    let residual = array_type(DataType::F32, &[2, 2]);
+    let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
+    let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
+    let bias = ArrayType::new_static(DataType::I32, [3]);
+    let residual = ArrayType::new_static(DataType::F32, [2, 2]);
     let structural_bias_signature = AttentionOperandSignature::new(true, false, false, false);
     let mut backward_input_types = vec![query.clone(), key_value.clone(), key_value.clone(), bias];
     backward_input_types.extend([query.clone(), residual, query.clone()]);
@@ -98,13 +94,14 @@ fn test_dot_product_attention_type_inference() {
 fn test_dot_product_attention() {
     // Rank-three operands normalize through an implicit batch. The arbitrary mask, asymmetric local window, and
     // query lengths compose independently, while the omitted scale defaults to `1 / sqrt(head_dimension)`.
-    let query = Array::from_f64s(array_type(DataType::F32, &[2, 1, 2]), vec![1.0, 0.0, 0.0, 1.0]);
-    let key = Array::from_f64s(array_type(DataType::F32, &[3, 1, 2]), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
-    let value = Array::from_f64s(array_type(DataType::F32, &[3, 1, 2]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let query = Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 1, 2]), vec![1.0, 0.0, 0.0, 1.0]);
+    let key = Array::from_f64s(ArrayType::new_static(DataType::F32, [3, 1, 2]), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    let value = Array::from_f64s(ArrayType::new_static(DataType::F32, [3, 1, 2]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let mask =
-        Array::from_elements(array_type(DataType::Boolean, &[2, 3]), &[true, false, true, true, true, false]).unwrap();
-    let bias = Array::from_elements(array_type(DataType::I32, &[]), &[0_i32]).unwrap();
-    let query_lengths = Array::from_elements(array_type(DataType::I32, &[1]), &[1_i32]).unwrap();
+        Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 3]), &[true, false, true, true, true, false])
+            .unwrap();
+    let bias = Array::from_elements(ArrayType::new_static(DataType::I32, []), &[0_i32]).unwrap();
+    let query_lengths = Array::from_elements(ArrayType::new_static(DataType::I32, [1]), &[1_i32]).unwrap();
     let inputs = AttentionInputs {
         query,
         key,
@@ -128,10 +125,10 @@ fn test_dot_product_attention() {
 
     // Float64 dot products, scaling, and bias addition retain float64 precision until the logits reach the
     // explicitly float32 softmax. Subtracting the large bias before that conversion preserves the unit gap.
-    let query = Array::from_f64s(array_type(DataType::F64, &[1, 1, 1]), vec![1.0e8]);
-    let key = Array::from_f64s(array_type(DataType::F64, &[2, 1, 1]), vec![1.0, 1.0 + 1.0e-8]);
-    let value = Array::from_f64s(array_type(DataType::F64, &[2, 1, 1]), vec![0.0, 1.0]);
-    let bias = Array::from_f64s(array_type(DataType::F64, &[2]), vec![-1.0e8, -1.0e8]);
+    let query = Array::from_f64s(ArrayType::new_static(DataType::F64, [1, 1, 1]), vec![1.0e8]);
+    let key = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 1]), vec![1.0, 1.0 + 1.0e-8]);
+    let value = Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 1, 1]), vec![0.0, 1.0]);
+    let bias = Array::from_f64s(ArrayType::new_static(DataType::F64, [2]), vec![-1.0e8, -1.0e8]);
     let output = Array::dot_product_attention(
         AttentionInputs { bias: Some(bias), ..AttentionInputs::new(query, key, value) },
         AttentionConfiguration::new().with_scale(1.0),
@@ -142,11 +139,12 @@ fn test_dot_product_attention() {
     assert!((output.to_f64s()[0] - 0.731_058_6).abs() < 1.0e-6);
 
     // MQA and its explicitly repeated MHA representation are semantically identical.
-    let query = Array::from_f64s(array_type(DataType::F32, &[1, 1, 2, 1]), vec![1.0, 1.0]);
-    let grouped_key = Array::from_f64s(array_type(DataType::F32, &[1, 2, 1, 1]), vec![1.0, 2.0]);
-    let grouped_value = Array::from_f64s(array_type(DataType::F32, &[1, 2, 1, 1]), vec![10.0, 20.0]);
-    let repeated_key = Array::from_f64s(array_type(DataType::F32, &[1, 2, 2, 1]), vec![1.0, 1.0, 2.0, 2.0]);
-    let repeated_value = Array::from_f64s(array_type(DataType::F32, &[1, 2, 2, 1]), vec![10.0, 10.0, 20.0, 20.0]);
+    let query = Array::from_f64s(ArrayType::new_static(DataType::F32, [1, 1, 2, 1]), vec![1.0, 1.0]);
+    let grouped_key = Array::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 1, 1]), vec![1.0, 2.0]);
+    let grouped_value = Array::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 1, 1]), vec![10.0, 20.0]);
+    let repeated_key = Array::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2, 1]), vec![1.0, 1.0, 2.0, 2.0]);
+    let repeated_value =
+        Array::from_f64s(ArrayType::new_static(DataType::F32, [1, 2, 2, 1]), vec![10.0, 10.0, 20.0, 20.0]);
     let grouped = Array::dot_product_attention(
         AttentionInputs::new(query.clone(), grouped_key, grouped_value),
         AttentionConfiguration::new(),
@@ -196,7 +194,7 @@ fn test_dot_product_attention_rendering() {
 fn test_dot_product_attention_batching() {
     // Each mapped example carries one complete rank-four attention problem. The boundary folds that mapped axis
     // into its logical batch axis and restores it on the output.
-    let r#type = array_type(DataType::F32, &[2, 1, 1, 1, 1]);
+    let r#type = ArrayType::new_static(DataType::F32, [2, 1, 1, 1, 1]);
     let query = ArrayBatch::new(Array::from_f64s(r#type.clone(), vec![1.0, 1.0]), BatchAxis::new(0)).unwrap();
     let key = ArrayBatch::new(Array::from_f64s(r#type.clone(), vec![1.0, 1.0]), BatchAxis::new(0)).unwrap();
     let value = ArrayBatch::new(Array::from_f64s(r#type, vec![5.0, 7.0]), BatchAxis::new(0)).unwrap();
@@ -218,21 +216,23 @@ fn test_dot_product_attention_batching() {
 
     // Rank-three attention has an implicit logical batch of one. A mapped rank-two mask is normalized alongside
     // the operands rather than being mistaken for a tensor batch prefix.
-    let query =
-        ArrayBatch::new(Array::from_f64s(array_type(DataType::F32, &[2, 1, 1, 1]), vec![1.0, 1.0]), BatchAxis::new(0))
-            .unwrap();
+    let query = ArrayBatch::new(
+        Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 1, 1, 1]), vec![1.0, 1.0]),
+        BatchAxis::new(0),
+    )
+    .unwrap();
     let key = ArrayBatch::new(
-        Array::from_f64s(array_type(DataType::F32, &[2, 2, 1, 1]), vec![1.0, 2.0, 1.0, 2.0]),
+        Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 2, 1, 1]), vec![1.0, 2.0, 1.0, 2.0]),
         BatchAxis::new(0),
     )
     .unwrap();
     let value = ArrayBatch::new(
-        Array::from_f64s(array_type(DataType::F32, &[2, 2, 1, 1]), vec![3.0, 9.0, 4.0, 10.0]),
+        Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 2, 1, 1]), vec![3.0, 9.0, 4.0, 10.0]),
         BatchAxis::new(0),
     )
     .unwrap();
     let mask = ArrayBatch::new(
-        Array::from_elements(array_type(DataType::Boolean, &[2, 1, 2]), &[true, false, false, true]).unwrap(),
+        Array::from_elements(ArrayType::new_static(DataType::Boolean, [2, 1, 2]), &[true, false, false, true]).unwrap(),
         BatchAxis::new(0),
     )
     .unwrap();

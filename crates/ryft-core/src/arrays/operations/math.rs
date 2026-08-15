@@ -1866,8 +1866,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::arrays::array_type;
     use crate::arrays::encoding::{f8e4m3fn, f8e8m0fnu, i2, i4};
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::operations::complex::Complex;
     use crate::operations::math::erf::erf_f64;
@@ -1890,13 +1890,13 @@ mod tests {
         // General broadcasting traverses arbitrary input layouts while mixed element types normalize through the
         // canonical conversion kernel.
         let left_type =
-            array_type(DataType::F32, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
+            ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
         let left = Array::from_elements(left_type, &[1.0f32, 2.0]).unwrap();
         let right_type =
-            array_type(DataType::F64, &[1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
+            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
         let right = Array::from_elements(right_type, &[0.5f64, 1.0, 1.5]).unwrap();
         let sum = left.add(&right).unwrap();
-        assert_eq!(sum.r#type().into_owned(), array_type(DataType::F64, &[2, 3]));
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
         assert_eq!(sum.elements::<f64>(), Ok(vec![1.5, 2.0, 2.5, 2.5, 3.0, 3.5]));
         // The `std::ops` sugar delegates to the fallible capabilities.
         assert_eq!(vector.clone() + Array::scalar(1.0), Array::vector(vec![2.0, 3.0, 4.0]));
@@ -1912,10 +1912,10 @@ mod tests {
     #[test]
     fn test_array_low_precision_float_arithmetic() {
         // Low-precision arithmetic computes through decoded values and re-encodes the nearest representable result.
-        let left = Array::from_f64s(array_type(DataType::F8E4M3FN, &[2]), vec![1.0, 2.0]);
-        let right = Array::from_f64s(array_type(DataType::F8E4M3FN, &[2]), vec![0.5, 0.25]);
+        let left = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![1.0, 2.0]);
+        let right = Array::from_f64s(ArrayType::new_static(DataType::F8E4M3FN, [2]), vec![0.5, 0.25]);
         let sum = left.add(&right).unwrap();
-        assert_eq!(sum.r#type().into_owned(), array_type(DataType::F8E4M3FN, &[2]));
+        assert_eq!(sum.r#type().into_owned(), ArrayType::new_static(DataType::F8E4M3FN, [2]));
         assert_eq!(sum.to_f64s(), vec![1.5, 2.25]);
         assert_eq!(left.sub(&right).unwrap().to_f64s(), vec![0.5, 1.75]);
         assert_eq!(left.mul(&right).unwrap().to_f64s(), vec![0.5, 0.5]);
@@ -1950,7 +1950,7 @@ mod tests {
         // The absolute value of a complex array is its elementwise magnitude with a real element data type.
         let complex = Array::vector(vec![3.0]).complex(&Array::vector(vec![4.0])).unwrap();
         let magnitude = complex.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), array_type(DataType::F64, &[1]));
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [1]));
         assert_abs_diff_eq!(magnitude, Array::vector(vec![5.0]), epsilon = 1e-12);
         // Elementwise extrema retain the selected operand's NaN payload and IEEE signed-zero encoding.
         let nan = f32::from_bits(0x7fc0_1234);
@@ -1971,7 +1971,8 @@ mod tests {
     #[test]
     fn test_array_transcendental_math_uses_typed_storage() {
         // Unary kernels preserve arbitrary physical layouts while traversing elements in logical order.
-        let input_type = array_type(DataType::F64, &[2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
+        let input_type =
+            ArrayType::new_static(DataType::F64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![-16])));
         let input = Array::from_elements(input_type.clone(), &[0.0f64, 1.0]).unwrap();
         let exponential = input.exp().unwrap();
         assert_eq!(exponential.r#type().as_ref(), &input_type);
@@ -1979,13 +1980,13 @@ mod tests {
 
         // Binary kernels perform complete broadcasting after promoting both physical inputs to their common type.
         let left_type =
-            array_type(DataType::F32, &[2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
+            ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 4])));
         let left = Array::from_elements(left_type, &[0.0f32, 1.0]).unwrap();
         let right_type =
-            array_type(DataType::F64, &[1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
+            ArrayType::new_static(DataType::F64, [1, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![24, -8])));
         let right = Array::from_elements(right_type, &[1.0f64, 1.0, -1.0]).unwrap();
         let angles = left.atan2(&right).unwrap();
-        assert_eq!(angles.r#type().into_owned(), array_type(DataType::F64, &[2, 3]));
+        assert_eq!(angles.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 3]));
         assert_abs_diff_eq!(
             angles,
             Array::matrix(
@@ -2018,7 +2019,7 @@ mod tests {
 
         // Low-precision formats decode, compute, and re-encode without constructing intermediary scalar values.
         let low_precision = Array::from_elements(
-            array_type(DataType::F8E4M3FN, &[2]),
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
             &[f8e4m3fn::from_f64(0.0).unwrap(), f8e4m3fn::from_f64(1.0).unwrap()],
         )
         .unwrap();
@@ -2043,7 +2044,7 @@ mod tests {
 
         // Sign preserves IEEE signed zero and NaN behavior and also covers signed sub-byte integers.
         let signs = Array::from_elements(
-            array_type(DataType::F64, &[4]),
+            ArrayType::new_static(DataType::F64, [4]),
             &[-2.0f64, -0.0, 0.0, f64::from_bits(0x7ff8_0000_0000_1234)],
         )
         .unwrap()
@@ -2056,7 +2057,8 @@ mod tests {
         assert_eq!(signs[2].to_bits(), 0.0f64.to_bits());
         assert_eq!(signs[3].to_bits(), 0x7ff8_0000_0000_1234);
         let narrow =
-            Array::from_elements(array_type(DataType::I2, &[3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX]).unwrap();
+            Array::from_elements(ArrayType::new_static(DataType::I2, [3]), &[i2::MIN, i2::new(0).unwrap(), i2::MAX])
+                .unwrap();
         assert_eq!(
             narrow.sign().unwrap().elements::<i2>(),
             Ok(vec![i2::new(-1).unwrap(), i2::new(0).unwrap(), i2::new(1).unwrap()]),
@@ -2075,7 +2077,7 @@ mod tests {
         assert_eq!(matrix.reduce(&[1], ReductionKind::Mean), Array::vector(vec![2.0, 5.0]));
         assert_eq!(
             matrix.reduce(&[0, 1], ReductionKind::Sum),
-            Array::from_f64s(array_type(DataType::F64, &[]), vec![21.0])
+            Array::from_f64s(ArrayType::new_static(DataType::F64, []), vec![21.0])
         );
         assert_eq!(matrix.reduce(&[], ReductionKind::Sum), matrix);
         // Max and min use the data type's reduction identities and ordinary ordering.
@@ -2090,10 +2092,12 @@ mod tests {
         assert_eq!(booleans.reduce(&[0], ReductionKind::Min).elements::<bool>(), Ok(vec![false]));
 
         // Numeric and Boolean reductions traverse arbitrary layouts and produce the abstract rule's dense result.
-        let r#type = array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 2])));
+        let r#type =
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-8, 2])));
         let matrix = Array::from_elements(r#type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
         assert_eq!(matrix.reduce(&[1], ReductionKind::Sum).elements::<u16>(), Ok(vec![6, 15]));
-        let r#type = array_type(DataType::Boolean, &[3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
+        let r#type =
+            ArrayType::new_static(DataType::Boolean, [3]).with_layout(Layout::Strided(StridedLayout::new(vec![-1])));
         let booleans = Array::from_elements(r#type, &[true, false, true]).unwrap();
         assert_eq!(booleans.reduce(&[0], ReductionKind::Any).elements::<bool>(), Ok(vec![true]));
 
@@ -2123,7 +2127,7 @@ mod tests {
             complex.reduce(&[0], ReductionKind::Mean).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(3.0, 6.0)]),
         );
-        let empty = Array::from_elements::<i32>(array_type(DataType::I32, &[2, 0]), &[]).unwrap();
+        let empty = Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
         assert_eq!(empty.reduce(&[1], ReductionKind::Sum).elements::<i32>(), Ok(vec![0, 0]));
 
         // Floating-point extrema propagate NaNs and order negative zero below positive zero.
@@ -2147,12 +2151,13 @@ mod tests {
             complex.reduce(&[0], ReductionKind::Min).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(1.0, 5.0)]),
         );
-        let empty = Array::from_elements::<ComplexNumber<f32>>(array_type(DataType::C64, &[2, 0]), &[]).unwrap();
+        let empty =
+            Array::from_elements::<ComplexNumber<f32>>(ArrayType::new_static(DataType::C64, [2, 0]), &[]).unwrap();
         assert_eq!(
             empty.reduce(&[1], ReductionKind::Max).elements::<ComplexNumber<f32>>(),
             Ok(vec![ComplexNumber::new(f32::NEG_INFINITY, 0.0), ComplexNumber::new(f32::NEG_INFINITY, 0.0),]),
         );
-        let empty = Array::from_elements::<f8e8m0fnu>(array_type(DataType::F8E8M0FNU, &[2, 0]), &[]).unwrap();
+        let empty = Array::from_elements::<f8e8m0fnu>(ArrayType::new_static(DataType::F8E8M0FNU, [2, 0]), &[]).unwrap();
         assert_eq!(
             empty.reduce(&[1], ReductionKind::Max).elements::<f8e8m0fnu>(),
             Ok(vec![f8e8m0fnu::MIN, f8e8m0fnu::MIN]),
@@ -2170,30 +2175,39 @@ mod tests {
         let rhs = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
         let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
         let product = lhs.dot(&rhs, &dimensions);
-        assert_eq!(product.r#type().into_owned(), array_type(DataType::F64, &[2, 2]));
+        assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2, 2]));
         assert_eq!(product.to_f64s(), vec![58.0, 64.0, 139.0, 154.0]);
 
         // Both operands are decoded through their physical layouts rather than through dense logical payload copies.
-        let lhs_type = array_type(DataType::U16, &[2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
-        let rhs_type = array_type(DataType::U16, &[3, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, -2])));
+        let lhs_type =
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![-6, 2])));
+        let rhs_type =
+            ArrayType::new_static(DataType::U16, [3, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![4, -2])));
         let lhs = Array::from_elements(lhs_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
         let rhs = Array::from_elements(rhs_type, &[7u16, 8, 9, 10, 11, 12]).unwrap();
         assert_eq!(lhs.dot(&rhs, &dimensions).elements::<u16>(), Ok(vec![58, 64, 139, 154]));
 
         // Batched generalized contraction places batch axes before both operands' non-contracting axes.
-        let lhs = Array::from_elements(array_type(DataType::I32, &[2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let rhs = Array::from_elements(array_type(DataType::I32, &[2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
+        let lhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 2]), &[1i32, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        let rhs = Array::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[2i32, 3, 4, 5]).unwrap();
         let batched = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
         let product = lhs.dot(&rhs, &batched);
-        assert_eq!(product.r#type().into_owned(), array_type(DataType::I32, &[2, 2, 1]));
+        assert_eq!(product.r#type().into_owned(), ArrayType::new_static(DataType::I32, [2, 2, 1]));
         assert_eq!(product.elements::<i32>(), Ok(vec![8, 18, 50, 68]));
 
         // Narrow integer products and sums wrap at the declared element width, and complex accumulation retains both
         // components.
-        let lhs = Array::from_elements(array_type(DataType::I4, &[1, 2]), &[i4::new(7).unwrap(), i4::new(7).unwrap()])
-            .unwrap();
-        let rhs = Array::from_elements(array_type(DataType::I4, &[2, 1]), &[i4::new(2).unwrap(), i4::new(2).unwrap()])
-            .unwrap();
+        let lhs = Array::from_elements(
+            ArrayType::new_static(DataType::I4, [1, 2]),
+            &[i4::new(7).unwrap(), i4::new(7).unwrap()],
+        )
+        .unwrap();
+        let rhs = Array::from_elements(
+            ArrayType::new_static(DataType::I4, [2, 1]),
+            &[i4::new(2).unwrap(), i4::new(2).unwrap()],
+        )
+        .unwrap();
         assert_eq!(lhs.dot(&rhs, &dimensions).elements::<i4>(), Ok(vec![i4::new(-4).unwrap()]));
         let lhs = Array::matrix(1, 2, vec![ComplexNumber::new(1.0f32, 2.0), ComplexNumber::new(3.0, -1.0)]);
         let rhs = Array::matrix(2, 1, vec![ComplexNumber::new(2.0f32, -1.0), ComplexNumber::new(0.5, 4.0)]);
@@ -2211,8 +2225,8 @@ mod tests {
         assert_eq!(product.elements::<f32>(), Ok(vec![9.0]));
 
         // An empty contracting dimension materializes one additive identity for every result coordinate.
-        let lhs = Array::from_elements::<f32>(array_type(DataType::F32, &[2, 0]), &[]).unwrap();
-        let rhs = Array::from_elements::<f32>(array_type(DataType::F32, &[0, 3]), &[]).unwrap();
+        let lhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 0]), &[]).unwrap();
+        let rhs = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 3]), &[]).unwrap();
         assert_eq!(lhs.dot(&rhs, &dimensions).elements::<f32>(), Ok(vec![0.0; 6]));
     }
 
@@ -2253,7 +2267,7 @@ mod tests {
         assert_abs_diff_eq!(left.cos().unwrap(), expect([left_values[0].cos(), left_values[1].cos()]), epsilon = 1e-12);
         // The absolute value is the elementwise magnitude with a real element data type.
         let magnitude = left.abs().unwrap();
-        assert_eq!(magnitude.r#type().into_owned(), array_type(DataType::F64, &[2]));
+        assert_eq!(magnitude.r#type().into_owned(), ArrayType::new_static(DataType::F64, [2]));
         assert_abs_diff_eq!(
             magnitude,
             Array::vector(vec![left_values[0].norm(), left_values[1].norm()]),

@@ -841,7 +841,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayIrType, ArrayType, DataType};
-    use crate::operations::StopGradientOperation;
+    use crate::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;

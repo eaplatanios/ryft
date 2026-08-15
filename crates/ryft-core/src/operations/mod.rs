@@ -12,7 +12,6 @@ pub mod constants;
 pub mod control_flow;
 pub mod custom_call;
 pub mod debugging;
-pub mod differentiation;
 pub mod dimensions;
 pub mod dot;
 pub mod logical;
@@ -31,7 +30,6 @@ pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
-pub use differentiation::*;
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,

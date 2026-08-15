@@ -1,18 +1,15 @@
 use std::fmt::{Display, Formatter};
 use std::ops::{Add, Mul};
 
+// TODO(eaplatanios): Review this module.
+
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableType;
+use crate::differentiation::types::DifferentiableType;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::fill::Fill;
-use crate::operations::constants::iota::Iota;
-use crate::operations::constants::one::One;
-use crate::operations::constants::zero::Zero;
-use crate::operations::control_flow::select::Select;
+use crate::operations::{Compare, ComparisonDirection, Fill, Iota, One, Select, Zero};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
