@@ -105,8 +105,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -123,12 +121,8 @@ mod tests {
 
     use super::*;
 
-    fn array_type(data_type: DataType, dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(data_type, Shape::new(dimensions.iter().copied().map(Dimension::Static).collect()))
-    }
-
     #[test]
-    fn test_fill_eager_context() {
+    fn test_eager_context_fill() {
         let context = EagerContext::<Array>::new();
 
         // Rank-zero and rank-positive fills both apply the requested element conversion exactly once.
@@ -140,22 +134,23 @@ mod tests {
             Array::from_elements(output_type, &[2.5f32; 6]).unwrap(),
         );
         assert_eq!(
-            context.fill(&array_type(DataType::F32, &[2]), ComplexNumber::new(1.0f32, 2.0)),
+            context.fill(&ArrayType::new_static(DataType::F32, [2]), ComplexNumber::new(1.0f32, 2.0)),
             Ok(Array::vector(vec![1.0f32; 2])),
         );
         assert_eq!(
-            context.fill(&array_type(DataType::Boolean, &[2]), ComplexNumber::new(0.0f32, 2.0)),
-            Array::from_elements(array_type(DataType::Boolean, &[2]), &[true; 2]).map_err(Into::into),
+            context.fill(&ArrayType::new_static(DataType::Boolean, [2]), ComplexNumber::new(0.0f32, 2.0)),
+            Array::from_elements(ArrayType::new_static(DataType::Boolean, [2]), &[true; 2]).map_err(Into::into),
         );
 
         // Fill uses the same checked element codecs for low-precision and sub-byte values as direct array creation.
         let low_precision = f6e2m3fn::from_bits(0x08).unwrap();
         assert_eq!(
-            context.fill(&array_type(DataType::F6E2M3FN, &[2]), low_precision),
-            Array::from_elements(array_type(DataType::F6E2M3FN, &[2]), &[low_precision; 2]).map_err(Into::into),
+            context.fill(&ArrayType::new_static(DataType::F6E2M3FN, [2]), low_precision),
+            Array::from_elements(ArrayType::new_static(DataType::F6E2M3FN, [2]), &[low_precision; 2])
+                .map_err(Into::into),
         );
         assert_eq!(
-            context.fill(&array_type(DataType::U4, &[2]), 2.5f64).unwrap().elements::<u4>(),
+            context.fill(&ArrayType::new_static(DataType::U4, [2]), 2.5f64).unwrap().elements::<u4>(),
             Ok(vec![u4::new(2).unwrap(); 2]),
         );
 
@@ -173,13 +168,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_projected_context() {
+    fn test_projected_context_fill() {
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
-        let output_type = array_type(DataType::F32, &[2]);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 1.5f32).unwrap();
         assert_eq!(output.r#type().as_ref(), &output_type);
-
         let program = parent
             .builder()
             .borrow()
@@ -203,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_staging_context() {
+    fn test_staging_context_fill() {
         // A rank-zero fill is represented by its literal constant alone.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output = context.fill(&ArrayType::scalar(DataType::U32), 2.5f64).unwrap();
@@ -225,7 +219,7 @@ mod tests {
 
         // A rank-positive fill broadcasts that literal, retaining the requested memory placement in both operations.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_type = array_type(DataType::F32, &[2, 3]).with_memory(Memory::Host { pinned: false });
+        let output_type = ArrayType::new_static(DataType::F32, [2, 3]).with_memory(Memory::Host { pinned: false });
         let output = context.fill(&output_type, 2.5f64).unwrap();
         assert_eq!(output.r#type().as_ref(), &output_type);
         let program = context
@@ -248,31 +242,28 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_partial_evaluation_context() {
+    fn test_partial_evaluation_context_fill() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = array_type(DataType::F32, &[2]);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 3.5f32).unwrap();
         let expected = Array::from_elements(output_type, &[3.5f32; 2]).unwrap();
-
         assert_eq!(output.value().unwrap().as_known(), Some(&expected));
     }
 
     #[test]
-    fn test_fill_batching_context() {
+    fn test_batching_context_fill() {
         let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        let output_type = array_type(DataType::F32, &[2]);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 4.5f32).unwrap();
-
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[4.5f32; 2]).unwrap(),);
     }
 
     #[test]
-    fn test_fill_differentiation_context() {
+    fn test_differentiation_context_fill() {
         let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = array_type(DataType::F32, &[2]);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 5.5f32).unwrap();
-
         assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[5.5f32; 2]).unwrap());
         assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
