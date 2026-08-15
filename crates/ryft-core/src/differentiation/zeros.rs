@@ -296,7 +296,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
 /// Role of differential boundary whose [`ZeroSpaceBoundaryLeaf`]s are reconstructed
 /// from [`ZeroSpaceBoundaryReconstruction`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ZeroSpaceBoundaryRole {
+pub enum ZeroSpaceBoundaryRole {
     /// Cotangents of the primal input boundary, returned by a _pullback_ function.
     InputCotangent,
 
@@ -366,7 +366,7 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 /// otherwise-unused inputs of the derivative program. The wrapper retains the boundary size, the position and type of
 /// every omitted zero, and the range of residuals that reconstructs it. The tangent/cotangent mapping and primal
 /// boundary are therefore consumed exactly once during capture and cannot be changed later during reconstruction.
-pub(crate) struct ZeroSpaceBoundaryReconstruction<V: Value> {
+pub struct ZeroSpaceBoundaryReconstruction<V: Value> {
     /// Semantic role of the differential boundary reconstructed by this instance.
     role: ZeroSpaceBoundaryRole,
 
@@ -401,7 +401,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
     /// captures residual values whose count or types disagree with its declaration.
-    pub(crate) fn capture<C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>>(
+    pub fn capture<C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>>(
         context: &C,
         primal_values: &[C::Value],
         primal_types: &[C::Type],
@@ -451,7 +451,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Returns a [`ProgramError`] if a zero cannot be materialized or if `live_values` does not contain exactly one
     /// value for every nonzero-space boundary leaf.
-    pub(crate) fn rebuild<
+    pub fn rebuild<
         C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
         I: IntoIterator<Item = C::Value>,
     >(
