@@ -801,7 +801,8 @@ invalid programs fail before any mutation or replay.
 ### Phase 3: Implement eager and staged local references
 
 - [ ] Implement eager create, read, write, swap, additive update, and freeze.
-- [ ] Validate referent compatibility on every write/update.
+- [ ] Enforce the exact replacement/update storage rules on every write, swap, and additive update; do not use broad
+      `ArrayType::is_compatible_with` as the mutation rule.
 - [ ] Make freeze invalidate the complete alias family.
 - [ ] Expose array-to-reference creation and reference capabilities through the composite parent-binding API.
 - [ ] Stage operations with exact inferred types, source locations, rendering, effects, and access semantics.
@@ -1020,7 +1021,7 @@ Use named families rather than an uncontrolled Cartesian product.
 | Area | Positive cases | Negative/safety cases |
 |---|---|---|
 | Type/member | reference projection; dynamic referent refinement; shared dimension identities | every cross-kind projection/refinement; numeric use of a reference |
-| Primitive ordering | create/read; write/read; swap old/new; ordered accumulates; interleaved roots | type mismatch; use/view after freeze |
+| Primitive ordering | create/read; write/read; swap old/new; ordered accumulates; interleaved roots | promoted/broadcast replacement; update result type change; dynamic extent change in MVP; use/view after freeze |
 | Aliases/views | base/view mutual observation; composed and disjoint views share root | implicit alias; escaping view; unsupported transform/overlap |
 | Effects/liveness | unused write retained; read/write order; I/O plus state | folding, DCE, duplication, speculation, rematerialization |
 | Straight-line discharge | each primitive; one/two roots; local/external; read-only/mutated | unresolved root; partial replay on validation failure |
