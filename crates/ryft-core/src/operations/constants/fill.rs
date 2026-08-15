@@ -3,7 +3,7 @@ use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
+use crate::operations::manipulation::broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
 use crate::operations::manipulation::conversion::ConvertElementType;
 use crate::operations::memory::TransferToMemory;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
@@ -12,10 +12,10 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
-/// Represents the ability to synthesize a value filled with one typed host literal. Array implementations encode the
-/// literal as a rank-zero [`Array`], convert it to the requested element type and memory, and use ordinary broadcasting
-/// for every rank-positive result. This keeps the fill value explicit in Static Single Assignment (SSA) dataflow and
-/// avoids a separate array-fill operation.
+/// Represents the ability to synthesize a value filled with one typed host literal. [`ArrayType`] implementations
+/// encode the literal as a rank-zero array, convert it to the requested element [`DataType`](crate::DataType) and
+/// [`Memory`](crate::Memory), and use ordinary broadcasting for every rank-positive result. This keeps the fill value
+/// explicit in Static Single Assignment (SSA) dataflow and avoids the need for a separate array fill operation type.
 pub trait Fill<S, V: Typed> {
     /// Returns a value of [`Type`] `type` with every element it holds set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
@@ -25,8 +25,8 @@ impl<S: ArrayElement, O: Operation<Type = ArrayType>> Fill<S, Array> for EagerCo
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<Array, ProgramError> {
         if r#type.static_shape().is_none() {
             return Err(TypeError::invalid(format!(
-                "cannot materialize a value of dynamically sized type {}; stage a rank-zero fill in an array program \
-                 over 'ArrayIrOperation' and expand it with 'dynamic_broadcast' instead",
+                "cannot materialize a value of dynamically sized type {}; stage a rank-zero fill \
+                 and expand it with a dynamic '{BROADCAST_OPERATION_NAME}' operation instead",
                 r#type,
             ))
             .into());
@@ -38,39 +38,20 @@ impl<S: ArrayElement, O: Operation<Type = ArrayType>> Fill<S, Array> for EagerCo
     }
 }
 
-/// Context-level implementation used by the generic transform forwarding below.
-pub(crate) trait FillContext<S, T: Type>: Context<Type = T> {
-    /// Materializes one value with `type` filled by `value`.
-    fn fill_literal(&self, r#type: &T, value: S) -> Result<Self::Value, ProgramError>;
-}
-
-impl<S: ArrayElement, C: Context<Type = ArrayType>> FillContext<S, ArrayType> for C
-where
-    C::Value: Broadcast,
-    C::Operation: From<ConstantOperation<Array>> + From<BroadcastOperation>,
-{
-    fn fill_literal(&self, r#type: &ArrayType, value: S) -> Result<Self::Value, ProgramError> {
-        let literal =
-            Array::scalar(value).convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
-        let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
-        scalar.broadcast(r#type.clone(), &[])
-    }
-}
-
 impl<S, C: Context, T: Type> Fill<S, <C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
 where
     C::Value: ValueProjection<T, Projected: Value<Type = T>>,
     C::Constant: ValueProjection<T, Projected: Value<Type = T>>,
     C::Operation: OperationProjection<T>,
-    ProjectedContext<C, T>: Context<Type = T, Value = <C::Value as ValueProjection<T>>::Projected> + FillContext<S, T>,
+    ProjectedContext<C, T>: Context<Type = T, Value = <C::Value as ValueProjection<T>>::Projected> + FillLiteral<S, T>,
 {
     #[inline]
     fn fill(&self, r#type: &T, value: S) -> Result<<C::Value as ValueProjection<T>>::Projected, ProgramError> {
-        <ProjectedContext<C, T> as FillContext<S, T>>::fill_literal(self, r#type, value)
+        <ProjectedContext<C, T> as FillLiteral<S, T>>::fill_literal(self, r#type, value)
     }
 }
 
-impl<S, T: Type, C: StagingContext<Type = T> + FillContext<S, T>> Fill<S, Tracer<C>> for C {
+impl<S, T: Type, C: StagingContext<Type = T> + FillLiteral<S, T>> Fill<S, Tracer<C>> for C {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<Tracer<C>, ProgramError> {
         self.fill_literal(r#type, value)
@@ -81,11 +62,11 @@ impl<S, T: Type, C: Context<Type = T>> Fill<S, PartialTracer<C>> for PartialEval
 where
     C::Operation:
         PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    PartialEvaluationContext<C>: Context<Type = T, Value = PartialTracer<C>> + FillContext<S, T>,
+    PartialEvaluationContext<C>: Context<Type = T, Value = PartialTracer<C>> + FillLiteral<S, T>,
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<PartialTracer<C>, ProgramError> {
-        <PartialEvaluationContext<C> as FillContext<S, T>>::fill_literal(self, r#type, value)
+        <PartialEvaluationContext<C> as FillLiteral<S, T>>::fill_literal(self, r#type, value)
     }
 }
 
@@ -106,6 +87,31 @@ impl<S, C: Context<Type: DifferentiableType> + Fill<S, C::Value>> Fill<S, Differ
     fn fill(&self, r#type: &C::Type, value: S) -> Result<DifferentiationTracer<C>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
+    }
+}
+
+/// Internal recipe for implementing [`Fill`] by embedding a typed host literal in the active [`Context`].
+///
+/// For arrays, the implementation converts `value` into a rank-zero [`Array`] and binds it as a
+/// [`ConstantOperation`], then broadcasts that scalar to the requested type. The [`Array`] is only a portable literal
+/// payload: a backend context interprets or lowers the constant into its own runtime value. It is distinct from the
+/// context's [`Domain::Constant`](crate::Domain::Constant) representation, which stores lifted constants and program
+/// captures.
+trait FillLiteral<S, T: Type>: Context<Type = T> {
+    /// Embeds `value` as a host literal and expands it to a value of `type` in this context.
+    fn fill_literal(&self, r#type: &T, value: S) -> Result<Self::Value, ProgramError>;
+}
+
+impl<S: ArrayElement, C: Context<Type = ArrayType>> FillLiteral<S, ArrayType> for C
+where
+    C::Value: Broadcast,
+    C::Operation: From<ConstantOperation<Array>> + From<BroadcastOperation>,
+{
+    fn fill_literal(&self, r#type: &ArrayType, value: S) -> Result<Self::Value, ProgramError> {
+        let literal =
+            Array::scalar(value).convert_element_type(r#type.data_type())?.transfer_to_memory(r#type.memory());
+        let scalar = self.bind(ConstantOperation::new(literal), Vec::new(), &[])?.remove(0);
+        scalar.broadcast(r#type.clone(), &[])
     }
 }
 

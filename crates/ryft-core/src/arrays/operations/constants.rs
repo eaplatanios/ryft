@@ -493,7 +493,7 @@ impl OneLike for Array {
     }
 }
 
-impl<O: Operation<Type = ArrayType>> crate::operations::constants::Iota<Array> for EagerContext<Array, O> {
+impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
         if !r#type.data_type().is_numeric() {
             return Err(TypeError::invalid(format!(
@@ -1517,8 +1517,8 @@ mod tests {
         ));
         assert_eq!(
             context.fill(&dynamic_type, 42.0f64).unwrap_err().to_string(),
-            "cannot materialize a value of dynamically sized type f64[dynamic, 3]; stage a rank-zero fill in an array \
-             program over 'ArrayIrOperation' and expand it with 'dynamic_broadcast' instead",
+            "cannot materialize a value of dynamically sized type f64[dynamic, 3]; stage a rank-zero fill and expand \
+             it with a dynamic 'broadcast' operation instead",
         );
         assert_eq!(
             context.iota(&dynamic_type, 1).unwrap_err().to_string(),
