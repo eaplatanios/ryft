@@ -56,8 +56,8 @@
 //!
 //! Differentiation captures are not static arguments and do not embed host values into a trace. They retain their
 //! runtime types, shapes, shardings, and placement, and changing capture values alone does not specialize the
-//! computation. They also differ from [`stop_gradient`](crate::stop_gradient), which blocks derivative flow but leaves
-//! the stopped value inside the active parameter structure and its derivative bookkeeping. Finally, they differ from
+//! computation. They also differ from [`StopGradients::stop_gradients`], which blocks derivative flow but leaves the
+//! stopped value inside the active parameter structure and its derivative bookkeeping. Finally, they differ from
 //! [`ClosedProgram`](crate::ClosedProgram) and Just-In-Time (JIT) compilation captures as those hide lifted runtime
 //! values from a compiled function's public signature, whereas differentiation captures are explicit inputs to the
 //! binary closure. Auxiliary outputs are similarly runtime outputs rather than differentiation variables. They remain
@@ -168,7 +168,7 @@ pub use jacobian::{Jacobian, JacobianBlock};
 pub use operations::{
     COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOperation, CustomJvp, CustomJvpOperation, CustomVjp,
     CustomVjpOperation, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
-    custom_jvp, custom_vjp, stop_gradient,
+    StopGradients, custom_jvp, custom_vjp,
 };
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, transpose_mixed_operation,
@@ -476,7 +476,7 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///     [`Parameterized`] structures. For example, a derived model struct can be active while a tuple containing
 ///     batches, targets, and optional runtime state is captured. The builder reparameterizes both structures from
 ///     runtime leaves to the terminal function's tracer leaves before invoking the closure. Unlike
-///     [`stop_gradient`](crate::stop_gradient()), captures do not allocate any gradient, Jacobian, or Hessian values.
+///     [`StopGradients::stop_gradients`], captures do not allocate any gradient, Jacobian, or Hessian values.
 ///     They are also distinct from compilation captures stored by [`ClosedProgram`](crate::ClosedProgram).
 ///     Differentiation captures remain explicit runtime inputs to the function being differentiated, and changing their
 ///     values does not make them static specialization arguments. Captures follow the same operational validity rules

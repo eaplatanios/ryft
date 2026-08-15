@@ -64,9 +64,9 @@ pub use differentiation::{
     ForwardModeDifferentiate, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock,
     LinearCallOperation, Linearization, LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward,
     RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, STOP_GRADIENT_OPERATION_NAME, StopGradient,
-    StopGradientOperation, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
+    StopGradientOperation, StopGradients, TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands,
     WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
-    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation, stop_gradient,
+    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation,
     transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};

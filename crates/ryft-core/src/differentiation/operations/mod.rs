@@ -16,7 +16,7 @@ pub use coordinate_basis::{COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOpera
 pub use custom_jvp::{CUSTOM_JVP_OPERATION_NAME, CustomJvp, CustomJvpOperation, custom_jvp};
 pub use custom_vjp::{CUSTOM_VJP_OPERATION_NAME, CustomVjp, CustomVjpOperation, custom_vjp};
 pub use linear_call::LinearCallOperation;
-pub use stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, stop_gradient};
+pub use stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients};
 
 #[cfg(test)]
 mod tests {
