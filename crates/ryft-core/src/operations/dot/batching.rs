@@ -135,7 +135,7 @@ where
                 output_ragged_axes.push(ragged_axis.clone().relocated(output_axes[index].as_slice()).ok_or_else(
                     || BatchingError::UnsupportedOperation {
                         message: format!(
-                            "'{DOT_OPERATION_NAME}' contracts an axis carrying the per-item extents of bounded ragged \
+                            "`{DOT_OPERATION_NAME}` contracts an axis carrying the per-item extents of bounded ragged \
                              dimension `{}`",
                             ragged_axis.dimension(),
                         ),

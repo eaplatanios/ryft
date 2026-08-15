@@ -1205,8 +1205,8 @@ mod tests {
                 &[],
             ),
             Err(TypeError::invalid(
-                "'custom_call' output-extent operand defines dimension variable 'columns', but the corresponding \
-                 declared output axis refers to 'rows'",
+                "`custom_call` output-extent operand defines dimension variable `columns`, but the corresponding \
+                 declared output axis refers to `rows`",
             )),
         );
         assert_eq!(

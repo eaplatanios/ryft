@@ -164,7 +164,7 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
             infer_array_ir_concatenation(input_types, Axis::from(self.axis))?;
         if !self.requires_runtime_assertion && requires_runtime_assertion {
             return Err(TypeError::invalid(format!(
-                "'{}' was constructed for an operand signature that proves its result extent, but the provided input \
+                "`{}` was constructed for an operand signature that proves its result extent, but the provided input \
                  types require a runtime extent check",
                 CONCATENATE_OPERATION_NAME,
             )));
@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(
             proven_operation.infer_output_types(&dynamic_input_types, &[]),
             Err(TypeError::invalid(format!(
-                "'{}' was constructed for an operand signature that proves its result extent, but the provided input \
+                "`{}` was constructed for an operand signature that proves its result extent, but the provided input \
                  types require a runtime extent check",
                 CONCATENATE_OPERATION_NAME,
             ))),

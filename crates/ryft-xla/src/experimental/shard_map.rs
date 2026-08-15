@@ -39,8 +39,8 @@ pub(crate) enum ShardMapError {
 
     /// Error returned when a partitioned dimension uses a free axis more major than a manual axis.
     #[error(
-        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis '{free_axis_name}' \
-         more major than manual axis '{manual_axis_name}'"
+        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis `{free_axis_name}` \
+         more major than manual axis `{manual_axis_name}`"
     )]
     ManualAxisMustPrecedeFreeAxis {
         value_kind: &'static str,
@@ -84,8 +84,8 @@ pub enum ShardMapTraceError {
 
     /// Error returned when a partitioned dimension uses a free axis more major than a manual axis.
     #[error(
-        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis '{free_axis_name}' \
-         more major than manual axis '{manual_axis_name}'"
+        "{value_kind} sharding #{value_index} dimension #{dimension} uses free axis `{free_axis_name}` \
+         more major than manual axis `{manual_axis_name}`"
     )]
     ManualAxisMustPrecedeFreeAxis {
         value_kind: &'static str,

@@ -7130,7 +7130,7 @@ fn mesh_axis_replica_groups(
     let Some(shard_map) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "collective over axis '{axis_name}' can only be lowered inside a \
+                "collective over axis `{axis_name}` can only be lowered inside a \
                      {SHARD_MAP_OPERATION_NAME} manual region",
             ),
         }
@@ -7190,7 +7190,7 @@ fn collective_replica_groups(
                     .map(|&index| {
                         mesh_group.get(index).copied().ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
-                                "collective over axis '{axis_name}' has group member {index} outside axis size \
+                                "collective over axis `{axis_name}` has group member {index} outside axis size \
                                  {mesh_axis_size}",
                             ))
                         })
@@ -7488,7 +7488,7 @@ fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     let Some(shard_map) = collective_state.manual_shard_map() else {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "{AXIS_INDEX_OPERATION_NAME} for axis '{axis_name}' can only be lowered inside a \
+                "{AXIS_INDEX_OPERATION_NAME} for axis `{axis_name}` can only be lowered inside a \
                  {SHARD_MAP_OPERATION_NAME} manual region",
             ),
         }
@@ -11447,8 +11447,8 @@ mod tests {
         assert_eq!(
             lower_custom_call_layout(&invalid_permutation_type),
             Err(LoweringError::UnsupportedOp {
-                op: "custom_call with invalid array layout 'tiled{0,0}' for rank-2 type \
-                     'f32[2, 3][layout=tiled{0,0}]'"
+                op: "custom_call with invalid array layout `tiled{0,0}` for rank-2 type \
+                     `f32[2, 3][layout=tiled{0,0}]`"
                     .to_string(),
             }),
         );

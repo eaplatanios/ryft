@@ -418,7 +418,7 @@ fn validate_dynamic_shape_slice(
 ) -> Result<(), String> {
     let stride = i64::try_from(stride).map_err(|_| {
         format!(
-            "'{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}' stride is outside the portable dimension range on axis \
+            "`{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` stride is outside the portable dimension range on axis \
                  {axis}",
         )
     })?;
