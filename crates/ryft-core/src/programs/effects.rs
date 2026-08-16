@@ -1,7 +1,8 @@
 /// Named class of observable _effects_ that an [`Operation`](crate::Operation) can have. Effect classes exist because
 /// [`Program`](crate::Program) transforms and backend lowering can have behavior conditional on those classes. For
-/// example, XLA lowering threads one StableHLO token chain per ordered effect class to preserve execution order,
-/// mirroring [JAX's side effect sequencing design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html).
+/// example, XLA lowering threads StableHLO token chains for backend-supported ordered classes to preserve execution
+/// order, mirroring [JAX's design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html). Ordered
+/// reference state is instead discharged before ordinary XLA lowering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// Observable runtime assertion whose execution order relative to other
@@ -19,11 +20,15 @@ pub enum Effect {
     /// observable. Operations with this effect must not be folded away or get eliminated, but independent unordered-I/O
     /// effects may execute in any order.
     UnorderedIo,
+
+    /// Observable access to unresolved reference state. Reference operations must be validated and discharged before
+    /// reaching a backend. This distinct ordered class prevents generic transforms from treating mutation like I/O.
+    OrderedState,
 }
 
 impl Effect {
     /// All declared [`Effect`] classes, in bit order, backing [`Effects`]'s [`IntoIterator`] implementation.
-    const ALL: [Effect; 3] = [Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo];
+    const ALL: [Effect; 4] = [Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo, Effect::OrderedState];
 
     /// Returns the bit representing this [`Effect`] class inside an [`Effects`] set.
     #[inline]
@@ -32,6 +37,7 @@ impl Effect {
             Effect::OrderedAssertion => 1 << 0,
             Effect::OrderedIo => 1 << 1,
             Effect::UnorderedIo => 1 << 2,
+            Effect::OrderedState => 1 << 3,
         }
     }
 
@@ -40,7 +46,7 @@ impl Effect {
     #[inline]
     pub const fn is_ordered(self) -> bool {
         match self {
-            Effect::OrderedAssertion | Effect::OrderedIo => true,
+            Effect::OrderedState | Effect::OrderedAssertion | Effect::OrderedIo => true,
             Effect::UnorderedIo => false,
         }
     }
@@ -56,8 +62,8 @@ impl Effect {
 ///     alive even when no program output consumes their results.
 ///   - [Ordered](Self::is_ordered) effect classes additionally promise that the relative execution order of same-class
 ///     instructions is preserved. Transforms that would interleave or reorder such instructions with respect to each
-///     other must keep them on one side of any split they introduce, and XLA lowering threads one StableHLO token
-///     chain per ordered class.
+///     other must keep them on one side of any split they introduce. For example, XLA lowering threads StableHLO token
+///     chains for the ordered classes it supports directly and rejects unresolved ordered reference state.
 ///
 /// The classification of a whole [`Program`](crate::Program) is the [`union`](Self::union) of its instructions'
 /// classifications and can be obtained via [`Program::effects`](crate::Program::effects). This is also what nested
@@ -162,13 +168,15 @@ mod tests {
         assert!(!Effects::PURE.contains(Effect::OrderedAssertion));
         assert!(!Effects::PURE.contains(Effect::OrderedIo));
         assert!(!Effects::PURE.contains(Effect::UnorderedIo));
+        assert!(!Effects::PURE.contains(Effect::OrderedState));
         assert!(!Effects::PURE.is_ordered());
         assert_eq!(Effects::PURE.into_iter().collect::<Vec<_>>(), Vec::<Effect>::new());
 
-        // A singleton set contains only its effect, and both ordered classes report observable ordering.
+        // A singleton set contains only its effect, and every ordered class reports observable ordering.
         let assertion = Effects::single(Effect::OrderedAssertion);
         let ordered_io = Effects::single(Effect::OrderedIo);
         let unordered = Effects::single(Effect::UnorderedIo);
+        let ordered_state = Effects::single(Effect::OrderedState);
         assert!(!assertion.is_pure());
         assert!(assertion.contains(Effect::OrderedAssertion));
         assert!(!assertion.contains(Effect::OrderedIo));
@@ -180,14 +188,18 @@ mod tests {
         assert!(ordered_io.is_ordered());
         assert!(!unordered.is_pure());
         assert!(!unordered.is_ordered());
+        assert!(!ordered_state.is_pure());
+        assert!(ordered_state.contains(Effect::OrderedState));
+        assert!(ordered_state.is_ordered());
         assert_eq!(assertion.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedAssertion]);
         assert_eq!(ordered_io.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedIo]);
         assert_eq!(unordered.into_iter().collect::<Vec<_>>(), vec![Effect::UnorderedIo]);
+        assert_eq!(ordered_state.into_iter().collect::<Vec<_>>(), vec![Effect::OrderedState]);
 
         // Union is commutative and idempotent, `PURE` is its identity element, and the combined set contains every
         // class and iterates in declaration order.
-        let all = assertion.union(ordered_io).union(unordered);
-        assert_eq!(all, unordered.union(ordered_io).union(assertion));
+        let all = assertion.union(ordered_io).union(unordered).union(ordered_state);
+        assert_eq!(all, unordered.union(ordered_io).union(assertion).union(ordered_state));
         assert_eq!(all.union(all), all);
         assert_eq!(all.union(Effects::PURE), all);
         assert_eq!(Effects::PURE.union(assertion), assertion);
@@ -195,10 +207,11 @@ mod tests {
         assert!(all.contains(Effect::OrderedAssertion));
         assert!(all.contains(Effect::OrderedIo));
         assert!(all.contains(Effect::UnorderedIo));
+        assert!(all.contains(Effect::OrderedState));
         assert!(all.is_ordered());
         assert_eq!(
             all.into_iter().collect::<Vec<_>>(),
-            vec![Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo],
+            vec![Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo, Effect::OrderedState],
         );
 
         // Equality distinguishes distinct sets, self-equality holds for rebuilt sets, and hashing supports map lookups.
@@ -210,7 +223,7 @@ mod tests {
         let lookup = HashMap::from([(assertion, "assertion"), (ordered_io, "ordered I/O"), (all, "all")]);
         assert_eq!(lookup.get(&Effects::single(Effect::OrderedAssertion)), Some(&"assertion"));
         assert_eq!(lookup.get(&Effects::single(Effect::OrderedIo)), Some(&"ordered I/O"));
-        assert_eq!(lookup.get(&unordered.union(ordered_io).union(assertion)), Some(&"all"));
+        assert_eq!(lookup.get(&unordered.union(ordered_io).union(assertion).union(ordered_state)), Some(&"all"));
         assert_eq!(lookup.get(&unordered), None);
     }
 }
