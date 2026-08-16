@@ -1158,7 +1158,9 @@ where
         let operands = &inputs[1..];
         let output_types = true_branch.output_types();
         let output_count = output_types.len();
-        let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        let tangent_output_count = output_types.iter().try_fold(0usize, |count, r#type| {
+            Ok::<_, DifferentiationError>(count + usize::from(!r#type.tangent()?.is_zero_space()))
+        })?;
 
         // Build both fused jvp branches — through each branch region's retained transform cache, so that a branch
         // shared by several programs is differentiated once — and stage one fused conditional over the predicate
@@ -1192,8 +1194,8 @@ where
             .cloned()
             .zip(output_types)
             .map(|(primal, output_type)| {
-                if output_type.tangent().is_zero_space() {
-                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                if output_type.tangent()?.is_zero_space() {
+                    DifferentiationDual::new_with_zero_tangent(primal)
                 } else {
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
                 }
@@ -1266,13 +1268,13 @@ where
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs
+        return inputs
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                Ok(MaybeZero::Zero(input_type.cotangent()?))
             })
-            .collect());
+            .collect();
     }
 
     // The rule operates on the attached branch regions through its driver (region 0 is the `true` branch and region 1
@@ -1352,15 +1354,15 @@ where
     let cotangents = operand_linear
         .iter()
         .zip(inputs)
-        .map(|(&linear, input)| {
+        .map(|(&linear, input)| -> Result<_, DifferentiationError> {
             if linear {
-                branch_cotangents.next().unwrap()
+                Ok(branch_cotangents.next().unwrap())
             } else {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                Ok(MaybeZero::Zero(input_type.cotangent()?))
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(cotangents)
 }
 

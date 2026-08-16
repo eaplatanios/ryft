@@ -2231,10 +2231,16 @@ where
         // construction filtered on.
         let (input_has_tangent, output_has_tangent) = {
             let body = driver.region(0)?;
-            let input_has_tangent =
-                body.input_types().iter().map(|r#type| !r#type.tangent().is_zero_space()).collect::<Vec<_>>();
-            let output_has_tangent =
-                body.output_types().iter().map(|r#type| !r#type.tangent().is_zero_space()).collect::<Vec<_>>();
+            let input_has_tangent = body
+                .input_types()
+                .iter()
+                .map(|r#type| Ok(!r#type.tangent()?.is_zero_space()))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?;
+            let output_has_tangent = body
+                .output_types()
+                .iter()
+                .map(|r#type| Ok(!r#type.tangent()?.is_zero_space()))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?;
             (input_has_tangent, output_has_tangent)
         };
         let body_input_count = input_has_tangent.len();
@@ -2305,7 +2311,7 @@ where
             jvp_outputs.push(if input_has_tangent[index] {
                 DifferentiationDual::new(outputs[index].clone(), carry_tangents.next().unwrap())?
             } else {
-                DifferentiationDual::new_with_zero_tangent(outputs[index].clone())
+                DifferentiationDual::new_with_zero_tangent(outputs[index].clone())?
             });
         }
         let mut stacked_tangents = outputs[stacked_tangents_start..].iter().cloned();
@@ -2316,7 +2322,7 @@ where
                     stacked_tangents.next().unwrap(),
                 )?
             } else {
-                DifferentiationDual::new_with_zero_tangent(outputs[stacked_primals_start + index].clone())
+                DifferentiationDual::new_with_zero_tangent(outputs[stacked_primals_start + index].clone())?
             });
         }
         Ok(jvp_outputs)
@@ -2531,7 +2537,7 @@ where
     D: TranspositionDriver<V, Target>,
 {
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+        return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
     }
     if operation.captures().is_empty() {
         return transpose_primal_scan(operation, context, driver, inputs, outputs).map_err(DifferentiationError::from);
@@ -2578,7 +2584,12 @@ where
     )?;
     check_count!("output", cotangents, body_inputs.len(), ProgramError);
     let mut cotangents = cotangents.into_iter().map(MaybeZero::Value).collect::<Vec<_>>();
-    cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
+    cotangents.extend(
+        runtime_length_inputs
+            .iter()
+            .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?,
+    );
     Ok(cotangents)
 }
 
@@ -2638,13 +2649,13 @@ where
 {
     // A scan with only zero output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs
+        return inputs
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                Ok(MaybeZero::Zero(input_type.cotangent()?))
             })
-            .collect());
+            .collect();
     }
 
     // Operand layout is `[carries..., scanned_inputs...]`, mirroring the body's input order one-to-one, where each
@@ -2738,7 +2749,7 @@ where
         }
     }
     for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
-        if !output_type.cotangent().is_zero_space() {
+        if !output_type.cotangent()?.is_zero_space() {
             operands.push(O::materialize_zero_from_residual_sources(context, cotangent.clone(), geometry_sources())?);
         }
     }
@@ -2790,19 +2801,24 @@ where
         .iter()
         .zip(scan_inputs)
         .enumerate()
-        .map(|(index, (&linear, input))| {
+        .map(|(index, (&linear, input))| -> Result<_, DifferentiationError> {
             if index < carry_count {
                 let cotangent = scan_cotangents.next().unwrap();
-                if linear { MaybeZero::Value(cotangent) } else { MaybeZero::Zero(input.r#type().cotangent()) }
+                Ok(if linear { MaybeZero::Value(cotangent) } else { MaybeZero::Zero(input.r#type().cotangent()?) })
             } else if linear {
-                MaybeZero::Value(scan_cotangents.next().unwrap())
+                Ok(MaybeZero::Value(scan_cotangents.next().unwrap()))
             } else {
-                MaybeZero::Zero(input.r#type().cotangent())
+                Ok(MaybeZero::Zero(input.r#type().cotangent()?))
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let mut cotangents = cotangents;
-    cotangents.extend(runtime_length_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
+    cotangents.extend(
+        runtime_length_inputs
+            .iter()
+            .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?,
+    );
     Ok(cotangents)
 }
 
@@ -2822,7 +2838,10 @@ where
     let output_cotangent_positions = body_output_types
         .iter()
         .enumerate()
-        .map(|(position, output_type)| (!output_type.cotangent().is_zero_space()).then_some(position))
+        .map(|(position, output_type)| Ok((position, output_type.cotangent()?)))
+        .collect::<Result<Vec<_>, DifferentiationError>>()?
+        .into_iter()
+        .map(|(position, cotangent_type)| (!cotangent_type.is_zero_space()).then_some(position))
         .collect::<Vec<_>>();
     let known_input_positions = operand_linear
         .iter()
@@ -4069,8 +4088,8 @@ mod tests {
         let key_type = ArrayIrType::Array(ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Dynamic(extent)])));
         let accumulator_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
         let mut builder = ProgramBuilder::<CompositeValue, CompositeOperation>::new();
-        let _key_cotangent = builder.add_input(key_type.cotangent());
-        let accumulator_cotangent = builder.add_input(accumulator_type.cotangent());
+        let _key_cotangent = builder.add_input(key_type.cotangent().unwrap());
+        let accumulator_cotangent = builder.add_input(accumulator_type.cotangent().unwrap());
         let _known_key = builder.add_input(key_type.clone());
         let transposed = builder
             .build::<Vec<CompositeValue>, Vec<CompositeValue>>(

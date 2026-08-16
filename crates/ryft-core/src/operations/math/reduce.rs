@@ -517,7 +517,7 @@ where
                 };
                 let primal = reduce(inputs[0].primal());
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                     MaybeZero::Value(tangent) => MaybeZero::Value(reduce(tangent)),
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -533,7 +533,7 @@ where
                 let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_primal, ComparisonDirection::Equal)?;
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                     MaybeZero::Value(input_tangent) => {
                         let numeric_mask = mask.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                         let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
@@ -597,7 +597,7 @@ where
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
                 let mut residuals = LinearResiduals::new();
                 let operand_shape = residuals.retain_shape(context, operand.primal())?;
@@ -627,7 +627,7 @@ where
                         let numeric_mask = context
                             .bind(
                                 <C::Operation as OperationProjection<ArrayType>>::Projected::from(
-                                    ConvertElementTypeOperation::new(operand_type.tangent().data_type()),
+                                    ConvertElementTypeOperation::new(operand_type.tangent()?.data_type()),
                                 ),
                                 Vec::new(),
                                 &[mask],
@@ -663,7 +663,7 @@ where
                         let forward_axes = self.axes().to_vec();
                         let transpose_shape = operand_shape.clone();
                         let transpose_output_axes = output_axes.clone();
-                        let transpose_target_type = operand_type.cotangent();
+                        let transpose_target_type = operand_type.cotangent()?;
                         let tangent = LinearCallOperation::stage(
                             context,
                             residuals.into_values(),
@@ -715,7 +715,7 @@ where
                     }
                     kind @ (ReductionKind::Sum | ReductionKind::Mean) => {
                         let forward_operation = self.clone();
-                        let transpose_operand_type = operand_type.cotangent();
+                        let transpose_operand_type = operand_type.cotangent()?;
                         let transpose_axes = self.axes().to_vec();
                         let transpose_output_axes =
                             output_to_input_axis_map(transpose_operand_type.rank(), &transpose_axes);
@@ -836,7 +836,7 @@ where
         let input_type = inputs[0].r#type();
         let input_shape = input_type.shape();
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent()?)]),
             MaybeZero::Value(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
                     // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
@@ -854,7 +854,7 @@ where
                         .into());
                     }
 
-                    let output_type = input_type.cotangent();
+                    let output_type = input_type.cotangent()?;
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
                     let cotangent_input = match self.kind {

@@ -978,8 +978,7 @@ where
                 .collect::<Result<Vec<_>, _>>()?,
         )
         .map_err(ProgramError::from)?;
-        let tangent_signature =
-            input_signature.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
+        let tangent_signature = input_signature.clone().try_map_parameters(|r#type| r#type.tangent())?;
         let mesh = self.mesh().clone();
         let captures = self
             .source_program()
@@ -2615,7 +2614,7 @@ mod tests {
 
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
         let primal_type = ArrayType::new(DataType::Boolean, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
-        let tangent_type = primal_type.tangent();
+        let tangent_type = primal_type.tangent().unwrap();
         let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|value| value, primal_type.clone(), &engine, mesh.clone()).unwrap();
         let jvp: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = primal.jvp(&engine).unwrap();

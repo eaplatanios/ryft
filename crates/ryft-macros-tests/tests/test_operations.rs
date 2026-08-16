@@ -1508,10 +1508,10 @@ mod mixed_members {
             Ok(inputs
                 .iter()
                 .map(|input| match input {
-                    PartialValue::Unknown(_) => outputs[0].clone(),
-                    PartialValue::Known(_) => MaybeZero::Zero(input.r#type().cotangent()),
+                    PartialValue::Unknown(_) => Ok(outputs[0].clone()),
+                    PartialValue::Known(_) => input.r#type().cotangent().map(MaybeZero::Zero),
                 })
-                .collect())
+                .collect::<Result<Vec<_>, _>>()?)
         }
     }
 
@@ -1591,7 +1591,7 @@ mod mixed_members {
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ryft::DifferentiationError> {
-            Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect())
+            inputs.iter().map(|input| input.r#type().cotangent().map(MaybeZero::Zero)).collect()
         }
     }
 
@@ -1651,11 +1651,11 @@ mod mixed_members {
             // The fixture's member family is only the projection target of this operation family, so its
             // parent-universe rule stages the member instruction and reports constant outputs.
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            Ok(context
+            context
                 .bind(self.clone(), Vec::new(), primals.as_slice())?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
-                .collect())
+                .collect()
         }
     }
 
@@ -1730,7 +1730,7 @@ mod mixed_members {
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
-        let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent();
+        let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent().unwrap();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
     }
@@ -1756,7 +1756,7 @@ mod mixed_members {
         let MaybeZero::Value(array_tangent) = duals[0].tangent() else {
             panic!("an array output of a structural mixed payload stages a member zero tangent: {duals:?}");
         };
-        assert_eq!(array_tangent.r#type().as_ref(), &ArrayIrType::from(array_type.tangent()));
+        assert_eq!(array_tangent.r#type().as_ref(), &ArrayIrType::from(array_type.tangent().unwrap()));
         assert!(matches!(duals[1].tangent(), MaybeZero::Zero(_)));
 
         // The staged program holds the primal instruction plus exactly one staged array zero tangent.

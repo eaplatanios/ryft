@@ -470,7 +470,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().reshape(operation.parameters().clone())?;
             let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(operation.parameters().clone())?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -485,7 +485,7 @@ impl_differentiable_operation! {
         |operation, _context, _driver, inputs, outputs| {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            let input_cotangent_type = inputs[0].r#type().cotangent();
+            let input_cotangent_type = inputs[0].r#type().cotangent()?;
             let permuted_input_cotangent_type = match operation.parameters().dimensions() {
                 Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
                 None => input_cotangent_type.clone(),
@@ -545,10 +545,10 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = match array.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(array_tangent) => {
                 let input_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.clone();
-                let input_cotangent_type = input_type.cotangent();
+                let input_cotangent_type = input_type.cotangent()?;
                 let permuted_input_cotangent_type = match self.dimensions() {
                     Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
                     None => input_cotangent_type.clone(),
@@ -676,7 +676,7 @@ where
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent();
+        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
         let permuted_input_cotangent_type = match self.dimensions() {
             Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
             None => input_cotangent_type.clone(),
@@ -710,7 +710,12 @@ where
         }
         let operation = <O as OperationProjection<ArrayType>>::Projected::from(ReshapeOperation::new(parameters));
         let mut cotangents = transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs)?;
-        cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+        cotangents.extend(
+            output_extents
+                .iter()
+                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         Ok(cotangents)
     }
 }

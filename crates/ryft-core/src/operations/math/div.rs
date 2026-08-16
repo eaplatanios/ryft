@@ -288,7 +288,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(0.0), Array::scalar(smallest_positive)).unwrap(),
-                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive)),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(smallest_positive)).unwrap(),
                 ],
             )
             .unwrap();

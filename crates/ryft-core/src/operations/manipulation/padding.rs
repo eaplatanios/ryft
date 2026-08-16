@@ -440,8 +440,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
             ]),
             MaybeZero::Value(cotangent) => {
                 let input_cotangent = if inputs[0].is_unknown() {
@@ -512,15 +512,15 @@ where
                     let slice = SliceOperation::new(vec![0; rank], limit_indices).with_strides(strides)?;
                     let mut sliced = context.stage_operation(slice, Vec::new(), std::slice::from_ref(&unpadded))?;
                     check_count!("output", sliced, 1, ProgramError);
-                    MaybeZero::Value(sliced.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent())?)
+                    MaybeZero::Value(sliced.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent()?)?)
                 } else {
-                    MaybeZero::Zero(inputs[0].r#type().cotangent())
+                    MaybeZero::Zero(inputs[0].r#type().cotangent()?)
                 };
                 let padding_value_cotangent = if inputs[1].is_unknown() {
                     let mask_input_type =
-                        inputs[0].r#type().cotangent().with_data_type(DataType::Boolean).with_layout(None);
+                        inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
                     let mask_padding_type =
-                        inputs[1].r#type().cotangent().with_data_type(DataType::Boolean).with_layout(None);
+                        inputs[1].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
                     let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
                     let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
                     let mut mask_padding =
@@ -543,9 +543,9 @@ where
                         &[selected.remove(0)],
                     )?;
                     check_count!("output", reduced, 1, ProgramError);
-                    MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent())?)
+                    MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent()?)?)
                 } else {
-                    MaybeZero::Zero(inputs[1].r#type().cotangent())
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?)
                 };
                 Ok(vec![input_cotangent, padding_value_cotangent])
             }
@@ -590,7 +590,7 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
             let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
             let mut tangent_inputs = array_inputs
@@ -603,7 +603,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let operand_cotangent_type =
-                <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent();
+                <&ArrayType>::try_from(array_inputs[0].primal().r#type().as_ref())?.cotangent()?;
             if operand_cotangent_type
                 .shape()
                 .dimensions()
@@ -621,8 +621,8 @@ where
                 let transpose_operation = self.clone();
                 let transpose_operand_type = operand_cotangent_type.clone();
                 let transpose_padding_type =
-                    <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent();
-                let transpose_output_type = <&ArrayType>::try_from(primal.r#type().as_ref())?.cotangent();
+                    <&ArrayType>::try_from(array_inputs[1].primal().r#type().as_ref())?.cotangent()?;
+                let transpose_output_type = <&ArrayType>::try_from(primal.r#type().as_ref())?.cotangent()?;
                 let tangent = LinearCallOperation::stage(
                     context,
                     residuals.into_values(),
@@ -896,7 +896,12 @@ where
         let operation =
             <O as OperationProjection<ArrayType>>::Projected::from(PadOperation::<ArrayType>::from(self.clone()));
         let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
-        cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+        cotangents.extend(
+            output_extents
+                .iter()
+                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         Ok(cotangents)
     }
 }

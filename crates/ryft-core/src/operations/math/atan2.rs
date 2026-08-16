@@ -49,7 +49,7 @@ impl_differentiable_operation! {
             let y = &inputs[0];
             let x = &inputs[1];
             let primal = y.primal().atan2(x.primal())?;
-            let target = primal.r#type().tangent();
+            let target = primal.r#type().tangent()?;
             let has_y_tangent = y.tangent().as_value().is_some();
             let has_x_tangent = x.tangent().as_value().is_some();
             if !has_y_tangent && !has_x_tangent {

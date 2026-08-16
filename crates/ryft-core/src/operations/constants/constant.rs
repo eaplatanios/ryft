@@ -200,7 +200,7 @@ impl<C: Context<Type: DifferentiableType>> Constant<DifferentiationTracer<C>, C:
 {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().lift(value)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().lift(value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

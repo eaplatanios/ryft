@@ -305,7 +305,7 @@ pub(crate) fn jacobian_forward_in_context<
     for (index, (program_input_type, (path, input_type))) in
         program_input_types[..tangent_input_count].iter().zip(input_types.named_parameters()).enumerate()
     {
-        let tangent_type = input_type.tangent();
+        let tangent_type = input_type.tangent()?;
         if tangent_type.is_zero_space() {
             return Err(DifferentiationError::NonDifferentiableParameter {
                 transform: DerivativeTransform::JacobianForward,
@@ -329,7 +329,7 @@ pub(crate) fn jacobian_forward_in_context<
         .named_parameters()
         .enumerate()
         .map(|(index, (path, r#type))| {
-            let tangent_type = r#type.tangent();
+            let tangent_type = r#type.tangent()?;
             if tangent_type.is_zero_space() {
                 return Err(DifferentiationError::NonDifferentiableParameter {
                     transform: DerivativeTransform::JacobianForward,
@@ -500,7 +500,7 @@ pub(crate) fn jacobian_reverse_in_context<
         .named_parameters()
         .enumerate()
         .map(|(index, (path, r#type))| {
-            let cotangent_type = r#type.cotangent();
+            let cotangent_type = r#type.cotangent()?;
             if cotangent_type.is_zero_space() {
                 return Err(DifferentiationError::NonDifferentiableParameter {
                     transform: DerivativeTransform::JacobianReverse,
@@ -583,7 +583,7 @@ impl JacobianMode {
             let differential_type = match self {
                 Self::Forward => r#type.tangent(),
                 Self::Reverse => r#type.cotangent(),
-            };
+            }?;
             if differential_type.is_zero_space() {
                 return Err(DifferentiationError::NonDifferentiableParameter {
                     transform,

@@ -564,14 +564,14 @@ impl_differentiable_operation! {
             }
             // A known (non-linear) operand contributes no cotangent.
             if inputs[0].is_known() {
-                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]);
+                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
             }
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
                     let contribution = stage_collective(context, operation, cotangent)?;
                     Ok(vec![MaybeZero::Value(contribution)])
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
             }
         }
     },
@@ -1847,7 +1847,7 @@ macro_rules! shape_changing_collective {
                 check_count!("output", primal_outputs, 1, ProgramError);
                 let primal = primal_outputs.remove(0);
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                    MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                     MaybeZero::Value(tangent) => {
                         let mut tangent_outputs =
                             context.bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
@@ -2804,7 +2804,7 @@ where
     let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
     let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
     let tangent = match array.tangent() {
-        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
             let mut residuals = LinearResiduals::new();
             let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
@@ -2863,7 +2863,7 @@ where
     let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
     let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
     let tangent = match array.tangent() {
-        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+        MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
             let mut residuals = LinearResiduals::new();
             let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
@@ -2871,7 +2871,7 @@ where
             let forward_operation = operation.clone();
             let forward_output_extents = output_extents.clone();
             let transpose_operation = operation.clone();
-            let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent();
+            let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
             let tangent = LinearCallOperation::stage(
                 context,
                 residuals.into_values(),
@@ -3770,7 +3770,7 @@ where
     check_count!("input", inputs, 1, ProgramError);
     check_count!("output", outputs, 1, ProgramError);
     if inputs[0].is_known() {
-        return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]);
+        return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
     }
     match &outputs[0] {
         MaybeZero::Value(cotangent) => {
@@ -3778,7 +3778,7 @@ where
             check_count!("output", contributions, 1, ProgramError);
             Ok(vec![MaybeZero::Value(contributions.remove(0))])
         }
-        MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+        MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
     }
 }
 
@@ -4234,13 +4234,13 @@ mod tests {
 
         // The cotangent of a reduced gather result is unreduced. Sum-scatter consumes exactly that marker and
         // restores the varying operand-cotangent state without a second reduce-scatter operation type.
-        let reduced_cotangent = reduced.cotangent();
+        let reduced_cotangent = reduced.cotangent().unwrap();
         assert_eq!(
             infer_explicit_psum_scatter_output_types(
                 &PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::default()),
                 &[reduced_cotangent.into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into(),],
             ),
-            Ok(vec![input.cotangent().into()]),
+            Ok(vec![input.cotangent().unwrap().into()]),
         );
     }
 
@@ -4865,7 +4865,7 @@ mod tests {
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::PSumScatter(_)));
-        assert_eq!(pullback.output_types(), vec![input_type.cotangent()]);
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
     }
 
     #[test]
@@ -4920,7 +4920,7 @@ mod tests {
         let primal = context.input(array_type.clone().into());
         let tangent = context.input(array_type.into());
         let extent = context.input(dimension_type.into());
-        let extent_tangent_type = extent.r#type().tangent();
+        let extent_tangent_type = extent.r#type().tangent()?;
         let outputs = AllGatherOperation::new(
             "x".to_string(),
             1,

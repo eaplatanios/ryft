@@ -272,7 +272,7 @@ impl Operation for DotProductAttentionBackwardOperation {
                 operands.query,
             )));
         }
-        let expected_output_cotangent_type = operands.query.cotangent();
+        let expected_output_cotangent_type = operands.query.cotangent()?;
         if !matches_expected(operands.output_cotangent.unwrap(), &expected_output_cotangent_type) {
             return Err(TypeError::invalid(format!(
                 "`{DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME}` output cotangent type {} does not match the \
@@ -295,9 +295,10 @@ impl Operation for DotProductAttentionBackwardOperation {
                 )));
             }
         }
-        let mut output_types = vec![operands.query.cotangent(), operands.key.cotangent(), operands.value.cotangent()];
+        let mut output_types =
+            vec![operands.query.cotangent()?, operands.key.cotangent()?, operands.value.cotangent()?];
         if let Some(bias) = operands.bias {
-            let bias_cotangent = bias.cotangent();
+            let bias_cotangent = bias.cotangent()?;
             if !bias_cotangent.is_zero_space() {
                 output_types.push(bias_cotangent);
             }

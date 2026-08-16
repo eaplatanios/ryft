@@ -330,9 +330,10 @@ impl_differentiable_operation! {
             }
             let axis = operation.axis();
             match &outputs[0] {
-                MaybeZero::Zero(_) => {
-                    Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect())
-                }
+                MaybeZero::Zero(_) => inputs
+                    .iter()
+                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                    .collect(),
                 MaybeZero::Value(cotangent) => {
                     let rank = inputs[0].r#type().rank();
                     let mut offset = 0usize;
@@ -368,7 +369,7 @@ impl_differentiable_operation! {
                         let outputs = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
                         check_count!("output", outputs, 1, ProgramError);
                         let input_cotangent =
-                            outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent())?;
+                            outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent()?)?;
                         input_cotangents.push(MaybeZero::Value(input_cotangent));
                         offset += input_axis_size;
                     }
@@ -426,7 +427,7 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
             // Concatenation needs one concrete array tangent per array operand. Materialize only structural zeros;
             // the trailing result extent remains the unchanged primal shape operand.
@@ -442,8 +443,8 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             let input_cotangent_types = array_inputs
                 .iter()
-                .map(|input| <&ArrayType>::try_from(input.primal().r#type().as_ref()).map(ArrayType::cotangent))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|input| Ok(<&ArrayType>::try_from(input.primal().r#type().as_ref())?.cotangent()?))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?;
             if input_cotangent_types
                 .iter()
                 .flat_map(|r#type| r#type.shape().dimensions())
@@ -594,7 +595,7 @@ where
                 ConcatenateOperation::<ArrayType>::from(self.clone()),
             );
             let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
-            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
+            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
             return Ok(cotangents);
         }
 
@@ -609,7 +610,12 @@ where
         let mut cotangents = Vec::with_capacity(inputs.len());
         match &outputs[0] {
             MaybeZero::Zero(_) => {
-                cotangents.extend(array_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())));
+                cotangents.extend(
+                    array_inputs
+                        .iter()
+                        .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                );
             }
             MaybeZero::Value(cotangent) => {
                 let cotangent_type = <&ArrayType>::try_from(cotangent.r#type().as_ref())?.clone();
@@ -687,7 +693,7 @@ where
                 }
             }
         }
-        cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()));
+        cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
         Ok(cotangents)
     }
 }
@@ -1968,7 +1974,7 @@ mod tests {
 
         let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.clone())]));
-        let widened_type = narrow_type.tangent();
+        let widened_type = narrow_type.tangent().unwrap();
         assert_eq!(widened_type.data_type(), DataType::F32);
 
         let context = TestContext::new();
@@ -1982,7 +1988,7 @@ mod tests {
         let inputs = vec![
             DifferentiationDual::new(first_primal, MaybeZero::Value(live_tangent)).unwrap(),
             DifferentiationDual::new(second_primal, MaybeZero::Zero(widened_type.clone().into())).unwrap(),
-            DifferentiationDual::new_with_zero_tangent(result_extent),
+            DifferentiationDual::new_with_zero_tangent(result_extent).unwrap(),
         ];
         let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
             .jvp(&context, &EmptyRegionDriver, inputs.as_slice())

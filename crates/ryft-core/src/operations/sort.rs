@@ -244,7 +244,7 @@ impl_differentiable_operation! {
                 .map(|(primal, tangent)| {
                     let tangent = match tangent {
                         Some(tangent) => MaybeZero::Value(tangent),
-                        None => MaybeZero::Zero(primal.r#type().tangent()),
+                        None => MaybeZero::Zero(primal.r#type().tangent()?),
                     };
                     DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
                 })

@@ -700,7 +700,7 @@ where
         .into_iter()
         .zip(input_types[..3].iter().zip(input_ranks))
         .map(|(cotangent, (input_type, rank))| {
-            let cotangent_data_type = input_type.cotangent().data_type();
+            let cotangent_data_type = input_type.cotangent()?.data_type();
             let cotangent = if cotangent.r#type().data_type() == cotangent_data_type {
                 cotangent
             } else {
@@ -713,7 +713,7 @@ where
     if let Some(bias) = &inputs.bias {
         let bias_type = bias.r#type();
         let bias_type = <&ArrayType>::try_from(bias_type.as_ref())?;
-        let bias_cotangent_type = bias_type.cotangent();
+        let bias_cotangent_type = bias_type.cotangent()?;
         if bias_cotangent_type.is_zero_space() {
             return Ok(cotangents);
         }

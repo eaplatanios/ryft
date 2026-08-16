@@ -197,7 +197,7 @@ impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBa
 impl<C: Context<Type: DifferentiableType> + One<C::Value>> One<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().one(r#type)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().one(r#type)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

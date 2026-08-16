@@ -344,7 +344,7 @@ pub fn unary_elementwise_jvp<
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
     let output_primal = primal_fn(input.primal())?;
-    let target = output_primal.r#type().tangent();
+    let target = output_primal.r#type().tangent()?;
     let output_tangent = match input.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(target),
         MaybeZero::Value(_) if target.is_zero_space() => {
@@ -432,7 +432,7 @@ pub fn binary_elementwise_jvp<
     let left = &inputs[0];
     let right = &inputs[1];
     let primal = primal_fn(left.primal(), right.primal())?;
-    let target = primal.r#type().tangent();
+    let target = primal.r#type().tangent()?;
     if target.is_zero_space() {
         if left.tangent().as_value().is_some() || right.tangent().as_value().is_some() {
             return Err(ProgramError::UnsupportedOperation {
@@ -658,7 +658,7 @@ mod tests {
         let tangent_calls = Cell::new(0);
         let outputs = unary_elementwise_jvp(
             &SinOperation::<ArrayType>::new(),
-            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64))],
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
             |input| Ok(input.clone()),
             |_| {
                 tangent_calls.set(tangent_calls.get() + 1);
@@ -707,7 +707,7 @@ mod tests {
 
         let outputs = unary_elementwise_jvp(
             &BooleanOutputOperation,
-            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64))],
+            &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
             |_| Ok(Array::scalar(true)),
             |_| -> Result<Array, DifferentiationError> {
                 panic!("zero-space output invoked its tangent function for a structural-zero input tangent")
@@ -751,8 +751,8 @@ mod tests {
         let outputs = binary_elementwise_jvp(
             &AddOperation::<ArrayType>::new(),
             &[
-                DifferentiationDual::new_with_zero_tangent(left_primal.clone()),
-                DifferentiationDual::new_with_zero_tangent(right_primal.clone()),
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
             |left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
@@ -772,8 +772,8 @@ mod tests {
         let outputs = binary_elementwise_jvp(
             &compare,
             &[
-                DifferentiationDual::new_with_zero_tangent(left_primal.clone()),
-                DifferentiationDual::new_with_zero_tangent(right_primal.clone()),
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
             |left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
             |_, _| -> Result<Array, DifferentiationError> {
@@ -793,7 +793,7 @@ mod tests {
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
-                DifferentiationDual::new_with_zero_tangent(right_primal.clone()),
+                DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
             |left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
@@ -812,7 +812,7 @@ mod tests {
         let outputs = binary_elementwise_jvp(
             &AddOperation::<ArrayType>::new(),
             &[
-                DifferentiationDual::new_with_zero_tangent(left_primal.clone()),
+                DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
                 DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64)).unwrap(),
             ],
             |left, right| Ok(left.clone() + right.clone()),
@@ -854,7 +854,7 @@ mod tests {
                 &compare,
                 &[
                     DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
-                    DifferentiationDual::new_with_zero_tangent(right_primal.clone()),
+                    DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
                 ],
                 |left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
                 |_, _| -> Result<Array, DifferentiationError> {
@@ -870,7 +870,7 @@ mod tests {
         assert!(matches!(
             binary_elementwise_jvp(
                 &AddOperation::<ArrayType>::new(),
-                &[DifferentiationDual::new_with_zero_tangent(left_primal)],
+                &[DifferentiationDual::new_with_zero_tangent(left_primal).unwrap()],
                 |left, right| Ok(left.clone() + right.clone()),
                 |_, tangent| Ok(tangent),
                 |_, tangent| Ok(tangent),

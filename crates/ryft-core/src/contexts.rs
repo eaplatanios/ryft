@@ -767,12 +767,12 @@ pub(crate) mod tests {
             false
         }
 
-        fn tangent(&self) -> Self {
-            self.clone()
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
         }
 
-        fn cotangent(&self) -> Self {
-            self.clone()
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
         }
     }
 
@@ -860,12 +860,12 @@ pub(crate) mod tests {
             false
         }
 
-        fn tangent(&self) -> Self {
-            self.clone()
+        fn tangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
         }
 
-        fn cotangent(&self) -> Self {
-            self.clone()
+        fn cotangent(&self) -> Result<Self, DifferentiationError> {
+            Ok(self.clone())
         }
     }
 
@@ -1037,7 +1037,7 @@ pub(crate) mod tests {
             check_count!("output", outputs, 1, ProgramError);
             Ok(vec![match &inputs[0] {
                 PartialValue::Unknown(_) => outputs[0].clone(),
-                PartialValue::Known(_) => MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                PartialValue::Known(_) => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
             }])
         }
     }

@@ -179,19 +179,20 @@ pub use zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpace
 
 /// Represents differentiation-related errors.
 ///
-/// [`DifferentiationError`] and [`ProgramError`] form the same normalized conversion cycle as
-/// [`BatchingError`](crate::BatchingError) and [`ProgramError`] do. Every differentiation surface including
+/// [`DifferentiationError`] forms normalized conversion cycles with [`TypeError`] and [`ProgramError`]. Every
+/// differentiation surface including
 /// the value-level entry points (i.e., `jvp`, `linearize`, `vjp`, etc.), the program-level transforms (i.e.,
 /// `Program::jvp`, `Program::linearize`, `Program::transpose`, etc.), and the per-operation rule traits (i.e.,
 /// [`DifferentiableOperation`] and [`TransposableOperation`]), returns [`DifferentiationError`], while the errors those
 /// rules produce *through* the kernel (i.e., binding and staging operations) are [`ProgramError`]s. The paired [`From`]
-/// implementations keep this cycle normalized instead of letting the two types nest: converting to [`ProgramError`]
+/// implementations keep these cycles normalized instead of letting the error types nest: converting to [`ProgramError`]
 /// unwraps a [`DifferentiationError::Program`] back into the program error that it carries and wraps every other
 /// variant in [`ProgramError::Custom`], while converting to [`DifferentiationError`] unwraps a [`ProgramError::Custom`]
 /// payload holding a [`DifferentiationError`] and wraps every other program error in [`DifferentiationError::Program`].
 /// Roundtrips therefore never nest one error type inside the other, and `?` re-types errors correctly at both
 /// boundaries. Outside of these conversions, a [`DifferentiationError`] carried by a [`ProgramError`] can be recovered
-/// using [`ProgramError::downcast_custom`].
+/// using [`ProgramError::downcast_custom`]. Type inference uses the analogous [`TypeError::Custom`] carrier so a
+/// failed tangent or cotangent mapping keeps its concrete differentiation error across an operation-inference boundary.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum DifferentiationError {
     /// Error returned when a differentiation entry point is invoked on an active input with no leaf values/parameters.
@@ -272,6 +273,14 @@ pub enum DifferentiationError {
         r#type: String,
     },
 
+    /// Error returned when a type has no representation for forward-mode perturbations.
+    #[error("type {primal_type} does not define a tangent representation")]
+    UndefinedTangentType { primal_type: String },
+
+    /// Error returned when a type has no representation for reverse-mode adjoints.
+    #[error("type {primal_type} does not define a cotangent representation")]
+    UndefinedCotangentType { primal_type: String },
+
     /// Error returned when the finite coordinate count of a Jacobian or Hessian parameter structure exceeds `usize`.
     #[error("{transform} {role} coordinate count overflows usize at parameter {path}: {type}")]
     CoordinateCountOverflow {
@@ -288,7 +297,21 @@ pub enum DifferentiationError {
 impl From<TypeError> for DifferentiationError {
     #[inline]
     fn from(error: TypeError) -> Self {
-        DifferentiationError::Program(error.into())
+        if let Some(differentiation) = error.downcast_custom::<DifferentiationError>() {
+            differentiation.clone()
+        } else {
+            DifferentiationError::Program(error.into())
+        }
+    }
+}
+
+impl From<DifferentiationError> for TypeError {
+    #[inline]
+    fn from(error: DifferentiationError) -> Self {
+        match error {
+            DifferentiationError::Program(ProgramError::Type(error)) => error,
+            error => TypeError::custom(error),
+        }
     }
 }
 
@@ -2592,6 +2615,14 @@ mod tests {
                 "forward Jacobian input parameter at $.value has non-differentiable type i32[]",
             ),
             (
+                DifferentiationError::UndefinedTangentType { primal_type: "ref<f32[4]>".to_string() },
+                "type ref<f32[4]> does not define a tangent representation",
+            ),
+            (
+                DifferentiationError::UndefinedCotangentType { primal_type: "ref<f32[4]>".to_string() },
+                "type ref<f32[4]> does not define a cotangent representation",
+            ),
+            (
                 DifferentiationError::ComplexParameter {
                     transform: DerivativeTransform::JacobianForward,
                     role: DifferentiationParameterRole::Input,
@@ -2648,6 +2679,13 @@ mod tests {
             DifferentiationError::from(ProgramError::from(differentiation_error.clone())),
             differentiation_error
         );
+
+        let type_error = TypeError::invalid("invalid type");
+        assert_eq!(TypeError::from(DifferentiationError::from(type_error.clone())), type_error);
+
+        let differentiation_error =
+            DifferentiationError::UndefinedTangentType { primal_type: "ref<f32[4]>".to_string() };
+        assert_eq!(DifferentiationError::from(TypeError::from(differentiation_error.clone())), differentiation_error,);
     }
 
     #[test]

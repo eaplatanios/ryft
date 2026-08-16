@@ -226,7 +226,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transpose(operation.permutation())?;
             let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(operation.permutation())?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -246,10 +246,10 @@ impl_differentiable_operation! {
                 MaybeZero::Value(cotangent) => {
                     let cotangent = cotangent.transpose(inverse)?;
                     Ok(vec![MaybeZero::Value(
-                        cotangent.unalign_cotangent(&inputs[0].r#type().cotangent())?,
+                        cotangent.unalign_cotangent(&inputs[0].r#type().cotangent()?)?,
                     )])
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
             }
         }
     },
@@ -787,10 +787,10 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(cycle_input_type.clone());
         let duals = TransposeOperation::new([2, 0, 1])
-            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(primal)])
+            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(primal).unwrap()])
             .unwrap();
         assert!(duals[0].tangent().is_zero());
-        assert_eq!(duals[0].tangent().r#type().as_ref(), &cycle_output_type.tangent());
+        assert_eq!(duals[0].tangent().r#type().as_ref(), &cycle_output_type.tangent().unwrap());
         assert_eq!(context.builder().borrow().instructions().len(), 1);
 
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
@@ -799,11 +799,11 @@ mod tests {
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(cycle_input_type.clone())],
-                &[MaybeZero::Zero(cycle_output_type.cotangent())],
+                &[MaybeZero::Zero(cycle_output_type.cotangent().unwrap())],
             )
             .unwrap();
         assert!(contributions[0].is_zero());
-        assert_eq!(contributions[0].r#type().as_ref(), &cycle_input_type.cotangent());
+        assert_eq!(contributions[0].r#type().as_ref(), &cycle_input_type.cotangent().unwrap());
         assert!(context.builder().borrow().instructions().is_empty());
 
         // Identity transpose preserves the exact tracer and placement metadata without staging an instruction.

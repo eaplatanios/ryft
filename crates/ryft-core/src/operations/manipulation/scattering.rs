@@ -400,7 +400,7 @@ where
         let updates = &inputs[2];
         let primal = operand.primal().scatter(indices, updates.primal(), self)?;
         let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -462,7 +462,7 @@ where
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -525,13 +525,13 @@ where
             .into());
         }
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(inputs
+            MaybeZero::Zero(_) => inputs
                 .iter()
                 .map(|input| {
                     let input_type = input.r#type();
-                    MaybeZero::Zero(input_type.cotangent())
+                    Ok(MaybeZero::Zero(input_type.cotangent()?))
                 })
-                .collect()),
+                .collect(),
             MaybeZero::Value(cotangent) => {
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
                 // value, so read the tracer directly.
@@ -583,11 +583,14 @@ where
                 let update_cotangents =
                     context.stage_operation(gather_operation, Vec::new(), &[cotangent.clone(), indices])?;
                 check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent =
-                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[2].r#type().cotangent())?;
+                let update_cotangent = update_cotangents
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
                 Ok(vec![
                     MaybeZero::Value(cotangent.clone()),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
                     MaybeZero::Value(update_cotangent),
                 ])
             }

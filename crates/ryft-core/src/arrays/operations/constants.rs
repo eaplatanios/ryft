@@ -1139,7 +1139,7 @@ mod tests {
 
         let cotangent = context.input(scalar_type.into());
         let cotangents = pullback.apply(vec![cotangent]).unwrap();
-        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(dynamic_type.cotangent()));
+        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(dynamic_type.cotangent().unwrap()));
         assert_eq!(cotangents[1].r#type().as_ref(), &ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
     }
 

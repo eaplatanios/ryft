@@ -160,7 +160,12 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
         check_count!("region", region_interfaces, 2, TypeError);
         let (_, differentiated_input_types) = self.split_inputs(input_types)?;
         let mut jvp_input_types = input_types.to_vec();
-        jvp_input_types.extend(differentiated_input_types.iter().map(DifferentiableType::tangent));
+        jvp_input_types.extend(
+            differentiated_input_types
+                .iter()
+                .map(DifferentiableType::tangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         Ok(vec![Some(input_types.to_vec()), Some(jvp_input_types)])
     }
 
@@ -177,20 +182,24 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
         let primal_input_types = primal_interface.input_types();
         let primal_output_types = primal_interface.output_types();
         let (_, differentiated_input_types) = self.split_inputs(primal_input_types)?;
-        let expected_jvp_input_types = primal_input_types
-            .iter()
-            .cloned()
-            .chain(differentiated_input_types.iter().map(DifferentiableType::tangent))
-            .collect::<Vec<_>>();
+        let mut expected_jvp_input_types = primal_input_types.to_vec();
+        expected_jvp_input_types.extend(
+            differentiated_input_types
+                .iter()
+                .map(DifferentiableType::tangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         check_types!(@same, format!("{CUSTOM_JVP_OPERATION_NAME} rule input"), [
             &expected_jvp_input_types,
             jvp_interface.input_types(),
         ]);
-        let expected_jvp_output_types = primal_output_types
-            .iter()
-            .cloned()
-            .chain(primal_output_types.iter().map(DifferentiableType::tangent))
-            .collect::<Vec<_>>();
+        let mut expected_jvp_output_types = primal_output_types.to_vec();
+        expected_jvp_output_types.extend(
+            primal_output_types
+                .iter()
+                .map(DifferentiableType::tangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         check_types!(@same, format!("{CUSTOM_JVP_OPERATION_NAME} rule output"), [
             &expected_jvp_output_types,
             jvp_interface.output_types(),
@@ -468,8 +477,7 @@ where
             return Err(TypeError::invalid(format!("{CUSTOM_JVP_OPERATION_NAME} requires at least one input")).into());
         };
         let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
-        let input_tangent_types =
-            input_types.clone().map_parameters(|r#type| r#type.tangent()).map_err(ProgramError::from)?;
+        let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
         let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
         let operation = D::Operation::from(CustomJvpOperation::new());
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a

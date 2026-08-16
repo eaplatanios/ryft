@@ -263,7 +263,7 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, Array
 impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<DifferentiationTracer<C>> for DifferentiationContext<C> {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

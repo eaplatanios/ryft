@@ -87,7 +87,7 @@ where
 {
     let signature = inputs.signature();
     let context = inputs.query.dispatch_domain();
-    let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent());
+    let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
     let mut operands = inputs.into_values();
     operands.extend([output, statistic, output_cotangent]);
     let mut outputs = context.bind(
@@ -161,7 +161,7 @@ where
                 output_cotangent,
                 configuration.with_residual(true),
             )?;
-            let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent());
+            let zero = |value: &DomainTracer<D>| value.context().zero(&value.r#type().cotangent()?);
             cotangents.mask = structural_inputs.mask.as_ref().map(zero).transpose()?;
             cotangents.query_sequence_lengths =
                 structural_inputs.query_sequence_lengths.as_ref().map(zero).transpose()?;

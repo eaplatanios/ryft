@@ -153,7 +153,10 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             &forward_output_types[..output_types.len()],
         ]);
         let residual_types = &forward_output_types[output_types.len()..];
-        let output_cotangent_types = output_types.iter().map(|r#type| r#type.cotangent());
+        let output_cotangent_types = output_types
+            .iter()
+            .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         let expected_backward_input_types: Vec<T> = non_differentiated_types
             .iter()
             .chain(residual_types)
@@ -164,8 +167,10 @@ impl<T: DifferentiableType> CustomVjpOperation<T> {
             &expected_backward_input_types,
             backward_interface.input_types(),
         ]);
-        let expected_backward_output_types =
-            differentiated_types.iter().map(|r#type| r#type.cotangent()).collect::<Vec<_>>();
+        let expected_backward_output_types = differentiated_types
+            .iter()
+            .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         check_types!(@same, format!("{CUSTOM_VJP_OPERATION_NAME} backward output"), [
             &expected_backward_output_types,
             backward_interface.output_types(),
@@ -241,7 +246,12 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
         let (non_differentiated_types, _) = self.split_inputs(input_types)?;
         let mut backward_input_types = non_differentiated_types.to_vec();
         backward_input_types.extend_from_slice(&forward_output_types[primal_output_types.len()..]);
-        backward_input_types.extend(primal_output_types.iter().map(DifferentiableType::cotangent));
+        backward_input_types.extend(
+            primal_output_types
+                .iter()
+                .map(DifferentiableType::cotangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         Ok(vec![Some(input_types.to_vec()), Some(input_types.to_vec()), Some(backward_input_types)])
     }
 
@@ -488,9 +498,12 @@ where
             .into());
         }
 
-        let input_tangent_types =
-            differentiated_inputs.iter().map(|input| input.primal().r#type().tangent()).collect::<Vec<_>>();
-        let output_tangent_types = primal_outputs.iter().map(|output| output.r#type().tangent()).collect::<Vec<_>>();
+        let input_tangent_types = differentiated_inputs
+            .iter()
+            .map(|input| input.primal().r#type().tangent())
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_tangent_types =
+            primal_outputs.iter().map(|output| output.r#type().tangent()).collect::<Result<Vec<_>, _>>()?;
 
         // Stage one opaque carrier over `[non_differentiated..., residuals..., differentiated_input_tangents...]`,
         // producing the output tangents. The carrier rejects forward interpretation and transposes by replaying the
@@ -618,8 +631,7 @@ where
         let (output_types, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
         let (forward_output_types, forward) = D::trace(|xs| (self.forward)(xs), input_types.clone())?;
         let (_, residual_types) = forward_output_types;
-        let output_cotangent_types =
-            output_types.clone().map_parameters(|r#type| r#type.cotangent()).map_err(ProgramError::from)?;
+        let output_cotangent_types = output_types.clone().try_map_parameters(|r#type| r#type.cotangent())?;
         let (_, backward) = D::trace(
             |(residuals, cotangents)| (self.backward)(residuals, cotangents),
             (residual_types, output_cotangent_types),

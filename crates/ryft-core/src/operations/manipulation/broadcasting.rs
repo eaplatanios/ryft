@@ -419,7 +419,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal =
                 inputs[0].primal().broadcast(operation.output_type().clone(), operation.output_axes())?;
-            let tangent_type = primal.r#type().tangent();
+            let tangent_type = primal.r#type().tangent()?;
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
                 MaybeZero::Value(tangent) => {
@@ -452,7 +452,7 @@ impl_differentiable_operation! {
             // space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            let input_cotangent_type = inputs[0].r#type().cotangent();
+            let input_cotangent_type = inputs[0].r#type().cotangent()?;
             if input_cotangent_type.is_zero_space() {
                 return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
             }
@@ -495,7 +495,7 @@ where
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = match array.tangent() {
             MaybeZero::Zero(_) => {
-                let tangent_type = primal.r#type().tangent();
+                let tangent_type = primal.r#type().tangent()?;
                 if tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
                     let array_tangent_type = <&ArrayType>::try_from(&tangent_type)?.clone();
                     let dynamic_extents = array_tangent_type
@@ -517,7 +517,7 @@ where
                 }
             }
             MaybeZero::Value(array_tangent) => {
-                let input_cotangent_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent();
+                let input_cotangent_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
                 if input_cotangent_type
                     .shape()
                     .dimensions()
@@ -655,7 +655,7 @@ where
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
-        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent();
+        let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
         if input_cotangent_type
             .shape()
             .dimensions()
@@ -681,7 +681,12 @@ where
             self.output_axes().to_vec(),
         ));
         let mut cotangents = transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs)?;
-        cotangents.extend(output_extents.iter().map(|extent| MaybeZero::Zero(extent.r#type().cotangent())));
+        cotangents.extend(
+            output_extents
+                .iter()
+                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         Ok(cotangents)
     }
 }
@@ -1643,8 +1648,8 @@ mod tests {
         let output_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
-        let input_cotangent_type = input_type.cotangent();
-        let output_cotangent_type = output_type.cotangent();
+        let input_cotangent_type = input_type.cotangent().unwrap();
+        let output_cotangent_type = output_type.cotangent().unwrap();
 
         let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let contributions = operation
@@ -1668,12 +1673,12 @@ mod tests {
                 &mut context,
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type.clone())],
-                &[MaybeZero::Zero(output_type.cotangent())],
+                &[MaybeZero::Zero(output_type.cotangent().unwrap())],
             )
             .unwrap();
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
-        assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent());
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent().unwrap());
     }
 
     #[test]

@@ -959,7 +959,7 @@ in (%4)
             "
             .trim(),
         );
-        assert_eq!(linearization.tangent().input_types()[0], ArrayIrType::Array(input_type.tangent()));
+        assert_eq!(linearization.tangent().input_types()[0], ArrayIrType::Array(input_type.tangent().unwrap()));
         assert!(
             linearization
                 .tangent()
@@ -1272,8 +1272,8 @@ in (%4)
             .unwrap();
 
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.tangent().output_types(), vec![input_type.tangent().into()]);
-        assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().into()]);
+        assert_eq!(linearization.tangent().output_types(), vec![input_type.tangent().unwrap().into()]);
+        assert_eq!(linearization.pullback().unwrap().output_types(), vec![input_type.cotangent().unwrap().into()]);
     }
 
     #[test]
@@ -1664,7 +1664,7 @@ in (%4)
         assert_eq!(
             linearization.tangent().input_types(),
             &[
-                input_type.tangent().into(),
+                input_type.tangent().unwrap().into(),
                 indices_type.clone().into(),
                 ArrayIrType::Dimension(DimensionType::new(extent)),
             ],

@@ -222,7 +222,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().reshard(operation.sharding());
             let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(operation.sharding())),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -240,7 +240,7 @@ impl_differentiable_operation! {
             // an exactly unsharded cotangent through an identity-axis broadcast.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            let input_cotangent_type = inputs[0].r#type().cotangent();
+            let input_cotangent_type = inputs[0].r#type().cotangent()?;
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
                     let contribution = match input_cotangent_type.sharding() {
@@ -439,7 +439,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().constrain_sharding(operation.sharding());
             let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(operation.sharding())),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -461,7 +461,7 @@ impl_differentiable_operation! {
                 MaybeZero::Value(cotangent) => {
                     Ok(vec![MaybeZero::Value(cotangent.constrain_sharding(operation.sharding()))])
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
             }
         }
     },
@@ -672,8 +672,8 @@ mod tests {
                 move |x| Ok(x.reshard(&target))
             })
             .unwrap();
-        let cotangent = pullback.apply(Array::from_f64s(output.r#type().cotangent(), vec![1.0; 8])).unwrap();
-        assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent());
+        let cotangent = pullback.apply(Array::from_f64s(output.r#type().cotangent().unwrap(), vec![1.0; 8])).unwrap();
+        assert_eq!(cotangent.r#type().as_ref(), &input_type.cotangent().unwrap());
         assert_eq!(cotangent.to_f64s(), vec![1.0; 8]);
 
         let jacobian = differentiate_at(input)

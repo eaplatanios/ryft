@@ -1535,7 +1535,7 @@ where
         let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
         check_count!("output", initial_mask, 1, ProgramError);
         let mut extended_inputs = inputs.to_vec();
-        extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0)));
+        extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0))?);
         // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
         // requested through the instruction-scoped driver over them.
         let mut outputs = driver.jvp_operation(
@@ -1669,11 +1669,13 @@ where
     while_outputs.truncate(state_count);
     let primal_outputs = while_outputs;
 
-    let element_has_tangent =
-        state_types.iter().map(|state_type| !state_type.tangent().is_zero_space()).collect::<Vec<_>>();
+    let element_has_tangent = state_types
+        .iter()
+        .map(|state_type| Ok(!state_type.tangent()?.is_zero_space()))
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
     let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
     if tangent_state_count == 0 {
-        return Ok(primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect());
+        return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
     }
 
     check_count!("input", tangent_program.input_ids(), tangent_state_count + residual_count, ProgramError);
@@ -1856,7 +1858,7 @@ where
             if has_tangent {
                 DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
             } else {
-                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                DifferentiationDual::new_with_zero_tangent(primal)
             }
         })
         .collect::<Result<Vec<_>, _>>()
@@ -1927,8 +1929,8 @@ where
         .region(1)?
         .input_types()
         .iter()
-        .map(|r#type| !r#type.tangent().is_zero_space())
-        .collect::<Vec<_>>();
+        .map(|r#type| Ok(!r#type.tangent()?.is_zero_space()))
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
     check_count!("input", element_has_tangent, state_count, ProgramError);
     let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
     let fused_state_count = state_count + tangent_state_count;
@@ -1981,7 +1983,7 @@ where
             if has_tangent {
                 DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
             } else {
-                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                DifferentiationDual::new_with_zero_tangent(primal)
             }
         })
         .collect::<Result<Vec<_>, _>>()?)
@@ -2061,7 +2063,7 @@ where
         let body_region = body.entry_region_ref();
         let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
             input_duals,
-            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.lift(constant.clone())?)),
+            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.lift(constant.clone())?)?),
             |instruction, input_duals| {
                 let programs = instruction
                     .regions()
@@ -2075,7 +2077,7 @@ where
                         .bind(instruction.operation().clone(), programs, primal_inputs.as_slice())?
                         .into_iter()
                         .map(DifferentiationDual::new_with_zero_tangent)
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>, _>>()?
                 } else {
                     driver.jvp_operation(instruction.operation(), programs, context, input_duals)?
                 };

@@ -98,7 +98,7 @@ impl_differentiable_operation! {
             // when only one is, the missing part is materialized as a real zero through the context so the staged
             // `complex` keeps its two-part arity.
             let tangent = match (real.tangent(), imaginary.tangent()) {
-                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()),
+                (MaybeZero::Zero(_), MaybeZero::Zero(_)) => MaybeZero::Zero(primal.r#type().tangent()?),
                 (real_tangent, imaginary_tangent) => MaybeZero::Value(
                     real_tangent
                         .clone()
@@ -124,14 +124,16 @@ impl_differentiable_operation! {
             // at the pullback output boundary.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            Ok(match &outputs[0] {
-                MaybeZero::Zero(_) =>
-                    inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect(),
-                MaybeZero::Value(output_cotangent) => vec![
+            match &outputs[0] {
+                MaybeZero::Zero(_) => inputs
+                    .iter()
+                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                    .collect(),
+                MaybeZero::Value(output_cotangent) => Ok(vec![
                     MaybeZero::Value(output_cotangent.unary(RealOperation::new())),
                     MaybeZero::Value(output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new())),
-                ],
-            })
+                ]),
+            }
         }
     },
 }
@@ -198,7 +200,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
                 MaybeZero::Value(output_cotangent) =>
                     vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation::new()))],
             })
@@ -247,7 +249,7 @@ impl_differentiable_operation! {
             // Real-part extraction is ℝ-linear: `d(Re(z)) = Re(dz)`. A structural zero tangent stays symbolic,
             // retyped to the real output type.
             let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.real()?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -266,7 +268,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
                     vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation::new()))]
@@ -317,7 +319,7 @@ impl_differentiable_operation! {
             // Imaginary-part extraction is ℝ-linear: `d(Im(z)) = Im(dz)`. A structural zero tangent stays symbolic,
             // retyped to the real output type.
             let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.imaginary()?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -337,7 +339,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent())],
+                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
                     let negated = output_cotangent.unary(NegOperation::new());

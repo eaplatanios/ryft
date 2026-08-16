@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::ops::Range;
 
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::{Zero, ZeroOperation, ZeroOperationProvider};
@@ -307,7 +308,7 @@ pub enum ZeroSpaceBoundaryRole {
 impl ZeroSpaceBoundaryRole {
     /// Returns the differential [`Type`] represented by this [`ZeroSpaceBoundaryRole`] for `primal_type`.
     #[inline]
-    fn differential_type<T: DifferentiableType>(self, primal_type: &T) -> T {
+    fn differential_type<T: DifferentiableType>(self, primal_type: &T) -> Result<T, DifferentiationError> {
         match self {
             Self::InputCotangent => primal_type.cotangent(),
             Self::OutputTangent => primal_type.tangent(),
@@ -418,7 +419,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         let mut residuals = Vec::new();
         let mut zero_leaves = Vec::new();
         for (index, (value, primal_type)) in primal_values.iter().zip(primal_types).enumerate() {
-            let differential_type = role.differential_type(primal_type);
+            let differential_type = role.differential_type(primal_type)?;
             if differential_type.is_zero_space() {
                 let residual_start = residuals.len();
                 residuals.extend(capture_and_validate_zero_residual_values(
@@ -557,7 +558,7 @@ mod tests {
                 Dimension::Dynamic(second.clone()),
             ]),
         );
-        let tangent_type = ArrayIrType::Array(primal_type.tangent());
+        let tangent_type = ArrayIrType::Array(primal_type.tangent().unwrap());
         let context = TestContext::new();
         let primal = context.input(primal_type.into());
 
@@ -614,7 +615,7 @@ mod tests {
         // its own type, yet the primal names the extent `k` and therefore supplies its geometry.
         let narrow_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(k.clone())]));
         let narrow_primal = context.input(narrow_type.clone().into());
-        let widened_tangent_type = narrow_type.tangent();
+        let widened_tangent_type = narrow_type.tangent().unwrap();
         assert_eq!(widened_tangent_type.data_type(), DataType::F32);
         let widened = TestOperation::materialize_zero_from_residual_sources(
             &context,
@@ -701,7 +702,7 @@ mod tests {
         )
         .unwrap();
         let outputs = reconstruction.rebuild(&context, [accumulator.clone()]).unwrap();
-        let key_tangent_type = ArrayIrType::Array(key_type.tangent());
+        let key_tangent_type = ArrayIrType::Array(key_type.tangent().unwrap());
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].r#type().as_ref(), &key_tangent_type);
         assert_eq!(outputs[1].atom_id(), accumulator.atom_id());

@@ -130,7 +130,7 @@ impl_differentiable_operation! {
             // differential data type. Converting into a type with no tangent space produces a structural zero tangent.
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().convert_element_type(operation.data_type)?;
-            let output_tangent_type = primal.r#type().tangent();
+            let output_tangent_type = primal.r#type().tangent()?;
             let tangent = match inputs[0].tangent() {
                 _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
                 MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
@@ -151,7 +151,7 @@ impl_differentiable_operation! {
             // structural, and an input with no cotangent space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            let input_cotangent_type = inputs[0].r#type().cotangent();
+            let input_cotangent_type = inputs[0].r#type().cotangent()?;
             if input_cotangent_type.is_zero_space() {
                 return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
             }

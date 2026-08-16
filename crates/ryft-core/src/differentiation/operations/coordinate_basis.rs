@@ -96,7 +96,7 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        let cotangent_data_type = self.leaf_type.data_type().cotangent();
+        let cotangent_data_type = self.leaf_type.data_type().cotangent()?;
         if cotangent_data_type.is_zero_space() {
             return Err(TypeError::invalid(format!(
                 "coordinate basis requires a differentiable leaf type but got {}",

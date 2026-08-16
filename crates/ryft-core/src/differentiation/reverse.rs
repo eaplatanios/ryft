@@ -137,6 +137,8 @@ impl<
         let live_output_cotangent_types = primal_output_types
             .iter()
             .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
             .filter(|r#type| !r#type.is_zero_space())
             .collect::<Vec<_>>();
         if live_output_cotangent_types.len() != cotangent_input_count {
@@ -161,6 +163,8 @@ impl<
         let live_input_cotangent_types = primal_input_types
             .iter()
             .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
             .filter(|r#type| !r#type.is_zero_space())
             .collect::<Vec<_>>();
         if live_input_cotangent_types.len() != program.output_ids().len() {
@@ -244,7 +248,7 @@ impl<
         // space.
         let mut program_inputs = Vec::new();
         for (index, (value, primal_type)) in public_cotangents.into_iter().zip(&self.primal_output_types).enumerate() {
-            let cotangent_type = primal_type.cotangent();
+            let cotangent_type = primal_type.cotangent()?;
             if value.r#type().as_ref() != &cotangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pullback cotangent {index} has type {} but its primal boundary requires cotangent type \
@@ -781,7 +785,7 @@ impl<
         for output in self.output_ids().iter().copied() {
             let output_atom = self.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
             let output_type = output_atom.r#type();
-            let cotangent_type = output_type.cotangent();
+            let cotangent_type = output_type.cotangent()?;
             let has_cotangent = !cotangent_type.is_zero_space();
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
             if has_cotangent && *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
@@ -878,7 +882,7 @@ impl<
                             .get(output.index())
                             .ok_or(ProgramError::UnboundAtomId { id: output })?
                             .r#type();
-                        MaybeZero::Zero(output_type.cotangent())
+                        MaybeZero::Zero(output_type.cotangent()?)
                     }
                 });
             }
@@ -955,7 +959,7 @@ impl<
                         let input_atom =
                             self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let input_type = input_atom.r#type();
-                        let cotangent_type = input_type.cotangent();
+                        let cotangent_type = input_type.cotangent()?;
                         let mut builder_borrow = builder.borrow_mut();
 
                         // These indices name source-program inputs, but zero construction occurs in the pullback
@@ -1271,7 +1275,7 @@ pub trait ReverseModeDifferentiate:
 
         // A non-differentiable scalar output carries no cotangent space and thus no "one" to seed, so reverse mode
         // is degenerate and is rejected up front.
-        let output_cotangent_type = output_type.cotangent();
+        let output_cotangent_type = output_type.cotangent()?;
         if output_cotangent_type.is_zero_space() {
             return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
         }
@@ -1355,7 +1359,7 @@ where
         .map(|value| {
             C::Operation::materialize_zero_from_residual_sources(
                 context,
-                MaybeZero::Zero(value.r#type().cotangent()),
+                MaybeZero::Zero(value.r#type().cotangent()?),
                 std::iter::once(value),
             )
         })
@@ -1549,7 +1553,7 @@ where
     // A mixed instruction with no member-typed operands stages a value that does not depend on any of them, so every
     // operand receives a structural zero and the member rule is never consulted.
     if data_inputs.is_empty() {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+        return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
     }
 
     // The delegated member rule sees only the member-typed prefix, so it must be able to derive every cotangent shape
@@ -1586,7 +1590,7 @@ where
                     .into()
                 })
             } else {
-                Ok(MaybeZero::Zero(input.r#type().cotangent()))
+                Ok(MaybeZero::Zero(input.r#type().cotangent()?))
             }
         })
         .collect()
@@ -3049,13 +3053,13 @@ mod tests {
             ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(inputs
+                inputs
                     .iter()
                     .map(|input| match input {
-                        PartialValue::Unknown(_) => outputs[0].clone(),
-                        PartialValue::Known(_) => MaybeZero::Zero(input.r#type().cotangent()),
+                        PartialValue::Unknown(_) => Ok(outputs[0].clone()),
+                        PartialValue::Known(_) => Ok(MaybeZero::Zero(input.r#type().cotangent()?)),
                     })
-                    .collect())
+                    .collect()
             }
         }
 

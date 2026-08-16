@@ -79,7 +79,7 @@ impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>> Fill<L, Differ
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: L) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

@@ -667,7 +667,7 @@ mod tests {
         let widening_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(n.variable().clone())]));
         let widening_primal = context.input(widening_type.clone().into());
-        let widened_tangent_type = widening_type.tangent();
+        let widened_tangent_type = widening_type.tangent().unwrap();
         assert_eq!(widened_tangent_type.data_type(), DataType::F32);
         let input = DifferentiationDual::new(
             widening_primal,

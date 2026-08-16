@@ -709,7 +709,7 @@ where
         return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
     };
     let output_shape = output_type.shape();
-    if output_type.tangent().is_zero_space()
+    if output_type.tangent()?.is_zero_space()
         || output_shape.dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
         || input_types.iter().all(|input_type| input_type.shape() == output_shape)
     {
@@ -771,7 +771,7 @@ where
             replication_inputs.extend(extents.iter().cloned());
             let primal = context.bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?.remove(0);
             let tangent = match input.tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
                     replication_inputs[0] = tangent.clone();
                     MaybeZero::Value(context.bind(replication, Vec::new(), replication_inputs.as_slice())?.remove(0))
@@ -982,7 +982,7 @@ mod tests {
         // The compact pullback has no result slot for the key's zero differential space. Rebuilding the public result
         // must use the key extent captured at linearization time rather than attempt a nullary dynamic zero.
         let cotangents = pullback.apply(cotangent).unwrap();
-        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(key_type.tangent()));
+        assert_eq!(cotangents[0].r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
         assert_eq!(cotangents[1].r#type().as_ref(), &ArrayType::scalar(DataType::F64).into());
     }
 
@@ -998,12 +998,12 @@ mod tests {
         let (_, pushforward) =
             context.linearize(|inputs: Vec<_>, ()| Ok(inputs[1].clone()), vec![extent, key], ()).unwrap();
         let extent_tangent = context.input(ArrayType::scalar(DataType::Zero).into());
-        let key_tangent = context.input(key_type.tangent().into());
+        let key_tangent = context.input(key_type.tangent().unwrap().into());
 
         // The compact pushforward has no output slot for the key's zero differential space. Rebuilding its public
         // result must consume the key extent captured at linearization time.
         let tangent = pushforward.apply(vec![extent_tangent, key_tangent]).unwrap();
-        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent()));
+        assert_eq!(tangent.r#type().as_ref(), &ArrayIrType::Array(key_type.tangent().unwrap()));
     }
 
     #[test]

@@ -490,11 +490,12 @@ where
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<StaticArrayBatchingPolicy>>, BatchingError> {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
-        output_roles.extend(
-            bias_index
-                .filter(|&index| !inputs[index].unbatched_type().cotangent().is_zero_space())
-                .map(AttentionBatchOutput::Score),
-        );
+        if let Some(index) = bias_index {
+            let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;
+            if !cotangent_type.is_zero_space() {
+                output_roles.push(AttentionBatchOutput::Score(index));
+            }
+        }
         Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
     }
 }
@@ -555,11 +556,12 @@ where
     ) -> Result<BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>, BatchingError>
     {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
-        output_roles.extend(
-            bias_index
-                .filter(|&index| !inputs[index].unbatched_type().cotangent().is_zero_space())
-                .map(AttentionBatchOutput::Score),
-        );
+        if let Some(index) = bias_index {
+            let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;
+            if !cotangent_type.is_zero_space() {
+                output_roles.push(AttentionBatchOutput::Score(index));
+            }
+        }
         Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
     }
 }

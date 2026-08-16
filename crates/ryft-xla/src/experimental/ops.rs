@@ -961,26 +961,29 @@ where
 
         // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the live operand tangents followed
         // by the residual values. Zero-space tangents have no compact callee boundary slot.
+        let input_tangent_types = input_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
         let mut tangent_operands = inputs
             .iter()
-            .zip(input_types)
-            .filter(|(_, input_type)| !input_type.tangent().is_zero_space())
+            .zip(input_tangent_types)
+            .filter(|(_, tangent_type)| !tangent_type.is_zero_space())
             .map(|(input, _)| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
         let tangent_outputs =
             context.bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
-        let tangent_output_count = output_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        let output_tangent_types =
+            output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
+        let tangent_output_count = output_tangent_types.iter().filter(|r#type| !r#type.is_zero_space()).count();
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
         let mut tangent_outputs = tangent_outputs.into_iter();
         Ok(primal_outputs
             .into_iter()
-            .zip(output_types)
-            .map(|(primal, output_type)| {
-                if output_type.tangent().is_zero_space() {
-                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+            .zip(output_tangent_types)
+            .map(|(primal, tangent_type)| {
+                if tangent_type.is_zero_space() {
+                    DifferentiationDual::new_with_zero_tangent(primal)
                 } else {
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
                 }
@@ -1094,7 +1097,10 @@ pub fn transpose_primal_jit_call<
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+        return inputs
+            .iter()
+            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
+            .collect();
     }
 
     // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
@@ -1122,7 +1128,8 @@ pub fn transpose_primal_jit_call<
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        operands.push(materialize_transpose_cotangent(context, cotangent, &output_type.cotangent(), inputs)?);
+        let output_cotangent_type = output_type.cotangent()?;
+        operands.push(materialize_transpose_cotangent(context, cotangent, &output_cotangent_type, inputs)?);
     }
     operands.extend(known_values);
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
@@ -1137,12 +1144,14 @@ pub fn transpose_primal_jit_call<
     let cotangents = operand_linear
         .iter()
         .zip(inputs)
-        .map(
-            |(&linear, input)| {
-                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().cotangent()) }
-            },
-        )
-        .collect();
+        .map(|(&linear, input)| {
+            if linear {
+                Ok(input_cotangents.next().unwrap())
+            } else {
+                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(cotangents)
 }
 
@@ -1397,7 +1406,7 @@ mod tests {
     fn test_xla_residual_zero_provider_materializes_dynamic_zero_from_array_source() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        let tangent_type = primal_type.tangent();
+        let tangent_type = primal_type.tangent().unwrap();
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let primal = context.input(ArrayIrType::Array(primal_type));
 
@@ -1639,7 +1648,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-        let expected = ArrayIrType::Array(tangent_type.cotangent());
+        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
         let tangent_type = ArrayIrType::Array(tangent_type);
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
         let cotangents = transpose_primal_jit_call(
@@ -1714,7 +1723,7 @@ mod tests {
         let transposed = {
             let mut builder = XlaProgramBuilder::new();
             let value_cotangent = builder.add_input(value_program_type.clone());
-            let _predicate_cotangent = builder.add_input(ArrayIrType::Array(predicate_type.cotangent()));
+            let _predicate_cotangent = builder.add_input(ArrayIrType::Array(predicate_type.cotangent().unwrap()));
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value_cotangent],
@@ -1732,7 +1741,10 @@ mod tests {
             &mut context,
             &driver,
             &[PartialValue::Unknown(value_program_type.clone())],
-            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent()))],
+            &[
+                MaybeZero::Value(value_cotangent),
+                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+            ],
         )
         .unwrap();
 

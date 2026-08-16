@@ -377,7 +377,7 @@ where
         let indices = inputs[1].primal();
         let primal = inputs[0].primal().gather(indices, self)?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -418,13 +418,13 @@ where
             .bind(operation, Vec::new(), &[operand.primal().clone(), indices.primal().clone()])?
             .remove(0);
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
                 let mut residuals = LinearResiduals::new();
                 let indices_index = residuals.retain(indices.primal().clone());
                 let operand_shape = residuals.retain_shape(context, operand.primal())?;
                 let forward_operation = self.clone();
-                let transpose_operand_type = operand_type.cotangent();
+                let transpose_operand_type = operand_type.cotangent()?;
                 let dimensions = self.dimensions();
                 let transpose_operation = ScatterOperation::new(
                     ScatterDimensionNumbers::new(
@@ -607,8 +607,8 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
             ]),
             MaybeZero::Value(cotangent) => {
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
@@ -619,7 +619,7 @@ where
                     .clone();
                 // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                 // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
-                let operand_cotangent_type = inputs[0].r#type().cotangent();
+                let operand_cotangent_type = inputs[0].r#type().cotangent()?;
                 if operand_cotangent_type.static_shape().is_none() {
                     return Err(TypeError::invalid(format!(
                         "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped operand but got \
@@ -646,7 +646,7 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![
                     MaybeZero::Value(outputs.into_iter().next().unwrap()),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
                 ])
             }
         }

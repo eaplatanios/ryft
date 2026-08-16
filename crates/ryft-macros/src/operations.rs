@@ -1434,7 +1434,7 @@ impl OperationEnum {
                                 <&#member_type as ::std::convert::TryFrom<&#primary_type>>::try_from(&output_type)
                             {
                                 let tangent_type =
-                                    <#member_type as #ryft::DifferentiableType>::tangent(output_type);
+                                    <#member_type as #ryft::DifferentiableType>::tangent(output_type)?;
                                 let mut tangents = context.bind(
                                     <#differentiation_self_type as ::std::convert::From<
                                         #ryft::ZeroOperation<#member_type>,
@@ -1471,9 +1471,7 @@ impl OperationEnum {
                                 .zip(output_types)
                                 .map(|(primal, output_type)| {
                                     #(#tangent_universe_arms)*
-                                    ::std::result::Result::Ok(
-                                        #ryft::DifferentiationDual::new_with_zero_tangent(primal),
-                                    )
+                                    #ryft::DifferentiationDual::new_with_zero_tangent(primal)
                                 })
                                 .collect()
                         },
@@ -1481,7 +1479,7 @@ impl OperationEnum {
                 }
                 OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
                     Self::#variant_ident(_) => {
-                        ::std::result::Result::Ok(context
+                        context
                             .bind(
                                 self.clone(),
                                 ::std::vec::Vec::new(),
@@ -1492,7 +1490,7 @@ impl OperationEnum {
                             )?
                             .into_iter()
                             .map(#ryft::DifferentiationDual::new_with_zero_tangent)
-                            .collect())
+                            .collect()
                     },
                 },
             }
@@ -1656,10 +1654,12 @@ impl OperationEnum {
                 },
                 OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
                     Self::#variant_ident(_) => {
-                        ::std::result::Result::Ok(inputs
+                        inputs
                             .iter()
-                            .map(|input| #ryft::MaybeZero::Zero(input.r#type().cotangent()))
-                            .collect())
+                            .map(|input| {
+                                ::std::result::Result::Ok(#ryft::MaybeZero::Zero(input.r#type().cotangent()?))
+                            })
+                            .collect()
                     },
                 },
             }
@@ -2840,7 +2840,7 @@ mod tests {
         assert!(generated.contains("jvp_in_parent(operation,context,driver,inputs)"));
         assert!(generated.contains("DifferentiationDual::new_with_zero_tangent"));
         assert!(generated.contains("transpose_projected_operation(context,operation,inputs,outputs)"));
-        assert!(generated.contains("MaybeZero::Zero(input.r#type().cotangent())"));
+        assert!(generated.contains("MaybeZero::Zero(input.r#type().cotangent()?)"));
 
         // Mixed payloads use their parent-universe contracts, while native payloads continue to delegate directly.
         assert!(generated.contains("MemberOperation<ArrayIrType>>::infer_parent_output_types"));
@@ -2931,7 +2931,7 @@ mod tests {
         .replace(' ', "");
         assert!(generated.contains("ryft::ZeroOperation<ArrayType>,>>::from(ryft::ZeroOperation::new(tangent_type))"));
         assert!(generated.contains("ryft::ZeroOperation<TableType>,>>::from(ryft::ZeroOperation::new(tangent_type))"));
-        assert!(generated.contains("ryft::DifferentiationDual::new_with_zero_tangent(primal),"));
+        assert!(generated.contains("ryft::DifferentiationDual::new_with_zero_tangent(primal)"));
         assert!(generated.contains("TableType:ryft::DifferentiableType"));
         assert!(!generated.contains("ryft::ZeroOperation<DimensionType>"));
     }

@@ -54,10 +54,11 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if a live `tangent` does not have the tangent type required by `primal`.
+    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation or if a live `tangent` does not
+    /// have the tangent type required by `primal`.
     #[inline]
-    pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, TypeError> {
-        let tangent_type = primal.r#type().tangent();
+    pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, DifferentiationError> {
+        let tangent_type = primal.r#type().tangent()?;
         let tangent = match tangent.into() {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
@@ -67,7 +68,8 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
                         tangent.r#type().as_ref(),
                         tangent_type,
                         primal.r#type().as_ref(),
-                    )));
+                    ))
+                    .into());
                 }
                 if tangent_type.is_zero_space() { MaybeZero::Zero(tangent_type) } else { MaybeZero::Value(tangent) }
             }
@@ -76,11 +78,15 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     }
 
     /// Creates a new [`DifferentiationDual`] with a [`MaybeZero::Zero`] tangent carrying the primal's concrete
-    /// tangent boundary [`Type`]. A primal with no tangent space uses its first-class zero-space [`Type`].
+    /// tangent boundary [`Type`]. A primal with a zero tangent space uses its first-class zero-space [`Type`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation.
     #[inline]
-    pub fn new_with_zero_tangent(primal: V) -> Self {
-        let tangent = MaybeZero::Zero(primal.r#type().tangent());
-        Self { primal, tangent }
+    pub fn new_with_zero_tangent(primal: V) -> Result<Self, DifferentiationError> {
+        let tangent = MaybeZero::Zero(primal.r#type().tangent()?);
+        Ok(Self { primal, tangent })
     }
 }
 
@@ -213,8 +219,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 tangent.input_ids().len(),
             ))
         })?;
-        let differentiable_primal_inputs =
-            primal.inputs().filter(|input| !input.r#type().tangent().is_zero_space()).collect::<Vec<_>>();
+        let differentiable_primal_inputs = primal
+            .inputs()
+            .map(|input| Ok((input.r#type().tangent()?, input)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
+            .filter_map(|(tangent_type, input)| (!tangent_type.is_zero_space()).then_some(input))
+            .collect::<Vec<_>>();
         if tangent_input_count != differentiable_primal_inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linearization tangent program consumes {tangent_input_count} tangent inputs \
@@ -225,7 +236,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         let differentiable_primal_outputs = primal
             .outputs()
             .take(primal_output_count)
-            .filter(|output| !output.r#type().tangent().is_zero_space())
+            .map(|output| Ok((output.r#type().tangent()?, output)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
+            .filter_map(|(tangent_type, output)| (!tangent_type.is_zero_space()).then_some(output))
             .collect::<Vec<_>>();
         if tangent.output_ids().len() != differentiable_primal_outputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
@@ -239,7 +253,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
             differentiable_primal_inputs.into_iter().zip(tangent.inputs().take(tangent_input_count)).enumerate()
         {
             let primal_type = primal_input.r#type();
-            let tangent_type = primal_type.tangent();
+            let tangent_type = primal_type.tangent()?;
             if tangent_input.r#type().as_ref() != &tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
                     "linearization tangent input {} has type {} but primal input type {} requires tangent type {}",
@@ -254,7 +268,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
             differentiable_primal_outputs.into_iter().zip(tangent.outputs()).enumerate()
         {
             let primal_type = primal_output.r#type();
-            let tangent_type = primal_type.tangent();
+            let tangent_type = primal_type.tangent()?;
             if tangent_output.r#type().as_ref() != &tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
                     "linearization tangent output {} has type {} but primal output type {} requires tangent type {}",
@@ -468,6 +482,8 @@ impl<
         let live_input_tangent_types = primal_input_types
             .iter()
             .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
             .filter(|r#type| !r#type.is_zero_space())
             .collect::<Vec<_>>();
         if live_input_tangent_types.len() != tangent_input_count {
@@ -491,6 +507,8 @@ impl<
         let live_output_tangent_types = primal_output_types
             .iter()
             .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
             .filter(|r#type| !r#type.is_zero_space())
             .collect::<Vec<_>>();
         if live_output_tangent_types.len() != program.output_ids().len() {
@@ -590,7 +608,7 @@ impl<
         // information-carrying values because the compact program has no SSA input for a zero differential space.
         let mut program_inputs = Vec::new();
         for (index, (value, primal_type)) in public_tangents.into_iter().zip(&self.primal_input_types).enumerate() {
-            let tangent_type = primal_type.tangent();
+            let tangent_type = primal_type.tangent()?;
             if value.r#type().as_ref() != &tangent_type {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
@@ -1085,7 +1103,7 @@ where
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         // Constants are independent of every differentiation input and so their tangents are structural zeros.
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent.lift(constant)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent.lift(constant)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 
@@ -1119,15 +1137,16 @@ where
             let input_types = input_duals.iter().map(|dual| dual.primal().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice(), &[])?;
             let mut reusable_zero_outputs = Vec::new();
-            let can_materialize = output_types.iter().enumerate().all(|(output_index, output_type)| {
-                let tangent_type = output_type.tangent();
+            let mut can_materialize = true;
+            for (output_index, output_type) in output_types.iter().enumerate() {
+                let tangent_type = output_type.tangent()?;
                 if operation.is_zero(output_index) && output_type == &tangent_type {
                     reusable_zero_outputs.push(output_index);
-                    true
-                } else {
-                    tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
+                } else if tangent_type.identities().any(|(position, _)| position == TypeIdentityPosition::Reference) {
+                    can_materialize = false;
+                    break;
                 }
-            });
+            }
             can_materialize.then_some(reusable_zero_outputs)
         };
 
@@ -1145,10 +1164,10 @@ where
                     if reusable_zero_outputs.contains(&output_index) {
                         DifferentiationDual::new(primal.clone(), primal)
                     } else {
-                        Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                        DifferentiationDual::new_with_zero_tangent(primal)
                     }
                 })
-                .collect::<Result<Vec<_>, TypeError>>()?
+                .collect::<Result<Vec<_>, DifferentiationError>>()?
         } else {
             // Borrow the complete region driver directly, preserving operation-defined ordering without collecting
             // it into temporary storage.
@@ -1184,11 +1203,11 @@ where
     /// the same program from the region's retained transform cache as a shared handle.
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
-        let tangent_input_count = self
-            .input_ids()
-            .iter()
-            .filter(|input| !self.atoms()[input.index()].r#type().tangent().is_zero_space())
-            .count();
+        let tangent_input_count = self.input_ids().iter().try_fold(0usize, |count, input| {
+            Ok::<_, DifferentiationError>(
+                count + usize::from(!self.atoms()[input.index()].r#type().tangent()?.is_zero_space()),
+            )
+        })?;
 
         // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so
         // that scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real
@@ -1215,7 +1234,7 @@ where
             }
             for input_id in self.input_ids().iter().copied() {
                 let primal_type = self.atoms()[input_id.index()].r#type();
-                let tangent_type = primal_type.tangent();
+                let tangent_type = primal_type.tangent()?;
                 tangents[input_id.index()] = Some(if !tangent_type.is_zero_space() {
                     MaybeZero::Value(context.input(tangent_type.clone()))
                 } else {
@@ -1248,7 +1267,7 @@ where
                         // take a structural zero typed with the atom's tangent boundary type.
                         let tangent = match &tangents[input_atom.index()] {
                             Some(tangent) => tangent.clone(),
-                            None => MaybeZero::Zero(primal.r#type().tangent()),
+                            None => MaybeZero::Zero(primal.r#type().tangent()?),
                         };
                         Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent)?)
                     })
@@ -1262,16 +1281,22 @@ where
                 // to materialize their structural-zero tangents.
                 let all_input_tangents_are_zero =
                     !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
-                let can_materialize_output_tangents_without_rules = || {
-                    instruction.outputs().iter().copied().enumerate().all(|(output_index, output_atom)| {
+                let can_materialize_output_tangents_without_rules = || -> Result<bool, DifferentiationError> {
+                    for (output_index, output_atom) in instruction.outputs().iter().copied().enumerate() {
                         let output_type = self.atoms()[output_atom.index()].r#type();
-                        let tangent_type = output_type.tangent();
-                        tangent_type.identities().all(|(position, _)| position != TypeIdentityPosition::Reference)
-                            || (instruction.operation().is_zero(output_index) && output_type.as_ref() == &tangent_type)
-                    })
+                        let tangent_type = output_type.tangent()?;
+                        let can_materialize = tangent_type
+                            .identities()
+                            .all(|(position, _)| position != TypeIdentityPosition::Reference)
+                            || (instruction.operation().is_zero(output_index) && output_type.as_ref() == &tangent_type);
+                        if !can_materialize {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
                 };
                 let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-                let output_duals = if all_input_tangents_are_zero && can_materialize_output_tangents_without_rules() {
+                let output_duals = if all_input_tangents_are_zero && can_materialize_output_tangents_without_rules()? {
                     let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
                     context
                         .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
@@ -1284,15 +1309,14 @@ where
                             // explicit shaped-constructor extents and avoids inventing a nullary dynamic zero at the
                             // fused Jacobian-Vector Product (JVP) boundary.
                             let primal_type = primal.r#type();
-                            if instruction.operation().is_zero(output_index)
-                                && primal_type.as_ref() == &primal_type.tangent()
-                            {
+                            let tangent_type = primal_type.tangent()?;
+                            if instruction.operation().is_zero(output_index) && primal_type.as_ref() == &tangent_type {
                                 DifferentiationDual::new(primal.clone(), primal)
                             } else {
-                                Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                                DifferentiationDual::new_with_zero_tangent(primal)
                             }
                         })
-                        .collect::<Result<Vec<_>, TypeError>>()?
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?
                 } else {
                     let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
                     instruction.operation().jvp(&context, &differentiation_driver, input_duals.as_slice())?
@@ -1330,7 +1354,7 @@ where
                         primals[output_atom.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: output_atom })?;
                     let tangent = match &tangents[output_atom.index()] {
                         Some(tangent) => tangent.clone(),
-                        None => MaybeZero::Zero(primal.r#type().tangent()),
+                        None => MaybeZero::Zero(primal.r#type().tangent()?),
                     };
                     if tangent.r#type().is_zero_space() {
                         Ok(None)
@@ -1410,11 +1434,11 @@ where
     /// retained transform cache as shared handles.
     pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
-        let tangent_input_count = self
-            .input_ids()
-            .iter()
-            .filter(|input| !self.atoms()[input.index()].r#type().tangent().is_zero_space())
-            .count();
+        let tangent_input_count = self.input_ids().iter().try_fold(0usize, |count, input| {
+            Ok::<_, DifferentiationError>(
+                count + usize::from(!self.atoms()[input.index()].r#type().tangent()?.is_zero_space()),
+            )
+        })?;
 
         // Keep one standalone handle to the primal builder. Every tracer and context clone is scoped below and must
         // be gone before this handle can be unwrapped at the trace boundary.
@@ -1433,7 +1457,7 @@ where
             .copied()
             .map(|input_atom| {
                 let primal_type = self.atoms()[input_atom.index()].r#type().into_owned();
-                let tangent_type = primal_type.tangent();
+                let tangent_type = primal_type.tangent()?;
                 let primal = primal_context.input(primal_type);
                 primal_input_atoms.push(primal.atom_id()?);
                 let tangent = if !tangent_type.is_zero_space() {
@@ -1601,7 +1625,10 @@ where
             .iter()
             .map(|input| &self.atoms()[input.index()])
             .zip(primal_input_atoms)
-            .filter(|(input, _)| !input.r#type().tangent().is_zero_space());
+            .map(|(input, primal)| Ok((input.r#type().tangent()?, input, primal)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
+            .filter_map(|(tangent_type, input, primal)| (!tangent_type.is_zero_space()).then_some((input, primal)));
         let mut zero_residual_types = Vec::new();
         for (((input, primal_input), tangent_input), tangent_input_atom) in differentiable_primal_inputs
             .zip(tangent_program.inputs().take(tangent_input_count))
@@ -1842,10 +1869,10 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let capture_structure = capture.parameter_structure();
         let capture_duals = capture
             .into_parameters()
-            .map(|primal| {
-                DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal), context.clone())
+            .map(|primal| -> Result<_, DifferentiationError> {
+                Ok(DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(primal)?, context.clone()))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let capture = Capture::To::<DifferentiationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
         let output = function(input, capture)?;
 
@@ -1910,7 +1937,9 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         // The dual-seeding pass consumes `input_values` so we retain the active primals separately because dead tangent
         // inputs may later need their concrete runtime shapes captured as residuals before transposition.
         let primal_input_values = input_values.clone();
-        let tangent_input_count = input_types.iter().filter(|r#type| !r#type.tangent().is_zero_space()).count();
+        let tangent_input_count = input_types.iter().try_fold(0usize, |count, r#type| {
+            Ok::<_, DifferentiationError>(count + usize::from(!r#type.tangent()?.is_zero_space()))
+        })?;
 
         // Active primals receive unknown tangent inputs. Captures are known primal inputs paired with structural zeros,
         // so they can be residualized when needed without increasing the pushforward's tangent arity.
@@ -1921,7 +1950,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             .into_iter()
             .map(|value| {
                 let primal_type = value.r#type().into_owned();
-                let tangent_type = primal_type.tangent();
+                let tangent_type = primal_type.tangent()?;
                 let tangent = if !tangent_type.is_zero_space() {
                     let tangent = evaluation_context.unknown_input(tangent_type.clone(), tangent_index);
                     tangent_index += 1;
@@ -1940,14 +1969,14 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         let capture_structure = capture.parameter_structure();
         let capture_duals = capture
             .into_parameters()
-            .map(|value| {
+            .map(|value| -> Result<_, DifferentiationError> {
                 let primal = PartialTracer::new(evaluation_context.clone(), PartialEvaluationValue::known_input(value));
-                DifferentiationTracer::new(
-                    DifferentiationDual::new_with_zero_tangent(primal),
+                Ok(DifferentiationTracer::new(
+                    DifferentiationDual::new_with_zero_tangent(primal)?,
                     differentiation_context.clone(),
-                )
+                ))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let capture = Capture::To::<LinearizationTracer<Self>>::from_parameters(capture_structure, capture_duals)?;
         let output = function(input, capture)?;
 
@@ -2041,8 +2070,12 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         // A dead active tangent input is the only one that can become a disconnected cotangent after transposition.
         let mut program = evaluation.program;
         let live_sets = program.live_sets();
-        let differentiable_primal_inputs =
-            primal_input_values.iter().filter(|value| !value.r#type().tangent().is_zero_space());
+        let differentiable_primal_inputs = primal_input_values
+            .iter()
+            .map(|value| Ok((value.r#type().tangent()?, value)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?
+            .into_iter()
+            .filter_map(|(tangent_type, value)| (!tangent_type.is_zero_space()).then_some(value));
         let mut zero_residuals = Vec::new();
         for ((primal, tangent_input), tangent_input_atom) in differentiable_primal_inputs
             .zip(program.inputs().take(tangent_input_count))
@@ -2139,14 +2172,14 @@ pub fn jvp_projected_operation<
         .map(|input| {
             let primal = <C::Value as ValueProjection<T>>::into_projected(input.primal().clone())?;
             match input.tangent() {
-                MaybeZero::Zero(_) => Ok(DifferentiationDual::new_with_zero_tangent(primal)),
+                MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
                 MaybeZero::Value(value) => {
                     let tangent = <C::Value as ValueProjection<T>>::into_projected(value.clone())?;
                     DifferentiationDual::new(primal, tangent)
                 }
             }
         })
-        .collect::<Result<Vec<_>, TypeError>>()?;
+        .collect::<Result<Vec<_>, DifferentiationError>>()?;
     operation
         .jvp(&ProjectedContext::new(context.clone()), &EmptyRegionDriver, projected_inputs.as_slice())?
         .into_iter()
@@ -2307,7 +2340,7 @@ mod tests {
 
         assert!(matches!(
             DifferentiationDual::new(token.clone(), token),
-            Err(TypeError::Invalid { message })
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
     }

@@ -74,7 +74,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let input = &inputs[0];
             let primal = input.primal().abs()?;
-            let primal_tangent_type = primal.r#type().tangent();
+            let primal_tangent_type = primal.r#type().tangent()?;
             let tangent = match input.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal_tangent_type),
                 MaybeZero::Value(_) if primal_tangent_type.is_zero_space() => {
@@ -97,7 +97,7 @@ impl_differentiable_operation! {
                         let real = conjugate.real()? / denominator.clone();
                         let imaginary = conjugate.imaginary()? / denominator.clone();
                         let coefficient = real.complex(&imaginary)?;
-                        let input_tangent_type = input.primal().r#type().tangent();
+                        let input_tangent_type = input.primal().r#type().tangent()?;
                         let tangent = tangent.align_tangent(&input_tangent_type, input.primal())?;
                         MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type, &primal)?)
                     } else {

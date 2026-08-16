@@ -206,7 +206,7 @@ impl_select_differentiation! {
             check_count!("output", primal, 1, ProgramError);
             let primal = primal.remove(0);
             let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
-                MaybeZero::Zero(primal.r#type().tangent())
+                MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
                 // A `select` needs both branch tangents as real values, so materialize the structurally zero side.
                 let on_true_tangent = on_true.tangent().clone().materialize(context)?;
@@ -217,7 +217,7 @@ impl_select_differentiation! {
                     &[condition.primal().clone(), on_true_tangent, on_false_tangent],
                 )?;
                 check_count!("output", tangents, 1, ProgramError);
-                let output_tangent_type = primal.r#type().tangent();
+                let output_tangent_type = primal.r#type().tangent()?;
                 MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type, &primal)?)
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -243,10 +243,10 @@ impl_select_differentiation! {
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(inputs
+                MaybeZero::Zero(_) => inputs
                     .iter()
-                    .map(|input| MaybeZero::Zero(input.r#type().cotangent()))
-                    .collect()),
+                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                    .collect(),
                 MaybeZero::Value(cotangent) => {
                     // The condition is the known operand. The dispatch guarantees a `Known` operand
                     // carries its pullback value, so read the tracer directly.
@@ -281,10 +281,10 @@ impl_select_differentiation! {
                         &[condition, zero, cotangent.clone()],
                     )?;
                     check_count!("output", on_false, 1, ProgramError);
-                    let on_true_type = inputs[1].r#type().cotangent();
-                    let on_false_type = inputs[2].r#type().cotangent();
+                    let on_true_type = inputs[1].r#type().cotangent()?;
+                    let on_false_type = inputs[2].r#type().cotangent()?;
                     Ok(vec![
-                        MaybeZero::Zero(inputs[0].r#type().cotangent()),
+                        MaybeZero::Zero(inputs[0].r#type().cotangent()?),
                         MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
                         MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
                     ])

@@ -481,12 +481,6 @@ fn residual_boundary(local_type: &ArrayType, mesh: &LogicalMesh) -> Result<(Arra
     Ok((global_type, sharding))
 }
 
-/// Returns the descriptor used for one tangent shard-map boundary value. Differentiable values use their declared
-/// tangent representation, while non-differentiable positional values use their first-class zero-space descriptor.
-fn tangent_boundary_type(r#type: &ArrayType) -> ArrayType {
-    r#type.tangent()
-}
-
 /// Fuse-linearizes a shard-map body capture-free into a primal body and a tangent body that thread residuals as plain
 /// operand edges across the shard-map boundary.
 ///
@@ -570,13 +564,19 @@ fn shard_map_bodies<
             manual_axes.to_vec(),
             operation.shard_map().check_vma(),
         );
-        let global_input_types = operation
+        let mut global_input_types = operation
             .global_input_types()
             .iter()
-            .map(tangent_boundary_type)
-            .chain(residual_global_types)
-            .collect();
-        let global_output_types = operation.global_output_types().iter().map(tangent_boundary_type).collect();
+            .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        global_input_types.extend(residual_global_types);
+        let global_output_types = operation
+            .global_output_types()
+            .iter()
+            .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
         ShardMapOperation::from_boundary(shard_map, global_input_types, global_output_types)
     };
 
@@ -647,11 +647,7 @@ where
         // tangent element representation.
         let tangent_output_types = primal_outputs
             .iter()
-            .map(|output| {
-                <&ArrayType>::try_from(output.r#type().as_ref())
-                    .map(tangent_boundary_type)
-                    .map_err(ProgramError::from)
-            })
+            .map(|output| <&ArrayType>::try_from(output.r#type().as_ref())?.tangent().map_err(ProgramError::from))
             .collect::<Result<Vec<_>, _>>()?;
         let tangent_operation = tangent_operation
             .with_global_output_types(tangent_output_types)
@@ -729,7 +725,10 @@ pub fn transpose_primal_shard_map<
 
     // A shard_map with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
-        return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+        return inputs
+            .iter()
+            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
+            .collect();
     }
 
     // Each operand maps to one body global input, independently linear (an input tangent) or known (a residual value).
@@ -755,7 +754,7 @@ pub fn transpose_primal_shard_map<
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
-        let output_type = ArrayIrType::Array(output_type.cotangent());
+        let output_type = ArrayIrType::Array(output_type.cotangent()?);
         operands.push(materialize_transpose_cotangent(context, cotangent, &output_type, inputs)?);
     }
     operands.extend(known_values);
@@ -777,12 +776,14 @@ pub fn transpose_primal_shard_map<
     let cotangents = operand_linear
         .iter()
         .zip(inputs)
-        .map(
-            |(&linear, input)| {
-                if linear { input_cotangents.next().unwrap() } else { MaybeZero::Zero(input.r#type().cotangent()) }
-            },
-        )
-        .collect();
+        .map(|(&linear, input)| {
+            if linear {
+                Ok(input_cotangents.next().unwrap())
+            } else {
+                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(cotangents)
 }
 
@@ -858,24 +859,24 @@ fn transpose_shard_map_body<
         operation.shard_map().check_vma(),
     );
 
-    let global_input_types = operation
+    let mut global_input_types = operation
         .global_output_types()
         .iter()
         .map(DifferentiableType::cotangent)
-        .chain(
-            input_linearity
-                .iter()
-                .zip(operation.global_input_types().iter())
-                .filter(|&(&linear, _)| !linear)
-                .map(|(_, global_type)| global_type.clone()),
-        )
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
+    global_input_types.extend(
+        input_linearity
+            .iter()
+            .zip(operation.global_input_types().iter())
+            .filter(|&(&linear, _)| !linear)
+            .map(|(_, global_type)| global_type.clone()),
+    );
     let global_output_types = input_linearity
         .iter()
         .zip(operation.global_input_types().iter())
         .filter(|&(&linear, _)| linear)
         .map(|(_, global_type)| global_type.cotangent())
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok((ShardMapOperation::from_boundary(shard_map, global_input_types, global_output_types), transposed_program))
 }
@@ -1407,8 +1408,8 @@ mod tests {
         let boundary_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(4)]));
         let ambient_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let ambient_input_type = boundary_type.clone().with_sharding(ambient_sharding).unwrap();
-        let ambient_tangent_type = ambient_input_type.tangent();
-        let boundary_tangent_type = boundary_type.tangent();
+        let ambient_tangent_type = ambient_input_type.tangent().unwrap();
+        let boundary_tangent_type = boundary_type.tangent().unwrap();
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
@@ -1476,7 +1477,7 @@ mod tests {
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
-        let cotangent_type = tangent_type.cotangent();
+        let cotangent_type = tangent_type.cotangent().unwrap();
 
         let source = {
             let mut builder = XlaProgramBuilder::new();
@@ -1519,7 +1520,7 @@ mod tests {
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
-        let cotangent_type = tangent_type.cotangent();
+        let cotangent_type = tangent_type.cotangent().unwrap();
         let shard_map =
             ShardMap::from_shardings(mesh, vec![tangent_sharding.clone()], vec![tangent_sharding], Vec::new(), true);
         let operation =
@@ -1565,7 +1566,7 @@ mod tests {
         let transposed = {
             let mut builder = XlaProgramBuilder::new();
             let value_cotangent = builder.add_input(value_type.clone());
-            let _predicate_cotangent = builder.add_input(predicate_type.cotangent());
+            let _predicate_cotangent = builder.add_input(predicate_type.cotangent().unwrap());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![value_cotangent],
@@ -1590,7 +1591,10 @@ mod tests {
             &mut context,
             &driver,
             &[PartialValue::Unknown(ArrayIrType::Array(value_type.clone()))],
-            &[MaybeZero::Value(value_cotangent), MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent()))],
+            &[
+                MaybeZero::Value(value_cotangent),
+                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+            ],
         )
         .unwrap();
 
@@ -1612,7 +1616,7 @@ mod tests {
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(tangent_sharding.clone())
             .unwrap();
-        let cotangent_type = tangent_type.cotangent();
+        let cotangent_type = tangent_type.cotangent().unwrap();
 
         let source = {
             let mut builder = XlaProgramBuilder::new();

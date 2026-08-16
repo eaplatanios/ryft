@@ -248,7 +248,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> Zero<Differentiation
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().zero(r#type)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().zero(r#type)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

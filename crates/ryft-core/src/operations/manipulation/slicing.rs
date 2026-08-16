@@ -546,7 +546,7 @@ where
         let apply = |value: &C::Value| value.slice(self.start_indices(), self.limit_indices(), self.strides());
         let primal = apply(inputs[0].primal())?;
         let tangent = match inputs[0].tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(tangent) => MaybeZero::Value(apply(tangent)?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -586,13 +586,13 @@ where
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
                 let mut residuals = LinearResiduals::new();
                 let operand_shape = residuals.retain_shape(context, operand.primal())?;
                 let forward_operation = self.clone();
                 let transpose_shape = operand_shape.clone();
-                let transpose_operand_type = operand_type.cotangent();
+                let transpose_operand_type = operand_type.cotangent()?;
                 let transpose_starts = self.start_indices().to_vec();
                 let transpose_strides = self.strides().to_vec();
                 let tangent = LinearCallOperation::stage(
@@ -702,11 +702,11 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
             MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
                 // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                 // contract explicitly, matching the strided strategy's own check below.
-                let input_cotangent_type = inputs[0].r#type().cotangent();
+                let input_cotangent_type = inputs[0].r#type().cotangent()?;
                 if input_cotangent_type.static_shape().is_none() {
                     return Err(TypeError::invalid(format!(
                         "`{SLICE_OPERATION_NAME}` transpose requires a static input shape but got \
@@ -722,7 +722,7 @@ where
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
                 let cotangent =
-                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
+                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
                 Ok(vec![MaybeZero::Value(cotangent)])
             }
             MaybeZero::Value(cotangent) => {
@@ -761,7 +761,7 @@ where
                     interior_padding.push(stride - 1);
                 }
                 let zero = MaybeZero::Zero(
-                    ArrayType::scalar(input_type.data_type().cotangent()).with_memory(input_type.memory()),
+                    ArrayType::scalar(input_type.data_type().cotangent()?).with_memory(input_type.memory()),
                 )
                 .materialize(context)?;
                 let outputs = context.stage_operation(
@@ -771,7 +771,7 @@ where
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
                 let cotangent =
-                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent())?;
+                    outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
                 Ok(vec![MaybeZero::Value(cotangent)])
             }
         }
@@ -1130,7 +1130,7 @@ where
         let update = &inputs[1];
         let primal = operand.primal().update_slice(update.primal(), self.start_indices())?;
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let update_tangent = update.tangent().clone().materialize(context)?;
@@ -1163,13 +1163,13 @@ where
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()),
+                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_type = inputs[1].r#type();
                 let update_sizes = static_update_sizes(UPDATE_SLICE_OPERATION_NAME, &update_type)?;
-                let zeros = MaybeZero::Zero(update_type.cotangent()).materialize(context)?;
+                let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -1185,8 +1185,11 @@ where
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent =
-                    update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?;
+                let update_cotangent = update_cotangents
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .unalign_cotangent(&inputs[1].r#type().cotangent()?)?;
                 Ok(vec![
                     MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
                     MaybeZero::Value(update_cotangent),
@@ -1468,7 +1471,7 @@ where
         let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         let primal = operand.primal().dynamic_slice(&primal_starts, self.sizes())?;
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -1508,7 +1511,7 @@ where
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
         let tangent = match operand.tangent() {
-            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
                 // Start indices have zero differential spaces but remain ordinary residual SSA values because both
                 // the forward slice and its transpose need their concrete runtime values.
@@ -1518,7 +1521,7 @@ where
                 let forward_operation = self.clone();
                 let forward_start_indices = start_indices.clone();
                 let transpose_shape = operand_shape.clone();
-                let transpose_operand_type = operand_type.cotangent();
+                let transpose_operand_type = operand_type.cotangent()?;
                 let tangent = LinearCallOperation::stage(
                     context,
                     residuals.into_values(),
@@ -1846,7 +1849,7 @@ where
         let primal_starts = inputs[2..].iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         let primal = operand.primal().dynamic_update_slice(update.primal(), &primal_starts)?;
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent())
+            MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let update_tangent = update.tangent().clone().materialize(context)?;
@@ -1893,7 +1896,7 @@ where
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
         if operand.tangent().is_zero() && update.tangent().is_zero() {
-            return Ok(vec![DifferentiationDual::new(primal.clone(), MaybeZero::Zero(primal.r#type().tangent()))?]);
+            return Ok(vec![DifferentiationDual::new(primal.clone(), MaybeZero::Zero(primal.r#type().tangent()?))?]);
         }
 
         // The integer starts are the ordinary primal residuals shared by the forward update and its two transpose
@@ -1916,14 +1919,14 @@ where
         if let MaybeZero::Value(tangent) = update.tangent() {
             linear_values.push(tangent.clone());
         }
-        let forward_operand_type = operand_type.tangent();
-        let forward_update_type = update_type.tangent();
+        let forward_operand_type = operand_type.tangent()?;
+        let forward_update_type = update_type.tangent()?;
         let forward_start_indices = start_indices.clone();
         let forward_operand_shape = operand_shape.clone();
         let forward_update_shape = update_shape.clone();
         let transpose_start_indices = start_indices.clone();
         let transpose_update_shape = update_shape.clone();
-        let transpose_update_type = update_type.cotangent();
+        let transpose_update_type = update_type.cotangent()?;
         let update_sizes = if update_is_live {
             transpose_update_type
                 .shape()
@@ -2279,14 +2282,14 @@ where
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                Ok(MaybeZero::Zero(input_type.cotangent()?))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
             // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
             // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
-            let operand_cotangent_type = inputs[0].r#type().cotangent();
+            let operand_cotangent_type = inputs[0].r#type().cotangent()?;
             if operand_cotangent_type.static_shape().is_none() {
                 return Err(TypeError::invalid(format!(
                     "`{DYNAMIC_SLICE_OPERATION_NAME}` transpose requires a statically shaped operand but got \
@@ -2353,13 +2356,13 @@ where
             .iter()
             .map(|input| {
                 let input_type = input.r#type();
-                MaybeZero::Zero(input_type.cotangent())
+                Ok(MaybeZero::Zero(input_type.cotangent()?))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let update_sizes = static_update_sizes(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &inputs[1].r#type())?;
             let start_indices = read_known_start_indices(&inputs[2..]);
-            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()).materialize(context)?;
+            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()?).materialize(context)?;
             // Input cotangent: the output cotangent with the update window overwritten by zeros.
             let mut input_operands = Vec::with_capacity(2 + start_indices.len());
             input_operands.push(cotangent.clone());
@@ -2380,7 +2383,7 @@ where
             check_count!("output", update_cotangents, 1, ProgramError);
             contributions[0] = MaybeZero::Value(input_cotangents.into_iter().next().unwrap());
             contributions[1] = MaybeZero::Value(
-                update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent())?,
+                update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent()?)?,
             );
         }
         Ok(contributions)

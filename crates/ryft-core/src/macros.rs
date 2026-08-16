@@ -1514,7 +1514,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![$crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
                     $crate::Typed::r#type(&inputs[0]).as_ref(),
-                ))])
+                )?)])
             }
         }
     };
@@ -1614,7 +1614,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![$crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
                     $crate::Typed::r#type(&inputs[0]).as_ref(),
-                ))])
+                )?)])
             }
         }
     };
@@ -2017,7 +2017,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 )?;
                 $crate::check_count!("output", primals, 1, ProgramError);
                 let primal = primals.remove(0);
-                let target = $crate::DifferentiableType::tangent($crate::Typed::r#type(&primal).as_ref());
+                let target = $crate::DifferentiableType::tangent($crate::Typed::r#type(&primal).as_ref())?;
                 let left = inputs[0].tangent().as_value();
                 let right = inputs[1].tangent().as_value();
                 if $crate::DifferentiableType::is_zero_space(&target) && (left.is_some() || right.is_some()) {
@@ -2088,14 +2088,14 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 match &outputs[0] {
                     $crate::MaybeZero::Zero(_) =>
-                        Ok(inputs
+                        inputs
                             .iter()
                             .map(|input| {
-                                $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                                Ok($crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
                                     $crate::Typed::r#type(input).as_ref(),
-                                ))
+                                )?))
                             })
-                            .collect()),
+                            .collect(),
                     $crate::MaybeZero::Value(cotangent) => {
                         let operation_name = $crate::Operation::name(self);
                         Ok(vec![
@@ -2140,7 +2140,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // linear rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly
     // that boundary handling even though their signs can differ.
     (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
-        let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref());
+        let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref())?;
         if $crate::DifferentiableType::is_zero_space(&target) {
             return Err($crate::ProgramError::UnsupportedOperation {
                 message: format!("`{}` input has no cotangent space", $operation_name),
@@ -2194,7 +2194,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                     (true, false) => {
                         let target = $crate::DifferentiableType::cotangent(
                             $crate::Typed::r#type(&inputs[0]).as_ref(),
-                        );
+                        )?;
                         let contribution = match &outputs[0] {
                             $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
                             $crate::MaybeZero::Value($left_output_cotangent) => {
@@ -2228,7 +2228,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                     (false, true) => {
                         let target = $crate::DifferentiableType::cotangent(
                             $crate::Typed::r#type(&inputs[1]).as_ref(),
-                        );
+                        )?;
                         let contribution = match &outputs[0] {
                             $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
                             $crate::MaybeZero::Value($right_output_cotangent) => {
@@ -2276,11 +2276,11 @@ macro_rules! impl_differentiable_elementwise_operation {
                 let mut contributions = inputs
                     .iter()
                     .map(|input| {
-                        $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
+                        Ok($crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
                             $crate::Typed::r#type(input).as_ref(),
-                        ))
+                        )?))
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, $crate::DifferentiationError>>()?;
                 contributions[linear_index] = contribution;
                 Ok(contributions)
             }
@@ -2339,7 +2339,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 }
                 let target = $crate::DifferentiableType::cotangent(
                     $crate::Typed::r#type(&inputs[0]).as_ref(),
-                );
+                )?;
                 let contribution = match &outputs[0] {
                     $crate::MaybeZero::Zero(_) => $crate::MaybeZero::Zero(target),
                     $crate::MaybeZero::Value($output_cotangent) => {
@@ -2369,7 +2369,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                     contribution,
                     $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
                         $crate::Typed::r#type(&inputs[1]).as_ref(),
-                    )),
+                    )?),
                 ])
             }
         }
@@ -2564,7 +2564,7 @@ macro_rules! impl_non_differentiable_operation {
             ) -> Result<Vec<$crate::DifferentiationDual<__C::Value>>, $crate::DifferentiationError> {
                 // The outputs carry no tangent. We replay the primal operation on the input primals and pair each
                 // output with a structural zero tangent, which stays symbolic and stages nothing.
-                Ok($crate::Context::bind(
+                $crate::Context::bind(
                     context,
                     self.clone(),
                     ::std::vec::Vec::new(),
@@ -2572,7 +2572,7 @@ macro_rules! impl_non_differentiable_operation {
                 )?
                 .into_iter()
                 .map($crate::DifferentiationDual::new_with_zero_tangent)
-                .collect())
+                .collect()
             }
         }
     };
@@ -6013,12 +6013,12 @@ mod tests {
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32)));
         let inputs = [
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32)));
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
@@ -6034,7 +6034,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32)));
         let inputs = [
-            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)),
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
@@ -6237,7 +6237,7 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
         let outputs = SinOperation::new()
-            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input)])
+            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input).unwrap()])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(

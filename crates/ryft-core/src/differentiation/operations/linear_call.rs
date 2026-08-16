@@ -224,11 +224,13 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
             },
             forward_input_types,
         )?;
-        let transpose_input_types = residuals
-            .iter()
-            .map(|value| value.r#type().into_owned())
-            .chain(forward.outputs().map(|output| output.r#type().into_owned().cotangent()))
-            .collect();
+        let mut transpose_input_types = residuals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        transpose_input_types.extend(
+            forward
+                .outputs()
+                .map(|output| output.r#type().cotangent())
+                .collect::<Result<Vec<_>, DifferentiationError>>()?,
+        );
         let (_, transpose) = NestedTracingContext::trace(
             context.clone(),
             move |inputs| {
@@ -366,11 +368,17 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         let forward_output_types = driver.region(0)?.output_types();
         let forward = forward.specialize(forward_input_types.as_slice())?;
         let physical_output_types = forward.output_types();
-        let transpose_input_types = packed_inputs[..boundary_operand_count + self.residual_count]
+        let mut transpose_input_types = packed_inputs[..boundary_operand_count + self.residual_count]
             .iter()
             .map(|input| input.r#type().into_owned())
-            .chain(physical_output_types.iter().map(DifferentiableType::cotangent))
             .collect::<Vec<_>>();
+        transpose_input_types.extend(
+            physical_output_types
+                .iter()
+                .map(DifferentiableType::cotangent)
+                .collect::<Result<Vec<_>, DifferentiationError>>()
+                .map_err(TypeError::from)?,
+        );
         let transpose = transpose.specialize(transpose_input_types.as_slice())?;
         let outputs = context.parent().bind(
             LinearCallOperation::new(self.residual_count + boundary_operand_count),
@@ -429,23 +437,24 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
                     .map(|r#type| r#type.rename_identities(&renaming))
                     .collect::<Result<Vec<_>, _>>()?;
                 let (residual_types, _) = self.split_inputs(input_types)?;
-                let transpose_input_types = residual_types
-                    .iter()
-                    .cloned()
-                    .chain(output_types.iter().map(DifferentiableType::cotangent))
-                    .collect();
+                let mut transpose_input_types = residual_types.to_vec();
+                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
+                    Vec<_>,
+                    DifferentiationError,
+                >>(
+                )?);
                 Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
             }
             LinearCallInterface::TransposeOnly { output_types, .. } => {
                 check_count!("region", region_interfaces, 1, TypeError);
                 let (residual_types, _) = self.split_inputs(input_types)?;
-                Ok(vec![Some(
-                    residual_types
-                        .iter()
-                        .cloned()
-                        .chain(output_types.iter().map(DifferentiableType::cotangent))
-                        .collect(),
-                )])
+                let mut transpose_input_types = residual_types.to_vec();
+                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
+                    Vec<_>,
+                    DifferentiationError,
+                >>(
+                )?);
+                Ok(vec![Some(transpose_input_types)])
             }
         }
     }
@@ -462,12 +471,19 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
                 let transpose = &region_interfaces[1];
                 check_types!(@same, "linear call forward input", [input_types, forward.input_types()]);
                 let (residual_types, linear_types) = self.split_inputs(input_types)?;
-                let transpose_input_types = residual_types
-                    .iter()
-                    .cloned()
-                    .chain(forward.output_types().iter().map(DifferentiableType::cotangent))
-                    .collect::<Vec<_>>();
-                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
+                let mut transpose_input_types = residual_types.to_vec();
+                transpose_input_types.extend(
+                    forward
+                        .output_types()
+                        .iter()
+                        .map(DifferentiableType::cotangent)
+                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
+                );
+                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<
+                    Vec<_>,
+                    DifferentiationError,
+                >>(
+                )?;
                 check_types!(@same, "linear call transpose input", [
                     &transpose_input_types,
                     transpose.input_types(),
@@ -483,12 +499,17 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
                 let transpose = &region_interfaces[0];
                 let (residual_types, actual_linear_types) = self.split_inputs(input_types)?;
                 check_types!(@same, "transpose-only linear call input", [linear_types, actual_linear_types]);
-                let transpose_input_types = residual_types
-                    .iter()
-                    .cloned()
-                    .chain(output_types.iter().map(DifferentiableType::cotangent))
-                    .collect::<Vec<_>>();
-                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Vec<_>>();
+                let mut transpose_input_types = residual_types.to_vec();
+                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
+                    Vec<_>,
+                    DifferentiationError,
+                >>(
+                )?);
+                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<
+                    Vec<_>,
+                    DifferentiationError,
+                >>(
+                )?;
                 check_types!(@same, "transpose-only linear call transpose input", [
                     &transpose_input_types,
                     transpose.input_types(),
@@ -612,7 +633,7 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if inputs.iter().all(|input| input.tangent().is_zero()) {
             let primal_outputs = forward.interpret_in_context(context, primals)?;
-            return Ok(primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect());
+            return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
         }
 
         // Higher-order differentiation must include the dependence of the linear map on its residual parameters.
@@ -641,8 +662,8 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
             .into_iter()
             .zip(output_types)
             .map(|(primal, output_type)| {
-                if output_type.tangent().is_zero_space() {
-                    Ok(DifferentiationDual::new_with_zero_tangent(primal))
+                if output_type.tangent()?.is_zero_space() {
+                    DifferentiationDual::new_with_zero_tangent(primal)
                 } else {
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
                 }
@@ -686,7 +707,7 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
 
         if outputs.iter().all(MaybeZero::is_zero) {
-            return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect());
+            return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
         }
 
         // Classify each transpose-region output as structurally zero by inspecting its producing instruction in the
@@ -747,17 +768,27 @@ impl<
         };
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
-        let mut cotangents =
-            residual_inputs.iter().map(|input| MaybeZero::Zero(input.r#type().cotangent())).collect::<Vec<_>>();
-        cotangents.extend(linear_inputs.iter().zip(input_cotangents.into_iter().zip(output_is_zero)).map(
-            |(input, (cotangent, is_zero))| {
-                if input.is_unknown() {
-                    if is_zero { MaybeZero::Zero(cotangent.r#type().into_owned()) } else { MaybeZero::Value(cotangent) }
-                } else {
-                    MaybeZero::Zero(input.r#type().cotangent())
-                }
-            },
-        ));
+        let mut cotangents = residual_inputs
+            .iter()
+            .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        cotangents.extend(
+            linear_inputs
+                .iter()
+                .zip(input_cotangents.into_iter().zip(output_is_zero))
+                .map(|(input, (cotangent, is_zero))| -> Result<_, DifferentiationError> {
+                    if input.is_unknown() {
+                        Ok(if is_zero {
+                            MaybeZero::Zero(cotangent.r#type().into_owned())
+                        } else {
+                            MaybeZero::Value(cotangent)
+                        })
+                    } else {
+                        Ok(MaybeZero::Zero(input.r#type().cotangent()?))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         Ok(cotangents)
     }
 }
@@ -1554,8 +1585,8 @@ mod tests {
         let primal_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::new(mesh, Vec::new()).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
-        let tangent_type = primal_type.tangent();
-        let cotangent_type = primal_type.cotangent();
+        let tangent_type = primal_type.tangent().unwrap();
+        let cotangent_type = primal_type.cotangent().unwrap();
         assert_ne!(tangent_type, cotangent_type);
 
         // A canonical `zero` transpose-region output is already typed in the linear input's cotangent space.
@@ -1598,7 +1629,7 @@ mod tests {
             .transpose(
                 &mut context,
                 &driver,
-                &[PartialValue::Unknown(primal_type.tangent())],
+                &[PartialValue::Unknown(primal_type.tangent().unwrap())],
                 &[MaybeZero::Value(output_cotangent)],
             )
             .unwrap();

@@ -146,7 +146,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             let primal = inputs[0].primal().transfer_to_memory(operation.destination());
             let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()),
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(operation.destination())),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -164,7 +164,7 @@ impl_differentiable_operation! {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent())]),
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
                 MaybeZero::Value(cotangent) => {
                     let outputs = context.stage_operation(
                         TransferToMemoryOperation::new(inputs[0].r#type().memory()),

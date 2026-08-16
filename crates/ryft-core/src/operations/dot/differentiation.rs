@@ -31,7 +31,7 @@ where
             (None, None) => left.dot(right, self.dimensions()),
         };
         let primal = stage_dot(left.primal(), right.primal());
-        let tangent_type = primal.r#type().tangent();
+        let tangent_type = primal.r#type().tangent()?;
         let convert_to_tangent_type = |value: &C::Value| {
             if value.r#type().data_type() == tangent_type.data_type() {
                 Ok(value.clone())
@@ -113,7 +113,7 @@ impl<
             // structural zero for the known operand. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {
                 let (linear_index, known_index) = if left_is_linear { (0, 1) } else { (1, 0) };
-                let linear_cotangent_type = inputs[linear_index].r#type().cotangent();
+                let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
                 let contribution = match &outputs[0] {
                     MaybeZero::Zero(_) => MaybeZero::Zero(linear_cotangent_type),
                     MaybeZero::Value(output_cotangent) => {
@@ -160,9 +160,9 @@ impl<
                     .iter()
                     .map(|input| {
                         let input_type = input.r#type();
-                        MaybeZero::Zero(input_type.cotangent())
+                        Ok(MaybeZero::Zero(input_type.cotangent()?))
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>, DifferentiationError>>()?;
                 contributions[linear_index] = contribution;
                 Ok(contributions)
             }
