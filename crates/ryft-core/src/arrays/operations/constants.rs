@@ -93,6 +93,11 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayIrType>> for ArrayIrOper
             ArrayIrType::Dimension(_) => {
                 Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
             }
+            // Fallible cotangent derivation rejects references before reverse-mode seeding reaches this conversion.
+            // Retain the same invalid sentinel used for dimensions solely so this public conversion remains total.
+            ArrayIrType::Reference(_) => {
+                Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
+            }
         }
     }
 }
@@ -173,6 +178,7 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
         match source.r#type().as_ref() {
             ArrayIrType::Dimension(source_type) if source_type.variable() == variable => Ok(Some(source.clone())),
             ArrayIrType::Dimension(_) => Ok(None),
+            ArrayIrType::Reference(_) => Ok(None),
             ArrayIrType::Array(source_type) => {
                 let axis =
                     source_type.shape().dimensions().iter().position(
@@ -227,6 +233,7 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
                 first_axes.into_iter().map(|(_, variable)| DimensionType::new(variable).into()).collect()
             }
             ArrayIrType::Dimension(_) => Vec::new(),
+            ArrayIrType::Reference(_) => Vec::new(),
         }
     }
 
@@ -459,6 +466,9 @@ mod tests {
                     .map(|extent| match extent.r#type().into_owned() {
                         ArrayIrType::Dimension(extent_type) => Ok(Dimension::Dynamic(extent_type.variable().clone())),
                         ArrayIrType::Array(_) => {
+                            Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
+                        }
+                        ArrayIrType::Reference(_) => {
                             Err(ProgramError::InvalidArgument { message: "expected a dimension input".to_string() })
                         }
                     })

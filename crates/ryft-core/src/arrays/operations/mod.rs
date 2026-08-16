@@ -47,13 +47,13 @@ use crate::operations::{
     DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
     Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log,
     LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, Pow,
-    PowOperation, PrintOperation, Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation,
-    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
-    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    NegOperation, NewReferenceOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
+    Pad, PadOperation, Pow, PowOperation, PrintOperation, Reduce, ReduceOperation, ReferenceReadOperation, Rem,
+    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
+    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation,
+    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation,
+    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
@@ -76,6 +76,7 @@ mod math;
 mod memory;
 mod quantization;
 mod random;
+mod references;
 mod sharding;
 mod sort;
 mod tag;
@@ -331,10 +332,12 @@ where
 {
 }
 
-/// Closed [`Operation`](crate::Operation) family for Ryft's array IR, whose values include ordinary arrays and
-/// first-class runtime dimensions. This dispatcher preserves the homogeneous contracts of [`ArrayOperation`] and
-/// [`DimensionOperation`]: it selects the member family, projects the composite type boundary once, delegates to that
-/// family, and lifts the inferred result types back into [`ArrayIrType`].
+/// Closed [`Operation`](crate::Operation) family for Ryft's array IR, whose values include ordinary arrays,
+/// first-class runtime dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of
+/// [`ArrayOperation`] and [`DimensionOperation`]: it selects the member family, projects the composite type boundary
+/// once, delegates to that family, and lifts the inferred result types back into [`ArrayIrType`]. Reference operations
+/// remain composite-native because their signatures cross the array/reference boundary and their ordered state
+/// semantics must remain visible to generic program passes.
 ///
 /// Operations whose signatures mix arrays and dimensions are represented as explicit variants because no homogeneous
 /// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
@@ -401,6 +404,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed operation that reads an array axis as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
+    /// Creates a new whole-array reference root.
+    NewReference(NewReferenceOperation),
+
+    /// Reads the current whole-array value from a reference.
+    ReferenceRead(ReferenceReadOperation),
+
     /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
 
@@ -440,28 +449,32 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     AllToAll(AllToAllOperation),
 
-    /// Composite condition whose attached branches may carry arrays and first-class dimensions.
+    /// Composite condition whose attached branches use the complete array IR storage universe. References may be
+    /// represented structurally but remain unsupported until reference validation and discharge.
     Condition(ConditionOperation<ArrayIrValue<A>>),
 
-    /// Composite while loop whose condition and body may carry arrays and first-class dimensions.
+    /// Composite while loop whose condition and body use the complete array IR storage universe. References may be
+    /// represented structurally but remain unsupported until reference validation and discharge.
     While(WhileOperation<ArrayIrType>),
 
-    /// Composite scan whose body may carry arrays and first-class dimensions.
+    /// Composite scan whose body uses the complete array IR storage universe. References may be represented
+    /// structurally but remain unsupported until reference validation and discharge.
     Scan(ScanOperation<ArrayIrValue<A>>),
 
-    /// Composite custom-JVP call whose primal and JVP regions may carry arrays and first-class dimensions.
+    /// Composite custom-JVP call whose primal and JVP regions use the complete array IR storage universe. Generic
+    /// differentiation rejects reference members because they have no tangent representation.
     CustomJvp(CustomJvpOperation<ArrayIrType>),
 
-    /// Composite custom-VJP call whose primal, forward, and backward regions may carry arrays and first-class
-    /// dimensions.
+    /// Composite custom-VJP call whose primal, forward, and backward regions use the complete array IR storage
+    /// universe. Generic differentiation rejects reference members because they have no cotangent representation.
     CustomVjp(CustomVjpOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual operands, in either its executable
     /// forward-and-transpose form or its reverse-only transpose-only form.
     LinearCall(LinearCallOperation<ArrayIrType>),
 
-    /// Composite rematerialized call whose primal, forward, backward, and tangent regions may carry arrays and
-    /// first-class dimensions.
+    /// Composite rematerialized call whose primal, forward, backward, and tangent regions use the complete array IR
+    /// storage universe. Unresolved state remains a non-recomputable boundary and is rejected before ordinary replay.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
@@ -485,11 +498,12 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///
 /// # Member Profiles
 ///
-/// The two member projections are themselves supertraits, each pinned to the sibling bundle of the member family it
-/// projects onto, so one bound carries the complete surface: the array member satisfies [`ArrayOperations`] and the
-/// first-class-dimension member satisfies [`DimensionOperations`]. Generic composite code therefore states
-/// `V: ArrayIrOperations` alone instead of restating `ValueProjection<ArrayType, Projected: ArrayOperations>`-style
-/// bounds at every call site.
+/// The two computational member projections are themselves supertraits, each pinned to the sibling bundle of the
+/// member family it projects onto, so one bound carries the complete surface: the array member satisfies
+/// [`ArrayOperations`] and the first-class-dimension member satisfies [`DimensionOperations`]. References deliberately
+/// have no homogeneous operation family or projection bundle; their cross-kind operations remain composite-native.
+/// Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
+/// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
 ///
 /// Checked arithmetic over two first-class dimensions is a bundle member in its own right, through
 /// [`DimensionArithmetic`], so composite shape arithmetic needs no projection vocabulary at all:
@@ -900,7 +914,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         AtomId, Effect, Effects, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder, ProgramError,
-        RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1022,6 +1036,11 @@ mod tests {
             array_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[],),
             Ok(vec![array_type.clone().into()]),
         );
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        assert_eq!(
+            array_operation.infer_output_types(&[reference_type.clone(), reference_type], &[]),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
 
         // Member control-flow operations promote to their direct composite carriers. Scan promotion also lifts its
         // capture values while preserving every semantic and lowering attribute.
@@ -1089,6 +1108,13 @@ mod tests {
         assert_eq!(
             ArrayIrOperation::<Array>::zero_operation(left_type.clone().into()).unwrap_err(),
             ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
+        );
+        let reference_type = ReferenceType::new(array_type.clone());
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation(reference_type.clone().into()).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(format!(
+                "cannot materialize a zero for reference type `{reference_type}`; references must be discharged first",
+            ))),
         );
 
         // The direct composite condition preserves the complete higher-order interface, including effects.
@@ -2681,11 +2707,17 @@ mod tests {
         /// Converts ordinary array data into a first-class dimension value.
         ArrayToDimensionGateway,
 
+        /// Creates a new reference root initialized from ordinary array data.
+        ArrayToReference,
+
+        /// Reads ordinary array data from a reference.
+        ReferenceToArray,
+
         /// Consumes first-class dimensions as geometry (or reads an array's geometry as a dimension) without ever
         /// converting a value from one member kind into the other.
         GeometryMixed,
 
-        /// Forwards composite regions whose bodies may carry both member kinds.
+        /// Forwards composite regions whose bodies may carry every admitted member kind.
         RegionForwarding,
     }
 
@@ -2693,9 +2725,9 @@ mod tests {
     ///
     /// The match is deliberately exhaustive with no wildcard arm, so adding an [`ArrayIrOperation`] variant fails to
     /// compile until its member-kind signature is declared here and recorded in the expected table of
-    /// `test_array_ir_operation_member_kinds_are_a_closed_family`. That is the compile-forced drift gate for the two
-    /// closed-family enumeration matrix rows: dimension-to-data conversion happens only through explicit gateways,
-    /// and data-to-dimension conversion happens only through the checked `dimension_from_scalar` gateway.
+    /// `test_array_ir_operation_member_kinds_are_a_closed_family`. That is the compile-forced drift gate for explicit
+    /// member-kind crossings: dimension-to-data and data-to-dimension conversion use their checked gateways, while
+    /// array-to-reference and reference-to-array crossings use their explicitly classified reference operations.
     fn member_kind_signature(operation: &ArrayIrOperation<Array>) -> MemberKindSignature {
         match operation {
             ArrayIrOperation::Zero(_) => MemberKindSignature::GeometryMixed,
@@ -2705,6 +2737,8 @@ mod tests {
             ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::NewReference(_) => MemberKindSignature::ArrayToReference,
+            ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::Reshape(_) => MemberKindSignature::GeometryMixed,
@@ -2765,6 +2799,8 @@ mod tests {
                 ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
                 MemberKindSignature::GeometryMixed,
             ),
+            (ArrayIrOperation::NewReference(NewReferenceOperation), MemberKindSignature::ArrayToReference),
+            (ArrayIrOperation::ReferenceRead(ReferenceReadOperation), MemberKindSignature::ReferenceToArray),
             (
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone())),
                 MemberKindSignature::ArrayToDimensionGateway,
@@ -2855,7 +2891,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 26);
+        assert_eq!(expected.len(), 28);
         assert_eq!(
             expected
                 .iter()
@@ -2868,6 +2904,14 @@ mod tests {
                 .iter()
                 .filter(|(_, signature)| *signature == MemberKindSignature::ArrayToDimensionGateway)
                 .count(),
+            1,
+        );
+        assert_eq!(
+            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ArrayToReference).count(),
+            1,
+        );
+        assert_eq!(
+            expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToArray).count(),
             1,
         );
     }

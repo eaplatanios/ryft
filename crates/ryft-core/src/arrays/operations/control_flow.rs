@@ -2,8 +2,9 @@
 //!
 //! Control-flow operations are universe-neutral: their differentiation and lowering rules describe how residuals are
 //! stored across time and how bounded-while state is stacked, without knowing what a program value is. This module
-//! supplies the array universe's answers to those questions, where a value is either ordinary array data or a
-//! first-class runtime dimension.
+//! supplies the array universe's answers to those questions, where a value may be ordinary array data, a first-class
+//! runtime dimension, or an unresolved array reference. Arrays and dimensions define temporal storage; references
+//! must be discharged before any residual stacking or transformed control-flow execution.
 
 use std::sync::Arc;
 
@@ -39,6 +40,9 @@ impl TemporalResidualType for ArrayIrType {
         Ok(match self {
             Self::Array(r#type) => Self::Array(r#type.clone()),
             Self::Dimension(_) => Self::Array(ArrayType::scalar(RUNTIME_DIMENSION_DATA_TYPE)),
+            Self::Reference(_) => {
+                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
+            }
         })
     }
 }
@@ -51,6 +55,9 @@ where
         Ok(match residual_type {
             ArrayIrType::Array(_) => None,
             ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
+            }
         })
     }
 
@@ -59,6 +66,9 @@ where
             ArrayIrType::Array(_) => None,
             ArrayIrType::Dimension(r#type) => {
                 Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
+            }
+            ArrayIrType::Reference(_) => {
+                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
             }
         })
     }
@@ -76,6 +86,9 @@ impl WhileResidualStackType for ArrayIrType {
             Self::Dimension(r#type) => {
                 Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
             }
+            Self::Reference(r#type) => {
+                Err(TypeError::invalid(format!("expected an array-backed bounded-while state type but got {}", r#type)))
+            }
         }
     }
 
@@ -84,6 +97,7 @@ impl WhileResidualStackType for ArrayIrType {
         match self {
             Self::Array(r#type) => Some(r#type),
             Self::Dimension(_) => None,
+            Self::Reference(_) => None,
         }
     }
 }
@@ -143,14 +157,25 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
             Self::Dimension(value) => Err(ProgramError::Concretization {
                 message: format!("cannot use first-class dimension `{value}` as a while predicate"),
             }),
+            Self::Reference(value) => Err(ProgramError::Concretization {
+                message: format!("cannot use reference `{value}` as a while predicate"),
+            }),
         }
     }
 
     fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let Self::Array(predicate) = self else {
-            return Err(ProgramError::Concretization {
-                message: format!("cannot use first-class dimension `{self}` as a while predicate"),
-            });
+        let predicate = match self {
+            Self::Array(predicate) => predicate,
+            Self::Dimension(value) => {
+                return Err(ProgramError::Concretization {
+                    message: format!("cannot use first-class dimension `{value}` as a while predicate"),
+                });
+            }
+            Self::Reference(value) => {
+                return Err(ProgramError::Concretization {
+                    message: format!("cannot use reference `{value}` as a while predicate"),
+                });
+            }
         };
         match (on_true, on_false) {
             (Self::Array(on_true), Self::Array(on_false)) => Ok(Self::Array(predicate.mask_select(on_true, on_false)?)),
@@ -164,6 +189,9 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
                 }
                 Ok(Self::Dimension(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
             }
+            (Self::Reference(_), Self::Reference(_)) => Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before while predicate selection".to_string(),
+            }),
             _ => Err(TypeError::invalid(format!(
                 "while predicate cannot select between mismatched state types {} and {}",
                 on_true.r#type().as_ref(),
@@ -393,11 +421,11 @@ mod tests {
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ScanOperation, Select, WhileOperation, ZeroOperation,
+        ScanOperation, Select, WhileOperation, WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Program, ProgramBuilder, Typed};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, Reference, Typed};
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;
@@ -1485,8 +1513,6 @@ mod tests {
 
     #[test]
     fn test_array_while_predicate() {
-        use crate::operations::WhilePredicate;
-
         let predicate = Array::vector(vec![false, true]);
         assert_eq!(predicate.any_true(), Ok(true));
         assert_eq!(Array::vector(vec![false, false]).any_true(), Ok(false));
@@ -1513,5 +1539,15 @@ mod tests {
         assert_eq!(selected.r#type().as_ref(), &branch_type);
         assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
+
+        let predicate = ArrayIrValue::Array(Array::scalar(true));
+        let on_true = ArrayIrValue::Reference(Reference::new(Array::scalar(1.0_f32)));
+        let on_false = ArrayIrValue::Reference(Reference::new(Array::scalar(2.0_f32)));
+        assert_eq!(
+            predicate.mask_select(&on_true, &on_false),
+            Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before while predicate selection".to_string(),
+            }),
+        );
     }
 }

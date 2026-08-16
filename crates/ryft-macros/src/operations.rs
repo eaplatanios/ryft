@@ -877,6 +877,16 @@ impl OperationEnum {
                 },
             }
         });
+        let reference_semantics_arms = self.variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_type as #ryft::Operation>::reference_semantics(#receiver)
+                },
+            }
+        });
         let effects_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -941,6 +951,10 @@ impl OperationEnum {
 
                 fn is_zero(&self, output_index: usize) -> bool {
                     match self { #(#is_zero_arms)* }
+                }
+
+                fn reference_semantics(&self) -> #ryft::ReferenceOperationSemantics {
+                    match self { #(#reference_semantics_arms)* }
                 }
 
                 fn effects(&self) -> #ryft::Effects {

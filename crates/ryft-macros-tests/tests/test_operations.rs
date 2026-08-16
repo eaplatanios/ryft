@@ -229,6 +229,14 @@ enum Effects {
     Ordered,
 }
 
+/// Stand-in for `ryft_core::ReferenceOperationSemantics`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+enum ReferenceOperationSemantics {
+    #[default]
+    None,
+    Read,
+}
+
 /// Stand-in for `ryft_core::RegionRole`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RegionRole {
@@ -279,6 +287,10 @@ trait Operation: Clone {
     fn is_zero(&self, output_index: usize) -> bool {
         let _ = output_index;
         false
+    }
+
+    fn reference_semantics(&self) -> ReferenceOperationSemantics {
+        ReferenceOperationSemantics::None
     }
 
     fn effects(&self) -> Effects {
@@ -990,6 +1002,10 @@ impl Operation for PrintOperation {
         Effects::Ordered
     }
 
+    fn reference_semantics(&self) -> ReferenceOperationSemantics {
+        ReferenceOperationSemantics::Read
+    }
+
     fn rename_type_identities(
         &self,
         _renaming: &TypeIdentityRenaming<<DataType as Type>::Identity>,
@@ -1355,6 +1371,8 @@ fn test_operation_generates_operation_forwarding() {
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));
+    assert_eq!(add.reference_semantics(), ReferenceOperationSemantics::None);
+    assert_eq!(print.reference_semantics(), ReferenceOperationSemantics::Read);
     assert_eq!(print.to_string(), "rendered print");
 }
 

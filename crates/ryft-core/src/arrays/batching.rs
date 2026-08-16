@@ -2,7 +2,9 @@
 //! [`batching`](crate::batching) module owns the universe-neutral transform protocol, contexts, drivers, and entry
 //! points. This module supplies that protocol's concrete implementations for [`ArrayType`] and [`ArrayIrType`]. Arrays
 //! use the ordinary [`ArrayBatch`] representation, while first-class dimensions are shared shape values and therefore
-//! remain replicated across the batch, and mixed operations explicitly state how they cross that boundary.
+//! remain replicated across the batch, and mixed operations explicitly state how they cross that boundary. References
+//! belong to [`ArrayIrType`]'s storage universe but have no batching-policy projection. Unresolved reference operations
+//! are rejected until discharge turns their state into ordinary arrays.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -1844,7 +1846,9 @@ pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
     /// Packed parent value.
     value: V,
 
-    /// Mapped packed array axis, or replicated for array and dimension values shared across the batch.
+    /// Mapped packed array axis, or replicated for array and dimension values shared across the batch. An unresolved
+    /// reference may occur only in an internal replicated carrier and remains unusable because no reference batching
+    /// projection exists and reference operations reject batching.
     batch_axis: BatchAxis,
 
     /// Per-item [`DimensionType`] of a mapped first-class dimension, whose per-item extents are packed into `value` as
@@ -1858,7 +1862,7 @@ pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
 }
 
 impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
-    /// Creates a batch view and rejects mapped first-class dimensions.
+    /// Creates a batch view, rejecting mapped first-class dimensions and every unresolved reference.
     pub fn new(value: V, batch_axis: BatchAxis) -> Result<Self, BatchingError> {
         let batch_axis = {
             let value_type = value.r#type();
@@ -1868,6 +1872,11 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 ArrayIrType::Dimension(_) if batch_axis.is_replicated() => batch_axis,
                 ArrayIrType::Dimension(r#type) => {
                     return Err(BatchingError::MappedDimension { r#type: Box::new(r#type.clone()), axis: batch_axis });
+                }
+                ArrayIrType::Reference(_) => {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: "references must be discharged before batching".to_string(),
+                    });
                 }
             }
         };
@@ -1934,6 +1943,11 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     }
 
     /// Creates a replicated batch view.
+    ///
+    /// This infallible constructor implements [`BatchingPolicy::replicated`] and may temporarily wrap any composite
+    /// constant kind. An unresolved reference value or handle remains unusable: batching entry boundaries use
+    /// [`Self::new`], no reference [`BatchingPolicyProjection`] exists, and every reference operation rejects
+    /// batching.
     #[inline]
     pub fn replicated(value: V) -> Self {
         Self { value, batch_axis: BatchAxis::replicated(), mapped_dimension: None, ragged_axes: Vec::new() }
@@ -1979,6 +1993,7 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 packed_type.unbatched_type_and_axis(self.batch_axis, self.ragged_axes.as_slice()).unwrap().0.into()
             }
             ArrayIrType::Dimension(r#type) => r#type.clone().into(),
+            ArrayIrType::Reference(r#type) => r#type.clone().into(),
         }
     }
 
@@ -2054,11 +2069,12 @@ pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter
     output_axes: Vec<BatchAxis>,
 }
 
-/// Batching policy for programs whose values may be arrays or first-class dimensions.
+/// Batching policy for programs whose values may be arrays, first-class dimensions, or unresolved references.
 ///
 /// Array members may carry a mapped axis. Dimension members are shared shape values and therefore remain
-/// replicated. The mapped-axis extent is itself an ordinary parent-owned dimension value, so dynamic extents remain
-/// SSA data rather than transform metadata.
+/// replicated. References have no [`BatchingPolicyProjection`] and must be discharged before batching. The mapped-axis
+/// extent is itself an ordinary parent-owned dimension value, so dynamic extents remain SSA data rather than transform
+/// metadata.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ArrayIrBatching;
 
@@ -2493,12 +2509,16 @@ where
 impl<C, T> ValueProjection<T> for BatchingTracer<C, ArrayIrBatching>
 where
     C: Context<Type = ArrayIrType, Operation: BatchableOperation<C, ArrayIrBatching>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    ArrayIrBatching: BatchingPolicyProjection<C, T>,
+    C::Constant:
+        ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + ValueProjection<T, Projected: Value<Type = T>>,
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
     C::Operation: BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
+        + OperationProjection<ArrayType>
+        + OperationProjection<T>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
     T: Type,
     for<'t> &'t T: TryFrom<&'t ArrayIrType, Error = TypeError>,
@@ -2520,12 +2540,14 @@ where
     where
         T: 'v,
     {
-        Ok(ProjectedValue::new(self, <&T>::try_from(&self.batch().unbatched_type())?.clone()))
+        let unbatched_type = <ArrayIrBatching as BatchingPolicy<C>>::unbatched_type(self.batch());
+        Ok(ProjectedValue::new(self, <&T>::try_from(unbatched_type.as_ref())?.clone()))
     }
 
     #[inline]
     fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        let r#type = <&T>::try_from(&self.batch().unbatched_type())?.clone();
+        let unbatched_type = <ArrayIrBatching as BatchingPolicy<C>>::unbatched_type(self.batch());
+        let r#type = <&T>::try_from(unbatched_type.as_ref())?.clone();
         Ok(ProjectedValue::new(self, r#type))
     }
 }

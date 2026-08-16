@@ -36,8 +36,10 @@ use crate::tracing::{Tracer, TracingContext};
 /// residual with the same [`DimensionVariable`], because a variable that appears several times (across axes, or as both
 /// an axis and an explicit dimension operand) denotes one runtime extent. This keeps operand lists minimal and, more
 /// importantly, preserves the type-level equality between axes when shapes are reconstructed inside the attached
-/// regions. All other values (i.e., ordinary arrays and dimensions whose types already pin a concrete extent) are
-/// purely positional: every retention appends a new slot, and the values themselves are never inspected.
+/// regions. All other valid differential residuals (i.e., ordinary arrays and dimensions whose types already pin a
+/// concrete extent) are purely positional: every retention appends a new slot, and the values themselves are never
+/// inspected. References have no differential representation and are rejected by the fallible differentiation type
+/// boundary (i.e., via [`DifferentiableType`](crate::DifferentiableType)) before a valid linearization can retain them.
 #[derive(Clone, Debug)]
 pub struct LinearResiduals<V: Value<Type = ArrayIrType>> {
     /// Retained residual [`Value`]s, in the trailing-operand order of the staged linear call. Indices returned by the
@@ -70,9 +72,10 @@ impl<V: Value<Type = ArrayIrType>> LinearResiduals<V> {
     /// [`ArrayIrType::Dimension`] and that [`DimensionType`](crate::DimensionType) has no concrete extent), retention
     /// deduplicates by identity: if a residual with the same [`DimensionVariable`] was already retained, its existing
     /// slot index is returned and `value` is dropped, since both values denote the same runtime extent. Every other
-    /// value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore carry no identity
-    /// worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an already-retained
-    /// value.
+    /// valid differential value (i.e., ordinary arrays, and dimensions whose types pin a concrete extent and therefore
+    /// carry no identity worth sharing) is appended to a fresh slot unconditionally, even when it compares equal to an
+    /// already-retained value. Unresolved references must never reach this method through a valid differentiation
+    /// pipeline.
     pub fn retain(&mut self, value: V) -> usize {
         if let ArrayIrType::Dimension(r#type) = value.r#type().as_ref()
             && r#type.extent().is_none()
