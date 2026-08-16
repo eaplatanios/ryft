@@ -14,7 +14,7 @@ use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, Shape};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::ResidualZeroProvider;

@@ -1,5 +1,7 @@
-use crate::Array;
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
+use std::fmt::Display;
+use std::marker::PhantomData;
+
+use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -7,8 +9,6 @@ use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_tra
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
-use std::fmt::Display;
-use std::marker::PhantomData;
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
@@ -130,8 +130,6 @@ impl<V: Value<DispatchDomain: Context<Operation: From<StopGradientOperation<V::T
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl StopGradient for Array {
     #[inline]
     fn stop_gradient(&self) -> Self {
@@ -139,12 +137,13 @@ impl StopGradient for Array {
     }
 }
 
-/// Structure-level gradient stopping capability. [`StopGradients`] applies [`StopGradient::stop_gradient`] to every
-/// leaf of a [`Parameterized`] receiver while preserving its exact structure. It supports nested tuples, vectors, and
-/// custom parameterized types, returning an unchanged primal structure whose leaves are constants to every enclosing
-/// differentiation transform.
+/// [`Parameterized`] structure-level gradient stopping capability. [`StopGradients`] applies
+/// [`StopGradient::stop_gradient`] to every leaf of a [`Parameterized`] receiver while preserving its exact structure.
+/// It supports nested tuples, vectors, and custom [`Parameterized`] types, returning an unchanged primal structure
+/// whose leaves are constants to every enclosing differentiation transform.
 pub trait StopGradients<P: Parameter + StopGradient>: Parameterized<P> {
-    /// Stops gradient propagation through every parameter leaf in this structure.
+    /// Stops gradient propagation through every [`Parameter`] leaf in this structure.
+    #[inline]
     fn stop_gradients(mut self) -> Self {
         for parameter in self.parameters_mut() {
             *parameter = parameter.stop_gradient();
@@ -153,7 +152,7 @@ pub trait StopGradients<P: Parameter + StopGradient>: Parameterized<P> {
     }
 }
 
-impl<P: Parameter + StopGradient, Values: Parameterized<P>> StopGradients<P> for Values {}
+impl<P: Parameter + StopGradient, V: Parameterized<P>> StopGradients<P> for V {}
 
 #[cfg(test)]
 mod tests {
@@ -162,7 +161,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayOperation, DataType, Dimension, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
@@ -202,38 +202,6 @@ mod tests {
 
         let input = Array::vector(vec![1.0, -2.0]);
         assert_eq!(input.stop_gradient(), input);
-    }
-
-    #[test]
-    fn test_stop_gradients() {
-        let values = (
-            Array::scalar(1.0f32),
-            vec![Array::scalar(2_i32), Array::scalar(Complex::new(3.0f64, -4.0)), Array::scalar(true)],
-        );
-        assert_eq!(values.clone().stop_gradients(), values);
-
-        assert!(Vec::<Array>::new().stop_gradients().is_empty());
-        assert_eq!(<() as StopGradients<Array>>::stop_gradients(()), ());
-
-        let first_derivative = differentiate_at(Array::scalar(2.0))
-            .gradient(|input| {
-                let stopped = (input.clone(), vec![input.clone(), input]).stop_gradients();
-                stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
-            })
-            .unwrap();
-        assert_eq!(first_derivative, Array::scalar(0.0));
-
-        let second_derivative = differentiate_at(Array::scalar(2.0))
-            .gradient(|input| {
-                differentiate_at(input)
-                    .gradient(|inner| {
-                        let stopped = (inner.clone(), vec![inner.clone(), inner]).stop_gradients();
-                        stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
-                    })
-                    .map_err(Into::into)
-            })
-            .unwrap();
-        assert_eq!(second_derivative, Array::scalar(0.0));
     }
 
     #[test]
@@ -281,6 +249,15 @@ mod tests {
                 input_types = [reduced.clone()],
                 output_types = [reduced],
             }],
+        );
+    }
+
+    #[test]
+    fn test_stop_gradient_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = StopGradientOperation::<ArrayType>::new(),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(2.0),
         );
     }
 
@@ -406,20 +383,43 @@ mod tests {
     }
 
     #[test]
-    fn test_stop_gradient_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = StopGradientOperation::<ArrayType>::new(),
-            inputs = [Array::scalar(2.0)],
-            expected = Array::scalar(2.0),
-        );
-    }
-
-    #[test]
     fn test_stop_gradient_transposition() {
         check_operation_transposition!(
             @rejected,
             operation = StopGradientOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
         );
+    }
+
+    #[test]
+    fn test_stop_gradients() {
+        let values = (
+            Array::scalar(1.0f32),
+            vec![Array::scalar(2_i32), Array::scalar(Complex::new(3.0f64, -4.0)), Array::scalar(true)],
+        );
+        assert_eq!(values.clone().stop_gradients(), values);
+
+        assert!(Vec::<Array>::new().stop_gradients().is_empty());
+        assert_eq!(<() as StopGradients<Array>>::stop_gradients(()), ());
+
+        let first_derivative = differentiate_at(Array::scalar(2.0))
+            .gradient(|input| {
+                let stopped = (input.clone(), vec![input.clone(), input]).stop_gradients();
+                stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
+            })
+            .unwrap();
+        assert_eq!(first_derivative, Array::scalar(0.0));
+
+        let second_derivative = differentiate_at(Array::scalar(2.0))
+            .gradient(|input| {
+                differentiate_at(input)
+                    .gradient(|inner| {
+                        let stopped = (inner.clone(), vec![inner.clone(), inner]).stop_gradients();
+                        stopped.0 + stopped.1[0].clone() + stopped.1[1].clone()
+                    })
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(second_derivative, Array::scalar(0.0));
     }
 }
