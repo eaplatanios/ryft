@@ -1,9 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-// TODO(eaplatanios): Review this module.
-
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -12,24 +10,23 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
 
-// TODO(eaplatanios): Review this.
-
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 
-/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. The `T` parameter fixes
-/// the operation's type universe at construction time, so each zero-sized payload implements exactly one [`Operation`]
+/// [`Operation`] that returns its input unchanged while severing gradient propagation. The `T` parameter fixes the
+/// operation's type universe at construction time, so each zero-sized payload implements exactly one [`Operation`]
 /// contract. Interpretation and backend lowering treat this operation as the identity function. Batching preserves
-/// its mapped axis and rebinds the barrier through the parent transform. The Jacobian-Vector Product (JVP) rule passes
-/// the primal through unchanged and replaces the tangent with a structural zero, so that no derivative flows through
-/// the marked value in either forward or reverse automatic differentiation. Because the rule stages only that zero
-/// tangent, `stop_gradient` can never appear on a linear operand in a valid tangent program, and its
+/// its mapped axis and rebinds the barrier through the parent transform. The Jacobian-Vector Product (JVP) rule (i.e.,
+/// the [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes the primal through unchanged
+/// and replaces the tangent with a structural zero, so that no derivative flows through the marked value in either
+/// forward or reverse automatic differentiation. Because the rule stages only that zero tangent,
+/// [`StopGradientOperation`] can never appear in a valid tangent program, and its
 /// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
 #[derive(Clone, Debug)]
 pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> StopGradientOperation<T> {
-    /// Constructs a stop-gradient operation for the `T` type universe.
+    /// Constructs a new [`StopGradientOperation`] for the `T` type universe.
     #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
@@ -44,13 +41,14 @@ impl<T: Type> Default for StopGradientOperation<T> {
 }
 
 impl<T: Type> Display for StopGradientOperation<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(STOP_GRADIENT_OPERATION_NAME)
     }
 }
 
-impl Operation for StopGradientOperation<DataType> {
-    type Type = DataType;
+impl<T: Type> Operation for StopGradientOperation<T> {
+    type Type = T;
 
     #[inline]
     fn name(&self) -> &'static str {
@@ -60,37 +58,15 @@ impl Operation for StopGradientOperation<DataType> {
     #[inline]
     fn infer_output_types(
         &self,
-        input_types: &[DataType],
-        _region_interfaces: &[RegionInterface<DataType>],
-    ) -> Result<Vec<DataType>, TypeError> {
+        input_types: &[T],
+        _region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
 }
 
-impl Operation for StopGradientOperation<ArrayType> {
-    type Type = ArrayType;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        STOP_GRADIENT_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(
-        &self,
-        input_types: &[ArrayType],
-        _region_interfaces: &[RegionInterface<ArrayType>],
-    ) -> Result<Vec<ArrayType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for StopGradientOperation<T>
-where
-    Self: Operation<Type = C::Type>,
-{
+impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for StopGradientOperation<T> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -103,23 +79,19 @@ where
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for StopGradientOperation<T>
-where
-    C::Operation: From<StopGradientOperation<T>>,
-    Self: Operation<Type = T>,
+impl<T: Type, C: Context<Type = T, Operation: From<StopGradientOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for StopGradientOperation<T>
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batching preserves the operand's mapped axis while recursively rebinding the gradient barrier through the parent
 /// [`Context`]. Rebinding is essential when the parent value is itself a differentiation or batching tracer: treating
 /// the packed value as an ordinary interpreted identity would clone that tracer and silently expose its tangent to an
 /// enclosing transform.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for StopGradientOperation<ArrayType>
-where
-    C::Operation: From<StopGradientOperation<ArrayType>>,
+impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayType>>>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for StopGradientOperation<ArrayType>
 {
     fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
         &self,

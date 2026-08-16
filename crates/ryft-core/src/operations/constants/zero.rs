@@ -1,10 +1,11 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType,
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -163,6 +164,33 @@ pub trait Zero<V: Typed> {
     fn zero(&self, r#type: &V::Type) -> Result<V, ProgramError>;
 }
 
+impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
+    fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        match r#type.data_type() {
+            DataType::Token => {
+                Err(TypeError::invalid(format!("data type `{}` cannot represent zero", DataType::Token)).into())
+            }
+            DataType::Zero => Array::new(r#type.clone(), Vec::new()),
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = Element::from_unsigned(0)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
+    }
+}
+
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayIrType>> Zero<ArrayIrValue<V>>
+    for EagerContext<ArrayIrValue<V>, O>
+where
+    EagerContext<V, ArrayOperation<V>>: Zero<V>,
+{
+    #[inline]
+    fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<V>, ProgramError> {
+        let r#type = <&ArrayType>::try_from(r#type)?;
+        Ok(ArrayIrValue::Array(EagerContext::<V, ArrayOperation<V>>::new().zero(r#type)?))
+    }
+}
+
 impl<C: Context, T: Type> Zero<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
 where
     C::Value: ValueProjection<T, Projected: Value<Type = T>>,
@@ -224,38 +252,21 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, Shape};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType,
+        Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
 
     use super::*;
 
     #[test]
     fn test_zero() {
-        // Verify canonical rank-zero zero values across every supported data-type family.
-        let context = EagerContext::<Array, ZeroOperation<ArrayType>>::new();
-        for (r#type, expected) in [
-            (DataType::Boolean, Array::scalar(false)),
-            (DataType::I8, Array::scalar(0i8)),
-            (DataType::I16, Array::scalar(0i16)),
-            (DataType::I32, Array::scalar(0i32)),
-            (DataType::I64, Array::scalar(0i64)),
-            (DataType::U8, Array::scalar(0u8)),
-            (DataType::U16, Array::scalar(0u16)),
-            (DataType::U32, Array::scalar(0u32)),
-            (DataType::U64, Array::scalar(0u64)),
-            (DataType::BF16, Array::scalar(bf16::ZERO)),
-            (DataType::F16, Array::scalar(f16::ZERO)),
-            (DataType::F32, Array::scalar(0.0f32)),
-            (DataType::F64, Array::scalar(0.0f64)),
-        ] {
-            assert_eq!(context.zero(&ArrayType::scalar(r#type)), Ok(expected));
-        }
-
         // Verify the operation's stored type, identity, zero metadata, rendering, and eager interpretation.
         let operation = ZeroOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.name(), ZERO_OPERATION_NAME);
@@ -319,5 +330,140 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_eager_context_zero() {
+        let context = EagerContext::<Array>::new();
+
+        // Verify canonical rank-zero zero values across every supported data-type family.
+        for (r#type, expected) in [
+            (DataType::Boolean, Array::scalar(false)),
+            (DataType::I8, Array::scalar(0i8)),
+            (DataType::I16, Array::scalar(0i16)),
+            (DataType::I32, Array::scalar(0i32)),
+            (DataType::I64, Array::scalar(0i64)),
+            (DataType::U8, Array::scalar(0u8)),
+            (DataType::U16, Array::scalar(0u16)),
+            (DataType::U32, Array::scalar(0u32)),
+            (DataType::U64, Array::scalar(0u64)),
+            (DataType::BF16, Array::scalar(bf16::ZERO)),
+            (DataType::F16, Array::scalar(f16::ZERO)),
+            (DataType::F32, Array::scalar(0.0f32)),
+            (DataType::F64, Array::scalar(0.0f64)),
+        ] {
+            assert_eq!(context.zero(&ArrayType::scalar(r#type)), Ok(expected));
+        }
+
+        // Rank-positive arrays and the zero-space data type preserve the requested geometry.
+        let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let expected = Array::from_elements(output_type.clone(), &[0.0f32; 6]).unwrap();
+        assert_eq!(context.zero(&output_type), Ok(expected.clone()));
+        let zero_space_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+        assert_eq!(context.zero(&zero_space_type), Array::new(zero_space_type, Vec::new()).map_err(Into::into));
+
+        // Token arrays and dynamically shaped eager arrays cannot be materialized as zeros.
+        assert_eq!(
+            context.zero(&ArrayType::scalar(DataType::Token)),
+            Err(ProgramError::Type(TypeError::invalid("data type token cannot represent zero"))),
+        );
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::unbounded()))]),
+        );
+        assert!(matches!(
+            context.zero(&dynamic_type),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot materialize a value of dynamically sized type f32[size]; dynamically shaped \
+                               values exist only in array programs over `ArrayIrOperation`",
+        ));
+
+        // Composite eager zero materialization delegates array members and rejects first-class dimensions.
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(context.zero(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
+        assert_eq!(
+            context.zero(&dimension_type),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
+    fn test_projected_context_zero() {
+        let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.zero(&output_type).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.into_value().atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = zero [type=f32[2]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_staging_context_zero() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.zero(&output_type).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = zero [type=f32[2]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_zero() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.zero(&output_type).unwrap();
+        let expected = Array::from_elements(output_type, &[0.0f32; 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_batching_context_zero() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.zero(&output_type).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0.0f32; 2]).unwrap());
+    }
+
+    #[test]
+    fn test_differentiation_context_zero() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.zero(&output_type).unwrap();
+        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[0.0f32; 2]).unwrap());
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }

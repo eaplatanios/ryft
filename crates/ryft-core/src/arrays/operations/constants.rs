@@ -10,7 +10,6 @@ use crate::arrays::arrays::Array;
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::encoding::ArrayElement;
-use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
@@ -417,30 +416,6 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
         residuals: &[R],
     ) -> Result<(Self, Vec<R>), ProgramError> {
         ArrayIrOperation::<A>::zero_operation_with_residuals(r#type, residuals)
-    }
-}
-
-impl<A: Value<Type = ArrayType>, O: Operation<Type = ArrayIrType>> Zero<ArrayIrValue<A>>
-    for EagerContext<ArrayIrValue<A>, O>
-where
-    EagerContext<A, ArrayOperation<A>>: Zero<A>,
-{
-    fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<A>, ProgramError> {
-        let array_type = <&ArrayType>::try_from(r#type)?;
-        Ok(ArrayIrValue::Array(EagerContext::<A, ArrayOperation<A>>::new().zero(array_type)?))
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> Zero<Array> for EagerContext<Array, O> {
-    fn zero(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-        match r#type.data_type() {
-            DataType::Token => Err(TypeError::invalid("data type token cannot represent zero".to_string()).into()),
-            DataType::Zero => Array::new(r#type.clone(), Vec::new()),
-            data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(0)?;
-                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
-            }),
-        }
     }
 }
 
