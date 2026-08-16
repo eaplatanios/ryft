@@ -150,12 +150,22 @@ impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ZeroOperationProv
 
 impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for ArrayIrOperation<A> {
     fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-        let ArrayIrType::Array(r#type) = r#type else {
-            // A first-class dimension is a symbolic runtime extent rather than an algebraic value. A zero dimension may
-            // violate the type's bounds, and also assigning zero would bind its identity to an extent that may disagree
-            // with the runtime definition. Dimension tangents and cotangents use the separate array `DataType::Zero`
-            // representation.
-            return Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type").into());
+        let r#type = match r#type {
+            ArrayIrType::Array(r#type) => r#type,
+            ArrayIrType::Dimension(_) => {
+                // A first-class dimension is a symbolic runtime extent rather than an algebraic value. A zero dimension
+                // may violate the type's bounds, and assigning zero would bind its identity to an extent that may
+                // disagree with the runtime definition. Dimension tangents and cotangents use the separate array
+                // `DataType::Zero` representation.
+                return Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type").into());
+            }
+            ArrayIrType::Reference(r#type) => {
+                return Err(TypeError::invalid(format!(
+                    "cannot materialize a zero for reference type `{}`; references must be discharged first",
+                    r#type,
+                ))
+                .into());
+            }
         };
         check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
         Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))

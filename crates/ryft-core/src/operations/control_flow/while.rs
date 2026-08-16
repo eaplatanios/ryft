@@ -175,10 +175,12 @@ impl<T: WhileTypeSemantics> Display for WhileOperation<T> {
 /// along its leading axes. This mirrors JAX's batched `while_p` contract, where the batching transform emits a loop
 /// whose condition returns a batched predicate and the loop's consumers implement the masked semantics.
 ///
-/// [`ArrayIrType`] conditions must produce a Boolean array member and may carry mixed array/dimension state. Under a
-/// batched predicate the prefix requirement applies to the array members only, since a first-class dimension carries
-/// no shape, and such a dimension carry must additionally be *loop-invariant*: one dimension value cannot represent
-/// independently masked per-item extents, but masking a carry that the body forwards unchanged is the identity. Eager
+/// [`ArrayIrType`] conditions must produce a Boolean array member and may carry mixed array/dimension state. Reference
+/// state is structurally representable in the composite signature but remains unsupported until validation and
+/// discharge make it explicit as arrays. Under a batched predicate the prefix requirement applies to the array members
+/// only, since a first-class dimension carries no shape, and such a dimension carry must additionally be
+/// *loop-invariant*: one dimension value cannot represent independently masked per-item extents, but masking a carry
+/// that the body forwards unchanged is the identity. Eager
 /// interpretation enforces that invariance dynamically through
 /// [`ArrayIrValue`](crate::arrays::ArrayIrValue)'s
 /// [`mask_select`](WhilePredicate::mask_select), which returns equal dimension carries unchanged and falls back to
@@ -249,11 +251,18 @@ impl WhileTypeSemantics for ArrayIrType {
             return Ok(());
         }
         for state_type in state_types {
-            // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it. Such
-            // a carry must instead be loop-invariant, which `WhilePredicate::mask_select` enforces dynamically (refer
-            // to the documentation of `WhileTypeSemantics`).
-            let Self::Array(state_type) = state_type else {
-                continue;
+            let state_type = match state_type {
+                Self::Array(state_type) => state_type,
+                // A first-class dimension carries no shape, so the predicate-prefix requirement does not apply to it.
+                // Such a carry must instead be loop-invariant, which `WhilePredicate::mask_select` enforces dynamically
+                // (refer to the documentation of `WhileTypeSemantics`).
+                Self::Dimension(_) => continue,
+                Self::Reference(state_type) => {
+                    return Err(TypeError::invalid(format!(
+                        "`{WHILE_OPERATION_NAME}` condition with a batched predicate requires references to be \
+                         discharged, but state type is `{state_type}`",
+                    )));
+                }
             };
             let state_shape = state_type.shape();
             let is_prefix = predicate_shape.rank() <= state_shape.rank()
@@ -1115,6 +1124,9 @@ where
                     input.validate_replicated_dimension()?;
                     Ok(input)
                 }
+                ArrayIrType::Reference(_) => Err(BatchingError::UnsupportedOperation {
+                    message: "references must be discharged before batching a `while`".to_string(),
+                }),
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
         let mut state_axes = state.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
@@ -1188,6 +1200,9 @@ where
                 .map(|(axis, input)| match input.unbatched_type() {
                     ArrayIrType::Array(_) => BatchAxis::new(0),
                     ArrayIrType::Dimension(_) => *axis,
+                    ArrayIrType::Reference(_) => {
+                        unreachable!("reference state inputs are rejected before while batching discovery")
+                    }
                 })
                 .collect::<Vec<_>>();
             if masked_state_axes != state_axes || batched_condition.output_axes()[0] != BatchAxis::new(0) {
@@ -2473,7 +2488,7 @@ mod tests {
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
-    use crate::programs::Effects;
+    use crate::programs::{Effects, ReferenceType};
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
@@ -2538,6 +2553,30 @@ mod tests {
             operation
                 .infer_output_types(state_types.as_slice(), &[batched_condition_interface, body_interface.clone()]),
             Ok(state_types.clone()),
+        );
+
+        // Reference state has no per-item mask semantics. Reject it at this local type boundary when the predicate is
+        // batched rather than silently treating it like a loop-invariant first-class dimension.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Static(2)]),
+        )));
+        let reference_condition_interface = RegionInterface::new(
+            vec![reference_type.clone()],
+            vec![ArrayIrType::Array(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)])))],
+            Effects::PURE,
+        );
+        let reference_body_interface =
+            RegionInterface::new(vec![reference_type.clone()], vec![reference_type.clone()], Effects::PURE);
+        assert_eq!(
+            operation.infer_output_types(
+                std::slice::from_ref(&reference_type),
+                &[reference_condition_interface, reference_body_interface],
+            ),
+            Err(TypeError::invalid(
+                "`while` condition with a batched predicate requires references to be discharged, but state type is \
+                 `ref<f32[2]>`",
+            )),
         );
 
         // The prefix requirement still holds for every array member under a batched predicate.

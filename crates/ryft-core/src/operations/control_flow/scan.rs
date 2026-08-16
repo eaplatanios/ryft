@@ -305,8 +305,10 @@ pub(crate) fn scan_output_types(
 /// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
 /// and requires a static trip count. [`ArrayIrType`] permits arrays and first-class dimensions in carry positions and
 /// a dynamic trip count backed by one trailing dimension operand, but requires every stacked input, output, and
-/// capture to be an array because the composite domain has no ragged or stacked dimension value. This trait keeps
-/// those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
+/// capture to be an array because the composite domain has no ragged or stacked dimension value. Reference members
+/// are structurally representable in a carry but remain unsupported until reference validation and discharge make
+/// their state explicit as arrays. This trait keeps those type rules local to the scan operation so the operation
+/// dispatcher itself can be generic over `T`.
 pub trait ScanTypeSemantics: Type {
     /// Renames any dynamic identity referenced by a scan length.
     fn rename_scan_length(length: &Dimension, _renaming: &TypeIdentityRenaming<Self::Identity>) -> Dimension {
@@ -2090,6 +2092,9 @@ where
                     input.validate_replicated_dimension()?;
                     Ok(input)
                 }
+                ArrayIrType::Reference(_) => Err(BatchingError::UnsupportedOperation {
+                    message: "references must be discharged before batching a `scan`".to_string(),
+                }),
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
         let stacks = scan_inputs[carry_count..]

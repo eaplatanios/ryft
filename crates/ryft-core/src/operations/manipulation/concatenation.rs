@@ -421,6 +421,10 @@ where
                      extent",
                 ))
                 .into()),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` differentiation expects a trailing result-extent dimension",
+                ))
+                .into()),
             };
         }
 
@@ -569,6 +573,10 @@ where
                 .into()),
                 ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                     "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array before its result extent",
+                ))
+                .into()),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` transpose expects a trailing result-extent dimension",
                 ))
                 .into()),
             };
@@ -767,6 +775,10 @@ where
                     "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
                 ))
                 .into()),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
+                ))
+                .into()),
             };
         }
         // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
@@ -962,6 +974,10 @@ fn infer_array_ir_concatenation(
             ))),
             ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
                 "`{}` expects at least one array before its result extent",
+                CONCATENATE_OPERATION_NAME,
+            ))),
+            ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                "`{}` expects a trailing result-extent dimension",
                 CONCATENATE_OPERATION_NAME,
             ))),
         };

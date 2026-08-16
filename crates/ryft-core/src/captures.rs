@@ -659,7 +659,8 @@ mod tests {
     use crate::operations::{AddOperation, CompareOperation, ComparisonDirection, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, ProgramBuilder, ProgramError, RegionId, RegionSlot, TypeIdentityRenaming, ValueProjection,
+        EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceType, RegionId, RegionSlot, TypeIdentityRenaming,
+        ValueProjection,
     };
     use crate::tests::TestRegionOperation;
     use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -705,6 +706,22 @@ mod tests {
             <CaptureReference<ArrayIrType> as ValueProjection<DimensionType>>::projected(&lifted),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
+
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let capture = CaptureReference::new(5, ArrayIrType::Reference(reference_type.clone()));
+        let projected =
+            <CaptureReference<ArrayIrType> as ValueProjection<ReferenceType<ArrayType>>>::projected(&capture).unwrap();
+        assert_eq!(projected.value().index(), 5);
+        assert_eq!(projected.r#type().as_ref(), &reference_type);
+        let projected =
+            <CaptureReference<ArrayIrType> as ValueProjection<ReferenceType<ArrayType>>>::into_projected(capture)
+                .unwrap();
+        assert_eq!(projected.index(), 5);
+        assert_eq!(projected.r#type().as_ref(), &reference_type);
+        let lifted =
+            <CaptureReference<ArrayIrType> as ValueProjection<ReferenceType<ArrayType>>>::from_projected(projected);
+        assert_eq!(lifted.index(), 5);
+        assert_eq!(lifted.r#type().as_ref(), &ArrayIrType::Reference(reference_type));
     }
 
     #[test]
