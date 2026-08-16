@@ -206,14 +206,14 @@ impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for A
 
 /// Provides checked access to one member kind of a composite [`Value`]. Some program families store several kinds of
 /// values in one [`Value`] type so that all of them can flow through the same [`Program`](crate::Program). For example,
-/// [`ArrayIrValue`](crate::ArrayIrValue) is either a backend array or a first-class runtime dimension, mirroring the
-/// two member types of [`ArrayIrType`](crate::ArrayIrType). Most operations and transform rules, however, are written
-/// against exactly one member kind (e.g., array-only rules consume values with `Value<Type = ArrayType>`), and
-/// `ValueProjection<T>` is what lets them accept a composite value. [`Self::projected`] returns a read-only view
-/// of the value as its `T`-typed member, [`Self::into_projected`] consumes the value and returns an owned member
-/// representation, and [`Self::from_projected`] embeds a member representation back into the composite value type.
-/// Both projection methods fail with a [`TypeError`] when the value holds a different member kind than the requested
-/// one. The associated representations depend on how a value relates to its member:
+/// [`ArrayIrValue`](crate::ArrayIrValue) may be a backend array, a first-class runtime dimension, or an array
+/// reference, mirroring the three member types of [`ArrayIrType`](crate::ArrayIrType). Most operations and transform
+/// rules, however, are written against exactly one member kind (e.g., array-only rules consume values with `Value<Type
+/// = ArrayType>`), and `ValueProjection<T>` is what lets them accept a composite value. [`Self::projected`] returns a
+/// read-only view of the value as its `T`-typed member, [`Self::into_projected`] consumes the value and returns an
+/// owned member representation, and [`Self::from_projected`] embeds a member representation back into the composite
+/// value type. Both projection methods fail with a [`TypeError`] when the value holds a different member kind than
+/// the requested one. The associated representations depend on how a value relates to its member:
 ///
 ///   - Values that contain their member directly, such as [`ArrayIrValue`](crate::ArrayIrValue), project to the member
 ///     itself (e.g., `&A` and `A` for the array member), so no payload is ever cloned or copied.
