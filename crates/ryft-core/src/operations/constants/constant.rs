@@ -49,17 +49,17 @@ impl<V: Value> ConstantOperation<V> {
     }
 }
 
-impl<V: Value> Debug for ConstantOperation<V> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
-    }
-}
-
 impl<V: Value> Display for ConstantOperation<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
+    }
+}
+
+impl<V: Value> Debug for ConstantOperation<V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
     }
 }
 
@@ -84,7 +84,7 @@ impl<V: Value> Operation for ConstantOperation<V> {
     #[inline]
     fn rename_type_identities(
         &self,
-        renaming: &TypeIdentityRenaming<<V::Type as crate::Type>::Identity>,
+        renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self::new(self.value.rename_type_identities(renaming)?))
     }
@@ -187,6 +187,7 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
 impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
     Constant<BatchingTracer<C, ArrayBatching>, Stored> for BatchingContext<C, ArrayBatching>
 {
+    #[inline]
     fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let value = self.parent().constant(value)?;
         let batch = ArrayBatch::new(value, BatchAxis::replicated())?;

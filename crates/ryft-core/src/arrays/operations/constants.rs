@@ -21,9 +21,8 @@ use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::operations::{
-    DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, ZERO_OPERATION_NAME,
-    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
-    check_constructor_type_has_no_identity_references, infer_dynamic_constructor_output_types,
+    DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, infer_dynamic_constructor_output_types,
 };
 use crate::programs::{
     AtomId, MemberOperation, Operation, ProgramBuilder, ProgramError, RegionInterface, TypeError, TypeIdentityRenaming,
@@ -383,16 +382,6 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
     }
 }
 
-impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for ArrayIrOperation<A> {
-    fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-        let ArrayIrType::Array(r#type) = r#type else {
-            return Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type").into());
-        };
-        check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
-        Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))
-    }
-}
-
 impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOperation<A> {
     fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
         match r#type {
@@ -564,7 +553,7 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{DynamicBroadcastOperation, Mul, Reduce, ReductionKind, ZeroOperation};
+    use crate::operations::{ConstantOperation, DynamicBroadcastOperation, Mul, Reduce, ReductionKind, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
@@ -1263,11 +1252,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let scalar = builder
-            .add_instruction(
-                ArrayOperation::from(crate::ConstantOperation::new(Array::scalar(2.5_f64))),
-                Vec::new(),
-                vec![],
-            )
+            .add_instruction(ArrayOperation::from(ConstantOperation::new(Array::scalar(2.5_f64))), Vec::new(), vec![])
             .unwrap()[0];
         let output = builder
             .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])

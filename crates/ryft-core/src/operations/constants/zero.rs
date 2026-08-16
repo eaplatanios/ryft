@@ -1,6 +1,8 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrType, ArrayType};
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayType,
+};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
@@ -21,8 +23,8 @@ use crate::tracing::{Tracer, TracingContext};
 pub const ZERO_OPERATION_NAME: &str = "zero";
 
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
-/// [`Type`] that it holds (i.e., for its `r#type` field). Note that for arrays, this would typically correspond to an
-/// array of the right type and shape filled with zeros.
+/// [`Type`] that it holds (i.e., for its `r#type` field). For arrays, this would typically correspond to an array of
+/// the right type and shape filled with zeros.
 #[derive(Clone, Debug)]
 pub struct ZeroOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
@@ -111,7 +113,7 @@ impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> ZeroOper
 
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
 //  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
-//  is built from `Self` (E0284); the equality is enforced per method through a `where` clause instead.
+//  is built from `Self` (E0284). The equality is enforced per method through a `where` clause instead.
 /// Supplies the canonical zero [`Operation`] of a program type's operation family. [`Self::zero_operation`] covers
 /// zeros that can be constructed from a type without operands, which is all that staging and eager materialization
 /// need. Differentiation additionally must materialize zeros whose runtime geometry is unavailable from the type alone
@@ -135,6 +137,20 @@ impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ZeroOperationProv
     #[inline]
     fn zero_operation(r#type: T) -> Result<Self, ProgramError> {
         Ok(Self::from(ZeroOperation::new(r#type)))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for ArrayIrOperation<A> {
+    fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
+        let ArrayIrType::Array(r#type) = r#type else {
+            // A first-class dimension is a symbolic runtime extent rather than an algebraic value. A zero dimension may
+            // violate the type's bounds, and also assigning zero would bind its identity to an extent that may disagree
+            // with the runtime definition. Dimension tangents and cotangents use the separate array `DataType::Zero`
+            // representation.
+            return Err(TypeError::invalid("cannot materialize a zero for a first-class dimension type").into());
+        };
+        check_constructor_type_has_no_identity_references(ZERO_OPERATION_NAME, &r#type)?;
+        Ok(Self::Array(ArrayOperation::Zero(ZeroOperation::new(r#type))))
     }
 }
 
@@ -274,7 +290,7 @@ mod tests {
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0]);
 
-        // Nullary construction rejects output types with ungrounded identity *references* (a dynamic array axis),
+        // Nullary construction rejects output types with ungrounded identity _references_ (a dynamic array axis),
         // which must instead be constructed through the mixed dimension-operand contract owned by the composite
         // operation family. Definition-position identities remain constructible: a dimension value's type defines
         // its own variable, so nullary construction leaves no dangling reference.
