@@ -1,6 +1,4 @@
-use std::fmt::Display;
-use std::marker::PhantomData;
-
+use crate::Array;
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -9,6 +7,8 @@ use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_tra
 use crate::parameters::{Parameter, Parameterized};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Value};
+use std::fmt::Display;
+use std::marker::PhantomData;
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
@@ -84,12 +84,6 @@ impl<T: Type, C: Context<Type = T, Operation: From<StopGradientOperation<T>>>> P
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Batching preserves the operand's mapped axis while recursively rebinding the gradient barrier through the parent
-/// [`Context`]. Rebinding is essential when the parent value is itself a differentiation or batching tracer: treating
-/// the packed value as an ordinary interpreted identity would clone that tracer and silently expose its tangent to an
-/// enclosing transform.
 impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayType>>>, P: ArrayBatchingPolicy<C>>
     BatchableOperation<C, ArrayBatching<P>> for StopGradientOperation<ArrayType>
 {
@@ -99,6 +93,10 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        // Batching preserves the operand's mapped axis while recursively rebinding the gradient barrier through the
+        // parent context. Rebinding is essential when the parent value is itself a differentiation or batching tracer.
+        // That is because treating the packed value as an ordinary interpreted identity would clone that tracer and
+        // silently expose its tangent to an enclosing transform.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
@@ -118,6 +116,29 @@ pub trait StopGradient: Sized {
     fn stop_gradient(&self) -> Self;
 }
 
+// Any context-carrying value stops gradients by binding a `StopGradientOperation` through its own context. A staged
+// tracer records the operation, while batching and Jacobian-Vector Product (JVP) tracers apply their transform rules.
+// The `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the concrete eager value types
+// (whose context operation is `ConstantOperation`), which implement `StopGradient` directly.
+impl<V: Value<DispatchDomain: Context<Operation: From<StopGradientOperation<V::Type>>>>> StopGradient for V {
+    #[inline]
+    fn stop_gradient(&self) -> Self {
+        self.dispatch_domain()
+            .bind(StopGradientOperation::new(), Vec::new(), std::slice::from_ref(self))
+            .unwrap()
+            .remove(0)
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+impl StopGradient for Array {
+    #[inline]
+    fn stop_gradient(&self) -> Self {
+        self.clone()
+    }
+}
+
 /// Structure-level gradient stopping capability. [`StopGradients`] applies [`StopGradient::stop_gradient`] to every
 /// leaf of a [`Parameterized`] receiver while preserving its exact structure. It supports nested tuples, vectors, and
 /// custom parameterized types, returning an unchanged primal structure whose leaves are constants to every enclosing
@@ -133,25 +154,6 @@ pub trait StopGradients<P: Parameter + StopGradient>: Parameterized<P> {
 }
 
 impl<P: Parameter + StopGradient, Values: Parameterized<P>> StopGradients<P> for Values {}
-
-/// Any context-carrying value stops gradients by binding a [`StopGradientOperation`] through its own context: a
-/// staged tracer records the operation, while batching / JVP tracers apply their transform rules. The
-/// `From<StopGradientOperation<V::Type>>` bound makes this blanket disjoint from the concrete eager value types (whose
-/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), which implement
-/// [`StopGradient`] directly.
-impl<V: Value> StopGradient for V
-where
-    V::DispatchDomain: Context,
-    <V::DispatchDomain as Domain>::Operation: From<StopGradientOperation<V::Type>>,
-{
-    #[inline]
-    fn stop_gradient(&self) -> Self {
-        self.dispatch_domain()
-            .bind(StopGradientOperation::new(), Vec::new(), &[self.clone()])
-            .expect("`stop_gradient` operation failed")
-            .remove(0)
-    }
-}
 
 #[cfg(test)]
 mod tests {

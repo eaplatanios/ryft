@@ -21,48 +21,11 @@ use crate::differentiation::ResidualZeroProvider;
 use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::operations::{
     DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, infer_dynamic_constructor_output_types,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
-use crate::programs::{
-    AtomId, MemberOperation, Operation, ProgramBuilder, ProgramError, RegionInterface, TypeError, TypeIdentityRenaming,
-    Typed, Value, ValueProjection,
-};
+use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, TypeError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review this.
-
-macro_rules! impl_dynamic_constructor_member_operation {
-    // Implements the shared mixed array IR boundary for one canonical homogeneous constructor payload.
-    ($operation:ty) => {
-        impl MemberOperation<ArrayIrType> for $operation {
-            fn infer_parent_region_input_types(
-                &self,
-                _input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
-                Ok(vec![None; region_interfaces.len()])
-            }
-
-            fn infer_parent_output_types(
-                &self,
-                input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<ArrayIrType>, TypeError> {
-                infer_dynamic_constructor_output_types(self.name(), self.r#type(), input_types, region_interfaces)
-            }
-
-            fn rename_parent_type_identities(
-                &self,
-                renaming: &TypeIdentityRenaming<DimensionVariable>,
-            ) -> Result<Self, TypeError> {
-                self.rename_type_identities(renaming)
-            }
-        }
-    };
-}
-
-impl_dynamic_constructor_member_operation!(ZeroOperation<ArrayType>);
-impl_dynamic_constructor_member_operation!(OneOperation<ArrayType>);
-impl_dynamic_constructor_member_operation!(IotaOperation<ArrayType>);
 
 /// Resolves one mixed constructor's explicit dimension operands into the concrete static output type required by an
 /// eager backend.
@@ -426,20 +389,6 @@ impl ZeroLike for Array {
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
                 let element = Element::from_unsigned(0).unwrap();
                 Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
-            }),
-        }
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
-    fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
-        match r#type.data_type() {
-            DataType::Token | DataType::Zero => {
-                Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
-            }
-            data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(1)?;
-                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
             }),
         }
     }

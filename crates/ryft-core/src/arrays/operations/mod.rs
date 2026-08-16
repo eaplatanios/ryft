@@ -69,7 +69,6 @@ mod complex;
 mod constants;
 mod control_flow;
 mod custom_call;
-mod differentiation;
 mod dimensions;
 mod logical;
 mod manipulation;
