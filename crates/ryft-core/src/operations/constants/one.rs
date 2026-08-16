@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    dispatch_on_array_element_type,
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayIrValue, ArrayOperation,
+    ArrayType, DataType, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -19,8 +19,6 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &str = "one";
@@ -136,6 +134,18 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
                 Array::from_fn_elements(r#type.clone(), |_| Ok(element))
             }),
         }
+    }
+}
+
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayIrType>> One<ArrayIrValue<V>>
+    for EagerContext<ArrayIrValue<V>, O>
+where
+    EagerContext<V, ArrayOperation<V>>: One<V>,
+{
+    #[inline]
+    fn one(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<V>, ProgramError> {
+        let r#type = <&ArrayType>::try_from(r#type)?;
+        Ok(ArrayIrValue::Array(EagerContext::<V, ArrayOperation<V>>::new().one(r#type)?))
     }
 }
 
@@ -299,7 +309,8 @@ mod tests {
 
         // Rank-positive arrays preserve the requested geometry.
         let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        assert_eq!(context.one(&output_type), Array::from_elements(output_type, &[1.0f32; 6]).map_err(Into::into));
+        let expected = Array::from_elements(output_type.clone(), &[1.0f32; 6]).unwrap();
+        assert_eq!(context.one(&output_type), Ok(expected.clone()));
 
         // Token, zero-space, and dynamically shaped eager arrays cannot be materialized as ones.
         for data_type in [DataType::Token, DataType::Zero] {
@@ -318,6 +329,16 @@ mod tests {
                 if message == "cannot materialize a value of dynamically sized type f32[size]; dynamically shaped \
                                values exist only in array programs over `ArrayIrOperation`",
         ));
+
+        // Composite eager one materialization delegates array members and rejects first-class dimensions.
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert_eq!(context.one(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
+        assert_eq!(
+            context.one(&dimension_type),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]
