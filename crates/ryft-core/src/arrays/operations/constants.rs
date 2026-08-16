@@ -25,8 +25,9 @@ use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Va
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayType>) -> Self {
-        // Each zero has one canonical encoding: identity-free static zeros already belong to the homogeneous array
-        // member family, and only reference-bearing dynamic output types need the mixed dimension-operand variant.
+        // Prefer the homogeneous member encoding for identity-free static zeros and the mixed dimension-operand
+        // encoding for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts
+        // normalize them to the homogeneous form.
         if operation
             .r#type()
             .shape()
@@ -57,8 +58,9 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
 impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: OneOperation<ArrayType>) -> Self {
-        // Each one has one canonical encoding: identity-free static ones already belong to the homogeneous array
-        // member family, and only reference-bearing dynamic output types need the mixed dimension-operand variant.
+        // Prefer the homogeneous member encoding for identity-free static ones and the mixed dimension-operand
+        // encoding for dynamic output types. Explicit mixed static constructors remain valid, but canonical lifts
+        // normalize them to the homogeneous form.
         if operation
             .r#type()
             .shape()
@@ -98,6 +100,9 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayIrType>> for ArrayIrOper
 impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: IotaOperation<ArrayType>) -> Self {
+        // Prefer the homogeneous member encoding for static iotas and the mixed dimension-operand encoding for dynamic
+        // output types. Explicit mixed static constructors remain valid, but canonical lifts normalize them to the
+        // homogeneous form.
         if operation
             .r#type()
             .shape()
@@ -850,10 +855,10 @@ mod tests {
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0]))]),
         );
 
-        // A boundary interpretation of the *uninstantiated* program with an alpha-renamed actual input type takes
-        // the non-exact establishment path instead: the actual dimension member refines the declared one by bounds
-        // alone, and the concrete static output then establishes its first fact for the declared input identity
-        // through the closed identity signature.
+        // A boundary interpretation of the *uninstantiated* program with an actual input type that uses a different
+        // dimension identity takes the non-exact establishment path instead: the actual dimension member refines the
+        // declared one by bounds alone, and the concrete static output then establishes its first fact for the declared
+        // input identity through the closed identity signature.
         assert_eq!(
             program
                 .interpret(vec![ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(caller), 3).unwrap())]),

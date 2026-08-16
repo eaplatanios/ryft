@@ -345,20 +345,25 @@ where
 #[ryft(dispatch(batching, differentiation, transposition))]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
-    /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. This constructor
-    /// lives at the composite-family level because its signature crosses member kinds: a homogeneous
-    /// [`ArrayOperation`] cannot consume dimension operands, while the stored structural type carries identities and
-    /// bounds but not the concrete runtime extents required to materialize the result.
+    /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. A static stored type
+    /// therefore consumes no operands and remains valid, although canonical lifts prefer the homogeneous
+    /// [`ArrayOperation`] encoding. This constructor lives at the composite-family level because its dynamic signature
+    /// crosses member kinds: a homogeneous [`ArrayOperation`] cannot consume dimension operands, while the stored
+    /// structural type carries identities and bounds but not the concrete runtime extents required to materialize the
+    /// result.
     #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
     /// Mixed one constructor whose stored [`ArrayType`] fully defines the output type and whose dynamic dimensions
-    /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order.
+    /// are consumed as explicit first-class dimension operands, one per dynamic axis in axis order. A static stored
+    /// type consumes no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`]
+    /// encoding.
     #[ryft(mixed(structural), skip_from)]
     DynamicOne(OneOperation<ArrayType>),
 
     /// Mixed iota constructor whose stored [`ArrayType`] and iota axis define the complete output, and whose dynamic
-    /// dimensions are consumed as explicit first-class dimension operands in axis order.
+    /// dimensions are consumed as explicit first-class dimension operands in axis order. A static stored type consumes
+    /// no operands and remains valid, although canonical lifts prefer the homogeneous [`ArrayOperation`] encoding.
     #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
@@ -1118,7 +1123,8 @@ mod tests {
             ConditionOperation::<ArrayIrValue<Array>>::new().output_region_provenance(0),
         );
 
-        // Identity-bearing zeros promote to the mixed constructor and retain ordinary identity renaming.
+        // Canonical lifts keep identity-free zeros homogeneous, while explicit static mixed constructors are also
+        // valid and identity-bearing zeros require the mixed encoding with ordinary identity renaming.
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
@@ -1130,12 +1136,18 @@ mod tests {
         };
         assert_eq!(zero.r#type().shape().dimensions(), &[Dimension::Dynamic(target)]);
 
-        let static_zero = ArrayIrOperation::<Array>::from(ZeroOperation::new(ArrayType::scalar(DataType::F32)));
+        let static_zero_type = ArrayType::scalar(DataType::F32);
+        let static_zero = ArrayIrOperation::<Array>::from(ZeroOperation::new(static_zero_type.clone()));
         assert!(matches!(static_zero, ArrayIrOperation::Array(ArrayOperation::Zero(_))));
+        let mixed_static_zero = ArrayIrOperation::<Array>::Zero(ZeroOperation::new(static_zero_type.clone()));
+        assert_eq!(mixed_static_zero.infer_output_types(&[], &[]), Ok(vec![static_zero_type.clone().into()]));
 
-        // Identity-free ones remain homogeneous, while identity-bearing ones use the explicit mixed constructor.
-        let static_one = ArrayIrOperation::<Array>::from(OneOperation::new(ArrayType::scalar(DataType::F32)));
+        // Canonical lifts keep identity-free ones homogeneous, while explicit static mixed constructors are also
+        // valid and identity-bearing ones require the mixed encoding.
+        let static_one = ArrayIrOperation::<Array>::from(OneOperation::new(static_zero_type.clone()));
         assert!(matches!(static_one, ArrayIrOperation::Array(ArrayOperation::One(_))));
+        let mixed_static_one = ArrayIrOperation::<Array>::DynamicOne(OneOperation::new(static_zero_type.clone()));
+        assert_eq!(mixed_static_one.infer_output_types(&[], &[]), Ok(vec![static_zero_type.into()]));
         let dynamic_one_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let dynamic_one = ArrayIrOperation::<Array>::from(OneOperation::new(dynamic_one_type.clone()));
         assert!(matches!(dynamic_one, ArrayIrOperation::DynamicOne(_)));
@@ -1166,10 +1178,12 @@ mod tests {
         );
 
         // Iota follows the same static-versus-dynamic routing while retaining and validating its varying axis.
-        let static_iota = ArrayIrOperation::<Array>::from(
-            IotaOperation::new(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)])), 0).unwrap(),
-        );
+        let static_iota_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)]));
+        let static_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
         assert!(matches!(static_iota, ArrayIrOperation::Array(ArrayOperation::Iota(_))));
+        let mixed_static_iota =
+            ArrayIrOperation::<Array>::DynamicIota(IotaOperation::new(static_iota_type.clone(), 0).unwrap());
+        assert_eq!(mixed_static_iota.infer_output_types(&[], &[]), Ok(vec![static_iota_type.into()]));
         let dynamic_iota_type =
             ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Static(2)]));
         let dynamic_iota = ArrayIrOperation::<Array>::from(IotaOperation::new(dynamic_iota_type.clone(), 0).unwrap());
@@ -1395,17 +1409,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(one, vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 1.0]))]);
+        // Explicit static mixed constructors consume no dimension operands and interpret identically to their
+        // preferred homogeneous encodings.
+        let static_float_type = ArrayType::scalar(DataType::F32);
+        assert_eq!(
+            context.bind(ArrayIrOperation::Zero(ZeroOperation::new(static_float_type.clone())), Vec::new(), &[],),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(0.0f32))]),
+        );
+        assert_eq!(
+            context.bind(ArrayIrOperation::DynamicOne(OneOperation::new(static_float_type)), Vec::new(), &[],),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(1.0f32))]),
+        );
+        let static_iota_type = ArrayType::new_static(DataType::I32, [3]);
         assert_eq!(
             context.bind(
-                ArrayIrOperation::DynamicOne(OneOperation::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrOperation::DynamicIota(IotaOperation::new(static_iota_type.clone(), 0).unwrap()),
                 Vec::new(),
                 &[],
             ),
-            Err(TypeError::invalid(
-                "`one` with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
-                 constructor instead",
-            )
-            .into()),
+            Ok(vec![ArrayIrValue::Array(Array::from_elements(static_iota_type.clone(), &[0i32, 1, 2]).unwrap(),)]),
+        );
+        assert_eq!(
+            context.bind(
+                ArrayIrOperation::DynamicIota(IotaOperation::new(static_iota_type, 0).unwrap()),
+                Vec::new(),
+                &[ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap())],
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
         let rows = DimensionValue::constant(2).unwrap();
@@ -1467,7 +1497,8 @@ mod tests {
 
         // A runtime extent outside the stored output axis's authoritative bounds is rejected before allocation,
         // even though eager binds skip inference: the operand's own variable admits the extent, so only the stored
-        // axis's bounds can catch it. Identity equality is deliberately not required (inputs may be alpha-renamed).
+        // axis's bounds can catch it. The input may use an equivalent dimension identity supplied by the calling
+        // program, so its identity does not need to exactly match the one stored on the operation.
         let bounded = DimensionVariable::new("bounded", DimensionBounds::new(1, Some(4)).unwrap());
         let error = context
             .bind(

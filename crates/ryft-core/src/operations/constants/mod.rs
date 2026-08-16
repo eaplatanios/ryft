@@ -24,7 +24,7 @@ macro_rules! impl_member_operation_for_array_ir_constant_operation {
                 input_types: &[$crate::arrays::ArrayIrType],
                 region_interfaces: &[$crate::programs::RegionInterface<$crate::arrays::ArrayIrType>],
             ) -> Result<Vec<$crate::arrays::ArrayIrType>, $crate::programs::TypeError> {
-                $crate::operations::constants::infer_dynamic_constructor_output_types(
+                $crate::operations::constants::infer_array_ir_constant_constructor_output_types(
                     self.name(),
                     self.r#type(),
                     input_types,
@@ -43,7 +43,6 @@ macro_rules! impl_member_operation_for_array_ir_constant_operation {
     };
 }
 
-// TODO(eaplatanios): Review this macro.
 /// Implements mixed [`MemberInterpretableOperation`](crate::MemberInterpretableOperation) semantics for an array
 /// constant constructor. The generated implementation projects each explicit first-class dimension operand to its
 /// runtime extent, validates that extent against the corresponding dynamic axis's declared bounds, and replaces the
@@ -99,16 +98,6 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                     .iter()
                     .filter(|dimension| matches!(dimension, $crate::arrays::Dimension::Dynamic(_)))
                     .count();
-                if expected == 0 {
-                    return Err($crate::programs::TypeError::invalid(format!(
-                        "`{}` with static output type {} has no dynamic dimensions; use the homogeneous nullary \
-                         constructor instead",
-                        self.name(),
-                        self.r#type(),
-                    ))
-                    .into());
-                }
-
                 let mut extents = inputs.iter();
                 let dimensions = self
                     .r#type()
@@ -128,8 +117,9 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
                             >>::into_projected(extent.clone())?;
 
                             // Eager binds skip inference and intermediate results skip boundary refinement checks, so
-                            // validate each runtime extent against the stored output axis before allocating. Identity
-                            // equality is deliberately not required because interpreted inputs may be alpha-renamed.
+                            // validate each runtime extent against the stored output axis before allocating. The input
+                            // may use the equivalent dimension identity supplied by the calling program, so its
+                            // identity does not need to exactly match the one stored on the operation.
                             if !variable.bounds().contains(extent.extent()) {
                                 return Err($crate::arrays::DimensionError::BindingOutOfBounds {
                                     variable: variable.to_string(),
@@ -181,16 +171,16 @@ pub(crate) fn check_constructor_type_has_no_identity_references<T: Type>(
     }
 }
 
-/// Infers the output type of one mixed [`ArrayIrType`] constructor whose stored [`ArrayType`] is the
-/// complete output type. The constructor consumes one first-class dimension operand per *dynamic* dimension
-/// of its stored shape, in axis order, and each operand's [`DimensionType`] must define exactly the
+/// Infers the output type of one mixed [`ArrayIrType`] constant constructor whose stored [`ArrayType`] is the complete
+/// output type. The constructor consumes one first-class dimension operand per *dynamic* dimension of its stored shape,
+/// in axis order, and each operand's [`DimensionType`] must define exactly the
 /// [`DimensionVariable`](crate::DimensionVariable) named by the corresponding output axis. Static axes remain ordinary
-/// stored type metadata and consume no operands, This is deliberately narrower than the mixed reshape/broadcast
+/// stored type metadata and consume no operands. This is deliberately narrower than the mixed reshape/broadcast
 /// contract, which derives *every* output axis from an operand (including exact constants): a constructor's static axes
 /// have no input geometry to relate to, so passing them as operands would only grow the interpreted representation. A
-/// stored type with no dynamic axes is rejected here because identity-free construction has one canonical encoding: the
-/// homogeneous nullary constructor inside the array member family.
-pub(crate) fn infer_dynamic_constructor_output_types(
+/// stored type with no dynamic axes is valid with no operands, although canonical operation-family lifts prefer the
+/// equivalent homogeneous nullary constructor inside the array member family.
+pub(crate) fn infer_array_ir_constant_constructor_output_types(
     name: &str,
     r#type: &ArrayType,
     input_types: &[ArrayIrType],
@@ -200,13 +190,6 @@ pub(crate) fn infer_dynamic_constructor_output_types(
         return Err(TypeError::invalid(format!("`{}` expects no regions but got {}", name, region_interfaces.len())));
     }
     let variables = r#type.shape().dimensions().iter().filter_map(Dimension::variable).collect::<Vec<_>>();
-    if variables.is_empty() {
-        return Err(TypeError::invalid(format!(
-            "`{}` with static output type {} has no dynamic dimensions; use the homogeneous nullary \
-            constructor instead",
-            name, r#type,
-        )));
-    }
     if input_types.len() != variables.len() {
         return Err(TypeError::invalid(format!(
             "`{}` expects one dimension operand per dynamic output dimension ({}) but got {} operands",
@@ -255,14 +238,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_infer_dynamic_constructor_output_types() {
+    fn test_infer_array_ir_constant_constructor_output_types() {
         let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
 
         // One identity-validated dimension operand per dynamic axis, in axis order; static axes consume no operands.
         assert_eq!(
-            infer_dynamic_constructor_output_types(
+            infer_array_ir_constant_constructor_output_types(
                 "zero",
                 &dynamic_type,
                 &[ArrayIrType::Dimension(DimensionType::new(rows.clone()))],
@@ -271,14 +254,14 @@ mod tests {
             Ok(vec![ArrayIrType::Array(dynamic_type.clone())]),
         );
         assert_eq!(
-            infer_dynamic_constructor_output_types("zero", &dynamic_type, &[], &[]),
+            infer_array_ir_constant_constructor_output_types("zero", &dynamic_type, &[], &[]),
             Err(TypeError::invalid(
                 "`zero` expects one dimension operand per dynamic output dimension (1) but got 0 operands",
             )),
         );
         let other = DimensionVariable::new("other", DimensionBounds::non_negative(Some(8)).unwrap());
         assert_eq!(
-            infer_dynamic_constructor_output_types(
+            infer_array_ir_constant_constructor_output_types(
                 "zero",
                 &dynamic_type,
                 &[ArrayIrType::Dimension(DimensionType::new(other))],
@@ -290,7 +273,7 @@ mod tests {
             )),
         );
         assert_eq!(
-            infer_dynamic_constructor_output_types(
+            infer_array_ir_constant_constructor_output_types(
                 "zero",
                 &dynamic_type,
                 &[ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
@@ -299,12 +282,21 @@ mod tests {
             Err(TypeError::invalid("`zero` operand 0 must be a dimension but has type i64[]")),
         );
 
-        // Reference-free static construction has one canonical encoding: the homogeneous nullary constructor.
+        // Static mixed construction is valid with no operands, while unexpected operands remain invalid.
+        let static_type = ArrayType::scalar(DataType::F32);
         assert_eq!(
-            infer_dynamic_constructor_output_types("zero", &ArrayType::scalar(DataType::F32), &[], &[]),
+            infer_array_ir_constant_constructor_output_types("zero", &static_type, &[], &[]),
+            Ok(vec![ArrayIrType::Array(static_type.clone())]),
+        );
+        assert_eq!(
+            infer_array_ir_constant_constructor_output_types(
+                "zero",
+                &static_type,
+                &[ArrayIrType::Array(ArrayType::scalar(DataType::I64))],
+                &[],
+            ),
             Err(TypeError::invalid(
-                "`zero` with static output type f32[] has no dynamic dimensions; use the homogeneous nullary \
-                 constructor instead",
+                "`zero` expects one dimension operand per dynamic output dimension (0) but got 1 operands",
             )),
         );
     }
