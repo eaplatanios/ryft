@@ -231,12 +231,9 @@ where
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
-        driver: &D,
+        _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
         let Some((result_extent, inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",

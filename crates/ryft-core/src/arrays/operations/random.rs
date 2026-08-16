@@ -29,12 +29,9 @@ impl<A: DimensionSize<usize> + RngBitGenerator + Value<Type = ArrayType>>
     fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
         _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
+        _driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
         self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
         let state = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;
         let mut output_extents = inputs[1..].iter();

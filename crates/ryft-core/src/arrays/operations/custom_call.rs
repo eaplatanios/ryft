@@ -14,7 +14,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCall, CustomCallOperation};
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
+use crate::programs::{Operation, ProgramError, Typed, Value, ValueProjection};
 
 // TODO(eaplatanios): Review this.
 
@@ -40,12 +40,9 @@ impl<A: CustomCall + DimensionSize<usize> + Value<Type = ArrayType>>
     fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
         _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
+        _driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
         self.infer_output_types(&inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(), &[])?;
         let dynamic_output_dimension_count = self
             .output_types()

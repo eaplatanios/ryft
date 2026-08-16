@@ -193,14 +193,10 @@ impl<C: Domain<Type = ArrayIrType, Value: DimensionFromScalar<C::Value>>> Interp
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
-        driver: &D,
+        _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let region_count = driver.region_count();
-        if region_count != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {region_count}")).into());
-        }
         self.infer_output_types(&[inputs[0].r#type().into_owned()], &[])?;
         Ok(vec![inputs[0].to_dimension(self.result_type.variable().clone())?])
     }

@@ -41,12 +41,9 @@ impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
     fn interpret<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         &self,
         _context: &EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>,
-        driver: &D,
+        _driver: &D,
         inputs: &[ArrayIrValue<A>],
     ) -> Result<Vec<ArrayIrValue<A>>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
         let expected_input_count = 2 + self.edge_padding_low().len();
         check_count!("input", inputs, expected_input_count, ProgramError);
         let input = <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(&inputs[0])?;

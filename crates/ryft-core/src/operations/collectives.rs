@@ -2238,14 +2238,9 @@ macro_rules! impl_shape_changing_collective_member_operation {
             fn interpret_in_parent<D: InterpretationDriver<C>>(
                 &self,
                 _context: &C,
-                driver: &D,
+                _driver: &D,
                 inputs: &[C::Value],
             ) -> Result<Vec<C::Value>, ProgramError> {
-                if driver.region_count() != 0 {
-                    return Err(
-                        TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count(),)).into()
-                    );
-                }
                 let Some((input, output_extents)) = inputs.split_first() else {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
                 };

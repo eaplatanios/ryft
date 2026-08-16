@@ -80,17 +80,9 @@ macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation
             fn interpret_in_parent<D: $crate::interpretation::InterpretationDriver<C>>(
                 &self,
                 _context: &C,
-                driver: &D,
+                _driver: &D,
                 inputs: &[C::Value],
             ) -> Result<Vec<C::Value>, $crate::programs::ProgramError> {
-                if driver.region_count() != 0 {
-                    return Err($crate::programs::TypeError::invalid(format!(
-                        "expected 0 regions but got {}",
-                        driver.region_count(),
-                    ))
-                    .into());
-                }
-
                 let expected = self
                     .r#type()
                     .shape()

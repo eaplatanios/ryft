@@ -147,12 +147,9 @@ where
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         _context: &C,
-        driver: &D,
+        _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(TypeError::invalid(format!(
                 "`{RESHAPE_OPERATION_NAME}` expects an array followed by its output extents"
