@@ -6,150 +6,20 @@
 //! operand per dynamic axis, the canonical lifts that route each constructor to its static or dynamic encoding, and
 //! the residual-aware zero construction that differentiation uses to rebuild a disconnected cotangent.
 
-use crate::arrays::arrays::Array;
+// TODO(eaplatanios): Review this module.
+
 use crate::arrays::differentiation::ExactShape;
-use crate::arrays::dimensions::DimensionValue;
-use crate::arrays::encoding::ArrayElement;
-use crate::arrays::macros::dispatch_on_array_element_type;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
-use crate::arrays::types::dimensions::{Dimension, DimensionError, DimensionType, Shape};
+use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::Context;
 use crate::differentiation::ResidualZeroProvider;
-use crate::interpretation::{InterpretationDriver, MemberInterpretableOperation};
 use crate::operations::{
-    DimensionSizeOperation, IOTA_OPERATION_NAME, Iota, IotaOperation, One, OneLike, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    DimensionSizeOperation, IotaOperation, OneOperation, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
-use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, TypeError, Typed, Value, ValueProjection};
-
-// TODO(eaplatanios): Review this.
-
-/// Resolves one mixed constructor's explicit dimension operands into the concrete static output type required by an
-/// eager backend.
-fn materialize_dynamic_constructor_type<V>(
-    name: &str,
-    r#type: &ArrayType,
-    inputs: &[V],
-) -> Result<ArrayType, ProgramError>
-where
-    V: ValueProjection<DimensionType, Projected = DimensionValue>,
-{
-    let expected = r#type
-        .shape()
-        .dimensions()
-        .iter()
-        .filter(|dimension| matches!(dimension, Dimension::Dynamic(_)))
-        .count();
-    if expected == 0 {
-        return Err(TypeError::invalid(format!(
-            "`{name}` with static output type {type} has no dynamic dimensions; use the homogeneous nullary \
-             constructor instead",
-            r#type = r#type,
-        ))
-        .into());
-    }
-    let mut extents = inputs.iter();
-    let dimensions = r#type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| match dimension {
-            Dimension::Static(extent) => Ok(Dimension::Static(*extent)),
-            Dimension::Dynamic(variable) => {
-                let extent =
-                    extents.next().ok_or(ProgramError::InvalidInputCount { expected, actual: inputs.len() })?;
-                let extent = <V as ValueProjection<DimensionType>>::into_projected(extent.clone())?;
-                // Eager binds skip inference and intermediate results skip boundary refinement checks, so validate
-                // each runtime extent against the stored output axis's authoritative bounds before allocation.
-                // Identity equality is deliberately not required because interpreted inputs may be alpha-renamed.
-                if !variable.bounds().contains(extent.extent()) {
-                    return Err(DimensionError::BindingOutOfBounds {
-                        variable: variable.to_string(),
-                        value: extent.extent(),
-                        bounds: variable.bounds(),
-                    }
-                    .into());
-                }
-                Ok(Dimension::Static(extent.extent()))
-            }
-        })
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    if extents.next().is_some() {
-        return Err(ProgramError::InvalidInputCount { expected, actual: inputs.len() });
-    }
-    Ok(r#type.clone().with_shape(Shape::new(dimensions)))
-}
-
-macro_rules! impl_dynamic_constant_interpretation {
-    // Implements eager materialization for a dynamic nullary array constructor.
-    ($operation:ty, $capability:ident, $method:ident) => {
-        impl<C> MemberInterpretableOperation<C> for $operation
-        where
-            C: Domain<Type = ArrayIrType>,
-            C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-                + ValueProjection<DimensionType, Projected = DimensionValue>,
-            EagerContext<
-                <C::Value as ValueProjection<ArrayType>>::Projected,
-                ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
-            >: $capability<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        {
-            fn interpret_in_parent<D: InterpretationDriver<C>>(
-                &self,
-                _context: &C,
-                driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, ProgramError> {
-                if driver.region_count() != 0 {
-                    return Err(
-                        TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count(),)).into()
-                    );
-                }
-                let output_type = materialize_dynamic_constructor_type(self.name(), self.r#type(), inputs)?;
-                let output = EagerContext::<
-                    <C::Value as ValueProjection<ArrayType>>::Projected,
-                    ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
-                >::new()
-                .$method(&output_type)?;
-                Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
-            }
-        }
-    };
-}
-
-impl_dynamic_constant_interpretation!(ZeroOperation<ArrayType>, Zero, zero);
-impl_dynamic_constant_interpretation!(OneOperation<ArrayType>, One, one);
-
-impl<C> MemberInterpretableOperation<C> for IotaOperation<ArrayType>
-where
-    C: Domain<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
-    EagerContext<
-        <C::Value as ValueProjection<ArrayType>>::Projected,
-        ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
-    >: Iota<<C::Value as ValueProjection<ArrayType>>::Projected>,
-{
-    fn interpret_in_parent<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        if driver.region_count() != 0 {
-            return Err(TypeError::invalid(format!("expected 0 regions but got {}", driver.region_count())).into());
-        }
-        let output_type = materialize_dynamic_constructor_type(self.name(), self.r#type(), inputs)?;
-        let output = EagerContext::<
-            <C::Value as ValueProjection<ArrayType>>::Projected,
-            ArrayOperation<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        >::new()
-        .iota(&output_type, self.dimension())?;
-        Ok(vec![<C::Value as ValueProjection<ArrayType>>::from_projected(output)])
-    }
-}
+use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Value};
 
 // TODO(eaplatanios): Why is this not generated from our derive macro?
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
@@ -382,71 +252,6 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
     }
 }
 
-impl ZeroLike for Array {
-    fn zero_like(&self) -> Self {
-        match self.r#type().data_type() {
-            DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
-            data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(0).unwrap();
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
-            }),
-        }
-    }
-}
-
-impl OneLike for Array {
-    fn one_like(&self) -> Self {
-        match self.r#type().data_type() {
-            DataType::Token | DataType::Zero => self.clone(),
-            data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(1).unwrap();
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
-            }),
-        }
-    }
-}
-
-impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
-    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
-        if !r#type.data_type().is_numeric() {
-            return Err(TypeError::invalid(format!(
-                "`{}` requires a numeric element type but has {}",
-                IOTA_OPERATION_NAME,
-                r#type.data_type(),
-            ))
-            .into());
-        }
-        let sizes = r#type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| {
-                dimension.value().ok_or_else(|| {
-                    TypeError::invalid(format!(
-                        "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
-                         over `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per \
-                         dynamic axis",
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if dimension >= sizes.len() {
-            return Err(TypeError::invalid(format!(
-                "iota dimension {dimension} is out of bounds for array type {type}",
-            ))
-            .into());
-        }
-        // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
-        // `stride` is the product of the sizes of the dimensions after `dimension`.
-        let size = sizes[dimension];
-        let stride: usize = sizes[dimension + 1..].iter().product();
-        let data_type = r#type.data_type();
-        dispatch_on_array_element_type!(data_type, |Element| {
-            Array::from_fn_elements(r#type.clone(), |flat| Element::from_unsigned(((flat / stride) % size) as u64))
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -456,7 +261,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::encoding::{f8e8m0fnu, i4, u4};
+    use crate::arrays::encoding::{i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::types::arrays::ArrayType;
@@ -469,7 +274,7 @@ mod tests {
         CompiledFunctionDispatcher, FlatCompilationProgram, LoweredFunction, LoweringRequest, StageRequest,
         StagedFunction, try_jit,
     };
-    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::StopGradientOperation;
     use crate::differentiation::{
         DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -477,10 +282,14 @@ mod tests {
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
-    use crate::operations::{ConstantOperation, DynamicBroadcastOperation, Mul, Reduce, ReductionKind, ZeroOperation};
+    use crate::operations::{
+        ConstantOperation, DynamicBroadcastOperation, Iota, Mul, One, Reduce, ReductionKind, Zero, ZeroOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{
+        AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, TypeError, Typed, ValueProjection,
+    };
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1399,23 +1208,6 @@ mod tests {
             "cannot materialize an iota of dynamically sized type f64[dynamic, 3]; stage it in an array program over \
              `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
         );
-    }
-
-    #[test]
-    fn test_array_zero_like_and_one_like() {
-        let array = Array::vector(vec![1.5f32, -2.5]);
-        assert_eq!(array.zero_like().elements::<f32>(), Ok(vec![0.0, 0.0]));
-        assert_eq!(array.one_like().elements::<f32>(), Ok(vec![1.0, 1.0]));
-        assert_eq!(array.zero_like().r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
-
-        // `f8e8m0fnu` cannot represent zero, so zero-like retains each value while one-like produces exact ones.
-        let array = Array::from_elements(
-            ArrayType::new_static(DataType::F8E8M0FNU, [2]),
-            &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
-        )
-        .unwrap();
-        assert_eq!(array.zero_like(), array);
-        assert_eq!(array.one_like().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
     }
 
     /// Identity-directed capture answers per declared residual rather than per exemplar, so it must inspect a

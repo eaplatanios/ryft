@@ -6,7 +6,7 @@ use crate::programs::{RegionInterface, Type, TypeError, TypeIdentityPosition};
 /// and requires one first-class [`DimensionType`] operand per dynamic axis, in axis order. Static axes remain stored
 /// metadata and consume no operands. This is specialized to constant constructors because they have no data operands
 /// or regions and derive their complete result solely from stored type metadata plus dynamic extent operands.
-macro_rules! impl_member_operation_for_constant_operation {
+macro_rules! impl_member_operation_for_array_ir_constant_operation {
     ($operation:ty) => {
         impl $crate::programs::MemberOperation<$crate::arrays::ArrayIrType> for $operation {
             #[inline]
@@ -52,20 +52,24 @@ macro_rules! impl_member_operation_for_constant_operation {
 /// reaches mixed constructors only through their Static Single Assignment (SSA) dimension operands. The final argument
 /// names the generated eager context, concrete output type, and operation payload for use in an operation-specific
 /// expression that returns the constructed projected value.
-macro_rules! impl_member_interpretable_operation_for_constant_operation {
+macro_rules! impl_member_interpretable_operation_for_array_ir_constant_operation {
+    // Implements one array-IR constant constructor from its capability and operation-specific eager expression.
     (
         $operation:ty,
         $capability:ident,
-        |$context:ident, $output_type:ident, $operation_value:ident| $interpretation:expr $(,)?) => {
+        |$context:ident, $output_type:ident, $operation_value:ident| $interpretation:expr $(,)?
+    ) => {
         impl<C> $crate::interpretation::MemberInterpretableOperation<C> for $operation
         where
-            C: $crate::contexts::Domain<Type = $crate::arrays::ArrayIrType>,
-            C::Value: $crate::programs::ValueProjection<
-                    $crate::arrays::ArrayType,
-                    Projected: $crate::programs::Value<Type = $crate::arrays::ArrayType>,
-                > + $crate::programs::ValueProjection<
-                    $crate::arrays::DimensionType,
-                    Projected = $crate::arrays::DimensionValue,
+            C: $crate::contexts::Domain<
+                    Type = $crate::arrays::ArrayIrType,
+                    Value: $crate::programs::ValueProjection<
+                        $crate::arrays::ArrayType,
+                        Projected: $crate::programs::Value<Type = $crate::arrays::ArrayType>,
+                    > + $crate::programs::ValueProjection<
+                        $crate::arrays::DimensionType,
+                        Projected = $crate::arrays::DimensionValue,
+                    >,
                 >,
             $crate::contexts::EagerContext<
                 <C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected,
@@ -118,9 +122,11 @@ macro_rules! impl_member_interpretable_operation_for_constant_operation {
                                 expected,
                                 actual: inputs.len(),
                             })?;
+
                             let extent = <C::Value as $crate::programs::ValueProjection<
                                 $crate::arrays::DimensionType,
                             >>::into_projected(extent.clone())?;
+
                             // Eager binds skip inference and intermediate results skip boundary refinement checks, so
                             // validate each runtime extent against the stored output axis before allocating. Identity
                             // equality is deliberately not required because interpreted inputs may be alpha-renamed.
@@ -132,6 +138,7 @@ macro_rules! impl_member_interpretable_operation_for_constant_operation {
                                 }
                                 .into());
                             }
+
                             Ok($crate::arrays::Dimension::Static(extent.extent()))
                         }
                     })
@@ -156,22 +163,6 @@ macro_rules! impl_member_interpretable_operation_for_constant_operation {
         }
     };
 }
-
-pub mod constant;
-pub mod fill;
-pub mod iota;
-pub mod one;
-pub mod one_like;
-pub mod zero;
-pub mod zero_like;
-
-pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation};
-pub use fill::Fill;
-pub use iota::{IOTA_OPERATION_NAME, Iota, IotaOperation};
-pub use one::{ONE_OPERATION_NAME, One, OneOperation};
-pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
-pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
-pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
 /// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
@@ -237,6 +228,22 @@ pub(crate) fn infer_dynamic_constructor_output_types(
     }
     Ok(vec![ArrayIrType::Array(r#type.clone())])
 }
+
+pub mod constant;
+pub mod fill;
+pub mod iota;
+pub mod one;
+pub mod one_like;
+pub mod zero;
+pub mod zero_like;
+
+pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation};
+pub use fill::Fill;
+pub use iota::{IOTA_OPERATION_NAME, Iota, IotaOperation};
+pub use one::{ONE_OPERATION_NAME, One, OneOperation};
+pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
+pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
+pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
 #[cfg(test)]
 mod tests {
