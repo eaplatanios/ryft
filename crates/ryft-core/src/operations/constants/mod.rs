@@ -1,3 +1,162 @@
+use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
+use crate::programs::{RegionInterface, Type, TypeError, TypeIdentityPosition};
+
+/// Implements the mixed [`ArrayIrType`] [`MemberOperation`](crate::MemberOperation) boundary for an array constant
+/// constructor. The generated implementation treats the operation's stored [`ArrayType`] as the complete output type
+/// and requires one first-class [`DimensionType`] operand per dynamic axis, in axis order. Static axes remain stored
+/// metadata and consume no operands. This is specialized to constant constructors because they have no data operands
+/// or regions and derive their complete result solely from stored type metadata plus dynamic extent operands.
+macro_rules! impl_member_operation_for_constant_operation {
+    ($operation:ty) => {
+        impl $crate::programs::MemberOperation<$crate::arrays::ArrayIrType> for $operation {
+            #[inline]
+            fn infer_parent_region_input_types(
+                &self,
+                _input_types: &[$crate::arrays::ArrayIrType],
+                region_interfaces: &[$crate::programs::RegionInterface<$crate::arrays::ArrayIrType>],
+            ) -> Result<Vec<Option<Vec<$crate::arrays::ArrayIrType>>>, $crate::programs::TypeError> {
+                Ok(vec![None; region_interfaces.len()])
+            }
+
+            #[inline]
+            fn infer_parent_output_types(
+                &self,
+                input_types: &[$crate::arrays::ArrayIrType],
+                region_interfaces: &[$crate::programs::RegionInterface<$crate::arrays::ArrayIrType>],
+            ) -> Result<Vec<$crate::arrays::ArrayIrType>, $crate::programs::TypeError> {
+                $crate::operations::constants::infer_dynamic_constructor_output_types(
+                    self.name(),
+                    self.r#type(),
+                    input_types,
+                    region_interfaces,
+                )
+            }
+
+            #[inline]
+            fn rename_parent_type_identities(
+                &self,
+                renaming: &$crate::programs::TypeIdentityRenaming<$crate::arrays::DimensionVariable>,
+            ) -> Result<Self, $crate::programs::TypeError> {
+                self.rename_type_identities(renaming)
+            }
+        }
+    };
+}
+
+// TODO(eaplatanios): Review this macro.
+/// Implements mixed [`MemberInterpretableOperation`](crate::MemberInterpretableOperation) semantics for an array
+/// constant constructor. The generated implementation projects each explicit first-class dimension operand to its
+/// runtime extent, validates that extent against the corresponding dynamic axis's declared bounds, and replaces the
+/// dynamic axes with static extents before invoking the constructor's eager capability. This runtime concretization is
+/// required because replay deliberately does not refine types stored in operation payloads; concrete shape information
+/// reaches mixed constructors only through their Static Single Assignment (SSA) dimension operands. The final argument
+/// names the generated eager context, concrete output type, and operation payload for use in an operation-specific
+/// expression that returns the constructed projected value.
+macro_rules! impl_member_interpretable_operation_for_constant_operation {
+    (
+        $operation:ty,
+        $capability:ident,
+        |$context:ident, $output_type:ident, $operation_value:ident| $interpretation:expr $(,)?) => {
+        impl<C> $crate::interpretation::MemberInterpretableOperation<C> for $operation
+        where
+            C: $crate::contexts::Domain<Type = $crate::arrays::ArrayIrType>,
+            C::Value: $crate::programs::ValueProjection<
+                    $crate::arrays::ArrayType,
+                    Projected: $crate::programs::Value<Type = $crate::arrays::ArrayType>,
+                > + $crate::programs::ValueProjection<
+                    $crate::arrays::DimensionType,
+                    Projected = $crate::arrays::DimensionValue,
+                >,
+            $crate::contexts::EagerContext<
+                <C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected,
+                $crate::arrays::ArrayOperation<
+                    <C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected,
+                >,
+            >: $capability<<C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected>,
+        {
+            fn interpret_in_parent<D: $crate::interpretation::InterpretationDriver<C>>(
+                &self,
+                _context: &C,
+                driver: &D,
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, $crate::programs::ProgramError> {
+                if driver.region_count() != 0 {
+                    return Err($crate::programs::TypeError::invalid(format!(
+                        "expected 0 regions but got {}",
+                        driver.region_count(),
+                    ))
+                    .into());
+                }
+
+                let expected = self
+                    .r#type()
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .filter(|dimension| matches!(dimension, $crate::arrays::Dimension::Dynamic(_)))
+                    .count();
+                if expected == 0 {
+                    return Err($crate::programs::TypeError::invalid(format!(
+                        "`{}` with static output type {} has no dynamic dimensions; use the homogeneous nullary \
+                         constructor instead",
+                        self.name(),
+                        self.r#type(),
+                    ))
+                    .into());
+                }
+
+                let mut extents = inputs.iter();
+                let dimensions = self
+                    .r#type()
+                    .shape()
+                    .dimensions()
+                    .iter()
+                    .map(|dimension| match dimension {
+                        $crate::arrays::Dimension::Static(extent) => Ok($crate::arrays::Dimension::Static(*extent)),
+                        $crate::arrays::Dimension::Dynamic(variable) => {
+                            let extent = extents.next().ok_or($crate::programs::ProgramError::InvalidInputCount {
+                                expected,
+                                actual: inputs.len(),
+                            })?;
+                            let extent = <C::Value as $crate::programs::ValueProjection<
+                                $crate::arrays::DimensionType,
+                            >>::into_projected(extent.clone())?;
+                            // Eager binds skip inference and intermediate results skip boundary refinement checks, so
+                            // validate each runtime extent against the stored output axis before allocating. Identity
+                            // equality is deliberately not required because interpreted inputs may be alpha-renamed.
+                            if !variable.bounds().contains(extent.extent()) {
+                                return Err($crate::arrays::DimensionError::BindingOutOfBounds {
+                                    variable: variable.to_string(),
+                                    value: extent.extent(),
+                                    bounds: variable.bounds(),
+                                }
+                                .into());
+                            }
+                            Ok($crate::arrays::Dimension::Static(extent.extent()))
+                        }
+                    })
+                    .collect::<Result<Vec<_>, $crate::programs::ProgramError>>()?;
+                if extents.next().is_some() {
+                    return Err($crate::programs::ProgramError::InvalidInputCount { expected, actual: inputs.len() });
+                }
+
+                let $output_type = self.r#type().clone().with_shape($crate::arrays::Shape::new(dimensions));
+                let $context = $crate::contexts::EagerContext::<
+                    <C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected,
+                    $crate::arrays::ArrayOperation<
+                        <C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::Projected,
+                    >,
+                >::new();
+                let $operation_value = self;
+                let output = $interpretation?;
+                Ok(vec![<C::Value as $crate::programs::ValueProjection<$crate::arrays::ArrayType>>::from_projected(
+                    output,
+                )])
+            }
+        }
+    };
+}
+
 pub mod constant;
 pub mod fill;
 pub mod iota;
@@ -13,9 +172,6 @@ pub use one::{ONE_OPERATION_NAME, One, OneOperation};
 pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
 pub use zero::{ZERO_OPERATION_NAME, Zero, ZeroOperation, ZeroOperationProvider};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
-
-use crate::arrays::{ArrayIrType, ArrayType, Dimension, DimensionType};
-use crate::programs::{RegionInterface, Type, TypeError, TypeIdentityPosition};
 
 /// Rejects a nullary constructor output [`Type`] that carries an ungrounded [`TypeIdentity`](crate::TypeIdentity)
 /// reference. A reference-position identity in a constructed-from-nothing type names a runtime quantity that no operand
