@@ -130,32 +130,39 @@ impl DifferentiableType for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.is_zero_space(),
             Self::Dimension(_) => true,
+            Self::Reference(_) => {
+                // A reference is not itself a differential value. Returning `false` avoids misclassifying it as a
+                // structural zero. `Self::tangent` and `Self::cotangent` provide the authoritative rejection.
+                false
+            }
         }
     }
 
     #[inline]
     fn tangent(&self) -> Result<Self, DifferentiationError> {
-        Ok(match self {
-            Self::Array(r#type) => Self::Array(r#type.tangent()?),
+        match self {
+            Self::Array(r#type) => Ok(Self::Array(r#type.tangent()?)),
             Self::Dimension(_) => {
                 // First-class dimensions describe shapes rather than numerical data. Their tangent space is
-                // structurally zero and uses the ordinary array member so generic zero materialization has one
-                // canonical backend representation.
-                Self::Array(ArrayType::scalar(DataType::Zero))
+                // structurally zero and uses the ordinary `Self::Array` variant so that generic zero materialization
+                // has one canonical backend representation.
+                Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
-        })
+            Self::Reference(_) => Err(DifferentiationError::UndefinedTangentType { primal_type: self.to_string() }),
+        }
     }
 
     #[inline]
     fn cotangent(&self) -> Result<Self, DifferentiationError> {
-        Ok(match self {
-            Self::Array(r#type) => Self::Array(r#type.cotangent()?),
+        match self {
+            Self::Array(r#type) => Ok(Self::Array(r#type.cotangent()?)),
             Self::Dimension(_) => {
-                // As in forward mode, dimensions receive no live adjoint. Keeping the zero space in the array
+                // As in `Self::tangent`, dimensions receive no live adjoint. Keeping the zero space in the array
                 // member prevents a zero value from being mistaken for a first-class dimension.
-                Self::Array(ArrayType::scalar(DataType::Zero))
+                Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
-        })
+            Self::Reference(_) => Err(DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() }),
+        }
     }
 }
 
@@ -657,6 +664,7 @@ mod tests {
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
+    use crate::programs::ReferenceType;
 
     use super::*;
 
@@ -779,6 +787,18 @@ mod tests {
         let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out.cotangent(), Ok(laid_out));
+    }
+
+    #[test]
+    fn test_array_ir_type_reference_tangent_and_cotangent_are_undefined() {
+        let r#type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(F32)));
+        let primal_type = r#type.to_string();
+        assert!(!r#type.is_zero_space());
+        assert_eq!(
+            r#type.tangent(),
+            Err(DifferentiationError::UndefinedTangentType { primal_type: primal_type.clone() }),
+        );
+        assert_eq!(r#type.cotangent(), Err(DifferentiationError::UndefinedCotangentType { primal_type }));
     }
 
     #[test]
