@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrType, ArrayType};
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
+    dispatch_on_array_element_type,
+};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -16,6 +19,8 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &str = "one";
@@ -104,6 +109,13 @@ impl_nullary_transposable_operation!(<T> OneOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated OneOperation<ArrayType>);
 impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> OneOperation<ArrayType>);
 
+impl_member_operation_for_array_ir_constant_operation!(OneOperation<ArrayType>);
+impl_member_interpretable_operation_for_array_ir_constant_operation!(
+    OneOperation<ArrayType>,
+    One,
+    |context, output_type, _operation| context.one(&output_type),
+);
+
 /// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
 /// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
@@ -111,6 +123,20 @@ impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> OneOpera
 pub trait One<V: Typed> {
     /// Returns a _one_ value for the provided [`Type`].
     fn one(&self, r#type: &V::Type) -> Result<V, ProgramError>;
+}
+
+impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
+    fn one(&self, r#type: &ArrayType) -> Result<Array, ProgramError> {
+        match r#type.data_type() {
+            DataType::Token | DataType::Zero => {
+                Err(TypeError::invalid(format!("data type {} cannot represent one", r#type.data_type())).into())
+            }
+            data_type => dispatch_on_array_element_type!(data_type, |Element| {
+                let element = Element::from_unsigned(1)?;
+                Array::from_fn_elements(r#type.clone(), |_| Ok(element))
+            }),
+        }
+    }
 }
 
 impl<C: Context, T: Type> One<<C::Value as ValueProjection<T>>::Projected> for ProjectedContext<C, T>
@@ -172,38 +198,21 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, DataType, Dimension, DimensionBounds, DimensionType, Shape};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionVariable, Shape,
+    };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
 
     use super::*;
 
     #[test]
     fn test_one() {
-        // Verify canonical rank-zero one values across every supported data-type family.
-        let context = EagerContext::<Array, OneOperation<ArrayType>>::new();
-        for (r#type, expected) in [
-            (DataType::Boolean, Array::scalar(true)),
-            (DataType::I8, Array::scalar(1i8)),
-            (DataType::I16, Array::scalar(1i16)),
-            (DataType::I32, Array::scalar(1i32)),
-            (DataType::I64, Array::scalar(1i64)),
-            (DataType::U8, Array::scalar(1u8)),
-            (DataType::U16, Array::scalar(1u16)),
-            (DataType::U32, Array::scalar(1u32)),
-            (DataType::U64, Array::scalar(1u64)),
-            (DataType::BF16, Array::scalar(bf16::ONE)),
-            (DataType::F16, Array::scalar(f16::ONE)),
-            (DataType::F32, Array::scalar(1.0f32)),
-            (DataType::F64, Array::scalar(1.0f64)),
-        ] {
-            assert_eq!(context.one(&ArrayType::scalar(r#type)), Ok(expected));
-        }
-
         // Verify the operation's stored type, identity, rendering, and eager interpretation.
         let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.name(), ONE_OPERATION_NAME);
@@ -263,5 +272,129 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_eager_context_one() {
+        let context = EagerContext::<Array>::new();
+
+        // Verify canonical rank-zero one values across every supported data-type family.
+        for (r#type, expected) in [
+            (DataType::Boolean, Array::scalar(true)),
+            (DataType::I8, Array::scalar(1i8)),
+            (DataType::I16, Array::scalar(1i16)),
+            (DataType::I32, Array::scalar(1i32)),
+            (DataType::I64, Array::scalar(1i64)),
+            (DataType::U8, Array::scalar(1u8)),
+            (DataType::U16, Array::scalar(1u16)),
+            (DataType::U32, Array::scalar(1u32)),
+            (DataType::U64, Array::scalar(1u64)),
+            (DataType::BF16, Array::scalar(bf16::ONE)),
+            (DataType::F16, Array::scalar(f16::ONE)),
+            (DataType::F32, Array::scalar(1.0f32)),
+            (DataType::F64, Array::scalar(1.0f64)),
+        ] {
+            assert_eq!(context.one(&ArrayType::scalar(r#type)), Ok(expected));
+        }
+
+        // Rank-positive arrays preserve the requested geometry.
+        let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        assert_eq!(context.one(&output_type), Array::from_elements(output_type, &[1.0f32; 6]).map_err(Into::into));
+
+        // Token, zero-space, and dynamically shaped eager arrays cannot be materialized as ones.
+        for data_type in [DataType::Token, DataType::Zero] {
+            assert_eq!(
+                context.one(&ArrayType::scalar(data_type)),
+                Err(ProgramError::Type(TypeError::invalid(format!("data type {data_type} cannot represent one",)))),
+            );
+        }
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::unbounded()))]),
+        );
+        assert!(matches!(
+            context.one(&dynamic_type),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "cannot materialize a value of dynamically sized type f32[size]; dynamically shaped \
+                               values exist only in array programs over `ArrayIrOperation`",
+        ));
+    }
+
+    #[test]
+    fn test_projected_context_one() {
+        let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.into_value().atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = one [type=f32[2]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_staging_context_one() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f32[2] = one [type=f32[2]]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_one() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        let expected = Array::from_elements(output_type, &[1.0f32; 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_batching_context_one() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[1.0f32; 2]).unwrap());
+    }
+
+    #[test]
+    fn test_differentiation_context_one() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[1.0f32; 2]).unwrap());
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }

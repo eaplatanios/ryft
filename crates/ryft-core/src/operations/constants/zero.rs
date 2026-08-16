@@ -112,6 +112,13 @@ impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
 impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> ZeroOperation<ArrayType>);
 
+impl_member_operation_for_array_ir_constant_operation!(ZeroOperation<ArrayType>);
+impl_member_interpretable_operation_for_array_ir_constant_operation!(
+    ZeroOperation<ArrayType>,
+    Zero,
+    |context, output_type, _operation| context.zero(&output_type),
+);
+
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
 //  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
 //  is built from `Self` (E0284). The equality is enforced per method through a `where` clause instead.
@@ -365,7 +372,7 @@ mod tests {
         // Token arrays and dynamically shaped eager arrays cannot be materialized as zeros.
         assert_eq!(
             context.zero(&ArrayType::scalar(DataType::Token)),
-            Err(ProgramError::Type(TypeError::invalid("data type token cannot represent zero"))),
+            Err(ProgramError::Type(TypeError::invalid("data type `token` cannot represent zero"))),
         );
         let dynamic_type = ArrayType::new(
             DataType::F32,

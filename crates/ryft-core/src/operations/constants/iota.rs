@@ -1,8 +1,11 @@
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrType, ArrayType};
+use crate::arrays::{
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayType,
+    dispatch_on_array_element_type,
+};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -145,6 +148,13 @@ impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> IotaOperation<ArrayType>);
 
+impl_member_operation_for_array_ir_constant_operation!(IotaOperation<ArrayType>);
+impl_member_interpretable_operation_for_array_ir_constant_operation!(
+    IotaOperation<ArrayType>,
+    Iota,
+    |context, output_type, operation| context.iota(&output_type, operation.dimension()),
+);
+
 /// Represents the ability to synthesize a value for a given [`Type`] whose elements increase from `0` along a chosen
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for
 /// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](crate::Zero), [`One`](super::One), and
@@ -158,6 +168,47 @@ pub trait Iota<V: Typed> {
     ///   - `r#type`: Type of the value to produce.
     ///   - `dimension`: Dimension of `type` along which the produced values increase from `0`.
     fn iota(&self, r#type: &V::Type, dimension: usize) -> Result<V, ProgramError>;
+}
+
+impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<Array, ProgramError> {
+        if !r#type.data_type().is_numeric() {
+            return Err(TypeError::invalid(format!(
+                "`{}` requires a numeric element type but has {}",
+                IOTA_OPERATION_NAME,
+                r#type.data_type(),
+            ))
+            .into());
+        }
+        let sizes = r#type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| {
+                    TypeError::invalid(format!(
+                        "cannot materialize an iota of dynamically sized type {type}; stage it in an array program \
+                         over `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per \
+                         dynamic axis",
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if dimension >= sizes.len() {
+            return Err(TypeError::invalid(format!(
+                "iota dimension {dimension} is out of bounds for array type {type}",
+            ))
+            .into());
+        }
+        // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
+        // `stride` is the product of the sizes of the dimensions after `dimension`.
+        let size = sizes[dimension];
+        let stride: usize = sizes[dimension + 1..].iter().product();
+        let data_type = r#type.data_type();
+        dispatch_on_array_element_type!(data_type, |Element| {
+            Array::from_fn_elements(r#type.clone(), |flat| Element::from_unsigned(((flat / stride) % size) as u64))
+        })
+    }
 }
 
 impl<C: Context> Iota<<C::Value as ValueProjection<ArrayType>>::Projected> for ProjectedContext<C, ArrayType>
@@ -222,23 +273,23 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::{
+        Array, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionVariable, Shape, u4,
+    };
+    use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder, ProgramError};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
 
     use super::*;
 
     #[test]
     fn test_iota() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
 
-        // Axis zero varies between rows, while an axis outside the rank is rejected by both the capability API and
-        // direct operation construction.
-        assert_eq!(context.iota(&r#type, 0), Ok(Array::from_f64s(r#type.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0])),);
-        assert!(matches!(context.iota(&r#type, 2), Err(ProgramError::Type(_))));
+        // Operation construction validates the varying dimension and element type.
         assert_eq!(
             IotaOperation::new(r#type.clone(), 2).unwrap_err(),
             TypeError::invalid("`iota` dimension 2 is out of bounds for rank 2"),
@@ -271,6 +322,7 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![r#type.clone()]));
 
         // Eager interpretation along axis one varies between columns and repeats across rows.
+        let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
         let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
         assert_eq!(
             InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
@@ -295,5 +347,136 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_eager_context_iota() {
+        let context = EagerContext::<Array>::new();
+
+        // Each selected axis varies independently and repeats along every other axis.
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        assert_eq!(
+            context.iota(&output_type, 0),
+            Array::from_elements(output_type.clone(), &[0i32, 0, 0, 1, 1, 1]).map_err(Into::into),
+        );
+        assert_eq!(
+            context.iota(&output_type, 1),
+            Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).map_err(Into::into),
+        );
+
+        // Iota uses the checked element codecs for sub-byte values.
+        assert_eq!(
+            context.iota(&ArrayType::new_static(DataType::U4, [2, 3]), 1).unwrap().elements::<u4>(),
+            Ok(vec![
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+                u4::new(0).unwrap(),
+                u4::new(1).unwrap(),
+                u4::new(2).unwrap(),
+            ]),
+        );
+
+        // Non-numeric elements, out-of-range axes, and dynamic eager shapes are rejected.
+        assert_eq!(
+            context.iota(&ArrayType::new_static(DataType::Boolean, [2]), 0),
+            Err(ProgramError::Type(TypeError::invalid("`iota` requires a numeric element type but has bool"))),
+        );
+        assert_eq!(
+            context.iota(&ArrayType::new_static(DataType::F32, [2]), 1),
+            Err(ProgramError::Type(TypeError::invalid("iota dimension 1 is out of bounds for array type f32[2]"))),
+        );
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("size", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            context.iota(&dynamic_type, 0),
+            Err(ProgramError::Type(TypeError::invalid(
+                "cannot materialize an iota of dynamically sized type f32[size]; stage it in an array program over \
+                 `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_projected_context_iota() {
+        let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.into_value().atom_id().unwrap()],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:i32[2, 3] = iota [type=i32[2, 3], dimension=1]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_staging_context_iota() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(output.r#type().as_ref(), &output_type);
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], Vec::new(), vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:i32[2, 3] = iota [type=i32[2, 3], dimension=1]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_iota() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        let expected = Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_batching_context_iota() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap(),);
+    }
+
+    #[test]
+    fn test_differentiation_context_iota() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(
+            output.primal(),
+            &Array::from_elements(output_type.clone(), &[0.0f32, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap(),
+        );
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }
