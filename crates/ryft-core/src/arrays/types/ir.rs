@@ -7,23 +7,25 @@ use crate::arrays::types::arrays::{ArrayType, ArrayTypeRefinements};
 use crate::arrays::types::dimensions::{Dimension, DimensionType, DimensionVariable};
 use crate::parameters::Parameter;
 use crate::programs::types::visit_type_signature_pairs;
-use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
+use crate::programs::{ReferenceType, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, TypeRefinements};
 
-/// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays or
-/// first-class runtime dimensions. It is the type-level counterpart of [`ArrayIrValue`](crate::ArrayIrValue), with
-/// one member per value kind.
+/// [`Type`] vocabulary of Ryft's array Intermediate Representation (IR), whose values may be ordinary arrays,
+/// first-class runtime dimensions, or [`Reference`](crate::Reference)s to arrays. It is the type-level counterpart of
+/// [`ArrayIrValue`](crate::ArrayIrValue), with one member per value kind.
 ///
 /// The sum is a storage boundary rather than the contract ordinary primitives are written against. Array-only
 /// [`Operation`](crate::Operation)s and transform rules keep consuming [`ArrayType`], dimension-only operations keep
-/// consuming [`DimensionType`], and only genuinely mixed operations (i.e., shape-carrying operations whose dynamic
-/// output extents are explicit dimension operands) consume this type directly. [`From`] lifts each member type into
-/// the sum, and the borrowing [`TryFrom`] implementations project it back out with a checked kind diagnostic.
-/// The same bridge backs the value-level [`ValueProjection`](crate::ValueProjection) implementations.
+/// consuming [`DimensionType`], and genuinely mixed operations consume this type directly. Those mixed operations
+/// include shape-carrying operations with explicit dimension operands and reference operations whose signatures cross
+/// the array/reference boundary. [`From`] lifts each member type into the sum, and the borrowing [`TryFrom`]
+/// implementations project it back out with a checked kind diagnostic. The same bridge backs the value-level
+/// [`ValueProjection`](crate::ValueProjection) implementations.
 ///
-/// Both members carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a complete
-/// signature. An [`ArrayType`] member *references* the variables named by its dynamic axes, while a [`DimensionType`]
-/// member _defines_ its variable. [`Type::derive_identity_renaming`] therefore checks a variable repeated across
-/// array and dimension members for consistency, exactly as it does within one member kind.
+/// All three members can carry [`DimensionVariable`] identities, so one renaming and refinement vocabulary spans a
+/// complete signature. An [`ArrayType`] member and the referent of a [`ReferenceType`] member _reference_ the variables
+/// named by their dynamic axes, while a [`DimensionType`] member _defines_ its variable.
+/// [`Type::derive_identity_renaming`] therefore checks a variable repeated across member kinds for consistency, exactly
+/// as it does within one member kind.
 ///
 /// Refer to the documentation of [`DimensionType`] for why runtime dimensions can be first-class typed values, the
 /// three supported provenance categories, the single checked data-to-dimension gateway, and how those contracts enable
@@ -32,6 +34,7 @@ use crate::programs::{Type, TypeError, TypeIdentityPosition, TypeIdentityRenamin
 pub enum ArrayIrType {
     Array(ArrayType),
     Dimension(DimensionType),
+    Reference(ReferenceType<ArrayType>),
 }
 
 impl ArrayIrType {
@@ -52,6 +55,15 @@ impl ArrayIrType {
             .map(|r#type| <&DimensionType>::try_from(r#type.borrow()).map(DimensionType::to_dimension))
             .collect()
     }
+
+    /// Returns this composite member's diagnostic kind name.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Array(_) => "array",
+            Self::Dimension(_) => "dimension",
+            Self::Reference(_) => "reference",
+        }
+    }
 }
 
 impl Display for ArrayIrType {
@@ -60,6 +72,7 @@ impl Display for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.fmt(formatter),
             Self::Dimension(r#type) => r#type.fmt(formatter),
+            Self::Reference(r#type) => r#type.fmt(formatter),
         }
     }
 }
@@ -78,6 +91,13 @@ impl From<DimensionType> for ArrayIrType {
     }
 }
 
+impl From<ReferenceType<ArrayType>> for ArrayIrType {
+    #[inline]
+    fn from(r#type: ReferenceType<ArrayType>) -> Self {
+        Self::Reference(r#type)
+    }
+}
+
 impl<'t> TryFrom<&'t ArrayIrType> for &'t ArrayType {
     type Error = TypeError;
 
@@ -85,7 +105,7 @@ impl<'t> TryFrom<&'t ArrayIrType> for &'t ArrayType {
     fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
         match r#type {
             ArrayIrType::Array(r#type) => Ok(r#type),
-            ArrayIrType::Dimension(_) => Err(TypeError::invalid("expected array type but got dimension type")),
+            other => Err(TypeError::invalid(format!("expected array type but got {} type", other.kind_name()))),
         }
     }
 }
@@ -96,8 +116,20 @@ impl<'t> TryFrom<&'t ArrayIrType> for &'t DimensionType {
     #[inline]
     fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
         match r#type {
-            ArrayIrType::Array(_) => Err(TypeError::invalid("expected dimension type but got array type")),
             ArrayIrType::Dimension(r#type) => Ok(r#type),
+            other => Err(TypeError::invalid(format!("expected dimension type but got {} type", other.kind_name()))),
+        }
+    }
+}
+
+impl<'t> TryFrom<&'t ArrayIrType> for &'t ReferenceType<ArrayType> {
+    type Error = TypeError;
+
+    #[inline]
+    fn try_from(r#type: &'t ArrayIrType) -> Result<Self, Self::Error> {
+        match r#type {
+            ArrayIrType::Reference(r#type) => Ok(r#type),
+            other => Err(TypeError::invalid(format!("expected reference type but got {} type", other.kind_name()))),
         }
     }
 }
@@ -109,16 +141,21 @@ impl Type for ArrayIrType {
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
         let array = match self {
             Self::Array(r#type) => Some(r#type),
-            Self::Dimension(_) => None,
+            Self::Dimension(_) | Self::Reference(_) => None,
         };
         let dimension = match self {
-            Self::Array(_) => None,
+            Self::Array(_) | Self::Reference(_) => None,
             Self::Dimension(r#type) => Some(r#type),
+        };
+        let reference = match self {
+            Self::Array(_) | Self::Dimension(_) => None,
+            Self::Reference(r#type) => Some(r#type),
         };
         array
             .into_iter()
             .flat_map(ArrayType::identities)
             .chain(dimension.into_iter().flat_map(DimensionType::identities))
+            .chain(reference.into_iter().flat_map(ReferenceType::identities))
     }
 
     fn derive_identity_renaming(
@@ -134,11 +171,20 @@ impl Type for ArrayIrType {
             (Self::Dimension(declared), Self::Dimension(actual)) => {
                 DimensionType::extend_identity_renaming(declared, actual, &mut renaming)
             }
-            (Self::Array(_), Self::Dimension(_)) => {
-                Err(TypeError::invalid("expected array type but got dimension type"))
+            (Self::Reference(declared), Self::Reference(actual)) => ArrayType::extend_identity_renaming(
+                declared.referent(),
+                actual.referent(),
+                &mut renaming,
+                &mut refinements,
+            ),
+            (Self::Array(_), actual) => {
+                Err(TypeError::invalid(format!("expected array type but got {} type", actual.kind_name())))
             }
-            (Self::Dimension(_), Self::Array(_)) => {
-                Err(TypeError::invalid("expected dimension type but got array type"))
+            (Self::Dimension(_), actual) => {
+                Err(TypeError::invalid(format!("expected dimension type but got {} type", actual.kind_name())))
+            }
+            (Self::Reference(_), actual) => {
+                Err(TypeError::invalid(format!("expected reference type but got {} type", actual.kind_name())))
             }
         })?;
         refinements.require_disjoint_from(&renaming)?;
@@ -150,6 +196,7 @@ impl Type for ArrayIrType {
         match self {
             Self::Array(r#type) => Ok(Self::Array(r#type.rename_identities(renaming)?)),
             Self::Dimension(r#type) => Ok(Self::Dimension(r#type.rename_identities(renaming)?)),
+            Self::Reference(r#type) => Ok(Self::Reference(r#type.rename_identities(renaming)?)),
         }
     }
 
@@ -158,6 +205,7 @@ impl Type for ArrayIrType {
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
             (Self::Dimension(left), Self::Dimension(right)) => left.is_compatible_with(right),
+            (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
             _ => false,
         }
     }
@@ -167,6 +215,7 @@ impl Type for ArrayIrType {
         match (self, other) {
             (Self::Array(left), Self::Array(right)) => left.is_refined_by(right),
             (Self::Dimension(left), Self::Dimension(right)) => left.is_refined_by(right),
+            (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
             _ => false,
         }
     }
@@ -176,6 +225,7 @@ impl Type for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.is_scalar(),
             Self::Dimension(r#type) => r#type.is_scalar(),
+            Self::Reference(_) => false,
         }
     }
 
@@ -184,6 +234,7 @@ impl Type for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.is_complex(),
             Self::Dimension(r#type) => r#type.is_complex(),
+            Self::Reference(_) => false,
         }
     }
 }
@@ -197,7 +248,7 @@ impl Type for ArrayIrType {
 /// input that supplied its shape) while still rejecting inconsistent repeated observations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArrayIrTypeRefinements {
-    /// [`ArrayTypeRefinements`] shared by all array members of the signature.
+    /// [`ArrayTypeRefinements`] shared by array members and reference referents across the complete signature.
     arrays: ArrayTypeRefinements,
 }
 
@@ -218,7 +269,8 @@ impl ArrayIrTypeRefinements {
     ///     pair carries no concrete extent to record. Concrete facts about such an identity can only be established
     ///     later, when output validation first observes it on an array member (refer to the [`ArrayIrTypeRefinements`]
     ///     documentation for how the closed identity set makes that sound).
-    ///   - Mismatched member kinds fail, since no array type refines a dimension type or vice versa.
+    ///   - A reference pair applies the array rules to its referents using the same refinement accumulator.
+    ///   - Mismatched member kinds fail, since values never refine across composite member kinds.
     ///
     /// # Parameters
     ///
@@ -242,11 +294,19 @@ impl ArrayIrTypeRefinements {
             (ArrayIrType::Dimension(declared), ArrayIrType::Dimension(actual)) => {
                 Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")))
             }
-            (ArrayIrType::Array(_), ArrayIrType::Dimension(_)) => {
-                Err(TypeError::invalid("expected array type but got dimension type"))
+            (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) => {
+                ArrayTypeRefinements::visit_dynamic_to_static_refinements(declared.referent(), actual.referent(), visit)
             }
-            (ArrayIrType::Dimension(_), ArrayIrType::Array(_)) => {
-                Err(TypeError::invalid("expected dimension type but got array type"))
+            // These cross-kind arms below stay keyed on the declared variant so that adding a composite member forces a
+            // compile-time decision here (a full catch-all would silently treat a new same-kind pair as a mismatch).
+            (ArrayIrType::Array(_), actual) => {
+                Err(TypeError::invalid(format!("expected array type but got {} type", actual.kind_name())))
+            }
+            (ArrayIrType::Dimension(_), actual) => {
+                Err(TypeError::invalid(format!("expected dimension type but got {} type", actual.kind_name())))
+            }
+            (ArrayIrType::Reference(_), actual) => {
+                Err(TypeError::invalid(format!("expected reference type but got {} type", actual.kind_name())))
             }
         }
     }
@@ -345,6 +405,26 @@ mod tests {
 
         let renaming = ArrayIrType::derive_identity_renaming(&declared, &actual).unwrap();
         assert_eq!(renaming.rename(&declared_variable), actual_variable);
+        let declared_with_reference = [
+            declared[1].clone(),
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+                F32,
+                Shape::new(vec![Dimension::Dynamic(declared_variable.clone())]),
+            ))),
+        ];
+        let actual_with_reference = [
+            actual[1].clone(),
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+                F32,
+                Shape::new(vec![Dimension::Dynamic(actual_variable.clone())]),
+            ))),
+        ];
+        let renaming = ArrayIrType::derive_identity_renaming(&declared_with_reference, &actual_with_reference).unwrap();
+        assert_eq!(renaming.rename(&declared_variable), actual_variable);
+        let declared_complete = [declared[0].clone(), declared[1].clone(), declared_with_reference[1].clone()];
+        let actual_complete = [actual[0].clone(), actual[1].clone(), actual_with_reference[1].clone()];
+        let renaming = ArrayIrType::derive_identity_renaming(&declared_complete, &actual_complete).unwrap();
+        assert_eq!(renaming.rename(&declared_variable), actual_variable);
         assert_eq!(
             ArrayIrType::derive_identity_renaming(&declared, &actual[..1]),
             Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
@@ -366,10 +446,50 @@ mod tests {
             [actual_two.clone(), actual_two.clone()],
         )
         .unwrap();
-        assert_eq!(refinements.validate([declared_array.clone()], [actual_two], &[],), Ok(()),);
+        assert_eq!(refinements.validate([declared_array.clone()], [actual_two.clone()], &[]), Ok(()));
         let error = ArrayIrTypeRefinements::establish(
             [declared_array.clone(), declared_array.clone()],
             [ArrayIrType::Array(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))), actual_three],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DimensionError>(),
+            Some(&DimensionError::InputDimensionMismatch { dimension: "batch".to_string(), expected: 2, actual: 3 }),
+        );
+
+        // Array members and reference referents share one identity-renaming and refinement accumulator. Repeating an
+        // identity across those two member kinds must therefore preserve one renaming and reject conflicting concrete
+        // extents exactly as repeated ordinary arrays do.
+        let declared_reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(batch.clone())]),
+        )));
+        let actual_reference_two =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(F32, Shape::new(vec![Dimension::Static(2)]))));
+        let actual_reference_three =
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]))));
+        let mixed_refinements = ArrayIrTypeRefinements::establish(
+            [declared_array.clone(), declared_reference.clone()],
+            [actual_two.clone(), actual_reference_two],
+        )
+        .unwrap();
+        assert_eq!(
+            mixed_refinements.validate(
+                [declared_array.clone(), declared_reference.clone()],
+                [
+                    actual_two.clone(),
+                    ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+                        F32,
+                        Shape::new(vec![Dimension::Static(2)]),
+                    )))
+                ],
+                &[],
+            ),
+            Ok(()),
+        );
+        let error = ArrayIrTypeRefinements::establish(
+            [declared_array.clone(), declared_reference],
+            [actual_two.clone(), actual_reference_three],
         )
         .unwrap_err();
         assert_eq!(
@@ -447,6 +567,10 @@ mod tests {
             <&DimensionType>::try_from(&stored),
             Err(TypeError::invalid("expected dimension type but got array type")),
         );
+        assert_eq!(
+            <&ReferenceType<ArrayType>>::try_from(&stored),
+            Err(TypeError::invalid("expected reference type but got array type")),
+        );
 
         // A dimension member provides the symmetric successful dimension projection and array-kind diagnostic.
         let dimension =
@@ -456,6 +580,29 @@ mod tests {
         assert_eq!(
             <&ArrayType>::try_from(&stored),
             Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            <&ReferenceType<ArrayType>>::try_from(&stored),
+            Err(TypeError::invalid("expected reference type but got dimension type")),
+        );
+
+        // A reference member projects only as its exact reference type and never as the referent array type.
+        let reference = ReferenceType::new(array.clone());
+        let stored = ArrayIrType::from(reference.clone());
+        assert_eq!(<&ReferenceType<ArrayType>>::try_from(&stored), Ok(&reference));
+        assert!(!stored.is_scalar());
+        assert!(!stored.is_complex());
+        assert!(!stored.is_compatible_with(&ArrayIrType::Array(array.clone())));
+        assert!(!ArrayIrType::Array(array.clone()).is_compatible_with(&stored));
+        assert!(!stored.is_refined_by(&ArrayIrType::Array(array.clone())));
+        assert!(!ArrayIrType::Array(array).is_refined_by(&stored));
+        assert_eq!(
+            <&ArrayType>::try_from(&stored),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            <&DimensionType>::try_from(&stored),
+            Err(TypeError::invalid("expected dimension type but got reference type")),
         );
     }
 }
