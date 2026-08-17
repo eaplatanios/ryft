@@ -823,7 +823,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         let mut visited = vec![false; self.arena.len()];
         let mut pending = vec![self.id];
         while let Some(id) = pending.pop() {
-            if std::mem::replace(&mut visited[id.index()], true) {
+            let Some(visited) = visited.get_mut(id.index()) else {
+                // An unbound attachment cannot be inspected, so answer conservatively.
+                return true;
+            };
+            if std::mem::replace(visited, true) {
                 continue;
             }
             let Ok(region) = RegionRef::new(self.arena, id) else {

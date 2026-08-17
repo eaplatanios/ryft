@@ -70,9 +70,9 @@ impl Display for ArrayIrType {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Array(r#type) => r#type.fmt(formatter),
-            Self::Dimension(r#type) => r#type.fmt(formatter),
-            Self::Reference(r#type) => r#type.fmt(formatter),
+            Self::Array(r#type) => Display::fmt(r#type, formatter),
+            Self::Dimension(r#type) => Display::fmt(r#type, formatter),
+            Self::Reference(r#type) => Display::fmt(r#type, formatter),
         }
     }
 }

@@ -377,6 +377,7 @@ impl<'c> Context for XlaDomain<'c> {
         P: Into<Self::Operation>,
     {
         let operation = operation.into();
+        operation.validate_region_count(driver.region_count())?;
         let name = operation.name();
         if inputs.is_empty() && (name == ZERO_OPERATION_NAME || name == ONE_OPERATION_NAME) {
             let array_type = eager_identity_output_type(&operation)?;
@@ -4717,6 +4718,32 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "xla domain cannot synthesize one value for element type token"
         ));
+    }
+
+    #[test]
+    fn test_domain_identity_fast_path_rejects_attached_regions() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh);
+        let array_type = ArrayType::scalar(DataType::F32);
+        let operations = [
+            XlaOperation::zero_operation(ArrayIrType::Array(array_type.clone())).unwrap(),
+            OneOperation::new(array_type).into(),
+        ];
+
+        for operation in operations {
+            let name = operation.name();
+            let attached_region = XlaProgramBuilder::new()
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+            assert_eq!(
+                domain.bind(operation, vec![attached_region], &[]),
+                Err(ProgramError::MalformedProgram(format!(
+                    "operation `{name}` declares no region slots but 1 regions were attached",
+                ))),
+            );
+        }
     }
 
     #[test]

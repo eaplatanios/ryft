@@ -3038,6 +3038,11 @@ where
         output: Self::Batch,
         output_batch_axis: BatchAxis,
     ) -> Result<C::Value, BatchingError> {
+        if matches!(output.value().r#type().as_ref(), ArrayIrType::Reference(_)) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "references must be discharged before batching".to_string(),
+            });
+        }
         if !output.ragged_axes().is_empty() {
             return Err(BatchingError::UnsupportedOperation {
                 message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
@@ -3240,7 +3245,10 @@ where
             let outputs = region.interpret_with(
                 inputs,
                 |_, constant| -> Result<_, BatchingError> {
-                    Ok(ArrayIrBatch::replicated(batching_context.parent().lift(constant.clone())?))
+                    <Self as BatchingPolicy<TracingContext<C::Constant, C::Operation>>>::batch(
+                        batching_context.parent().lift(constant.clone())?,
+                        BatchAxis::replicated(),
+                    )
                 },
                 |instruction, instruction_inputs| -> Result<_, BatchingError> {
                     let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
@@ -3344,6 +3352,7 @@ mod tests {
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,
     };
+    use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearCallOperation, LinearizationTracer};
     use crate::operations::collectives::{
@@ -3359,7 +3368,7 @@ mod tests {
         WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Reference, ReferenceType};
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
@@ -5137,6 +5146,62 @@ mod tests {
             )),
         );
         drop(builder);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_structural_batching_rejects_reference_capture_constant() -> Result<(), ProgramError> {
+        type CaptureTraceContext =
+            TracingContext<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>;
+
+        let mut builder =
+            ProgramBuilder::<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>::new();
+        let reference = builder.add_constant(CaptureReference::new(
+            0,
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+        ));
+        let program = builder.build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+            vec![reference],
+            Vec::<Placeholder>::new(),
+            vec![Placeholder],
+        )?;
+        let trace = CaptureTraceContext::new();
+        let extent = trace.input(DimensionValue::constant(2)?.r#type().into_owned().into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+
+        assert_eq!(
+            <ArrayIrBatching as RecursiveBatchingPolicy<CaptureTraceContext>>::batch_program(
+                &context,
+                program.entry_region_ref(),
+                &[],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "references must be discharged before batching".to_string(),
+            }),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_materialize_output_rejects_replicated_reference() -> Result<(), ProgramError> {
+        type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            Parent::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let output = ArrayIrBatch::replicated(ArrayIrValue::Reference(Reference::new(Array::scalar(1.0_f32))));
+
+        assert_eq!(
+            ArrayIrBatching::materialize_output(&context, output, BatchAxis::replicated()),
+            Err(BatchingError::UnsupportedOperation {
+                message: "references must be discharged before batching".to_string(),
+            }),
+        );
 
         Ok(())
     }

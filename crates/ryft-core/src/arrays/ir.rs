@@ -53,9 +53,9 @@ impl<A: Value<Type = ArrayType>> Display for ArrayIrValue<A> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Array(value) => value.fmt(formatter),
-            Self::Dimension(value) => value.fmt(formatter),
-            Self::Reference(value) => value.fmt(formatter),
+            Self::Array(value) => Display::fmt(value, formatter),
+            Self::Dimension(value) => Display::fmt(value, formatter),
+            Self::Reference(value) => Display::fmt(value, formatter),
         }
     }
 }

@@ -120,7 +120,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     }
 
     /// Validates that this value can be used as a program constant (i.e., [`Atom::Constant`](crate::Atom::Constant)).
-    /// Such values must satisfy the rendering contract ove: their [`Display`] output must be deterministic and
+    /// Such values must satisfy the followwing rendering contract: their [`Display`] output must be deterministic and
     /// semantically complete, because program renderings double as structural fingerprints. Values that cannot satisfy
     /// it (most notably identity-bearing mutable reference holders, whose runtime identity is process-local and
     /// deliberately absent from their deterministic rendering) must reject constant storage here and enter programs

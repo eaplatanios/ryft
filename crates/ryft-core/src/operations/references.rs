@@ -250,17 +250,19 @@ impl_non_transposable_operation!(ReferenceReadOperation);
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, DataType};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        CustomJvpOperation, DifferentiationError, DifferentiationTracer, ForwardModeDifferentiate,
-        TransposableOperation,
+        CustomJvpOperation, CustomVjpOperation, DifferentiationError, DifferentiationTracer, ForwardModeDifferentiate,
+        Linearization, TransposableOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Reference};
+    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, Reference, RegionDriver, RegionRef};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -450,6 +452,157 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`custom_jvp` carries unresolved state in an attached region and must be \
                     discharged before differentiation",
+        ));
+    }
+
+    #[test]
+    fn test_operation_local_custom_derivative_guards_reject_state_in_nested_dormant_rules() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+        type TestContext = EagerContext<TestValue, TestOperation>;
+        type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
+
+        struct TestDifferentiationDriver {
+            programs: Vec<TestProgram>,
+        }
+
+        impl RegionDriver<TestValue, TestOperation> for TestDifferentiationDriver {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestValue, TestOperation>>
+            where
+                TestValue: 'r,
+                TestOperation: 'r,
+            {
+                self.programs.iter().map(Program::entry_region_ref)
+            }
+        }
+
+        impl DifferentiationDriver<TestContext> for TestDifferentiationDriver {
+            fn jvp_program(
+                &self,
+                _region: RegionRef<'_, TestValue, TestOperation>,
+            ) -> Result<Arc<TestProgram>, DifferentiationError> {
+                unreachable!("the operation-local state guard must reject before recursive differentiation")
+            }
+
+            fn linearize_program(
+                &self,
+                _region: RegionRef<'_, TestValue, TestOperation>,
+            ) -> Result<Linearization<TestValue, TestOperation>, DifferentiationError> {
+                unreachable!("the operation-local state guard must reject before recursive linearization")
+            }
+
+            fn jvp_operation(
+                &self,
+                _operation: &TestOperation,
+                _programs: Vec<TestProgram>,
+                _context: &TestContext,
+                _inputs: &[DifferentiationDual<TestValue>],
+            ) -> Result<Vec<DifferentiationDual<TestValue>>, DifferentiationError> {
+                unreachable!("the operation-local state guard must reject before recursive differentiation")
+            }
+        }
+
+        fn nested_custom_jvp_regions(scalar_type: &ArrayIrType) -> Vec<TestProgram> {
+            let primal = {
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let input = builder.add_input(scalar_type.clone());
+                builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                    .unwrap()
+            };
+            let rule = {
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let input = builder.add_input(scalar_type.clone());
+                let tangent = builder.add_input(scalar_type.clone());
+                let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+                let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+                builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(
+                        vec![output, tangent],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 2],
+                    )
+                    .unwrap()
+            };
+            vec![primal, rule]
+        }
+
+        fn nested_rule_state_program(scalar_type: &ArrayIrType, include_tangent_output: bool) -> TestProgram {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let regions = nested_custom_jvp_regions(scalar_type)
+                .iter()
+                .map(|region| builder.import_region(region.entry_region_ref()))
+                .collect::<Vec<_>>();
+            let input = builder.add_input(scalar_type.clone());
+            let tangent = include_tangent_output.then(|| builder.add_input(scalar_type.clone()));
+            let output =
+                builder.add_instruction(CustomJvpOperation::<ArrayIrType>::new(), regions, vec![input]).unwrap()[0];
+            let mut outputs = vec![output];
+            if let Some(tangent) = tangent {
+                outputs.push(tangent);
+            }
+            let input_count = usize::from(include_tangent_output) + 1;
+            let output_count = outputs.len();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(
+                    outputs,
+                    vec![Placeholder; input_count],
+                    vec![Placeholder; output_count],
+                )
+                .unwrap()
+        }
+
+        fn identity_program(scalar_type: &ArrayIrType) -> TestProgram {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        }
+
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let context = TestContext::new();
+        let input = DifferentiationDual::new(
+            TestValue::Array(Array::scalar(1.0_f32)),
+            TestValue::Array(Array::scalar(1.0_f32)),
+        )
+        .unwrap();
+
+        // The outer JVP rule is pure under ordinary effect aggregation because its nested custom-JVP call keeps the
+        // state in a dormant rule. Direct operation-rule invocation must nevertheless inspect the complete closure.
+        let primal = identity_program(&scalar_type);
+        let jvp = nested_rule_state_program(&scalar_type, true);
+        assert!(jvp.effects().is_pure());
+        assert!(jvp.entry_region_ref().contains_effect_in_closure(Effect::OrderedState));
+        let driver = TestDifferentiationDriver { programs: vec![primal, jvp] };
+        assert!(matches!(
+            CustomJvpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_jvp` rule regions must not contain unresolved state",
+        ));
+
+        // Custom VJP retains both its directly interpreted forward rule and its transpose-time backward rule in the
+        // differentiated program. Exercise each position independently so neither can hide state in a dormant child.
+        let primal = identity_program(&scalar_type);
+        let forward = nested_rule_state_program(&scalar_type, false);
+        let backward = identity_program(&scalar_type);
+        assert!(forward.effects().is_pure());
+        let driver = TestDifferentiationDriver { programs: vec![primal, forward, backward] };
+        assert!(matches!(
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_vjp` rule regions must not contain unresolved state",
+        ));
+
+        let primal = identity_program(&scalar_type);
+        let forward = identity_program(&scalar_type);
+        let backward = nested_rule_state_program(&scalar_type, false);
+        assert!(backward.effects().is_pure());
+        let driver = TestDifferentiationDriver { programs: vec![primal, forward, backward] };
+        assert!(matches!(
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_vjp` rule regions must not contain unresolved state",
         ));
     }
 

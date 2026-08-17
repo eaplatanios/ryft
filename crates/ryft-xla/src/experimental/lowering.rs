@@ -495,8 +495,9 @@ where
 /// Returns `true` if `program` contains a reference-typed atom in any region.
 ///
 /// This type scan is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
-/// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back
-/// every ordinary-XLA entry boundary.
+/// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back the
+/// compilation preflight and the two direct module-lowering entries; eager binding, dispatch, and staging enforce
+/// their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
 ) -> bool
@@ -8950,7 +8951,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_lowering_rejects_unresolved_state_before_token_threading() {
+    fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
         use ryft_core::{NewReferenceOperation, ReferenceReadOperation};
 
         assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);

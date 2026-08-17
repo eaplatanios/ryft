@@ -465,9 +465,13 @@ where
         let forward_region = driver.region(1)?;
         let backward_region = driver.region(2)?;
 
-        // The forward and backward rule regions are interpreted directly rather than routed through the transform
-        // rejections, so unresolved state inside either must be rejected before any of it executes.
-        if forward_region.effects().union(backward_region.effects()).contains(Effect::OrderedState) {
+        // The forward and backward rule regions bypass ordinary differentiation dispatch: the forward region is
+        // interpreted directly and the backward region is retained for later transposition. Reject unresolved state
+        // anywhere in either attached-region closure, including dormant nested rules, before it can enter the
+        // differentiated program.
+        if forward_region.contains_effect_in_closure(Effect::OrderedState)
+            || backward_region.contains_effect_in_closure(Effect::OrderedState)
+        {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{CUSTOM_VJP_OPERATION_NAME}` rule regions must not contain unresolved state"),
             }

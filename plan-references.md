@@ -981,16 +981,16 @@ broad trait-solver migration.
       reject, or remain unreachable after a verified pipeline boundary. Measured magnitude: ~40 files, with
       `arrays/operations/control_flow.rs` (75 matches), `arrays/batching.rs` (37), `ryft-xla/.../ops.rs` (29),
       `arrays/operations/constants.rs` (23), and `ryft-xla/.../shard_map.rs` (22) as the top sites.
-- [x] Handle `XlaConstant` explicitly: its `ValueProjection` impls are hand-written per member
-      (`ryft-xla/src/experimental/ops.rs:145`, `:171`, `:200`), and its `Typed`/`Value`/`CaptureConstant` matches
-      (`ops.rs:63-130`) deliberately support typed `CaptureReference<ReferenceType<ArrayType>>` metadata while
-      excluding concrete `Reference<Array>` holders from literal/serialized constants. By contrast, the tracer
-      projections (`Tracer`, `PartialTracer`, `DifferentiationTracer`, `CaptureReference`) are blanket impls keyed on
-      the seam-1 `TryFrom` and fall out for free.
-- [x] Record that batching projection is compile-time absent for references: `BatchingPolicyProjection` is
-      implemented only for `ArrayType` and `DimensionType` (`arrays/batching.rs:2445`, `:2500`), so a
-      reference cannot be projected through `BatchingTracer` at all — the plan's batching rejection is structural,
-      not a runtime guard.
+- [x] Handle `XlaConstant` explicitly: its `Captured(CaptureReference<ArrayIrType>)` variant can retain composite
+      reference-typed capture metadata, while concrete `Reference<Array>` holders remain excluded from
+      literal/serialized constants. Do not add a `ValueProjection<ReferenceType<ArrayType>>` for `XlaConstant` until
+      capture lifting consumes that projected form. By contrast, the tracer projections (`Tracer`, `PartialTracer`,
+      `DifferentiationTracer`, and `CaptureReference`) are blanket implementations keyed on the seam-1 `TryFrom` and
+      fall out for free.
+- [x] Record that `BatchingPolicyProjection` is compile-time absent for references (it is implemented only for
+      `ArrayType` and `DimensionType`), which prevents reference-specific operation rules from projecting through a
+      `BatchingTracer`. Opaque replicated carriers do not use that projection, so every batching entry, structural
+      constant replay, and output-materialization boundary also uses the checked policy path and rejects references.
 - [x] Add tests for cross-kind failures, projection, dynamic referent identity refinement, aliasing clones, poisoned
       holder access, a dimension variable shared across array, dimension, and reference leaves, dynamic-to-dynamic
       identity-renaming derivation through references (declared `ref<f32[n]>` against actual `ref<f32[m]>` yields
@@ -1028,10 +1028,12 @@ array/dimension behavior or being accepted by numeric operations.
       non-pure instructions and hard-errors on replaying them (`tracing_v2/rematerialization.rs:1524-1533`,
       `:1598-1628`, `:1726-1735`).
 - [ ] Implement the partial-evaluation gate — this one is genuinely new work, not verification: the default
-      `fold_or_residualize` contract places all-known *effectful* operations on the known side and executes them
-      (`partial.rs:863-890`), the opposite of what unresolved state needs. The "never execute, fold, or split an
-      unresolved state chain" rule must be implemented at that level; the existing per-region-op purity gates
-      (`condition.rs:301-308`, `scan.rs:1090-1103`, `while.rs:501`) are not sufficient.
+      `fold_or_residualize` contract executes an all-known effectful operation on the known side and imports a
+      mixed/unknown operation into the residual program unchanged. Either branch can violate the unresolved-state
+      contract by executing hidden state early or preserving it past the transform boundary. The "never execute, fold,
+      residualize, or split an unresolved state chain" rule must therefore be enforced before the knownness branch;
+      the existing per-region-operation purity gates (`condition.rs:301-308`, `scan.rs:1090-1103`, `while.rs:501`)
+      are not sufficient.
 - [ ] Add precise diagnostics for every second-class, alias, scope, freeze, root, and unsupported operation violation.
 
 **Exit criterion:** every reference operation has both conservative effect visibility and a precise canonical root;
@@ -1115,7 +1117,8 @@ all unsupported ownership/control-flow patterns fail before replay.
 - [ ] Reject references in custom derivative/rule regions.
 - [ ] Add guards proving no reference reaches generic AD representational rules. For batching, the projection is
       already compile-time absent (`BatchingPolicyProjection` covers only `ArrayType` and `DimensionType`,
-      `arrays/batching.rs:2429-2493`), so the guard work there is error quality, not prevention.
+      `arrays/batching.rs:2429-2493`), but opaque replicated carriers bypass member projection; checked batching entry,
+      replay, and output boundaries remain required for prevention as well as error quality.
 - [ ] Test nested transform orderings: discharge/JVP/transpose, discharge/batch, discharge/remat, and transforms around
       condition/while/scan.
 
@@ -1618,7 +1621,7 @@ At each checkpoint, ask:
       constants structurally (`Value::validate_as_constant`, enforced at `ProgramBuilder::build` and, since
       pass 8, at region sealing, with the
       rendering-contract rationale recorded in §5.2); guarded custom JVP/VJP rule regions against unresolved
-      unresolved state before direct interpretation (with an end-to-end rejection test); added the compilation-path
+      state before direct interpretation (with an end-to-end rejection test); added the compilation-path
       preflight at the start of `lower_xla_program` so external and dynamically shaped references get the targeted
       discharge diagnostic before boundary projection and partitioner selection (module-entry guards retained as
       defense, tested through the real lowering path); removed the premature commutativity/atomicity promises from
@@ -1637,16 +1640,18 @@ At each checkpoint, ask:
       differentiation state guard in `DifferentiationContext::bind` before the all-zero tangent fast path (covering
       computation and dormant rule regions; operation-local guards remain defense in depth; both the normal and
       stop-gradient zero-tangent paths are tested); replaced the effects-only XLA preflights with two shared scans,
-      `contains_unresolved_state` and `contains_unresolved_references`, used at dispatch, the
-      compilation preflight, and both module-lowering entries, with pure pass-through and forwarded-capture tests;
-      moved the dispatch-time reference rejection ahead of every mesh/option constraint; aligned eager binding with
-      `Program::effects` by excluding dormant rule regions (differentiation owns rule-region state); relaxed
+      `contains_unresolved_state` and `contains_unresolved_references`, used at the compilation preflight and both
+      module-lowering entries, with pure pass-through and forwarded-capture tests; added a separate dispatch-boundary
+      reference check ahead of every mesh/option constraint; aligned eager binding with
+      `Program::effects` by excluding dormant rule regions at that pass (subsequently superseded by pass 9's
+      artifact-wide ordinary-XLA rejection policy); relaxed
       `reference_semantics` to `Cow<'_, _>` so future payload-borrowing operations need not clone; and fixed the
       remaining documentation (state may alternatively be handled by a state-aware backend; the import/inline rename
       consequence is unreachable now that constants are sealed out; the `XlaReferenceConstant` TODO moved out of
       public rustdoc). Known accepted gap, unchanged: the central partial-evaluation gate for `fold_or_residualize`
       remains Phase 2 work, so the branch must not be described as generally transform-safe until it lands —
-      higher-order all-known partial evaluation can still execute hidden state.
+      higher-order all-known partial evaluation can still execute hidden state, while mixed-input evaluation can
+      import it into the residual program unchanged.
 - [x] 2026-08-16 review pass 9 (external feedback, 6 findings applied): added
       `RegionRef::contains_effect_in_closure` — a closure-wide scan that descends into dormant rule regions at every
       nesting depth — and used it to guard the fused `RegionRef::jvp` replay at entry (covering `Program::jvp`,
@@ -1656,8 +1661,7 @@ At each checkpoint, ask:
       the constant-storability contract so lifted reference holders cannot ride through batching as replicated
       batches; unified the XLA dormant-rule policy on artifact-wide rejection (eager binding now scans rule regions
       too, matching the ordinary-XLA unresolved-artifact checks, with an eager custom-JVP rule-region test; later phases
-      may
-      relax this with an executable-region analysis); added staged-boundary reference checks before sharding
+      may relax this with an executable-region analysis); added staged-boundary reference checks before sharding
       overrides in `stage` so overridden reference boundaries get the targeted diagnostic; removed the speculative
       `XlaReferenceConstant` alias and projection until capture lifting consumes them (keeping the rename-metadata
       coverage over plain captures); and fixed the remaining stale statements (identity is equality/hash-only with

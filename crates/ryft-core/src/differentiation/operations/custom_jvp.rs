@@ -370,8 +370,9 @@ where
         let jvp_region = driver.region(1)?;
 
         // The rule region is interpreted directly rather than routed through the transform rejections, so unresolved
-        // state inside it must be rejected here before any of it executes during differentiation.
-        if jvp_region.effects().contains(Effect::OrderedState) {
+        // state anywhere in its attached-region closure (including dormant nested rules) must be rejected here before
+        // any of it can enter the differentiated program.
+        if jvp_region.contains_effect_in_closure(Effect::OrderedState) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{CUSTOM_JVP_OPERATION_NAME}` rule regions must not contain unresolved state"),
             }
