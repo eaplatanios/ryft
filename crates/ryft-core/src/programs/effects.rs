@@ -1,8 +1,8 @@
 /// Named class of observable _effects_ that an [`Operation`](crate::Operation) can have. Effect classes exist because
 /// [`Program`](crate::Program) transforms and backend lowering can have behavior conditional on those classes. For
 /// example, XLA lowering threads StableHLO token chains for backend-supported ordered classes to preserve execution
-/// order, mirroring [JAX's design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html). Ordered
-/// reference state is instead discharged before ordinary XLA lowering.
+/// order, mirroring [JAX's design](https://docs.jax.dev/en/latest/jep/10657-sequencing-effects.html). Ordered state
+/// is instead discharged before ordinary XLA lowering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     /// Observable runtime assertion whose execution order relative to other
@@ -21,8 +21,10 @@ pub enum Effect {
     /// effects may execute in any order.
     UnorderedIo,
 
-    /// Observable access to unresolved reference state. Reference operations must be validated and discharged before
-    /// reaching a backend. This distinct ordered class prevents generic transforms from treating mutation like I/O.
+    /// Observable access to unresolved mutable state. Stateful operations must be validated and either discharged
+    /// before stateless lowering or handled by a state-aware backend. References are one source of this effect, but
+    /// generic consumers must not infer a particular state representation from the effect class. Keeping state distinct
+    /// from I/O also prevents generic transforms from treating mutation like an external I/O effect.
     OrderedState,
 }
 
@@ -63,7 +65,7 @@ impl Effect {
 ///   - [Ordered](Self::is_ordered) effect classes additionally promise that the relative execution order of same-class
 ///     instructions is preserved. Transforms that would interleave or reorder such instructions with respect to each
 ///     other must keep them on one side of any split they introduce. For example, XLA lowering threads StableHLO token
-///     chains for the ordered classes it supports directly and rejects unresolved ordered reference state.
+///     chains for the ordered classes it supports directly and rejects unresolved ordered state.
 ///
 /// The classification of a whole [`Program`](crate::Program) is the [`union`](Self::union) of its instructions'
 /// classifications and can be obtained via [`Program::effects`](crate::Program::effects). This is also what nested

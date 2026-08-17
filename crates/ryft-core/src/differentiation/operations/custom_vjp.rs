@@ -19,7 +19,7 @@ use crate::operations::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value,
+    Effect, Operation, OperationFormatter, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -464,6 +464,16 @@ where
         let primal_region = driver.region(0)?;
         let forward_region = driver.region(1)?;
         let backward_region = driver.region(2)?;
+
+        // The forward and backward rule regions are interpreted directly rather than routed through the transform
+        // rejections, so unresolved state inside either must be rejected before any of it executes.
+        if forward_region.effects().union(backward_region.effects()).contains(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{CUSTOM_VJP_OPERATION_NAME}` rule regions must not contain unresolved state"),
+            }
+            .into());
+        }
+
         let output_count = primal_region.output_types().len();
         check_count!("input", inputs, primal_region.input_types().len(), ProgramError);
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the residuals.

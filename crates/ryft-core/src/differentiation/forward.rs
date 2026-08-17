@@ -22,7 +22,7 @@ use crate::partial::{
 };
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
-    Atom, AtomId, BindingRegionDriver, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
+    Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
     ProgramBuilder, ProgramError, ProjectedValue, Region, RegionDriver, RegionRef, RegionReplayMappings,
     ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
@@ -1114,10 +1114,26 @@ where
         inputs: &[DifferentiationTracer<C>],
     ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
         let operation = operation.into();
+        operation.validate_region_attachments(driver.region_count())?;
 
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
+
+        // Attached regions can hide unresolved state (including dormant rule regions at any nesting depth under the
+        // current conservative custom-derivative policy), and the all-zero fast path below binds the primal directly
+        // without reaching any operation-local differentiation guard. Reject state centrally over the whole attached
+        // closure so no differentiation path can execute it. The operation-local rule-region guards remain as defense
+        // in depth.
+        if driver.regions().any(|region| region.contains_effect_in_closure(Effect::OrderedState)) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` carries unresolved state in an attached region and must be discharged before \
+                    differentiation",
+                    operation.name(),
+                ),
+            });
+        }
 
         // All-zero fast path mirroring `Program::jvp`. When an operation consumes at least one input and every input
         // tangent is a structural zero, skip its rule only when each output tangent can later be materialized without
@@ -1202,6 +1218,18 @@ where
     /// [`DifferentiationDriver`], take it through [`RegionRef::jvp_shared`] counterpart instead, which serves
     /// the same program from the region's retained transform cache as a shared handle.
     pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
+        // This fused replay has its own all-zero shortcut that stages a primal instruction without consulting any
+        // differentiation rule, so unresolved state anywhere in the attached closure (i.e., dormant rule regions
+        // included, since differentiation is exactly what activates them) must be rejected up front. This guard covers
+        // the public `Program::jvp` entry point, which builds the fused program through this function. Linearization
+        // uses a separate replay through `RegionRef::linearize`, which carries its own matching guard.
+        if self.contains_effect_in_closure(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "program carries unresolved state and must be discharged before differentiation".to_string(),
+            }
+            .into());
+        }
+
         let primal_input_count = self.input_ids().len();
         let tangent_input_count = self.input_ids().iter().try_fold(0usize, |count, input| {
             Ok::<_, DifferentiationError>(
@@ -1433,6 +1461,16 @@ where
     /// [`RegionRef::linearize_shared`] instead, which serves the same sub-programs from the region's
     /// retained transform cache as shared handles.
     pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
+        // This guard mirrors the fused `RegionRef::jvp` entry guard. Linearization replays through
+        // `DifferentiationContext::bind` (whose own guard covers region-carrying instructions), but rejecting the whole
+        // attached closure up front (dormant rule regions included) gives every structural differentiation entry point
+        // one consistent, early diagnostic.
+        if self.contains_effect_in_closure(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "program carries unresolved state and must be discharged before differentiation".to_string(),
+            }
+            .into());
+        }
         let primal_input_count = self.input_ids().len();
         let tangent_input_count = self.input_ids().iter().try_fold(0usize, |count, input| {
             Ok::<_, DifferentiationError>(
