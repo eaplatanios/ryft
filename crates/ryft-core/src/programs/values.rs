@@ -116,16 +116,20 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        let current_type = self.r#type();
-        let renamed_type = current_type.rename_identities(renaming)?;
-        if current_type.as_ref() != &renamed_type {
-            return Err(TypeError::invalid(format!(
-                "cannot rename type identities in value of type {} without a value-specific \
-                reconstruction implementation",
-                current_type.as_ref(),
-            )));
-        }
-        Ok(self.clone())
+        rename_type_identities_by_rejection(self, renaming)
+    }
+
+    /// Validates that this value can be used as a program constant (i.e., [`Atom::Constant`](crate::Atom::Constant)).
+    /// Such values must satisfy the rendering contract ove: their [`Display`] output must be deterministic and
+    /// semantically complete, because program renderings double as structural fingerprints. Values that cannot satisfy
+    /// it (most notably identity-bearing mutable reference holders, whose runtime identity is process-local and
+    /// deliberately absent from their deterministic rendering) must reject constant storage here and enter programs
+    /// through inputs or captures instead. [`Region`](crate::Region) sealing enforces this for every stored constant
+    /// in every region, so all construction paths (i.e., program builders, [`Program::new`](crate::Program::new), and
+    /// region imports alike) are covered. The default implementation accepts all values.
+    #[inline]
+    fn validate_as_constant(&self) -> Result<(), TypeError> {
+        Ok(())
     }
 }
 
@@ -394,6 +398,30 @@ impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> 
     fn concretize(&self) -> Result<C, ProgramError> {
         self.value.concretize()
     }
+}
+
+/// Renames a value's type-identity metadata by _rejection_ meaning that identity renamings and renamings that leave
+/// the value's [`Type`] unchanged clone the value, while identity-bearing changes fail because the value has no
+/// value-specific reconstruction. This one helper backs the [`Value::rename_type_identities`] default implementation
+/// and composite member arms that deliberately keep the same semantics (e.g., eager reference holders, whose shared
+/// state must not be renamed through one alias), so the rejection policy and diagnostic have exactly one home.
+pub(crate) fn rename_type_identities_by_rejection<V: Typed + Clone>(
+    value: &V,
+    renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
+) -> Result<V, TypeError> {
+    if renaming.is_identity() {
+        return Ok(value.clone());
+    }
+    let current_type = value.r#type();
+    let renamed_type = current_type.rename_identities(renaming)?;
+    if current_type.as_ref() != &renamed_type {
+        return Err(TypeError::invalid(format!(
+            "cannot rename type identities in value of type {} without a value-specific \
+            reconstruction implementation",
+            current_type.as_ref(),
+        )));
+    }
+    Ok(value.clone())
 }
 
 #[cfg(test)]
