@@ -440,7 +440,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_value_rename_type_identities() {
+    fn test_value() {
         #[derive(Clone, Debug, PartialEq)]
         struct TestValue {
             r#type: ArrayType,
@@ -480,6 +480,7 @@ mod tests {
         let target = DimensionVariable::new("target", bounds);
         let value =
             TestValue { r#type: ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])) };
+        assert_eq!(value.validate_as_constant(), Ok(()));
         assert_eq!(value.rename_type_identities(&TypeIdentityRenaming::new()), Ok(value.clone()));
 
         let mut renaming = TypeIdentityRenaming::new();

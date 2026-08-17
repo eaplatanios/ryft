@@ -33,7 +33,7 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::Effects;
+use crate::programs::effects::{Effect, Effects};
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
@@ -410,6 +410,18 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
             )
             .copied()
             .try_for_each(|id| region.atoms.get(id.index()).map(|_| ()).ok_or(ProgramError::UnboundAtomId { id }))?;
+
+        // Constants must be storable per the `Value` rendering contract (i.e., deterministic, semantically complete
+        // renderings), because program renderings double as structural fingerprints. Sealing is the one boundary that
+        // every region construction path crosses (i.e., program builders, `Program::new`, and region imports alike),
+        // so identity-bearing values such as mutable reference holders are rejected here for every region, nested ones
+        // included.
+        for atom in region.atoms.iter() {
+            if let Atom::Constant(value) = atom {
+                value.validate_as_constant()?;
+            }
+        }
+
         let effects = region.instructions.iter().try_fold(Effects::PURE, |effects, instruction| {
             let region_slots = instruction.operation().region_slots();
             let declared_region_count = region_slots.len();
@@ -797,6 +809,38 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn effects(self) -> Effects {
         self.arena.effects(self.id).unwrap()
+    }
+
+    /// Returns `true` if any instruction in this [`Region`]'s complete attached-region closure (dormant rule regions
+    /// included) carries the provided [`Effect`]. [`RegionRef::effects`] deliberately excludes dormant rule regions
+    /// because merely attaching a rule does not execute it, but transforms that may activate those rules later (most
+    /// importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
+    /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
+    pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
+        // Attachments form a Directed Acyclic Graph (DAG) in which one shared region can be reachable through many
+        // paths, so this is an iterative worklist with an arena-indexed visited set: a naive recursion would revisit
+        // shared regions once per path (exponentially in the worst case) and could overflow the stack on deeply
+        // nested closures. The sealed per-region fold already covers each region's instructions and its transitive
+        // _computation_ closure, so a hit there answers immediately and the walk only needs to keep descending into
+        // attached regions of every role to reach the rule regions the sealed fold deliberately drops.
+        let mut visited = vec![false; self.arena.len()];
+        let mut pending = vec![self.id];
+        while let Some(id) = pending.pop() {
+            if std::mem::replace(&mut visited[id.index()], true) {
+                continue;
+            }
+            let Ok(region) = RegionRef::new(self.arena, id) else {
+                // An unbound attachment cannot be inspected, so answer conservatively.
+                return true;
+            };
+            if region.effects().contains(effect) {
+                return true;
+            }
+            for instruction in region.instructions() {
+                pending.extend(instruction.regions().iter().copied());
+            }
+        }
+        false
     }
 
     /// Returns this [`Region`]'s retained closed [`TypeIdentitySignature`].
@@ -1602,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_identity_closure_classifies_forwarded_and_fresh_definitions() {
+    fn test_region_type_identity_signature_classifies_forwarded_and_fresh_definitions() {
         let boundary = StructuralIdentity::new("boundary");
         let fresh = StructuralIdentity::new("fresh");
 
@@ -1659,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_identity_closure_supports_shared_instruction_outputs() {
+    fn test_region_type_identity_signature_supports_shared_instruction_outputs() {
         let boundary = StructuralIdentity::new("boundary");
         let fresh = StructuralIdentity::new("fresh");
         let region = structural_region(
@@ -1672,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_identity_closure_rejects_invalid_dominance_and_ownership() {
+    fn test_region_type_identity_signature_rejects_invalid_dominance_and_ownership() {
         let boundary = StructuralIdentity::new("boundary");
         let fresh = StructuralIdentity::new("fresh");
 
@@ -1749,6 +1793,42 @@ mod tests {
             Err(TypeError::Invalid { message })
                 if message == "constant type references identity fresh which is not established by a region input",
         ));
+    }
+
+    #[test]
+    fn test_region_contains_effect_in_closure_descends_rule_regions_across_shared_and_deep_closures() {
+        // The leaf carries an effectful instruction, and every level above attaches the previous level _twice_ through
+        // two dormant rule slots. Sealed effects therefore stay pure at every level (rule regions are excluded from
+        // the fold), shared attachments form a diamond at each step, and a per-path recursion would take `2^DEPTH`
+        // visits, so this also pins the iterative, visited-tracking traversal.
+        let mut regions = vec![Region::<Array, TestRegionOperation>::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![Instruction::new(TestRegionOperation::Effectful, Vec::new(), Vec::new(), Vec::new())],
+        )];
+        const DEPTH: usize = 64;
+        for level in 0..DEPTH {
+            let previous = RegionId::new(level);
+            regions.push(Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(
+                        const { &[RegionSlot::rule("first"), RegionSlot::rule("second")] },
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![previous, previous],
+                )],
+            ));
+        }
+        let arena = RegionArena::from_regions(regions).unwrap();
+        let top = RegionRef::new(&arena, RegionId::new(DEPTH)).unwrap();
+        assert!(top.effects().is_pure());
+        assert!(top.contains_effect_in_closure(Effect::OrderedIo));
+        assert!(!top.contains_effect_in_closure(Effect::OrderedState));
     }
 
     #[test]
