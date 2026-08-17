@@ -422,40 +422,37 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
             }
         }
 
-        let effects = region.instructions.iter().try_fold(Effects::PURE, |effects, instruction| {
-            let region_slots = instruction.operation().region_slots();
-            let declared_region_count = region_slots.len();
-            if instruction.regions().len() != declared_region_count {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares {} region slots but {} regions were attached",
-                    instruction.operation().name(),
-                    declared_region_count,
-                    instruction.regions().len(),
-                )));
-            }
-            instruction.regions().iter().copied().enumerate().try_fold(
-                effects.union(instruction.operation().effects()),
-                |effects, (region_index, nested_region)| {
-                    let nested_effects = sealed_regions
-                        .get(nested_region.index())
-                        .map(|nested_region| nested_region.effects)
-                        .ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "instruction references region {nested_region} which has not been sealed yet",
-                            ))
-                        })?;
+        let effects =
+            region
+                .instructions
+                .iter()
+                .try_fold(Effects::PURE, |effects, instruction| -> Result<_, ProgramError> {
+                    let region_slots = instruction.operation().region_slots();
+                    instruction.operation().validate_region_count(instruction.regions().len())?;
+                    instruction.regions().iter().copied().enumerate().try_fold(
+                        effects.union(instruction.operation().effects()),
+                        |effects, (region_index, nested_region)| {
+                            let nested_effects = sealed_regions
+                                .get(nested_region.index())
+                                .map(|nested_region| nested_region.effects)
+                                .ok_or_else(|| {
+                                    ProgramError::MalformedProgram(format!(
+                                        "instruction references region {nested_region} which has not been sealed yet",
+                                    ))
+                                })?;
 
-                    // Only computation regions may execute as part of the owning operation, so their effects are
-                    // observable and must propagate outward. Rule regions are dormant transform definitions. Merely
-                    // attaching one does not execute it and therefore must not make the owning computation effectful.
-                    Ok(if region_slots[region_index].role == RegionRole::Computation {
-                        effects.union(nested_effects)
-                    } else {
-                        effects
-                    })
-                },
-            )
-        })?;
+                            // Only computation regions may execute as part of the owning operation, so their
+                            // effects are observable and must propagate outward. Rule regions are dormant transform
+                            // definitions. Merely attaching one does not execute it and therefore must not make the
+                            // owning computation effectful.
+                            Ok(if region_slots[region_index].role == RegionRole::Computation {
+                                effects.union(nested_effects)
+                            } else {
+                                effects
+                            })
+                        },
+                    )
+                })?;
         let type_identity_signature = region.type_identity_signature()?;
         Ok(Self { region, effects, type_identity_signature })
     }

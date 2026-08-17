@@ -1464,8 +1464,11 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
 impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy<C>> Context for BatchingContext<C, P> {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C, P>, ProgramError> {
-        // Lifts a constant by lifting it in the parent context and replicating it across the batch.
-        Ok(BatchingTracer::new(self.clone(), P::replicated(self.parent().lift(constant)?)))
+        // Lifts a constant by lifting it in the parent context and wrapping it as a replicated batch through the
+        // policy's _checked_ `BatchingPolicy::batch` constructor: kinds the policy cannot batch (most importantly
+        // unresolved reference holders and capture references) are rejected at this boundary instead of riding
+        // through batching as replicated batches that could cross the output boundary unchanged;
+        Ok(BatchingTracer::new(self.clone(), P::batch(self.parent().lift(constant)?, BatchAxis::replicated())?))
     }
 
     #[inline]
@@ -1481,6 +1484,7 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
         // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
+        operation.validate_region_count(driver.region_count())?;
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
         let driver = RecursiveBatchingDriver::new(&driver);
 

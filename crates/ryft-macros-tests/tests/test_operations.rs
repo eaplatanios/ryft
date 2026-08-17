@@ -289,8 +289,8 @@ trait Operation: Clone {
         false
     }
 
-    fn reference_semantics(&self) -> ReferenceOperationSemantics {
-        ReferenceOperationSemantics::None
+    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
+        std::borrow::Cow::Owned(ReferenceOperationSemantics::None)
     }
 
     fn effects(&self) -> Effects {
@@ -1002,8 +1002,8 @@ impl Operation for PrintOperation {
         Effects::Ordered
     }
 
-    fn reference_semantics(&self) -> ReferenceOperationSemantics {
-        ReferenceOperationSemantics::Read
+    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
+        std::borrow::Cow::Owned(ReferenceOperationSemantics::Read)
     }
 
     fn rename_type_identities(
@@ -1371,8 +1371,8 @@ fn test_operation_generates_operation_forwarding() {
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));
-    assert_eq!(add.reference_semantics(), ReferenceOperationSemantics::None);
-    assert_eq!(print.reference_semantics(), ReferenceOperationSemantics::Read);
+    assert_eq!(add.reference_semantics().into_owned(), ReferenceOperationSemantics::None);
+    assert_eq!(print.reference_semantics().into_owned(), ReferenceOperationSemantics::Read);
     assert_eq!(print.to_string(), "rendered print");
 }
 

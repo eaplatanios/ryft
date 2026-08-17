@@ -953,7 +953,7 @@ impl OperationEnum {
                     match self { #(#is_zero_arms)* }
                 }
 
-                fn reference_semantics(&self) -> #ryft::ReferenceOperationSemantics {
+                fn reference_semantics(&self) -> std::borrow::Cow<'_, #ryft::ReferenceOperationSemantics> {
                     match self { #(#reference_semantics_arms)* }
                 }
 

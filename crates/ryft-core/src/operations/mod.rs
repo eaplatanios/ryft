@@ -20,6 +20,7 @@ pub mod math;
 pub mod memory;
 pub mod quantization;
 pub mod random;
+pub mod references;
 pub mod sharding;
 pub mod sort;
 pub mod tag;
@@ -50,6 +51,10 @@ pub use manipulation::*;
 pub use math::*;
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use references::{
+    NEW_REFERENCE_OPERATION_NAME, NewReference, NewReferenceOperation, REFERENCE_READ_OPERATION_NAME, ReferenceRead,
+    ReferenceReadOperation,
+};
 pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 

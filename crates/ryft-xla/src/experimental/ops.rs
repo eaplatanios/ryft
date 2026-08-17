@@ -27,17 +27,17 @@ use ryft_core::{
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation,
-    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation,
-    OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation, Parameter, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation,
-    PrintOperation, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue,
-    ReduceOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
-    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
-    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
-    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
-    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation,
+    NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation,
+    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, ReferenceReadOperation, RegionInterface, RegionSlot,
+    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
 use ryft_macros::Parameter;
 
@@ -51,9 +51,10 @@ pub type XlaArrayConstant = CaptureReference<ArrayType>;
 /// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
-///   - **Captured array data:** the runtime buffer stays in the surrounding compiled function's capture table and the
-///     program stores only a lifetime-free [`CaptureReference`] to it. This keeps device buffers on-device, keeps the
-///     IR compact, and lets one compiled executable serve any captured value of a given type.
+///   - **Captured runtime values:** array buffers and future external reference holders stay in the surrounding
+///     compiled function's capture table, while the program stores only a lifetime-free [`CaptureReference`] carrying
+///     its index and structural [`ArrayIrType`]. This keeps runtime storage out of literal IR payloads. A captured
+///     reference remains metadata only and must be validated and discharged before ordinary XLA lowering.
 ///   - **Immediate first-class dimensions:** a [`DimensionValue`] is a checked host integer, so embedding it costs
 ///     nothing and it lowers to a scalar `stablehlo.constant`. Unlike a capture reference it also stays usable inside
 ///     a nested region — most importantly a `shard_map` manual computation, which owns no capture table of its own —
@@ -265,6 +266,12 @@ where
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
+    /// Unresolved whole-array reference allocation retained until reference discharge.
+    NewReference(NewReferenceOperation),
+
+    /// Unresolved whole-array reference read retained until reference discharge.
+    ReferenceRead(ReferenceReadOperation),
+
     /// Converts scalar array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
 
@@ -361,6 +368,8 @@ where
             ArrayIrOperation::Dimension(operation) => Self::Dimension(operation),
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
+            ArrayIrOperation::NewReference(operation) => Self::NewReference(operation),
+            ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
             ArrayIrOperation::Reshape(operation) => Self::Reshape(operation),
@@ -382,8 +391,15 @@ where
                     .cloned()
                     .map(|capture| match capture {
                         ryft_core::arrays::ArrayIrValue::Array(capture) => C::from_projected(capture),
-                        ryft_core::arrays::ArrayIrValue::Dimension(_) => {
-                            unreachable!("validated scan captures are always stacked arrays")
+                        ryft_core::arrays::ArrayIrValue::Dimension(_)
+                        | ryft_core::arrays::ArrayIrValue::Reference(_) => {
+                            // Scan captures are validated as stacked arrays during `infer_output_types`
+                            // (`validate_scan_capture`); this conversion is infallible, so a dimension or reference
+                            // capture reaching it means a scan was converted before that validation ran.
+                            unreachable!(
+                                "scan captures must be validated as stacked arrays before converting the scan; \
+                                dimension and reference captures are rejected by scan capture validation"
+                            )
                         }
                     })
                     .collect();
@@ -623,6 +639,8 @@ where
             Self::Dimension(operation) => ArrayIrOperation::Dimension(operation.clone()),
             Self::Compare(operation) => ArrayIrOperation::Compare(operation.clone()),
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
+            Self::NewReference(operation) => ArrayIrOperation::NewReference(*operation),
+            Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
             Self::DimensionFromScalar(operation) => ArrayIrOperation::DimensionFromScalar(operation.clone()),
             Self::DimensionToScalar(operation) => ArrayIrOperation::DimensionToScalar(*operation),
             Self::Reshape(operation) => ArrayIrOperation::Reshape(operation.clone()),
@@ -1011,7 +1029,7 @@ pub(crate) fn materialize_transpose_cotangent<
         ArrayIrType::Array(array_type)
             if array_type.shape().dimensions().iter().any(|dimension| matches!(dimension, Dimension::Dynamic(_))) =>
         {
-            // The generic input-free provider cannot construct a reference-bearing array zero. Resolve each dynamic
+            // The generic input-free provider cannot construct a dynamically shaped array zero. Resolve each dynamic
             // axis from the known dimension inputs and pass those extents through the mixed zero operation instead.
             let operands = array_type
                 .shape()
@@ -1184,10 +1202,10 @@ mod tests {
         CaptureReference, ConditionOperation, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType,
         DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
         DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis,
-        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, RegionDriver,
+        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, ReferenceType, RegionDriver,
         RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
-        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, Typed,
-        ValueProjection, WhileOperation, ZeroOperation,
+        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1275,7 +1293,8 @@ mod tests {
         );
         assert_eq!(immediate.map_capture_index(|_| 7), immediate);
 
-        // Each variant projects to exactly its own member universe and rejects the other one.
+        // The array-typed captured case and immediate-dimension case project to their corresponding member universes
+        // and reject the other one.
         assert_eq!(
             <XlaConstant as ValueProjection<ArrayType>>::into_projected(captured.clone()),
             Ok(XlaArrayConstant::new(2, array_type.clone())),
@@ -1293,6 +1312,35 @@ mod tests {
         assert_eq!(
             <XlaConstant as ValueProjection<DimensionType>>::projected(&captured),
             Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
+
+        // A reference-typed capture carries only its capture-table index and structural type metadata. Identity
+        // renaming preserves that index, while ordinary array/dimension projections remain unavailable. (No
+        // reference-typed `ValueProjection` exists: capture lifting is its intended consumer and has not landed.)
+        let source = DimensionVariable::new("source", DimensionBounds::positive(Some(8)).unwrap());
+        let target = DimensionVariable::new("target", DimensionBounds::positive(Some(8)).unwrap());
+        let reference_type =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())])));
+        let reference = XlaConstant::Captured(CaptureReference::new(7, ArrayIrType::Reference(reference_type.clone())));
+        assert_eq!(reference.capture_index(), Some(7));
+        assert_eq!(
+            <XlaConstant as ValueProjection<ArrayType>>::projected(&reference).map(|value| value.r#type().into_owned()),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            <XlaConstant as ValueProjection<DimensionType>>::projected(&reference),
+            Err(TypeError::invalid("expected an immediate dimension but got a captured value")),
+        );
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source, target.clone()).unwrap();
+        let renamed_reference = reference.rename_type_identities(&renaming).unwrap();
+        assert_eq!(renamed_reference.capture_index(), Some(7));
+        assert_eq!(
+            renamed_reference.r#type().into_owned(),
+            ArrayIrType::Reference(ReferenceType::new(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(target)]),
+            ))),
         );
     }
 

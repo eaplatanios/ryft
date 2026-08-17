@@ -133,9 +133,11 @@ pub use operations::{
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
     DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, ElementwiseOperation, PRINT_OPERATION_NAME, Print, PrintOperation,
-    RUNTIME_DIMENSION_DATA_TYPE, TAG_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation,
-    TransferToMemory, TransferToMemoryOperation, forward_collective_to_parent,
+    DimensionToScalarOperation, ElementwiseOperation, NEW_REFERENCE_OPERATION_NAME, NewReference,
+    NewReferenceOperation, PRINT_OPERATION_NAME, Print, PrintOperation, REFERENCE_READ_OPERATION_NAME,
+    RUNTIME_DIMENSION_DATA_TYPE, ReferenceRead, ReferenceReadOperation, TAG_OPERATION_NAME,
+    TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation, TransferToMemory, TransferToMemoryOperation,
+    forward_collective_to_parent,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
@@ -152,11 +154,13 @@ pub use programs::{
     DestinationRegionMapping, Effect, Effects, EmptyRegionDriver, FlatProgram, Instruction, InstructionId, MaybeZero,
     MemberOperation, NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider,
     OutputRegionProvenance, ParameterProjection, Program, ProgramBuilder, ProgramError, ProgramLiveSets,
-    ProgramStatistics, ProjectedValue, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
-    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata,
-    ReplayRegionDriver, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId,
-    ValueProjection, infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    ProgramStatistics, ProjectedValue, Reference, ReferenceAccessMode, ReferenceError, ReferenceInputAccess,
+    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements, Region,
+    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
+    RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, Transform, TransformArtifact,
+    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
+    TypeRefinements, Typed, Value, ValueId, ValueProjection, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,

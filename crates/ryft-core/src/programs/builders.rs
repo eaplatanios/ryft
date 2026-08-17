@@ -135,15 +135,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         inputs: Vec<AtomId>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
-        let region_slots = operation.region_slots();
-        if regions.len() != region_slots.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` declares {} region slots but {} regions were attached",
-                operation.name(),
-                region_slots.len(),
-                regions.len(),
-            )));
-        }
+        operation.validate_region_count(regions.len())?;
         for region in regions.iter().copied() {
             if region.index() >= self.regions.len() {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -1219,7 +1211,7 @@ mod tests {
         assert!(matches!(
             builder.add_instruction(TestRegionOperation::Add, vec![sealed], vec![input, input]),
             Err(ProgramError::MalformedProgram(message))
-                if message == "operation `add` declares 0 region slots but 1 regions were attached",
+                if message == "operation `add` declares no region slots but 1 regions were attached",
         ));
         let output = builder.add_variable(ArrayType::scalar(DataType::F64));
         builder.add_instruction_unchecked(Instruction::new(
@@ -1231,7 +1223,7 @@ mod tests {
         assert!(matches!(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]),
             Err(ProgramError::MalformedProgram(message))
-                if message == "operation `add` declares 0 region slots but 1 regions were attached",
+                if message == "operation `add` declares no region slots but 1 regions were attached",
         ));
 
         // Every sealed region must be reachable from the entry root.

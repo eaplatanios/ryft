@@ -1,4 +1,6 @@
-//! StableHLO lowering for programs that mix arrays with first-class dimensions.
+//! StableHLO lowering for programs that mix arrays with first-class dimensions. The composite IR can also store
+//! references, but ordinary XLA lowering rejects any unresolved reference type or operation before entering these
+//! array/dimension lowering rules.
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
@@ -96,6 +98,7 @@ pub(super) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     match r#type {
         ArrayIrType::Array(r#type) => lower_tensor_type(r#type, context, location),
         ArrayIrType::Dimension(_) => lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location),
+        ArrayIrType::Reference(_) => Err(LoweringError::UnresolvedReference { construct: r#type.to_string() }),
     }
 }
 
@@ -540,6 +543,12 @@ where
                     Ok(vec![converted.result(0).expect("stablehlo.convert should return one result").as_ref()])
                 }
             }
+        }
+        ArrayIrOperation::NewReference(operation) => {
+            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
+        }
+        ArrayIrOperation::ReferenceRead(operation) => {
+            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
         }
         ArrayIrOperation::DimensionFromScalar(operation) => {
             let [input] = input_values else {

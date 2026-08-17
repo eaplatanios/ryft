@@ -1341,6 +1341,7 @@ where
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         let operation = operation.into();
+        operation.validate_region_count(driver.region_count())?;
         let input_values = inputs.iter().map(|input| input.value()).collect::<Result<Vec<_>, _>>();
         let error = match input_values {
             Ok(input_values) => {

@@ -319,7 +319,9 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
         driver: D,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        operation.into().interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
+        let operation = operation.into();
+        operation.validate_region_count(driver.region_count())?;
+        operation.interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
     }
 
     #[inline]
@@ -579,24 +581,11 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         // builder path will infer them directly from its atoms.
         let declared_region_count = operation.region_slots().len();
         let (input_types, region_input_types) = if declared_region_count == 0 {
-            if driver.regions().next().is_some() {
-                return Err(self.error(ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares no region slots but {} regions were attached",
-                    operation.name(),
-                    driver.region_count(),
-                ))));
-            }
+            operation.validate_region_count(driver.region_count()).map_err(|error| self.error(error))?;
             (None, Vec::new())
         } else {
             let region_interfaces = driver.regions().map(|region| region.interface()).collect::<Vec<_>>();
-            if region_interfaces.len() != declared_region_count {
-                return Err(self.error(ProgramError::MalformedProgram(format!(
-                    "operation `{}` declares {} region slots but {} regions were attached",
-                    operation.name(),
-                    declared_region_count,
-                    region_interfaces.len(),
-                ))));
-            }
+            operation.validate_region_count(region_interfaces.len()).map_err(|error| self.error(error))?;
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let region_input_types = operation
                 .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
@@ -1177,9 +1166,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_eager_context_bind_interprets_shared_callee_programs() {
-        // Shared callee programs bind through the same eager interpretation driver as owned regions. The while loop
-        // below receives its condition and body as callee attachments and runs to completion.
+    fn test_eager_context_bind_validates_and_interprets_shared_callee_programs() {
+        // Shared callee programs bind through the same eager interpretation driver as owned regions. Eager binding
+        // validates the complete attachment count before handing that driver to the operation's interpretation rule.
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1199,11 +1188,40 @@ pub(crate) mod tests {
                 .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
+        let condition = Arc::new(condition);
+        let body = Arc::new(body);
         let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            context.bind(
+                AddOperation::new(),
+                CalleeRegionDriver::new(std::slice::from_ref(&condition)),
+                &[Array::scalar(1.0), Array::scalar(2.0)],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `add` declares no region slots but 1 regions were attached",
+        ));
+        assert!(matches!(
+            context.bind(
+                ArrayOperation::While(WhileOperation::new()),
+                CalleeRegionDriver::new(&[]),
+                &[Array::scalar(1.0)],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `while` declares 2 region slots but 0 regions were attached",
+        ));
+        assert!(matches!(
+            context.bind(
+                ArrayOperation::While(WhileOperation::new()),
+                CalleeRegionDriver::new(&[condition.clone(), body.clone(), body.clone()]),
+                &[Array::scalar(1.0)],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "operation `while` declares 2 region slots but 3 regions were attached",
+        ));
         assert_eq!(
             context.bind(
                 ArrayOperation::While(WhileOperation::new()),
-                CalleeRegionDriver::new(&[Arc::new(condition), Arc::new(body)]),
+                CalleeRegionDriver::new(&[condition, body]),
                 &[Array::scalar(1.0)],
             ),
             Ok(vec![Array::scalar(8.0)]),

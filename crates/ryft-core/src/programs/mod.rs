@@ -128,6 +128,7 @@ pub mod identities;
 pub mod instructions;
 pub mod operations;
 pub mod programs;
+pub mod references;
 pub mod regions;
 pub mod statistics;
 pub mod transforms;
@@ -144,6 +145,10 @@ pub use operations::{
     infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
+pub use references::{
+    Reference, ReferenceAccessMode, ReferenceError, ReferenceInputAccess, ReferenceOperationSemantics,
+    ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements,
+};
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,
     Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,

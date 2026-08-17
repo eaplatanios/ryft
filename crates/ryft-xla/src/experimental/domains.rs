@@ -16,11 +16,11 @@ use ryft_core::{
     BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
     Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, InterpretableOperation, InterpretationDriver,
-    Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, Parameterized,
-    Placeholder, ProgramError, ReductionKind, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest,
-    StagedFunction, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements,
-    Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
+    InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
+    Operation, Parameterized, Placeholder, ProgramError, ReductionKind, ScatterReductionKind, Shape, Sharding,
+    ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+    Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as ReferenceArray, ProjectedContext};
@@ -29,7 +29,7 @@ use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Progra
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::lowering::XlaExecutableSignature;
+use super::lowering::{XlaExecutableSignature, contains_unresolved_references, contains_unresolved_state};
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays::ArrayTypeExtension;
@@ -522,6 +522,23 @@ impl<'c> XlaDomain<'c> {
         driver: D,
         inputs: &[ArrayIrValue<Array<'c>>],
     ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
+        if inputs.iter().any(|input| matches!(input, ArrayIrValue::Reference(_))) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before XLA eager execution".to_string(),
+            });
+        }
+        // The intrinsic operation effects alone would miss region-carried state: control-flow operations do not
+        // override `Operation::effects` because region effects are aggregated arena-side. The closure-wide scan also
+        // includes dormant rule regions: although they do not execute during this eager bind, ordinary XLA rejects
+        // unresolved state program-wide, so accepting it here would only defer the failure to compilation with a less
+        // targeted diagnostic. Later phases may relax this with a proper executable-region analysis.
+        if operation.effects().contains(Effect::OrderedState)
+            || driver.regions().any(|region| region.contains_effect_in_closure(Effect::OrderedState))
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` must be discharged before XLA eager execution", operation.name()),
+            });
+        }
         if let XlaOperation::Dimension(operation) = &operation {
             if driver.regions().count() != 0 {
                 return Err(TypeError::invalid("dimension operations do not accept attached regions").into());
@@ -605,6 +622,9 @@ impl<'c> XlaDomain<'c> {
                     ArrayIrValue::Dimension(dimension) => {
                         let operation = DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
                         Ok(builder.add_instruction(XlaOperation::Dimension(operation), Vec::new(), Vec::new())?[0])
+                    }
+                    ArrayIrValue::Reference(_) => {
+                        unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -2283,6 +2303,17 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         input_types: Vec<ArrayIrType>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
+        // Reference inputs are rejected before any mesh- or option-specific constraint so they always receive the
+        // targeted discharge diagnostic instead of an unrelated bucketing or mesh error.
+        if let Some(reference_input) = input_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Reference(_))) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "references must be discharged before XLA compilation, but dispatch input has type \
+                    `{reference_input}`",
+                ),
+            }
+            .into());
+        }
         let Some(bucketing) = options.input_bound_bucketing else {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
             return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
@@ -2296,14 +2327,20 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         }
         let mut bucketed_array_types = Vec::with_capacity(input_types.len());
         for (input_index, r#type) in input_types.iter().enumerate() {
-            let ArrayIrType::Array(array_type) = r#type else {
-                return Err(XlaDomainError::InvalidCompilationOptions {
-                    reason: format!(
-                        "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
-                         type {}",
-                        input_index, r#type,
-                    ),
-                });
+            let array_type = match r#type {
+                ArrayIrType::Array(array_type) => array_type,
+                ArrayIrType::Dimension(_) => {
+                    return Err(XlaDomainError::InvalidCompilationOptions {
+                        reason: format!(
+                            "input-bound bucketing only supports array inputs, but input {} has first-class dimension \
+                             type {}",
+                            input_index, r#type,
+                        ),
+                    });
+                }
+                ArrayIrType::Reference(_) => {
+                    unreachable!("reference inputs are rejected at the `dispatch_signature` entry guard")
+                }
             };
             let dimensions = array_type
                 .shape()
@@ -2345,6 +2382,19 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     where
         Request: StageRequest<Self>,
     {
+        // Reference-typed boundary leaves must receive the targeted discharge diagnostic before any sharding
+        // override is applied: the override path projects leaves to arrays and would otherwise fail with a generic
+        // `expected array type` error.
+        if let Some(reference) =
+            request.input_types().parameters().find(|r#type| matches!(r#type, ArrayIrType::Reference(_)))
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "references must be discharged before XLA compilation, but staged input has type `{reference}`",
+                ),
+            }
+            .into());
+        }
         if let Some(in_shardings) = request.options().in_shardings.clone() {
             let input_types = apply_signature_shardings(
                 request.input_types().parameters().cloned().collect(),
@@ -2354,6 +2404,15 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             request.replace_input_types(input_types)?;
         }
         request.trace(|options, output_types| {
+            if let Some(reference) = output_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Reference(_))) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "references must be discharged before XLA compilation, but staged output has type \
+                        `{reference}`",
+                    ),
+                }
+                .into());
+            }
             apply_signature_shardings(output_types, options.out_shardings.as_deref(), "out")
         })
     }
@@ -2429,6 +2488,23 @@ impl<'c> XlaDomain<'c> {
         capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        // Unresolved references and state must be rejected before boundary types are projected to arrays and before
+        // the partitioner policy is selected. The reference scan runs first so every reference artifact — stateful
+        // operations, pure pass-through, and forwarded reference captures alike — receives the dedicated reference
+        // diagnostic, while the state scan stays behind it for future non-reference state. The lower-level
+        // module-entry guards remain as defense.
+        if contains_unresolved_references(program) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before XLA compilation".to_string(),
+            }
+            .into());
+        }
+        if contains_unresolved_state(program) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "state must be discharged before XLA compilation".to_string(),
+            }
+            .into());
+        }
         validate_data_dependent_compilation(program)?;
         let input_types = program.input_types();
         if capture_count > input_types.len() {
@@ -3015,8 +3091,11 @@ fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Opti
     }
 }
 
-/// Applies an optional per-leaf sharding override to a public composite signature. Every boundary leaf must be an
-/// array; first-class dimensions are internal SSA values and cannot cross the PJRT ABI.
+/// Applies an optional per-leaf sharding override to a public composite signature. When overrides are provided, every
+/// overridden leaf must be an array: first-class dimensions are internal SSA values, and references must be discharged
+/// into explicit array state before either kind can cross the PJRT ABI. Note that without overrides the signature
+/// passes through unchecked here; non-array boundary leaves are rejected by the later array-only conversions on the
+/// compile path.
 fn apply_signature_shardings(
     mut types: Vec<ArrayIrType>,
     shardings: Option<&[Sharding]>,
@@ -3054,6 +3133,10 @@ fn has_only_static_array_types(program: &FlatXlaProgram) -> bool {
         region.atoms().iter().all(|atom| match atom.r#type().as_ref() {
             ArrayIrType::Array(array_type) => array_type.static_shape().is_some(),
             ArrayIrType::Dimension(_) => true,
+            // The predicate answers its own question rather than relying on the lowering-time reference rejection
+            // firing first: a dynamically shaped referent counts as dynamic so that partitioner selection and its
+            // guards stay correct even for programs whose only dynamic type is a reference referent.
+            ArrayIrType::Reference(reference_type) => reference_type.referent().static_shape().is_some(),
         })
     })
 }
@@ -3243,6 +3326,9 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
             reason: "random generation advances state according to physical rather than logical element count",
         },
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
+        XlaOperation::NewReference(_) | XlaOperation::ReferenceRead(_) => {
+            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
+        }
         XlaOperation::ShardMap(_) => {
             Unsupported { reason: "shard-map lowering requires Shardy, which does not support bounded-dynamic tensors" }
         }
@@ -4053,13 +4139,14 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CompareOperation,
-        ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, ConditionOperation, ConstantOperation,
-        ConvertElementTypeOperation, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
-        DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation,
-        DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation,
-        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation,
-        MulOperation, NegOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, ScaledDotOperation,
+        AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CaptureReference,
+        CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, ConditionOperation,
+        ConstantOperation, ConvertElementTypeOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
+        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
+        IotaOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation, OneOperation, PrintOperation,
+        ReduceOperation, ReductionKind, Reference, ReferenceReadOperation, ReferenceType, ScaledDotOperation,
         ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
         SubOperation, WhileOperation, try_jit_with_options,
     };
@@ -6190,6 +6277,7 @@ mod tests {
                 .map(|value| match value {
                     ArrayIrValue::Array(array) => array,
                     ArrayIrValue::Dimension(_) => panic!("padding fixture returned a first-class dimension"),
+                    ArrayIrValue::Reference(_) => panic!("padding fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -6273,6 +6361,7 @@ mod tests {
                 .map(|value| match value {
                     ArrayIrValue::Array(array) => array,
                     ArrayIrValue::Dimension(_) => panic!("attention fixture returned a first-class dimension"),
+                    ArrayIrValue::Reference(_) => panic!("attention fixture returned a reference"),
                 })
                 .collect::<Vec<_>>();
             let compiled = domain.execute_xla_program(&compiled, vec![input]).unwrap();
@@ -6923,7 +7012,7 @@ mod tests {
         assert!(matches!(
             single_device_domain.dispatch_signature(
                 vec![dimension_type.clone().into()],
-                &XlaOptions::new(single_device_mesh)
+                &XlaOptions::new(single_device_mesh.clone())
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
@@ -6932,6 +7021,23 @@ mod tests {
                     dimension_type,
                 ),
         ));
+        // Reference inputs are rejected before any mesh- or option-specific constraint, so the same targeted
+        // diagnostic fires with bucketing options, without them, and on multi-device meshes whose bucketing
+        // rejection would otherwise come first.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        for options in [
+            XlaOptions::new(single_device_mesh.clone()),
+            XlaOptions::new(single_device_mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
+        ] {
+            assert!(matches!(
+                single_device_domain.dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &options),
+                Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                    if message == format!(
+                        "references must be discharged before XLA compilation, but dispatch input has type \
+                        `{reference_type}`",
+                    ),
+            ));
+        }
 
         let multi_device_client =
             plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
@@ -6946,6 +7052,21 @@ mod tests {
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
                     signatures require disabling the Shardy partitioner",
+        ));
+
+        // A reference input on the same multi-device bucketing options still gets the targeted discharge diagnostic:
+        // the reference entry guard precedes the multi-device bucketing rejection asserted just above.
+        assert!(matches!(
+            multi_device_domain.dispatch_signature(
+                vec![ArrayIrType::Reference(reference_type.clone())],
+                &XlaOptions::new(domain_mesh(&multi_device_client, "x", 2))
+                    .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
+            ),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "references must be discharged before XLA compilation, but dispatch input has type \
+                    `{reference_type}`",
+                ),
         ));
     }
 
@@ -7442,6 +7563,200 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_rejects_unresolved_references_before_special_cases_or_tracing() {
+        let domain = XlaDomain::token();
+        assert_eq!(
+            domain.bind(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), &[]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`new_reference` must be discharged before XLA eager execution".to_string(),
+            }),
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let reference = ArrayIrValue::Reference(Reference::new(f32_vector(&client, &mesh, &[1.0])));
+        assert_eq!(
+            domain.bind(AddOperation::new(), Vec::new(), &[reference]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before XLA eager execution".to_string(),
+            }),
+        );
+
+        // Region-carried state must be rejected too: control-flow operations report pure intrinsic effects, so the
+        // guard has to union the driver's region-program effects to see a reference operation inside a loop body.
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
+            let next = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 1], vec![Placeholder; 1])
+                .unwrap()
+        };
+        assert_eq!(
+            XlaDomain::token().bind(XlaOperation::While(WhileOperation::new()), vec![body], &[]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`while` must be discharged before XLA eager execution".to_string(),
+            }),
+        );
+
+        // Reference state confined to a dormant custom-derivative rule region is rejected too: ordinary XLA rejects
+        // unresolved reference artifacts program-wide, so eager binding matches that policy instead of deferring the
+        // failure to compilation with a less targeted diagnostic.
+        let primal = {
+            let mut builder = XlaProgramBuilder::new();
+            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![state], vec![Placeholder; 1], vec![Placeholder; 1])
+                .unwrap()
+        };
+        let rule = {
+            let mut builder = XlaProgramBuilder::new();
+            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
+            let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output, state_tangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            XlaDomain::token().bind(XlaOperation::CustomJvp(CustomJvpOperation::new()), vec![primal, rule], &[]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`custom_jvp` must be discharged before XLA eager execution".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_stage_rejects_reference_boundaries_before_sharding_projection() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+
+        // A reference input with `in_shardings` receives the targeted discharge diagnostic before the sharding
+        // override projects boundary leaves to arrays.
+        fn forward<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<CompilationTracer<XlaDomain<'c>>>,
+            input: CompilationTracer<XlaDomain<'c>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            Ok(input)
+        }
+        assert!(matches!(
+            domain
+                .stage(
+                    ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                        forward,
+                        Vec::new(),
+                        reference_type.clone(),
+                        XlaOptions::new(mesh.clone()).with_in_shardings(vec![scalar_sharding.clone()]),
+                    ),
+                )
+                .map(|_| ()),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "references must be discharged before XLA compilation, but staged input has type \
+                    `{reference_type}`",
+                ),
+        ));
+
+        // A reference output with `out_shardings` is likewise rejected before the output override runs.
+        fn allocate<'c>(
+            _: Vec<XlaConstant>,
+            _: Vec<CompilationTracer<XlaDomain<'c>>>,
+            input: CompilationTracer<XlaDomain<'c>>,
+        ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            Ok(input.new_reference()?)
+        }
+        assert!(matches!(
+            domain
+                .stage(
+                    ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                        allocate,
+                        Vec::new(),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                        XlaOptions::new(mesh.clone()).with_out_shardings(vec![scalar_sharding]),
+                    ),
+                )
+                .map(|_| ()),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "references must be discharged before XLA compilation, but staged output has type \
+                    `{reference_type}`",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_compilation_rejects_unresolved_state_and_references_before_boundary_projection() {
+        // The preflight in `lower_xla_program` must fire before boundary types are projected to arrays and before the
+        // partitioner policy is selected. The reference scan runs first, so every reference artifact — stateful
+        // reference operations included — receives the dedicated reference diagnostic, while the generic state
+        // diagnostic stays behind it for future non-reference state.
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![input]).unwrap()[0];
+        let program: FlatXlaProgram = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        assert!(matches!(
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "references must be discharged before XLA compilation",
+        ));
+
+        // A pure reference pass-through carries reference types but no stateful instruction, so it has
+        // `Effects::PURE` and only the type scan can catch it.
+        let pass_through = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        assert!(pass_through.effects().is_pure());
+        assert!(matches!(
+            domain.lower_xla_program(&pass_through, 0, &XlaOptions::new(mesh.clone())),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "references must be discharged before XLA compilation",
+        ));
+
+        // A forwarded reference capture is likewise pure: the constant stores only deterministic capture metadata,
+        // so it survives construction, and only the type scan can reject it here.
+        let forwarded_capture = {
+            let mut builder = XlaProgramBuilder::new();
+            let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(
+                0,
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+            )));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![capture], Vec::new(), vec![Placeholder])
+                .unwrap()
+        };
+        assert!(forwarded_capture.effects().is_pure());
+        assert!(matches!(
+            domain.lower_xla_program(&forwarded_capture, 0, &XlaOptions::new(mesh)),
+            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "references must be discharged before XLA compilation",
+        ));
     }
 
     #[test]

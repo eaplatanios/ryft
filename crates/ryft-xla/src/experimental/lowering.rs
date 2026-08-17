@@ -104,6 +104,14 @@ pub(crate) enum LoweringError {
     #[error("unsupported staged op `{op}` during XLA lowering")]
     UnsupportedOp { op: String },
 
+    /// Error returned when unresolved reference semantics reach XLA lowering before functionalization.
+    #[error("unresolved reference construct `{construct}` must be discharged before XLA lowering")]
+    UnresolvedReference { construct: String },
+
+    /// Error returned when unresolved mutable state reaches ordinary XLA lowering before functionalization.
+    #[error("unresolved state in `{construct}` must be discharged before XLA lowering")]
+    UnresolvedState { construct: String },
+
     /// Error returned when a shard-map body carries ordered effects, whose tokens `sdy.manual_computation` cannot
     /// thread across its boundary.
     #[error(
@@ -446,6 +454,7 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
     /// Returns the current token for `effect`.
     fn get(&self, effect: Effect) -> Option<ValueRef<'b, 'c, 't>> {
         match effect {
+            Effect::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
             Effect::OrderedAssertion => self.ordered_assertion,
             Effect::OrderedIo => self.ordered_io,
             Effect::UnorderedIo => None,
@@ -455,6 +464,7 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
     /// Replaces the current token for one ordered effect class.
     fn set(&mut self, effect: Effect, token: ValueRef<'b, 'c, 't>) {
         match effect {
+            Effect::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
             Effect::OrderedAssertion => self.ordered_assertion = Some(token),
             Effect::OrderedIo => self.ordered_io = Some(token),
             Effect::UnorderedIo => panic!("unordered effects do not have token slots"),
@@ -462,9 +472,56 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
     }
 }
 
-/// Returns the ordered classes contained in `effects`, in canonical token/result order.
-fn ordered_effects(effects: Effects) -> impl Iterator<Item = Effect> {
-    effects.into_iter().filter(|effect| effect.is_ordered())
+/// Returns `true` if any operation in `program`'s complete region arena carries unresolved ordered state.
+///
+/// This scans every region rather than consulting the program's effect summary because that summary intentionally
+/// excludes dormant rule regions. Ordinary XLA cannot preserve state in either computation or rule regions, so both
+/// must be rejected before lowering.
+pub(crate) fn contains_unresolved_state<ProgramInput, ProgramOutput>(
+    program: &XlaProgram<ProgramInput, ProgramOutput>,
+) -> bool
+where
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+{
+    program.regions().iter().any(|region| {
+        region
+            .instructions()
+            .iter()
+            .any(|instruction| instruction.operation().effects().contains(Effect::OrderedState))
+    })
+}
+
+/// Returns `true` if `program` contains a reference-typed atom in any region.
+///
+/// This type scan is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
+/// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back
+/// every ordinary-XLA entry boundary.
+pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput>(
+    program: &XlaProgram<ProgramInput, ProgramOutput>,
+) -> bool
+where
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+{
+    program
+        .regions()
+        .iter()
+        .any(|region| region.atoms().iter().any(|atom| matches!(atom.r#type().as_ref(), ArrayIrType::Reference(_))))
+}
+
+/// Returns the effect classes that have StableHLO token slots, in canonical token/result order.
+///
+/// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the
+/// core [`Effect`] type — but the match is deliberately exhaustive so that adding an effect class forces an explicit
+/// token-slot decision in this backend instead of a silent omission. [`Effect::OrderedState`] has no slot: ordinary
+/// XLA lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn
+/// state into an ordinary token-threaded effect.
+fn token_threaded_effects(effects: Effects) -> impl Iterator<Item = Effect> {
+    effects.into_iter().filter(|effect| match effect {
+        Effect::OrderedAssertion | Effect::OrderedIo => true,
+        Effect::UnorderedIo | Effect::OrderedState => false,
+    })
 }
 
 /// Lowering mode used for plain `tracing_v2` MLIR emission.
@@ -4060,6 +4117,14 @@ pub(crate) fn to_mlir_module<
     _local_output_types: &Output,
     function_name: S,
 ) -> Result<String, LoweringError> {
+    // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
+    // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
+    if contains_unresolved_references(program) {
+        return Err(LoweringError::UnresolvedReference { construct: "program with unresolved references".to_string() });
+    }
+    if contains_unresolved_state(program) {
+        return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
+    }
     let function_name = normalize_function_name(function_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let local_input_types = local_input_types.parameters().cloned().collect::<Vec<_>>();
@@ -4201,6 +4266,12 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
+    if contains_unresolved_references(program) {
+        return Err(LoweringError::UnresolvedReference { construct: "program with unresolved references".to_string() });
+    }
+    if contains_unresolved_state(program) {
+        return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
+    }
     let function_name = normalize_function_name(function_name.as_ref())?;
     let global_input_types = global_input_types.parameters().cloned().collect::<Vec<_>>();
     let global_output_types = global_output_types.parameters().cloned().collect::<Vec<_>>();
@@ -4791,7 +4862,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
             collective_state,
             &mut region_effect_tokens,
         )?;
-        for effect in ordered_effects(threaded_effects) {
+        for effect in token_threaded_effects(threaded_effects) {
             outputs.push(
                 region_effect_tokens
                     .get(effect)
@@ -4836,7 +4907,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
     let threaded_effects = true_branch.effects().union(false_branch.effects());
     let mut entry_effect_tokens = *effect_tokens;
-    for effect in ordered_effects(threaded_effects) {
+    for effect in token_threaded_effects(threaded_effects) {
         let token = current_or_new_token(effect, effect_tokens, block, location)?;
         entry_effect_tokens.set(effect, token);
     }
@@ -4869,7 +4940,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let output_count = true_branch.output_types().len();
-    for (token_index, effect) in ordered_effects(threaded_effects).enumerate() {
+    for (token_index, effect) in token_threaded_effects(threaded_effects).enumerate() {
         effect_tokens.set(
             effect,
             operation
@@ -4942,7 +5013,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     // Carry one trailing token for each ordered class used by either nested program. Each class advances independently
     // through the body; a body that is pure for one active class returns that class's entry token unchanged.
     let threaded_effects = condition_effects.union(body.effects());
-    let threaded_effect_count = ordered_effects(threaded_effects).count();
+    let threaded_effect_count = token_threaded_effects(threaded_effects).count();
     // State layout: `[counter?, states..., predicate?, ordered-effect tokens...]`.
     let predicate_index = counter_offset + state_count;
     let token_start_index = counter_offset + state_count + predicate_offset;
@@ -4990,7 +5061,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         }
         state_values.push(initial_predicate[0]);
     }
-    for effect in ordered_effects(threaded_effects) {
+    for effect in token_threaded_effects(threaded_effects) {
         state_values.push(current_or_new_token(effect, effect_tokens, block, location)?);
     }
 
@@ -5026,7 +5097,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
                 })
                 .collect::<Vec<_>>();
             let mut condition_effect_tokens = EffectTokens::default();
-            for (token_offset, effect) in ordered_effects(threaded_effects).enumerate() {
+            for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
                 condition_effect_tokens.set(
                     effect,
                     condition_block_ref
@@ -5088,7 +5159,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
             .map(|index| body_block_ref.argument(index).expect("while body should have state arguments").as_ref())
             .collect::<Vec<_>>();
         let mut body_effect_tokens = EffectTokens::default();
-        for (token_offset, effect) in ordered_effects(threaded_effects).enumerate() {
+        for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
             body_effect_tokens.set(
                 effect,
                 body_block_ref
@@ -5201,7 +5272,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         if let Some(next_predicate) = next_predicate {
             next_state.push(next_predicate);
         }
-        for effect in ordered_effects(threaded_effects) {
+        for effect in token_threaded_effects(threaded_effects) {
             next_state.push(
                 body_effect_tokens
                     .get(effect)
@@ -5218,7 +5289,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
         body_region.into(),
         location,
     )?)?;
-    for (token_offset, effect) in ordered_effects(threaded_effects).enumerate() {
+    for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
         effect_tokens.set(
             effect,
             operation
@@ -5415,7 +5486,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         .iter()
         .map(|r#type| composite::lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    for effect in ordered_effects(threaded_effects) {
+    for effect in token_threaded_effects(threaded_effects) {
         lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
         state_values.push(current_or_new_token(effect, effect_tokens, block, location)?);
     }
@@ -5471,7 +5542,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         let x_stacks = arguments[1 + carry_count..1 + carry_count + x_slice_types.len()].to_vec();
         let mut y_accumulators = arguments[1 + carry_count + x_slice_types.len()..].to_vec();
         let mut body_effect_tokens = EffectTokens::default();
-        for (token_offset, effect) in ordered_effects(threaded_effects).enumerate() {
+        for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
             body_effect_tokens.set(
                 effect,
                 body_block_ref
@@ -5523,7 +5594,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         next_state.extend(carries);
         next_state.extend(x_stacks);
         next_state.extend(y_accumulators);
-        for effect in ordered_effects(threaded_effects) {
+        for effect in token_threaded_effects(threaded_effects) {
             next_state.push(
                 body_effect_tokens
                     .get(effect)
@@ -5540,7 +5611,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         body_region.into(),
         location,
     )?)?;
-    for (token_offset, effect) in ordered_effects(threaded_effects).enumerate() {
+    for (token_offset, effect) in token_threaded_effects(threaded_effects).enumerate() {
         effect_tokens.set(
             effect,
             operation
@@ -8866,6 +8937,176 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_lowering_rejects_unresolved_reference_type() {
+        use ryft_core::ReferenceType;
+
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(
+            composite::lower_array_ir_type(&reference_type, &context, location),
+            Err(LoweringError::UnresolvedReference { construct }) if construct == reference_type.to_string(),
+        ));
+    }
+
+    #[test]
+    fn test_xla_lowering_rejects_unresolved_state_before_token_threading() {
+        use ryft_core::{NewReferenceOperation, ReferenceReadOperation};
+
+        assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
+
+        let array_type = ArrayType::scalar(DataType::F32);
+        let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
+        let reference = builder
+            .add_instruction(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), vec![input])
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation), Vec::new(), vec![reference])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The reference scan runs before the generic state scan at the module entry, so a program whose state comes
+        // from reference operations receives the dedicated reference diagnostic; the state error remains behind it
+        // for future non-reference state (`token_threaded_effects` above pins that `OrderedState` has no token slot
+        // either way).
+        assert!(matches!(
+            lower_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![array_type.clone()],
+                &vec![array_type],
+                "main",
+                None,
+                None,
+                None,
+            ),
+            Err(LoweringError::UnresolvedReference { construct })
+                if construct == "program with unresolved references",
+        ));
+    }
+
+    #[test]
+    fn test_entry_alias_attribute_executes_in_place_on_cpu() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+        use ryft_pjrt::{
+            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+            load_cpu_plugin,
+        };
+
+        use crate::tests::{values_from_bytes, values_to_bytes};
+
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[MlirSize::Static(4)], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let function_block = context.block(&[(tensor_type, location)]);
+                {
+                    let input = function_block.argument(0).unwrap();
+                    let mut function_block_ref = function_block.as_ref();
+                    let doubled =
+                        function_block_ref.append_operation(stable_hlo::add(input, input, location).unwrap()).unwrap();
+                    function_block_ref
+                        .append_operation(func::r#return(&[doubled.result(0).unwrap()], location).unwrap())
+                        .unwrap();
+                }
+                let mut function_region = context.region();
+                function_region.append_block(function_block).unwrap();
+                func::func(
+                    "main",
+                    func::FuncAttributes {
+                        arguments: vec![TypeAndAttributes {
+                            r#type: tensor_type.as_ref(),
+                            attributes: Some(HashMap::from([
+                                ("mhlo.sharding".into(), context.string_attribute("{replicated}").as_ref()),
+                                (
+                                    "tf.aliasing_output".into(),
+                                    context.integer_attribute(context.signless_integer_type(64), 0).as_ref(),
+                                ),
+                            ])),
+                        }],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    function_region,
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        let module = module.to_string();
+        assert!(
+            module.contains("%arg0: tensor<4xf32> {mhlo.sharding = \"{replicated}\", tf.aliasing_output = 0 : i64}",),
+            "{module}",
+        );
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(
+                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                &CompilationOptions {
+                    argument_layouts: Vec::new(),
+                    parameter_is_tupled_arguments: false,
+                    executable_build_options: Some(ExecutableCompilationOptions {
+                        device_ordinal: -1,
+                        replica_count: 1,
+                        partition_count: 1,
+                        ..Default::default()
+                    }),
+                    compile_portable_executable: false,
+                    profile_version: 0,
+                    serialized_multi_slice_configuration: Vec::new(),
+                    environment_option_overrides: HashMap::new(),
+                    target_config: None,
+                    allow_in_place_mlir_modification: false,
+                    matrix_unit_operand_precision: Precision::Default as i32,
+                },
+            )
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let input = client
+            .buffer(values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(), BufferType::F32, &[4], None, device, None)
+            .unwrap();
+        input.ready().unwrap().r#await().unwrap();
+        // The input is ready and remains alive in `inputs` until execution completes, so comparing its opaque address
+        // with the synchronized output address does not dereference either device pointer.
+        let input_pointer = unsafe { input.unsafe_pointer().unwrap() };
+        let inputs = [ExecutionInput { buffer: Arc::new(input), donatable: true }];
+        let execution = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+            )
+            .unwrap();
+        let mut device_outputs = execution.block_until_ready().unwrap().remove(0);
+        let output = device_outputs.outputs.remove(0);
+        let output_pointer = unsafe { output.unsafe_pointer().unwrap() };
+        // `tf.aliasing_output` is a hint rather than a guarantee (XLA's copy insertion may materialize a fresh
+        // output), so this pointer equality is a deliberate canary pinned to the repository's pinned CPU plugin: if a
+        // plugin upgrade breaks it while the numeric assertion below still passes, re-evaluate whether the alias hint
+        // is still honored rather than assuming a correctness bug.
+        assert_eq!(output_pointer, input_pointer);
+        let output = output.copy_to_host(None).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(output.as_slice()), vec![2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
     fn test_broadcast_explicit_sharding_transition_executes_on_cpu() {
         use std::collections::HashMap;
 
@@ -10380,6 +10621,7 @@ mod tests {
             .map(|r#type| match r#type {
                 ArrayIrType::Array(r#type) => r#type.clone(),
                 ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
+                ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
             })
             .collect::<Vec<_>>();
         let primal_stablehlo =
@@ -10394,6 +10636,7 @@ mod tests {
             .map(|r#type| match r#type {
                 ArrayIrType::Array(r#type) => r#type.clone(),
                 ArrayIrType::Dimension(_) => panic!("this fixture has only array residuals"),
+                ArrayIrType::Reference(_) => panic!("this fixture has no reference residuals"),
             })
             .collect::<Vec<_>>();
         let pullback_outputs = vec![scalar_f32, vector_f32];

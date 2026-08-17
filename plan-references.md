@@ -1,6 +1,7 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** proposed architecture; no implementation has begun
+**Status:** Phases 0 and 1 implemented and verified; narrow later-phase prerequisites are prototyped, with remaining
+phase work still planned
 
 **Research snapshot:** 2026-08-14
 
@@ -132,11 +133,12 @@ where its contracts must live.
 
 ### Important current constraints
 
-- `ArrayIrType` currently contains only `Array` and `Dimension`; adding a third member requires a broad but mostly
-  compiler-guided exhaustive-match audit.
+- `ArrayIrType` now contains `Array`, `Dimension`, and `Reference`; the completed compiler-guided exhaustive-match
+  audit intentionally supports metadata-only paths and rejects unresolved references at transform/backend boundaries.
 - `ArrayIrType::Identity` is `DimensionVariable`. Reference referents may contain those dimension identities, but
   runtime reference identity must not become a `Type::Identity`.
-- `Effects` is a small `Copy` bitset with three global classes. It cannot encode dynamic resource identities.
+- `Effects` is a small `Copy` bitset with four global classes, including `OrderedState`. It cannot encode dynamic
+  resource identities.
 - `Operation::effects()` has no instruction operands and therefore cannot identify a concrete root by itself.
 - Generic partial evaluation may move all-known work ahead of residual work; unresolved state operations cannot use
   its default rule.
@@ -216,7 +218,8 @@ cache statistics, and none should be introduced. `ArrayIrValue<A>` stores `Refer
 primitive is an implementation choice, but the semantics are fixed:
 
 - Cloning the internal value aliases the same resource; it does not copy the array contents.
-- Equality, hashing, and display use stable reference identity, never mutable contents.
+- Equality and hashing use stable reference identity, never mutable contents. `Display` is deterministic and
+  type-based (renderings back diagnostics and structural fingerprints), while `Debug` includes the runtime identity.
 - No public program operation compares reference identities.
 - A read returns an immutable snapshot. Later writes may reuse storage only when doing so cannot mutate any retained
   snapshot; otherwise eager execution or the backend must copy or use copy-on-write protection.
@@ -228,14 +231,23 @@ primitive is an implementation choice, but the semantics are fixed:
 - Frozen, failed, or otherwise invalid state produces an explicit error rather than panicking or returning stale data.
 - The holder is an opaque `Parameter` leaf. This is free: `Parameter` is a bare marker trait (`parameters.rs:153`),
   so a leaf implementation exposes nothing and there is no traversal behavior to suppress.
-- Identity renaming of an eager `ArrayIrValue::Reference` rejects every non-identity renaming in the MVP, via the
-  default `Value::rename_type_identities` behavior (clone when the type is unchanged, error otherwise,
-  `programs/values.rs:115-129`): renaming shared holder metadata would rename every alias, while minting a new holder
-  would break resource identity, so neither is admissible. Before views land (Phase 8), separate root-shared holder
-  state (and `ReferenceId`) from the handle-local referent type and eventual view mapping; a renamed or projected
-  handle then retains its root without mutating shared metadata, and the rename restriction can be revisited.
+- Identity renaming of an eager `ArrayIrValue::Reference` rejects every renaming that would change the handle's type,
+  via the shared rejection helper behind the default `Value::rename_type_identities` behavior (identity renamings and
+  renamings that do not touch the handle's identities clone the handle; type-changing renamings error): renaming
+  shared holder metadata would rename every alias, while minting a new holder
+  would break resource identity, so neither is admissible. Because reference constants are structurally rejected at
+  region sealing, no built program can store an eager reference constant, so this rename rejection can never be
+  reached through program import/inlining — it governs directly held eager values only, while the staged
+  `XlaConstant` captured-reference path renames successfully because it stores only metadata. Before views land
+  (Phase 8), separate root-shared holder state (and `ReferenceId`) from the handle-local referent
+  type and eventual view mapping; a renamed or projected handle then retains its root without mutating shared
+  metadata, and both the rename restriction and the import limitation can be revisited.
 - Mutable external references are not literal constants and are not serialized as payload data. They enter through
-  arguments or typed captures whose invocation supplies the holder.
+  arguments or typed captures whose invocation supplies the holder. This is enforced structurally:
+  `Value::validate_as_constant` rejects reference values at region sealing — the one boundary every region
+  construction path crosses (program builders, `Program::new`, and region imports alike, nested regions included) —
+  because a holder's process-local identity is deliberately absent from its deterministic rendering, and a stored
+  reference constant would let two programs over distinct holders render (and therefore fingerprint) identically.
 
 The staged resource identity is not the runtime `ReferenceId`. Within a program it is derived from the canonical SSA
 root: an entry reference input, a captured reference, or the result of a local reference allocation. Invocation-time
@@ -277,10 +289,13 @@ would create (an unused-result `swap` is a `write`). JAX/Pallas precedent confir
 under kernel lowering: an unused old value lowers to a plain store at the target level. Additive update remains
 distinct because future kernel lowering and differentiation need to distinguish accumulation from replacement.
 
-One consequence needs an explicit canonicalization rule: to the operation-level access analysis an unused-result
-`swap` is still semantically `ReadWrite`, but a write-only or uninitialized kernel operand must never require reading
-its previous contents. The rule is: a `swap` whose old result is provably dead classifies as a write-only
-access/store. It is applied in the resource-access analysis (§6.2) before preserved-kernel eligibility (Phase 12).
+The access contract classifies `swap` as `Write` (JAX does the same for `swap_p`), and `Write` deliberately does not
+assert the absence of a read: a used-result `swap` observes prior state through its result, so generic consumers must
+treat every `Write` conservatively and never remove an earlier write based on the mode alone. Read-ness is
+operation-specific knowledge rather than a generic result-liveness rule — kernel lowering of `swap` knows its own
+old-value result and emits an exchange when it is live and a plain store when it is provably dead (§6.2). A
+write-only or uninitialized kernel operand must never require readable previous contents, which the dead-result
+store lowering guarantees (Phase 12).
 
 These are composite-native `ArrayIrOperation` variants because their signatures cross array/reference kinds. Do not
 create a projected homogeneous reference operation universe until a concrete family of reference-to-reference
@@ -363,8 +378,9 @@ metadata may remain pure; every actual access through that view is ordered.
 
 Reads are ordered in the conservative model because the unchanged reference handle does not encode a new SSA version;
 their result depends on intervening writes. This global chain may serialize independent resources, but it immediately
-keeps existing simplification, liveness, partial-evaluation gates, control-flow summaries, and rematerialization logic
-safe. The cost is bounded: it only pessimizes pre-discharge simplification (for example, common-subexpression
+keeps existing simplification, liveness, control-flow summaries, and rematerialization logic safe. Partial evaluation
+is the exception: its default rule folds all-known effectful operations, so it needs its own dedicated gate (§9,
+Phase 2) rather than inheriting safety from the ordered class. The cost is bounded: it only pessimizes pre-discharge simplification (for example, common-subexpression
 elimination of adjacent reads), and every transform and lowering route discharges first, so no post-discharge pass
 pays for it. Do not attempt to relax pre-discharge read ordering as an optimization.
 
@@ -390,11 +406,18 @@ one allocation, one read, and one view before finalizing, but it must express at
 
 ```text
 ReferenceOperationSemantics
-    root definitions: output -> NewRoot
-    aliases: output -> AliasOf(input)
-    accesses: input -> Read | Write | ReadWrite | Accumulate | Freeze
-    view mapping: optional ordered transform stack
+    outputs:  NewRoot { output_index } | Alias { output_index, input_index }
+    accesses: input_index -> Read | Write | Accumulate | Consume
 ```
+
+All indices are operation-local operand/result positions, never resource identifiers. Output classification is
+mutually exclusive by construction (an output is a fresh root or an alias, never both), and `Alias` carries exactly
+one `input_index` on purpose: it structurally encodes the one-canonical-root invariant (§5.4), so multi-source
+aliases are unrepresentable rather than merely rejected. There is deliberately no `ReadWrite` mode (`swap` classifies
+as `Write`, matching JAX's `swap_p`) and no `Freeze` mode (`freeze` classifies as `Consume`, a lifetime event that
+also covers a future result-less `free_reference`). View operations attach their ordered coordinate-transform stacks
+to the `Alias` case when the Phase 8 view representation lands; the alias edge alone is all root resolution needs
+until then.
 
 The program-level `ReferenceAnalysis` resolves these templates to canonical roots:
 
@@ -411,8 +434,11 @@ It must:
 - summarize nested-region access in parent-root terms;
 - preserve deterministic root order independent of hash-map iteration;
 - distinguish ordinary ordered accumulation from future atomic/commutative accumulation;
-- classify a `swap` whose old result is provably dead as a write-only access (§5.3), so preserved-kernel eligibility
-  sees stores rather than reads;
+- treat `Write` as an over-approximation that permits observing prior state through results: never infer
+  absence-of-read from the mode, and never remove an earlier write based on it alone. Whether a specific write
+  actually reads is operation-specific knowledge — the descriptor deliberately carries no access-to-result mapping,
+  so kernel lowering of `swap` uses its own old-value result (a plain store when that result is provably dead, an
+  exchange when it is live) rather than a generic result-liveness rule;
 - report unresolved, multiply rooted, escaped, or invalidated operands precisely.
 
 This analysis becomes the shared source of truth for static validation, discharge, invocation alias checks, eventual
@@ -568,9 +594,34 @@ replay must compose this order transitively.
 - Multiple roots never exchange state slots.
 - Invalid input fails before the destination builder contains a partial result.
 - Discharge is deterministic.
-- Reference-free input is either returned unchanged or handled by one documented idempotent path.
+- A reference-free source program produces an identity discharge artifact: its program is unchanged, its public output
+  count is the source output count, and its external-state list is empty. Discharge itself is one-shot: it accepts a
+  source program plus validated analysis and returns `DischargedReferenceProgram`; the wrapper is not a valid input to
+  discharge because replaying its inner program would misclassify hidden final-state outputs as public outputs. Do not
+  add an `already_discharged` bit to generic `Program`.
 - Simplification after discharge may optimize the pure state chain; simplification before discharge retains every
   unresolved state access in order.
+
+### 8.6 Error ownership
+
+Keep reference failures with the layer that has enough evidence to diagnose them, and do not introduce overlapping
+catch-all error types:
+
+- `ReferenceError`, colocated with `Reference<V>`, owns eager holder and runtime-lifecycle failures such as frozen,
+  invalid, or poisoned state and referent-type mismatches.
+- `ReferenceAnalysisError`, colocated with `ReferenceAnalysis`, owns static root resolution, multiple roots, use after
+  freeze, escape, forbidden boundary positions, invalid views, alias ambiguity, and unsupported region/capture forms.
+  Expose it through `ProgramError::Custom` rather than adding reference-specific variants to generic `ProgramError`.
+- Discharge adds no public `ReferenceDischargeError` initially. User-correctable legality failures occur during the
+  prerequisite analysis; ordinary replay/build failures remain `ProgramError`, and disagreement between a validated
+  analysis and its exact source program is an internal malformed-artifact invariant.
+- Each generic transform owns its targeted surviving-reference error (`BatchingError`, `DifferentiationError`, and the
+  corresponding partial-evaluation or rematerialization error path); there is no generic reference-transform error.
+- `ryft-xla` adds a backend-owned unsupported-reference-ABI error for logical-to-physical state restrictions and a
+  distinct undischarged-reference lowering error for the ordinary StableHLO boundary. Persistent corruption remains a
+  persistent-executable error, and PJRT execution failures remain PJRT errors.
+
+Core errors never contain physical buffer indices, PJRT values, StableHLO attributes, or backend fence types.
 
 ## 9. Transformation policy
 
@@ -836,7 +887,12 @@ They belong to a future higher-order kernel-call operation and its attached kern
 
 1. Define a kernel-call boundary whose operands are read-only, write-only, read/write, and scratch references.
 2. Define preserved-reference eligibility and prohibit references outside validated kernel regions.
-3. Add scoped uninitialized scratch allocation and non-escape validation.
+3. Add scoped uninitialized scratch allocation and non-escape validation. **Access-mode revisit trigger:** when
+   uninitialized allocation (`empty_reference`-style scratch) lands, read-before-initialization becomes an error
+   worth catching, and a `Write`-classified used-result `swap` reads uninitialized memory — at that point either a
+   `ReadWrite` mode returns to `ReferenceAccessMode` or the definedness check becomes operation-aware
+   (result-liveness-based). Until then `Write`-for-`swap` is safe because every reference is initialized at
+   allocation. A result-less `free_reference` needs no new mode: it is `Consume` without a result.
 4. Complete view metadata with offsets, strides, alignment, layout, address space, and access mode.
 5. Distinguish ordered accumulation from atomic/commutative operations.
 6. Add target-neutral synchronization operations.
@@ -871,71 +927,75 @@ reference-specific when a generic boundary-widening primitive is genuinely reusa
 
 ### Phase 0: Freeze contracts and prototype the seam
 
-- [ ] Confirm names for `ReferenceType<T>`, `Reference<V>`, `ReferenceId`, and the five whole-array operations
+- [x] Confirm names for `ReferenceType<T>`, `Reference<V>`, `ReferenceId`, and the five whole-array operations
       (`swap` is the sole replacement primitive; `write`/`set` are binding-level sugar). Weigh the existing
       collisions when confirming: `TypeIdentityPosition::Reference` (`programs/identities.rs:44`) and
       `CaptureReference` (`captures.rs:96`) already use the word for unrelated concepts.
-- [ ] Prototype `tf.aliasing_output` emission on a toy module and confirm XLA accepts and honors it. No in-repo code
+- [x] Prototype `tf.aliasing_output` emission on a toy module and confirm XLA accepts and honors it. No in-repo code
       currently emits this attribute, so attribute-value construction and XLA acceptance are the unproven halves of
       the §15 "no broad initial changes" claim. Merging is not at risk: `TypeAndAttributes.attributes` is a
       per-argument `HashMap` with multi-attribute round-trip tests (`ryft-mlir/src/types.rs:120-126`,
       `operations/traits.rs:596-680`), and sharding already attaches at the entry-lowering site to extend
       (`sdy.sharding` in physical index space, `lowering.rs:4321-4342`).
-- [ ] Record the supported and unsupported matrix from this document in public-facing design documentation.
-- [ ] Prototype one `Reference` type projection, one `new_reference`, and one `read` through `ArrayIrOperation` without
+- [x] Record the supported and unsupported matrix from this document in public-facing design documentation.
+- [x] Prototype one `Reference` type projection, one `new_reference`, and one `read` through `ArrayIrOperation` without
       migrating unrelated operations.
-- [ ] Prototype the operation-level reference semantic descriptor against allocation, read, and an aliasing view.
-- [ ] Verify (already answered affirmatively by shipped code) that the composite operation derive expresses native
+- [x] Prototype the operation-level reference semantic descriptor against allocation, read, and an aliasing view.
+- [x] Verify (already answered affirmatively by shipped code) that the composite operation derive expresses native
       mixed reference operations: unmarked composite-native `ArrayIrOperation` variants already ship, with
       `DimensionSize` (`operations/dimensions/dimension_size.rs:66-92`, including its `ProjectedValue` receiver form)
       as the template. Composite-native variants need no `#[ryft(members(...))]` change and no projected
       `ReferenceOperation` family.
-- [ ] Decide whether reference-free discharge is idempotent or explicitly one-shot.
-- [ ] Specify error types for lifecycle, root resolution, transform rejection, discharge, and backend ABI failures.
+- [x] Decide whether reference-free discharge is idempotent or explicitly one-shot.
+- [x] Specify error types for lifecycle, root resolution, transform rejection, discharge, and backend ABI failures.
 
 **Exit criterion:** the minimum type/operation/access contract is demonstrated without a parallel type universe or a
 broad trait-solver migration.
 
 ### Phase 1: Add the array IR reference member
 
-- [ ] Add `crates/ryft-core/src/programs/references.rs` with generic `ReferenceType<T: Type>` and its
+- [x] Add `crates/ryft-core/src/programs/references.rs` with generic `ReferenceType<T: Type>` and its
       `ReferenceTypeRefinements<T>` adapter over `T::Refinements` (a bare `()` loses cross-signature identity facts,
       §5.1), with exact-equality compatibility and referent-delegating refinement, re-exported through the programs
       facade and crate root. Note this is the first generic `Type` implementor in the tree; the nearest existing
       generic wrapper is the value-side `CaptureReference<T: Type>` (`captures.rs:96-184`), whose blanket
       `ValueProjection` shape is the pattern to follow.
-- [ ] Add `ArrayIrType::Reference` and checked `From`/`TryFrom` projections.
-- [ ] Extend display, identity traversal/renaming, compatibility, refinement, scalar/complex classification, and
+- [x] Add `ArrayIrType::Reference` and checked `From`/`TryFrom` projections.
+- [x] Extend display, identity traversal/renaming, compatibility, refinement, scalar/complex classification, and
       `ArrayIrTypeRefinements`. Sizing notes: `derive_identity_renaming` grows from a 2x2 to a 3x3 member match
       (`arrays/types/ir.rs:124-146`), and the refinement change is a one-arm addition to the single dispatch site
       `visit_dynamic_to_static_refinements` (`ir.rs:230-252`).
-- [ ] Route reference/referent dimension refinements through the existing shared `ArrayTypeRefinements` state.
-- [ ] Add generic `Reference<V: Value>` in the same core references module, with `Arc`-pointer identity mirroring
+- [x] Route reference/referent dimension refinements through the existing shared `ArrayTypeRefinements` state.
+- [x] Add generic `Reference<V: Value>` in the same core references module, with `Arc`-pointer identity mirroring
       `DimensionVariable` (`arrays/types/dimensions.rs:241-255`) and `ReferenceId` derived from that pointer.
-- [ ] Implement `Typed<Type = ReferenceType<V::Type>>`, identity-based traits, a bare `Parameter` leaf (marker trait
-      only — nothing to suppress), and the storage/lifecycle primitives without adding a standalone `Value`
-      implementation.
-- [ ] Add `ArrayIrValue::Reference(Reference<A>)` and
+- [x] Implement `Typed<Type = ReferenceType<V::Type>>`, identity-based traits, a bare `Parameter` leaf (marker trait
+      only — nothing to suppress), and the initial holder access primitives without adding a standalone `Value`
+      implementation. Freeze-driven invalidation remains Phase 3 work so Phase 1 does not add a temporary lifecycle
+      state with no consuming operation.
+- [x] Add `ArrayIrValue::Reference(Reference<A>)` and
       `ValueProjection<ReferenceType<ArrayType>, Projected = Reference<A>>`.
-- [ ] Implement identity-based display/equality/hash and alias-preserving internal clone behavior.
-- [ ] Update exports and documentation that currently describe Array IR as containing only arrays and dimensions.
-- [ ] Audit every exhaustive type/value match in core, XLA, tests, and derives. Each site must intentionally support,
+- [x] Implement identity-based equality/hash with deterministic type-based display (runtime identity stays on
+      `Debug`, per the `Value` rendering contract) and alias-preserving internal clone behavior.
+- [x] Update exports and documentation that currently describe Array IR as containing only arrays and dimensions.
+- [x] Audit every exhaustive type/value match in core, XLA, tests, and derives. Each site must intentionally support,
       reject, or remain unreachable after a verified pipeline boundary. Measured magnitude: ~40 files, with
       `arrays/operations/control_flow.rs` (75 matches), `arrays/batching.rs` (37), `ryft-xla/.../ops.rs` (29),
       `arrays/operations/constants.rs` (23), and `ryft-xla/.../shard_map.rs` (22) as the top sites.
-- [ ] Handle `XlaConstant` explicitly: its `ValueProjection` impls are hand-written per member
-      (`ryft-xla/src/experimental/ops.rs:137`, `:163`), and its `Typed`/`Value`/`CaptureConstant` matches
-      (`ops.rs:63-130`) need a deliberate third-member decision (support or reject). By contrast, the tracer
-      projections (`Tracer`, `PartialTracer`, `DifferentiationTracer`, `CaptureReference`) are blanket impls keyed
-      on the seam-1 `TryFrom` and fall out for free.
-- [ ] Record that batching projection is compile-time absent for references: `BatchingPolicyProjection` is
-      implemented only for `ArrayType` and `DimensionType` (`arrays/batching.rs:2429`, `:2484`, `:2493`), so a
+- [x] Handle `XlaConstant` explicitly: its `ValueProjection` impls are hand-written per member
+      (`ryft-xla/src/experimental/ops.rs:145`, `:171`, `:200`), and its `Typed`/`Value`/`CaptureConstant` matches
+      (`ops.rs:63-130`) deliberately support typed `CaptureReference<ReferenceType<ArrayType>>` metadata while
+      excluding concrete `Reference<Array>` holders from literal/serialized constants. By contrast, the tracer
+      projections (`Tracer`, `PartialTracer`, `DifferentiationTracer`, `CaptureReference`) are blanket impls keyed on
+      the seam-1 `TryFrom` and fall out for free.
+- [x] Record that batching projection is compile-time absent for references: `BatchingPolicyProjection` is
+      implemented only for `ArrayType` and `DimensionType` (`arrays/batching.rs:2445`, `:2500`), so a
       reference cannot be projected through `BatchingTracer` at all — the plan's batching rejection is structural,
       not a runtime guard.
-- [ ] Add tests for cross-kind failures, projection, dynamic referent identity refinement, aliasing clones, invalidation,
-      a dimension variable shared across array, dimension, and reference leaves, dynamic-to-dynamic identity-renaming
-      derivation through references (declared `ref<f32[n]>` against actual `ref<f32[m]>` yields `n -> m`), repeated
-      identities, and mixed array/reference occurrences of one identity.
+- [x] Add tests for cross-kind failures, projection, dynamic referent identity refinement, aliasing clones, poisoned
+      holder access, a dimension variable shared across array, dimension, and reference leaves, dynamic-to-dynamic
+      identity-renaming derivation through references (declared `ref<f32[n]>` against actual `ref<f32[m]>` yields
+      `n -> m`), repeated identities, mixed array/reference occurrences of one identity, and eager non-identity rename
+      rejection. Alias-family invalidation tests land with the first real consuming `freeze` operation in Phase 3.
 
 **Exit criterion:** references can be stored, typed, projected, and diagnosed — with reference *types* and staged
 metadata renameable, while eager handles reject non-identity renames until Phase 8 (§5.2) — without changing ordinary
@@ -943,16 +1003,20 @@ array/dimension behavior or being accepted by numeric operations.
 
 ### Phase 2: Add effects, reference semantics, and validation
 
-- [ ] Add `Effect::OrderedState`: extend `Effect::ALL` (hard-coded `[Effect; 3]` at `programs/effects.rs:26`),
-      `Effect::bit`, and `Effect::is_ordered`, plus the only two exhaustive `Effect` matches outside the module —
-      `EffectTokens::get`/`set` in XLA lowering (`lowering.rs:445-462`, whose `set` panics on the fallthrough arm).
+- [x] Add `Effect::OrderedState`: extend `Effect::ALL`, `Effect::bit`, and `Effect::is_ordered`, plus the exhaustive
+      `EffectTokens::get`/`set` matches in XLA lowering.
       `OrderedState` gets no token slot: its `EffectTokens` arm is an error made unreachable by the discharge
       verifier, never a new token chain. No `Display` exists for effects, so there is no rendering to update. Add
       tests.
-- [ ] Add the operation-level root-definition/alias/access/view semantic contract.
-- [ ] Add whole-array reference operations as native `ArrayIrOperation` variants.
-- [ ] Mirror them in `XlaOperation` so XLA staging can carry them before discharge.
-- [ ] Give every unresolved state access the coarse ordered-state effect.
+- [x] Add the operation-level reference semantics contract: mutually exclusive output classification
+      (`NewRoot` | `Alias`) plus input accesses (`Read`/`Write`/`Accumulate`/`Consume`) in operation-local index
+      space, with per-operation examples in the rustdoc; view transform stacks attach to the `Alias` arm in Phase 8.
+- [ ] Complete the whole-array reference operation set as native `ArrayIrOperation` variants (`new_reference` and
+      `read` are already present from Phase 0; `swap`, additive update, and `freeze` remain).
+- [ ] Mirror the remaining operations in `XlaOperation` so XLA staging can carry them before discharge
+      (`new_reference` and `read` are already mirrored).
+- [x] Give every currently implemented unresolved state access the coarse ordered-state effect; apply the same rule to
+      each remaining operation as it lands.
 - [ ] Implement `ReferenceAnalysis` over entry inputs, captures, allocations, aliases, and nested regions.
 - [ ] Implement the dedicated static validator.
 - [ ] Implement invocation-time duplicate-holder validation separately.
@@ -1078,7 +1142,8 @@ risk, and they exercise the view-to-gather/scatter discharge path that later pha
 
 - [ ] Separate root-shared holder state (and `ReferenceId`) from the handle-local referent type and view mapping
       (§5.2), so renamed or projected handles retain their root without mutating shared metadata.
-- [ ] Define the composable reference-view representation.
+- [ ] Define the composable reference-view representation, attaching the ordered transform stack to the semantics
+      contract's `Alias` arm (which ships without transforms until this phase).
 - [ ] Add indexing/slicing views and bounds/type validation.
 - [ ] Lower reads/writes/swaps/additive updates through canonical array slicing/gather/scatter/update operations.
 - [ ] Preserve base-root identity and composed access mappings.
@@ -1192,8 +1257,8 @@ validation/lowering rather than after launch.
 - [ ] Prove ordinary XLA rejects preserved refs outside that boundary.
 - [ ] Define scratch allocation/non-escape, address spaces, atomics, synchronization, and view alignment as separate
       kernel contracts.
-- [ ] Apply the dead-old-result `swap` to write-only canonicalization (§5.3, §6.2) before preserved-kernel
-      eligibility, so write-only and scratch operands never require readable previous contents.
+- [ ] Lower `swap` by result liveness — exchange when the old value is live, plain store when it is provably dead
+      (§5.3, §6.2) — so write-only and scratch operands never require readable previous contents.
 - [ ] Lower one conformance program both through ordinary discharge and through a preserved mock/Mosaic path.
 - [ ] Keep all grid/launch/backend concepts outside the core reference type.
 
@@ -1523,6 +1588,123 @@ At each checkpoint, ask:
       `compilation/contexts.rs` and `ryft-xla/src/jit.rs`; rejected `freeze(view)` (root-only freeze); separated
       kernel operand-result aliases from executable-entry aliases; named the complete V6 persistence migration; and
       scoped Phase 1's rename exit criterion to types and staged metadata.
+- [x] 2026-08-16 review pass 5 (implementation feedback on the semantics contract): simplified
+      `ReferenceOperationSemantics` to mutually exclusive output classification (`NewRoot` | `Alias`) plus input
+      accesses, dropping the separate root/alias collections; dropped `ReadWrite` (`swap` classifies as `Write`,
+      matching JAX's `swap_p`, with `Write` documented as not asserting absence-of-read — result liveness decides,
+      and dead-store elimination must consult it); renamed `Freeze` to `Consume` (a lifetime event that also covers
+      a future result-less `free_reference`); deleted the premature `ReferenceViewTransform` (transform stacks attach
+      to the `Alias` arm in Phase 8; the alias edge alone is the Phase 0 view proof); documented that `Alias`'s
+      single `input_index` structurally encodes the one-root invariant; inverted the dead-result `swap` rule into a
+      result-liveness lowering decision (exchange vs. store); added per-operation examples and the
+      indices-are-not-resource-IDs warning to the rustdoc; and recorded the uninitialized-scratch access-mode revisit
+      trigger under the kernel phases.
+- [x] 2026-08-16 review pass 6 (working-tree code review, 24 findings fixed): forwarded `reference_semantics` through
+      `Box<O>`; made the eager-bind guard union driver region effects (region-carried unresolved state now rejected,
+      with a `while`-body regression test); made `Reference`'s `Display` deterministic and type-based (identity stays
+      on `Debug`); moved the token-slot classification onto `Effect::has_token_slot` and guarded the shard-map
+      `to_mlir_module` entry; added the `From` coherence discriminators to the batching/differentiation rejection
+      blankets and switched transposition to the shared `impl_non_transposable_operation!`; made
+      `ReferenceOperationSemantics::new` enforce its documented invariants (panicking on duplicate classifications or
+      accesses) and return shared `Cow<'static, _>` descriptors; recursed `has_only_static_array_types` into
+      reference referents; extracted the shared rename-rejection helper with an identity-renaming fast path and
+      documented the import/inline limitation above; made refinements delegation borrow-based; consolidated
+      member-kind diagnostics behind `kind_name` helpers while keeping declared-variant compile gates; centralized
+      attached-region count validation at eager binding instead of duplicating it in interpretation rules; added the
+      missing rejection/eager tests and convention fixes
+      (`$crate` paths, defining-path test imports, `Display`-via-`render`, rustdoc links); and marked
+      `XlaReferenceConstant` with its owning-phase TODO.
+- [x] 2026-08-16 review pass 7 (external feedback on the fixes, 8 findings applied): rejected concrete reference
+      constants structurally (`Value::validate_as_constant`, enforced at `ProgramBuilder::build` and, since
+      pass 8, at region sealing, with the
+      rendering-contract rationale recorded in §5.2); guarded custom JVP/VJP rule regions against unresolved
+      unresolved state before direct interpretation (with an end-to-end rejection test); added the compilation-path
+      preflight at the start of `lower_xla_program` so external and dynamically shaped references get the targeted
+      discharge diagnostic before boundary projection and partitioner selection (module-entry guards retained as
+      defense, tested through the real lowering path); removed the premature commutativity/atomicity promises from
+      `Accumulate` (ordered additive accumulation, linear in the update; atomic/commutative semantics stay future
+      work) and the generic result-liveness promise from `Write` (read-ness is operation-specific; no
+      access-to-result mapping until a generic analysis needs one); moved the token-slot classification out of core
+      into an exhaustive local match in XLA's `token_threaded_effects` (backend representation decisions stay out of
+      `ryft-core`; exhaustiveness keeps the forcing function); corrected `ReferenceOperationSemantics::new`'s arity
+      claim to name the planned reference analysis as the validator; and fixed the stale plan statements (partial
+      evaluation is not made safe by the ordered class alone; display is type-based with identity on `Debug`; rename
+      rejection is type-change-keyed; the pass-5 record no longer claims the removed `ArraySliceAxis` descriptor or
+      completed discharge work) plus the test import grouping and the vague temporal-residual TODO.
+- [x] 2026-08-16 review pass 8 (external feedback, 8 findings applied): moved constant-storage validation to region
+      sealing — the one boundary every construction path crosses (builders, `Program::new`, imports, nested regions) —
+      removing the builder-only scan and testing the direct `Region`/`RegionArena` path; added the central
+      differentiation state guard in `DifferentiationContext::bind` before the all-zero tangent fast path (covering
+      computation and dormant rule regions; operation-local guards remain defense in depth; both the normal and
+      stop-gradient zero-tangent paths are tested); replaced the effects-only XLA preflights with two shared scans,
+      `contains_unresolved_state` and `contains_unresolved_references`, used at dispatch, the
+      compilation preflight, and both module-lowering entries, with pure pass-through and forwarded-capture tests;
+      moved the dispatch-time reference rejection ahead of every mesh/option constraint; aligned eager binding with
+      `Program::effects` by excluding dormant rule regions (differentiation owns rule-region state); relaxed
+      `reference_semantics` to `Cow<'_, _>` so future payload-borrowing operations need not clone; and fixed the
+      remaining documentation (state may alternatively be handled by a state-aware backend; the import/inline rename
+      consequence is unreachable now that constants are sealed out; the `XlaReferenceConstant` TODO moved out of
+      public rustdoc). Known accepted gap, unchanged: the central partial-evaluation gate for `fold_or_residualize`
+      remains Phase 2 work, so the branch must not be described as generally transform-safe until it lands —
+      higher-order all-known partial evaluation can still execute hidden state.
+- [x] 2026-08-16 review pass 9 (external feedback, 6 findings applied): added
+      `RegionRef::contains_effect_in_closure` — a closure-wide scan that descends into dormant rule regions at every
+      nesting depth — and used it to guard the fused `RegionRef::jvp` replay at entry (covering `Program::jvp`,
+      `jvp_shared`, and linearization, whose all-zero shortcut previously staged primals unguarded) and to deepen the
+      `DifferentiationContext::bind` guard (nested rule regions were previously invisible through sealed effects),
+      with direct `Program::jvp` and pure-program rule-region-hidden-state tests; made `BatchingContext::lift` apply
+      the constant-storability contract so lifted reference holders cannot ride through batching as replicated
+      batches; unified the XLA dormant-rule policy on artifact-wide rejection (eager binding now scans rule regions
+      too, matching the ordinary-XLA unresolved-artifact checks, with an eager custom-JVP rule-region test; later phases
+      may
+      relax this with an executable-region analysis); added staged-boundary reference checks before sharding
+      overrides in `stage` so overridden reference boundaries get the targeted diagnostic; removed the speculative
+      `XlaReferenceConstant` alias and projection until capture lifting consumes them (keeping the rename-metadata
+      coverage over plain captures); and fixed the remaining stale statements (identity is equality/hash-only with
+      type-based `Display`; constant-storage docs and tests now name region sealing, with direct `Program::new`
+      coverage; the multi-device dispatch claim is now actually asserted). The partial-evaluation gate remains the
+      acknowledged Phase 2 gap.
+- [x] 2026-08-17 review pass 10 (external feedback, 6 findings applied): closed the structural-batching passthrough
+      by routing both `BatchingContext::lift` and `ArrayIrBatching::batch_region` constant replay through the checked
+      `BatchingPolicy::batch` constructor (replacing the semantically inappropriate constant-storage check in `lift`;
+      the infallible replicated carrier is no longer an entry boundary, and its docs plus the disproven
+      "projection absence is structural prevention" claims were corrected); made `contains_effect_in_closure`
+      iterative with an arena-indexed visited set (shared attachment DAGs were revisited once per path — worst-case
+      exponential — and deep closures risked stack overflow), pinned by a 64-level shared-diamond rule-closure test;
+      centralized `validate_region_count` on `Operation` and invoked it from the differentiation, batching, and
+      partial-evaluation `bind` implementations so every operation-application boundary rejects mismatched region
+      attachments; reordered all three XLA discharge boundaries to check unresolved references before generic state
+      so reference operations get the dedicated diagnostic (the state error remains for future non-reference state);
+      added focused staging-guard tests proving reference inputs with `in_shardings` and reference outputs with
+      `out_shardings` are rejected before array projection; and fixed the stale statements (the fused-JVP guard
+      comment no longer claims to cover linearization, which has its own guard; the partial-evaluation gap is now
+      described over both unsafe branches — executing all-known state and residualizing/importing mixed-input state
+      unchanged). The central partial-evaluation gate remains the acknowledged Phase 2 gap.
+- [x] 2026-08-16 Phase 0 implementation/review pass 5: fixed the canonical generic and Array IR reference names;
+      implemented the minimum production-safe type/value/projection plus `new_reference`/`read` vertical slice;
+      added the operation-local reference semantics descriptor (initially carrying an `ArraySliceAxis` view mapping,
+      since simplified in the later semantics refactor to `NewRoot`/`Alias` outputs plus accesses, with view
+      transforms deferred to Phase 8);
+      added conservative `OrderedState` handling and deterministic transform/backend rejections; integrated references
+      with the fallible differentiation-type contract (`is_zero_space == false`, undefined tangent/cotangent errors)
+      without a separate program preflight or fabricated differential representation; proved `tf.aliasing_output`
+      attribute coexistence and donated CPU buffer reuse without adding a production XLA ABI; decided (not yet
+      implemented — discharge itself remains Phase 4 work) that reference-free discharge will be a one-shot wrapper
+      contract with reference-free identity output; assigned lifecycle, analysis, transform, and backend error
+      ownership; and completed independent core and XLA simplification reviews.
+- [x] 2026-08-16 Phase 1 implementation/review pass 6: completed the generic `ReferenceType<T>` refinement and
+      whole-signature identity-renaming contract; completed holder-free structural type identity and identity-bearing
+      `Reference<V>` semantics; integrated the third `ArrayIrType`/`ArrayIrValue` member across projections,
+      classification, diagnostics, captures, control-flow boundaries, and documentation; supported reference-typed
+      `XlaConstant` capture metadata without admitting concrete holder literals; made member batching projection
+      structurally unavailable for references through the existing `BatchingPolicyProjection` contract (later
+      found insufficient on its own, since infallible replicated carriers bypass projection — refer to review
+      pass 10); added exact
+      mixed array/dimension/reference identity, eager rename, holder poisoning, numeric rejection, and XLA dispatch
+      tests; deliberately kept freeze-driven invalidation in Phase 3 rather than adding a temporary holder state; and
+      completed full core, macro, and XLA test suites plus three independent simplification reviews, including their
+      final fixes for borrowed capture projection, zero construction, batched-`while` reference diagnostics, and stale
+      projection/member-kind documentation.
 
-No implementation items above are complete merely because this plan exists. Checkboxes in Phases 0-13 are execution
-work and must be updated, with phase summaries, only when implementation begins.
+Unchecked implementation items above remain future execution work. Completed items record code and verification that
+landed with the corresponding phase summary.

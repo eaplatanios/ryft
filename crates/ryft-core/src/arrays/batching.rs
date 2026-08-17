@@ -1945,9 +1945,10 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// Creates a replicated batch view.
     ///
     /// This infallible constructor implements [`BatchingPolicy::replicated`] and may temporarily wrap any composite
-    /// constant kind. An unresolved reference value or handle remains unusable: batching entry boundaries use
-    /// [`Self::new`], no reference [`BatchingPolicyProjection`] exists, and every reference operation rejects
-    /// batching.
+    /// constant kind, so it must never be the boundary through which values _enter_ batching: entry boundaries
+    /// (batching entry points, constant lifting, and structural constant replay) use the checked [`Self::new`], which
+    /// rejects unresolved references. The absence of a reference [`BatchingPolicyProjection`] and the per-operation
+    /// batching rejections are complementary guards, not substitutes for that checked entry.
     #[inline]
     pub fn replicated(value: V) -> Self {
         Self { value, batch_axis: BatchAxis::replicated(), mapped_dimension: None, ragged_axes: Vec::new() }
@@ -3142,7 +3143,11 @@ where
         let region_mappings = RegionReplayMappings::new();
         region.interpret_with(
             inputs,
-            |_, constant| Ok(<Self as BatchingPolicy<C>>::replicated(context.parent().lift(constant.clone())?)),
+            // Constant replay goes through the _checked_ batch constructor as the infallible replicated wrapper would
+            // let a reference-typed capture constant ride through structural batching unchanged.
+            |_, constant| {
+                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
+            },
             |instruction, instruction_inputs| {
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
                 let (outputs, evidence) = instruction

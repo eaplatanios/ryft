@@ -1,8 +1,11 @@
+use std::borrow::Cow;
+
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
+use crate::programs::references::ReferenceOperationSemantics;
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
@@ -425,6 +428,30 @@ pub trait Operation: Clone {
         self.region_slots().get(index).map(|slot| slot.role)
     }
 
+    /// Validates that `region_count` matches the number of regions declared by [`region_slots`](Self::region_slots).
+    /// Operation application and program-construction boundaries call this function before inspecting attached regions
+    /// so downstream operation rules receive structurally valid applications.
+    #[inline]
+    fn validate_region_count(&self, region_count: usize) -> Result<(), ProgramError> {
+        let declared_region_count = self.region_slots().len();
+        if region_count == declared_region_count {
+            return Ok(());
+        }
+        if declared_region_count == 0 {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` declares no region slots but {} regions were attached",
+                self.name(),
+                region_count,
+            )));
+        }
+        Err(ProgramError::MalformedProgram(format!(
+            "operation `{}` declares {} region slots but {} regions were attached",
+            self.name(),
+            declared_region_count,
+            region_count,
+        )))
+    }
+
     /// Derives the input [`Type`]s with which each attached [`Region`](crate::Region) will be invoked when this
     /// [`Operation`] receives `input_types`. An attached region is traced independently with a declared input
     /// signature. Before importing that region into the caller's [`Program`], staging must rename the signature's
@@ -490,6 +517,21 @@ pub trait Operation: Clone {
     fn is_zero(&self, output_index: usize) -> bool {
         let _ = output_index;
         false
+    }
+
+    /// Returns this operation's local [`ReferenceOperationSemantics`] (i.e., output root/alias classification and input
+    /// accesses) in operand/result index space. Refer to the documentation of [`ReferenceOperationSemantics`] for more
+    /// information and per-operation examples. The empty default is correct for operations that do not themselves
+    /// create, alias, or access references. [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals)
+    /// also keep the empty default even when their nested programs touch references. Like [`Operation::effects`] versus
+    /// [`Program::effects`], this descriptor is _intrinsic_ to the operation, and program-level reference analysis is
+    /// responsible for recursing into attached regions rather than trusting per-instruction descriptors alone. The
+    /// returned [`Cow`] borrows at `self`'s lifetime so implementations can hand out shared static descriptors _or_
+    /// borrow descriptors stored in their own payloads (e.g., custom-call or kernel operations with payload-dependent
+    /// semantics) without cloning on every query.
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(ReferenceOperationSemantics::empty())
     }
 
     /// Returns the observable [`Effect`](crate::Effect) classes of this [`Operation`]. Refer to the documentation of
@@ -595,6 +637,11 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn is_zero(&self, output_index: usize) -> bool {
         self.as_ref().is_zero(output_index)
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        self.as_ref().reference_semantics()
     }
 
     #[inline]
@@ -845,6 +892,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
+    use crate::programs::references::ReferenceOutputSemantics;
 
     use super::*;
 
@@ -891,6 +939,13 @@ mod tests {
 
         fn is_zero(&self, output_index: usize) -> bool {
             output_index == 2
+        }
+
+        fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+            Cow::Owned(ReferenceOperationSemantics::new(
+                vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
+                Vec::new(),
+            ))
         }
 
         fn effects(&self) -> Effects {
@@ -986,6 +1041,13 @@ mod tests {
 
         assert_eq!(operation.region_slots(), &[]);
         assert_eq!(operation.region_role(0), None);
+        assert_eq!(operation.validate_region_count(0), Ok(()));
+        assert_eq!(
+            operation.validate_region_count(1),
+            Err(ProgramError::MalformedProgram(
+                "operation `stop_gradient` declares no region slots but 1 regions were attached".to_string(),
+            )),
+        );
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
         assert_eq!(operation.output_region_provenance(0), Vec::new());
         assert!(!operation.is_zero(0));
@@ -1001,6 +1063,13 @@ mod tests {
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
         assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
         assert_eq!(operation.region_role(1), None);
+        assert_eq!(operation.validate_region_count(1), Ok(()));
+        assert_eq!(
+            operation.validate_region_count(0),
+            Err(ProgramError::MalformedProgram(
+                "operation `forwarding` declares 1 region slots but 0 regions were attached".to_string(),
+            )),
+        );
         assert_eq!(
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
@@ -1015,6 +1084,7 @@ mod tests {
         );
         assert!(!operation.is_zero(1));
         assert!(operation.is_zero(2));
+        assert_eq!(operation.reference_semantics().outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }],);
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),

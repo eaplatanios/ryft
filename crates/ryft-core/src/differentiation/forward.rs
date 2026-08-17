@@ -1114,7 +1114,7 @@ where
         inputs: &[DifferentiationTracer<C>],
     ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
         let operation = operation.into();
-        operation.validate_region_attachments(driver.region_count())?;
+        operation.validate_region_count(driver.region_count())?;
 
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.

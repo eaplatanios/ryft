@@ -191,6 +191,7 @@ fn call_workload<'c>(
     match ryft_core::compilation::call_function(domain, compiled.executable_function(), ArrayIrValue::Array(input))? {
         ArrayIrValue::Array(output) => Ok(output),
         ArrayIrValue::Dimension(_) => Err("compilation benchmark produced a first-class dimension".into()),
+        ArrayIrValue::Reference(_) => Err("compilation benchmark produced a reference".into()),
     }
 }
 
