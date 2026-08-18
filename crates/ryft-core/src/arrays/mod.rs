@@ -8,6 +8,7 @@ pub mod encoding;
 pub mod ir;
 pub mod macros;
 pub mod operations;
+pub mod reference_analysis;
 pub mod sharding;
 pub mod types;
 
@@ -30,6 +31,10 @@ pub use macros::dispatch_on_array_element_type;
 pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,
     DimensionOperations, DimensionTracingContext,
+};
+pub use reference_analysis::{
+    ExternalReferenceRoot, ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
+    ReferenceRoot, ReferenceSource,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

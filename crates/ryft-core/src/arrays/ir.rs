@@ -88,24 +88,6 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
         EagerContext::new()
     }
 
-    fn validate_eager_replay<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
-        region: RegionRef<'_, V, O>,
-    ) -> Result<(), ProgramError> {
-        // TODO(eaplatanios): Phase 4 capture lifting must thread the lifted-capture count here so that external-root
-        //  diagnostics name captures instead of public inputs.
-        let analysis = region.analyze_references(0)?;
-        if let Some(external) = analysis.external_roots().first() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "program replay of external reference {} is not supported before external holder runtime \
-                     integration",
-                    external.source(),
-                ),
-            });
-        }
-        Ok(())
-    }
-
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
@@ -138,6 +120,24 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
                 ))
             }
         }
+    }
+
+    fn validate_eager_replay<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
+        region: RegionRef<'_, V, O>,
+    ) -> Result<(), ProgramError> {
+        // TODO(eaplatanios): Phase 4 capture lifting must thread the lifted-capture count here so that external-root
+        //  diagnostics name captures instead of public inputs.
+        let analysis = region.analyze_references(0)?;
+        if let Some(external) = analysis.external_roots().first() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "program replay of external reference {} is not supported before external holder runtime \
+                     integration",
+                    external.source(),
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
