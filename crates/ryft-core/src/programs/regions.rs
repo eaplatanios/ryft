@@ -398,18 +398,60 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
         {
             region.invalidate_transform_cache();
         }
-        region
-            .input_ids
-            .iter()
-            .chain(&region.output_ids)
-            .chain(
-                region
-                    .instructions
-                    .iter()
-                    .flat_map(|instruction| instruction.inputs().iter().chain(instruction.outputs())),
-            )
-            .copied()
-            .try_for_each(|id| region.atoms.get(id.index()).map(|_| ()).ok_or(ProgramError::UnboundAtomId { id }))?;
+
+        // Region inputs must be distinct variables. Every variable consumed by an instruction must be an input or an
+        // output of an earlier instruction, every instruction output must be a fresh variable, and every variable
+        // exposed at the region output boundary must have a provider. Constants need no provider and may be used
+        // anywhere.
+        let mut input_atoms = vec![false; region.atoms.len()];
+        let mut variable_has_provider = vec![false; region.atoms.len()];
+        for input_id in region.input_ids.iter().copied() {
+            let input = region.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+            let Atom::Variable(_) = input else {
+                return Err(ProgramError::MalformedProgram("region input atom was not a variable".to_string()));
+            };
+            if input_atoms[input_id.index()] {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "region input atom {input_id} appears more than once",
+                )));
+            }
+            input_atoms[input_id.index()] = true;
+            variable_has_provider[input_id.index()] = true;
+        }
+        for instruction in region.instructions.iter() {
+            for input_id in instruction.inputs.iter().copied() {
+                let input = region.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+                if input.is_variable() && !variable_has_provider[input_id.index()] {
+                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+                }
+            }
+            for output_id in instruction.outputs.iter().copied() {
+                let output =
+                    region.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+                let Atom::Variable(_) = output else {
+                    return Err(ProgramError::MalformedProgram(
+                        "instruction output atom was not a variable".to_string(),
+                    ));
+                };
+                if input_atoms[output_id.index()] {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is a region input",
+                    )));
+                }
+                if variable_has_provider[output_id.index()] {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is produced by more than one instruction",
+                    )));
+                }
+                variable_has_provider[output_id.index()] = true;
+            }
+        }
+        for output_id in region.output_ids.iter().copied() {
+            let output = region.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+            if output.is_variable() && !variable_has_provider[output_id.index()] {
+                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+            }
+        }
 
         // Constants must be storable per the `Value` rendering contract (i.e., deterministic, semantically complete
         // renderings), because program renderings double as structural fingerprints. Sealing is the one boundary that
@@ -808,12 +850,43 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.effects(self.id).unwrap()
     }
 
-    /// Returns `true` if any instruction in this [`Region`]'s complete attached-region closure (dormant rule regions
+    /// Returns `true` if any instruction in this [`Region`]'s complete attached region closure (dormant rule regions
     /// included) carries the provided [`Effect`]. [`RegionRef::effects`] deliberately excludes dormant rule regions
     /// because merely attaching a rule does not execute it, but transforms that may activate those rules later (most
     /// importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
     /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
+    #[inline]
     pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
+        self.any_region_in_closure(|region| region.effects().contains(effect))
+    }
+
+    /// Returns the first operation in this region's complete attached region closure that intrinsically carries
+    /// `effect`, or [`None`] when no such operation exists. Attached region effects are inspected through their own
+    /// operations rather than attributed to the enclosing carrier, preserving the precise operation diagnostic.
+    pub(crate) fn first_operation_with_effect_in_closure(self, effect: Effect) -> Option<&'r O> {
+        let mut matching = None;
+        self.any_region_in_closure(|region| {
+            matching = region
+                .instructions()
+                .iter()
+                .map(Instruction::operation)
+                .find(|operation| operation.effects().contains(effect));
+            matching.is_some()
+        });
+        matching
+    }
+
+    /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure has a type accepted by
+    /// `predicate`. Every attached region is traversed regardless of [`RegionRole`], making this function suitable for
+    /// artifact-wide validation that must include dormant transformation rules. Shared descendants are visited once.
+    #[inline]
+    pub fn contains_atom_type_in_closure<F: FnMut(&V::Type) -> bool>(self, mut predicate: F) -> bool {
+        self.any_region_in_closure(|region| region.atoms().iter().any(|atom| predicate(atom.r#type().as_ref())))
+    }
+
+    /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
+    /// it at most once to each visited region and short-circuiting at the first match.
+    fn any_region_in_closure<F: FnMut(Self) -> bool>(self, mut predicate: F) -> bool {
         // Attachments form a Directed Acyclic Graph (DAG) in which one shared region can be reachable through many
         // paths, so this is an iterative worklist with an arena-indexed visited set: a naive recursion would revisit
         // shared regions once per path (exponentially in the worst case) and could overflow the stack on deeply
@@ -834,7 +907,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                 // An unbound attachment cannot be inspected, so answer conservatively.
                 return true;
             };
-            if region.effects().contains(effect) {
+            if predicate(region) {
                 return true;
             }
             for instruction in region.instructions() {
@@ -1050,6 +1123,28 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionD
     }
 }
 
+/// Opaque evidence that a [`Value::validate_eager_replay`] preflight already covered a complete region closure. Ryft's
+/// checked replay roots (i.e., [`Program::interpret_in_context`] and [`RegionRef::interpret_in_context`]) run that
+/// whole-closure preflight once, before anything executes, and then thread this token through their nested replay
+/// drivers so that nested regions are not revalidated. Skipping revalidation is not merely an optimization. A nested
+/// region that receives parent-created references as inputs is valid only in the context of its root, and revalidating
+/// it in isolation would misclassify those references as external roots. Therefore, the token has no public constructor
+/// and is not cloneable. Downstream code can propagate evidence it received from a checked root but cannot forge it to
+/// bypass the preflight.
+#[derive(Debug)]
+pub struct EagerReplayValidation {
+    /// Private field preventing downstream construction.
+    _private: (),
+}
+
+impl EagerReplayValidation {
+    /// Creates a new [`EagerReplayValidation`].
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// [`RegionDriver`] for the regions supplied to one [`Context::bind`](crate::Context::bind) [`Operation`] application.
 /// In addition to providing application-scoped structural access through [`RegionDriver`], a binding region driver can
 /// be consumed through [`import_into`](Self::import_into) to import its regions into a staging context's destination
@@ -1058,7 +1153,20 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionD
 ///
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
+///
+/// [`EagerReplayValidation`] is opaque evidence created only by Ryft's checked interpretation entry points. A custom
+/// driver can participate in ordinary binding but cannot forge the evidence that permits eager replay to skip its
+/// value-family preflight.
 pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> + Sized {
+    /// Returns evidence that these attached regions come from a replay whose complete root was already validated before
+    /// any operation executed. Ordinary direct-bind drivers return [`None`]. A [`ReplayRegionDriver`] returns evidence
+    /// only when interpretation constructed it beneath an already-validated source root through its private validated
+    /// constructor. The public [`ReplayRegionDriver::new`] constructor returns an ordinary unvalidated driver.
+    #[inline]
+    fn eager_replay_validation(&self) -> Option<&EagerReplayValidation> {
+        None
+    }
+
     /// Imports these attached [`Region`]s into the provided [`ProgramBuilder`] in application order and returns their
     /// [`RegionId`]s in the same order. Each type in `input_types` corresponds to the corresponding attached [`Region`]
     /// at that same index and [`None`] preserves its declared input [`TypeIdentity`](crate::TypeIdentity)s, while
@@ -1194,6 +1302,9 @@ pub struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// One [`RegionReplayMappings`] value must be scoped to exactly one source-arena replay. Its per-destination state
     /// is shared across that replay's instruction drivers, but must not be reused for a different source arena.
     mappings: &'r RegionReplayMappings<V, O>,
+
+    /// Evidence that the complete replay root passed its value-family interpretation preflight before execution began.
+    validation: Option<EagerReplayValidation>,
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
@@ -1207,7 +1318,19 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
         for root in roots {
             source.with_id(*root)?;
         }
-        Ok(Self { source, roots, mappings })
+        Ok(Self { source, roots, mappings, validation: None })
+    }
+
+    /// Creates a replay driver beneath a root whose complete interpretation preflight has already succeeded.
+    pub(crate) fn new_validated(
+        source: RegionRef<'r, V, O>,
+        roots: &'r [RegionId],
+        mappings: &'r RegionReplayMappings<V, O>,
+    ) -> Result<Self, ProgramError> {
+        for root in roots {
+            source.with_id(*root)?;
+        }
+        Ok(Self { source, roots, mappings, validation: Some(EagerReplayValidation::new()) })
     }
 }
 
@@ -1223,6 +1346,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for ReplayRegion
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
+    #[inline]
+    fn eager_replay_validation(&self) -> Option<&EagerReplayValidation> {
+        self.validation.as_ref()
+    }
+
     fn import_into(
         self,
         builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
@@ -1752,7 +1880,8 @@ mod tests {
             unrelated_reference.type_identity_signature(),
             Err(TypeError::Invalid { message })
                 if message
-                    == "operation `structural` output type references identity boundary without consuming or defining it",
+                    == "operation `structural` output type references identity boundary without consuming or \
+                        defining it",
         ));
 
         let fresh_reference = structural_region(
@@ -1806,7 +1935,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            vec![Instruction::new(TestRegionOperation::Effectful, Vec::new(), Vec::new(), Vec::new())],
+            vec![Instruction::new(
+                TestRegionOperation::Effectful(Effect::OrderedIo),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )],
         )];
         const DEPTH: usize = 64;
         for level in 0..DEPTH {
@@ -1854,8 +1988,9 @@ mod tests {
     fn test_region_arena_retains_derived_metadata() {
         let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let body_output =
-            body_builder.add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![body_input]).unwrap()[0];
+        let body_output = body_builder
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input])
+            .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1917,15 +2052,16 @@ mod tests {
 
     #[test]
     fn test_region_arena_rejects_unsealed_region_reference() {
-        let atom = AtomId::new(0);
+        let input = AtomId::new(0);
+        let output = AtomId::new(1);
         let region: Region<Array, TestRegionOperation> = Region::new(
-            vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
-            vec![atom],
-            vec![atom],
+            vec![Atom::Variable(ArrayType::scalar(DataType::F64)), Atom::Variable(ArrayType::scalar(DataType::F64))],
+            vec![input],
+            vec![output],
             vec![Instruction::new(
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
-                vec![atom],
-                vec![atom],
+                vec![input],
+                vec![output],
                 vec![RegionId::new(0)],
             )],
         );
@@ -2027,6 +2163,9 @@ mod tests {
         let roots = [second_root, first_root, second_root];
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(driver.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
+        assert!(driver.eager_replay_validation().is_none());
+        let driver = ReplayRegionDriver::new_validated(program.entry_region_ref(), &roots, &mappings).unwrap();
+        assert!(driver.eager_replay_validation().is_some());
     }
 
     #[test]
