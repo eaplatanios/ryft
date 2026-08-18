@@ -1,7 +1,7 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** Phases 0 and 1 implemented and verified; narrow later-phase prerequisites are prototyped, with remaining
-phase work still planned
+**Status:** Phases 0 through 3 implemented and verified; discharge, external runtime integration, and preserved kernel
+lowering remain planned
 
 **Research snapshot:** 2026-08-14
 
@@ -239,9 +239,10 @@ primitive is an implementation choice, but the semantics are fixed:
   region sealing, no built program can store an eager reference constant, so this rename rejection can never be
   reached through program import/inlining — it governs directly held eager values only, while the staged
   `XlaConstant` captured-reference path renames successfully because it stores only metadata. Before views land
-  (Phase 8), separate root-shared holder state (and `ReferenceId`) from the handle-local referent
-  type and eventual view mapping; a renamed or projected handle then retains its root without mutating shared
-  metadata, and both the rename restriction and the import limitation can be revisited.
+  (Phase 8), add a handle-local identity/view mapping and the reconstruction contract for values crossing between that
+  handle type and the root-shared stored value. The holder state and handle-local referent type are already separate;
+  the missing mapping is what lets a renamed or projected handle retain its root without misrepresenting stored value
+  metadata. Once it exists, both the rename restriction and the import limitation can be revisited.
 - Mutable external references are not literal constants and are not serialized as payload data. They enter through
   arguments or typed captures whose invocation supplies the holder. This is enforced structurally:
   `Value::validate_as_constant` rejects reference values at region sealing — the one boundary every region
@@ -343,13 +344,12 @@ Initial static rules:
 - Every reference operand resolves to exactly one canonical root.
 - A local root cannot escape its creation scope.
 - `freeze` is valid only in the local root's creation scope, consumes the root, and invalidates all aliases and views.
-- Scope exit implicitly discards and invalidates any still-live, unescaped local root without producing an array
-  result. This is a program-execution concept: discharge drops the root's final current state, and interpreted region
-  execution invalidates the alias family before the region is released, because only there does an owner observe the
-  scope exit. Directly eager references have no observable creation scope — handles are cloneable and `Arc` last-drop
-  is not scope exit — so they are never implicitly invalidated: they live until an explicit `freeze` or until the
-  last handle drops, and their second-class restrictions are enforced at program boundaries (arguments and captures),
-  where validation exists.
+- Scope exit implicitly discards any still-live, unescaped local root without producing an array result. Discharge
+  drops the root's final current state. Interpreted execution needs no separate invalidation registry: static
+  nonescape guarantees that releasing the region environment drops its final handles, making explicit invalidation
+  unobservable. Directly eager references have no program-owned creation scope, so they are never implicitly
+  invalidated: they live until an explicit `freeze` or until the last handle drops, and their second-class
+  restrictions are enforced at program boundaries (arguments and captures), where validation exists.
 - External or captured references cannot be frozen in the initial implementation.
 - All uses after freeze are rejected, including uses through pre-existing views or nested captures.
 - Allocations inside a condition branch, loop iteration, scan step, or nested call are allowed only if completely
@@ -366,7 +366,9 @@ Initial invocation-time rules:
 - Two capture paths cannot resolve to the same mutable holder.
 - Alias validation completes before interpretation, lowering, or runtime state extraction mutates anything.
 
-Static SSA validation and invocation-time holder validation are distinct and both are required.
+Static SSA validation and invocation-time holder validation are distinct and both are required. Static validation
+lands in Phase 2; holder-identity validation lands with the external runtime boundary in Phase 9 and must complete
+before that runtime extracts or mutates holder state.
 
 ## 6. Effects and resource-access analysis
 
@@ -419,19 +421,22 @@ also covers a future result-less `free_reference`). View operations attach their
 to the `Alias` case when the Phase 8 view representation lands; the alias edge alone is all root resolution needs
 until then.
 
-The program-level `ReferenceAnalysis` resolves these templates to canonical roots:
+The program-level `ReferenceAnalysis` resolves these templates to region-relative canonical roots:
 
 ```text
-EntryInput(index)
-Capture(index)
-Allocation(region, instruction, output)
+RegionInput(region, input_index)
+Allocation(instruction, output_index)
 ```
+
+Entry-region `RegionInput` roots are additionally classified by `ReferenceSource` as captures or public inputs.
+Nested invocations retain `ReferenceRegionInputBinding` substitutions from each formal region root to its canonical
+caller root; the analysis does not rewrite the nested region's own access records into a different root namespace.
 
 It must:
 
 - propagate roots through views;
 - substitute region inputs and captures at condition, loop, scan, and call boundaries;
-- summarize nested-region access in parent-root terms;
+- record nested-region substitutions so consumers can resolve accesses in caller context;
 - preserve deterministic root order independent of hash-map iteration;
 - distinguish ordinary ordered accumulation from future atomic/commutative accumulation;
 - treat `Write` as an over-approximation that permits observing prior state through results: never infer
@@ -462,7 +467,11 @@ The validator proves:
 - freeze is local, unique, consuming, root-only (never through a view), and followed by no use;
 - external roots are not frozen;
 - region captures and inputs do not create forbidden static aliases;
-- while conditions do not write state in the supported subset;
+- while conditions do not write, accumulate into, or consume roots that enter the condition evaluation, because the
+  Boolean-only condition boundary cannot return their final state. A condition-local allocation that neither escapes
+  nor survives the evaluation is externally pure and may remain supported. Phase 2's second-class boundary rules make
+  entering condition references unrepresentable; recursive capture normalization and discharge enforce this policy
+  when Phase 5 makes those roots explicit;
 - transform/backend-specific restrictions are satisfied before the corresponding pipeline starts.
 
 Diagnostics must name the operation, root source, scope, and violated rule. Generic “expected array” errors are
@@ -1011,50 +1020,54 @@ array/dimension behavior or being accepted by numeric operations.
 - [x] Add the operation-level reference semantics contract: mutually exclusive output classification
       (`NewRoot` | `Alias`) plus input accesses (`Read`/`Write`/`Accumulate`/`Consume`) in operation-local index
       space, with per-operation examples in the rustdoc; view transform stacks attach to the `Alias` arm in Phase 8.
-- [ ] Complete the whole-array reference operation set as native `ArrayIrOperation` variants (`new_reference` and
-      `read` are already present from Phase 0; `swap`, additive update, and `freeze` remain).
-- [ ] Mirror the remaining operations in `XlaOperation` so XLA staging can carry them before discharge
-      (`new_reference` and `read` are already mirrored).
+- [x] Complete the whole-array reference operation set as native `ArrayIrOperation` variants: `new_reference`, `read`,
+      `swap`, additive update, and `freeze`.
+- [x] Mirror the complete operation set in `XlaOperation` so XLA staging can carry it before discharge.
 - [x] Give every currently implemented unresolved state access the coarse ordered-state effect; apply the same rule to
       each remaining operation as it lands.
-- [ ] Implement `ReferenceAnalysis` over entry inputs, captures, allocations, aliases, and nested regions.
-- [ ] Implement the dedicated static validator.
-- [ ] Implement invocation-time duplicate-holder validation separately.
-- [ ] Verify (existing behavior, regression tests only) that simplification retains effectful instructions with
+- [x] Implement `ReferenceAnalysis` over entry inputs, captures, allocations, aliases, and nested regions.
+- [x] Implement the dedicated static validator.
+- [x] Keep invocation-time holder validation separate from static analysis and defer its implementation to Phase 9,
+      where external holders first enter the runtime boundary.
+- [x] Verify (existing behavior, regression tests only) that simplification retains effectful instructions with
       unused outputs in program order (`programs/programs.rs:639-700`, `:1204-1220`) and that region ops need no
       effect overrides because seal-time folds already aggregate nested-region effects (`programs/regions.rs:413-448`,
       `Operation::effects` defaults to `PURE` at `operations.rs:498-500`).
-- [ ] Verify (existing behavior, regression tests only) that rematerialization force-saves residual roots reaching
+- [x] Verify (existing behavior, regression tests only) that rematerialization force-saves residual roots reaching
       non-pure instructions and hard-errors on replaying them (`tracing_v2/rematerialization.rs:1524-1533`,
       `:1598-1628`, `:1726-1735`).
-- [ ] Implement the partial-evaluation gate — this one is genuinely new work, not verification: the default
+- [x] Implement the partial-evaluation gate — this one is genuinely new work, not verification: the default
       `fold_or_residualize` contract executes an all-known effectful operation on the known side and imports a
       mixed/unknown operation into the residual program unchanged. Either branch can violate the unresolved-state
       contract by executing hidden state early or preserving it past the transform boundary. The "never execute, fold,
       residualize, or split an unresolved state chain" rule must therefore be enforced before the knownness branch;
       the existing per-region-operation purity gates (`condition.rs:301-308`, `scan.rs:1090-1103`, `while.rs:501`)
-      are not sufficient.
-- [ ] Add precise diagnostics for every second-class, alias, scope, freeze, root, and unsupported operation violation.
+      are not sufficient. Independently, pure reference passthroughs and unused reference boundaries contain no
+      stateful instruction, so partial evaluation must recursively reject reference-bearing types at root and inline
+      replay, operation-input and attached-region sinks, and finalization before it seeds or emits residual state.
+- [x] Add precise diagnostics for every second-class, alias, scope, freeze, root, and unsupported operation violation.
 
 **Exit criterion:** every reference operation has both conservative effect visibility and a precise canonical root;
 invalid programs fail before any mutation or replay.
 
 ### Phase 3: Implement eager and staged local references
 
-- [ ] Implement eager create, read, write, swap, additive update, and freeze.
-- [ ] Enforce the exact replacement/update storage rules on every write, swap, and additive update; do not use broad
+- [x] Implement eager create, read, write, swap, additive update, and freeze.
+- [x] Enforce the exact replacement/update storage rules on every write, swap, and additive update; do not use broad
       `ArrayType::is_compatible_with` as the mutation rule.
-- [ ] Make freeze invalidate the complete alias family.
-- [ ] Expose array-to-reference creation and reference capabilities through the composite parent-binding API.
-- [ ] Stage operations with exact inferred types, source locations, rendering, effects, and access semantics.
-- [ ] Support local references in straight-line programs.
-- [ ] Add eager/staged equivalence tests and all lifecycle/type errors.
-- [ ] Verify that a retained read snapshot is unchanged by every later write/update path.
-- [ ] Verify that the retained initializer and two distinct roots initialized from storage-sharing values remain
+- [x] Make freeze invalidate the complete alias family.
+- [x] Expose array-to-reference creation and reference capabilities through the composite parent-binding API.
+- [x] Stage operations with exact inferred types, source locations, rendering, effects, and access semantics.
+- [x] Support local references in straight-line programs.
+- [x] Run complete reference analysis before eager program replay and reject external reference roots until the
+      external-holder runtime protocol lands, so invalid or unsupported programs cannot mutate state before failing.
+- [x] Add eager/staged equivalence tests and all lifecycle/type errors.
+- [x] Verify that a retained read snapshot is unchanged by every later write/update path.
+- [x] Verify that the retained initializer and two distinct roots initialized from storage-sharing values remain
       unchanged/independent under later mutation.
-- [ ] Test explicit freeze, implicit scope-exit discard, a never-frozen local root, nested-region local discard, and
+- [x] Test explicit freeze, implicit scope-exit discard, a never-frozen local root, nested-region local discard, and
       invalid branch/loop lifecycle paths.
-- [ ] Test that directly eager references are never implicitly invalidated: they remain valid until explicit `freeze`
+- [x] Test that directly eager references are never implicitly invalidated: they remain valid until explicit `freeze`
       or last handle drop, with implicit scope-exit discard applying only to staged/interpreted region execution
       (§5.4).
 
@@ -1089,7 +1102,8 @@ program plus complete logical state metadata.
 
 - [ ] Thread canonical state through condition branches and joins.
 - [ ] Thread body-mutated state through while carries.
-- [ ] Allow while conditions to read current state and reject condition writes.
+- [ ] Allow while conditions to read current entering state and reject writes, accumulations, or consumption of that
+      entering state; condition-local nonescaping state remains legal.
 - [ ] Thread scan-mutated state as carries, separate from per-step values.
 - [ ] Rewrite nested calls and substitute callee root mappings into callers.
 - [ ] Derive every nested-region and callee root substitution from the same `ReferenceAnalysis` summaries used by
@@ -1143,8 +1157,10 @@ Views land before the external runtime because they are the bread-and-butter pro
 and the scan patterns references exist to replace), they are pure core analysis/discharge work with no concurrency
 risk, and they exercise the view-to-gather/scatter discharge path that later phases reuse.
 
-- [ ] Separate root-shared holder state (and `ReferenceId`) from the handle-local referent type and view mapping
-      (§5.2), so renamed or projected handles retain their root without mutating shared metadata.
+- [ ] Add a handle-local identity/view mapping and the value-reconstruction contract needed when values cross between
+      that handle type and the root-shared stored value (§5.2). The holder state and handle-local type are already
+      separate; the missing mapping lets renamed or projected handles retain their root without misrepresenting the
+      stored value's metadata.
 - [ ] Define the composable reference-view representation, attaching the ordered transform stack to the semantics
       contract's `Alias` arm (which ships without transforms until this phase).
 - [ ] Add indexing/slicing views and bounds/type validation.
@@ -1301,6 +1317,9 @@ support for deferred aliases, transforms, dynamic shapes, or kernel operations.
 - `src/programs/operations.rs` or a focused reference module: reusable semantic-access contract if it is genuinely
   operation-family-wide.
 - `src/arrays/reference_analysis.rs`: roots, aliases, scopes, accesses, validation.
+- `src/programs/values.rs`, `src/interpretation.rs`, `src/contexts.rs`, and `src/programs/regions.rs`: the generic
+  value-family preflight hook, checked eager root/direct-bind replay, explicit prevalidated replay provenance, shared
+  closure traversal, and canonical region sealing invariants needed to guarantee validation before mutation.
 - `src/arrays/reference_discharge.rs`: region-aware replay and logical external-state metadata.
 - `src/partial.rs`, `src/arrays/batching.rs`, differentiation modules, and rematerialization: routing/guards.
 - condition, while, and scan implementations: only generic boundary-widening hooks proven necessary by discharge.
@@ -1684,6 +1703,81 @@ At each checkpoint, ask:
       comment no longer claims to cover linearization, which has its own guard; the partial-evaluation gap is now
       described over both unsafe branches — executing all-known state and residualizing/importing mixed-input state
       unchanged). The central partial-evaluation gate remains the acknowledged Phase 2 gap.
+- [x] 2026-08-17 review pass 11 (final Phase 0/1 hardening): centralized structural constant and operation replay
+      behind one checked `ArrayIrBatching::batch_region_values` helper shared by both `batch_region` and
+      `batch_program`, eliminating the duplicated implementation that previously let the whole-program path drift;
+      retained the independent output-materialization rejection for manually manufactured replicated reference
+      carriers; moved XLA region-count validation ahead of the nullary identity fast path and made its control-flow
+      reference regression a well-formed condition/body pair; strengthened operation-local custom-JVP/VJP guards over
+      complete nested rule closures; made the all-role closure scan iterative and conservative for invalid attachment
+      identifiers; disambiguated composite `Display` forwarding; and corrected the remaining plan/rustdoc/test-name
+      drift. Full verification passed: 1,373 core tests plus 3 ignored, the macro integration suite, XLA all-target
+      compilation, and 477 XLA tests plus 5 ignored. The central `fold_or_residualize` rejection remains deliberately
+      pending in Phase 2 and is not part of the completed Phase 0/1 support claim.
+- [x] 2026-08-17 Phase 2 implementation/review pass 12 (superseded in part by pass 14): completed the whole-array
+      operation language with `swap`, additive update, and consuming `freeze`, together with exact types,
+      ordered-state effects, operation-local access semantics, Array IR/XLA staging variants, and deterministic
+      pre-discharge transform/backend rejection; added the program-relative `ReferenceAnalysis` artifact with canonical
+      allocation/region-input roots, validated access records, exact nested-region bindings, caller-context root
+      substitution, capture/public input classification, precise instruction-scoped diagnostics, second-class and
+      lifetime enforcement, dormant-rule closure rejection, and per-invocation static alias rejection; initially added
+      invocation-time holder uniqueness validation without placing holder identity in types or effects, but pass 14
+      removed that unused pre-runtime surface and made Phase 9 its canonical owner; closed partial evaluation before
+      knownness, control-flow probing, JIT-call partitioning, and shard-map partitioning; and pinned simplification
+      ordering and rematerialization non-recomputation. Phase 2 remains intentionally non-executable: eager mutation
+      starts in Phase 3 and ordinary XLA continues to reject every undischarge reference artifact.
+- [x] 2026-08-17 Phase 3 implementation/review pass 13: implemented the fixed-shape local eager language over one
+      shared ready/frozen holder, including snapshot reads, exact swaps, ordered additive updates, consuming freeze,
+      complete alias-family invalidation, and failure atomicity; exposed all five composite reference capabilities
+      while preserving one `swap` IR primitive for write sugar; reused canonical operation inference before every
+      eager holder mutation and retained exact holder checks as defense in depth; added transactional whole-program
+      eager preflight from the Phase 2 `ReferenceAnalysis`, rejecting every external root before replay (duplicate
+      external-holder validation remains deferred to the Phase 9 runtime boundary), and closed the standalone
+      `RegionRef` bypass with root preflight plus a private prevalidated nested replay path; validated implicit local
+      discard without a scope registry, and covered repeated `while` invocation,
+      invalid reference carries, snapshots, independent storage-sharing roots, dynamic-referent rejection, and direct
+      eager/staged equivalence; completed the composite capability bundle and aligned condition/while/scan contracts;
+      and strengthened ordinary-XLA eager rejection to catch pure reference-typed atoms throughout attached dormant
+      closures as well as ordered state. Review pass 14 below records the subsequent combined Phase 2-3 audit and the
+      final verification counts.
+- [x] 2026-08-17 combined Phase 2-3 implementation/review pass 14: ran three fresh independent audits focused on
+      correctness, repository conventions, and removing avoidable complexity; made partial evaluation report
+      unresolved state before deferred-error erasure; moved the array-specific reference analysis into the `arrays`
+      owner, removed parallel root state, and added a reference-free fast path; centralized region Single Static
+      Assignment validation at sealing so every safe program construction path rejects orphan or cyclic providers;
+      closed differentiation's intrinsic-state zero-tangent shortcut and eager higher-order direct-bind/standalone
+      region preflight bypasses with explicit prevalidated replay provenance; reused one iterative region-closure walk;
+      completed fixed-shape read/freeze checks, exact diagnostics, and local-reference scan coverage; and kept
+      structural batching on one shared checked replay helper instead of adding an artificial test-only operation
+      universe. Also deleted the speculative pre-Phase-4 discharge surface until a consumer exists (contextual root
+      resolution, source-identity binding, holder-list invocation validation, external-root referent copies, and the
+      public holder identity, which returned to crate-private); reduced handle origin tracking to the single
+      allocation bit the freeze check reads; collapsed the five per-rule partial-evaluation state-gate preambles into
+      one replayed-instruction gate next to `Context::bind`'s; deferred diagnostic name allocation to error paths; and
+      applied the remaining convention fixes (defining-path imports, error-enum and shared-fixture placement, line
+      wrapping, trailing commas, and bound ordering). All three final auditor passes reported no remaining actionable
+      issue. Review pass 15 below supersedes this pass's final verification counts and records the later type-only
+      partial-evaluation and replay-evidence hardening.
+- [x] 2026-08-18 combined Phase 2-3 independent re-audit pass 15: repeated three strict independent audits over core
+      reference semantics and eager lifecycle, transform/control-flow/replay safety, and XLA/macro/convention
+      integration. Closed every remaining public partial-evaluation escape route: a type-recursive
+      `Type::is_reference` contract now rejects pure passthroughs, unused or mismatched reference boundaries,
+      attached dormant reference regions, direct residual emission, and finalization, while a read-only root preflight
+      preserves the precise first intrinsic-state operation diagnostic before replay. Replaced forgeable replay booleans
+      with opaque `PrevalidatedReplay` evidence, issued that evidence only after successful eager value-family
+      validation, generalized the eager hook to borrowed rooted closures, and pinned both Program and RegionRef positive
+      and negative paths. Corrected `ReferenceAnalysis` to its actual rooted-closure/source-arena contract and added an
+      unreachable-sibling regression. Reconciled static root validation with Phase 9's deferred external-holder identity
+      validation, removed stale API/docs/imports, and retained defense-in-depth gates only at independently public or
+      directly callable transform sinks. Consolidated the ordered-state and region-effect test fixtures into the shared
+      crate test module (one parameterized `Effectful(Effect)` region family plus one shared `TestOrderedStateOperation`
+      replacing three local copies), removed the shard-map duplicate of the centralized partial-evaluation gate test in
+      favor of the interned-callee `jit_call` variant, dropped the redundant operation-level dynamic-referent assertion
+      from the capability tests, and applied the remaining convention fixes (module documentation headers, imported-name
+      call sites, literal wrapping, and the `Display` import in `instructions.rs`). All three final auditors reported no
+      actionable code issue. Final verification passed: formatting and `git diff --check`; 1,407 core tests plus 3
+      ignored; the complete macro integration and compile-fail suites; XLA all-target compilation; 481 XLA tests plus 5
+      ignored; and core documentation generation with 97 pre-existing warnings, none in the reference modules.
 - [x] 2026-08-16 Phase 0 implementation/review pass 5: fixed the canonical generic and Array IR reference names;
       implemented the minimum production-safe type/value/projection plus `new_reference`/`read` vertical slice;
       added the operation-local reference semantics descriptor (initially carrying an `ArraySliceAxis` view mapping,

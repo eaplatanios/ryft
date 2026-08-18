@@ -45,15 +45,17 @@ use crate::operations::{
     DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
     Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
     DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
-    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log,
-    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, NewReferenceOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation,
-    Pad, PadOperation, Pow, PowOperation, PrintOperation, Reduce, ReduceOperation, ReferenceReadOperation, Rem,
-    RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot,
-    ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation,
-    Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation,
-    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
-    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, FreezeReference, FreezeReferenceOperation, Gather,
+    GatherOperation, IotaOperation, Log, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min,
+    MinOperation, Mul, MulOperation, Neg, NegOperation, NewReference, NewReferenceOperation, Not, NotOperation,
+    OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, Pow, PowOperation, PrintOperation,
+    Reduce, ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
+    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
+    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
+    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
@@ -410,6 +412,15 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Reads the current whole-array value from a reference.
     ReferenceRead(ReferenceReadOperation),
 
+    /// Replaces a whole-array reference and returns its previous value.
+    ReferenceSwap(ReferenceSwapOperation),
+
+    /// Adds an array update into a whole-array reference in program order.
+    ReferenceAddUpdate(ReferenceAddUpdateOperation),
+
+    /// Consumes a whole-array reference and returns its final value.
+    FreezeReference(FreezeReferenceOperation),
+
     /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
 
@@ -449,16 +460,19 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     #[ryft(mixed)]
     AllToAll(AllToAllOperation),
 
-    /// Composite condition whose attached branches use the complete array IR storage universe. References may be
-    /// represented structurally but remain unsupported until reference validation and discharge.
+    /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
+    /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
+    /// remain unsupported until discharge.
     Condition(ConditionOperation<ArrayIrValue<A>>),
 
-    /// Composite while loop whose condition and body use the complete array IR storage universe. References may be
-    /// represented structurally but remain unsupported until reference validation and discharge.
+    /// Composite while loop whose condition and body use the complete array IR storage universe. Validated local,
+    /// nonescaping reference state can execute eagerly; reference-valued carries/results and generic
+    /// transforms/backends remain unsupported until discharge.
     While(WhileOperation<ArrayIrType>),
 
-    /// Composite scan whose body uses the complete array IR storage universe. References may be represented
-    /// structurally but remain unsupported until reference validation and discharge.
+    /// Composite scan whose body uses the complete array IR storage universe. Validated local, nonescaping reference
+    /// state can execute eagerly; reference-valued sequences/carries/results and generic transforms/backends remain
+    /// unsupported until discharge.
     Scan(ScanOperation<ArrayIrValue<A>>),
 
     /// Composite custom-JVP call whose primal and JVP regions use the complete array IR storage universe. Generic
@@ -489,7 +503,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
-///     [`DynamicReshape`].
+///     [`DynamicReshape`], and the whole-value reference capabilities [`NewReference`], [`ReferenceRead`],
+///     [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
 ///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand
@@ -501,7 +516,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// The two computational member projections are themselves supertraits, each pinned to the sibling bundle of the
 /// member family it projects onto, so one bound carries the complete surface: the array member satisfies
 /// [`ArrayOperations`] and the first-class-dimension member satisfies [`DimensionOperations`]. References deliberately
-/// have no homogeneous operation family or projection bundle; their cross-kind operations remain composite-native.
+/// have no homogeneous operation family or projection bundle; their cross-kind capabilities are direct supertraits
+/// because the corresponding operations remain composite-native.
 /// Generic composite code therefore states `V: ArrayIrOperations` alone instead of restating
 /// `ValueProjection<ArrayType, Projected: ArrayOperations>`-style bounds at every call site.
 ///
@@ -562,6 +578,8 @@ pub trait ArrayIrOperations:
     // First-class dimensions.
     + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
+    // Whole-value references.
+    + NewReference + ReferenceRead + ReferenceSwap + ReferenceAddUpdate + FreezeReference
 {
 }
 
@@ -572,6 +590,7 @@ where
     V: Value<Type = ArrayIrType> + Compare,
     V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
+    V: NewReference + ReferenceRead + ReferenceSwap + ReferenceAddUpdate + FreezeReference,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
 {
@@ -961,9 +980,8 @@ mod tests {
         requires_array_ir_operations::<Tracer<TracingContext<TestValue, TestOperation>>>();
         requires_array_ir_operations::<LinearizationTracer<EagerContext<TestValue, TestOperation>>>();
 
-        // The bundle's member profiles make one bound enough to reach both surfaces: ordinary array math through the
-        // array member projection and checked dimension arithmetic directly on the composite value, with no
-        // projection bounds restated here.
+        // The bundle's member profiles make one bound enough to reach ordinary array math through projection, checked
+        // dimension arithmetic, and composite-native reference capabilities, with no projection bounds restated here.
         fn square_and_element_count<V: ArrayIrOperations>(value: &V) -> Result<(V, V), ProgramError> {
             // The array member carries both the fallible capability and its panicking operator sugar, so the
             // capability is named explicitly here.
@@ -973,6 +991,10 @@ mod tests {
             Ok((square, elements))
         }
 
+        fn reference_round_trip<V: ArrayIrOperations>(value: &V) -> Result<V, ProgramError> {
+            value.new_reference()?.freeze()
+        }
+
         let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let (square, elements) = square_and_element_count(&input).unwrap();
         assert_eq!(square, ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 4.0, 9.0, 16.0, 25.0, 36.0])));
@@ -980,6 +1002,7 @@ mod tests {
             panic!("expected a first-class dimension member");
         };
         assert_eq!(elements.extent(), 6);
+        assert_eq!(reference_round_trip(&input), Ok(input));
     }
 
     #[test]
@@ -2710,8 +2733,14 @@ mod tests {
         /// Creates a new reference root initialized from ordinary array data.
         ArrayToReference,
 
-        /// Reads ordinary array data from a reference.
+        /// Reads or consumes ordinary array data from a reference.
         ReferenceToArray,
+
+        /// Replaces a reference from an ordinary array and returns the previous ordinary array value.
+        ReferenceAndArrayToArray,
+
+        /// Updates a reference from an ordinary array without producing a value.
+        ReferenceAndArrayToUnit,
 
         /// Consumes first-class dimensions as geometry (or reads an array's geometry as a dimension) without ever
         /// converting a value from one member kind into the other.
@@ -2739,6 +2768,9 @@ mod tests {
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::NewReference(_) => MemberKindSignature::ArrayToReference,
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
+            ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
+            ArrayIrOperation::ReferenceAddUpdate(_) => MemberKindSignature::ReferenceAndArrayToUnit,
+            ArrayIrOperation::FreezeReference(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::Reshape(_) => MemberKindSignature::GeometryMixed,
@@ -2801,6 +2833,12 @@ mod tests {
             ),
             (ArrayIrOperation::NewReference(NewReferenceOperation), MemberKindSignature::ArrayToReference),
             (ArrayIrOperation::ReferenceRead(ReferenceReadOperation), MemberKindSignature::ReferenceToArray),
+            (ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation), MemberKindSignature::ReferenceAndArrayToArray),
+            (
+                ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
+                MemberKindSignature::ReferenceAndArrayToUnit,
+            ),
+            (ArrayIrOperation::FreezeReference(FreezeReferenceOperation), MemberKindSignature::ReferenceToArray),
             (
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone())),
                 MemberKindSignature::ArrayToDimensionGateway,
@@ -2891,7 +2929,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 28);
+        assert_eq!(expected.len(), 31);
         assert_eq!(
             expected
                 .iter()
@@ -2912,6 +2950,20 @@ mod tests {
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToArray).count(),
+            2,
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToArray)
+                .count(),
+            1,
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToUnit)
+                .count(),
             1,
         );
     }

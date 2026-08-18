@@ -1116,6 +1116,15 @@ where
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
 
+        // The zero-tangent fast path below bypasses the operation's JVP rule, so we reject intrinsic state before that
+        // shortcut just as we reject state hidden in attached regions. Operation-local differentiation rules remain a
+        // defense in depth for callers that invoke them directly.
+        if operation.effects().contains(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` must be discharged before differentiation", operation.name()),
+            });
+        }
+
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();

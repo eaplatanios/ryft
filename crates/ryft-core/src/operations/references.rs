@@ -1,3 +1,8 @@
+//! Whole-array reference [`Operation`]s: allocation ([`NewReferenceOperation`]),
+//! reading ([`ReferenceReadOperation`]), replacement ([`ReferenceSwapOperation`]), ordered additive update
+//! ([`ReferenceAddUpdateOperation`]), and consuming finalization ([`FreezeReferenceOperation`]), together with the
+//! capability traits that value families implement to execute them eagerly.
+
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
@@ -14,13 +19,14 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::operations::math::add::AddOperation;
 use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Effect, Effects, Operation, ProgramError, ReferenceAccessMode, ReferenceInputAccess, ReferenceOperationSemantics,
-    ReferenceOutputSemantics, ReferenceType, RegionInterface, TypeError, Value,
+    Effect, Effects, Operation, ProgramError, ProjectedValue, ReferenceAccessMode, ReferenceInputAccess,
+    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType, RegionInterface, TypeError, Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -30,6 +36,15 @@ pub const NEW_REFERENCE_OPERATION_NAME: &str = "new_reference";
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
+
+/// Canonical operation name for [`ReferenceSwapOperation`].
+pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
+
+/// Canonical operation name for [`ReferenceAddUpdateOperation`].
+pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
+
+/// Canonical operation name for [`FreezeReferenceOperation`].
+pub const FREEZE_REFERENCE_OPERATION_NAME: &str = "freeze_reference";
 
 /// Creates a new reference initialized from this value.
 pub trait NewReference<Output = Self>: Sized {
@@ -50,10 +65,145 @@ where
     }
 }
 
+impl<V: Value<Type = ArrayIrType>> NewReference<V> for ProjectedValue<ArrayType, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<NewReferenceOperation>,
+{
+    fn new_reference(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(NewReferenceOperation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
+
 /// Reads an immutable snapshot from a reference value.
 pub trait ReferenceRead<Output = Self>: Sized {
     /// Returns the reference's current value as an immutable snapshot.
     fn read(&self) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation>,
+{
+    fn read(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(ReferenceReadOperation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
+
+/// Replaces the value stored by a reference in program order and returns its previous immutable snapshot.
+pub trait ReferenceSwap<Replacement = Self, Output = Replacement>: Sized {
+    /// Installs `replacement` in program order and returns the previously stored value.
+    fn swap(&self, replacement: &Replacement) -> Result<Output, ProgramError>;
+
+    /// Installs `replacement` in program order and discards the previously stored value.
+    #[inline]
+    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError> {
+        self.swap(replacement).map(drop)
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceSwap<V, V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation>,
+{
+    fn swap(&self, replacement: &V) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceSwapOperation, Vec::new(), &[self.clone(), replacement.clone()])?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceSwap<ProjectedValue<ArrayType, V>, V>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation>,
+{
+    fn swap(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(ReferenceSwapOperation, Vec::new(), &[self.value().clone(), replacement.value().clone()])?
+            .remove(0))
+    }
+}
+
+/// Adds an update into the value stored by a reference in program order.
+pub trait ReferenceAddUpdate<Update = Self>: Sized {
+    /// Adds `update` to the stored value in program order.
+    fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation>,
+{
+    fn add_update(&self, update: &V) -> Result<(), ProgramError> {
+        self.dispatch_domain()
+            .bind(ReferenceAddUpdateOperation, Vec::new(), &[self.clone(), update.clone()])?;
+        Ok(())
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation>,
+{
+    fn add_update(&self, update: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceAddUpdateOperation,
+            Vec::new(),
+            &[self.value().clone(), update.value().clone()],
+        )?;
+        Ok(())
+    }
+}
+
+/// Consumes a reference, returning its final value and invalidating its complete alias family.
+pub trait FreezeReference<Output = Self>: Sized {
+    /// Returns the final stored value and invalidates this reference and all aliases.
+    fn freeze(&self) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> FreezeReference<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation>,
+{
+    fn freeze(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(FreezeReferenceOperation, Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> FreezeReference<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation>,
+{
+    fn freeze(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(FreezeReferenceOperation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
 }
 
 impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for V
@@ -77,6 +227,18 @@ static NEW_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> 
 
 static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)])
+});
+
+static REFERENCE_SWAP_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)])
+});
+
+static REFERENCE_ADD_UPDATE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Accumulate)])
+});
+
+static FREEZE_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)])
 });
 
 /// Composite array-to-reference allocation operation.
@@ -106,6 +268,7 @@ impl Operation for NewReferenceOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let referent = <&ArrayType>::try_from(&input_types[0])?;
+        require_static_referent(NEW_REFERENCE_OPERATION_NAME, referent)?;
         Ok(vec![ReferenceType::new(referent.clone()).into()])
     }
 
@@ -128,8 +291,7 @@ impl<C: Domain<Type = ArrayIrType, Value: NewReference<C::Value>>> Interpretable
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        // Member-kind checking is owned by the value-level `NewReference` implementation, whose projection produces
-        // the same diagnostic type inference would, so no inference re-run is needed here.
+        // Canonical eager type validation and holder construction are owned by the value-level capability.
         Ok(vec![inputs[0].new_reference()?])
     }
 }
@@ -161,6 +323,7 @@ impl Operation for ReferenceReadOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        require_static_referent(REFERENCE_READ_OPERATION_NAME, reference.referent())?;
         Ok(vec![reference.referent().clone().into()])
     }
 
@@ -185,9 +348,213 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceRead<C::Value>>> Interpretabl
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        // Member-kind checking is owned by the value-level `ReferenceRead` implementation, whose projection produces
-        // the same diagnostic type inference would, so no inference re-run is needed here.
+        // Canonical eager type validation and holder access are owned by the value-level capability.
         Ok(vec![inputs[0].read()?])
+    }
+}
+
+/// Composite whole-array replacement operation that returns the value stored before the replacement.
+///
+/// The replacement operand must have exactly the reference's declared referent type. No broadcasting, data-type
+/// promotion, layout change, sharding change, or memory change is implicit at this storage boundary.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceSwapOperation;
+
+impl Display for ReferenceSwapOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ReferenceSwapOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REFERENCE_SWAP_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        let replacement = <&ArrayType>::try_from(&input_types[1])?;
+        require_static_referent(REFERENCE_SWAP_OPERATION_NAME, reference.referent())?;
+        if replacement != reference.referent() {
+            return Err(TypeError::invalid(format!(
+                "`{REFERENCE_SWAP_OPERATION_NAME}` replacement type `{replacement}` must exactly match reference \
+                 referent type `{}`",
+                reference.referent(),
+            )));
+        }
+        Ok(vec![reference.referent().clone().into()])
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&REFERENCE_SWAP_OPERATION_SEMANTICS)
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedState)
+    }
+}
+
+/// Composite ordered additive-update operation over a whole-array reference.
+///
+/// The update uses ordinary array addition type inference, but it is legal only when that addition produces exactly
+/// the reference's declared referent type. The operation has no result; later reads observe the updated state.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceAddUpdateOperation;
+
+impl Display for ReferenceAddUpdateOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ReferenceAddUpdateOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REFERENCE_ADD_UPDATE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        let update = <&ArrayType>::try_from(&input_types[1])?;
+        require_static_referent(REFERENCE_ADD_UPDATE_OPERATION_NAME, reference.referent())?;
+        let addition_result = AddOperation::<ArrayType>::new()
+            .infer_output_types(&[reference.referent().clone(), update.clone()], &[])?
+            .remove(0);
+        if &addition_result != reference.referent() {
+            return Err(TypeError::invalid(format!(
+                "`{REFERENCE_ADD_UPDATE_OPERATION_NAME}` addition result type `{addition_result}` must exactly match \
+                 reference referent type `{}`",
+                reference.referent(),
+            )));
+        }
+        Ok(Vec::new())
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&REFERENCE_ADD_UPDATE_OPERATION_SEMANTICS)
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedState)
+    }
+}
+
+/// Rejects dynamic referents until runtime extent preservation is explicitly represented and validated.
+fn require_static_referent(operation: &str, referent: &ArrayType) -> Result<(), TypeError> {
+    if referent.static_shape().is_some() {
+        return Ok(());
+    }
+    Err(TypeError::invalid(format!(
+        "`{operation}` does not support dynamically shaped reference referent type `{referent}`",
+    )))
+}
+
+/// Composite consuming operation that returns a reference's final whole-array value and invalidates its complete alias
+/// family.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct FreezeReferenceOperation;
+
+impl Display for FreezeReferenceOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for FreezeReferenceOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        FREEZE_REFERENCE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        require_static_referent(FREEZE_REFERENCE_OPERATION_NAME, reference.referent())?;
+        Ok(vec![reference.referent().clone().into()])
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&FREEZE_REFERENCE_OPERATION_SEMANTICS)
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedState)
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: ReferenceSwap<C::Value>>> InterpretableOperation<C>
+    for ReferenceSwapOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].swap(&inputs[1])?])
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: ReferenceAddUpdate<C::Value>>> InterpretableOperation<C>
+    for ReferenceAddUpdateOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        inputs[0].add_update(&inputs[1])?;
+        Ok(Vec::new())
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: FreezeReference<C::Value>>> InterpretableOperation<C>
+    for FreezeReferenceOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].freeze()?])
     }
 }
 
@@ -242,34 +609,49 @@ macro_rules! impl_unsupported_reference_transforms {
 
 impl_unsupported_reference_transforms!(NewReferenceOperation);
 impl_unsupported_reference_transforms!(ReferenceReadOperation);
+impl_unsupported_reference_transforms!(ReferenceSwapOperation);
+impl_unsupported_reference_transforms!(ReferenceAddUpdateOperation);
+impl_unsupported_reference_transforms!(FreezeReferenceOperation);
 
 // Transposition rejection reuses the shared non-transposable diagnostic: reference operations never transpose
 // directly because reverse-mode differentiation always discharges them first (refer to `plan-references.md`).
 impl_non_transposable_operation!(NewReferenceOperation);
 impl_non_transposable_operation!(ReferenceReadOperation);
+impl_non_transposable_operation!(ReferenceSwapOperation);
+impl_non_transposable_operation!(ReferenceAddUpdateOperation);
+impl_non_transposable_operation!(FreezeReferenceOperation);
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, DataType};
+    use crate::arrays::{
+        Array, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds,
+        DimensionVariable, ReferenceAnalysisError, ReferenceRoot, Shape,
+    };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        CustomJvpOperation, CustomVjpOperation, DifferentiationError, DifferentiationTracer, ForwardModeDifferentiate,
-        Linearization, TransposableOperation,
+        CustomJvpOperation, CustomVjpOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        DifferentiationTracer, ForwardModeDifferentiate, Linearization, TransposableOperation,
     };
+    use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::control_flow::scan::ScanOperation;
+    use crate::operations::control_flow::r#while::WhileOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, Reference, RegionDriver, RegionRef};
-    use crate::tracing::TracingContext;
+    use crate::programs::{
+        EmptyRegionDriver, InstructionId, Program, ProgramBuilder, Reference, RegionDriver, RegionRef, ValueProjection,
+    };
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
     #[test]
     fn test_reference_operation_type_and_access_contracts() {
-        let array_type = ArrayType::scalar(DataType::F32);
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
         let reference_type = ReferenceType::new(array_type.clone());
         assert_eq!(
             NewReferenceOperation.infer_output_types(std::slice::from_ref(&array_type.clone().into()), &[]),
@@ -277,17 +659,277 @@ mod tests {
         );
         assert_eq!(
             ReferenceReadOperation.infer_output_types(std::slice::from_ref(&reference_type.into()), &[]),
-            Ok(vec![array_type.into()]),
+            Ok(vec![array_type.clone().into()]),
+        );
+        assert_eq!(
+            ReferenceSwapOperation
+                .infer_output_types(&[ReferenceType::new(array_type.clone()).into(), array_type.clone().into()], &[],),
+            Ok(vec![array_type.clone().into()]),
+        );
+        assert_eq!(
+            ReferenceAddUpdateOperation.infer_output_types(
+                &[ReferenceType::new(array_type.clone()).into(), ArrayType::scalar(DataType::F32).into(),],
+                &[],
+            ),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            FreezeReferenceOperation.infer_output_types(
+                std::slice::from_ref(&ArrayIrType::Reference(ReferenceType::new(array_type.clone()))),
+                &[],
+            ),
+            Ok(vec![array_type.clone().into()]),
+        );
+        assert_eq!(
+            ReferenceSwapOperation.infer_output_types(
+                &[
+                    ReferenceType::new(array_type.clone()).into(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`reference_swap` replacement type `f32[3]` must exactly match reference referent type `f32[2]`",
+            )),
+        );
+        assert_eq!(
+            ReferenceAddUpdateOperation.infer_output_types(
+                &[
+                    ReferenceType::new(array_type.clone()).into(),
+                    array_type.clone().with_data_type(DataType::F64).into(),
+                ],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`reference_add_update` addition result type `f64[2]` must exactly match reference referent \
+                 type `f32[2]`",
+            )),
+        );
+        assert_eq!(
+            ReferenceSwapOperation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[]),
+            Err(TypeError::invalid("expected reference type but got array type")),
+        );
+        assert_eq!(
+            ReferenceAddUpdateOperation.infer_output_types(
+                &[ReferenceType::new(array_type.clone()).into(), ReferenceType::new(array_type.clone()).into(),],
+                &[],
+            ),
+            Err(TypeError::invalid("expected array type but got reference type")),
+        );
+        assert_eq!(
+            FreezeReferenceOperation.infer_output_types(std::slice::from_ref(&ArrayIrType::Array(array_type)), &[]),
+            Err(TypeError::invalid("expected reference type but got array type")),
         );
         assert_eq!(NewReferenceOperation.effects(), Effects::single(Effect::OrderedState));
         assert_eq!(ReferenceReadOperation.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(ReferenceSwapOperation.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(ReferenceAddUpdateOperation.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(FreezeReferenceOperation.effects(), Effects::single(Effect::OrderedState));
         assert_eq!(
             NewReferenceOperation.reference_semantics().outputs(),
             &[ReferenceOutputSemantics::NewRoot { output_index: 0 }],
         );
+        assert!(NewReferenceOperation.reference_semantics().accesses().is_empty());
         assert_eq!(
             ReferenceReadOperation.reference_semantics().accesses(),
             &[ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
+        );
+        assert!(ReferenceReadOperation.reference_semantics().outputs().is_empty());
+        assert_eq!(
+            ReferenceSwapOperation.reference_semantics().accesses(),
+            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
+        );
+        assert!(ReferenceSwapOperation.reference_semantics().outputs().is_empty());
+        assert_eq!(
+            ReferenceAddUpdateOperation.reference_semantics().accesses(),
+            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Accumulate)],
+        );
+        assert!(ReferenceAddUpdateOperation.reference_semantics().outputs().is_empty());
+        assert_eq!(
+            FreezeReferenceOperation.reference_semantics().accesses(),
+            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)],
+        );
+        assert!(FreezeReferenceOperation.reference_semantics().outputs().is_empty());
+        assert_eq!(NewReferenceOperation.to_string(), NEW_REFERENCE_OPERATION_NAME);
+        assert_eq!(ReferenceReadOperation.to_string(), REFERENCE_READ_OPERATION_NAME);
+        assert_eq!(ReferenceSwapOperation.to_string(), REFERENCE_SWAP_OPERATION_NAME);
+        assert_eq!(ReferenceAddUpdateOperation.to_string(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
+        assert_eq!(FreezeReferenceOperation.to_string(), FREEZE_REFERENCE_OPERATION_NAME);
+
+        let dynamic_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            NewReferenceOperation.infer_output_types(std::slice::from_ref(&dynamic_type.clone().into()), &[]),
+            Err(TypeError::invalid(
+                "`new_reference` does not support dynamically shaped reference referent type `f32[length]`",
+            )),
+        );
+        assert_eq!(
+            ReferenceReadOperation
+                .infer_output_types(std::slice::from_ref(&ReferenceType::new(dynamic_type.clone()).into()), &[],),
+            Err(TypeError::invalid(
+                "`reference_read` does not support dynamically shaped reference referent type `f32[length]`",
+            )),
+        );
+        assert_eq!(
+            ReferenceSwapOperation.infer_output_types(
+                &[ReferenceType::new(dynamic_type.clone()).into(), dynamic_type.clone().into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`reference_swap` does not support dynamically shaped reference referent type `f32[length]`",
+            )),
+        );
+        assert_eq!(
+            ReferenceAddUpdateOperation.infer_output_types(
+                &[ReferenceType::new(dynamic_type.clone()).into(), dynamic_type.clone().into()],
+                &[],
+            ),
+            Err(TypeError::invalid(
+                "`reference_add_update` does not support dynamically shaped reference referent type `f32[length]`",
+            )),
+        );
+        assert_eq!(
+            FreezeReferenceOperation
+                .infer_output_types(std::slice::from_ref(&ReferenceType::new(dynamic_type).into()), &[]),
+            Err(TypeError::invalid(
+                "`freeze_reference` does not support dynamically shaped reference referent type `f32[length]`",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_mutating_reference_operations_stage_as_composite_native_variants() {
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = builder.add_input(reference_type.into());
+        let update = builder.add_input(array_type.into());
+        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, update]).unwrap()[0];
+        assert!(
+            builder
+                .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+                .unwrap()
+                .is_empty(),
+        );
+        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![old, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        assert!(matches!(ArrayIrOperation::<Array>::from(ReferenceSwapOperation), ArrayIrOperation::ReferenceSwap(_),));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceAddUpdateOperation),
+            ArrayIrOperation::ReferenceAddUpdate(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(FreezeReferenceOperation),
+            ArrayIrOperation::FreezeReference(_),
+        ));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[2]>, %1:f32[2] .
+                let %2:f32[2] = reference_swap %0 %1
+                    reference_add_update %0 %1
+                    %3:f32[2] = freeze_reference %0
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+    }
+
+    #[test]
+    fn test_mutating_reference_operations_execute_eagerly_and_reject_transforms_until_discharge() {
+        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestTraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let context = TestContext::new();
+        let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).new_reference().unwrap();
+        let update = ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0]));
+        assert_eq!(
+            context.bind(ReferenceSwapOperation, Vec::new(), &[reference.clone(), update.clone()]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))]),
+        );
+        assert_eq!(context.bind(ReferenceAddUpdateOperation, Vec::new(), &[reference.clone(), update]), Ok(Vec::new()));
+        assert_eq!(
+            context.bind(FreezeReferenceOperation, Vec::new(), std::slice::from_ref(&reference)),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![6.0_f32, 8.0]))]),
+        );
+
+        macro_rules! check_transform_rejections {
+            // Eager semantics do not make an unresolved state operation safe for any generic transform.
+            ($operation_type:ty, $operation:expr, $name:expr $(,)?) => {{
+                let operation = $operation;
+                let partial_context = PartialEvaluationContext::new(TestContext::new());
+                assert!(matches!(
+                    <$operation_type as PartiallyEvaluatableOperation<TestContext>>::partially_evaluate(
+                        &operation,
+                        &partial_context,
+                        &EmptyRegionDriver,
+                        &[],
+                    ),
+                    Err(ProgramError::UnsupportedOperation { message })
+                        if message == format!("`{}` must be discharged before partial evaluation", $name),
+                ));
+
+                let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
+                    TestContext::new(),
+                    ArrayIrValue::Array(Array::scalar(2_i64)),
+                );
+                assert!(matches!(
+                    <$operation_type as BatchableOperation<_, ArrayIrBatching>>::batch(
+                        &operation,
+                        &batching_context,
+                        &EmptyRegionDriver,
+                        &[],
+                    ),
+                    Err(BatchingError::UnsupportedOperation { message })
+                        if message == format!("`{}` must be discharged before batching", $name),
+                ));
+
+                assert!(matches!(
+                    <$operation_type as DifferentiableOperation<TestContext>>::jvp(
+                        &operation,
+                        &TestContext::new(),
+                        &EmptyRegionDriver,
+                        &[],
+                    ),
+                    Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                        if message == format!("`{}` must be discharged before differentiation", $name),
+                ));
+
+                assert!(matches!(
+                    <$operation_type as TransposableOperation<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::transpose(
+                        &operation,
+                        &mut TestTraceContext::new(),
+                        &EmptyRegionDriver,
+                        &[],
+                        &[],
+                    ),
+                    Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                        if message == format!("operation `{}` is not transposable", $name),
+                ));
+            }};
+        }
+
+        check_transform_rejections!(ReferenceSwapOperation, ReferenceSwapOperation, REFERENCE_SWAP_OPERATION_NAME,);
+        check_transform_rejections!(
+            ReferenceAddUpdateOperation,
+            ReferenceAddUpdateOperation,
+            REFERENCE_ADD_UPDATE_OPERATION_NAME,
+        );
+        check_transform_rejections!(
+            FreezeReferenceOperation,
+            FreezeReferenceOperation,
+            FREEZE_REFERENCE_OPERATION_NAME,
         );
     }
 
@@ -310,6 +952,487 @@ mod tests {
         assert!(matches!(allocation.operation(), ArrayIrOperation::NewReference(_)));
         assert!(matches!(read.operation(), ArrayIrOperation::ReferenceRead(_)));
         assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+    }
+
+    #[test]
+    fn test_differentiation_context_rejects_intrinsic_state_before_zero_tangent_fast_path() {
+        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let context = DifferentiationContext::new(TestContext::new());
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(ArrayIrValue::Array(Array::scalar(1.0_f32))).unwrap(),
+            context.clone(),
+        );
+
+        assert!(matches!(
+            context.bind(NewReferenceOperation, Vec::new(), &[input]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`new_reference` must be discharged before differentiation",
+        ));
+    }
+
+    #[test]
+    fn test_partial_evaluation_reports_state_errors_with_dead_or_zero_result_operations() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+        builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, input]).unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The entry-level preflight identifies the first intrinsic state operation before replay, preserving its
+        // operation-specific diagnostic even when later results are dead or the update has no results.
+        assert_eq!(
+            program.partially_evaluate(&[PartialValue::Unknown(ArrayIrType::Array(array_type))]).map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`new_reference` must be discharged before partial evaluation".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_projected_reference_capabilities_bind_through_the_composite_parent() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        type TestTracer = Tracer<TestContext>;
+
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2]));
+        let (_, program) = TestContext::trace(
+            |inputs| {
+                let [initial, replacement, update]: [TestTracer; 3] = inputs.try_into().unwrap();
+                let initial = <TestTracer as ValueProjection<ArrayType>>::into_projected(initial)?;
+                let replacement = <TestTracer as ValueProjection<ArrayType>>::into_projected(replacement)?;
+                let update = <TestTracer as ValueProjection<ArrayType>>::into_projected(update)?;
+                let reference = initial.new_reference()?;
+                let reference = <TestTracer as ValueProjection<ReferenceType<ArrayType>>>::into_projected(reference)?;
+                reference.write(&replacement)?;
+                reference.add_update(&update)?;
+                Ok(vec![reference.freeze()?])
+            },
+            vec![array_type.clone(), array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![
+                NEW_REFERENCE_OPERATION_NAME,
+                REFERENCE_SWAP_OPERATION_NAME,
+                REFERENCE_ADD_UPDATE_OPERATION_NAME,
+                FREEZE_REFERENCE_OPERATION_NAME,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_reference_program_eager_and_staged_semantics_are_equivalent() {
+        type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let inputs = (
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0])),
+            ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+        );
+        let (eager_outputs, program) = TestContext::new()
+            .interpret_and_trace(
+                |(initial, replacement, written, update)| {
+                    let reference = initial.new_reference()?;
+                    let snapshot = reference.read()?;
+                    let old = reference.swap(&replacement)?;
+                    reference.write(&written)?;
+                    reference.add_update(&update)?;
+                    let final_value = reference.freeze()?;
+                    Ok((snapshot, old, final_value))
+                },
+                inputs.clone(),
+            )
+            .unwrap();
+        let expected = (
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            ArrayIrValue::Array(Array::vector(vec![6.0_f32, 8.0])),
+        );
+        assert_eq!(eager_outputs, expected);
+        assert!(program.analyze_references(0).is_ok());
+        assert_eq!(program.interpret(inputs), Ok(expected));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![
+                NEW_REFERENCE_OPERATION_NAME,
+                REFERENCE_READ_OPERATION_NAME,
+                REFERENCE_SWAP_OPERATION_NAME,
+                REFERENCE_SWAP_OPERATION_NAME,
+                REFERENCE_ADD_UPDATE_OPERATION_NAME,
+                FREEZE_REFERENCE_OPERATION_NAME,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_reference_program_preflight_rejects_before_external_mutation() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let external = builder.add_input(ReferenceType::new(array_type.clone()).into());
+        let replacement = builder.add_input(array_type.into());
+        builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![external, replacement]).unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![external],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = initial.new_reference().unwrap();
+        assert!(matches!(
+            program.interpret(vec![
+                reference.clone(),
+                ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0])),
+            ]),
+            Err(error)
+                if error.downcast_custom::<ReferenceAnalysisError>()
+                    == Some(&ReferenceAnalysisError::ReferenceOutput {
+                        region: program.entry(),
+                        output_index: 0,
+                        root: ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 },
+                    }),
+        ));
+        assert_eq!(reference.read(), Ok(initial));
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let external = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into());
+        let replacement = builder.add_input(ArrayType::new_static(DataType::F32, [2]).into());
+        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![external, replacement]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![old],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(program.analyze_references(0).is_ok());
+        assert_eq!(
+            program.entry_region_ref().interpret_in_context(
+                &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                vec![reference.clone(), ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))],
+            ),
+            Err(ProgramError::UnsupportedOperation {
+                message: "program replay of external reference public input 0 is not supported before external \
+                          holder runtime integration"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(reference.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))));
+        assert_eq!(
+            program.interpret(vec![reference.clone(), ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "program replay of external reference public input 0 is not supported before external \
+                          holder runtime integration"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(reference.read(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))));
+    }
+
+    #[test]
+    fn test_nested_reference_program_implicitly_discards_local_roots() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+
+        let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let true_input = true_builder.add_input(array_type.clone().into());
+        let true_reference =
+            true_builder.add_instruction(NewReferenceOperation, Vec::new(), vec![true_input]).unwrap()[0];
+        let true_output =
+            true_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![true_reference]).unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![true_output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let false_input = false_builder.add_input(array_type.clone().into());
+        let false_branch = false_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![false_input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(array_type.into());
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(program.analyze_references(0).is_ok());
+
+        let value = ArrayIrValue::Array(Array::vector(vec![2.0_f32, 4.0]));
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(Array::scalar(true)), value.clone()]),
+            Ok(vec![value.clone()]),
+        );
+        assert_eq!(program.interpret(vec![ArrayIrValue::Array(Array::scalar(false)), value.clone()]), Ok(vec![value]),);
+    }
+
+    #[test]
+    fn test_checked_root_replay_forwards_local_references_into_condition_branches() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let reference_type = ReferenceType::new(array_type.clone());
+        let build_branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let true_branch = build_branch();
+        let false_branch = build_branch();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(array_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, reference],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert!(program.analyze_references(0).is_ok());
+
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]));
+        assert_eq!(
+            program.interpret(vec![TestValue::Array(Array::scalar(true)), value.clone()]),
+            Ok(vec![value.clone()]),
+        );
+        assert_eq!(
+            program.interpret(vec![TestValue::Array(Array::scalar(false)), value.clone()]),
+            Ok(vec![value.clone()]),
+        );
+        assert_eq!(
+            program
+                .entry_region_ref()
+                .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(true)), value.clone()]),
+            Ok(vec![value.clone()]),
+        );
+        assert_eq!(
+            program
+                .entry_region_ref()
+                .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(false)), value.clone()]),
+            Ok(vec![value]),
+        );
+    }
+
+    #[test]
+    fn test_direct_eager_bind_validates_every_attached_region_before_selection() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let valid_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(array_type.clone().into());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let invalid_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(array_type.clone().into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+            builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap();
+            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let invalid_region = invalid_branch.entry();
+
+        let context = EagerContext::<TestValue, TestOperation>::new();
+        let error = context
+            .bind(
+                ConditionOperation::new(),
+                vec![valid_branch, invalid_branch],
+                &[TestValue::Array(Array::scalar(true)), TestValue::Array(Array::vector(vec![1.0_f32, 2.0]))],
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceAnalysisError>(),
+            Some(&ReferenceAnalysisError::UseAfterConsume {
+                instruction: InstructionId::new(invalid_region, 2),
+                operation: REFERENCE_READ_OPERATION_NAME.to_string(),
+                input_index: 0,
+                root: ReferenceRoot::Allocation { instruction: InstructionId::new(invalid_region, 0), output_index: 0 },
+            }),
+        );
+    }
+
+    #[test]
+    fn test_while_recreates_and_discards_local_roots_per_invocation_and_rejects_reference_carries() {
+        type Values = Vec<ArrayIrValue<Array>>;
+
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let boolean_type = ArrayType::scalar(DataType::Boolean);
+
+        // The condition executes twice and the body once. Every invocation creates a fresh local root whose read
+        // snapshot remains inside that invocation, so releasing each region environment discards the holder.
+        let condition = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let state = builder.add_input(array_type.clone().into());
+            let predicate = builder.add_input(boolean_type.clone().into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+            builder.build::<Values, Values>(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let state = builder.add_input(array_type.clone().into());
+            builder.add_input(boolean_type.clone().into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
+            let update = builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+            let state = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            let done = builder.add_constant(ArrayIrValue::Array(Array::scalar(false)));
+            builder
+                .build::<Values, Values>(vec![state, done], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let state = builder.add_input(array_type.clone().into());
+        let predicate = builder.add_input(boolean_type.clone().into());
+        let outputs = builder
+            .add_instruction(
+                ArrayIrOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![state, predicate],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        assert!(program.analyze_references(0).is_ok());
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+                ArrayIrValue::Array(Array::scalar(true)),
+            ]),
+            Ok(
+                vec![ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])), ArrayIrValue::Array(Array::scalar(false)),]
+            ),
+        );
+
+        // Reference-valued loop state would escape each nested invocation and is rejected before the entry allocation
+        // can execute.
+        let reference_type = ReferenceType::new(array_type.clone());
+        let reference_condition = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            builder.add_input(reference_type.clone().into());
+            let done = builder.add_constant(ArrayIrValue::Array(Array::scalar(false)));
+            builder.build::<Values, Values>(vec![done], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let reference_body = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let reference = builder.add_input(reference_type.into());
+            builder.build::<Values, Values>(vec![reference], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let condition_region = builder.import_region(reference_condition.entry_region_ref());
+        let body_region = builder.import_region(reference_body.entry_region_ref());
+        let input = builder.add_input(array_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+        let reference = builder
+            .add_instruction(
+                ArrayIrOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![reference],
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let invalid = builder.build::<Values, Values>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            invalid.analyze_references(0).unwrap_err().downcast_custom::<ReferenceAnalysisError>(),
+            Some(&ReferenceAnalysisError::ReferenceOutput {
+                region: body_region,
+                output_index: 0,
+                root: ReferenceRoot::RegionInput { region: body_region, input_index: 0 },
+            }),
+        );
+    }
+
+    #[test]
+    fn test_scan_recreates_and_discards_local_roots_per_iteration() {
+        type Values = Vec<ArrayIrValue<Array>>;
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let stacked_type = ArrayType::new_static(DataType::F32, [3]);
+        let body = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let carry = builder.add_input(scalar_type.clone().into());
+            let item = builder.add_input(scalar_type.clone().into());
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![carry]).unwrap()[0];
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, item]).unwrap();
+            let next = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Values, Values>(vec![next, next], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(scalar_type.into());
+        let items = builder.add_input(stacked_type.into());
+        let outputs = builder
+            .add_instruction(ScanOperation::new(1, 3), vec![body_region], vec![carry, items])
+            .unwrap()
+            .to_vec();
+        let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+
+        assert!(program.analyze_references(0).is_ok());
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(1.0_f32)),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 3.0, 4.0])),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(9.0_f32)),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 5.0, 9.0])),
+            ]),
+        );
     }
 
     #[test]

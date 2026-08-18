@@ -193,6 +193,11 @@ where
         Ok(true_interface.output_types().to_vec())
     }
 
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index < 2).then_some(input_index + 1)
+    }
+
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![
             OutputRegionProvenance { region_index: 0, output_index },
