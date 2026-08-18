@@ -253,11 +253,11 @@ pub trait Context: Domain + Clone {
     }
 }
 
-/// [`Context`] used for a concrete `(type, value, operation)` universe that carries no runtime state and for which,
-/// binding an operation to some input values corresponds to directly interpreting/evaluating/executing that operation
-/// for those input values using the value type's default interpretation context. [`EagerContext`] exists to make direct
-/// interpretation contexts explicit in generic code that otherwise has no backend-owned eager context value to pass
-/// around.
+/// Zero-sized [`Context`] used for a concrete `(type, value, operation)` universe whose operations can be interpreted
+/// directly without backend-owned context state. Values may themselves can carry explicit resources, such as reference
+/// holders, but all state needed to interpret an operation arrives through those values and the attached regions.
+/// [`EagerContext`] makes this direct interpretation mode explicit in generic code that otherwise has no backend-owned
+/// eager context value to pass around.
 ///
 /// The default operation family is [`ConstantOperation`], which is the minimal operation family needed by ordinary
 /// eager value contexts that only materialize constants and expose context capabilities such as zero, one, fill, etc.
@@ -321,6 +321,11 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
     ) -> Result<Vec<V>, ProgramError> {
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
+        if V::VALIDATES_EAGER_REPLAY && driver.prevalidated_replay().is_none() {
+            for region in driver.regions() {
+                V::validate_eager_replay(region)?;
+            }
+        }
         operation.interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
     }
 

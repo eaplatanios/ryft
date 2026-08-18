@@ -237,6 +237,11 @@ impl Type for ArrayIrType {
             Self::Reference(_) => false,
         }
     }
+
+    #[inline]
+    fn is_reference(&self) -> bool {
+        matches!(self, Self::Reference(_))
+    }
 }
 
 /// [`TypeRefinements`] established while refining one complete [`ArrayIrType`] signature. A declared dynamic array
@@ -563,6 +568,7 @@ mod tests {
         let array = ArrayType::new(F32, Shape::scalar());
         let stored = ArrayIrType::from(array.clone());
         assert_eq!(<&ArrayType>::try_from(&stored), Ok(&array));
+        assert!(!stored.is_reference());
         assert_eq!(
             <&DimensionType>::try_from(&stored),
             Err(TypeError::invalid("expected dimension type but got array type")),
@@ -577,6 +583,7 @@ mod tests {
             DimensionType::new(DimensionVariable::new("extent", DimensionBounds::positive(Some(9)).unwrap()));
         let stored = ArrayIrType::from(dimension.clone());
         assert_eq!(<&DimensionType>::try_from(&stored), Ok(&dimension));
+        assert!(!stored.is_reference());
         assert_eq!(
             <&ArrayType>::try_from(&stored),
             Err(TypeError::invalid("expected array type but got dimension type")),
@@ -592,6 +599,7 @@ mod tests {
         assert_eq!(<&ReferenceType<ArrayType>>::try_from(&stored), Ok(&reference));
         assert!(!stored.is_scalar());
         assert!(!stored.is_complex());
+        assert!(stored.is_reference());
         assert!(!stored.is_compatible_with(&ArrayIrType::Array(array.clone())));
         assert!(!ArrayIrType::Array(array.clone()).is_compatible_with(&stored));
         assert!(!stored.is_refined_by(&ArrayIrType::Array(array.clone())));

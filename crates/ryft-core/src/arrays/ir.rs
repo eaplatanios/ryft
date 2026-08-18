@@ -12,8 +12,8 @@ use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::values::rename_type_identities_by_rejection;
 use crate::programs::{
-    Concretizable, ProgramError, Reference, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueProjection,
+    Concretizable, Operation, ProgramError, Reference, ReferenceType, RegionRef, Type, TypeError, TypeIdentityRenaming,
+    Typed, Value, ValueProjection,
 };
 
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
@@ -23,9 +23,9 @@ use crate::programs::{
 /// dispatch to device backends.
 ///
 /// This type lets arrays, checked host-side dimensions, and identity-bearing array references share one storage
-/// universe, while [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume
-/// only the member it understands. Reference operations remain composite-native because their signatures cross member
-/// kinds; ordinary numeric operations still project only the array member.
+/// universe, while [`ValueProjection`] lets homogeneous [`Operation`] machinery borrow or consume only the member it
+/// understands. Reference operations remain composite-native because their signatures cross member kinds. Ordinary
+/// numeric operations still project only the array member.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
     /// Ordinary backend [`ArrayType`]-typed [`Value`].
@@ -73,6 +73,8 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
 }
 
 impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
+    const VALIDATES_EAGER_REPLAY: bool = true;
+
     type DispatchDomain = EagerContext<Self>;
     type ExecutionDomain = EagerContext<Self, ArrayIrOperation<A>>;
 
@@ -86,6 +88,24 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
         EagerContext::new()
     }
 
+    fn validate_eager_replay<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
+        region: RegionRef<'_, V, O>,
+    ) -> Result<(), ProgramError> {
+        // TODO(eaplatanios): Phase 4 capture lifting must thread the lifted-capture count here so that external-root
+        //  diagnostics name captures instead of public inputs.
+        let analysis = region.analyze_references(0)?;
+        if let Some(external) = analysis.external_roots().first() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "program replay of external reference {} is not supported before external holder runtime \
+                     integration",
+                    external.source(),
+                ),
+            });
+        }
+        Ok(())
+    }
+
     fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<Self::Type as Type>::Identity>,
@@ -94,10 +114,11 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
             Self::Array(value) => Ok(Self::Array(value.rename_type_identities(renaming)?)),
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
             Self::Reference(value) => {
-                // TODO(eaplatanios): Separate the handle-local referent type from the root-shared holder state
-                //  so it can be renamed without changing every alias or minting a new resource identity. Once this arm
-                //  no longer needs the shared rejection helper, inline `rename_type_identities_by_rejection` back into
-                //  `Value::rename_type_identities` and remove the helper.
+                // TODO(eaplatanios): Add a handle-local identity/view mapping that can reconstruct values crossing the
+                //  boundary between this handle's type and the root-shared stored value. The holder and handle metadata
+                //  are already separate, but changing only the handle type would make reads claim a renamed type while
+                //  returning the root's original value. Once this mapping exists, inline
+                //  `rename_type_identities_by_rejection` back into `Value::rename_type_identities` and remove it.
                 rename_type_identities_by_rejection(value, renaming).map(Self::Reference)
             }
         }
@@ -383,14 +404,10 @@ mod tests {
             )
         };
         assert_eq!(RegionArena::from_regions(vec![reference_region()]).map(|_| ()), expected_error);
+        type TestValue = ArrayIrValue<Array>;
+        type TestProgram = Program<TestValue, ArrayIrOperation<Array>, Vec<TestValue>, Vec<TestValue>>;
         assert_eq!(
-            Program::<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>::new(
-                Vec::new(),
-                Vec::new(),
-                vec![reference_region()],
-                RegionId::new(0),
-            )
-            .map(|_| ()),
+            TestProgram::new(Vec::new(), Vec::new(), vec![reference_region()], RegionId::new(0)).map(|_| ()),
             expected_error,
         );
     }
