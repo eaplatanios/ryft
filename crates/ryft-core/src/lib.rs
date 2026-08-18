@@ -155,9 +155,9 @@ pub use partial::{
 };
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BindingRegionDriver, CalleeRegionDriver, Concretizable,
-    DestinationRegionMapping, Effect, Effects, EmptyRegionDriver, FlatProgram, Instruction, InstructionId, MaybeZero,
-    MemberOperation, NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider,
-    OutputRegionProvenance, ParameterProjection, PrevalidatedReplay, Program, ProgramBuilder, ProgramError,
+    DestinationRegionMapping, EagerReplayValidation, Effect, Effects, EmptyRegionDriver, FlatProgram, Instruction,
+    InstructionId, MaybeZero, MemberOperation, NoIdentity, Operation, OperationFormatter, OperationProjection,
+    OperationProvider, OutputRegionProvenance, ParameterProjection, Program, ProgramBuilder, ProgramError,
     ProgramLiveSets, ProgramStatistics, ProjectedValue, Reference, ReferenceAccessMode, ReferenceError,
     ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType,
     ReferenceTypeRefinements, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,

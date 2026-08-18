@@ -150,9 +150,9 @@ pub use references::{
     ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, OutputRegionProvenance,
-    Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
+    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerReplayValidation, EmptyRegionDriver,
+    OutputRegionProvenance, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

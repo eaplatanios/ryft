@@ -75,7 +75,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ///   - It lets eager replay boundaries skip validation entirely for ordinary value families. Because the check is
     ///     a monomorphization-time constant, the branch compiles away instead of invoking the no-op default for every
     ///     attached region of every bind.
-    ///   - It gates the creation of [`PrevalidatedReplay`](crate::PrevalidatedReplay) evidence, which lets nested
+    ///   - It gates the creation of [`EagerReplayValidation`](crate::EagerReplayValidation) evidence, which lets nested
     ///     eager replay skip revalidating regions that a whole-closure preflight already covered. Only a family whose
     ///     preflight actually ran may issue that evidence; staging and transform contexts enforce their own structural
     ///     legality gates and never produce it.
@@ -152,7 +152,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// transactionally: this hook inspects the complete region closure up front and either accepts all of it or rejects
     /// it before any constant is lifted or instruction is executed. Eager program interpretation calls it with the
     /// program's entry region, and direct eager binding calls it with each attached region that carries no
-    /// [`PrevalidatedReplay`](crate::PrevalidatedReplay) evidence.
+    /// [`EagerReplayValidation`](crate::EagerReplayValidation) evidence.
     ///
     /// The default accepts every closure and is correct for value universes that cannot carry concrete mutable
     /// resources. A family that admits such resources (e.g., the core array IR with references) must override this
