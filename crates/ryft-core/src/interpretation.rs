@@ -26,9 +26,11 @@
 //!
 //! [`Program::interpret_in_context`] first checks the input [`Parameterized`] structure and the complete input type
 //! signature. Refinements are established across the whole signature so repeated dynamic type identities cannot receive
-//! contradictory concrete bindings. Structured inputs are then flattened into an atom-indexed environment. Only live
-//! constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its results in
-//! that environment.
+//! contradictory concrete bindings. Before replay, an eager concrete [`Value`] family may run its
+//! [`Value::validate_eager_replay`] hook. For example, the core array IR uses this boundary to reject invalid or
+//! external reference state before any mutation. Structured inputs are then flattened into an atom-indexed environment.
+//! Only live constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its
+//! results in that environment.
 //!
 //! Values are moved from the environment on their final use and cloned only when another consumer remains. Once all
 //! instructions have run, output types are validated against the input refinement environment and the program's closed
@@ -80,8 +82,9 @@ use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
-    Atom, AtomId, EmptyRegionDriver, Instruction, Operation, Program, ProgramError, RegionDriver, RegionRef,
-    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value, ValueProjection,
+    Atom, AtomId, EagerReplayValidation, EmptyRegionDriver, Instruction, Operation, Program, ProgramError,
+    RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value,
+    ValueProjection,
 };
 
 /// Provides instruction-scoped access to the attached [`Region`](crate::Region)s of one interpreted [`Operation`]
@@ -145,13 +148,17 @@ impl<C: Domain> InterpretationDriver<C> for EmptyRegionDriver {
 pub(crate) struct EagerInterpretationDriver<'r, D> {
     /// Binding [`RegionDriver`] supplied to the active [`Operation`] application.
     driver: &'r D,
+
+    /// Evidence that the complete attached region closure was validated before the active application's eager rule
+    /// began executing, forwarded to nested replay so that selected regions are not revalidated.
+    validation: Option<EagerReplayValidation>,
 }
 
 impl<'r, D> EagerInterpretationDriver<'r, D> {
     /// Creates a new [`EagerInterpretationDriver`].
     #[inline]
-    pub(crate) fn new(driver: &'r D) -> Self {
-        Self { driver }
+    pub(crate) fn new(driver: &'r D, validation: Option<EagerReplayValidation>) -> Self {
+        Self { driver, validation }
     }
 }
 
@@ -178,7 +185,10 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<EagerContex
         index: usize,
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError> {
-        self.region(index)?.interpret_in_context(context, inputs)
+        // `EagerContext::bind` ensures the complete attached region closure is validated before any eager rule runs,
+        // so this recursion forwards that evidence instead of revalidating the selected child. Revalidation here
+        // would happen after branch selection and would misclassify forwarded parent roots as external resources.
+        self.region(index)?.interpret_in_context(context, inputs, self.validation.as_ref())
     }
 }
 
@@ -363,6 +373,14 @@ impl<
             .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
         };
 
+        // Concrete resource-bearing value families need a complete, all-or-nothing legality check before replay can
+        // lift constants or execute the first instruction. Transform wrappers use their own value family and therefore
+        // retain their operation-level gates even when their innermost execution context is eager.
+        let requires_validation = context.is_eager() && C::Value::VALIDATES_EAGER_REPLAY;
+        if requires_validation {
+            C::Value::validate_eager_replay(self.entry_region_ref())?;
+        }
+
         // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
         // structured output form of this program, reparameterized at the context's value type. All instructions
         // share one mapping scope so that a staging destination imports each unchanged source region at most once.
@@ -372,11 +390,12 @@ impl<
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
-                context.bind(
-                    instruction.operation().clone(),
-                    ReplayRegionDriver::new(source, instruction.regions(), &region_mappings)?,
-                    inputs,
-                )
+                let driver = if requires_validation {
+                    ReplayRegionDriver::new_validated(source, instruction.regions(), &region_mappings)?
+                } else {
+                    ReplayRegionDriver::new(source, instruction.regions(), &region_mappings)?
+                };
+                context.bind(instruction.operation().clone(), driver, inputs)
             },
         )?;
 
@@ -424,6 +443,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// already generic over `V`, carrying the matching `E` keeps each interpreter's error statically typed rather than
     /// erasing it to a runtime downcast.
     ///
+    /// This low-level callback API does not run [`Value::validate_eager_replay`]. A caller whose `interpret_fn` can
+    /// mutate resource-bearing values must validate the complete program and invocation before calling it.
+    /// [`Program::interpret_in_context`] is the canonical checked eager entry point.
+    ///
     /// # Parameters
     ///
     ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
@@ -454,10 +477,23 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     /// values. The region and every nested region attached to its [`Instruction`]s are replayed directly from the
     /// source arena. When the provided context stages an unchanged nested region, one replay-scoped mapping preserves
     /// repeated roots and shared descendants in the destination arena.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`Context`] that assigns meaning to constant lifting and instruction binding.
+    ///   - `inputs`: Flat input values aligned with this region's input atoms.
+    ///   - `validation`: Evidence that a [`Value::validate_eager_replay`] preflight already covered this region as
+    ///     part of an enclosing checked replay root. Pass [`None`] unless you hold evidence obtained from such a root.
+    ///     [`None`] makes this replay its own root boundary, so that an eager context whose value family validates
+    ///     eager replay runs the whole-closure preflight here before anything executes. Ryft's nested replay machinery
+    ///     forwards the evidence minted by its enclosing root instead, both because that root's preflight already
+    ///     covered every nested region and because revalidating a selected child in isolation would misclassify
+    ///     parent-created references forwarded into the child as external roots.
     pub fn interpret_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         self,
         context: &C,
         inputs: Vec<C::Value>,
+        validation: Option<&EagerReplayValidation>,
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, self.input_ids().len(), ProgramError);
         let input_ids = self.input_ids();
@@ -505,6 +541,20 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             .map_err(|error| contextualize_refinement_error(error, input_ids, &inputs, "input"))?
         };
 
+        // A replay without validation evidence is a root execution boundary just like `Program::interpret_in_context`.
+        // Nested eager recursion supplies its root's evidence instead, because that root's preflight has already
+        // validated the whole closure in its original context.
+        let validated = match validation {
+            Some(_) => true,
+            None => {
+                let requires_preflight = context.is_eager() && C::Value::VALIDATES_EAGER_REPLAY;
+                if requires_preflight {
+                    C::Value::validate_eager_replay(self)?;
+                }
+                requires_preflight
+            }
+        };
+
         // Share one source-to-destination mapping across every instruction in this replay. If several instructions
         // attach the same nested source region, a staging context imports it only once and preserves that sharing.
         let region_mappings = RegionReplayMappings::new();
@@ -512,11 +562,12 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
-                context.bind(
-                    instruction.operation().clone(),
-                    ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?,
-                    inputs,
-                )
+                let driver = if validated {
+                    ReplayRegionDriver::new_validated(self, instruction.regions(), &region_mappings)?
+                } else {
+                    ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?
+                };
+                context.bind(instruction.operation().clone(), driver, inputs)
             },
         )?;
 
@@ -546,6 +597,10 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     /// semantics. This is the borrowed-[`Region`](crate::Region) counterpart of [`Program::interpret_with`]. It replays
     /// the region directly from its source arena without first materializing a standalone [`Program`], while preserving
     /// the same flat input, constant-lifting, instruction-dispatch, and output-gathering behavior.
+    ///
+    /// This low-level callback API does not run [`Value::validate_eager_replay`]. A caller whose `interpret_fn` can
+    /// mutate resource-bearing values must validate the complete reachable region closure and its invocation before
+    /// calling it. [`RegionRef::interpret_in_context`] is the canonical checked eager entry point.
     pub fn interpret_with<
         RuntimeValue: Clone,
         Error: From<ProgramError>,
@@ -707,6 +762,9 @@ pub fn interpret_projected_operation<
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -717,7 +775,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{AddOperation, BroadcastOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError, RegionInterface, TypeError};
+    use crate::programs::{AtomId, BindingRegionDriver, ProgramBuilder, ProgramError, RegionInterface, TypeError};
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
 
@@ -789,6 +847,75 @@ mod tests {
         assert_eq!(destination.instructions().len(), 2);
         assert_eq!(destination.instructions()[0].regions(), destination.instructions()[1].regions());
         assert_eq!(destination.instructions()[0].regions(), &[crate::RegionId::new(0)]);
+    }
+
+    #[test]
+    fn test_program_interpret_marks_replay_validated_only_after_running_the_value_hook() {
+        /// Eager test context that records whether program replay supplied privileged preflight evidence.
+        #[derive(Clone)]
+        struct ReplayEvidenceContext {
+            /// Whether the observed application used an ordinary unvalidated replay driver.
+            saw_unvalidated_replay: Rc<Cell<bool>>,
+        }
+
+        impl Domain for ReplayEvidenceContext {
+            type Type = ArrayType;
+            type Value = Array;
+            type Constant = Array;
+            type Operation = TestRegionOperation;
+        }
+
+        impl Context for ReplayEvidenceContext {
+            fn lift(&self, constant: Array) -> Result<Array, ProgramError> {
+                Ok(constant)
+            }
+
+            fn bind<O: Into<TestRegionOperation>, D: BindingRegionDriver<Array, TestRegionOperation>>(
+                &self,
+                operation: O,
+                driver: D,
+                inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
+                let operation = operation.into();
+                operation.validate_region_count(driver.region_count())?;
+                self.saw_unvalidated_replay.set(driver.eager_replay_validation().is_none());
+                Ok(inputs.to_vec())
+            }
+
+            fn is_eager(&self) -> bool {
+                true
+            }
+        }
+
+        let mut nested_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested_input = nested_builder.add_input(ArrayType::scalar(DataType::F64));
+        let nested = nested_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![nested_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let nested = builder.import_program(nested);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![nested],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let saw_unvalidated_replay = Rc::new(Cell::new(false));
+        let context = ReplayEvidenceContext { saw_unvalidated_replay: Rc::clone(&saw_unvalidated_replay) };
+
+        assert_eq!(program.interpret_in_context(&context, vec![Array::scalar(1.0_f64)]), Ok(vec![Array::scalar(1.0)]));
+        assert!(saw_unvalidated_replay.get());
+
+        saw_unvalidated_replay.set(false);
+        assert_eq!(
+            program.entry_region_ref().interpret_in_context(&context, vec![Array::scalar(1.0_f64)], None),
+            Ok(vec![Array::scalar(1.0)]),
+        );
+        assert!(saw_unvalidated_replay.get());
     }
 
     #[test]
@@ -973,6 +1100,7 @@ mod tests {
                 .interpret_in_context(
                     &EagerContext::<Array, WrongShapeOperation>::new(),
                     vec![Array::vector(vec![1.0, 2.0])],
+                    None,
                 ),
             Err(ProgramError::Type(error))
                 if error.downcast_custom::<DimensionError>()
