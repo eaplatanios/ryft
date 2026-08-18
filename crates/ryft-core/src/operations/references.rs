@@ -1122,6 +1122,7 @@ mod tests {
             program.entry_region_ref().interpret_in_context(
                 &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
                 vec![reference.clone(), ArrayIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))],
+                None,
             ),
             Err(ProgramError::UnsupportedOperation {
                 message: "program replay of external reference public input 0 is not supported before external \
@@ -1245,15 +1246,19 @@ mod tests {
             Ok(vec![value.clone()]),
         );
         assert_eq!(
-            program
-                .entry_region_ref()
-                .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(true)), value.clone()]),
+            program.entry_region_ref().interpret_in_context(
+                &context,
+                vec![TestValue::Array(Array::scalar(true)), value.clone()],
+                None,
+            ),
             Ok(vec![value.clone()]),
         );
         assert_eq!(
-            program
-                .entry_region_ref()
-                .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(false)), value.clone()]),
+            program.entry_region_ref().interpret_in_context(
+                &context,
+                vec![TestValue::Array(Array::scalar(false)), value.clone()],
+                None,
+            ),
             Ok(vec![value]),
         );
     }

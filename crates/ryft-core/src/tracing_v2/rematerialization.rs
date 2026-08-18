@@ -395,7 +395,7 @@ where
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent region consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands, None)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -442,7 +442,7 @@ where
             )?);
         }
 
-        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands)?;
+        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands, None)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs

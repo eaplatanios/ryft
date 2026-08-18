@@ -632,7 +632,7 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         let forward = driver.region(0)?;
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if inputs.iter().all(|input| input.tangent().is_zero()) {
-            let primal_outputs = forward.interpret_in_context(context, primals)?;
+            let primal_outputs = forward.interpret_in_context(context, primals, None)?;
             return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
         }
 
@@ -755,7 +755,7 @@ impl<
         let input_cotangents = if self.is_transpose_only() {
             // The transpose-only form's region is a user-supplied backward program with no linearity contract of its
             // own, so it cannot be re-transposed and is replayed inline into the pullback.
-            transpose.interpret_in_context(context, transpose_inputs)?
+            transpose.interpret_in_context(context, transpose_inputs, None)?
         } else {
             // The forward-and-transpose form transposes by *swapping* its regions: the pullback stages the same
             // operation with the transpose region leading, over the same residuals followed by the output

@@ -414,7 +414,7 @@ where
             )?);
         }
 
-        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
+        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs, None)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
         Ok(outputs

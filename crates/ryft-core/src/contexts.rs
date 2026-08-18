@@ -89,8 +89,8 @@ use crate::macros::check_builders;
 use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
-    AtomId, BindingRegionDriver, Operation, OperationProjection, Program, ProgramBuilder, ProgramError, Type, Typed,
-    Value, ValueProjection,
+    AtomId, BindingRegionDriver, EagerReplayValidation, Operation, OperationProjection, Program, ProgramBuilder,
+    ProgramError, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -321,12 +321,21 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
     ) -> Result<Vec<V>, ProgramError> {
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
-        if V::VALIDATES_EAGER_REPLAY && driver.prevalidated_replay().is_none() {
-            for region in driver.regions() {
-                V::validate_eager_replay(region)?;
+        // A resource-bearing value family requires the complete attached region closure to be validated before its
+        // eager rule runs. A driver carrying evidence was already covered by its root's whole-closure preflight.
+        // Otherwise, this bind is itself a validation boundary. Either way the eager rule receives fresh evidence
+        // so that nested replay does not revalidate the regions it selects.
+        let validation = if V::VALIDATES_EAGER_REPLAY {
+            if driver.eager_replay_validation().is_none() {
+                for region in driver.regions() {
+                    V::validate_eager_replay(region)?;
+                }
             }
-        }
-        operation.interpret(self, &EagerInterpretationDriver::new(&driver), inputs)
+            Some(EagerReplayValidation::new())
+        } else {
+            None
+        };
+        operation.interpret(self, &EagerInterpretationDriver::new(&driver, validation), inputs)
     }
 
     #[inline]
