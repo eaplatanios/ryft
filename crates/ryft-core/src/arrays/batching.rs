@@ -1947,8 +1947,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// This infallible constructor implements [`BatchingPolicy::replicated`] and may temporarily wrap any composite
     /// constant kind, so it must never be the boundary through which values _enter_ batching: entry boundaries
     /// (batching entry points, constant lifting, and structural constant replay) use the checked [`Self::new`], which
-    /// rejects unresolved references. The absence of a reference [`BatchingPolicyProjection`] and the per-operation
-    /// batching rejections are complementary guards, not substitutes for that checked entry.
+    /// rejects unresolved references, and output materialization rejects any manually manufactured reference carrier.
+    /// The absence of a reference [`BatchingPolicyProjection`] and the per-operation batching rejections are
+    /// complementary guards, not substitutes for those checked boundaries.
     #[inline]
     pub fn replicated(value: V) -> Self {
         Self { value, batch_axis: BatchAxis::replicated(), mapped_dimension: None, ragged_axes: Vec::new() }
@@ -2078,6 +2079,49 @@ pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter
 /// metadata.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ArrayIrBatching;
+
+impl ArrayIrBatching {
+    /// Lifts and batches one structurally replayed constant through the checked composite policy boundary.
+    fn batch_constant<C: Context<Type = ArrayIrType>>(
+        context: &C,
+        constant: C::Constant,
+    ) -> Result<ArrayIrBatch<C::Value>, BatchingError> {
+        <Self as BatchingPolicy<C>>::batch(context.lift(constant)?, BatchAxis::replicated())
+    }
+
+    /// Replays one region through composite batching using the checked constant and operation boundaries.
+    fn batch_region_values<C>(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<ArrayIrBatch<C::Value>>,
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
+    where
+        C: Context<Type = ArrayIrType, Operation: BatchableOperation<C, Self>>,
+        Self: RecursiveBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayIrBatch<C::Value>>,
+    {
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            // The shared replay helper uses the checked constructor; the infallible replicated wrapper would let a
+            // reference-typed capture constant ride through structural batching unchanged.
+            |_, constant| Self::batch_constant(context.parent(), constant.clone()),
+            |instruction, instruction_inputs| {
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let (outputs, evidence) = instruction
+                    .operation()
+                    .batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
+                    .into_parts();
+                <Self as BatchingPolicy<C>>::validate_operation_outputs(
+                    instruction.operation().name(),
+                    instruction_inputs,
+                    outputs.as_slice(),
+                    &evidence,
+                )?;
+                Ok(outputs)
+            },
+        )
+    }
+}
 
 impl BatchableType for ArrayIrType {
     type Policy = ArrayIrBatching;
@@ -3145,29 +3189,7 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError> {
-        let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
-            inputs,
-            // Constant replay goes through the _checked_ batch constructor as the infallible replicated wrapper would
-            // let a reference-typed capture constant ride through structural batching unchanged.
-            |_, constant| {
-                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
-            },
-            |instruction, instruction_inputs| {
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = instruction
-                    .operation()
-                    .batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
-                    .into_parts();
-                <Self as BatchingPolicy<C>>::validate_operation_outputs(
-                    instruction.operation().name(),
-                    instruction_inputs,
-                    outputs.as_slice(),
-                    &evidence,
-                )?;
-                Ok(outputs)
-            },
-        )
+        Self::batch_region_values(context, region, inputs)
     }
 
     fn batch_program(
@@ -3241,30 +3263,7 @@ where
                 })
                 .collect::<Result<Vec<_>, BatchingError>>()?;
 
-            let region_mappings = RegionReplayMappings::new();
-            let outputs = region.interpret_with(
-                inputs,
-                |_, constant| -> Result<_, BatchingError> {
-                    <Self as BatchingPolicy<TracingContext<C::Constant, C::Operation>>>::batch(
-                        batching_context.parent().lift(constant.clone())?,
-                        BatchAxis::replicated(),
-                    )
-                },
-                |instruction, instruction_inputs| -> Result<_, BatchingError> {
-                    let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                    let (outputs, evidence) = instruction
-                        .operation()
-                        .batch(&batching_context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
-                        .into_parts();
-                    <Self as BatchingPolicy<TracingContext<C::Constant, C::Operation>>>::validate_operation_outputs(
-                        instruction.operation().name(),
-                        instruction_inputs,
-                        outputs.as_slice(),
-                        &evidence,
-                    )?;
-                    Ok(outputs)
-                },
-            )?;
+            let outputs = Self::batch_region_values(&batching_context, region, inputs)?;
 
             let output_target_axes = match &output_axes_policy {
                 ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
@@ -3352,7 +3351,6 @@ mod tests {
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,
     };
-    use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearCallOperation, LinearizationTracer};
     use crate::operations::collectives::{
@@ -3368,7 +3366,7 @@ mod tests {
         WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Reference, ReferenceType};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Reference};
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
@@ -5151,39 +5149,18 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_structural_batching_rejects_reference_capture_constant() -> Result<(), ProgramError> {
-        type CaptureTraceContext =
-            TracingContext<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>;
-
-        let mut builder =
-            ProgramBuilder::<CaptureReference<ArrayIrType>, ArrayIrOperation<CaptureReference<ArrayType>>>::new();
-        let reference = builder.add_constant(CaptureReference::new(
-            0,
-            ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-        ));
-        let program = builder.build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
-            vec![reference],
-            Vec::<Placeholder>::new(),
-            vec![Placeholder],
-        )?;
-        let trace = CaptureTraceContext::new();
-        let extent = trace.input(DimensionValue::constant(2)?.r#type().into_owned().into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+    fn test_array_ir_batch_constant_rejects_reference() {
+        type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         assert_eq!(
-            <ArrayIrBatching as RecursiveBatchingPolicy<CaptureTraceContext>>::batch_program(
-                &context,
-                program.entry_region_ref(),
-                &[],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .err(),
-            Some(BatchingError::UnsupportedOperation {
+            ArrayIrBatching::batch_constant(
+                &Parent::new(),
+                ArrayIrValue::Reference(Reference::new(Array::scalar(1.0_f32))),
+            ),
+            Err(BatchingError::UnsupportedOperation {
                 message: "references must be discharged before batching".to_string(),
             }),
         );
-
-        Ok(())
     }
 
     #[test]

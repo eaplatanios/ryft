@@ -437,60 +437,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         let expected_output_count = output_structure.parameter_count();
         check_count!("output", output_ids, expected_output_count, ProgramError);
 
-        // Check for entry-region well-formedness. Program inputs must be unique variable atoms. Every variable
-        // an instruction consumes must be provided first (i.e., it is a program input or the output of an earlier
-        // instruction, so that instruction order is a valid evaluation order). Every instruction output must be a
-        // fresh variable with exactly one provider. Finally,every program output must be bound. Constants need no
-        // provider and are usable anywhere.
-        let mut input_atoms = vec![false; self.atoms.len()];
-        let mut variable_has_provider = vec![false; self.atoms.len()];
-        for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(_) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-            };
-            if input_atoms[input_id.index()] {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "program input atom {input_id} appears more than once",
-                )));
-            }
-            input_atoms[input_id.index()] = true;
-            variable_has_provider[input_id.index()] = true;
-        }
-        for instruction in self.instructions.iter() {
-            for input_id in instruction.inputs.iter().copied() {
-                let input = self.atoms.get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-                if input.is_variable() && !variable_has_provider[input_id.index()] {
-                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-                }
-            }
-            for output_id in instruction.outputs.iter().copied() {
-                let output = self.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-                let Atom::Variable(_) = output else {
-                    return Err(ProgramError::MalformedProgram(
-                        "instruction output atom was not a variable".to_string(),
-                    ));
-                };
-                if input_atoms[output_id.index()] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is a program input",
-                    )));
-                }
-                if variable_has_provider[output_id.index()] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is produced by more than one instruction",
-                    )));
-                }
-                variable_has_provider[output_id.index()] = true;
-            }
-        }
-        for output_id in output_ids.iter().copied() {
-            let output = self.atoms.get(output_id.index()).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-            if output.is_variable() && !variable_has_provider[output_id.index()] {
-                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-            }
-        }
-
         // The entry is sealed last. `RegionArena::push` verifies that every attached region already exists, preserving
         // the arena's topological ordering and acyclicity before it publishes the entry and its derived metadata.
         let entry = RegionId::new(self.regions.len());
@@ -665,7 +611,7 @@ mod tests {
                 vec![Placeholder],
             ),
             Err(ProgramError::MalformedProgram(message))
-                if message == format!("program input atom {input} appears more than once")
+                if message == format!("region input atom {input} appears more than once")
         ));
 
         let mut input_output_overlap_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -683,7 +629,7 @@ mod tests {
                 vec![Placeholder],
             ),
             Err(ProgramError::MalformedProgram(message))
-                if message == format!("instruction output atom {input} is a program input")
+                if message == format!("instruction output atom {input} is a region input")
         ));
 
         let mut duplicate_output_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
