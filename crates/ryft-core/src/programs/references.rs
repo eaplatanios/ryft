@@ -1,38 +1,31 @@
-//! Core structural types and eager holder representation for Ryft references.
+//! Structural reference types, operation-level reference semantics descriptors, and the eager reference holder.
 //!
-//! The initial reference seam deliberately supports only whole-value allocation and snapshot reads in the composite
-//! array IR. It establishes resource identity, structural typing, projection, and operation-level access metadata.
-//! Mutation, freezing, views, control-flow discharge, automatic differentiation, batching, rematerialization, and
-//! backend lowering remain unsupported until their dedicated validation and rewriting phases land. References are
-//! intended to be second-class program values: they may be instruction intermediates, inputs, or captures, but public
-//! outputs and ordinary numeric uses remain unsupported. Phases 0 and 1 establish the representation, composite member
-//! integration, and conservative operation boundaries; the later reference-analysis phase will enforce the complete
-//! lifetime contract. There is no homogeneous reference operation family.
+//! References give programs mutable state with explicit runtime identity. This module owns the program-facing
+//! surface of that feature:
 //!
-//! ## Phase 1 support boundary
+//! - [`ReferenceType`] is the structural [`Type`] of a reference. It carries only referent metadata: runtime
+//!   identity belongs to [`Reference`] and never participates in structural equality, hashing, or retained-program
+//!   specialization.
+//! - [`Reference`] is the cloneable identity-bearing eager holder. Clones alias one holder, reads return immutable
+//!   value snapshots, replacement and additive update are atomic and preserve the exact declared referent type, and
+//!   a consuming freeze invalidates the complete alias family.
+//! - [`ReferenceOperationSemantics`], together with [`ReferenceOutputSemantics`], [`ReferenceInputAccess`], and
+//!   [`ReferenceAccessMode`], is the descriptor vocabulary through which an operation declares which of its outputs
+//!   define new reference roots or alias input roots and how each reference input is accessed. Descriptors speak
+//!   only in operation-local operand/result index space; program-level analysis resolves them to canonical roots.
+//! - [`ReferenceError`] reports failed accesses to an eager holder.
 //!
-//! Implemented through Phase 1:
+//! References are second-class program values: they may appear as instruction intermediates, inputs, or captures,
+//! but never as public program outputs or in ordinary numeric use.
+//! [`ReferenceAnalysis`](crate::arrays::ReferenceAnalysis) enforces that static root, lifetime, and second-class
+//! boundary contract before eager program replay or later discharge. The reference operations themselves —
+//! allocation, snapshot read, replacement, ordered additive update, and consuming freeze — are independent operation
+//! payloads defined in [`crate::operations::references`] rather than one homogeneous reference operation family, and
+//! binding-level sugar such as `write` is defined over `swap` instead of adding IR operations.
 //!
-//! - array referents in Array IR;
-//! - generic referent refinement and identity-renaming delegation;
-//! - structural reference types and identity-bearing eager holders;
-//! - checked composite type/value projections and typed capture metadata;
-//! - whole-array allocation and snapshot reads;
-//! - operation-local reference semantics descriptors (new-root/alias output classification and input accesses);
-//! - conservative ordered-state effects;
-//! - reference-operation transform rejection and fallible tangent/cotangent type mappings; and
-//! - targeted ordinary-XLA rejection.
-//!
-//! Mutation, freezing, public views, program-level root/lifetime analysis, discharge, per-root scheduling, external
-//! state ABIs, and preserved-reference kernel lowering remain unsupported.
-//!
-//! The five-operation whole-array vocabulary remains
-//! [`NewReferenceOperation`](crate::operations::references::NewReferenceOperation),
-//! [`ReferenceReadOperation`](crate::operations::references::ReferenceReadOperation),
-//! `ReferenceSwapOperation`, `ReferenceAddUpdateOperation`, and `FreezeReferenceOperation`; only the first two are
-//! implemented here. Future `write` and `set` APIs are sugar over `swap`, not additional IR operations. The complete
-//! validation, discharge, transformation, runtime, and kernel contracts are tracked in the repository's
-//! `plan-references.md`.
+//! Views, discharge, automatic differentiation, batching, rematerialization, external program-holder mutation, and
+//! backend lowering are not yet supported. The complete validation, runtime, and kernel roadmap is tracked in the
+//! repository's `plan-references.md`.
 
 // TODO(eaplatanios): Review this module.
 
@@ -45,6 +38,7 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::parameters::Parameter;
+use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements, Typed};
 use crate::programs::values::Value;
@@ -53,9 +47,23 @@ use crate::programs::values::Value;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 #[non_exhaustive]
 pub enum ReferenceError {
+    /// The reference and its complete alias family were invalidated by a consuming freeze.
+    #[error("reference is frozen")]
+    Frozen,
+
     /// The holder's synchronization primitive was poisoned by a panic during an earlier access.
     #[error("reference holder is poisoned")]
     Poisoned,
+
+    /// A replacement or update result did not preserve the holder's exact declared referent type.
+    #[error("reference value type `{actual}` must exactly match declared referent type `{expected}`")]
+    ReferentTypeMismatch {
+        /// Exact declared referent type.
+        expected: String,
+
+        /// Actual replacement or update-result type.
+        actual: String,
+    },
 }
 
 /// Meaning of one reference input access performed by an operation.
@@ -222,8 +230,8 @@ impl ReferenceOperationSemantics {
     /// Panics when one output index receives two classifications or one input index receives two accesses. These are
     /// operation-author contract violations: the documented mutual exclusivity of [`ReferenceOutputSemantics`] holds
     /// only if each operand/result position appears at most once, and program-level analysis trusts that invariant.
-    /// Index ranges cannot be checked here because the descriptor carries no arity information; the planned
-    /// program-level reference analysis validates them against each instruction's actual operand/result arity.
+    /// Index ranges cannot be checked here because the descriptor carries no arity information; program-level
+    /// reference analysis validates them against each instruction's actual operand/result arity.
     pub fn new(outputs: Vec<ReferenceOutputSemantics>, accesses: Vec<ReferenceInputAccess>) -> Self {
         for (index, output) in outputs.iter().enumerate() {
             let output_index = output.output_index();
@@ -338,6 +346,11 @@ impl<T: Type> Type for ReferenceType<T> {
     fn is_complex(&self) -> bool {
         false
     }
+
+    #[inline]
+    fn is_reference(&self) -> bool {
+        true
+    }
 }
 
 /// Cross-occurrence refinements established for a complete [`ReferenceType`] signature.
@@ -392,7 +405,11 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
     }
 }
 
-/// Process-local identity that remains stable for the lifetime of one eager [`Reference`] holder.
+/// Opaque process-local identity that remains stable for the lifetime of one eager [`Reference`] holder.
+///
+/// The identity supports alias-identity checks and diagnostics inside one process. It carries no structural type
+/// information, is never serialized into a program or compilation key, and may be reused after the last handle for
+/// the original holder is dropped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ReferenceId(usize);
 
@@ -405,21 +422,36 @@ impl Display for ReferenceId {
 
 /// Cloneable identity-bearing holder for a referenced [`Value`].
 ///
-/// Cloning a reference aliases the same holder. Reading clones the current immutable value, which preserves snapshot
-/// semantics for value implementations such as [`Array`](crate::Array) that use copy-on-write storage.
+/// Cloning a reference aliases the same holder. Reading clones the current value. Reference referents are expected to
+/// have immutable-value clone semantics so that later replacement or update cannot change an initializer, read
+/// result, or swap result retained by the caller. Array IR admits only array referents, whose SSA/copy-on-write
+/// semantics satisfy this requirement; resource handles such as references are not valid referents there.
+///
+/// A directly created eager handle has no program-owned scope: it remains valid until an explicit freeze or until the
+/// last handle in its alias family is dropped. Statically validated local program roots that are never frozen are
+/// implicitly discarded when their nonescaping interpretation environment is released.
 pub struct Reference<V: Value> {
     /// Shared mutable holder whose allocation defines this reference's runtime identity.
-    holder: Arc<Mutex<V>>,
+    holder: Arc<Mutex<ReferenceState<V>>>,
 
     /// Handle-local structural referent type.
     r#type: ReferenceType<V::Type>,
+}
+
+/// Lifecycle state shared by every handle in one reference alias family.
+enum ReferenceState<V: Value> {
+    /// Live reference containing its current immutable value snapshot.
+    Ready(V),
+
+    /// Consumed reference whose value was returned by `freeze`.
+    Frozen,
 }
 
 impl<V: Value> Reference<V> {
     /// Creates a new independent reference initialized with `value`.
     pub fn new(value: V) -> Self {
         let r#type = ReferenceType::new(value.r#type().into_owned());
-        Self { holder: Arc::new(Mutex::new(value)), r#type }
+        Self { holder: Arc::new(Mutex::new(ReferenceState::Ready(value))), r#type }
     }
 
     /// Returns this holder's process-local identity, which remains stable while any alias is alive.
@@ -428,9 +460,66 @@ impl<V: Value> Reference<V> {
         ReferenceId(Arc::as_ptr(&self.holder) as usize)
     }
 
-    /// Returns an immutable snapshot of the currently stored value.
+    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
     pub fn read(&self) -> Result<V, ReferenceError> {
-        self.holder.lock().map(|value| value.clone()).map_err(|_| ReferenceError::Poisoned)
+        match &*self.holder.lock().map_err(|_| ReferenceError::Poisoned)? {
+            ReferenceState::Ready(value) => Ok(value.clone()),
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+        }
+    }
+
+    /// Atomically replaces the stored value and returns the previous referent value.
+    ///
+    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the live holder
+    /// unchanged.
+    pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
+        let mut state = self.holder.lock().map_err(|_| ReferenceError::Poisoned)?;
+        match &mut *state {
+            ReferenceState::Ready(current) => {
+                self.validate_referent_type(&replacement)?;
+                Ok(std::mem::replace(current, replacement))
+            }
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+        }
+    }
+
+    /// Atomically computes and installs an updated value while retaining the old value on every failure.
+    ///
+    /// This crate-visible primitive keeps value-family-specific update logic (such as array addition) outside the
+    /// generic holder while ensuring no other access can interleave between reading the old state and installing the
+    /// new one.
+    pub(crate) fn update_with(&self, update: impl FnOnce(&V) -> Result<V, ProgramError>) -> Result<(), ProgramError> {
+        let mut state = self.holder.lock().map_err(|_| ProgramError::custom(ReferenceError::Poisoned))?;
+        match &mut *state {
+            ReferenceState::Ready(current) => {
+                let updated = update(current)?;
+                self.validate_referent_type(&updated).map_err(ProgramError::custom)?;
+                *current = updated;
+                Ok(())
+            }
+            ReferenceState::Frozen => Err(ProgramError::custom(ReferenceError::Frozen)),
+        }
+    }
+
+    /// Consumes this reference's current value and invalidates every handle in its alias family.
+    pub fn freeze(&self) -> Result<V, ReferenceError> {
+        let mut state = self.holder.lock().map_err(|_| ReferenceError::Poisoned)?;
+        match std::mem::replace(&mut *state, ReferenceState::Frozen) {
+            ReferenceState::Ready(value) => Ok(value),
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+        }
+    }
+
+    /// Validates that `value` preserves this holder's exact declared referent type.
+    fn validate_referent_type(&self, value: &V) -> Result<(), ReferenceError> {
+        let actual = value.r#type();
+        if actual.as_ref() == self.r#type.referent() {
+            return Ok(());
+        }
+        Err(ReferenceError::ReferentTypeMismatch {
+            expected: self.r#type.referent().to_string(),
+            actual: actual.to_string(),
+        })
     }
 }
 
@@ -488,6 +577,7 @@ impl<V: Value> Typed for Reference<V> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -498,6 +588,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionVariable, Shape,
     };
+    use crate::operations::Add;
     use crate::programs::operations::Operation;
     use crate::programs::regions::RegionInterface;
 
@@ -523,6 +614,7 @@ mod tests {
         assert!(declared_type.is_refined_by(&static_two));
         assert!(!declared_type.is_compatible_with(&static_two));
         assert!(!static_two.is_compatible_with(&static_three));
+        assert!(static_two.is_reference());
         assert!(!static_two.is_scalar());
         assert!(!static_two.is_complex());
         assert_eq!(static_two.to_string(), "ref<f32[2]>");
@@ -580,6 +672,76 @@ mod tests {
         let references = HashMap::from([(reference.clone(), "root")]);
         assert_eq!(references.get(&alias), Some(&"root"));
         assert_eq!(references.get(&distinct), None);
+    }
+
+    #[test]
+    fn test_reference_freeze_invalidates_the_complete_alias_family() {
+        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0]));
+        let alias = reference.clone();
+        assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+
+        assert_eq!(alias.read(), Err(ReferenceError::Frozen));
+        assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
+        assert_eq!(reference.freeze(), Err(ReferenceError::Frozen));
+
+        // A rejected update must not invoke value-family code after the shared holder has been consumed.
+        let update_executed = Cell::new(false);
+        let error = alias
+            .update_with(|_| {
+                update_executed.set(true);
+                Ok(Array::vector(vec![3.0_f32, 4.0]))
+            })
+            .unwrap_err();
+        assert!(!update_executed.get());
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_reference_rejected_replacements_and_updates_leave_the_holder_unchanged() {
+        let initial = Array::vector(vec![1.0_f32, 2.0]);
+        let reference = Reference::new(initial.clone());
+
+        assert_eq!(
+            reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])),
+            Err(ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() }),
+        );
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
+        let update_error = ProgramError::InvalidArgument { message: "test update failed".to_string() };
+        assert_eq!(reference.update_with(|_| Err(update_error.clone())), Err(update_error));
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
+        let error = reference.update_with(|_| Ok(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ReferentTypeMismatch {
+                expected: "f32[2]".to_string(),
+                actual: "f32[3]".to_string(),
+            }),
+        );
+        assert_eq!(reference.read(), Ok(initial));
+    }
+
+    #[test]
+    fn test_reference_mutation_preserves_snapshots_and_independent_roots() {
+        let initializer = Array::vector(vec![1.0_f32, 2.0]);
+        let first = Reference::new(initializer.clone());
+        let second = Reference::new(initializer.clone());
+        let read_snapshot = first.read().unwrap();
+        let replacement = Array::vector(vec![3.0_f32, 4.0]);
+        let retained_replacement = replacement.clone();
+
+        let swapped_snapshot = first.swap(replacement).unwrap();
+        first.update_with(|current| current.add(&Array::vector(vec![10.0_f32, 20.0]))).unwrap();
+        assert_eq!(second.read(), Ok(initializer.clone()));
+        assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer.clone()));
+
+        assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(swapped_snapshot, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]));
+        assert_eq!(first.read(), Ok(Array::vector(vec![13.0_f32, 24.0])));
+        assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0])));
     }
 
     #[test]
