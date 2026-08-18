@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::programs::atoms::AtomId;
 use crate::programs::regions::RegionId;
 
@@ -29,6 +31,13 @@ impl InstructionId {
     #[inline]
     pub fn index(self) -> usize {
         self.index
+    }
+}
+
+impl Display for InstructionId {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}[{}]", self.region, self.index)
     }
 }
 
@@ -101,5 +110,17 @@ impl<O> Instruction<O> {
     #[inline]
     pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>) {
         (self.operation, self.inputs, self.outputs, self.regions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_instruction_id_display() {
+        assert_eq!(InstructionId::new(RegionId::new(2), 7).to_string(), "^2[7]");
     }
 }

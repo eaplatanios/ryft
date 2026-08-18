@@ -177,6 +177,14 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// output types for which this returns `true`, and the holomorphic ones reject output types for which it returns
     /// `false`.
     fn is_complex(&self) -> bool;
+
+    /// Returns `true` if this [`Type`] describes a [`ReferenceType`](crate::ReferenceType). Transform boundaries use
+    /// this predicate to reject unresolved references even when no stateful operation is present, such as a pure
+    /// reference passthrough.
+    #[inline]
+    fn is_reference(&self) -> bool {
+        false
+    }
 }
 
 /// Cross-occurrence established while validating one complete type signature at a [`Program`](crate::Program) or
