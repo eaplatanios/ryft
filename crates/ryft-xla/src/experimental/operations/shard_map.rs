@@ -331,7 +331,6 @@ where
                 inputs,
             );
         }
-
         // Split the local body through the shared online boundary machinery. The body's inputs are index-aligned
         // with the boundary inputs and carry the *local* types, so both split sides stay local programs.
         let body_program = driver.region(0)?;

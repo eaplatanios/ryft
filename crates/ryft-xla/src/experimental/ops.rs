@@ -26,18 +26,19 @@ use ryft_core::{
     DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation,
-    LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation,
-    NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation, PadOperation,
-    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    EagerContext, ErfOperation, ExpOperation, FloorOperation, FreezeReferenceOperation, GatherOperation, IotaOperation,
+    LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation,
+    NegOperation, NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
+    PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, ReferenceReadOperation, RegionInterface, RegionSlot,
-    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
+    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
+    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
+    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
 use ryft_macros::Parameter;
 
@@ -272,6 +273,15 @@ where
     /// Unresolved whole-array reference read retained until reference discharge.
     ReferenceRead(ReferenceReadOperation),
 
+    /// Unresolved whole-array reference replacement retained until reference discharge.
+    ReferenceSwap(ReferenceSwapOperation),
+
+    /// Unresolved whole-array additive reference update retained until reference discharge.
+    ReferenceAddUpdate(ReferenceAddUpdateOperation),
+
+    /// Unresolved consuming whole-array reference freeze retained until reference discharge.
+    FreezeReference(FreezeReferenceOperation),
+
     /// Converts scalar array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
 
@@ -370,6 +380,9 @@ where
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::NewReference(operation) => Self::NewReference(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
+            ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
+            ArrayIrOperation::ReferenceAddUpdate(operation) => Self::ReferenceAddUpdate(operation),
+            ArrayIrOperation::FreezeReference(operation) => Self::FreezeReference(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
             ArrayIrOperation::Reshape(operation) => Self::Reshape(operation),
@@ -641,6 +654,9 @@ where
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
             Self::NewReference(operation) => ArrayIrOperation::NewReference(*operation),
             Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
+            Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
+            Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
+            Self::FreezeReference(operation) => ArrayIrOperation::FreezeReference(*operation),
             Self::DimensionFromScalar(operation) => ArrayIrOperation::DimensionFromScalar(operation.clone()),
             Self::DimensionToScalar(operation) => ArrayIrOperation::DimensionToScalar(*operation),
             Self::Reshape(operation) => ArrayIrOperation::Reshape(operation.clone()),
@@ -771,6 +787,11 @@ impl<T: Type> Operation for JitCallOperation<T> {
         ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
         Ok(callee_interface.output_types().to_vec())
     }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(input_index)
+    }
 }
 
 /// Online partial-evaluation rule for a staged jitted call — ryft's analogue of JAX's call partial-evaluation
@@ -810,7 +831,6 @@ where
                 inputs,
             );
         }
-
         // Split the callee through the shared online boundary machinery, bind the known side into the enclosing
         // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
         // side as the residual `jit_call`, and reassemble the original output order.
@@ -1199,12 +1219,14 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
-        CaptureReference, ConditionOperation, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType,
-        DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
-        DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis,
-        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, ProgramBuilder, ReferenceType, RegionDriver,
-        RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
-        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        AtomId, CaptureReference, ConditionOperation, CustomJvpOperation, CustomVjpOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver,
+        FreezeReferenceOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation,
+        Operation, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation,
+        ReferenceAnalysisError, ReferenceReadOperation, ReferenceRoot, ReferenceSwapOperation, ReferenceType,
+        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
+        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
         TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
     };
 
@@ -1342,6 +1364,87 @@ mod tests {
                 Shape::new(vec![Dimension::Dynamic(target)]),
             ))),
         );
+    }
+
+    #[test]
+    fn test_reference_analysis_rejects_unlifted_reference_capture_metadata() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = builder
+            .add_constant(XlaConstant::Captured(CaptureReference::new(3, ArrayIrType::Reference(reference_type))));
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let error = program.analyze_references(0).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceAnalysisError>(),
+            Some(&ReferenceAnalysisError::ReferenceConstant { region: program.entry(), atom: AtomId::new(0) }),
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_substitutes_nested_jit_call_roots() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = callee_builder.add_input(reference_type.clone().into());
+        let value = callee_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut middle_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee_region = middle_builder.import_region(callee.entry_region_ref());
+        let reference = middle_builder.add_input(reference_type.clone().into());
+        let value = middle_builder
+            .add_instruction(JitCallOperation::new(), vec![callee_region], vec![reference])
+            .unwrap()[0];
+        let middle = middle_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let middle_region = builder.import_region(middle.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let value = builder.add_instruction(JitCallOperation::new(), vec![middle_region], vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let analysis = program.analyze_references(0).unwrap();
+        assert_eq!(analysis.bindings().len(), 2);
+        let callee_root = ReferenceRoot::RegionInput { region: callee_region, input_index: 0 };
+        let middle_root = ReferenceRoot::RegionInput { region: middle_region, input_index: 0 };
+        let entry_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 };
+        assert_eq!(analysis.bindings()[0].region_root(), callee_root,);
+        assert_eq!(analysis.bindings()[0].source_root(), middle_root);
+        assert_eq!(analysis.bindings()[1].region_root(), middle_root);
+        assert_eq!(analysis.bindings()[1].source_root(), entry_root);
+        assert_eq!(analysis.accesses()[0].root(), analysis.bindings()[0].region_root());
+    }
+
+    #[test]
+    fn test_core_reference_operations_promote_to_xla_reference_operations() {
+        let swap: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::ReferenceSwap(ReferenceSwapOperation).into();
+        assert!(matches!(&swap, XlaOperation::ReferenceSwap(ReferenceSwapOperation)));
+        assert!(matches!(swap.to_core_operation(), Some(ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation))));
+
+        let add_update: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation).into();
+        assert!(matches!(&add_update, XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),));
+        assert!(matches!(
+            add_update.to_core_operation(),
+            Some(ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation)),
+        ));
+
+        let freeze: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::FreezeReference(FreezeReferenceOperation).into();
+        assert!(matches!(&freeze, XlaOperation::FreezeReference(FreezeReferenceOperation)));
+        assert!(matches!(
+            freeze.to_core_operation(),
+            Some(ArrayIrOperation::FreezeReference(FreezeReferenceOperation)),
+        ));
     }
 
     #[test]
@@ -1893,6 +1996,58 @@ mod tests {
         assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
         assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_rejects_state_before_partitioning() {
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let known_input = builder.add_input(r#type.clone());
+            let runtime_input = builder.add_input(r#type.clone());
+            builder.add_instruction(NewReferenceOperation, Vec::new(), vec![known_input]).unwrap();
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input]).unwrap()[0];
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![doubled, product],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let known_input = builder.add_input(r#type.clone());
+        let runtime_input = builder.add_input(r#type.clone());
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new()),
+                vec![callee_region],
+                vec![known_input, runtime_input],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(r#type.clone());
+        assert_eq!(
+            program
+                .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)],)
+                .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                // The entry-level closure preflight identifies the intrinsic state operation before carrier-specific
+                // partitioning can stage any known work.
+                message: "`new_reference` must be discharged before partial evaluation".to_string(),
+            }),
+        );
+        assert!(outer.builder().borrow().instructions().is_empty());
     }
 
     #[test]

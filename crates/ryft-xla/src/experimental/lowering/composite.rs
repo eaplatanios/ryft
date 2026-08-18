@@ -550,6 +550,15 @@ where
         ArrayIrOperation::ReferenceRead(operation) => {
             Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
         }
+        ArrayIrOperation::ReferenceSwap(operation) => {
+            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
+        }
+        ArrayIrOperation::ReferenceAddUpdate(operation) => {
+            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
+        }
+        ArrayIrOperation::FreezeReference(operation) => {
+            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
+        }
         ArrayIrOperation::DimensionFromScalar(operation) => {
             let [input] = input_values else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());

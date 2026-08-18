@@ -528,13 +528,16 @@ impl<'c> XlaDomain<'c> {
                 message: "references must be discharged before XLA eager execution".to_string(),
             });
         }
-        // The intrinsic operation effects alone would miss region-carried state: control-flow operations do not
-        // override `Operation::effects` because region effects are aggregated arena-side. The closure-wide scan also
-        // includes dormant rule regions: although they do not execute during this eager bind, ordinary XLA rejects
-        // unresolved state program-wide, so accepting it here would only defer the failure to compilation with a less
-        // targeted diagnostic. Later phases may relax this with a proper executable-region analysis.
+        // The intrinsic operation effects alone would miss region-carried state, while effect scans alone would miss
+        // a pure reference-typed pass-through or capture. The borrowed closure scan covers dormant rule regions too
+        // without cloning their program graphs. Although those rules do not execute in this eager bind, ordinary XLA
+        // rejects unresolved references artifact-wide, so accepting one here would only defer failure to compilation
+        // with a less targeted diagnostic.
         if operation.effects().contains(Effect::OrderedState)
-            || driver.regions().any(|region| region.contains_effect_in_closure(Effect::OrderedState))
+            || driver.regions().any(|region| {
+                region.contains_effect_in_closure(Effect::OrderedState)
+                    || region.contains_atom_type_in_closure(|r#type| matches!(r#type, ArrayIrType::Reference(_)))
+            })
         {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` must be discharged before XLA eager execution", operation.name()),
@@ -3327,7 +3330,11 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
             reason: "random generation advances state according to physical rather than logical element count",
         },
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        XlaOperation::NewReference(_) | XlaOperation::ReferenceRead(_) => {
+        XlaOperation::NewReference(_)
+        | XlaOperation::ReferenceRead(_)
+        | XlaOperation::ReferenceSwap(_)
+        | XlaOperation::ReferenceAddUpdate(_)
+        | XlaOperation::FreezeReference(_) => {
             Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
         }
         XlaOperation::ShardMap(_) => {
@@ -4146,10 +4153,11 @@ mod tests {
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
         DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
-        IotaOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation, OneOperation, PrintOperation,
-        ReduceOperation, ReductionKind, Reference, ReferenceReadOperation, ReferenceType, ScaledDotOperation,
-        ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape,
-        SubOperation, WhileOperation, try_jit_with_options,
+        FreezeReferenceOperation, IotaOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation,
+        OneOperation, PrintOperation, ReduceOperation, ReductionKind, Reference, ReferenceAddUpdateOperation,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ScaledDotOperation, ScatterDimensionNumbers,
+        ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation,
+        ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6229,6 +6237,19 @@ mod tests {
     fn test_data_dependent_padding_inventory_is_kind_and_kernel_specific() {
         use DataDependentPaddingDiscipline::{RyftMasked, Unsupported, XlaMasked};
 
+        for operation in [
+            XlaOperation::NewReference(NewReferenceOperation),
+            XlaOperation::ReferenceRead(ReferenceReadOperation),
+            XlaOperation::ReferenceSwap(ReferenceSwapOperation),
+            XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
+            XlaOperation::FreezeReference(FreezeReferenceOperation),
+        ] {
+            assert_eq!(
+                data_dependent_padding_discipline(&operation),
+                Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
+            );
+        }
+
         for kind in [ReductionKind::Sum, ReductionKind::Max, ReductionKind::Min, ReductionKind::Any, ReductionKind::All]
         {
             assert_eq!(reduction_data_dependent_padding_discipline(kind), XlaMasked);
@@ -7595,12 +7616,21 @@ mod tests {
     #[test]
     fn test_eager_bind_rejects_unresolved_references_before_special_cases_or_tracing() {
         let domain = XlaDomain::token();
-        assert_eq!(
-            domain.bind(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), &[]),
-            Err(ProgramError::UnsupportedOperation {
-                message: "`new_reference` must be discharged before XLA eager execution".to_string(),
-            }),
-        );
+        for operation in [
+            XlaOperation::NewReference(NewReferenceOperation),
+            XlaOperation::ReferenceRead(ReferenceReadOperation),
+            XlaOperation::ReferenceSwap(ReferenceSwapOperation),
+            XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
+            XlaOperation::FreezeReference(FreezeReferenceOperation),
+        ] {
+            let name = operation.name();
+            assert_eq!(
+                domain.bind(operation, Vec::new(), &[]),
+                Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{name}` must be discharged before XLA eager execution"),
+                }),
+            );
+        }
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -7616,17 +7646,26 @@ mod tests {
 
         // Region-carried state must be rejected too: control-flow operations report pure intrinsic effects, so the
         // guard has to union the driver's region-program effects to see a reference operation inside a loop body.
-        let body = {
+        let condition = {
             let mut builder = XlaProgramBuilder::new();
-            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
-            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
-            let next = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            let predicate = builder
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::Boolean)), Vec::new(), Vec::new())
+                .unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 1], vec![Placeholder; 1])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], Vec::new(), vec![Placeholder])
                 .unwrap()
         };
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let state = builder
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), Vec::new())
+                .unwrap()[0];
+            let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![state]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+            builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new()).unwrap()
+        };
         assert_eq!(
-            XlaDomain::token().bind(XlaOperation::While(WhileOperation::new()), vec![body], &[]),
+            XlaDomain::token().bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &[]),
             Err(ProgramError::UnsupportedOperation {
                 message: "`while` must be discharged before XLA eager execution".to_string(),
             }),
@@ -7657,7 +7696,40 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(
-            XlaDomain::token().bind(XlaOperation::CustomJvp(CustomJvpOperation::new()), vec![primal, rule], &[]),
+            XlaDomain::token().bind(
+                XlaOperation::CustomJvp(CustomJvpOperation::new()),
+                vec![primal.clone(), rule],
+                &[],
+            ),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`custom_jvp` must be discharged before XLA eager execution".to_string(),
+            }),
+        );
+
+        // A pure reference-typed capture in the dormant rule has no ordered-state effect, so only the complete-arena
+        // type scan can keep eager and compiled XLA rejection policy aligned.
+        let pure_reference_rule = {
+            let mut builder = XlaProgramBuilder::new();
+            let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            builder.add_constant(XlaConstant::Captured(CaptureReference::new(
+                0,
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+            )));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![state, state_tangent],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            XlaDomain::token().bind(
+                XlaOperation::CustomJvp(CustomJvpOperation::new()),
+                vec![primal, pure_reference_rule],
+                &[],
+            ),
             Err(ProgramError::UnsupportedOperation {
                 message: "`custom_jvp` must be discharged before XLA eager execution".to_string(),
             }),

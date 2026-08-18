@@ -8952,7 +8952,10 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
-        use ryft_core::{NewReferenceOperation, ReferenceReadOperation};
+        use ryft_core::{
+            FreezeReferenceOperation, NewReferenceOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
+            ReferenceSwapOperation,
+        };
 
         assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
 
@@ -8962,8 +8965,21 @@ mod tests {
         let reference = builder
             .add_instruction(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), vec![input])
             .unwrap()[0];
-        let output = builder
+        let snapshot = builder
             .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation), Vec::new(), vec![reference])
+            .unwrap()[0];
+        let old_value = builder
+            .add_instruction(XlaOperation::ReferenceSwap(ReferenceSwapOperation), Vec::new(), vec![reference, snapshot])
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
+                Vec::new(),
+                vec![reference, old_value],
+            )
+            .unwrap();
+        let output = builder
+            .add_instruction(XlaOperation::FreezeReference(FreezeReferenceOperation), Vec::new(), vec![reference])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
