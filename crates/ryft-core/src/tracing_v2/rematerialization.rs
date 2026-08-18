@@ -2274,6 +2274,7 @@ mod tests {
     use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::RegionRole;
+    use crate::tests::TestOrderedStateOperation;
 
     use super::*;
 
@@ -4072,6 +4073,44 @@ mod tests {
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 8.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 12.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_ordered_state_residuals_are_non_recomputable() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let state = builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![state]).unwrap()[0];
+        let primal =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Classification sees the state effect through the pure residual root and therefore must upgrade that root
+        // from recompute to save. This is the exact predicate used by the producer-topological force-save pass.
+        let instruction_by_output = primal.instruction_by_output();
+        assert!(
+            !residual_slice_is_pure(&primal, &instruction_by_output, &HashSet::new(), &mut HashSet::new(), output,)
+        );
+
+        // The resolver independently refuses to copy the state producer if classification ever misses the upgrade.
+        let mut destination = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
+        let destination_input = destination.add_input(scalar_type.clone());
+        let mut resolver = PrimalSliceResolver::new(&primal, &[destination_input]);
+        assert!(matches!(
+            resolver.resolve(output, &mut destination),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "rematerialization attempted to recompute the non-pure operation `state`",
+        ));
+
+        // Once force-saved, the residual is an immutable cut. Reconstruction resolves it directly and imports no
+        // unresolved state instruction into the backward or tangent program.
+        let mut destination = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
+        let destination_input = destination.add_input(scalar_type.clone());
+        let saved = destination.add_input(scalar_type);
+        let mut resolver = PrimalSliceResolver::new(&primal, &[destination_input]);
+        resolver.seed_cut(output, saved);
+        assert_eq!(resolver.resolve(output, &mut destination), Ok(saved));
+        assert!(destination.instructions().is_empty());
     }
 
     #[test]

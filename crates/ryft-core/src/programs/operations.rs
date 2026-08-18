@@ -496,12 +496,32 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Returns information about which attached-[`Region`](crate::Region) `output_index`-th output can come from.
-    /// An empty vector means that the [`Instruction`](crate::Instruction) result is produced by the [`Operation`]
-    /// itself. A non-empty vector forwards the result to every listed region output, in semantic order. Analyses
-    /// recursively resolve those outputs and may therefore recover no instruction producer when a path ends at a
-    /// region input or constant. Region-forwarding operations such as the condition and scan operations override this
-    /// function. The empty default is correct for every operation whose results are not forwarded region outputs.
+    /// Returns the parent [`Instruction`](crate::Instruction) input that directly supplies `input_index` of attached
+    /// [`Region`](crate::Region) at index `region_index`. [`None`] means that the region input is not a direct
+    /// forwarding of one instruction input and may instead be derived by the operation, such as a sliced scan element.
+    ///
+    /// This is the input side counterpart of [`Self::output_region_provenance`]. Together they describe value flow
+    /// across an operation's attached region boundary. For example, for a condition with inputs `(predicate, value)`,
+    /// branch input `0` comes from instruction input `1`, while instruction output `0` may come from output `0` of
+    /// either branch. Analyses use the input relation to carry identities and canonical resource roots into nested
+    /// regions without guessing from equal types or matching positions. The default is correct when no region input
+    /// directly forwards an instruction input.
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        let _ = (region_index, input_index);
+        None
+    }
+
+    /// Returns the attached [`Region`](crate::Region) outputs that may directly supply output `output_index` of the
+    /// parent [`Instruction`](crate::Instruction). Each item identifies one attached region and one output within it.
+    /// Multiple items represent alternative sources, such as the corresponding outputs of a condition's two branches,
+    /// and semantic order is preserved. An empty vector means that the operation itself produces the instruction
+    /// output.
+    ///
+    /// This is the output side counterpart of [`Self::input_region_provenance`]. Analyses can recursively follow the
+    /// returned region outputs to their producers; a path may end at a region input or constant and therefore have no
+    /// producing instruction. The empty default is correct when instruction outputs do not directly forward outputs
+    /// from attached regions.
     #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
@@ -627,6 +647,11 @@ impl<O: Operation> Operation for Box<O> {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError> {
         self.as_ref().infer_output_types(input_types, region_interfaces)
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        self.as_ref().input_region_provenance(region_index, input_index)
     }
 
     #[inline]
@@ -933,6 +958,10 @@ mod tests {
             Ok(input_types.iter().chain(region_interfaces[0].output_types()).cloned().collect())
         }
 
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+            (region_index == 0).then_some(input_index + 1)
+        }
+
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
             vec![OutputRegionProvenance { region_index: 0, output_index }]
         }
@@ -1074,6 +1103,8 @@ mod tests {
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
+        assert_eq!(operation.input_region_provenance(0, 2), Some(3));
+        assert_eq!(operation.input_region_provenance(1, 2), None);
         assert_eq!(
             operation.infer_output_types(&[DataType::F32], &region_interfaces),
             Ok(vec![DataType::F32, DataType::F64]),

@@ -28,12 +28,14 @@ pub use arrays::{
     ArrayType, ArrayTypeRefinements, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device,
     DeviceId, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations,
     DimensionSource, DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable, ExactShape,
-    ExactShapeDimension, Layout, LayoutError, LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis,
-    MeshAxisType, ProcessIndex, RaggedArrayBatchingPolicy, RaggedAxis, ReplicatedDimensionBatchingPolicy, Shape,
-    Sharding, ShardingDimension, ShardingError, ShardingVisualization, StaticArrayBatchingPolicy, StaticShape,
-    StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements,
-    encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
-    f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4, validate_storage_bytes,
+    ExactShapeDimension, ExternalReferenceRoot, Layout, LayoutError, LinearResiduals, LogicalMesh,
+    MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, RaggedArrayBatchingPolicy, RaggedAxis,
+    ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding, ReferenceRoot,
+    ReferenceSource, ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError,
+    ShardingVisualization, StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
+    bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn,
+    f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4,
+    materialize_array_tangent, u1, u2, u4, validate_storage_bytes,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -133,9 +135,11 @@ pub use operations::{
     DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
     DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, ElementwiseOperation, NEW_REFERENCE_OPERATION_NAME, NewReference,
-    NewReferenceOperation, PRINT_OPERATION_NAME, Print, PrintOperation, REFERENCE_READ_OPERATION_NAME,
-    RUNTIME_DIMENSION_DATA_TYPE, ReferenceRead, ReferenceReadOperation, TAG_OPERATION_NAME,
+    DimensionToScalarOperation, ElementwiseOperation, FREEZE_REFERENCE_OPERATION_NAME, FreezeReference,
+    FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME, NewReference, NewReferenceOperation, PRINT_OPERATION_NAME,
+    Print, PrintOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
+    REFERENCE_SWAP_OPERATION_NAME, RUNTIME_DIMENSION_DATA_TYPE, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, TAG_OPERATION_NAME,
     TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation, TransferToMemory, TransferToMemoryOperation,
     forward_collective_to_parent,
 };
@@ -153,14 +157,14 @@ pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BindingRegionDriver, CalleeRegionDriver, Concretizable,
     DestinationRegionMapping, Effect, Effects, EmptyRegionDriver, FlatProgram, Instruction, InstructionId, MaybeZero,
     MemberOperation, NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider,
-    OutputRegionProvenance, ParameterProjection, Program, ProgramBuilder, ProgramError, ProgramLiveSets,
-    ProgramStatistics, ProjectedValue, Reference, ReferenceAccessMode, ReferenceError, ReferenceInputAccess,
-    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, Transform, TransformArtifact,
-    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
-    TypeRefinements, Typed, Value, ValueId, ValueProjection, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    OutputRegionProvenance, ParameterProjection, PrevalidatedReplay, Program, ProgramBuilder, ProgramError,
+    ProgramLiveSets, ProgramStatistics, ProjectedValue, Reference, ReferenceAccessMode, ReferenceError,
+    ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType,
+    ReferenceTypeRefinements, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
+    Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId, ValueProjection,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -206,8 +210,8 @@ pub(crate) mod tests {
         /// Region-free binary addition stand-in used inside region bodies.
         Add,
 
-        /// Region-free unary identity stand-in with an observable ordered-IO effect.
-        Effectful,
+        /// Region-free unary identity stand-in with the declared observable effect.
+        Effectful(Effect),
 
         /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
@@ -220,14 +224,14 @@ pub(crate) mod tests {
         fn name(&self) -> &'static str {
             match self {
                 Self::Add => "add",
-                Self::Effectful => "effectful",
+                Self::Effectful(_) => "effectful",
                 Self::WithRegions(_) => "with_regions",
             }
         }
 
         fn region_slots(&self) -> &'static [RegionSlot] {
             match self {
-                Self::Add | Self::Effectful => &[],
+                Self::Add | Self::Effectful(_) => &[],
                 Self::WithRegions(slots) => slots,
             }
         }
@@ -242,7 +246,7 @@ pub(crate) mod tests {
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
-                Self::Effectful => {
+                Self::Effectful(_) => {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
@@ -263,8 +267,43 @@ pub(crate) mod tests {
         fn effects(&self) -> Effects {
             match self {
                 Self::Add | Self::WithRegions(_) => Effects::PURE,
-                Self::Effectful => Effects::single(Effect::OrderedIo),
+                Self::Effectful(effect) => Effects::single(*effect),
             }
+        }
+    }
+
+    /// Region-free test [`Operation`] family isolating ordered-state effect handling (i.e., simplification liveness
+    /// and ordering, rematerialization boundaries) from reference-operation semantics.
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum TestOrderedStateOperation {
+        /// Pure unary work that transforms may remove when its result is dead.
+        Pure,
+
+        /// Unary ordered-state access carrying a stable ordinal used to assert relative order.
+        State(u8),
+    }
+
+    impl Operation for TestOrderedStateOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Pure => "pure",
+                Self::State(_) => "state",
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            check_count!("input", input_types, 1, TypeError);
+            Ok(input_types.to_vec())
+        }
+
+        fn effects(&self) -> Effects {
+            if matches!(self, Self::State(_)) { Effects::single(Effect::OrderedState) } else { Effects::PURE }
         }
     }
 

@@ -279,6 +279,10 @@ trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
+    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<usize> {
+        None
+    }
+
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         let _ = output_index;
         Vec::new()
@@ -990,6 +994,10 @@ impl Operation for PrintOperation {
         Ok(input_types.to_vec())
     }
 
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(input_index)
+    }
+
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
@@ -1368,6 +1376,9 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(print.rename_type_identities(&TypeIdentityRenaming::new()), Ok(print.clone()));
     assert_eq!(print.infer_region_input_types(&[DataType], &[]), Ok(vec![Some(vec![DataType])]));
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
+    assert_eq!(add.input_region_provenance(0, 0), None);
+    assert_eq!(print.input_region_provenance(0, 2), Some(2));
+    assert_eq!(print.input_region_provenance(1, 2), None);
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));
