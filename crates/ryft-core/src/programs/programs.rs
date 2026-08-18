@@ -2006,7 +2006,7 @@ mod tests {
     use crate::programs::operations::OperationFormatter;
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
-    use crate::tests::TestRegionOperation;
+    use crate::tests::{TestOrderedStateOperation, TestRegionOperation};
 
     use super::*;
 
@@ -2223,6 +2223,53 @@ mod tests {
             builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
         ));
+    }
+
+    #[test]
+    fn test_program_new_rejects_orphan_variable_outputs() {
+        let output = AtomId::new(0);
+        let region =
+            Region::new(vec![Atom::Variable(ArrayType::scalar(DataType::F32))], Vec::new(), vec![output], Vec::new());
+        assert!(matches!(
+            Program::<Array, ArrayOperation<Array>, (), Array>::new(
+                (),
+                Placeholder,
+                vec![region],
+                RegionId::new(0),
+            ),
+            Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
+        ));
+    }
+
+    #[test]
+    fn test_program_new_rejects_cyclic_use_def_graphs() {
+        // Every safe program construction path seals each region and validates definition-before-use. A cyclic graph
+        // necessarily contains a forward use, so it is rejected before any rebuild can observe it.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1)],
+            vec![
+                Instruction::new(
+                    AddOperation::new().into(),
+                    vec![AtomId::new(0), AtomId::new(2)],
+                    vec![AtomId::new(1)],
+                    Vec::new(),
+                ),
+                Instruction::new(NegOperation::new().into(), vec![AtomId::new(1)], vec![AtomId::new(2)], Vec::new()),
+            ],
+        );
+        assert_eq!(
+            Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+                vec![Placeholder],
+                vec![Placeholder],
+                vec![region],
+                RegionId::new(0),
+            )
+            .map(|_| ()),
+            Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string())),
+        );
     }
 
     #[test]
@@ -2748,6 +2795,43 @@ mod tests {
     }
 
     #[test]
+    fn test_program_simplified_preserves_ordered_state_in_program_order() {
+        let build = || {
+            let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            let first =
+                builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input]).unwrap()[0];
+            builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![first]).unwrap();
+            builder.add_instruction(TestOrderedStateOperation::State(1), Vec::new(), vec![input]).unwrap();
+            builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap()
+        };
+
+        // Both state results are dead and the pure instruction between them is dead. The state effect alone retains
+        // both accesses, and their ordinals prove that borrowing and consuming simplification preserve source order.
+        let expected = vec![TestOrderedStateOperation::State(0), TestOrderedStateOperation::State(1)];
+        assert_eq!(
+            build()
+                .simplified()
+                .unwrap()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().clone())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+        assert_eq!(
+            build()
+                .into_simplified()
+                .unwrap()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().clone())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+    }
+
+    #[test]
     fn test_program_simplified_multi_region() {
         // We use two sealed regions: a pure one (^0) referenced only by a dead instruction, and an effectful one (^1)
         // referenced by another dead instruction. Simplification drops the pure dead instruction together with its
@@ -2763,7 +2847,7 @@ mod tests {
         let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
         let effectful_output = effectful_builder
-            .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![effectful_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![effectful_input])
             .unwrap()[0];
         let effectful_program = effectful_builder
             .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
@@ -3179,48 +3263,6 @@ mod tests {
     }
 
     #[test]
-    fn test_program_rebuilds_reject_cyclic_use_def_graphs() {
-        // Sealing a region checks neither definition-before-use nor acyclicity, so a hand-built region may contain a
-        // use-def cycle. Both rebuild walks must report it instead of scheduling its instructions forever.
-        let scalar = ArrayType::scalar(DataType::F64);
-        let region = Region::new(
-            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
-            vec![AtomId::new(0)],
-            vec![AtomId::new(1)],
-            vec![
-                Instruction::new(
-                    AddOperation::new().into(),
-                    vec![AtomId::new(0), AtomId::new(2)],
-                    vec![AtomId::new(1)],
-                    Vec::new(),
-                ),
-                Instruction::new(NegOperation::new().into(), vec![AtomId::new(1)], vec![AtomId::new(2)], Vec::new()),
-            ],
-        );
-        let cyclic = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
-            vec![Placeholder],
-            vec![Placeholder],
-            vec![region],
-            RegionId::new(0),
-        )
-        .unwrap();
-
-        let expected = "instruction 0 was scheduled twice, which indicates a cyclic use-def graph";
-        assert!(matches!(
-            cyclic.simplified(),
-            Err(ProgramError::MalformedProgram(message)) if message == expected,
-        ));
-        assert!(matches!(
-            cyclic.clone().into_filtered(&[AtomId::new(0)], &[AtomId::new(1)], &[]),
-            Err(ProgramError::MalformedProgram(message)) if message == expected,
-        ));
-        assert!(matches!(
-            cyclic.into_simplified(),
-            Err(ProgramError::MalformedProgram(message)) if message == expected,
-        ));
-    }
-
-    #[test]
     fn test_program_render_multi_region() {
         // A shared region renders its body once (labeled with its identifier, at its first reference) and later
         // references render as that identifier alone, while a singly referenced region renders nested inline.
@@ -3328,7 +3370,7 @@ mod tests {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
-            .add_instruction(TestRegionOperation::Effectful, Vec::new(), vec![region_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![region_input])
             .unwrap()[0];
         let region_program = region_builder
             .build::<Vec<Array>, Vec<Array>>(vec![region_output], vec![Placeholder], vec![Placeholder])
@@ -3353,6 +3395,33 @@ mod tests {
         );
         assert_eq!(program.instruction_effects(InstructionId::new(entry, 1)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::single(Effect::OrderedIo));
+
+        // Ordered state in an executable region participates in the same seal-time summary. This explicit state case
+        // pins the effect class that pre-discharge simplification and rematerialization rely on.
+        let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let body_output = body_builder
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![body_input])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![body_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(
+            program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(),
+            Effects::single(Effect::OrderedState),
+        );
+        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
 
         // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
         // containing instruction or program effectful.
