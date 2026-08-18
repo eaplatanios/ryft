@@ -137,7 +137,7 @@ pub mod values;
 
 pub use atoms::{Atom, AtomId, MaybeZero};
 pub use builders::ProgramBuilder;
-pub use effects::{Effect, Effects};
+pub use effects::{Effect, EffectOccurrence, Effects};
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{

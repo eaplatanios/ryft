@@ -1115,9 +1115,11 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
-        if let Some(operation) = region.first_operation_with_effect_in_closure(Effect::OrderedState) {
+        if let Some(occurrence) = region.effect_occurrences_in_closure(Effect::OrderedState).next() {
+            // TODO(eaplatanios): Aggregate all effect occurrences into one diagnostic once `ProgramError` supports
+            //  multi-diagnostic reporting.
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` must be discharged before partial evaluation", operation.name()),
+                message: format!("`{}` must be discharged before partial evaluation", occurrence.operation().name()),
             });
         }
 
@@ -1406,7 +1408,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         if contains_state {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "`{}` carries unresolved state in an attached region and must be discharged before partial\
+                    "`{}` carries unresolved state in an attached region and must be discharged before partial \
                     evaluation",
                     operation.name(),
                 ),
@@ -1724,9 +1726,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
         }
 
-        if let Some(operation) = self.first_operation_with_effect_in_closure(Effect::OrderedState) {
+        if let Some(occurrence) = self.effect_occurrences_in_closure(Effect::OrderedState).next() {
+            // TODO(eaplatanios): Aggregate all effect occurrences into one diagnostic once `ProgramError` supports
+            //  multi-diagnostic reporting.
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` must be discharged before partial evaluation", operation.name()),
+                message: format!("`{}` must be discharged before partial evaluation", occurrence.operation().name()),
             });
         }
 

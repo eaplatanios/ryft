@@ -33,9 +33,9 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::{Effect, Effects};
+use crate::programs::effects::{Effect, EffectOccurrence, Effects};
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
-use crate::programs::instructions::Instruction;
+use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::transforms::RegionTransformCache;
@@ -860,20 +860,38 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.any_region_in_closure(|region| region.effects().contains(effect))
     }
 
-    /// Returns the first operation in this region's complete attached region closure that intrinsically carries
-    /// `effect`, or [`None`] when no such operation exists. Attached region effects are inspected through their own
-    /// operations rather than attributed to the enclosing carrier, preserving the precise operation diagnostic.
-    pub(crate) fn first_operation_with_effect_in_closure(self, effect: Effect) -> Option<&'r O> {
-        let mut matching = None;
-        self.any_region_in_closure(|region| {
-            matching = region
-                .instructions()
-                .iter()
-                .map(Instruction::operation)
-                .find(|operation| operation.effects().contains(effect));
-            matching.is_some()
-        });
-        matching
+    /// Returns the operations in this region's complete attached region closure that intrinsically carry `effect`.
+    /// Each occurrence retains its source [`InstructionId`], and shared descendants are visited once. Attached region
+    /// effects are inspected through their own operations rather than attributed to the enclosing carrier.
+    pub fn effect_occurrences_in_closure(self, effect: Effect) -> impl Iterator<Item = EffectOccurrence<'r, O>> {
+        let mut visited = vec![false; self.arena.len()];
+        let mut pending = vec![self.id];
+        let mut current = None;
+        std::iter::from_fn(move || {
+            loop {
+                if let Some((region_id, instruction_index)) = current.as_mut() {
+                    let region = RegionRef::new(self.arena, *region_id).unwrap();
+                    if let Some(instruction) = region.instructions().get(*instruction_index) {
+                        let occurrence = EffectOccurrence::new(
+                            InstructionId::new(*region_id, *instruction_index),
+                            instruction.operation(),
+                        );
+                        *instruction_index += 1;
+                        pending.extend(instruction.regions().iter().copied());
+                        if occurrence.operation().effects().contains(effect) {
+                            return Some(occurrence);
+                        }
+                        continue;
+                    }
+                    current = None;
+                }
+                let region_id = pending.pop()?;
+                if std::mem::replace(&mut visited[region_id.index()], true) {
+                    continue;
+                }
+                current = Some((region_id, 0));
+            }
+        })
     }
 
     /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure has a type accepted by
@@ -1935,12 +1953,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            vec![Instruction::new(
-                TestRegionOperation::Effectful(Effect::OrderedIo),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )],
+            vec![
+                Instruction::new(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), Vec::new(), Vec::new()),
+                Instruction::new(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), Vec::new(), Vec::new()),
+            ],
         )];
         const DEPTH: usize = 64;
         for level in 0..DEPTH {
@@ -1964,6 +1980,13 @@ mod tests {
         assert!(top.effects().is_pure());
         assert!(top.contains_effect_in_closure(Effect::OrderedIo));
         assert!(!top.contains_effect_in_closure(Effect::OrderedState));
+        let occurrences = top.effect_occurrences_in_closure(Effect::OrderedIo).collect::<Vec<_>>();
+        assert_eq!(occurrences.len(), 2);
+        assert_eq!(occurrences[0].instruction(), InstructionId::new(RegionId::new(0), 0));
+        assert_eq!(occurrences[1].instruction(), InstructionId::new(RegionId::new(0), 1));
+        assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
+        assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
+        assert_eq!(top.effect_occurrences_in_closure(Effect::OrderedState).count(), 0);
     }
 
     #[test]

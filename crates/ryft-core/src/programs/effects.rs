@@ -1,3 +1,5 @@
+use crate::programs::instructions::InstructionId;
+
 /// Named class of observable _effects_ that an [`Operation`](crate::Operation) can have. Effect classes exist because
 /// [`Program`](crate::Program) transforms and backend lowering can have behavior conditional on those classes. For
 /// example, XLA lowering threads StableHLO token chains for backend-supported ordered classes to preserve execution
@@ -155,11 +157,44 @@ impl IntoIterator for Effects {
     }
 }
 
+/// [`Effect`] that is intrinsically carried by an [`Instruction`](crate::Instruction) in a [`Region`](crate::Region).
+pub struct EffectOccurrence<'o, O> {
+    /// Location of the [`Instruction`](crate::Instruction) that corresponds to this [`Effect`] occurrence in the source
+    /// [`Region`](crate::Region) arena.
+    instruction: InstructionId,
+
+    /// [`Effect`]-carrying [`Operation`](crate::Operation).
+    operation: &'o O,
+}
+
+impl<'o, O> EffectOccurrence<'o, O> {
+    /// Creates a new [`EffectOccurrence`].
+    #[inline]
+    pub(crate) fn new(instruction: InstructionId, operation: &'o O) -> Self {
+        Self { instruction, operation }
+    }
+
+    /// Returns the location of the [`Instruction`](crate::Instruction) that corresponds to this [`Effect`] occurrence
+    /// in the source [`Region`](crate::Region) arena.
+    #[inline]
+    pub fn instruction(&self) -> InstructionId {
+        self.instruction
+    }
+
+    /// Returns the [`Effect`]-carrying [`Operation`](crate::Operation).
+    #[inline]
+    pub fn operation(&self) -> &'o O {
+        self.operation
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
+
+    use crate::programs::regions::RegionId;
 
     use super::*;
 
@@ -227,5 +262,14 @@ mod tests {
         assert_eq!(lookup.get(&Effects::single(Effect::OrderedIo)), Some(&"ordered I/O"));
         assert_eq!(lookup.get(&unordered.union(ordered_io).union(assertion).union(ordered_state)), Some(&"all"));
         assert_eq!(lookup.get(&unordered), None);
+    }
+
+    #[test]
+    fn test_effect_occurrence() {
+        let operation = "effectful";
+        let instruction = InstructionId::new(RegionId::new(2), 3);
+        let occurrence = EffectOccurrence::new(instruction, &operation);
+        assert_eq!(occurrence.instruction(), instruction);
+        assert_eq!(occurrence.operation(), &operation);
     }
 }
