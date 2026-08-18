@@ -65,9 +65,9 @@
 //! # Identity, Concretization, and Failure Propagation
 //!
 //! [`PartialTracer`] equality is logical transform identity—two live tracers compare equal only when they share one
-//! materialization slot—not equality of their eventual payloads. This conservative identity is used by fixed-point and
-//! passthrough analyses. Host control flow can inspect a known tracer only when its parent context resolves it to a
-//! constant supporting the requested concretization; unknown and opaque values remain residual.
+//! materialization slot, not when their eventual payloads are equal. This conservative identity is used by fixed-point
+//! and passthrough analyses. Host control flow can inspect a known tracer only when its parent context resolves it to
+//! a constant supporting the requested concretization; unknown and opaque values remain residual.
 //!
 //! Binding failures are deferred through poisoned [`PartialTracer`]s so infallible operator syntax can continue to
 //! construct the surrounding closure. Poison propagates through later binds, and the partial-evaluation boundary
@@ -77,9 +77,10 @@
 //! # Control Flow, Effects, and Recursion
 //!
 //! Higher-order rules receive a [`PartialEvaluationDriver`] for recursively transforming attached regions. A rule may
-//! inline selected nested work; uninlined mixed work remains attached to a residual operation. Effectful operations
-//! follow the same placement rule as pure ones: all-known effects execute under an eager parent or stage under a
-//! staging parent, while unknown-dependent effects remain residual. Probe-based fixed points must not speculatively
+//! inline selected nested work; uninlined mixed work remains attached to a residual operation. Ordinary effectful
+//! operations follow the same placement rule as pure ones: all-known effects execute under an eager parent or stage
+//! under a staging parent, while unknown-dependent effects remain residual. Unresolved ordered state is excluded from
+//! both placements and must be discharged before partial evaluation. Probe-based fixed points must not speculatively
 //! execute effectful bodies, because every probe would otherwise repeat or duplicate the effect.
 //!
 //! # Extending Partial Evaluation
@@ -102,8 +103,8 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
-    AtomId, BindingRegionDriver, EmptyRegionDriver, FlatProgram, Operation, Program, ProgramBuilder, ProgramError,
-    ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, FlatProgram, Operation, Program, ProgramBuilder,
+    ProgramError, ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
     TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
@@ -724,6 +725,9 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
     /// the following semantics:
     ///
+    ///   - An operation that declares [`Effect::OrderedState`], or whose complete attached region closure contains that
+    ///     effect, is rejected before input knownness is inspected. Unresolved state may neither execute on the known
+    ///     side nor survive in the residual program.
     ///   - When *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
     ///     [`bind`](Context::bind)ing it in the known-side context, interpreting it immediately under an eager context,
     ///     and staging it into the outer program under a [`StagingContext`], so that the operation's outputs become
@@ -867,10 +871,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     /// # Effect Placement Contract
     ///
-    /// Operations whose [`effects`](Operation::effects) are not [`Effects::PURE`](crate::Effects::PURE) follow the
-    /// same known-ness placement: an all-known effectful operation folds into the known side, and a mixed-input one
-    /// residualizes. This encodes the split's execution contract where all known work must run before residual work,
-    /// so that an effect's side is determined by its input known-ness:
+    /// Operations whose [`effects`](Operation::effects) are not [`Effects::PURE`](crate::Effects::PURE) ordinarily
+    /// follow the same known-ness placement: an all-known effectful operation folds into the known side, and a
+    /// mixed-input one residualizes. [`Effect::OrderedState`] is the exception: unresolved state is rejected before the
+    /// knownness branch, including state anywhere in the complete attached-region closure, because neither executing it
+    /// during specialization nor preserving it past the transform boundary is valid. For the remaining effects, the
+    /// split's execution contract requires all known work to run before residual work, so that an effect's side is
+    /// determined by its input known-ness:
     ///
     ///   - Under an *eager* known-side context, folding executes the effect at partial-evaluation time, because the
     ///     known side of an eager split **is** executed at partial-evaluation time. This is also what makes
@@ -907,6 +914,11 @@ impl<C: Context> PartialEvaluationContext<C> {
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let operation = operation.into();
+        self.validate_no_unresolved_references_or_state(
+            &operation,
+            inputs,
+            regions.iter().map(|region| region.entry_region_ref()),
+        )?;
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
             Ok(self
@@ -961,6 +973,13 @@ impl<C: Context> PartialEvaluationContext<C> {
         regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let operation = operation.into();
+        self.validate_no_unresolved_references_or_state(
+            &operation,
+            inputs,
+            regions.iter().map(Program::entry_region_ref),
+        )?;
+
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
         let input_atoms = inputs
@@ -1096,12 +1115,31 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
+        if let Some(operation) = region.first_operation_with_effect_in_closure(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` must be discharged before partial evaluation", operation.name()),
+            });
+        }
+
+        if inputs.iter().any(|input| input.r#type().is_reference())
+            || region.contains_atom_type_in_closure(Type::is_reference)
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before partial evaluation".to_string(),
+            });
+        }
+
         let region_mappings = RegionReplayMappings::new();
         region.interpret_with(
             inputs,
             |_, constant| Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant.clone())?)),
             |instruction, inputs| {
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                // This replay loop and `Context::bind` are the only two production paths into partial-evaluation rules,
+                // so gating every replayed instruction here (with `fold_or_residualize` retaining its own gate as
+                // direct-invocation defense) covers all higher-order operations centrally (including future ones that
+                // would otherwise each have to remember a per-rule preamble).
+                self.validate_no_unresolved_references_or_state(instruction.operation(), inputs, regions.regions())?;
                 let driver = RecursivePartialEvaluationDriver { driver: &regions };
                 instruction.operation().partially_evaluate(self, &driver, inputs)
             },
@@ -1267,6 +1305,17 @@ impl<C: Context> PartialEvaluationContext<C> {
         self,
         outputs: Vec<PartialEvaluationValue<C::Value>>,
     ) -> Result<PartialEvaluation<C>, ProgramError> {
+        let builder = self.builder.borrow();
+        if outputs.iter().any(|output| output.r#type().is_reference())
+            || builder.atoms().iter().any(|atom| atom.r#type().is_reference())
+            || builder.regions.iter().any(|region| region.atoms().iter().any(|atom| atom.r#type().is_reference()))
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before partial evaluation".to_string(),
+            });
+        }
+        drop(builder);
+
         // Assemble outputs. Folded values return directly and residual values index the residual program's outputs.
         let mut evaluation_outputs = Vec::with_capacity(outputs.len());
         let mut residual_output_atoms: Vec<AtomId> = Vec::new();
@@ -1297,6 +1346,74 @@ impl<C: Context> PartialEvaluationContext<C> {
             )?
             .into_simplified()?;
         Ok(PartialEvaluation { program, inputs, outputs: evaluation_outputs })
+    }
+
+    /// Rejects an operation application whose inputs contain references or whose operation or complete attached region
+    /// closure contains unresolved references or ordered state. The partial-evaluation bind, replay, fold, and residual
+    /// emission boundaries call this before executing, partitioning, importing, or emitting the application.
+    ///
+    /// The operation-local diagnostic intentionally matches the conservative reference-operation rules. The attached
+    /// region diagnostic identifies the higher-order carrier whose region closure is unsafe, including state hidden
+    /// under dormant rule regions that ordinary executable region effect summaries exclude.
+    fn validate_no_unresolved_references_or_state<
+        'r,
+        'i,
+        V: Typed<Type = C::Type> + 'i,
+        I: IntoIterator<Item = &'i V>,
+        R: IntoIterator<Item = RegionRef<'r, C::Constant, C::Operation>>,
+    >(
+        &self,
+        operation: &C::Operation,
+        inputs: I,
+        regions: R,
+    ) -> Result<(), ProgramError>
+    where
+        C::Constant: 'r,
+        C::Operation: 'r,
+    {
+        if operation.effects().contains(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` must be discharged before partial evaluation", operation.name()),
+            });
+        }
+
+        if inputs.into_iter().any(|input| input.r#type().is_reference()) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` consumes unresolved references and must be discharged before partial evaluation",
+                    operation.name(),
+                ),
+            });
+        }
+
+        let mut contains_reference = false;
+        let mut contains_state = false;
+        for region in regions {
+            contains_reference |= region.contains_atom_type_in_closure(Type::is_reference);
+            contains_state |= region.contains_effect_in_closure(Effect::OrderedState);
+        }
+
+        if contains_reference {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` carries unresolved references in an attached region and must be discharged before partial \
+                    evaluation",
+                    operation.name(),
+                ),
+            });
+        }
+
+        if contains_state {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{}` carries unresolved state in an attached region and must be discharged before partial\
+                    evaluation",
+                    operation.name(),
+                ),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -1342,6 +1459,9 @@ where
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
+        // Unresolved state is a transform-boundary error, not a value-producing rule failure. Report it before the
+        // generic poison propagation below, where a zero-result operation or dead result could otherwise erase it.
+        self.validate_no_unresolved_references_or_state(&operation, inputs, driver.regions())?;
         let input_values = inputs.iter().map(|input| input.value()).collect::<Result<Vec<_>, _>>();
         let error = match input_values {
             Ok(input_values) => {
@@ -1604,6 +1724,20 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
         }
 
+        if let Some(operation) = self.first_operation_with_effect_in_closure(Effect::OrderedState) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` must be discharged before partial evaluation", operation.name()),
+            });
+        }
+
+        if inputs.iter().any(|input| input.r#type().is_reference())
+            || self.contains_atom_type_in_closure(Type::is_reference)
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "references must be discharged before partial evaluation".to_string(),
+            });
+        }
+
         let context = PartialEvaluationContext::new(context.clone());
         let mut seed = Vec::with_capacity(inputs.len());
         for (index, knowledge) in inputs.iter().enumerate() {
@@ -1795,13 +1929,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayTracingContext, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayTracingContext, ArrayType, DataType,
+    };
     use crate::contexts::{Context, StagingContext};
+    use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, ConstantOperation, MulOperation, NegOperation, PrintOperation, SinOperation, Zero,
+        AddOperation, ConditionOperation, ConstantOperation, MulOperation, NegOperation, PrintOperation, SinOperation,
+        Zero,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, Concretizable, ProgramBuilder, ProgramError};
+    use crate::programs::{
+        AtomId, Concretizable, Effects, ProgramBuilder, ProgramError, Reference, ReferenceType, RegionInterface,
+        RegionSlot,
+    };
 
     use super::*;
 
@@ -2064,6 +2205,309 @@ mod tests {
             ArrayType::scalar(DataType::F64),
             AtomId::new(0)
         )]),);
+    }
+
+    #[test]
+    fn test_partial_evaluation_rejects_state_before_folding_or_residual_emission() {
+        /// Test operation family whose higher-order carrier encloses state under a dormant rule region.
+        #[derive(Clone, Debug)]
+        enum HigherOrderStateOperation {
+            /// Binary operation carrying one executable computation region.
+            HigherOrder,
+
+            /// Unary operation carrying one dormant transformation-rule region.
+            RuleCarrier,
+
+            /// Unary unresolved-state operation.
+            State,
+        }
+
+        impl Operation for HigherOrderStateOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::HigherOrder => "higher_order",
+                    Self::RuleCarrier => "rule_carrier",
+                    Self::State => "state",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::HigherOrder => const { &[RegionSlot::computation("body")] },
+                    Self::RuleCarrier => const { &[RegionSlot::rule("rule")] },
+                    Self::State => &[],
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                let expected = if matches!(self, Self::HigherOrder) { 2 } else { 1 };
+                check_count!("input", input_types, expected, TypeError);
+                Ok(vec![input_types[0].clone()])
+            }
+
+            fn effects(&self) -> Effects {
+                if matches!(self, Self::State) { Effects::single(Effect::OrderedState) } else { Effects::PURE }
+            }
+        }
+
+        impl InterpretableOperation<EagerContext<Array, Self>> for HigherOrderStateOperation {
+            fn interpret<D: InterpretationDriver<EagerContext<Array, Self>>>(
+                &self,
+                _context: &EagerContext<Array, Self>,
+                _driver: &D,
+                _inputs: &[Array],
+            ) -> Result<Vec<Array>, ProgramError> {
+                panic!("the state-bearing higher-order operation must be rejected before interpretation")
+            }
+        }
+
+        impl PartiallyEvaluatableOperation<EagerContext<Array, Self>> for HigherOrderStateOperation {}
+
+        // The executable body is superficially pure: its only state lives in a dormant rule attached to its carrier.
+        // The complete closure scan must still find that state rather than trusting ordinary executable effects.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut state_builder = ProgramBuilder::<Array, HigherOrderStateOperation>::new();
+        let state_input = state_builder.add_input(scalar_type.clone());
+        let state_output = state_builder
+            .add_instruction(HigherOrderStateOperation::State, Vec::new(), vec![state_input])
+            .unwrap()[0];
+        let state = state_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![state_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<Array, HigherOrderStateOperation>::new();
+        let state_region = body_builder.import_region(state.entry_region_ref());
+        let body_input = body_builder.add_input(scalar_type.clone());
+        let body_output = body_builder
+            .add_instruction(HigherOrderStateOperation::RuleCarrier, vec![state_region], vec![body_input])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(body.effects(), Effects::PURE);
+        assert!(body.entry_region_ref().contains_effect_in_closure(Effect::OrderedState));
+
+        let expected = ProgramError::UnsupportedOperation {
+            message: "`higher_order` carries unresolved state in an attached region and must be discharged before \
+                partial evaluation"
+                .to_string(),
+        };
+
+        // With every operand known, the pre-branch gate prevents eager interpretation of the higher-order carrier.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, HigherOrderStateOperation>::new());
+        let known = [
+            PartialEvaluationValue::known(Array::scalar(1.0_f64)),
+            PartialEvaluationValue::known(Array::scalar(2.0_f64)),
+        ];
+        assert_eq!(
+            context
+                .fold_or_residualize(HigherOrderStateOperation::HigherOrder, vec![body.clone()], &known)
+                .map(|_| ()),
+            Err(expected.clone()),
+        );
+
+        // With one unknown operand, the same gate runs before residual emission can import the state-bearing closure.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, HigherOrderStateOperation>::new());
+        let mixed = [PartialEvaluationValue::known(Array::scalar(1.0_f64)), context.unknown_input(scalar_type, 0)];
+        assert_eq!(
+            context
+                .fold_or_residualize(HigherOrderStateOperation::HigherOrder, vec![body.clone()], &mixed)
+                .map(|_| ()),
+            Err(expected.clone()),
+        );
+
+        // The public residual-emission sink independently enforces the same closure check so custom rules cannot
+        // bypass the default fold-or-residualize policy and import unresolved state directly.
+        let residual_state = {
+            let builder = context.builder.borrow();
+            (
+                builder.atoms().len(),
+                builder.input_ids().len(),
+                builder.instructions().len(),
+                builder.regions.len(),
+                context.inputs.borrow().len(),
+                context.staged_feeders.borrow().len(),
+            )
+        };
+        assert_eq!(
+            context.residualize(HigherOrderStateOperation::HigherOrder, vec![body], &mixed).map(|_| ()),
+            Err(expected),
+        );
+        {
+            let builder = context.builder.borrow();
+            assert_eq!(
+                (
+                    builder.atoms().len(),
+                    builder.input_ids().len(),
+                    builder.instructions().len(),
+                    builder.regions.len(),
+                    context.inputs.borrow().len(),
+                    context.staged_feeders.borrow().len(),
+                ),
+                residual_state,
+            );
+        }
+        assert_eq!(
+            context.residualize(HigherOrderStateOperation::State, Vec::new(), &mixed[..1]).map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`state` must be discharged before partial evaluation".to_string(),
+            }),
+        );
+        {
+            let builder = context.builder.borrow();
+            assert_eq!(
+                (
+                    builder.atoms().len(),
+                    builder.input_ids().len(),
+                    builder.instructions().len(),
+                    builder.regions.len(),
+                    context.inputs.borrow().len(),
+                    context.staged_feeders.borrow().len(),
+                ),
+                residual_state,
+            );
+        }
+    }
+
+    #[test]
+    fn test_partial_evaluation_rejects_reference_types_before_seeding_or_replay() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let expected = ProgramError::UnsupportedOperation {
+            message: "references must be discharged before partial evaluation".to_string(),
+        };
+
+        let mut passthrough_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = passthrough_builder.add_input(reference_type.clone());
+        let passthrough = passthrough_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            passthrough.partially_evaluate(&[PartialValue::Unknown(reference_type.clone())]).map(|_| ()),
+            Err(expected.clone()),
+        );
+
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let residual_state = {
+            let builder = context.builder.borrow();
+            (
+                builder.atoms().len(),
+                builder.input_ids().len(),
+                builder.instructions().len(),
+                builder.regions.len(),
+                context.inputs.borrow().len(),
+                context.staged_feeders.borrow().len(),
+            )
+        };
+        assert_eq!(
+            context
+                .residualize(
+                    TestOperation::Condition(ConditionOperation::new()),
+                    vec![passthrough.clone(), passthrough.clone()],
+                    &[],
+                )
+                .map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`condition` carries unresolved references in an attached region and must be discharged \
+                    before partial evaluation"
+                    .to_string(),
+            }),
+        );
+        {
+            let builder = context.builder.borrow();
+            assert_eq!(
+                (
+                    builder.atoms().len(),
+                    builder.input_ids().len(),
+                    builder.instructions().len(),
+                    builder.regions.len(),
+                    context.inputs.borrow().len(),
+                    context.staged_feeders.borrow().len(),
+                ),
+                residual_state,
+            );
+        }
+
+        let mut unused_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        unused_builder.add_input(reference_type.clone());
+        let array = unused_builder.add_input(array_type.clone().into());
+        let unused = unused_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        assert_eq!(
+            unused
+                .partially_evaluate_in_context(
+                    &outer,
+                    &[PartialValue::Unknown(reference_type.clone()), PartialValue::Unknown(array_type.clone().into()),],
+                )
+                .map(|_| ()),
+            Err(expected.clone()),
+        );
+        let outer_builder = outer.builder().borrow();
+        assert!(outer_builder.atoms().is_empty());
+        assert!(outer_builder.input_ids().is_empty());
+        assert!(outer_builder.instructions().is_empty());
+        assert!(outer_builder.regions.is_empty());
+        drop(outer_builder);
+
+        let mut array_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = array_builder.add_input(array_type.clone().into());
+        let array_passthrough = array_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let concrete_reference = TestValue::Reference(Reference::new(Array::scalar(1.0_f32)));
+        assert_eq!(
+            array_passthrough.partially_evaluate(&[PartialValue::Known(concrete_reference.clone())]).map(|_| ()),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            array_passthrough.partially_evaluate(&[PartialValue::Unknown(reference_type.clone())]).map(|_| ()),
+            Err(expected.clone()),
+        );
+
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let unknown_reference = context.unknown_input(reference_type, 0);
+        let observer = context.clone();
+        assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(expected.clone()));
+        let builder = observer.builder.borrow();
+        assert_eq!(builder.atoms().len(), 1);
+        assert_eq!(builder.input_ids().len(), 1);
+        assert!(builder.instructions().is_empty());
+        assert!(builder.regions.is_empty());
+        drop(builder);
+        drop(unknown_reference);
+
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let observer = context.clone();
+        assert_eq!(
+            context.into_evaluation(vec![PartialEvaluationValue::known(concrete_reference)]).map(|_| ()),
+            Err(expected.clone()),
+        );
+        let builder = observer.builder.borrow();
+        assert!(builder.atoms().is_empty());
+        assert!(builder.input_ids().is_empty());
+        assert!(builder.instructions().is_empty());
+        assert!(builder.regions.is_empty());
+        drop(builder);
+
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        context.builder.borrow_mut().import_region(passthrough.entry_region_ref());
+        let observer = context.clone();
+        assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(expected));
+        let builder = observer.builder.borrow();
+        assert!(builder.atoms().is_empty());
+        assert!(builder.input_ids().is_empty());
+        assert!(builder.instructions().is_empty());
+        assert_eq!(builder.regions.len(), 1);
     }
 
     #[test]
