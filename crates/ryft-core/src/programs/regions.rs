@@ -1333,22 +1333,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
         roots: &'r [RegionId],
         mappings: &'r RegionReplayMappings<V, O>,
     ) -> Result<Self, ProgramError> {
-        for root in roots {
-            source.with_id(*root)?;
-        }
-        Ok(Self { source, roots, mappings, validation: None })
+        Self::with_validation(source, roots, mappings, false)
     }
 
-    /// Creates a replay driver beneath a root whose complete interpretation preflight has already succeeded.
-    pub(crate) fn new_validated(
+    /// Creates a replay driver that carries preflight evidence when `validated` marks a replay beneath a root whose
+    /// complete interpretation preflight has already succeeded.
+    pub(crate) fn with_validation(
         source: RegionRef<'r, V, O>,
         roots: &'r [RegionId],
         mappings: &'r RegionReplayMappings<V, O>,
+        validated: bool,
     ) -> Result<Self, ProgramError> {
         for root in roots {
             source.with_id(*root)?;
         }
-        Ok(Self { source, roots, mappings, validation: Some(EagerReplayValidation::new()) })
+        Ok(Self { source, roots, mappings, validation: validated.then(EagerReplayValidation::new) })
     }
 }
 
@@ -1501,6 +1500,30 @@ pub struct OutputRegionProvenance {
 
     /// Index of the output in the attached [`Region`]'s output boundary.
     pub output_index: usize,
+}
+
+/// Returns a boolean mask over `region_count` [`Region`]s that represent which regions are reachable when walking
+/// attached region edges from `seeds` with `region_fn` resolving each visited [`RegionId`]. Attachments form a Directed
+/// Acyclic Graph (DAG) in which one shared region can be reachable through many paths, so this is an iterative worklist
+/// with an index-based visited mask that expands each region's edges exactly once. Seeds are themselves part of the
+/// returned mask, and a seed or attached ID outside `region_count` panics on the mask index, so callers must pass IDs
+/// already validated against the owning arena.
+pub(crate) fn reachable_region_mask<'r, V: Typed + Parameter + 'r, O: 'r>(
+    region_count: usize,
+    seeds: impl IntoIterator<Item = RegionId>,
+    region_fn: impl Fn(RegionId) -> &'r Region<V, O>,
+) -> Vec<bool> {
+    let mut reachable = vec![false; region_count];
+    let mut pending = seeds.into_iter().collect::<Vec<_>>();
+    while let Some(current) = pending.pop() {
+        if std::mem::replace(&mut reachable[current.index()], true) {
+            continue;
+        }
+        for instruction in region_fn(current).instructions() {
+            pending.extend(instruction.regions().iter().copied());
+        }
+    }
+    reachable
 }
 
 #[cfg(test)]
@@ -2187,7 +2210,7 @@ mod tests {
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(driver.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
         assert!(driver.eager_replay_validation().is_none());
-        let driver = ReplayRegionDriver::new_validated(program.entry_region_ref(), &roots, &mappings).unwrap();
+        let driver = ReplayRegionDriver::with_validation(program.entry_region_ref(), &roots, &mappings, true).unwrap();
         assert!(driver.eager_replay_validation().is_some());
     }
 
@@ -2330,5 +2353,51 @@ mod tests {
         let replacement_driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(replacement_driver.import_into(&replacement, &[None]), Ok(vec![RegionId::new(1)]));
         assert_eq!(mappings.destinations.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_reachable_region_mask() {
+        // Regions 1 and 2 both attach the shared region 0, so region 3 reaches it through two distinct paths, while
+        // region 4 is attached by nothing and stays outside every closure rooted below it.
+        let attaching = |attached: Vec<RegionId>| {
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(
+                        const { &[RegionSlot::computation("first"), RegionSlot::computation("second")] },
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                    attached,
+                )],
+            )
+        };
+        let regions = vec![
+            Region::<Array, TestRegionOperation>::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            attaching(vec![RegionId::new(0)]),
+            attaching(vec![RegionId::new(0)]),
+            attaching(vec![RegionId::new(1), RegionId::new(2)]),
+            attaching(vec![RegionId::new(0)]),
+        ];
+        let resolve = |id: RegionId| &regions[id.index()];
+
+        // The diamond root reaches every region below it exactly once and leaves the unreachable sibling out.
+        assert_eq!(
+            reachable_region_mask(regions.len(), [RegionId::new(3)], resolve),
+            vec![true, true, true, true, false],
+        );
+
+        // Seeds are part of the mask even when they attach nothing, and each seed contributes its own closure.
+        assert_eq!(
+            reachable_region_mask(regions.len(), [RegionId::new(0)], resolve),
+            vec![true, false, false, false, false],
+        );
+        assert_eq!(
+            reachable_region_mask(regions.len(), [RegionId::new(1), RegionId::new(4)], resolve),
+            vec![true, true, false, false, true],
+        );
+        assert_eq!(reachable_region_mask(regions.len(), [], resolve), vec![false; 5]);
     }
 }
