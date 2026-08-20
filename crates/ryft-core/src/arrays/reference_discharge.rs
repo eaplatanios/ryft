@@ -1085,6 +1085,9 @@ mod tests {
 
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
+    type Capture = CaptureReference<ArrayIrType>;
+    type CaptureArray = CaptureReference<ArrayType>;
+    type CaptureOperation = ArrayIrOperation<CaptureArray>;
 
     /// Test operation that deliberately reports behavior incompatible with the public discharge contract.
     #[derive(Clone, Debug)]
@@ -1622,6 +1625,46 @@ mod tests {
     }
 
     #[test]
+    fn test_discharge_local_references() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(ReferenceType::new(scalar_type()).into());
+        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let external = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Every transform adapter shares this gate, so its rejection names the requesting transform verbatim
+        // together with the caller-owned boundary source the program depends on. Public arguments and captures are
+        // both external: neither boundary can supply the runtime holder that writing final state back would need.
+        assert!(matches!(
+            external.clone().discharge_local_references(0, "differentiation"),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "differentiation supports only local references, but the program uses external \
+                    `public input 0`",
+        ));
+        assert!(matches!(
+            external.discharge_local_references(1, "batching"),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "batching supports only local references, but the program uses external `capture 0`",
+        ));
+
+        // A program that allocates every root itself passes the gate with its boundary unchanged, because hidden
+        // final-state outputs are appended only for external roots. The result is an ordinary pure array program.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(scalar_type().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, initial]).unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let local = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let discharged = local.discharge_local_references(0, "rematerialization").unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert!(discharged.effects().is_pure());
+        assert_eq!(discharged.interpret(vec![scalar(3.0)]), Ok(vec![scalar(6.0)]));
+    }
+
+    #[test]
     fn test_discharge_rejects_invalid_program_before_producing_an_artifact() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
@@ -2038,10 +2081,6 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_resolves_reference_captures_inside_condition_regions() {
-        type Capture = CaptureReference<ArrayIrType>;
-        type CaptureArray = CaptureReference<ArrayType>;
-        type CaptureOperation = ArrayIrOperation<CaptureArray>;
-
         let reference_type = ReferenceType::new(scalar_type());
         let mut branch_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = branch_builder.add_constant(Capture::new(0, reference_type.into()));
@@ -2091,10 +2130,6 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_resolves_transitively_nested_reference_captures() {
-        type Capture = CaptureReference<ArrayIrType>;
-        type CaptureArray = CaptureReference<ArrayType>;
-        type CaptureOperation = ArrayIrOperation<CaptureArray>;
-
         let reference_type = ReferenceType::new(scalar_type());
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let mut leaf_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
@@ -2137,10 +2172,6 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_threads_reference_captures_through_while() {
-        type Capture = CaptureReference<ArrayIrType>;
-        type CaptureArray = CaptureReference<ArrayType>;
-        type CaptureOperation = ArrayIrOperation<CaptureArray>;
-
         // A capture read only by the loop condition still needs a synthesized state input on both while regions, but no
         // final-state output because nothing writes it.
         let reference_type = ReferenceType::new(scalar_type());
@@ -2176,10 +2207,6 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_threads_reference_captures_through_scan() {
-        type Capture = CaptureReference<ArrayIrType>;
-        type CaptureArray = CaptureReference<ArrayType>;
-        type CaptureOperation = ArrayIrOperation<CaptureArray>;
-
         // A capture read by a scan body becomes a synthesized carry in front of the declared carry prefix, which raises
         // the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
         let reference_type = ReferenceType::new(scalar_type());
@@ -2214,10 +2241,6 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_threads_mutated_reference_capture_through_scan() {
-        type Capture = CaptureReference<ArrayIrType>;
-        type CaptureArray = CaptureReference<ArrayType>;
-        type CaptureOperation = ArrayIrOperation<CaptureArray>;
-
         // A capture that a scan body accumulates into reaches that body only through a synthesized carry, which is the
         // most involved discharge path: the state must enter the scan ahead of the declared carry prefix, be updated
         // inside the body, leave through the matching synthesized carry output, and reach the hidden entry final-state

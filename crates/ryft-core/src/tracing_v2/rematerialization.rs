@@ -2308,10 +2308,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use approx::assert_abs_diff_eq;
-
     use std::fmt::Debug;
     use std::rc::Rc;
+
+    use approx::assert_abs_diff_eq;
+    use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, Memory,
@@ -4282,17 +4283,15 @@ mod tests {
         let external = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+
+        // Routing pin only: the rematerialization adapter delegates to the shared discharge gate under the
+        // `rematerialization` transform name. The complete boundary-source semantics live in
+        // `Program::discharge_local_references`'s owner test in `arrays::reference_discharge`.
         assert!(matches!(
-            external.clone().rematerialize_with_local_references::<TestContext>(0),
+            external.rematerialize_with_local_references::<TestContext>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "rematerialization supports only local references, but the program uses external \
                     `public input 0`",
-        ));
-        assert!(matches!(
-            external.rematerialize_with_local_references::<TestContext>(1),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "rematerialization supports only local references, but the program uses external \
-                    `capture 0`",
         ));
     }
 

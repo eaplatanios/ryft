@@ -8103,8 +8103,8 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
-        let immutable_oracle = (0..3).fold(2.0f32, |state, _| state + 1.0);
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+        // Three bounded iterations accumulate the constant `1.0` into the initial `2.0` state.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
     }
 
     #[test]
@@ -8155,14 +8155,10 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
-        let mut immutable_state = 2.0f32;
-        let mut immutable_steps = Vec::new();
-        for _ in 0..3 {
-            immutable_state += 1.0;
-            immutable_steps.push(immutable_state);
-        }
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_state]);
-        assert_eq!(read_f32s(&client, &outputs[1]), immutable_steps);
+        // Three scan iterations accumulate the constant `1.0` into the initial `2.0` state, and the body's second
+        // output stacks the state observed after each iteration.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0, 4.0, 5.0]);
     }
 
     #[test]
@@ -8220,8 +8216,9 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
-        let immutable_oracle = (0..3).fold(2.0f32, |state, _| state + 1.0);
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+        // The runtime length is three, so the scan accumulates the constant `1.0` into the initial `2.0` state three
+        // times.
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
     }
 
     #[test]

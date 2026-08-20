@@ -967,7 +967,7 @@ mod tests {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let (output_type, program) = TestContext::trace(
-            |input| ReferenceRead::read(&input.new_reference()?),
+            |input| input.new_reference()?.read(),
             ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
         )
         .unwrap();
@@ -1414,7 +1414,7 @@ mod tests {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let (_, program) =
-            TestContext::trace(|input| ReferenceRead::read(&input.new_reference()?), input_type.clone()).unwrap();
+            TestContext::trace(|input| input.new_reference()?.read(), input_type.clone()).unwrap();
         let program = program.into_flat_program();
 
         // Partial evaluation must never execute, fold, or split an unresolved state chain, regardless of whether the
