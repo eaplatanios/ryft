@@ -1,7 +1,7 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** Phases 0 through 7 implemented and verified. Views, external runtime integration, and preserved kernel
-lowering remain planned.
+**Status:** Phases 0 through 9 implemented and verified. The asynchronous external runtime protocol and preserved
+kernel lowering remain planned.
 
 **Research snapshot:** 2026-08-14
 
@@ -25,7 +25,7 @@ pub enum ArrayIrType {
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
     Array(A),
     Dimension(DimensionValue),
-    Reference(Reference<A>),
+    Reference(ArrayReference<A>),
 }
 ```
 
@@ -119,7 +119,7 @@ where its contracts must live.
 | Capability | Current ownership | Consequence for references |
 |---|---|---|
 | Mixed array IR type universe | `crates/ryft-core/src/arrays/types/ir.rs` | Add `Reference`; do not create `AtomType<T>`. |
-| Mixed runtime value universe | `crates/ryft-core/src/arrays/ir.rs` | Add an identity-bearing `Reference<A>`. |
+| Mixed runtime value universe | `crates/ryft-core/src/arrays/ir.rs` | Add an identity-bearing `ArrayReference<A>`. |
 | Checked member projection | `ValueProjection` and tracer projections | Keep ordinary array operations narrow and reject references unless explicitly read. |
 | Composite operation family | `ArrayIrOperation` | Add cross-member reference operations as native mixed variants. |
 | Composite XLA domain | `XlaDomain` and `XlaOperation` | Trace references without changing the public array-only facade initially. |
@@ -189,7 +189,7 @@ Requirements:
 - Do not duplicate `Memory` or other array metadata in `ReferenceType<ArrayType>`.
 - Do not store resource identity, allocation identity, capture identity, or SSA identity in the type. This is
   load-bearing for dispatch: `ReferenceType` participates in the retained-JIT dispatch key
-  (`XlaDispatchKeyKind::Exact` over `ArrayIrType` signatures, `domains.rs:1019`), so its `Hash`/`Eq` must stay
+  (`XlaDispatchKeyKind::Exact` over `ArrayIrType` signatures), so its `Hash`/`Eq` must stay
   structural and holder-free or every holder mints its own specialization. Pin this with the same test shape as the
   existing `DimensionType` structural-hash test (`arrays/ir.rs:186-201`).
 - Do not add a `ReferenceKind` until at least two implemented behaviors require it. A speculative flag bag would make
@@ -210,12 +210,14 @@ dynamic-extent compatibility have been proven.
 
 ### 5.2 Runtime value and identity
 
-Introduce a reusable `Reference<V: Value>` holding an `Arc`-shared holder for the current value, with identity
-following the `DimensionVariable` precedent (`arrays/types/dimensions.rs:198-255`): `PartialEq` via `Arc::ptr_eq`,
-`Hash` via `Arc::as_ptr`, and a diagnostic-only `Display`. `ReferenceId` is a handle derived from that pointer (used
-for stable lock ordering and diagnostics), not a global counter — no counter scheme exists in `ryft-core` outside
-cache statistics, and none should be introduced. `ArrayIrValue<A>` stores `Reference<A>`. The exact synchronization
-primitive is an implementation choice, but the semantics are fixed:
+The reusable `Reference<V: Value>` owns the `Arc`-shared root holder. Array IR wraps it in
+`ArrayReference<A> { root, view }`, keeping root resource identity separate from the handle-local coordinate mapping.
+Root identity follows the `DimensionVariable` precedent (`arrays/types/dimensions.rs:198-255`): `PartialEq` via
+`Arc::ptr_eq`, `Hash` via `Arc::as_ptr`, and a diagnostic-only `Display`. `ReferenceId` is a handle derived from that
+pointer (used for stable lock ordering and diagnostics), not a global counter — no counter scheme exists in
+`ryft-core` outside cache statistics, and none should be introduced. `ArrayIrValue<A>` stores `ArrayReference<A>`.
+Root `Reference` equality and hashing identify the shared resource; `ArrayReference` equality and hashing additionally
+include the exact view. The synchronization primitive remains private, but the semantics are fixed:
 
 - Cloning the internal value aliases the same resource; it does not copy the array contents.
 - Equality and hashing use stable reference identity, never mutable contents. `Display` is deterministic and
@@ -231,18 +233,12 @@ primitive is an implementation choice, but the semantics are fixed:
 - Frozen, failed, or otherwise invalid state produces an explicit error rather than panicking or returning stale data.
 - The holder is an opaque `Parameter` leaf. This is free: `Parameter` is a bare marker trait (`parameters.rs:153`),
   so a leaf implementation exposes nothing and there is no traversal behavior to suppress.
-- Identity renaming of an eager `ArrayIrValue::Reference` rejects every renaming that would change the handle's type,
-  via the shared rejection helper behind the default `Value::rename_type_identities` behavior (identity renamings and
-  renamings that do not touch the handle's identities clone the handle; type-changing renamings error): renaming
-  shared holder metadata would rename every alias, while minting a new holder
-  would break resource identity, so neither is admissible. Because reference constants are structurally rejected at
-  region sealing, no built program can store an eager reference constant, so this rename rejection can never be
-  reached through program import/inlining — it governs directly held eager values only, while the staged
-  `XlaConstant` captured-reference path renames successfully because it stores only metadata. Before views land
-  (Phase 8), add a handle-local identity/view mapping and the reconstruction contract for values crossing between that
-  handle type and the root-shared stored value. The holder state and handle-local referent type are already separate;
-  the missing mapping is what lets a renamed or projected handle retain its root without misrepresenting stored value
-  metadata. Once it exists, both the rename restriction and the import limitation can be revisited.
+- Identity renaming of an eager `ArrayIrValue::Reference` preserves the shared root while deriving exact bidirectional
+  root-to-handle and handle-to-root mappings. A type-changing renaming is accepted only when both value-reconstruction
+  directions are valid and inverse at the declared types; non-bijective mappings fail without changing the holder.
+  Reference constants remain structurally rejected at region sealing because process-local holder identity cannot
+  participate in deterministic program storage. The staged `XlaConstant` captured-reference path remains
+  metadata-only and renames independently.
 - Mutable external references are not literal constants and are not serialized as payload data. They enter through
   arguments or typed captures whose invocation supplies the holder. This is enforced structurally:
   `Value::validate_as_constant` rejects reference values at region sealing — the one boundary every region
@@ -264,23 +260,26 @@ leases store that token directly; there is no `ryft-xla` side map keyed by `Refe
 It should not automatically implement `Value` in the first slice: doing so would require a standalone
 `Domain<Type = ReferenceType<V::Type>, Value = Reference<V>>` and would incorrectly imply a homogeneous reference
 operation universe. `ArrayIrValue<A>` remains the actual `Value`; its `ValueProjection<ReferenceType<ArrayType>>`
-projects to `Reference<A>`. A standalone `Value` implementation can be added later only if an independent reference
-domain has real use.
+projects to `ArrayReference<A>`. A standalone `Value` implementation can be added later only if an independent
+reference domain has real use.
 
 The generic carriers are reusable representation, not a promise that every `T` or `V` is a supported referent. Each
 composite universe chooses its admitted specialization. Array IR admits only `ReferenceType<ArrayType>` and
-`Reference<A>`; it remains structurally unable to contain a reference to a dimension, another reference, or a List.
+`ArrayReference<A>`; it remains structurally unable to contain a reference to a dimension, another reference, or a
+List.
 
 ### 5.3 Operations
 
-Start with whole-array operations:
+Start with root and view operations:
 
 | Operation | Logical signature | Semantics |
 |---|---|---|
 | `NewReferenceOperation` | `Array -> Reference` | Create a scoped root initialized from the array. |
+| `ReferenceIndexOperation` | `Reference -> Reference` | Create a pure axis-removing view alias. |
+| `ReferenceSliceOperation` | `Reference -> Reference` | Create a pure static unit-stride slice alias. |
 | `ReferenceReadOperation` | `Reference -> Array` | Snapshot the current value. |
-| `ReferenceSwapOperation` | `(Reference, Array) -> Array` | Return the old value and install the new value. |
-| `ReferenceAddUpdateOperation` | `(Reference, Array) -> ()` | Ordered elementwise accumulation. |
+| `ReferenceSwapOperation` | `(Reference, Array) -> Array` | Return and replace the selected root or view. |
+| `ReferenceAddUpdateOperation` | `(Reference, Array) -> ()` | Ordered accumulation into the selected root or view. |
 | `FreezeReferenceOperation` | `Reference -> Array` | Return final state and invalidate the entire alias family. |
 
 `swap` is the sole replacement primitive. `write`/`set` are binding-level sugar that stages a `swap` and discards the
@@ -312,12 +311,12 @@ Replacement/update type legality is stricter than `ArrayType::is_compatible_with
   the current instantiated referent type. Any promoted or broadcast result that would change stored type is rejected.
 - Reference-type compatibility/refinement is not a substitute for these operation-specific storage checks.
 
-After whole-value discharge is proven, add explicit reference views:
+Array IR represents explicit reference views as an ordered root-relative mapping:
 
 ```text
 ReferenceView {
     root,
-    ordered transforms: [index, slice, reshape, transpose, bitcast, ...]
+    ordered transforms: [index, static unit-stride slice]
 }
 ```
 
@@ -325,8 +324,9 @@ Only implemented and validated transforms may appear. A view preserves its base 
 that root, and never allocates a new resource. Indexed reads, writes, swaps, and accumulations then operate through the
 view. Views are never freezable: `freeze` accepts only a root handle, and `freeze(view)` is rejected in the MVP —
 whether it would return the slice or the complete root is ambiguous, and neither reading composes cleanly with
-alias-family invalidation. Start with indexing/slicing and reuse Ryft's canonical array indexing and gather/scatter
-descriptors rather than inventing a second indexing language.
+alias-family invalidation. The initial implementation deliberately rejects dynamic indices, non-unit strides, and
+reshape/transpose/bitcast views until each has an explicit inverse/update proof. It reuses canonical slice, reshape,
+and update-slice operations for discharge rather than inventing a second indexing language.
 
 ### 5.4 Purity, lifetime, and second-class restrictions
 
@@ -337,8 +337,11 @@ program that reads or mutates an argument or captured reference is externally st
 Initial static rules:
 
 - References cannot be public program outputs.
-- References cannot be condition branch results, while carries/results, scan sequences/carries/results, or nested-call
-  public results. Discharge-generated hidden carries and outputs are arrays, not references.
+- References cannot escape the complete program or a local allocation scope. Existing roots may be forwarded through
+  condition results, fixed-point while/scan carries, and nested-call results only when every provenance path resolves
+  to the same canonical root; scan sequence outputs remain invalid. Derived views do not cross attached-region
+  boundaries in Phase 8 and must be recreated from a carried root inside the region. Discharge-generated hidden state
+  carries and outputs are arrays, not references.
 - References cannot be nested in references or Lists.
 - Only explicit view operations introduce aliases.
 - Every reference operand resolves to exactly one canonical root.
@@ -408,7 +411,8 @@ one allocation, one read, and one view before finalizing, but it must express at
 
 ```text
 ReferenceOperationSemantics
-    outputs:  NewRoot { output_index } | Alias { output_index, input_index }
+    outputs:  NewRoot { output_index }
+              | Alias { output_index, input_index, kind: Identity | View }
     accesses: input_index -> Read | Write | Accumulate | Consume
 ```
 
@@ -418,8 +422,10 @@ one `input_index` on purpose: it structurally encodes the one-canonical-root inv
 aliases are unrepresentable rather than merely rejected. There is deliberately no `ReadWrite` mode (`swap` classifies
 as `Write`, matching JAX's `swap_p`) and no `Freeze` mode (`freeze` classifies as `Consume`, a lifetime event that
 also covers a future result-less `free_reference`). View operations attach their ordered coordinate-transform stacks
-to the `Alias` case when the Phase 8 view representation lands; the alias edge alone is all root resolution needs
-until then.
+to the arrays-owned `ArrayReferenceOperation` contract; the generic `Alias { kind: View }` edge records root
+provenance without making the generic program layer depend on array coordinate descriptors. `ReferenceAnalysis`
+validates and stores the exact composed `ArrayReferenceView` once, and discharge consumes that artifact rather than
+re-resolving view coordinates.
 
 The program-level `ReferenceAnalysis` resolves these templates to region-relative canonical roots:
 
@@ -489,8 +495,8 @@ The compilation/core-interpretation adapter must:
 1. Validate the source `ClosedProgram` and lift its captures using the existing canonical mechanism.
 2. Retain `capture_count` and classify each leading reference input as `ReferenceSource::Capture(index)`; later
    reference inputs are classified from public parameter positions. (`to_program_with_lifted_captures` records
-   nothing itself; `XlaLoweredProgram::capture_count` at `domains.rs:1232` is the existing precedent for carrying
-   this count alongside a lifted program — mirror it.)
+   nothing itself; `XlaLoweredProgram::capture_count` is the existing precedent for carrying this count alongside a
+   lifted program — mirror it.)
 3. Run reference analysis and discharge on the lifted open program.
 4. Return a binding recipe that maps each logical external-reference slot back to its original capture or public
    argument position.
@@ -499,8 +505,8 @@ The compilation/core-interpretation adapter must:
 
 Nested closed calls are already normalized at staging time: `StagedFunction::call_with_flat_capture_references_in_context`
 re-registers callee captures in the caller's table and attaches the callee's memoized lifted program
-(`compilation/function.rs:592-641`) — verify rather than implement, and memoize discharge alongside that `OnceLock`
-cache rather than invalidating it. One gap is real, however: `to_program_with_lifted_captures` rewrites
+— verify rather than implement, and memoize discharge alongside that `OnceLock` cache rather than invalidating it.
+One gap is real, however: `to_program_with_lifted_captures` rewrites
 capture-referencing constants only in the entry region, while `CaptureReference`s inside attached regions are
 preserved verbatim and resolved later against the hidden capture-argument prefix (`captures.rs:546-551`). The "no
 reference-typed `CaptureReference` survives lifting" invariant therefore does not hold automatically. Phases 4 and 5
@@ -682,11 +688,11 @@ preserves existing array-only APIs. Do not weaken the current array projection m
 Externally stateful calls return a completion-bearing wrapper conceptually like `ReferenceExecution<Output>`, even
 when `Output` has no leaves. Naming and seam: the existing pure, output-only call remains unchanged — it is not
 "synchronous" (static-shape XLA calls already enqueue work and return pending arrays, discarding only the explicit
-fence carrier, `domains.rs:2633-2639`); `call_statefully` is the blocking Phase 9 convenience; and
+fence carrier in `execute_compiled_async`); `call_statefully` is the blocking Phase 9 convenience; and
 `call_statefully_async` returns the completion-bearing wrapper, keeping its public shape in Phase 10. Model the
 stateful surface as an opt-in `StatefulCompilationDomain` capability rather than required methods on every
-`CompilationDomain`: `CompilationCall` fixes `RuntimeOutput = Output::To<D::Value>` (`compilation/function.rs:927`),
-so the stateful path is a new request/method, not a reparameterization of the existing trait. Refactor executable
+`CompilationDomain`: `CompilationCall` fixes `RuntimeOutput = Output::To<D::Value>`, so the stateful path is a new
+request/method, not a reparameterization of the existing trait. Refactor executable
 specialization acquisition so pure and stateful invocation share the dispatcher pipeline instead of duplicating it,
 and make ordinary calls explicitly reject executables with non-empty external-state metadata — the output-only path
 must never be the one that silently discards the only fence/error carrier for an externally stateful call.
@@ -720,7 +726,7 @@ pub struct XlaReferenceStateSignature {
 
 Physical indices and referent types are deliberately not stored: `XlaExecutableSignature` already models zero-space
 erasure and hidden dynamic-extent scalars through `input_mapping`/`output_mapping` and the generic
-`project_inputs`/`project_outputs` projectors (`lowering.rs:171-196`, `:327-334`), and the referent type is
+`project_inputs`/`project_outputs` projectors, and the referent type is
 `XlaLoweredProgram::input_types[logical_input_index]`. Duplicating any of them creates a second source of truth.
 Resolve physical indices through those accessors at use time, only after composing with:
 
@@ -731,7 +737,7 @@ Resolve physical indices through those accessors at use time, only after composi
 
 Never derive physical indices by adding counts or assuming one logical value maps to one physical value. This is
 already the codebase's discipline: the donation path flattens captures plus public inputs and projects through the
-signature at `domains.rs:2165-2174` — extend that construction rather than adding a parallel one.
+signature — extend that construction rather than adding a parallel one.
 
 Initially admit only these combinations, stated in terms of resolved mappings:
 
@@ -741,10 +747,8 @@ Initially admit only these combinations, stated in terms of resolved mappings:
 Public and executable output signatures are distinct concepts and must be modeled separately: the staged function's
 public output types/structure on one side, and the executable's logical output list (public outputs followed by
 hidden final-state outputs) on the other, split by a validated `public_output_count` carried through lowering,
-execution, persistence, and executable replacement. Today's lowering validates the staged public signature directly
-against the complete lowered output list (`validate_output_types` at `domains.rs:2374`) and applies user
-`out_shardings` to the complete list (`domains.rs:2460`); both must be rescoped to the public prefix, and each hidden
-state output inherits its paired input's effective sharding.
+execution, persistence, and executable replacement. Lowering validates the staged public signature and applies user
+`out_shardings` only to that public prefix; each hidden state output inherits its paired input's effective sharding.
 
 Reject any external reference whose physical input is erased, including zero-space references, until Phase 11 defines
 another representation. A read-only slot is never donated or aliased. A mutated slot has exactly one hidden output and
@@ -789,9 +793,8 @@ For each invocation:
 8. Immediately after successful PJRT submission, while the ordered holder guards remain held, atomically publish the
    execution fence as a read lease on every read-only holder and reserve a pending generation on every mutated
    holder; then release the guards. Nothing fallible precedes this step — today's output splitting constructs
-   arrays, materializes dynamic extents, and validates ownership fallibly after obtaining the fence
-   (`domains.rs:2178-2192`), so lease/reservation publication must come first or a failure there leaves active
-   device reads unregistered.
+   arrays, materializes dynamic extents, and validates ownership fallibly after obtaining the fence, so
+   lease/reservation publication must come first or a failure there leaves active device reads unregistered.
 9. Construct, split, and validate public results, hidden state results, and hidden dynamic extents.
 10. Replace every mutated holder's reservation with its pending final value, carrying readiness events and
     generation/dependency information — or poison all mutated holders if any hidden state cannot be constructed or
@@ -801,10 +804,12 @@ For each invocation:
 Required failure semantics:
 
 - Before the PJRT irreversibility boundary, every extracted mutated state is restored.
-- When `PJRT_LoadedExecutable_Execute` returns an immediate error without producing a fence, do not assume no device
-  read was accepted unless the PJRT contract proves it: restore mutated states (the pre-boundary rule), and
-  conservatively quarantine read-only participants behind a synthetic lease until the error path is proven
-  access-free. Narrow this only when the PJRT contract guarantees non-acceptance.
+- Passing prepared arguments to `PJRT_LoadedExecutable_Execute` is the Phase 9 irreversibility boundary. An immediate
+  execute error without a fence therefore poisons every extracted mutated holder conservatively; it does not restore
+  potentially donated storage. Read-only values are never donated and remain ready: Ryft's safe
+  `LoadedExecutable::execute` wrapper drops its retained input-buffer `Arc`s on this error path, whose memory-safety
+  contract therefore already requires that an immediate error retain no asynchronous device access. A narrower
+  mutated-state restore rule requires an explicit PJRT guarantee that donation was not accepted.
 - After that boundary, Ryft does not claim it can restore a potentially donated input. If all hidden final states can be
   constructed, it installs them even when later public-output reconstruction or refinement fails. If any hidden state
   cannot be constructed or validated, it poisons every mutated holder in the invocation.
@@ -818,18 +823,18 @@ Required failure semantics:
 - Once execution crosses the irreversibility boundary, dropping its completion handle does not cancel or roll back the
   mutation.
 - A holder never exposes potentially donated stale storage as its current state.
-- State installation for a multi-reference call is logically atomic: all mutated holders become pending on the same
-  submitted execution, all are restored before handoff, or all are poisoned after an unrecoverable post-handoff
-  failure.
-- Calls involving the same holder serialize through its state/dependency chain. Read-only calls may overlap only when
-  the holder tracks all outstanding read leases; a mutation waits/dependency-chains them before donation. Independent
-  holders may execute concurrently.
-- Pending states use generation-safe cumulative dependency/error chains. If call B consumes call A's pending result
-  and A later fails, B cannot overwrite or hide that failure; the holder remains poisoned. Older completion callbacks
-  cannot mutate a newer generation.
+- State installation for a Phase 9 multi-reference call is logically atomic: all mutated holders are installed after
+  completion, all are restored before handoff, or all are poisoned after an unrecoverable post-handoff failure.
+- Calls involving the same holder serialize under the ordered guards in Phase 9; read-only calls do not overlap.
+  Independent holders may execute concurrently.
+- Phase 10 replaces those long-held guards with pending states and generation-safe cumulative dependency/error chains.
+  If call B consumes call A's pending result and A later fails, B cannot overwrite or hide that failure; the holder
+  remains poisoned. Older completion callbacks cannot mutate a newer generation. Read-only calls may overlap only
+  after the holder tracks every outstanding read lease and mutations wait or dependency-chain those leases.
 
-Do not hold a host mutex for device execution duration. Install pending generation/event state and read leases, then
-let later accesses await or dependency-chain them.
+In the Phase 10 asynchronous protocol, do not hold a host mutex for device execution duration. Install pending
+generation/event state and read leases, then let later accesses await or dependency-chain them. Phase 9 deliberately
+holds ordered holder guards through synchronous device completion as its simpler transitional contract.
 
 ### 11.4 Compilation identity and persistence
 
@@ -870,7 +875,7 @@ discharge inside an explicitly validated kernel region.
 
 ### Shared core contract
 
-- `ReferenceType<ArrayType>` and `ArrayIrValue::Reference(Reference<A>)` remain unchanged.
+- `ReferenceType<ArrayType>` and `ArrayIrValue::Reference(ArrayReference<A>)` remain unchanged.
 - Root identity, access modes, lifetime checks, and view composition come from the same `ReferenceAnalysis`.
 - Ordinary and kernel lowering share read/write/swap/accumulate semantics.
 - `ArrayType` remains the canonical source of element, shape, layout, sharding, and memory information.
@@ -940,9 +945,8 @@ reference-specific when a generic boundary-widening primitive is genuinely reusa
 - [x] Prototype `tf.aliasing_output` emission on a toy module and confirm XLA accepts and honors it. No in-repo code
       currently emits this attribute, so attribute-value construction and XLA acceptance are the unproven halves of
       the §15 "no broad initial changes" claim. Merging is not at risk: `TypeAndAttributes.attributes` is a
-      per-argument `HashMap` with multi-attribute round-trip tests (`ryft-mlir/src/types.rs:120-126`,
-      `operations/traits.rs:596-680`), and sharding already attaches at the entry-lowering site to extend
-      (`sdy.sharding` in physical index space, `lowering.rs:4321-4342`).
+      per-argument `HashMap` with multi-attribute round-trip tests, and sharding already attaches at the
+      entry-lowering site to extend (`sdy.sharding` in physical index space).
 - [x] Record the supported and unsupported matrix from this document in public-facing design documentation.
 - [x] Prototype one `Reference` type projection, one `new_reference`, and one `read` through `ArrayIrOperation` without
       migrating unrelated operations.
@@ -978,8 +982,8 @@ broad trait-solver migration.
       only — nothing to suppress), and the initial holder access primitives without adding a standalone `Value`
       implementation. Freeze-driven invalidation remains Phase 3 work so Phase 1 does not add a temporary lifecycle
       state with no consuming operation.
-- [x] Add `ArrayIrValue::Reference(Reference<A>)` and
-      `ValueProjection<ReferenceType<ArrayType>, Projected = Reference<A>>`.
+- [x] Add `ArrayIrValue::Reference(ArrayReference<A>)` and
+      `ValueProjection<ReferenceType<ArrayType>, Projected = ArrayReference<A>>`.
 - [x] Implement identity-based equality/hash with deterministic type-based display (runtime identity stays on
       `Debug`, per the `Value` rendering contract) and alias-preserving internal clone behavior.
 - [x] Update exports and documentation that currently describe Array IR as containing only arrays and dimensions.
@@ -988,7 +992,7 @@ broad trait-solver migration.
       `arrays/operations/control_flow.rs` (75 matches), `arrays/batching.rs` (37), `ryft-xla/.../ops.rs` (29),
       `arrays/operations/constants.rs` (23), and `ryft-xla/.../shard_map.rs` (22) as the top sites.
 - [x] Handle `XlaConstant` explicitly: its `Captured(CaptureReference<ArrayIrType>)` variant can retain composite
-      reference-typed capture metadata, while concrete `Reference<Array>` holders remain excluded from
+      reference-typed capture metadata, while concrete `ArrayReference<Array>` holders remain excluded from
       literal/serialized constants. Do not add a `ValueProjection<ReferenceType<ArrayType>>` for `XlaConstant` until
       capture lifting consumes that projected form. By contrast, the tracer projections (`Tracer`, `PartialTracer`,
       `DifferentiationTracer`, and `CaptureReference`) are blanket implementations keyed on the seam-1 `TryFrom` and
@@ -1003,9 +1007,9 @@ broad trait-solver migration.
       `n -> m`), repeated identities, mixed array/reference occurrences of one identity, and eager non-identity rename
       rejection. Alias-family invalidation tests land with the first real consuming `freeze` operation in Phase 3.
 
-**Exit criterion:** references can be stored, typed, projected, and diagnosed — with reference *types* and staged
-metadata renameable, while eager handles reject non-identity renames until Phase 8 (§5.2) — without changing ordinary
-array/dimension behavior or being accepted by numeric operations.
+**Exit criterion:** references can be stored, typed, projected, and diagnosed without changing ordinary
+array/dimension behavior or being accepted by numeric operations. Phase 8 subsequently added exact bidirectional
+identity reconstruction for renamed eager handles (§5.2).
 
 ### Phase 2: Add effects, reference semantics, and validation
 
@@ -1015,8 +1019,9 @@ array/dimension behavior or being accepted by numeric operations.
       verifier, never a new token chain. No `Display` exists for effects, so there is no rendering to update. Add
       tests.
 - [x] Add the operation-level reference semantics contract: mutually exclusive output classification
-      (`NewRoot` | `Alias`) plus input accesses (`Read`/`Write`/`Accumulate`/`Consume`) in operation-local index
-      space, with per-operation examples in the rustdoc; view transform stacks attach to the `Alias` arm in Phase 8.
+      (`NewRoot` | `Alias`) plus input accesses (`Read`/`Write`/`Accumulate`/`Consume`) in operation-local index space.
+      `Alias` records identity versus view provenance; exact view transforms remain arrays-owned and are validated
+      through `ArrayReferenceOperation`.
 - [x] Complete the whole-array reference operation set as native `ArrayIrOperation` variants: `new_reference`, `read`,
       `swap`, additive update, and `freeze`.
 - [x] Mirror the complete operation set in `XlaOperation` so XLA staging can carry it before discharge.
@@ -1160,19 +1165,22 @@ representation or changing the executable ABI.
 
 Views land before the external runtime because they are the bread-and-butter programming model (accumulate-into-slice
 and the scan patterns references exist to replace), they are pure core analysis/discharge work with no concurrency
-risk, and they exercise the view-to-gather/scatter discharge path that later phases reuse.
+risk, and they exercise the view-to-update discharge path that later phases reuse. In the initial slice, only root
+handles cross attached-region boundaries; a derived view is recreated from the carried root inside each region. This
+keeps region state signatures root-based while supporting loop/scan update patterns without a second view-carry ABI.
 
-- [ ] Add a handle-local identity/view mapping and the value-reconstruction contract needed when values cross between
+- [x] Add a handle-local identity/view mapping and the value-reconstruction contract needed when values cross between
       that handle type and the root-shared stored value (§5.2). The holder state and handle-local type are already
       separate; the missing mapping lets renamed or projected handles retain their root without misrepresenting the
       stored value's metadata.
-- [ ] Define the composable reference-view representation, attaching the ordered transform stack to the semantics
-      contract's `Alias` arm (which ships without transforms until this phase).
-- [ ] Add indexing/slicing views and bounds/type validation.
-- [ ] Lower reads/writes/swaps/additive updates through canonical array slicing/gather/scatter/update operations.
-- [ ] Preserve base-root identity and composed access mappings.
-- [ ] Add reshape/transpose/bitcast only with explicit layout, overlap, and alias proofs.
-- [ ] Add base/view mutual-observation, composed-view, overlap, invalidation, and discharge equivalence tests.
+- [x] Define the composable arrays-owned `ArrayReferenceView`; generic alias semantics records `kind: View`, while
+      `ArrayReferenceOperation` supplies the exact transform to analysis without an ownership inversion.
+- [x] Add indexing/slicing views and bounds/type validation.
+- [x] Lower reads/writes/swaps/additive updates through canonical array slicing/reshape/update-slice operations.
+- [x] Preserve base-root identity and composed access mappings.
+- [x] Defer reshape/transpose/bitcast and non-unit-stride slices until each has explicit layout and inverse-update
+      proofs; do not accept them through the Phase 8 static index/unit-stride slice surface.
+- [x] Add base/view mutual-observation, composed-view, overlap, invalidation, and discharge equivalence tests.
 
 **Exit criterion:** views provide enough backend-neutral address semantics for ordinary discharge and future kernel
 lowering without creating independent resources.
@@ -1184,53 +1192,49 @@ holds them through device completion, then installs all hidden final states (or 
 releasing and returning. Awaiting before returning does not serialize concurrent host threads; the held guards do.
 No pending states, generations, or read leases exist yet (§11.3 staging).
 
-- [ ] Define and implement the eager/XLA holder state machine with ready, poisoned, and frozen/invalid states;
+- [x] Define and implement the eager/XLA holder state machine with ready, poisoned, and frozen/invalid states;
       pending states are deferred to Phase 10.
-- [ ] Hold per-holder guards in stable `ReferenceId` order for the entire execution, through device completion and
+- [x] Hold per-holder guards in stable `ReferenceId` order for the entire execution, through device completion and
       state installation; do not rely on await-before-return for serialization. Holding host guards across device
       execution is the accepted Phase 9 limitation that Phase 10 removes.
-- [ ] Extend the executable-signature metadata with logical reference-state slots only; resolve physical indices and
+- [x] Extend the executable-signature metadata with logical reference-state slots only; resolve physical indices and
       referent types through the existing `input_mapping`/`output_mapping`/`input_types` accessors at use time
       (§11.2), never storing them.
-- [ ] Separate public and executable output signatures end to end (§11.2): executable logical outputs are the public
+- [x] Separate public and executable output signatures end to end (§11.2): executable logical outputs are the public
       prefix followed by hidden state outputs, split by a validated `public_output_count` carried through lowering,
-      execution, persistence, and replacement. Rescope `validate_output_types` to the public prefix (it currently
-      compares against the complete lowered output list, `domains.rs:2374`), apply user `out_shardings` to the
-      public prefix only (currently the complete list, `domains.rs:2460`), and give each hidden state output its
-      paired input's effective sharding.
-- [ ] Record `ReadOnly` versus `Mutated` disposition; reject reference slots whose logical input is erased
+      execution, persistence, and replacement. Scope `validate_output_types` and user `out_shardings` to the public
+      prefix, and give each hidden state output its paired input's effective sharding.
+- [x] Record `ReadOnly` versus `Mutated` disposition; reject reference slots whose logical input is erased
       (`input_mapping` absent) in this phase.
-- [ ] Handle retained-JIT dispatch keys: exact keys (`XlaDispatchKeyKind::Exact`, `domains.rs:1019`) hash
-      `ArrayIrType`s structurally and are holder-free by construction, but the bucketed path
-      (`BucketedDispatchSignature`, `domains.rs:1025-1060`) alpha-normalizes only `ArrayType`s — reference slots must
-      take the exact path or be explicitly rejected from bucketing.
-- [ ] Derive physical indices only after zero-space and dynamic-extent mappings are complete.
-- [ ] Emit and verify `tf.aliasing_output` on the correct entry argument.
-- [ ] Implement hidden final-state result splitting and holder installation; keep hidden results out of public
+- [x] Handle retained-JIT dispatch keys: `XlaDispatchKeyKind::Exact` hashes `ArrayIrType`s structurally and is
+      holder-free by construction, but `BucketedDispatchSignature` alpha-normalizes only `ArrayType`s — reference
+      slots must take the exact path or be explicitly rejected from bucketing.
+- [x] Derive physical indices only after zero-space and dynamic-extent mappings are complete.
+- [x] Emit and verify `tf.aliasing_output` on the correct entry argument.
+- [x] Implement hidden final-state result splitting and holder installation; keep hidden results out of public
       reconstruction.
-- [ ] Construct donation flags in logical ABI order: ordinary capture/dimension/read-only reference `false`, ordinary
+- [x] Construct donation flags in logical ABI order: ordinary capture/dimension/read-only reference `false`, ordinary
       public array from the user flag, and mutated reference internally `true` with uniqueness downgrade. Extend the
-      existing flatten-then-project construction at `domains.rs:2165-2174` — the recipe already exists for ordinary
-      inputs; do not add a parallel one.
-- [ ] Mark the PJRT handoff irreversibility boundary; restore extracted states on failure before handoff, and await
-      completion then install-or-poison after handoff.
-- [ ] Define pre-handoff, execute-call, and post-submission public-reconstruction failure behavior.
-- [ ] Introduce the stateful call surface as an opt-in `StatefulCompilationDomain` capability: `call_statefully`
+      existing flatten-then-project construction — the recipe already exists for ordinary inputs; do not add a
+      parallel one.
+- [x] Mark the PJRT handoff irreversibility boundary; complete every fallible preflight before extraction so
+      pre-handoff failures leave holders ready, and await completion then install-or-poison after handoff.
+- [x] Define pre-handoff, execute-call, and post-submission public-reconstruction failure behavior.
+- [x] Introduce the stateful call surface as an opt-in `StatefulCompilationDomain` capability: `call_statefully`
       (blocking convenience) and `call_statefully_async` returning the completion-bearing wrapper — already-completed
       in this phase, so Phase 10 changes the implementation rather than the public shape. Share the executable
       specialization/dispatcher pipeline with pure calls, make ordinary calls reject executables with non-empty
       external-state metadata, and never lose execution errors on zero-output calls.
-- [ ] Add internal mutated-reference donation while preserving copy-protection fallback; never donate read-only slots.
-- [ ] Start with one static, unsharded, device-memory external reference; then multiple unique holders with stable
+- [x] Add internal mutated-reference donation while preserving copy-protection fallback; never donate read-only slots.
+- [x] Start with one static, unsharded, device-memory external reference; then multiple unique holders with stable
       lock order and all-installed-or-all-poisoned installation; then captured references with the
       reference-specific internal donation policy.
-- [ ] Add explicit external reference arguments through a heterogeneous boundary without breaking array-only APIs.
-- [ ] Reject public/capture duplicate identities before state extraction.
-- [ ] Add state ABI metadata to lowering, compiled programs, cache identity, persistence, and executable replacement;
+- [x] Add explicit external reference arguments through a heterogeneous boundary without breaking array-only APIs.
+- [x] Reject public/capture duplicate identities before state extraction.
+- [x] Add state ABI metadata to lowering, compiled programs, cache identity, persistence, and executable replacement;
       bump and validate the persistent executable schema as the complete V6 migration: `XlaPersistentKeyV6`,
-      `XlaPersistentExecutableMetadataV6`, schema version 6, and magic `RYFTXLA6` (mirroring the current V5 set at
-      `domains.rs:1293`, `:1418`).
-- [ ] Add capture, cache round-trip, corruption, replacement, and synchronous failure tests.
+      `XlaPersistentExecutableMetadataV6`, schema version 6, and magic `RYFTXLA6`.
+- [x] Add capture, cache round-trip, corruption, replacement, and synchronous failure tests.
 
 **Exit criterion:** consecutive compiled calls observe mutation under a fully synchronous state protocol; retained
 snapshots remain valid; failures leave every holder restored or explicitly poisoned; semantics remain correct when
@@ -1344,7 +1348,7 @@ generic mechanism in the program transform layer.
 - `src/jit.rs`: stateful call plumbing through the retained-JIT facade (§10 Stage C).
 - composite lowering: targeted error for surviving references.
 - `src/arrays.rs` or a focused reference module: only narrowly scoped state extraction/install support that cannot
-  remain generic over `Reference<A>`.
+  remain generic over `ArrayReference<A>`.
 
 ### `ryft-mlir`, `ryft-pjrt`, and `ryft-xla-sys`
 
@@ -1367,7 +1371,7 @@ Use named families rather than an uncontrolled Cartesian product.
 |---|---|---|
 | Type/member | reference projection; dynamic referent refinement; shared dimension identities | every cross-kind projection/refinement; numeric use of a reference |
 | Primitive ordering | create/read; write/read; swap old/new; ordered accumulates; interleaved roots | promoted/broadcast replacement; update result type change; dynamic extent change in MVP; use/view after freeze |
-| Aliases/views | base/view mutual observation; composed and disjoint views share root | implicit alias; escaping view; unsupported transform/overlap |
+| Views | base/view and composed/overlapping observation | implicit/escaping view; bad transform |
 | Effects/liveness | unused write retained; read/write order; I/O plus state | folding, DCE, duplication, speculation, rematerialization |
 | Straight-line discharge | each primitive; one/two roots; local/external; read-only/mutated | unresolved root; partial replay on validation failure |
 | Condition | branch write combinations; two roots; fixed-root forwarding | inconsistent/duplicate roots; escape |
@@ -1405,8 +1409,8 @@ For each implementation phase:
 - [ ] Verify source rendering distinguishes all semantics-bearing reference/view metadata. Renderings back the
       debug-assertions transform-cache determinism recheck (`transforms.rs:591-618`) and rendered-program test
       assertions; production cache keys are argument-based (`ErasedTransformArguments`), StableHLO-text-based
-      (`XlaPersistentKeyV5`), and dispatch-signature-based (`XlaDispatchKey`) — reference ABI metadata must enter
-      the persistent key schema as a new `XlaPersistentKeyV6`, not the rendering.
+      (`XlaPersistentKeyV6`), and dispatch-signature-based (`XlaDispatchKey`) — reference ABI metadata participates
+      in the persistent key schema, not the rendering.
 - [ ] Verify invalid programs fail before mutation, replay, or backend lowering.
 - [ ] Verify ordinary StableHLO contains no reference types or operations.
 - [ ] Inspect translated/optimized HLO for exact input/output alias configuration when external refs land.
@@ -1898,6 +1902,52 @@ At each checkpoint, ask:
       compile-fail suite; core and XLA all-target checks; core documentation with 95 pre-existing warnings and
       warning-free XLA documentation; formatting, stale-identifier and added-line-width audits; and
       `git diff --check`.
+
+- [x] 2026-08-20 combined Phase 2–7 independent re-audit pass 19: three fresh independent audits over the complete
+      phases 4–7 surface plus the committed phases 2–3 modules. No exploitable correctness defect; every finding was
+      fixed. Production: the four transform adapters now delegate to one shared
+      `Program::discharge_local_references` gate that owns both the external-root rejection and the hidden-output
+      invariant previously enforced only at the XLA boundary; the re-added duplicate partial-evaluation entry gates
+      were removed again with the replay-loop comment corrected; the tautological StableHLO reference-name scan was
+      deleted; the dual lowering boundary forms are pinned by a debug assertion (the auditor's stronger
+      single-ABI proposal was rejected — the unlifted-plus-captures form is the pre-existing public module contract);
+      the independent verifier's semantics arm documents its unique core-bug catch; the rematerialization adapter's
+      context-recovery diagnostic names its actual cause; and the fresh-root capture rationale now lives in two
+      canonical places with cross-references elsewhere. The conservative rejection of region-local references inside
+      `shard_map`/rematerialization/linear-call/custom-derivative carriers is now a documented limitation here and in
+      the discharge module docs. The dropped changelog entries were restored in `ryft-core` (including the
+      `DiscardedCaptures` breaking-change note) and `ryft-xla`, and the missing `ryft-macros` derive-forwarding entry
+      was added — twice: the first restoration was lost again to a concurrent commit wave, and the second-round audit
+      caught the regression, so verify these entries survive before cutting any release. Tests: the four external-root
+      rejection tests were reduced to one owner-module gate test plus
+      per-entry routing smokes; the duplicated condition fixture was hoisted into the shared crate test module; group
+      comments, alias hoists, oracle literals, `pretty_assertions`, and the last two UFCS call sites were cleaned up;
+      and a new pin records that `jit_call` residual candidates now classify through callee provenance to leaf
+      producers. Final verification passed: 1,489 core tests plus 3 ignored; 502 XLA tests plus 5 ignored; all macro
+      suites; zero compiler warnings across all targets; formatting and `git diff --check`.
+
+- [x] 2026-08-20 combined Phase 8–9 implementation/review pass 20: added arrays-owned `ArrayReference` handles with
+      composable static-index and positive unit-stride slice views over one generic root holder. Eager mutations are
+      transactional, root mutations keep a direct no-allocation path, analysis preserves canonical root identity and
+      rejects derived views at attached-region boundaries, and discharge lowers view access through canonical
+      slice/reshape/update-slice SSA. Exact eager, discharge, condition-region, and XLA tests cover composed and
+      overlapping views, indexed inverse reconstruction, invalidation, and root-only structured carries. Added the
+      opt-in synchronous stateful compilation/JIT surface: logical external-state metadata and the public-output split
+      flow through lowering, compiled artifacts, replacement/cache identity, and V6 persistence while physical indices
+      remain derived from `XlaExecutableSignature`; entry aliases merge with sharding attributes; and ordinary calls
+      reject stateful executables. Runtime transactions deduplicate and order root holders by `ReferenceId`, complete
+      fallible preflight before extraction, keep every guard through the execution fence, donate only uniquely owned
+      mutated state, install all hidden states before reconstructing public outputs, and otherwise leave holders ready
+      before handoff or poison all extracted mutated holders afterward. Coverage includes public/captured/read-only and
+      multiple holders, reverse logical/identity order, retained snapshots, uniqueness downgrade, zero-output errors,
+      exact failure boundaries, non-root/effective-sharding rejection, physical alias mapping, restored captured V6
+      execution, corruption, replacement, and retained-dispatch cache reuse. Three independent correctness,
+      runtime/ABI, and conventions/simplicity audit loops fixed every finding and each final pass reported clean. Final
+      verification passed: 1,502 core tests plus 3 ignored; 520 XLA tests plus 5 ignored; 57 macro unit tests; 20
+      operation-macro integration tests and 17 parameter-macro tests including all trybuild cases; core and XLA
+      all-target checks; core documentation with 95 pre-existing warnings and warning-free XLA documentation;
+      formatting, stale-identifier, added-line-width, and `git diff --check` audits. Phase 10 asynchronous leases and
+      generations plus Phase 11 preserved-reference kernel lowering remain deferred.
 
 Unchecked implementation items above remain future execution work. Completed items record code and verification that
 landed with the corresponding phase summary.

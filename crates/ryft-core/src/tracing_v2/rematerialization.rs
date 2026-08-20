@@ -1965,7 +1965,7 @@ where
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation + From<AddOperation<ArrayIrType>>,
+    O: ReferenceDischargeOperation,
 {
     /// Builds a rematerialized flat-vector function after discharging every local reference into immutable array
     /// state. External reference inputs and captures are rejected because rematerialization has no caller-visible
