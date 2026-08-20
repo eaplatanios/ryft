@@ -1418,10 +1418,10 @@ mod tests {
         Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Broadcast,
         CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh,
         DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
-        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian,
-        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
-        ReductionKind, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value,
-        ValueProjection, WhileOperation, ZeroLike,
+        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, FreezeReference, Hessian,
+        Iota, Jacobian, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, NewReference, OneLike, ProgramError,
+        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, Reshape, Select, Shape, Sharding, ShardingDimension,
+        Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1520,6 +1520,38 @@ mod tests {
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
+    }
+
+    #[test]
+    fn test_public_jit_discharges_local_reference_state_without_changing_the_array_abi() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |input| {
+                let input = input.into_value();
+                let reference = input.new_reference().unwrap();
+                reference.add_update(&input).unwrap();
+                ValueProjection::<ArrayType>::into_projected(reference.freeze().unwrap()).unwrap()
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let executable = compiled.executable_function();
+        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.output_types(), &[input_type.clone()]);
+
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
+        let output = domain.interpret(&executable, input).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![6.0]);
     }
 
     #[test]
@@ -2737,7 +2769,7 @@ mod tests {
                 let context = primal_input.value().context().clone();
                 let mut primal_outputs = context
                     .stage_operation(
-                        XlaOperation::JitCall(JitCallOperation::new()),
+                        XlaOperation::JitCall(JitCallOperation::new(0)),
                         CalleeRegionDriver::new(&[primal_half.clone()]),
                         &[primal_input.into_value()],
                     )
@@ -2749,7 +2781,7 @@ mod tests {
                 tangent_inputs.extend(residuals);
                 let tangent_output = context
                     .stage_operation(
-                        XlaOperation::JitCall(JitCallOperation::new()),
+                        XlaOperation::JitCall(JitCallOperation::new(0)),
                         CalleeRegionDriver::new(&[tangent_half.clone()]),
                         tangent_inputs.as_slice(),
                     )

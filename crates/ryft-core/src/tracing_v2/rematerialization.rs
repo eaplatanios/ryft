@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayType, Memory};
+use crate::arrays::{ArrayIrType, ArrayType, Memory, ReferenceDischargeOperation};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -1962,6 +1962,53 @@ where
     }
 }
 
+impl<V, O> Program<V, O, Vec<V>, Vec<V>>
+where
+    V: Value<Type = ArrayIrType>,
+    O: ReferenceDischargeOperation + From<AddOperation<ArrayIrType>>,
+{
+    /// Builds a rematerialized flat-vector function after discharging every local reference into immutable array
+    /// state. External reference inputs and captures are rejected because rematerialization has no caller-visible
+    /// state write-back contract. The returned wrapper delegates derivation, caching, policy selection, and
+    /// `prevent_cse` behavior to the ordinary [`Rematerialize`] implementation. `capture_count` classifies leading
+    /// boundary inputs that have already been lifted; this ordinary-value adapter does not accept capture-reference
+    /// constants retained in attached regions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_count`: Number of leading flat inputs lifted from the source capture table.
+    pub fn rematerialize_with_local_references<D>(
+        self,
+        capture_count: usize,
+    ) -> Result<
+        Rematerialize<
+            D,
+            impl Fn(Vec<DomainTracer<D>>) -> Result<Vec<DomainTracer<D>>, ProgramError>,
+            Vec<DomainTracer<D>>,
+            Vec<DomainTracer<D>>,
+        >,
+        ProgramError,
+    >
+    where
+        D: Context<Type = ArrayIrType, Constant = V, Operation = O>,
+    {
+        let (program, _, external_states) = self.discharge_references(capture_count)?.into_parts();
+        if let Some(state) = external_states.first() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "rematerialization supports only local references, but the program uses external `{}`",
+                    state.source(),
+                ),
+            });
+        }
+        Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
+            let context =
+                inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context().clone();
+            program.interpret_in_context(&context, inputs)
+        }))
+    }
+}
+
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
     D: Domain,
@@ -2267,13 +2314,19 @@ mod tests {
     use std::fmt::Debug;
     use std::rc::Rc;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, Memory,
+        Shape, ShardingDimension,
+    };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
-    use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
+    use crate::operations::{
+        Cos, Dot, DotDimensionNumbers, FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, Sin, Tag,
+    };
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::RegionRole;
+    use crate::programs::{ReferenceType, RegionRole};
     use crate::tests::TestOrderedStateOperation;
 
     use super::*;
@@ -4114,6 +4167,137 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialization_accepts_local_references_only_after_whole_program_discharge() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+        type TestContext = EagerContext<TestValue, TestOperation>;
+
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(scalar_type);
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, input]).unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Before discharge, simplification retains the complete ordered state chain and generic rematerialization
+        // would reject it. Discharge eliminates that chain, after which ordinary pure simplification and the existing
+        // rematerialization derivation can run without any reference-specific rule.
+        let pre_discharge = source.simplified().unwrap();
+        assert_eq!(pre_discharge.instructions().len(), 3);
+        assert!(pre_discharge.effects().contains(crate::programs::Effect::OrderedState));
+        let unresolved = rematerialize::<TestContext, _, _, _>(|input: DomainTracer<TestContext>| {
+            let reference = input.new_reference()?;
+            reference.add_update(&input)?;
+            reference.freeze()
+        });
+        let unresolved_context = TracingContext::<TestValue, TestOperation>::new();
+        let unresolved_input = unresolved_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(
+            unresolved.call(unresolved_input),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "program carries unresolved state and must be discharged before differentiation",
+        ));
+
+        let (pure, public_output_count, external_states) = source.clone().discharge_references(0).unwrap().into_parts();
+        assert_eq!(public_output_count, 1);
+        assert!(external_states.is_empty());
+        let pure = pure.into_simplified().unwrap();
+        assert!(pure.effects().is_pure());
+
+        let rematerialized = source.rematerialize_with_local_references::<TestContext>(0).unwrap();
+        let wrong_context = TracingContext::<TestValue, TestOperation>::new();
+        let wrong_input = wrong_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        assert!(matches!(
+            rematerialized.call(vec![wrong_input]),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "encountered input type bool[] which is incompatible with the program's declared type \
+                    f32[]",
+        ));
+        let (_, staged) = TracingContext::<TestValue, TestOperation>::trace(
+            |input| {
+                let mut outputs = rematerialized.call(vec![input])?;
+                Ok(outputs.pop().unwrap())
+            },
+            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert!(matches!(staged.instructions()[0].operation(), TestOperation::Rematerialize(_)));
+        assert_eq!(
+            staged.interpret(TestValue::Array(Array::scalar(3.0_f32))),
+            Ok(TestValue::Array(Array::scalar(6.0_f32))),
+        );
+
+        let (_, repeated) = TracingContext::<TestValue, TestOperation>::trace(
+            |input| {
+                let mut outputs = rematerialized.call(vec![input])?;
+                Ok(outputs.pop().unwrap())
+            },
+            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert_eq!(repeated.to_string(), staged.to_string());
+
+        let domain = TestContext::new();
+        let (primal, tangent) = domain
+            .jvp(
+                |input, ()| {
+                    let mut outputs = rematerialized.call(vec![input])?;
+                    Ok(outputs.pop().unwrap())
+                },
+                TestValue::Array(Array::scalar(3.0_f32)),
+                TestValue::Array(Array::scalar(1.0_f32)),
+                (),
+            )
+            .unwrap();
+        assert_eq!(primal, TestValue::Array(Array::scalar(6.0_f32)));
+        assert_eq!(tangent, TestValue::Array(Array::scalar(2.0_f32)));
+        let (_, pullback) = domain
+            .vjp(
+                |input, ()| {
+                    let mut outputs = rematerialized.call(vec![input])?;
+                    Ok(outputs.pop().unwrap())
+                },
+                TestValue::Array(Array::scalar(3.0_f32)),
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            pullback.apply(TestValue::Array(Array::scalar(4.0_f32))).unwrap(),
+            TestValue::Array(Array::scalar(8.0_f32)),
+        );
+    }
+
+    #[test]
+    fn test_rematerialization_with_local_references_rejects_external_roots() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+        type TestContext = EagerContext<TestValue, TestOperation>;
+
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type);
+        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let external = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            external.clone().rematerialize_with_local_references::<TestContext>(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "rematerialization supports only local references, but the program uses external \
+                    `public input 0`",
+        ));
+        assert!(matches!(
+            external.rematerialize_with_local_references::<TestContext>(1),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "rematerialization supports only local references, but the program uses external \
+                    `capture 0`",
+        ));
+    }
+
+    #[test]
     fn test_effect_force_saving_is_topological_so_later_residuals_recompute_from_upgraded_cuts() {
         use crate::operations::Print;
 
@@ -4177,7 +4361,7 @@ mod tests {
 
     #[test]
     fn test_bounded_while_residual_candidates_classify_through_the_staged_loop() {
-        use crate::operations::{ComparisonDirection, WhileOperation};
+        use crate::operations::{CompareOperation, ComparisonDirection, MulOperation, WhileOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -4190,11 +4374,7 @@ mod tests {
             let state = builder.add_input(scalar_type.clone());
             let bound = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
-                .add_instruction(
-                    crate::operations::compare::CompareOperation::new(ComparisonDirection::LessThan),
-                    Vec::new(),
-                    vec![state, bound],
-                )
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, bound])
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
@@ -4202,9 +4382,7 @@ mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
-            let doubled = builder
-                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![state, state])
-                .unwrap()[0];
+            let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
@@ -4262,5 +4440,73 @@ mod tests {
         // The forward program stores only the body output and the region input.
         assert!(names.borrow().is_empty(), "bounded-while loops contribute no residual candidates");
         assert_eq!(forward.output_types().len(), 2);
+    }
+
+    #[test]
+    fn test_while_residual_candidates_classify_through_loop_provenance() {
+        use crate::operations::{CompareOperation, ComparisonDirection, MulOperation, WhileOperation};
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+
+        // Pins the classification consequences of `while` adopting output-region provenance: a computed carry
+        // classifies through the body to its leaf producer instead of the loop operation, and a loop-invariant
+        // pass-through carry lands on the body's region input and therefore deliberately produces no policy
+        // candidate at all — rematerialization always recomputes it, exactly like the generic pass-through pin in
+        // `test_origin_landing_on_a_region_input_skips_classification`.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let condition = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let state = builder.add_input(scalar_type.clone());
+            builder.add_input(scalar_type.clone());
+            let bound = builder.add_constant(Array::scalar(8.0));
+            let predicate = builder
+                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, bound])
+                .unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+        }
+        .unwrap();
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let state = builder.add_input(scalar_type.clone());
+            let invariant = builder.add_input(scalar_type.clone());
+            let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(
+                vec![doubled, invariant],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+        }
+        .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let state = builder.add_input(scalar_type.clone());
+        let invariant = builder.add_input(scalar_type.clone());
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                ArrayOperation::While(WhileOperation::new()),
+                vec![condition_region, body_region],
+                vec![state, invariant],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs.clone(), vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // The computed carry classifies through provenance to the body's leaf producer.
+        let candidate = RematerializationCandidate::from_program_residual(&program, outputs[0], scalar_type.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.producers().len(), 1);
+        assert!(matches!(candidate.producers()[0].operation(), ArrayOperation::Mul(_)));
+
+        // The loop-invariant carry's provenance lands on the body's region input, so it is never policy-classified.
+        assert!(
+            RematerializationCandidate::from_program_residual(&program, outputs[1], scalar_type)
+                .unwrap()
+                .is_none(),
+            "a pass-through `while` carry must not produce a policy candidate",
+        );
     }
 }

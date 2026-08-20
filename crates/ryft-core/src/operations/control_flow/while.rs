@@ -51,9 +51,9 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection, Program,
-    ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection,
+    AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, RegionInterface, RegionRef,
+    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -353,6 +353,28 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
         check_count!("input", input_types, state_types.len(), TypeError);
         check_types!(@same, format!("{WHILE_OPERATION_NAME} input"), [state_types, input_types]);
         Ok(state_types.to_vec())
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index < 2).then_some(input_index)
+    }
+
+    #[inline]
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![OutputRegionProvenance { region_index: 1, output_index }]
+    }
+
+    #[inline]
+    fn reference_output_root_input(&self, output_index: usize) -> Option<usize> {
+        // Every `while` output is a loop carry aligned with the same-position input, so the root constraint maps
+        // positionally for any output the operation actually declares.
+        Some(output_index)
+    }
+
+    #[inline]
+    fn allows_region_input_reference_access(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        region_index != 0 || mode == ReferenceAccessMode::Read
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -2623,9 +2645,21 @@ mod tests {
         let body = subtract_one_body();
         let interfaces = vec![region_interface(&condition), region_interface(&body)];
 
-        // Operation identity, declared region slots, and payload-free rendering.
+        // Operation identity, declared region slots, reference flow, and payload-free rendering.
         assert_eq!(operation.name(), WHILE_OPERATION_NAME);
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("condition"), RegionSlot::computation("body")]);
+        assert_eq!(operation.input_region_provenance(0, 0), Some(0));
+        assert_eq!(operation.input_region_provenance(1, 0), Some(0));
+        assert_eq!(
+            operation.output_region_provenance(0),
+            vec![OutputRegionProvenance { region_index: 1, output_index: 0 }],
+        );
+        assert_eq!(operation.reference_output_root_input(0), Some(0));
+        assert!(operation.allows_region_input_reference_access(0, ReferenceAccessMode::Read));
+        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Accumulate));
+        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Consume));
+        assert!(operation.allows_region_input_reference_access(1, ReferenceAccessMode::Write));
         assert_eq!(format!("{operation}"), "while");
 
         // Type inference validates the region interfaces and the input types, and returns the state types.

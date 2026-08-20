@@ -544,19 +544,11 @@ where
                 }
             }
         }
-        ArrayIrOperation::NewReference(operation) => {
-            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
-        }
-        ArrayIrOperation::ReferenceRead(operation) => {
-            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
-        }
-        ArrayIrOperation::ReferenceSwap(operation) => {
-            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
-        }
-        ArrayIrOperation::ReferenceAddUpdate(operation) => {
-            Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
-        }
-        ArrayIrOperation::FreezeReference(operation) => {
+        operation @ (ArrayIrOperation::NewReference(_)
+        | ArrayIrOperation::ReferenceRead(_)
+        | ArrayIrOperation::ReferenceSwap(_)
+        | ArrayIrOperation::ReferenceAddUpdate(_)
+        | ArrayIrOperation::FreezeReference(_)) => {
             Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
         }
         ArrayIrOperation::DimensionFromScalar(operation) => {

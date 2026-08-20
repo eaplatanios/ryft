@@ -330,9 +330,11 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// is filled only when tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes
     /// over device buffers), in which case those values are passed to the compiled program as runtime arguments rather
     /// than being baked into it. Capturing is gated at the type level: [`capture`](crate::CapturingContext::capture)
-    /// is implemented only when the staged constant type is [`CaptureReference`](crate::CaptureReference), and so an
-    /// ordinary trace can never push into this table. Refer to the documentation of
-    /// [`CaptureReference`](crate::CaptureReference) for more information.
+    /// is implemented only when the staged constant type can embed a [`CaptureReference`](crate::CaptureReference),
+    /// and so an ordinary trace over plain runtime constants can never push into this table. Capture-owning traces
+    /// construct their context directly and read this table back out through [`captures`](Self::captures). The
+    /// [`trace`](Self::trace) entry points instead discard it and therefore reject traces that registered captures.
+    /// Refer to the documentation of [`CaptureReference`](crate::CaptureReference) for more information.
     ///
     /// Like the [`builder`](Self::builder), the table is held behind an [`Rc`] and a [`RefCell`] for the same reason:
     /// one capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
@@ -393,7 +395,8 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
     /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
     /// type (such as a backend whose runtime [`Domain::Value`] differs from its staged [`Domain::Constant`]) observe
-    /// that same context type.
+    /// that same context type. The trace must not register captures. Refer to the documentation of
+    /// [`trace_with_named_axes`](Self::trace_with_named_axes) for the rationale and the rejection semantics.
     #[inline]
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
@@ -408,6 +411,14 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
 
     /// Traces `function` against `input_type` like [`trace`](Self::trace), but seeds the trace's context with the
     /// provided named axes. Named-axis readers staged by `function` (e.g., collectives) resolve against these bindings.
+    /// This entry point returns only the traced [`Program`] and therefore has no way to hand a capture table to its
+    /// caller. A capture registered through [`capture`](crate::CapturingContext::capture) during the trace would leave
+    /// capture-referencing constants in the returned program while the values they name are silently discarded, and a
+    /// later use of that program inside a capture-owning scope (e.g., as an attached region of a compiled function)
+    /// would resolve those references against that unrelated scope's capture table, silently aliasing whichever value
+    /// occupies the referenced slot. Such traces are therefore rejected with [`ProgramError::DiscardedCaptures`].
+    /// Traces that need to capture must construct their [`TracingContext`] directly and pair the traced program with
+    /// the context's [`captures`](Self::captures) table (e.g., through a [`ClosedProgram`](crate::ClosedProgram)).
     pub fn trace_with_named_axes<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -417,17 +428,54 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        let (output_types, program, capture_count) =
+            Self::trace_with_named_axes_counting_captures(function, input_type, named_axes)?;
+        if capture_count > 0 {
+            return Err(ProgramError::DiscardedCaptures { count: capture_count });
+        }
+        Ok((output_types, program))
+    }
+
+    /// Traces `function` against `input_type` and returns the output type, without retaining the traced [`Program`].
+    /// Use this when callers only need the output types of an ordinary symbolic trace. Unlike [`trace`](Self::trace),
+    /// captures registered during the trace are tolerated: the traced program is discarded together with them, so no
+    /// dangling capture reference can escape (e.g., output-type inference over a function that stages calls to
+    /// captured compiled functions remains valid).
+    #[inline]
+    pub fn infer_output_type<
+        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+    ) -> Result<Output::To<V::Type>, ProgramError> {
+        Ok(Self::trace_with_named_axes_counting_captures(function, input_type, Vec::new())?.0)
+    }
+
+    /// Traces like [`trace_with_named_axes`](Self::trace_with_named_axes) but additionally reports the number of
+    /// captures the trace registered into its local (and discarded) capture table, leaving the decision of whether
+    /// discarding them is acceptable to the caller. [`trace_with_named_axes`](Self::trace_with_named_axes) rejects
+    /// such traces because it retains the program, while [`infer_output_type`](Self::infer_output_type) tolerates
+    /// them because it discards the program along with the captures.
+    fn trace_with_named_axes_counting_captures<
+        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let captures = Rc::new(RefCell::new(Vec::new()));
         let input_structure = input_type.parameter_structure();
 
         let (output_types, outputs, output_structure) = {
-            let context = Self {
-                builder: builder.clone(),
-                captures: Rc::new(RefCell::new(Vec::new())),
-                named_axes: Rc::new(named_axes),
-            };
+            let context =
+                Self { builder: builder.clone(), captures: captures.clone(), named_axes: Rc::new(named_axes) };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
-            let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
+            let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
 
             // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
             // whichever atom shares its index in this builder, and so we check for this here.
@@ -440,24 +488,11 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
             (output_types, outputs, output_structure)
         };
 
+        let capture_count = captures.borrow().len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program = builder.build(outputs, input_structure, output_structure)?;
 
-        Ok((output_types, program))
-    }
-
-    /// Traces `function` against `input_type` and returns the output type, without retaining the traced [`Program`].
-    /// Use this when callers only need the output types of an ordinary symbolic trace.
-    #[inline]
-    pub fn infer_output_type<
-        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
-        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
-    >(
-        function: F,
-        input_type: Input,
-    ) -> Result<Output::To<V::Type>, ProgramError> {
-        Ok(Self::trace(function, input_type)?.0)
+        Ok((output_types, program, capture_count))
     }
 }
 
@@ -966,7 +1001,34 @@ mod tests {
     }
 
     #[test]
-    fn test_interpret_and_trace() {
+    fn test_context_trace_rejects_captures_registered_into_its_discarded_capture_table() {
+        /// Capturing trace universe whose staged constants are capture references into a runtime `Array` table.
+        type CapturingTrace =
+            TracingContext<CaptureReference<ArrayType>, ArrayOperation<CaptureReference<ArrayType>>, Array>;
+
+        /// Stages `x + capture#0` with the capture registered through the trace's own context.
+        fn capturing_body(x: Tracer<CapturingTrace>) -> Result<Vec<Tracer<CapturingTrace>>, ProgramError> {
+            let context = x.context().clone();
+            let reference = context.capture(Array::scalar(3.0))?;
+            let captured = StagingContext::constant(&context, reference);
+            context.bind(AddOperation::new(), Vec::new(), &[x, captured])
+        }
+
+        // `trace` retains the traced program but discards the trace's local capture table, so the registered
+        // capture would leave a dangling `capture#0` reference behind (silently aliasing whatever capture table
+        // later surrounds the program) and the trace is rejected instead.
+        let result = CapturingTrace::trace(capturing_body, ArrayType::scalar(DataType::F64));
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
+
+        // `infer_output_type` discards the traced program together with the captures, and so the same body still
+        // infers output types successfully (e.g., shape inference over functions that call captured compiled
+        // functions remains valid).
+        let output_types = CapturingTrace::infer_output_type(capturing_body, ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(output_types, vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_context_interpret_and_trace() {
         let domain = EagerContext::<Array, ArrayOperation<Array>>::new();
         let (output, program) =
             domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Array::scalar(2.0)).unwrap();
@@ -975,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_output_type() {
+    fn test_context_infer_output_type() {
         let output_type = EagerContext::<Array, ArrayOperation<Array>>::infer_output_type(
             |x| Ok(x.sin()?),
             ArrayType::scalar(DataType::F64),

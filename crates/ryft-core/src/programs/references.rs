@@ -27,8 +27,6 @@
 //! backend lowering are not yet supported. The complete validation, runtime, and kernel roadmap is tracked in the
 //! repository's `plan-references.md`.
 
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -256,6 +254,12 @@ impl ReferenceOperationSemantics {
         &EMPTY_REFERENCE_OPERATION_SEMANTICS
     }
 
+    /// Returns whether this descriptor declares no reference outputs and no reference accesses.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.outputs.is_empty() && self.accesses.is_empty()
+    }
+
     /// Returns output reference classifications in deterministic operation-defined order.
     #[inline]
     pub fn outputs(&self) -> &[ReferenceOutputSemantics] {
@@ -410,15 +414,8 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
 /// The identity supports alias-identity checks and diagnostics inside one process. It carries no structural type
 /// information, is never serialized into a program or compilation key, and may be reused after the last handle for
 /// the original holder is dropped.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReferenceId(usize);
-
-impl Display for ReferenceId {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "0x{:x}", self.0)
-    }
-}
 
 /// Cloneable identity-bearing holder for a referenced [`Value`].
 ///
@@ -789,8 +786,10 @@ mod tests {
 
         let semantics = TestAliasingViewOperation.reference_semantics();
         assert!(semantics.accesses().is_empty());
+        assert!(!semantics.is_empty());
         assert_eq!(semantics.outputs(), &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0 }]);
         assert_eq!(ReferenceOperationSemantics::empty(), &ReferenceOperationSemantics::default());
+        assert!(ReferenceOperationSemantics::empty().is_empty());
 
         // Boxed operations must forward reference semantics rather than fall back to the empty trait default.
         let boxed: Box<TestAliasingViewOperation> = Box::new(TestAliasingViewOperation);

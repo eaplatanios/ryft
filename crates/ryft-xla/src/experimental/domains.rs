@@ -16,14 +16,15 @@ use ryft_core::{
     BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
     Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
-    InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, Parameterized, Placeholder, ProgramError, ReductionKind, ScatterReductionKind, Shape, Sharding,
-    ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
-    Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    DimensionVariable, DischargedReferenceProgram, DiskCache, Domain, DomainTracer, EagerContext, Effect,
+    InterpretableOperation, InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType,
+    ONE_OPERATION_NAME, Operation, Parameterized, Placeholder, ProgramError, ReductionKind, ScatterReductionKind,
+    Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile, TileDimension,
+    TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
+    ZeroOperationProvider,
 };
 #[cfg(test)]
-use ryft_core::{Array as ReferenceArray, ProjectedContext};
+use ryft_core::{Array as CpuArray, ProjectedContext};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Program as PjrtProgram, Value as PjrtValue};
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,11 @@ pub enum XlaDomainError {
     /// Runtime assertion host callbacks currently require host-accessible scalar buffers.
     #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
     UnsupportedRuntimeAssertionPlatform { platform: String },
+
+    /// Reference discharge produced external state that the ordinary array-only XLA invocation boundary cannot
+    /// supply or install.
+    #[error("unsupported XLA reference ABI: {reason}")]
+    UnsupportedReferenceAbi { reason: String },
 }
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs
@@ -536,7 +542,7 @@ impl<'c> XlaDomain<'c> {
         if operation.effects().contains(Effect::OrderedState)
             || driver.regions().any(|region| {
                 region.contains_effect_in_closure(Effect::OrderedState)
-                    || region.contains_atom_type_in_closure(|r#type| matches!(r#type, ArrayIrType::Reference(_)))
+                    || region.contains_atom_type_in_closure(Type::is_reference)
             })
         {
             return Err(ProgramError::UnsupportedOperation {
@@ -2309,7 +2315,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
         // Reference inputs are rejected before any mesh- or option-specific constraint so they always receive the
         // targeted discharge diagnostic instead of an unrelated bucketing or mesh error.
-        if let Some(reference_input) = input_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Reference(_))) {
+        if let Some(reference_input) = input_types.iter().find(|r#type| r#type.is_reference()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "references must be discharged before XLA compilation, but dispatch input has type \
@@ -2389,9 +2395,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         // Reference-typed boundary leaves must receive the targeted discharge diagnostic before any sharding
         // override is applied: the override path projects leaves to arrays and would otherwise fail with a generic
         // `expected array type` error.
-        if let Some(reference) =
-            request.input_types().parameters().find(|r#type| matches!(r#type, ArrayIrType::Reference(_)))
-        {
+        if let Some(reference) = request.input_types().parameters().find(|r#type| r#type.is_reference()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "references must be discharged before XLA compilation, but staged input has type `{reference}`",
@@ -2408,7 +2412,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             request.replace_input_types(input_types)?;
         }
         request.trace(|options, output_types| {
-            if let Some(reference) = output_types.iter().find(|r#type| matches!(r#type, ArrayIrType::Reference(_))) {
+            if let Some(reference) = output_types.iter().find(|r#type| r#type.is_reference()) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
                         "references must be discharged before XLA compilation, but staged output has type \
@@ -2492,17 +2496,65 @@ impl<'c> XlaDomain<'c> {
         capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
-        // Unresolved references and state must be rejected before boundary types are projected to arrays and before
-        // the partitioner policy is selected. The reference scan runs first so every reference artifact — stateful
-        // operations, pure pass-through, and forwarded reference captures alike — receives the dedicated reference
-        // diagnostic, while the state scan stays behind it for future non-reference state. The lower-level
-        // module-entry guards remain as defense.
-        if contains_unresolved_references(program) {
+        if capture_count > program.input_count() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "capture_count is {capture_count}, but the program has only {} flat input(s)",
+                    program.input_count(),
+                ),
+            });
+        }
+        // Avoid cloning the dominant reference-free program path. Its discharge artifact is the identity with an
+        // empty external-state list, so the same metadata can cross the lowering boundary by borrow.
+        if !contains_unresolved_references(program) {
+            return self.lower_verified_reference_free_xla_program(program, capture_count, options);
+        }
+        // Discharge the exact lifted program so attached-region capture references resolve against the same lexical
+        // capture prefixes used during staging. Programs that actually contain references are cloned because
+        // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
+        let discharged = program.clone().discharge_references_with_lifted_captures(capture_count)?;
+        self.lower_discharged_xla_program(&discharged, capture_count, options)
+    }
+
+    /// Lowers one validated reference-discharge artifact through the ordinary array-only XLA path.
+    fn lower_discharged_xla_program(
+        &self,
+        discharged: &DischargedReferenceProgram<XlaConstant, XlaOperation>,
+        capture_count: usize,
+        options: &XlaOptions,
+    ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        if !discharged.external_states().is_empty() {
+            return Err(XlaDomainError::UnsupportedReferenceAbi {
+                reason: "external reference state requires a stateful XLA invocation boundary".to_string(),
+            });
+        }
+        if discharged.public_output_count() != discharged.program().output_count() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "local XLA reference discharge retained {} total outputs for {} public outputs",
+                discharged.program().output_count(),
+                discharged.public_output_count(),
+            ))
+            .into());
+        }
+        // The backend verifier remains independent from core discharge and runs before boundary projection,
+        // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
+        // containing both a reference and ordered state receives the more precise reference diagnostic.
+        if contains_unresolved_references(discharged.program()) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "references must be discharged before XLA compilation".to_string(),
             }
             .into());
         }
+        self.lower_verified_reference_free_xla_program(discharged.program(), capture_count, options)
+    }
+
+    /// Lowers one program after an independent verifier has established that it contains no references.
+    fn lower_verified_reference_free_xla_program(
+        &self,
+        program: &FlatXlaProgram,
+        capture_count: usize,
+        options: &XlaOptions,
+    ) -> Result<XlaLoweredProgram, XlaDomainError> {
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "state must be discharged before XLA compilation".to_string(),
@@ -2511,14 +2563,6 @@ impl<'c> XlaDomain<'c> {
         }
         validate_data_dependent_compilation(program)?;
         let input_types = program.input_types();
-        if capture_count > input_types.len() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "capture_count is {capture_count}, but the program has only {} flat input(s)",
-                    input_types.len(),
-                ),
-            });
-        }
         let (capture_types, public_input_types) = input_types.split_at(capture_count);
         if let Some(donation_flags) = &options.donation_flags
             && donation_flags.len() != public_input_types.len()
@@ -2534,15 +2578,23 @@ impl<'c> XlaDomain<'c> {
         let mut donation_flags =
             options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
 
-        let effective_program_input_types =
-            capture_types.iter().cloned().chain(public_input_types.iter().cloned()).collect::<Vec<_>>();
-        let program_output_types =
-            apply_signature_shardings(program.output_types().to_vec(), options.out_shardings.as_deref(), "out")?;
-        let effective_input_types = effective_program_input_types
+        let effective_capture_types = capture_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
+        let effective_public_input_types = public_input_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let program_output_types =
+            apply_signature_shardings(program.output_types().to_vec(), options.out_shardings.as_deref(), "out")?;
+        let effective_input_types = effective_capture_types
+            .iter()
+            .cloned()
+            .chain(effective_public_input_types.iter().cloned())
+            .collect::<Vec<_>>();
         let output_types = program_output_types
             .iter()
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
@@ -2602,8 +2654,8 @@ impl<'c> XlaDomain<'c> {
         let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
         let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program(
             program,
-            &[],
-            &effective_input_types,
+            effective_capture_types.as_slice(),
+            &effective_public_input_types,
             &output_types,
             "main",
             lowered_argument_shardings,
@@ -4137,6 +4189,7 @@ mod tests {
     #[cfg(feature = "cuda-13")]
     use std::time::Instant;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft_core::operations::attention::{
@@ -4153,11 +4206,11 @@ mod tests {
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
         DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
-        FreezeReferenceOperation, IotaOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation,
-        OneOperation, PrintOperation, ReduceOperation, ReductionKind, Reference, ReferenceAddUpdateOperation,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, ScaledDotOperation, ScatterDimensionNumbers,
-        ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation,
-        ZeroOperation, try_jit_with_options,
+        FreezeReference, FreezeReferenceOperation, IotaOperation, MulOperation, NegOperation, NewReference,
+        NewReferenceOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, Reference,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceType, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation,
+        Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -4242,6 +4295,19 @@ mod tests {
         ArrayType::scalar(data_type)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap()
+    }
+
+    fn assert_reference_free_stable_hlo(lowered: &XlaLoweredProgram) {
+        for unresolved in [
+            "new_reference",
+            "reference_read",
+            "reference_swap",
+            "reference_add_update",
+            "freeze_reference",
+            "ordered_state",
+        ] {
+            assert!(!lowered.stable_hlo().contains(unresolved), "{}", lowered.stable_hlo());
+        }
     }
 
     fn f32_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
@@ -4551,7 +4617,7 @@ mod tests {
         let logical_length = builder
             .add_instruction(ConvertElementTypeOperation::new(DataType::I32), Vec::new(), vec![logical_length])
             .unwrap()[0];
-        let one = ReferenceArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
+        let one = CpuArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
         let one = builder.add_instruction(ConstantOperation::new(one), Vec::new(), Vec::new()).unwrap()[0];
         let length = builder.add_instruction(SubOperation::new(), Vec::new(), vec![logical_length, one]).unwrap()[0];
         let lengths = builder
@@ -6237,18 +6303,11 @@ mod tests {
     fn test_data_dependent_padding_inventory_is_kind_and_kernel_specific() {
         use DataDependentPaddingDiscipline::{RyftMasked, Unsupported, XlaMasked};
 
-        for operation in [
-            XlaOperation::NewReference(NewReferenceOperation),
-            XlaOperation::ReferenceRead(ReferenceReadOperation),
-            XlaOperation::ReferenceSwap(ReferenceSwapOperation),
-            XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
-            XlaOperation::FreezeReference(FreezeReferenceOperation),
-        ] {
-            assert_eq!(
-                data_dependent_padding_discipline(&operation),
-                Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
-            );
-        }
+        // Every reference operation shares one collapsed match arm, so one representative pins that arm.
+        assert_eq!(
+            data_dependent_padding_discipline(&XlaOperation::NewReference(NewReferenceOperation)),
+            Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
+        );
 
         for kind in [ReductionKind::Sum, ReductionKind::Max, ReductionKind::Min, ReductionKind::Any, ReductionKind::All]
         {
@@ -7615,22 +7674,14 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_unresolved_references_before_special_cases_or_tracing() {
-        let domain = XlaDomain::token();
-        for operation in [
-            XlaOperation::NewReference(NewReferenceOperation),
-            XlaOperation::ReferenceRead(ReferenceReadOperation),
-            XlaOperation::ReferenceSwap(ReferenceSwapOperation),
-            XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
-            XlaOperation::FreezeReference(FreezeReferenceOperation),
-        ] {
-            let name = operation.name();
-            assert_eq!(
-                domain.bind(operation, Vec::new(), &[]),
-                Err(ProgramError::UnsupportedOperation {
-                    message: format!("`{name}` must be discharged before XLA eager execution"),
-                }),
-            );
-        }
+        // The guard is operation-agnostic: it keys off unresolved reference state rather than the specific reference
+        // operation, so one representative operation pins the diagnostic.
+        assert_eq!(
+            XlaDomain::token().bind(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), &[]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`new_reference` must be discharged before XLA eager execution".to_string(),
+            }),
+        );
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -7800,61 +7851,460 @@ mod tests {
     }
 
     #[test]
-    fn test_compilation_rejects_unresolved_state_and_references_before_boundary_projection() {
-        // The preflight in `lower_xla_program` must fire before boundary types are projected to arrays and before the
-        // partitioner policy is selected. The reference scan runs first, so every reference artifact — stateful
-        // reference operations included — receives the dedicated reference diagnostic, while the generic state
-        // diagnostic stays behind it for future non-reference state.
+    fn test_xla_lowering_discharges_and_executes_local_reference_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar_type.clone().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+        let snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, input]).unwrap();
+        let final_value = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program: FlatXlaProgram = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![snapshot, final_value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {",
+        );
+        let expected_stable_hlo = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=1]>
+            @SIGNATURE@
+                %0 = stablehlo.add %arg0, %arg0 : tensor<f32>
+                return %arg0, %0 : tensor<f32>, tensor<f32>
+              }
+            }
+        "#}
+        .replace("@SIGNATURE@", expected_signature);
+        assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 3.0)]).unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![3.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![6.0]);
+
+        let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32));
+        let eager_reference = eager_input.new_reference().unwrap();
+        let eager_snapshot = eager_reference.read().unwrap();
+        eager_reference.add_update(&eager_input).unwrap();
+        let eager_final = eager_reference.freeze().unwrap();
+        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(3.0f32)));
+        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(6.0f32)));
+    }
+
+    #[test]
+    fn test_xla_lowering_preserves_lifted_capture_scope_inside_condition_regions() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
+
+        let branch = || {
+            let mut builder = XlaProgramBuilder::new();
+            let capture =
+                builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone().into())));
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![capture], Vec::new(), vec![Placeholder])
+                .unwrap()
+        };
+        let true_branch = branch();
+        let false_branch = branch();
+        let mut builder = XlaProgramBuilder::new();
+        builder.add_input(scalar_type.clone().into());
+        let predicate = builder.add_input(predicate_type.into());
+        let true_region = builder.import_region(true_branch.entry_region_ref());
+        let false_region = builder.import_region(false_branch.entry_region_ref());
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 1, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 7.0), boolean_scalar(&client, &mesh, true)])
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![7.0]);
+    }
+
+    #[test]
+    fn test_xla_lowering_validates_capture_count_before_reference_discharge() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(scalar_type.into());
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            domain.lower_xla_program(&program, 2, &XlaOptions::new(mesh)),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "capture_count is 2, but the program has only 1 flat input(s)",
+        ));
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_reference_state_through_condition() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let true_branch = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(scalar_type.clone().into());
+            let snapshot =
+                builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            builder.add_input(scalar_type.clone().into());
+            let snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let replacement = builder.add_input(scalar_type.clone().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<XlaConstant>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, replacement],
+            )
+            .unwrap()[0];
+        let final_value = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![snapshot, final_value],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg2: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {",
+        );
+        let expected_stable_hlo = indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=1]>
+            @SIGNATURE@
+                %0:2 = "stablehlo.if"(%arg0) ({
+                  stablehlo.return %arg1, %arg2 : tensor<f32>, tensor<f32>
+                }, {
+                  stablehlo.return %arg1, %arg1 : tensor<f32>, tensor<f32>
+                }) : (tensor<i1>) -> (tensor<f32>, tensor<f32>)
+                return %0#0, %0#1 : tensor<f32>, tensor<f32>
+              }
+            }
+        "#}
+        .replace("@SIGNATURE@", expected_signature);
+        assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+
+        let true_outputs = domain
+            .execute_xla_program(
+                &compiled,
+                vec![
+                    boolean_scalar(&client, &mesh, true),
+                    f32_scalar(&client, &mesh, 10.0),
+                    f32_scalar(&client, &mesh, 7.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &true_outputs[0]), vec![10.0]);
+        assert_eq!(read_f32s(&client, &true_outputs[1]), vec![7.0]);
+
+        let false_outputs = domain
+            .execute_xla_program(
+                &compiled,
+                vec![
+                    boolean_scalar(&client, &mesh, false),
+                    f32_scalar(&client, &mesh, 10.0),
+                    f32_scalar(&client, &mesh, 7.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &false_outputs[0]), vec![10.0]);
+        assert_eq!(read_f32s(&client, &false_outputs[1]), vec![10.0]);
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_reference_state_through_while() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let condition = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+            let predicate = CpuArray::from_elements(replicated_scalar_type(&mesh, DataType::Boolean), &[true]).unwrap();
+            let predicate =
+                builder.add_instruction(ConstantOperation::new(predicate), Vec::new(), Vec::new()).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        assert_reference_free_stable_hlo(&lowered);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+
+        let immutable_oracle = (0..3).fold(2.0f32, |state, _| state + 1.0);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_reference_state_through_static_scan() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+            let value = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![reference, value],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let scan_outputs = builder
+            .add_instruction(ScanOperation::<XlaConstant>::new(1, 3), vec![body], vec![reference])
+            .unwrap()
+            .to_vec();
+        let final_value =
+            builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![scan_outputs[0]]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![final_value, scan_outputs[1]],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        assert_reference_free_stable_hlo(&lowered);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+
+        let mut immutable_state = 2.0f32;
+        let mut immutable_steps = Vec::new();
+        for _ in 0..3 {
+            immutable_state += 1.0;
+            immutable_steps.push(immutable_state);
+        }
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_state]);
+        assert_eq!(read_f32s(&client, &outputs[1]), immutable_steps);
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_reference_state_through_dynamic_scan() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let length_variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
+        let length = DimensionValue::new(DimensionType::new(length_variable.clone()), 3).unwrap();
+
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let runtime_length = builder.add_constant(XlaConstant::Dimension(length.clone()));
+        let reference = builder
+            .add_instruction(
+                ScanOperation::<XlaConstant>::new(1, Dimension::Dynamic(length_variable.clone())),
+                vec![body],
+                vec![reference, runtime_length],
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let scan_instruction = &program.entry_region_ref().instructions()[1];
+        let XlaOperation::Scan(scan) = scan_instruction.operation() else {
+            panic!("expected dynamic scan operation");
+        };
+        assert_eq!(scan.carry_count(), 1);
+        assert_eq!(scan.length(), &Dimension::Dynamic(length_variable));
+        let runtime_length = *scan_instruction.inputs().last().unwrap();
+        assert_eq!(
+            program.entry_region_ref().atoms()[runtime_length.index()].as_constant(),
+            Some(&XlaConstant::Dimension(length)),
+        );
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
+        assert_reference_free_stable_hlo(&lowered);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
+
+        let immutable_oracle = (0..3).fold(2.0f32, |state, _| state + 1.0);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_reference_state_through_nested_jit_call() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            let update = builder.add_input(scalar_type.clone().into());
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let update = builder.add_input(scalar_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update])
+            .unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            program.entry_region_ref().instructions()[1].operation(),
+            XlaOperation::JitCall(operation) if operation.capture_count() == 0,
+        ));
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
+        assert_reference_free_stable_hlo(&lowered);
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0), f32_scalar(&client, &mesh, 4.0)])
+            .unwrap();
+
+        let immutable_oracle = 2.0f32 + 4.0;
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![immutable_oracle]);
+    }
+
+    #[test]
+    fn test_xla_lowering_rejects_external_reference_state_after_discharge() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![input]).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = XlaDomain::new(&client);
         assert!(matches!(
-            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "references must be discharged before XLA compilation",
-        ));
-
-        // A pure reference pass-through carries reference types but no stateful instruction, so it has
-        // `Effects::PURE` and only the type scan can catch it.
-        let pass_through = {
-            let mut builder = XlaProgramBuilder::new();
-            let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-            builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        assert!(pass_through.effects().is_pure());
-        assert!(matches!(
-            domain.lower_xla_program(&pass_through, 0, &XlaOptions::new(mesh.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "references must be discharged before XLA compilation",
-        ));
-
-        // A forwarded reference capture is likewise pure: the constant stores only deterministic capture metadata,
-        // so it survives construction, and only the type scan can reject it here.
-        let forwarded_capture = {
-            let mut builder = XlaProgramBuilder::new();
-            let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(
-                0,
-                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
-            )));
-            builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![capture], Vec::new(), vec![Placeholder])
-                .unwrap()
-        };
-        assert!(forwarded_capture.effects().is_pure());
-        assert!(matches!(
-            domain.lower_xla_program(&forwarded_capture, 0, &XlaOptions::new(mesh)),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == "references must be discharged before XLA compilation",
+            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external reference state requires a stateful XLA invocation boundary",
         ));
     }
 
@@ -8121,7 +8571,7 @@ mod tests {
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
-            let literal = ReferenceArray::from_elements(scalar_type.clone(), &[3.0f32]).unwrap();
+            let literal = CpuArray::from_elements(scalar_type.clone(), &[3.0f32]).unwrap();
             let limit = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), vec![]).unwrap()[0];
             let predicate = builder
                 .add_instruction(
@@ -8369,7 +8819,7 @@ mod tests {
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
         };
-        let operation = XlaOperation::JitCall(JitCallOperation::new());
+        let operation = XlaOperation::JitCall(JitCallOperation::new(0));
         let callee = Arc::new(callee);
 
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);

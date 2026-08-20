@@ -2207,6 +2207,37 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_rejects_captures_registered_in_its_body() {
+        use ryft_core::{CaptureReference, CapturingContext};
+
+        // The shard-map body is traced through a fresh-root context whose capture table is local to that trace and
+        // discarded. A capture registered inside the body would therefore leave a `capture#0` constant in the body
+        // region that XLA lowering later resolves against whatever capture prefix surrounds the enclosing compiled
+        // function — silently aliasing an unrelated captured value — so the body trace is rejected at trace time
+        // instead.
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
+        let mesh = test_logical_mesh_2x2();
+        let captured_value = XlaConstant::Captured(CaptureReference::new(
+            0,
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))),
+        ));
+        let result: Result<TracedShardMap<ArrayType, ArrayType>, ShardMapTraceError> = shard_map(
+            move |x: ShardMapTracer| {
+                // Registering the capture is enough to poison the body trace's discarded capture table; the trace
+                // boundary rejects the body regardless of whether the returned reference is staged.
+                x.value().context().capture(captured_value.clone()).unwrap();
+                x.clone() + x
+            },
+            global_input_type,
+            mesh.clone(),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+            test_sharding(&mesh, vec![ShardingDimension::sharded(["x"])], vec![]),
+        );
+
+        assert!(matches!(result, Err(ShardMapTraceError::ProgramError(ProgramError::DiscardedCaptures { count: 1 }))));
+    }
+
+    #[test]
     fn test_shard_map_rejects_zero_input_traced_invocation_without_domain() {
         let mesh = test_logical_mesh_2x2();
         let result: Result<Vec<ShardMapTracer>, ShardMapTraceError> =

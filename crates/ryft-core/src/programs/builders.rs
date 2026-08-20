@@ -12,7 +12,7 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
@@ -448,16 +448,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         // assigned last.
         let mut regions = self.regions;
         regions.push(Region::new(self.atoms, self.input_ids, output_ids, self.instructions))?;
-        let mut reachable = vec![false; regions.len()];
-        let mut pending = vec![entry];
-        while let Some(current) = pending.pop() {
-            if std::mem::replace(&mut reachable[current.index()], true) {
-                continue;
-            }
-            for instruction in &regions[current.index()].instructions {
-                pending.extend(instruction.regions.iter().copied());
-            }
-        }
+        let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
         if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
             return Err(ProgramError::MalformedProgram(format!(
                 "region {} is not reachable from the program entry region",

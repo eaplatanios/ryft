@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, CalleeRegionDriver, Concretizable, Context, DifferentiableOperation, DifferentiableType,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero, MeshAxisType, Operation,
-    OperationFormatter, Parameterized, ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationInput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Program, ProgramError,
-    ProjectedValue, RegionInterface, RegionRef, RegionSlot, Sharding, ShardingDimension, StagingContext, Tracer,
-    TracingContext, TransposableOperation, TranspositionDriver, Type, TypeError, Typed, Value, ValueProjection, Zero,
+    ArrayIrType, ArrayType, CalleeRegionDriver, CaptureConstant, Concretizable, Context, DifferentiableOperation,
+    DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero,
+    MeshAxisType, Operation, OperationFormatter, Parameterized, ParameterizedFamily, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, Program, ProgramError, ProjectedValue, RegionInterface, RegionRef, RegionSlot,
+    Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TransposableOperation, TranspositionDriver,
+    Type, TypeError, Typed, Value, ValueProjection, Zero,
 };
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
@@ -313,6 +314,7 @@ where
     V: PartialEq
         + Value<Type = ArrayIrType>
         + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CaptureConstant
         + Concretizable<bool>,
     C: Context<Type = ArrayIrType, Constant = V, Operation = XlaOperation<V>>,
 {
@@ -500,6 +502,7 @@ fn shard_map_bodies<
     V: PartialEq
         + Value<Type = ArrayIrType>
         + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CaptureConstant
         + Concretizable<bool>,
 >(
     operation: &ShardMapOperation<V>,
@@ -611,6 +614,7 @@ where
     V: PartialEq
         + Value<Type = ArrayIrType>
         + ryft_core::ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CaptureConstant
         + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(

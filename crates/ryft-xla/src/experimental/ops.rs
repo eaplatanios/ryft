@@ -28,10 +28,11 @@ use ryft_core::{
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     EagerContext, ErfOperation, ExpOperation, FloorOperation, FreezeReferenceOperation, GatherOperation, IotaOperation,
     LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation,
-    NegOperation, NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OrOperation,
-    PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
+    NegOperation, NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
+    OrOperation, OutputRegionProvenance, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
+    ReferenceAddUpdateOperation, ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceReadOperation,
     ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
     ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
     SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
@@ -350,6 +351,39 @@ where
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<C>>),
+}
+
+impl<Constant> ReferenceDischargeOperation for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
+        // The `Ordinary` fallback is safe for the remaining region-carrying families (`shard_map`, rematerialization,
+        // linear calls, and custom-derivative carriers): discharge rejects any `Ordinary` instruction whose boundary
+        // or attached closure carries reference state before replaying it.
+        match self {
+            Self::NewReference(_) => ReferenceDischargeRule::NewReference,
+            Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
+            Self::ReferenceSwap(_) => ReferenceDischargeRule::Swap,
+            Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::AddUpdate,
+            Self::FreezeReference(_) => ReferenceDischargeRule::Freeze,
+            Self::Condition(_) => ReferenceDischargeRule::Condition,
+            Self::While(_) => ReferenceDischargeRule::While,
+            Self::Scan(operation) => ReferenceDischargeRule::Scan { carry_count: operation.carry_count() },
+            Self::JitCall(_) => ReferenceDischargeRule::Call,
+            _ => ReferenceDischargeRule::Ordinary,
+        }
+    }
+
+    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
+        let Self::Scan(operation) = self else {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` is not a scan and cannot carry discharged reference state",
+                self.name(),
+            )));
+        };
+        Ok(Self::Scan(operation.with_added_carries(additional_carry_count)?))
+    }
 }
 
 impl<C> From<ArrayOperation<C::Projected>> for XlaOperation<C>
@@ -701,8 +735,13 @@ pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
 /// one function handle share one callee root and remain identity-comparable for call-site deduplication at lowering.
 /// The `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form
 /// and the executable composite array IR form to remain distinct payload types with one [`Operation`] contract each.
+/// The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it participates in
+/// operation equality and callee-deduplication identity and scopes reference-capture resolution during analysis.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JitCallOperation<T: Type> {
+    /// Number of leading callee inputs that form its lifted lexical capture prefix.
+    capture_count: usize,
+
     /// Type universe of the callee boundary.
     marker: PhantomData<fn() -> T>,
 }
@@ -711,17 +750,23 @@ impl<T: Type> Copy for JitCallOperation<T> {}
 
 impl<T: Type> JitCallOperation<T> {
     /// Creates a staged jitted-call operation. The flat callee program is supplied as a shared region attachment to
-    /// [`Context::bind`].
+    /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
     #[inline]
-    pub(crate) fn new() -> Self {
-        Self { marker: PhantomData }
+    pub(crate) fn new(capture_count: usize) -> Self {
+        Self { capture_count, marker: PhantomData }
+    }
+
+    /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
+    #[inline]
+    pub(crate) fn capture_count(&self) -> usize {
+        self.capture_count
     }
 }
 
 impl CompiledCallOperation<XlaConstant> for XlaOperation {
     #[inline]
-    fn compiled_call() -> Self {
-        Self::JitCall(JitCallOperation::new())
+    fn compiled_call(capture_count: usize) -> Self {
+        Self::JitCall(JitCallOperation::new(capture_count))
     }
 }
 
@@ -792,6 +837,24 @@ impl<T: Type> Operation for JitCallOperation<T> {
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
         (region_index == 0).then_some(input_index)
     }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn region_capture_count(&self, region_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(self.capture_count)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
+        if self.capture_count == 0 {
+            Ok(())
+        } else {
+            operation.bracketed(|operation| operation.field("capture_count", self.capture_count))
+        }
+    }
 }
 
 /// Online partial-evaluation rule for a staged jitted call — ryft's analogue of JAX's call partial-evaluation
@@ -813,6 +876,7 @@ where
     V: PartialEq
         + Value<Type = ArrayIrType>
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CaptureConstant
         + Concretizable<bool>,
     C: Context<Type = ArrayIrType, Constant = V, Operation = XlaOperation<V>>,
 {
@@ -835,6 +899,15 @@ where
         // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
         // side as the residual `jit_call`, and reassemble the original output order.
         let callee = driver.region(0)?;
+        // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
+        // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
+        // silently aliasing an unrelated leading operand at worst. Preserve the original call boundary for any callee
+        // whose closure still holds a capture constant.
+        if callee.contains_atom_in_closure(|atom| {
+            atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+        }) {
+            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+        }
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
         let partition = callee.partition(input_known.as_slice())?;
         // A trivial partition — one whose known program contains no instructions — hoists no work (its known side
@@ -843,11 +916,16 @@ where
         if partition.known_program().instructions().is_empty() {
             return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
         }
+        // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
+        // members of the original lifted-capture prefix; the residual callee's inputs are residual edges and unknown
+        // inputs, which never form a capture prefix. The guard above already preserved the boundary of any callee
+        // retaining attached-region capture constants, so neither derived callee can hold one.
+        let known_capture_count = input_known.iter().take(self.capture_count()).filter(|known| **known).count();
         context.inline_partitioned_program(
             partition,
             inputs,
-            |known_program| (XlaOperation::JitCall(JitCallOperation::new()), vec![known_program]),
-            |residual_program| (XlaOperation::JitCall(JitCallOperation::new()), vec![residual_program]),
+            |known_program| (XlaOperation::JitCall(JitCallOperation::new(known_capture_count)), vec![known_program]),
+            |residual_program| (XlaOperation::JitCall(JitCallOperation::new(0)), vec![residual_program]),
         )
     }
 }
@@ -958,6 +1036,7 @@ where
     V: PartialEq
         + Value<Type = ArrayIrType>
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + CaptureConstant
         + Concretizable<bool>,
 {
     fn jvp<D: DifferentiationDriver<C>>(
@@ -983,7 +1062,9 @@ where
         // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
         // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_call = XlaOperation::JitCall(JitCallOperation::new());
+        // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
+        // survives verbatim and its length carries over.
+        let primal_call = XlaOperation::JitCall(JitCallOperation::new(self.capture_count()));
         let mut primal_call_outputs =
             context.bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
@@ -1007,7 +1088,12 @@ where
             .map(|(input, _)| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
-        let tangent_call = XlaOperation::JitCall(JitCallOperation::new());
+        // The tangent callee's inputs are live input tangents followed by residuals — never a lifted-capture prefix.
+        // Attached-region capture constants cannot appear in it because fresh-root region traces reject bodies that
+        // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
+        // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
+        // value.
+        let tangent_call = XlaOperation::JitCall(JitCallOperation::new(0));
         let tangent_outputs =
             context.bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
         let output_tangent_types =
@@ -1170,7 +1256,10 @@ pub fn transpose_primal_jit_call<
         operands.push(materialize_transpose_cotangent(context, cotangent, &output_cotangent_type, inputs)?);
     }
     operands.extend(known_values);
-    let transposed_call = XlaOperation::JitCall(JitCallOperation::new());
+    // The transposed callee's inputs are output cotangents followed by known input values — never a lifted-capture
+    // prefix. Attached-region capture constants cannot appear in it because region bodies are traced through
+    // fresh-root contexts.
+    let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0));
     let input_cotangents =
         context.bind(transposed_call, CalleeRegionDriver::new(&[transposed_callee]), operands.as_slice())?;
     let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
@@ -1219,19 +1308,21 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
-        AtomId, CaptureReference, ConditionOperation, CustomJvpOperation, CustomVjpOperation, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DynamicBroadcastOperation, Effects, EmptyRegionDriver,
-        FreezeReferenceOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation,
-        Operation, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation,
-        ReferenceAnalysisError, ReferenceReadOperation, ReferenceRoot, ReferenceSwapOperation, ReferenceType,
-        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
-        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
+        AtomId, CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation,
+        CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
+        DynamicBroadcastOperation, Effects, EmptyRegionDriver, FreezeReferenceOperation, InstructionId, LogicalMesh,
+        MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation, Operation, OutputRegionProvenance,
+        PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError,
+        ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
+        ReferenceSwapOperation, ReferenceType, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
+        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
+        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
-    use crate::experimental::domains::XlaTracer;
+    use crate::experimental::domains::{XlaDomain, XlaTracer};
     use crate::experimental::shard_map::ShardMapTracer;
 
     use super::{
@@ -1270,6 +1361,25 @@ mod tests {
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))
+    }
+
+    #[test]
+    fn test_jit_call_reference_provenance_is_positional() {
+        // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
+        // output provenance are all index-preserving for the single callee region and absent for any other region.
+        let operation = JitCallOperation::<ArrayIrType>::new(2);
+        assert_eq!(operation.input_region_provenance(0, 3), Some(3));
+        assert_eq!(operation.input_region_provenance(1, 3), None);
+        assert_eq!(operation.region_capture_count(0), Some(2));
+        assert_eq!(operation.region_capture_count(1), None);
+        assert_eq!(
+            std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(),
+            "jit_call [capture_count=2]",
+        );
+        assert_eq!(
+            operation.output_region_provenance(2),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 2 }],
+        );
     }
 
     #[test]
@@ -1397,7 +1507,7 @@ mod tests {
         let callee_region = middle_builder.import_region(callee.entry_region_ref());
         let reference = middle_builder.add_input(reference_type.clone().into());
         let value = middle_builder
-            .add_instruction(JitCallOperation::new(), vec![callee_region], vec![reference])
+            .add_instruction(JitCallOperation::new(0), vec![callee_region], vec![reference])
             .unwrap()[0];
         let middle = middle_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
@@ -1406,21 +1516,21 @@ mod tests {
         let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let middle_region = builder.import_region(middle.entry_region_ref());
         let reference = builder.add_input(reference_type.into());
-        let value = builder.add_instruction(JitCallOperation::new(), vec![middle_region], vec![reference]).unwrap()[0];
+        let value = builder.add_instruction(JitCallOperation::new(0), vec![middle_region], vec![reference]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
         let analysis = program.analyze_references(0).unwrap();
-        assert_eq!(analysis.bindings().len(), 2);
         let callee_root = ReferenceRoot::RegionInput { region: callee_region, input_index: 0 };
         let middle_root = ReferenceRoot::RegionInput { region: middle_region, input_index: 0 };
         let entry_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 };
-        assert_eq!(analysis.bindings()[0].region_root(), callee_root,);
-        assert_eq!(analysis.bindings()[0].source_root(), middle_root);
-        assert_eq!(analysis.bindings()[1].region_root(), middle_root);
-        assert_eq!(analysis.bindings()[1].source_root(), entry_root);
-        assert_eq!(analysis.accesses()[0].root(), analysis.bindings()[0].region_root());
+        let middle_call = InstructionId::new(middle_region, 0);
+        let entry_call = InstructionId::new(program.entry(), 0);
+        assert_eq!(analysis.region_root_for_source(middle_call, 0, middle_root), Some(callee_root));
+        assert_eq!(analysis.region_root_for_source(entry_call, 0, entry_root), Some(middle_root));
+        assert_eq!(analysis.region_root_for_source(entry_call, 0, middle_root), None);
+        assert_eq!(analysis.accesses()[0].root(), callee_root);
     }
 
     #[test]
@@ -1521,6 +1631,32 @@ mod tests {
         assert!(matches!(&promoted, XlaOperation::Rematerialize(operation) if operation == &rematerialize));
         assert_eq!(promoted.name(), rematerialize.name());
         assert_eq!(promoted.region_slots(), rematerialize.region_slots());
+    }
+
+    #[test]
+    fn test_rematerialize_rejects_captures_registered_in_its_body() {
+        use ryft_core::tracing_v2::rematerialize;
+
+        // The rematerialized body is traced through a fresh-root context whose capture table is local to that trace
+        // and discarded. A capture registered inside the body would therefore leave a `capture#0` constant in the
+        // rematerialized region that XLA lowering later resolves against whatever capture prefix surrounds the
+        // enclosing compiled function — silently aliasing an unrelated captured value — so the body trace is
+        // rejected at trace time instead.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
+        let captured_value = XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone()));
+        let function = rematerialize::<XlaDomain<'static>, _, _, _>(
+            move |x: XlaTracer<'static>| -> Result<XlaTracer<'static>, ProgramError> {
+                let context = x.context().clone();
+                let reference = context.capture(captured_value.clone())?;
+                let captured = StagingContext::constant(&context, reference);
+                let mut outputs = context.bind(AddOperation::new(), Vec::new(), &[x, captured])?;
+                Ok(outputs.remove(0))
+            },
+        );
+        let root = DomainTracingContext::<XlaDomain<'static>>::new();
+        let input = root.input(scalar_type);
+        let result = function.call(input);
+        assert!(matches!(result, Err(ProgramError::DiscardedCaptures { count: 1 })));
     }
 
     #[test]
@@ -1635,7 +1771,7 @@ mod tests {
             vec![array_type.clone(), dimension_type.clone()],
             Effects::PURE,
         );
-        let operation = JitCallOperation::new();
+        let operation = JitCallOperation::new(0);
 
         assert_eq!(operation.name(), JIT_CALL_OPERATION_NAME);
         assert_eq!(
@@ -1674,7 +1810,7 @@ mod tests {
         let array = builder.add_input(array_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
         let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new()), vec![callee], vec![dimension, array])
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dimension, array])
             .unwrap()
             .to_vec();
         let program = builder
@@ -1803,7 +1939,7 @@ mod tests {
         let tangent_type = ArrayIrType::Array(tangent_type);
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
         let cotangents = transpose_primal_jit_call(
-            &JitCallOperation::new(),
+            &JitCallOperation::new(0),
             &mut context,
             &EmptyRegionDriver,
             &[PartialValue::Unknown(tangent_type.clone())],
@@ -1814,7 +1950,7 @@ mod tests {
 
         let known = context.input(tangent_type.clone());
         let cotangents = transpose_primal_jit_call(
-            &JitCallOperation::new(),
+            &JitCallOperation::new(0),
             &mut context,
             &EmptyRegionDriver,
             &[PartialValue::Known(known)],
@@ -1888,7 +2024,7 @@ mod tests {
         let value_cotangent = context.input(value_program_type.clone());
 
         let contributions = transpose_primal_jit_call(
-            &JitCallOperation::new(),
+            &JitCallOperation::new(0),
             &mut context,
             &driver,
             &[PartialValue::Unknown(value_program_type.clone())],
@@ -1915,16 +2051,18 @@ mod tests {
 
         let r#type = ArrayIrType::Array(vector_type());
 
-        // Callee `f(a, x) = (a + c, x * c, (a + c) * x)` over a known `a`, an unknown `x`, and a literal `c`.
+        // Callee `f(a, x) = (a + a, x * x, (a + a) * x)` over a known `a` and an unknown `x`. Capture constants are
+        // deliberately absent: a capture-bearing callee preserves its boundary instead of splitting, which
+        // `test_jit_call_partial_evaluation_preserves_boundary_for_capture_bearing_callees` pins.
         let callee = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
-            let literal = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, r#type.clone())));
             let shifted =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, literal]).unwrap()[0];
-            let scaled =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![runtime_input, literal]).unwrap()[0];
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input]).unwrap()[0];
+            let scaled = builder
+                .add_instruction(MulOperation::new(), Vec::new(), vec![runtime_input, runtime_input])
+                .unwrap()[0];
             let product =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![shifted, runtime_input]).unwrap()[0];
             builder
@@ -1941,7 +2079,7 @@ mod tests {
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
-        let call = XlaOperation::JitCall(JitCallOperation::new());
+        let call = XlaOperation::JitCall(JitCallOperation::new(0));
         let outputs = builder
             .add_instruction(call, vec![callee_region], vec![known_input, runtime_input])
             .unwrap()
@@ -1971,11 +2109,9 @@ mod tests {
             assert_eq!(known_callee.output_ids().len(), 2);
             assert_eq!(known_callee.instructions().len(), 1);
             assert!(matches!(known_callee.instructions()[0].operation(), XlaOperation::Array(ArrayOperation::Add(_)),));
-            assert!(known_callee.atoms().iter().any(|atom| atom.is_constant()));
         }
 
-        // The unknown half stayed behind one residual `jit_call` over the unknown input plus the residual edge, with
-        // the literal rebuilt inline from its original payload.
+        // The unknown half stayed behind one residual `jit_call` over the unknown input plus the residual edge.
         assert_eq!(evaluation.program().instructions().len(), 1);
         let residual_instruction = &evaluation.program().instructions()[0];
         assert!(
@@ -1985,7 +2121,6 @@ mod tests {
         let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
         assert_eq!(residual_callee.input_ids().len(), 2);
         assert_eq!(residual_callee.instructions().len(), 2);
-        assert!(residual_callee.atoms().iter().any(|atom| atom.is_constant()));
 
         // The boundary descriptors: the unknown enclosing input feeds the residual call, the residual edge is a
         // known feeder naming the known-side call's staged output, and the outputs reassemble in original order.
@@ -1996,6 +2131,69 @@ mod tests {
         assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
         assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_preserves_boundary_for_capture_bearing_callees() {
+        use ryft_core::{StagingContext, TracingContext};
+
+        // Partitioning does not remap the absolute indices of retained capture constants, so a mixed call whose
+        // callee still holds one must keep its original boundary instead of splitting into derived callees whose
+        // compacted or absent capture prefixes those indices would misname.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let known_input = builder.add_input(r#type.clone());
+            let runtime_input = builder.add_input(r#type.clone());
+            let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, r#type.clone())));
+            let shifted =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, captured]).unwrap()[0];
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![shifted, runtime_input]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![shifted, product],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let known_input = builder.add_input(r#type.clone());
+        let runtime_input = builder.add_input(r#type.clone());
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![known_input, runtime_input],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(r#type.clone());
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
+            .unwrap();
+
+        // No known-side call was hoisted into the outer trace, and the residual program retains the original call
+        // with its callee — capture constant included — intact.
+        assert!(outer.builder().borrow().instructions().is_empty());
+        assert_eq!(evaluation.program().instructions().len(), 1);
+        let residual_instruction = &evaluation.program().instructions()[0];
+        assert!(matches!(residual_instruction.operation(), XlaOperation::JitCall(_)));
+        let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
+        assert_eq!(residual_callee.instructions().len(), 2);
+        assert!(
+            residual_callee
+                .atoms()
+                .iter()
+                .any(|atom| atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())),
+        );
     }
 
     #[test]
@@ -2025,7 +2223,7 @@ mod tests {
         let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
         let outputs = builder
             .add_instruction(
-                XlaOperation::JitCall(JitCallOperation::new()),
+                XlaOperation::JitCall(JitCallOperation::new(0)),
                 vec![callee_region],
                 vec![known_input, runtime_input],
             )
@@ -2048,6 +2246,283 @@ mod tests {
             }),
         );
         assert!(outer.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_nested_jit_call_reference_discharge_threads_callee_state_into_the_caller() {
+        // Two nested call levels each swap a distinct reference. Discharge must lift both states to the caller's
+        // boundary in public-input order, mark both as mutated with their own final-state output slot, and leave no
+        // reference-typed atom anywhere in the resulting program.
+        let reference_type = ReferenceType::new(vector_type());
+        let inner_callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(vector_type().into());
+            let snapshot =
+                builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let inner_callee = builder.import_region(inner_callee.entry_region_ref());
+            let first_reference = builder.add_input(reference_type.clone().into());
+            let first_replacement = builder.add_input(vector_type().into());
+            let second_reference = builder.add_input(reference_type.clone().into());
+            let second_replacement = builder.add_input(vector_type().into());
+            let first_snapshot = builder
+                .add_instruction(
+                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                    vec![inner_callee],
+                    vec![first_reference, first_replacement],
+                )
+                .unwrap()[0];
+            let second_snapshot = builder
+                .add_instruction(
+                    XlaOperation::JitCall(JitCallOperation::new(0)),
+                    vec![inner_callee],
+                    vec![second_reference, second_replacement],
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![first_snapshot, second_snapshot],
+                    vec![Placeholder; 4],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let first_reference = builder.add_input(reference_type.clone().into());
+        let first_replacement = builder.add_input(vector_type().into());
+        let second_reference = builder.add_input(reference_type.into());
+        let second_replacement = builder.add_input(vector_type().into());
+        let snapshots = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![first_reference, first_replacement, second_reference, second_replacement],
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(snapshots, vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.program().output_count(), 4);
+        assert_eq!(discharged.external_states().len(), 2);
+        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::PublicInput { index: 0 });
+        assert!(discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
+        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::PublicInput { index: 2 });
+        assert!(discharged.external_states()[1].is_mutated());
+        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(3));
+    }
+
+    #[test]
+    fn test_nested_jit_call_reference_discharge_resolves_callee_lexical_capture_scope() {
+        // A branch region inside the callee reaches its reference through a capture constant, which must resolve
+        // against the callee's own capture scope rather than the entry program's lifted prefix: the accessed root is
+        // the caller's second public input, and only that mutated state gains a final-state output.
+        let reference_type = ReferenceType::new(vector_type());
+        let branch = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let replacement = builder.add_input(vector_type().into());
+            let reference = builder.add_constant(XlaConstant::Captured(CaptureReference::new(
+                0,
+                ArrayIrType::Reference(reference_type.clone()),
+            )));
+            let snapshot =
+                builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let branch = builder.import_region(branch.entry_region_ref());
+            builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(vector_type().into());
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let snapshot = builder
+                .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, replacement])
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        builder.add_input(reference_type.clone().into());
+        let reference = builder.add_input(reference_type.into());
+        let replacement = builder.add_input(vector_type().into());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let snapshot = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(1)),
+                vec![callee],
+                vec![reference, replacement, predicate],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        let analysis = program.analyze_references_with_lifted_captures(0).unwrap();
+        assert_eq!(
+            analysis
+                .instruction_summary(InstructionId::new(program.entry(), 0))
+                .unwrap()
+                .iter()
+                .map(|access| access.root())
+                .collect::<Vec<_>>(),
+            vec![ReferenceRoot::RegionInput { region: program.entry(), input_index: 1 }],
+        );
+        let discharged = program.discharge_references_with_lifted_captures(0).unwrap();
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.program().output_count(), 2);
+        assert_eq!(discharged.external_states().len(), 2);
+        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::PublicInput { index: 0 });
+        assert!(!discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::PublicInput { index: 1 });
+        assert!(discharged.external_states()[1].is_mutated());
+        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(1));
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_preserves_forwarded_root_identity() {
+        let reference_type = ReferenceType::new(vector_type());
+        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = callee_builder.add_input(reference_type.clone().into());
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let forwarded = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference])
+            .unwrap()[0];
+        let value = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![forwarded]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The callee only forwards its reference input, so discharge must keep the forwarded value bound to the same
+        // root as the caller's public reference input instead of synthesizing a second state slot for it. Reading
+        // through the forwarded result is not a mutation, so no final-state output is appended.
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.program().output_count(), 1);
+        assert_eq!(discharged.external_states().len(), 1);
+        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::PublicInput { index: 0 });
+        assert!(!discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+    }
+
+    #[test]
+    fn test_reference_discharge_rules() {
+        // The `XlaOperation` rule mapping is written arm by arm, so a mis-paired arm would still compile: each
+        // reference operation must classify into its own rule, region carriers must classify into the region-aware
+        // rules, a scan must report its current carry count, a jitted call must classify as a call boundary, and
+        // every other operation family must fall back to `Ordinary`.
+        assert_eq!(
+            XlaOperation::<XlaConstant>::NewReference(NewReferenceOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::NewReference,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Read,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::ReferenceSwap(ReferenceSwapOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Swap,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::AddUpdate,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::FreezeReference(FreezeReferenceOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Freeze,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::Condition(ConditionOperation::new()).reference_discharge_rule(),
+            ReferenceDischargeRule::Condition,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::While(WhileOperation::new()).reference_discharge_rule(),
+            ReferenceDischargeRule::While,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::Scan(ScanOperation::new(2, 4)).reference_discharge_rule(),
+            ReferenceDischargeRule::Scan { carry_count: 2 },
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::JitCall(JitCallOperation::new(0)).reference_discharge_rule(),
+            ReferenceDischargeRule::Call,
+        );
+        assert_eq!(
+            XlaOperation::<XlaConstant>::Array(ArrayOperation::Add(AddOperation::new())).reference_discharge_rule(),
+            ReferenceDischargeRule::Ordinary,
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_widens_carries_and_preserves_scan_metadata() {
+        let reference_type = ReferenceType::new(vector_type());
+        let mut body_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let body_carry = body_builder.add_input(vector_type().into());
+        let reference =
+            body_builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone().into())));
+        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![body_carry, value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let capture = XlaConstant::Captured(CaptureReference::new(
+            1,
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3), Dimension::Static(4)])).into(),
+        ));
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        builder.add_input(reference_type.into());
+        let carry = builder.add_input(vector_type().into());
+        let operation = ScanOperation::<XlaConstant>::new(1, 3)
+            .with_reverse(true)
+            .with_unroll(3)
+            .unwrap()
+            .with_captures(vec![capture.clone()]);
+        let outputs = builder.add_instruction(XlaOperation::Scan(operation), vec![body], vec![carry]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Threading the captured reference state through the scan widens the carry list of the rebuilt `XlaOperation`
+        // scan payload and leaves its capture environment intact.
+        let discharged = program.discharge_references_with_lifted_captures(1).unwrap();
+        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.external_states().len(), 1);
+        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(!discharged.external_states()[0].is_mutated());
+        let XlaOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
+            panic!("expected a discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 2);
+        assert_eq!(scan.unroll(), 3);
+        assert_eq!(scan.captures(), &[capture]);
     }
 
     #[test]

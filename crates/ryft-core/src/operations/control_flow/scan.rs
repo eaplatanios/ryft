@@ -148,6 +148,22 @@ impl<Capture: Value> ScanOperation<Capture> {
         Ok(self)
     }
 
+    /// Returns this [`ScanOperation`] with `additional_carry_count` extra carries appended after its existing
+    /// carries, preserving its length, direction, unroll factor, and capture payloads. Reference discharge uses this
+    /// to widen a scan with hidden immutable state carries.
+    pub fn with_added_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
+        let carry_count = self.carry_count.checked_add(additional_carry_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`scan` carry count {} overflows when adding {additional_carry_count} discharged reference state \
+                 carries",
+                self.carry_count,
+            ))
+        })?;
+        let mut operation = self.clone();
+        operation.carry_count = carry_count;
+        Ok(operation)
+    }
+
     /// Returns this [`ScanOperation`] with the provided capture environment.
     ///
     /// Captures are interpreted by operation payloads inside the body. The scan operation itself only stores and
@@ -804,8 +820,18 @@ where
         Ok(output_types)
     }
 
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index == 0 && input_index < self.carry_count).then_some(input_index)
+    }
+
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    #[inline]
+    fn reference_output_root_input(&self, output_index: usize) -> Option<usize> {
+        (output_index < self.carry_count).then_some(output_index)
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
@@ -3145,10 +3171,14 @@ mod tests {
         // Operation identity, declared region slots, output provenance, and accessors.
         assert_eq!(operation.name(), SCAN_OPERATION_NAME);
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
+        assert_eq!(operation.input_region_provenance(0, 0), Some(0));
+        assert_eq!(operation.input_region_provenance(0, 1), None);
         assert_eq!(
             operation.output_region_provenance(1),
             vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
         );
+        assert_eq!(operation.reference_output_root_input(0), Some(0));
+        assert_eq!(operation.reference_output_root_input(1), None);
         assert_eq!(operation.carry_count(), 1);
         assert_eq!(operation.length(), &Dimension::Static(3));
         assert!(!operation.reverse());
@@ -3358,6 +3388,33 @@ mod tests {
                 in (%2, %3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_scan_with_added_carries() {
+        // Widening appends the requested carries and preserves every other payload field, including the visit order,
+        // the lowering-only unroll factor, and the capture environment.
+        let capture = Array::vector(vec![1.0_f64, 2.0, 3.0]);
+        let operation = TestScanOperation::new(1, 3)
+            .with_reverse(true)
+            .with_unroll(3)
+            .unwrap()
+            .with_captures(vec![capture.clone()]);
+        let widened = operation.with_added_carries(2).unwrap();
+        assert_eq!(widened.carry_count(), 3);
+        assert_eq!(widened.length(), &Dimension::Static(3));
+        assert!(widened.reverse());
+        assert_eq!(widened.unroll(), 3);
+        assert_eq!(widened.captures(), &[capture]);
+
+        // An overflowing carry count is reported instead of wrapping.
+        assert_eq!(
+            operation.with_added_carries(usize::MAX).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "`scan` carry count 1 overflows when adding {} discharged reference state carries",
+                usize::MAX,
+            )),
         );
     }
 

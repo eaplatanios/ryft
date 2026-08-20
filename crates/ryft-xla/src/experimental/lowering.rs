@@ -21,8 +21,8 @@ use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperation};
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
-    Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureConstant,
-    CaptureReference, CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
+    Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureReference,
+    CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
     ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension, DimensionOperation,
     DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
     DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
@@ -492,9 +492,9 @@ where
     })
 }
 
-/// Returns `true` if `program` contains a reference-typed atom in any region.
+/// Returns `true` if `program` contains a reference-typed atom or intrinsic reference semantics in any region.
 ///
-/// This type scan is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
+/// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
 /// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back the
 /// compilation preflight and the two direct module-lowering entries; eager binding, dispatch, and staging enforce
 /// their corresponding boundary invariants separately.
@@ -505,10 +505,13 @@ where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
 {
-    program
-        .regions()
-        .iter()
-        .any(|region| region.atoms().iter().any(|atom| matches!(atom.r#type().as_ref(), ArrayIrType::Reference(_))))
+    program.entry_region_ref().contains_atom_type_in_closure(RyftType::is_reference)
+        || program.regions().iter().any(|region| {
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| !instruction.operation().reference_semantics().is_empty())
+        })
 }
 
 /// Returns the effect classes that have StableHLO token slots, in canonical token/result order.
@@ -4095,7 +4098,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             global_output_types,
             self.context,
             self.location,
-            self.captured_values.as_slice(),
             &self.collective_state,
         )
     }
@@ -4191,7 +4193,6 @@ pub(crate) fn to_mlir_module<
             global_output_types.as_slice(),
             &context,
             location.as_ref(),
-            &[],
             &collective_state,
         )?;
         function_block_ref.append_operation(func::r#return(manual_results.as_slice(), location)?)?;
@@ -4475,7 +4476,16 @@ where
                 debug_assert_eq!(value.r#type()?, tensor_type.as_ref());
                 logical_argument_values.push(value);
             }
-            let (capture_values, input_values) = logical_argument_values.split_at(capture_types.len());
+            let (capture_values, public_input_values) = logical_argument_values.split_at(capture_types.len());
+            // Ordinary module callers lower an unlifted program whose entry inputs are only the public arguments.
+            // The compilation domain instead supplies the capture-lifted program so core reference discharge and
+            // lowering observe the same arena; in that form the complete logical argument list is also the entry
+            // input list, while the leading prefix still serves attached `CaptureReference` constants.
+            let input_values = if program.input_count() == logical_argument_values.len() {
+                logical_argument_values.as_slice()
+            } else {
+                public_input_values
+            };
             let logical_outputs = lower_program_outputs_with_inputs(
                 program,
                 capture_values,
@@ -5960,25 +5970,6 @@ fn jit_call_region_key(region: RegionRef<'_, XlaConstant, XlaOperation>) -> Opti
     })
 }
 
-/// Returns the leading lowered input values that correspond to the capture table referenced by `program`.
-fn captured_prefix_values<'b, 'c: 'b, 't: 'c>(
-    program: &FlatXlaProgram,
-    input_values: &[ValueRef<'b, 'c, 't>],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    let capture_count = program
-        .regions()
-        .iter()
-        .flat_map(|region| region.atoms())
-        .filter_map(|atom| atom.as_constant().and_then(CaptureConstant::capture_index))
-        .max()
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if input_values.len() < capture_count {
-        return Err(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
-    }
-    Ok(input_values[..capture_count].to_vec())
-}
-
 /// One deduplicated callee emitted as a shared private `func.func`.
 struct JitCallFunction {
     /// Symbol name of the emitted private function.
@@ -6202,10 +6193,12 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
 /// Lowers one `jit_call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
 /// an inlined copy of the callee body (otherwise).
 ///
-/// `input_values` are the lowered call operands in callee-input order; for a `linear_jit_call` they are the lowered
-/// captured prefix followed by the lowered linear inputs.
+/// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
+/// exact leading lifted-capture prefix length; deriving it from capture-constant indices instead would conflate the
+/// independent capture namespaces of nested calls inside the callee arena.
 fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
     program: &FlatXlaProgram,
+    capture_count: usize,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -6250,7 +6243,10 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
             }
         }
     }
-    let captured_values = captured_prefix_values(program, input_values)?;
+    if input_values.len() < capture_count {
+        return Err(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) });
+    }
+    let captured_values = input_values[..capture_count].to_vec();
     lower_nested_program_inline(
         program,
         input_values,
@@ -6637,7 +6633,6 @@ fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     global_output_types: &[ArrayType],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
     collective_state: &CollectiveLoweringState,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
@@ -6664,11 +6659,15 @@ where
     {
         let mut body_block_ref = body_block.as_ref();
         // Shard-map bodies lower with shard-local types, so their `jit_call`s always inline; do not thread the
-        // module's deduplicated functions (which are typed against global shapes) into them.
+        // module's deduplicated functions (which are typed against global shapes) into them. The body is traced
+        // through a fresh-root context and is therefore capture-free by construction (the trace boundary rejects
+        // bodies that register captures), so it lowers with an empty capture namespace: any capture-referencing
+        // constant that still sneaks in fails loudly with `MissingCapturedConstant` instead of silently aliasing
+        // the enclosing function's captures.
         let body_collective_state = collective_state.enter_manual_region(shard_map.clone());
         let body_outputs = lower_program_outputs(
             program,
-            captured_values,
+            &[],
             &mut body_block_ref,
             context,
             location.as_ref(),
@@ -6802,13 +6801,19 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     op: format!("{} expected 2 attached regions but got {}", CUSTOM_JVP_OPERATION_NAME, regions.len(),),
                 });
             };
+            // Custom-JVP regions are traced through fresh-root contexts whose local capture tables are discarded, so
+            // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies
+            // that register captures). Lowering them with an empty capture namespace turns any capture-referencing
+            // constant that still sneaks in into a loud `MissingCapturedConstant` error instead of silently aliasing
+            // whatever value occupies the referenced slot of the enclosing capture prefix. Nested-traced regions
+            // (`while`/`scan`/`condition`/`linear_call`) share the enclosing capture scope and keep inheriting it.
             lower_nested_program_inline(
                 primal,
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
-                captured_values,
+                &[],
                 false,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
@@ -6821,13 +6826,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     op: format!("{} expected 3 attached regions but got {}", CUSTOM_VJP_OPERATION_NAME, regions.len(),),
                 });
             };
+            // Custom-VJP regions are traced through fresh-root contexts and lower with an empty capture namespace;
+            // refer to the `CustomJvp` arm above for the rationale.
             lower_nested_program_inline(
                 primal,
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
-                captured_values,
+                &[],
                 false,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
@@ -6844,13 +6851,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                     ),
                 });
             };
+            // Rematerialized regions are traced through fresh-root contexts and lower with an empty capture
+            // namespace; refer to the `CustomJvp` arm above for the rationale.
             lower_nested_program_inline(
                 primal,
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
-                captured_values,
+                &[],
                 false,
                 lowerer.nested_functions.as_ref(),
                 &lowerer.collective_state,
@@ -6882,7 +6891,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 &mut lowerer.effect_tokens,
             )
         }
-        XlaOperation::JitCall(_) => {
+        XlaOperation::JitCall(operation) => {
             let [callee] = regions else {
                 return Err(LoweringError::UnsupportedOp {
                     op: format!("jit_call expected 1 attached region but got {}", regions.len()),
@@ -6890,6 +6899,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             };
             lower_jit_call(
                 callee,
+                operation.capture_count(),
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
@@ -8952,32 +8962,18 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
-        use ryft_core::{
-            FreezeReferenceOperation, NewReferenceOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
-            ReferenceSwapOperation,
-        };
+        use ryft_core::{FreezeReferenceOperation, NewReferenceOperation};
 
         assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
 
+        // The artifact-wide reference scan catches the reference atoms and intrinsic semantics before token threading,
+        // so two representative reference operations are enough to pin the diagnostic.
         let array_type = ArrayType::scalar(DataType::F32);
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let reference = builder
             .add_instruction(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), vec![input])
             .unwrap()[0];
-        let snapshot = builder
-            .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation), Vec::new(), vec![reference])
-            .unwrap()[0];
-        let old_value = builder
-            .add_instruction(XlaOperation::ReferenceSwap(ReferenceSwapOperation), Vec::new(), vec![reference, snapshot])
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
-                Vec::new(),
-                vec![reference, old_value],
-            )
-            .unwrap();
         let output = builder
             .add_instruction(XlaOperation::FreezeReference(FreezeReferenceOperation), Vec::new(), vec![reference])
             .unwrap()[0];
@@ -9352,6 +9348,64 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_capture_prefix_ignores_nested_call_capture_namespaces() {
+        // The inner callee establishes its own two-slot capture namespace: its first two inputs are its lifted
+        // captures, and its body resolves the constant `Captured(1)` against that prefix. Deriving the OUTER call's
+        // capture prefix from capture-constant indices anywhere in the callee arena would conflate the namespaces
+        // and reject this program with a false missing-capture error; the operation payload is authoritative.
+        let array_type = test_vector_type(4);
+        let inner = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let first_capture = builder.add_input(array_type.clone());
+            let _second_capture = builder.add_input(array_type.clone());
+            let second =
+                builder.add_constant(XlaConstant::Captured(CaptureReference::new(1, array_type.clone().into())));
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first_capture, second]).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let outer = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(array_type.clone());
+            let callee_region = builder.intern_callee(&inner, None).unwrap();
+            let output = builder
+                .add_instruction(
+                    XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new(2)),
+                    vec![callee_region],
+                    vec![input, input],
+                )
+                .unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let callee_region = builder.intern_callee(&outer, None).unwrap();
+        let output = builder
+            .add_instruction(
+                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(stablehlo.matches("stablehlo.add").count(), 1, "{stablehlo}");
+    }
+
+    #[test]
     fn test_plain_elementwise_lowering_normalizes_all_implicit_operands() {
         let program = xla_elementwise_normalization_program();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
@@ -9421,7 +9475,7 @@ mod tests {
         let callee_region = builder.intern_callee(callee, None).unwrap();
         builder
             .add_instruction(
-                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new()),
+                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new(0)),
                 vec![callee_region],
                 inputs,
             )
@@ -9751,6 +9805,57 @@ mod tests {
         assert!(print_lines[2].contains("label = \"after\""), "{stablehlo}");
         assert!(print_lines[1].contains("%1)"), "{stablehlo}");
         assert!(print_lines[2].contains("%2)"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_rematerialize_lowering_rejects_capture_constants_in_its_regions() {
+        use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
+
+        // Rematerialized regions are traced through fresh-root contexts and can therefore never legally reference
+        // the enclosing function's captures. A capture constant smuggled into such a region must fail loudly
+        // instead of silently resolving against the enclosing function's capture prefix, which would alias
+        // whichever captured value happens to occupy the referenced slot.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let primal = {
+            let mut builder = CompositeXlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let captured = builder
+                .add_constant(XlaConstant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, captured]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let identity = unproject_plain_program(xla_identity_branch(scalar_type.clone()));
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let primal_region = builder.import_region(primal.entry_region_ref());
+        let forward_region = builder.import_region(identity.entry_region_ref());
+        let backward_region = builder.import_region(identity.entry_region_ref());
+        let tangent_region = builder.import_region(identity.entry_region_ref());
+        let input = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::Rematerialize(RematerializeOperation::new()),
+                vec![primal_region, forward_region, backward_region, tangent_region],
+                vec![input],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The enclosing function's capture prefix has a matching slot #0, so before rematerialized regions were
+        // scoped to an empty capture namespace this lowering silently forwarded that unrelated captured value.
+        let result = to_mlir_module_for_program(
+            &program,
+            &[scalar_type.clone()],
+            &scalar_type,
+            &scalar_type,
+            "main",
+            None,
+            None,
+        );
+        assert_eq!(result, Err(LoweringError::MissingCapturedConstant { index: 0 }));
     }
 
     #[test]
@@ -10617,7 +10722,7 @@ mod tests {
         let items = builder.add_input(vector_f32.clone());
         let outputs = builder
             .add_instruction(
-                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new()),
+                XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new(0)),
                 vec![callee],
                 vec![predicate, operand, items],
             )
