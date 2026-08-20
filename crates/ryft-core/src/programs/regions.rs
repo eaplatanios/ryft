@@ -894,12 +894,20 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         })
     }
 
+    /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure is accepted by `predicate`.
+    /// Every attached region is traversed regardless of [`RegionRole`], making this function suitable for artifact-wide
+    /// validation that must include dormant transformation rules. Shared descendants are visited once.
+    #[inline]
+    pub fn contains_atom_in_closure<F: FnMut(&Atom<V>) -> bool>(self, mut predicate: F) -> bool {
+        self.any_region_in_closure(|region| region.atoms().iter().any(&mut predicate))
+    }
+
     /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure has a type accepted by
-    /// `predicate`. Every attached region is traversed regardless of [`RegionRole`], making this function suitable for
-    /// artifact-wide validation that must include dormant transformation rules. Shared descendants are visited once.
+    /// `predicate`. Refer to the documentation of [`contains_atom_in_closure`](Self::contains_atom_in_closure) for
+    /// information on the traversal contract.
     #[inline]
     pub fn contains_atom_type_in_closure<F: FnMut(&V::Type) -> bool>(self, mut predicate: F) -> bool {
-        self.any_region_in_closure(|region| region.atoms().iter().any(|atom| predicate(atom.r#type().as_ref())))
+        self.contains_atom_in_closure(|atom| predicate(atom.r#type().as_ref()))
     }
 
     /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
