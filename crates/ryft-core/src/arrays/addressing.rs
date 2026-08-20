@@ -1,9 +1,12 @@
 use std::ops::Range;
 
+use ryft_macros::Parameter;
+
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::Dimension;
 use crate::arrays::types::layouts::{Layout, Tile, TileDimension, TiledLayout};
+use crate::parameters::Parameter;
 use crate::programs::{ProgramError, TypeError};
 
 /// Checked mapping from a static [`ArrayType`]'s logical indices to its storage addresses. Addressing includes both
@@ -559,7 +562,7 @@ impl ArrayAddressing {
 /// Selection of logical coordinates along one array axis. It selects `start + index * stride` for every `index` in
 /// `0..size`. A [`Range<usize>`] converts to a unit-stride selection of the same coordinates. An empty or reversed
 /// range converts to an empty selection beginning at the range's start.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ArraySliceAxis {
     /// First selected logical coordinate.
     start: usize,

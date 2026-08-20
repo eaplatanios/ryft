@@ -22,9 +22,11 @@ pub use experimental::domains::{
 };
 pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{
-    CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
-    compile_with_captures, compile_with_options, infer_output_types, jitted, jitted_with_options, stage,
-    stage_with_captures, try_jitted_with_options,
+    CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, StatefulCompiledXlaFunction,
+    StatefulJittedXlaFunction, XlaCompileTracer, XlaStatefulCompileTracer, XlaStatefulValue, compile,
+    compile_statefully, compile_statefully_with_captures, compile_with_captures, compile_with_options,
+    infer_output_types, jitted, jitted_statefully, jitted_statefully_with_options, jitted_with_options, stage,
+    stage_with_captures, try_jitted_statefully_with_options, try_jitted_with_options,
 };
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};

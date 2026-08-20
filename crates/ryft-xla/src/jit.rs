@@ -2,12 +2,17 @@
 //!
 //! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and entry
 //! points. [`jitted`] is the retained `jax.jit` analogue: it specializes on runtime-derived abstract signatures and
-//! dispatches warm calls through cached compiled functions. [`compile`] instead traces and compiles exactly one explicit
-//! abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the trace-only counterpart: it returns a
+//! dispatches warm calls through cached compiled functions. [`compile`] instead traces and compiles exactly one
+//! explicit abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the trace-only counterpart: it returns a
 //! [`StagedXlaFunction`] that can be embedded into outer traces via [`StagedXlaFunction::call`] and compiled later, so
 //! functions that are only ever composed into larger programs never pay for their own executable. Staged functions
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
+//!
+//! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array-reference
+//! holders. Stateful calls hold every participating root transaction through execution completion, install hidden
+//! final state before reconstructing public outputs, and return the completion-bearing [`ReferenceExecution`] shape;
+//! Phase 9 performs that transaction synchronously, so the wrapper is already complete when returned.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -18,7 +23,8 @@ use ryft_core::{
     CompilationStagingRequest, CompiledFunction, CompiledFunctionDispatcher as CoreCompiledFunctionDispatcher,
     Constant, Context, DeviceMesh, DifferentiableType, DomainTracingContext, ExecutableFunction,
     ForwardModeDifferentiate, JitCacheStatistics, Parameterized, ParameterizedFamily, ProgramError, ProjectedContext,
-    ProjectedValue, ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value, ValueProjection, call_function,
+    ProjectedValue, ReferenceExecution, ReverseModeDifferentiate, StagedFunction, Tracer, Typed, Value,
+    ValueProjection, call_function, call_function_statefully, call_function_statefully_async,
     try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_pjrt::Execution;
@@ -29,7 +35,10 @@ use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions};
 
 /// Composite tracer retained by the production XLA program.
-type XlaProgramTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
+pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
+
+/// Internal name for the production composite tracer.
+type XlaProgramTracer<'c> = XlaStatefulCompileTracer<'c>;
 
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
 pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaProgramTracer<'c>>;
@@ -43,8 +52,17 @@ type XlaProgramParameterValues<P, V> = <XlaProgramParameters<P> as Parameterized
 /// Captured-constant tree corresponding to one public array parameter tree.
 type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
 
+/// Heterogeneous XLA runtime value used by the stateful compilation facade.
+pub type XlaStatefulValue<'c> = ArrayIrValue<Array<'c>>;
+
+/// Traced output tree produced by one heterogeneous stateful XLA closure.
+type XlaStatefulTraceOutput<'c, P> = <P as Parameterized<ArrayIrType>>::To<XlaStatefulCompileTracer<'c>>;
+
+/// Fallible traced output of one heterogeneous stateful XLA closure.
+type XlaStatefulTraceResult<'c, P> = Result<XlaStatefulTraceOutput<'c, P>, XlaDomainError>;
+
 /// Concrete runtime value retained by the production composite domain.
-type XlaProgramValue<'c> = ArrayIrValue<Array<'c>>;
+type XlaProgramValue<'c> = XlaStatefulValue<'c>;
 
 /// Projects one internal composite tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
@@ -308,6 +326,287 @@ where
         + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     jitted_with_options(function, domain, XlaOptions::new(mesh))
+}
+
+/// Retained heterogeneous XLA JIT dispatcher whose calls may bind external reference holders.
+pub struct StatefulJittedXlaFunction<
+    'c,
+    F,
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<ArrayIrType>,
+    Out: Parameterized<ArrayIrType>,
+> where
+    In::ParameterStructure: Eq + Hash,
+    In::Family: ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<XlaConstant>,
+{
+    /// Backend-neutral dispatcher retaining heterogeneous runtime values and compiled specializations.
+    function: CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, In, Out>,
+}
+
+impl<'c, F, Static, In, Out> Clone for StatefulJittedXlaFunction<'c, F, Static, In, Out>
+where
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<ArrayIrType>,
+    In::ParameterStructure: Eq + Hash,
+    In::Family: ParameterizedFamily<XlaConstant>,
+    Out: Parameterized<ArrayIrType>,
+    Out::Family: ParameterizedFamily<XlaConstant>,
+    CoreCompiledFunctionDispatcher<XlaDomain<'c>, F, Static, In, Out>: Clone,
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { function: self.function.clone() }
+    }
+}
+
+impl<'c, F, Static, In, Out> StatefulJittedXlaFunction<'c, F, Static, In, Out>
+where
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<ArrayIrType>,
+    In::ParameterStructure: Eq + Hash,
+    In::Family: ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<XlaStatefulValue<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    In::To<XlaStatefulValue<'c>>: Parameterized<
+            XlaStatefulValue<'c>,
+            Family = In::Family,
+            ParameterStructure = In::ParameterStructure,
+            To<ArrayIrType> = In,
+        >,
+    Out: Parameterized<ArrayIrType>,
+    Out::Family: ParameterizedFamily<XlaConstant>
+        + ParameterizedFamily<XlaStatefulValue<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    Out::To<XlaStatefulValue<'c>>:
+        Parameterized<XlaStatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    Out::To<XlaStatefulCompileTracer<'c>>:
+        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
+    /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
+    pub fn call_statefully(
+        &self,
+        static_parameters: Static,
+        inputs: In::To<XlaStatefulValue<'c>>,
+    ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
+    where
+        XlaOptions: Clone,
+        F: Fn(
+            Static,
+            In::To<XlaStatefulCompileTracer<'c>>,
+        ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    {
+        self.function.call_statefully(static_parameters, inputs)
+    }
+
+    /// Returns the completion-bearing stateful call shape for one retained specialization.
+    pub fn call_statefully_async(
+        &self,
+        static_parameters: Static,
+        inputs: In::To<XlaStatefulValue<'c>>,
+    ) -> ReferenceExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError>
+    where
+        XlaOptions: Clone,
+        F: Fn(
+            Static,
+            In::To<XlaStatefulCompileTracer<'c>>,
+        ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    {
+        self.function.call_statefully_async(static_parameters, inputs)
+    }
+
+    /// Returns a snapshot of this dispatcher's cache activity.
+    #[inline]
+    pub fn statistics(&self) -> JitCacheStatistics {
+        self.function.statistics()
+    }
+}
+
+/// Constructs a retained stateful dispatcher for a fallible heterogeneous XLA closure.
+pub fn try_jitted_statefully_with_options<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    options: XlaOptions,
+) -> StatefulJittedXlaFunction<'c, F, Static, In, Out>
+where
+    F: Fn(
+        Static,
+        In::To<XlaStatefulCompileTracer<'c>>,
+    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+    In::ParameterStructure: Eq + Hash,
+    Out: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+{
+    StatefulJittedXlaFunction { function: core_try_jit_with_options(domain, function, options) }
+}
+
+/// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure.
+pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    options: XlaOptions,
+) -> StatefulJittedXlaFunction<
+    'c,
+    impl Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> XlaStatefulTraceResult<'c, Out>,
+    Static,
+    In,
+    Out,
+>
+where
+    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Out::To<XlaStatefulCompileTracer<'c>>,
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+    In::ParameterStructure: Eq + Hash,
+    Out: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+{
+    try_jitted_statefully_with_options(
+        move |static_parameters, inputs| Ok(function(static_parameters, inputs)),
+        domain,
+        options,
+    )
+}
+
+/// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure on `mesh`.
+#[inline]
+pub fn jitted_statefully<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    mesh: DeviceMesh,
+) -> StatefulJittedXlaFunction<
+    'c,
+    impl Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> XlaStatefulTraceResult<'c, Out>,
+    Static,
+    In,
+    Out,
+>
+where
+    F: Fn(Static, In::To<XlaStatefulCompileTracer<'c>>) -> Out::To<XlaStatefulCompileTracer<'c>>,
+    Static: Clone + Debug + Eq + Hash,
+    In: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+    In::ParameterStructure: Eq + Hash,
+    Out: Parameterized<
+            ArrayIrType,
+            Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+        >,
+{
+    jitted_statefully_with_options(function, domain, XlaOptions::new(mesh))
+}
+
+/// Compiled heterogeneous XLA function whose invocation may bind external reference holders.
+pub struct StatefulCompiledXlaFunction<'c, In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
+where
+    In::Family: ParameterizedFamily<XlaConstant>,
+    Out::Family: ParameterizedFamily<XlaConstant>,
+{
+    /// Backend-neutral compiled function retaining the composite runtime boundary.
+    function: CompiledFunction<XlaDomain<'c>, In, Out>,
+}
+
+impl<'c, In, Out> StatefulCompiledXlaFunction<'c, In, Out>
+where
+    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaProgramValue<'c>>>,
+    Out:
+        Parameterized<ArrayIrType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaProgramValue<'c>>>,
+    In::To<XlaProgramValue<'c>>: Parameterized<XlaProgramValue<'c>>,
+    Out::To<XlaProgramValue<'c>>:
+        Parameterized<XlaProgramValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+{
+    /// Returns the runtime-only executable handle.
+    #[inline]
+    pub fn executable_function(&self) -> &ExecutableFunction<XlaDomain<'c>, In, Out> {
+        self.function.executable_function()
+    }
+
+    /// Executes synchronously and returns public outputs after holder installation.
+    pub fn call_statefully(
+        &self,
+        domain: &XlaDomain<'c>,
+        inputs: In::To<XlaStatefulValue<'c>>,
+    ) -> Result<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
+        call_function_statefully(domain, self.function.executable_function(), inputs)
+    }
+
+    /// Returns the completion-bearing stateful call shape, already completed by the synchronous Phase 9 runtime.
+    pub fn call_statefully_async(
+        &self,
+        domain: &XlaDomain<'c>,
+        inputs: In::To<XlaStatefulValue<'c>>,
+    ) -> ReferenceExecution<Out::To<XlaStatefulValue<'c>>, XlaDomainError> {
+        call_function_statefully_async(domain, self.function.executable_function(), inputs)
+    }
+
+    /// Returns the public flat output types.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayIrType] {
+        self.function.executable_function().output_types()
+    }
+}
+
+/// Compiles one heterogeneous signature for stateful invocation.
+pub fn compile_statefully<'domain, 'c: 'domain, F, In, Out>(
+    function: F,
+    input_types: In,
+    domain: &'domain XlaDomain<'c>,
+    options: XlaOptions,
+) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(In::To<XlaStatefulCompileTracer<'c>>) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    In: Parameterized<ArrayIrType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    In::ParameterStructure: Hash,
+    Out: Parameterized<ArrayIrType>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    Out::To<XlaStatefulCompileTracer<'c>>:
+        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
+    compile_statefully_with_captures(move |_, inputs| function(inputs), Vec::new(), input_types, domain, options)
+}
+
+/// Compiles one heterogeneous signature with explicit array or reference captures for stateful invocation.
+pub fn compile_statefully_with_captures<'domain, 'c: 'domain, F, In, Out>(
+    function: F,
+    captures: Vec<XlaStatefulValue<'c>>,
+    input_types: In,
+    domain: &'domain XlaDomain<'c>,
+    options: XlaOptions,
+) -> Result<StatefulCompiledXlaFunction<'c, In, Out>, XlaDomainError>
+where
+    F: FnOnce(
+        Vec<XlaStatefulCompileTracer<'c>>,
+        In::To<XlaStatefulCompileTracer<'c>>,
+    ) -> Result<Out::To<XlaStatefulCompileTracer<'c>>, XlaDomainError>,
+    In: Parameterized<ArrayIrType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    In::ParameterStructure: Hash,
+    Out: Parameterized<ArrayIrType>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
+    Out::To<XlaStatefulCompileTracer<'c>>:
+        Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
+{
+    let staged = domain.stage(CompilationStagingRequest::new(
+        |_, capture_tracers, inputs| function(capture_tracers, inputs),
+        captures,
+        input_types,
+        options,
+    ))?;
+    let lowered = domain.lower(staged)?;
+    Ok(StatefulCompiledXlaFunction { function: domain.compile(lowered)? })
 }
 
 /// Captured-constant output tree produced by tracing an XLA closure.
@@ -1415,21 +1714,24 @@ mod tests {
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
-        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, Atan2, Broadcast,
-        CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device, DeviceMesh,
-        DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
+        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceViewTransform,
+        ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device,
+        DeviceMesh, DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
         DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, FreezeReference, Hessian,
         Iota, Jacobian, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, NewReference, OneLike, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, Reshape, Select, Shape, Sharding, ShardingDimension,
-        Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceRead, ReferenceType, Reshape, Select,
+        Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::XlaDomainError;
+    use crate::experimental::domains::StatefulFailureInjection;
     use crate::experimental::ops::XlaOperation;
     use crate::jit::{
-        CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
-        compile_with_captures, compile_with_options, infer_output_types, jitted, stage, stage_with_captures,
+        CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer,
+        XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
+        compile_with_options, infer_output_types, jitted, jitted_statefully, stage, stage_with_captures,
     };
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{AdaptiveProfileGuidedOptions, Array, FromPjrt, XlaDomain, XlaOptions};
@@ -1552,6 +1854,553 @@ mod tests {
             Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
         let output = domain.interpret(&executable, input).unwrap();
         assert_eq!(read_f32_array(&client, &output), vec![6.0]);
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_updates_public_holder_across_calls() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
+            },
+            (reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let initial =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        assert!(initial.r#type().sharding().is_some());
+        let reference = ArrayReference::new(initial);
+        let retained_snapshot = reference.read().unwrap();
+        let rejected_update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        assert!(matches!(
+            ryft_core::call_function(
+                &domain,
+                compiled.executable_function(),
+                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(rejected_update)),
+            ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external reference state requires `call_statefully`",
+        ));
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
+
+        for expected in [3.0f32, 5.0] {
+            let update =
+                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            let output = compiled
+                .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+                .unwrap();
+            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            assert_eq!(read_f32_array(&client, &output), vec![expected]);
+            assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![expected]);
+        }
+        assert_eq!(read_f32_array(&client, &retained_snapshot), vec![1.0]);
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_delegates_an_all_array_signature() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                Ok((input.clone() + input).into_value())
+            },
+            ArrayIrType::Array(array_type.clone()),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        let output = compiled.call_statefully(&domain, ArrayIrValue::Array(input)).unwrap();
+        let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        assert_eq!(read_f32_array(&client, &output), vec![6.0]);
+    }
+
+    #[test]
+    fn test_stateful_read_only_holder_remains_ready_across_calls() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        for _ in 0..2 {
+            let output = compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap();
+            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            assert_eq!(read_f32_array(&client, &output), vec![7.0]);
+            assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![7.0]);
+        }
+    }
+
+    #[test]
+    fn test_stateful_zero_public_output_waits_for_holder_installation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        compiled
+            .call_statefully_async(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+            .r#await()
+            .unwrap();
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_stateful_call_rejects_non_root_external_view_without_consuming_root() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(scalar_type)),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let root = ArrayReference::new(
+            Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
+                .unwrap(),
+        );
+        let view = root.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }).unwrap();
+        assert!(matches!(
+            compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external state input 0 must be a root reference handle",
+        ));
+        assert_eq!(read_f32_array(&client, &root.read().unwrap()), vec![4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_stateful_external_holder_requires_the_exact_replicated_compiled_type() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let shape = Shape::new(vec![Dimension::Static(2)]);
+        let replicated_type = ArrayType::new(DataType::F32, shape.clone())
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let alternate_type = ArrayType::new(DataType::F32, shape)
+            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            compile_statefully::<_, ArrayIrType, ArrayIrType>(
+                |reference| reference.read().map_err(Into::into),
+                ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
+                &domain,
+                XlaOptions::new(mesh.clone()),
+            ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external state input 0 must use replicated sharding",
+        ));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
+            },
+            (
+                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
+                ArrayIrType::Array(replicated_type.clone()),
+            ),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &client,
+                alternate_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &client,
+            replicated_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)),
+            ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == format!(
+                    "external state input 0 holder type `{alternate_type}` does not match effective compiled state \
+                     type `{replicated_type}`",
+                ),
+        ));
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_retained_stateful_jit_reuses_public_holder_specialization() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let function = jitted_statefully::<_, (), (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(), (reference, update): (XlaStatefulCompileTracer<'_>, XlaStatefulCompileTracer<'_>)| {
+                reference.add_update(&update).unwrap();
+                reference.read().unwrap()
+            },
+            &domain,
+            mesh.clone(),
+        );
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+
+        for expected in [3.0f32, 5.0] {
+            let update =
+                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                    .unwrap();
+            let output = function
+                .call_statefully((), (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+                .unwrap();
+            let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+            assert_eq!(read_f32_array(&client, &output), vec![expected]);
+        }
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_misses, 1);
+        assert_eq!(statistics.dispatch_hits, 1);
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_updates_captured_holder() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+            |captures, update| {
+                captures[0].add_update(&update)?;
+                captures[0].read().map_err(Into::into)
+            },
+            vec![ArrayIrValue::Reference(reference.clone())],
+            ArrayIrType::Array(array_type.clone()),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let output = compiled.call_statefully(&domain, ArrayIrValue::Array(update)).unwrap();
+        let ArrayIrValue::Array(output) = output else { panic!("stateful public output must be an array") };
+        assert_eq!(read_f32_array(&client, &output), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_stateful_call_rejects_duplicate_capture_and_public_holder_before_mutation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+            |captures, public_reference| {
+                let update = public_reference.read()?;
+                captures[0].add_update(&update)?;
+                captures[0].read().map_err(Into::into)
+            },
+            vec![ArrayIrValue::Reference(reference.clone())],
+            reference_type.clone(),
+            &domain,
+            XlaOptions::new(mesh),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == format!(
+                    "reference holder {:?} is bound more than once in one invocation",
+                    reference.id(),
+                ),
+        ));
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
+    }
+
+    #[test]
+    fn test_stateful_call_installs_two_mutated_holders_bound_in_reverse_identity_order() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                Ok((first.read()?, second.read()?))
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let second = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let (lower_reference, higher_reference) =
+            if first.id() < second.id() { (first, second) } else { (second, first) };
+        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        let (higher_output, lower_output) = compiled
+            .call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(higher_reference.clone()),
+                    ArrayIrValue::Reference(lower_reference.clone()),
+                    ArrayIrValue::Array(update),
+                ),
+            )
+            .unwrap();
+        let ArrayIrValue::Array(higher_output) = higher_output else {
+            panic!("first stateful public output must be an array")
+        };
+        let ArrayIrValue::Array(lower_output) = lower_output else {
+            panic!("second stateful public output must be an array")
+        };
+        assert_eq!(read_f32_array(&client, &higher_output), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &lower_output), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &higher_reference.read().unwrap()), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &lower_reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_stateful_failure_boundaries_restore_poison_or_install_holder_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(first, second, read_only, update)| {
+                let output = read_only.read()?;
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                Ok(output)
+            },
+            (reference_type.clone(), reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let new_reference = |value: f32| {
+            ArrayReference::new(
+                Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                    .unwrap(),
+            )
+        };
+
+        // Complete preflight failures leave every holder Ready and unchanged.
+        let pre_handoff_first = new_reference(1.0);
+        let pre_handoff_second = new_reference(10.0);
+        let pre_handoff_read_only = new_reference(20.0);
+        let wrong_update_type = ArrayType::scalar(DataType::F64)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let wrong_update =
+            Array::from_host_buffer(&client, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
+        let declared_update_type = <&ArrayType>::try_from(&compiled.executable_function().input_types()[3]).unwrap();
+        let expected_error = format!(
+            "runtime input type {} does not refine declared type {declared_update_type}",
+            wrong_update.r#type(),
+        );
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(pre_handoff_first.clone()),
+                    ArrayIrValue::Reference(pre_handoff_second.clone()),
+                    ArrayIrValue::Reference(pre_handoff_read_only.clone()),
+                    ArrayIrValue::Array(wrong_update),
+                ),
+            ),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message })) if message == expected_error,
+        ));
+        assert_eq!(read_f32_array(&client, &pre_handoff_first.read().unwrap()), vec![1.0]);
+        assert_eq!(read_f32_array(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
+        assert_eq!(read_f32_array(&client, &pre_handoff_read_only.read().unwrap()), vec![20.0]);
+
+        // Once mutable buffers cross the execution handoff, every mutated holder is poisoned together while a
+        // read-only peer remains Ready.
+        let post_handoff_first = new_reference(1.0);
+        let post_handoff_second = new_reference(10.0);
+        let post_handoff_read_only = new_reference(20.0);
+        let update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::AfterHandoff);
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(post_handoff_first.clone()),
+                    ArrayIrValue::Reference(post_handoff_second.clone()),
+                    ArrayIrValue::Reference(post_handoff_read_only.clone()),
+                    ArrayIrValue::Array(update),
+                ),
+            ),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "injected failure after execution handoff",
+        ));
+        for reference in [&post_handoff_first, &post_handoff_second] {
+            let Err(error) = reference.read() else { panic!("mutated holder must be poisoned after handoff") };
+            assert_eq!(
+                error.downcast_custom::<ryft_core::ReferenceError>(),
+                Some(&ryft_core::ReferenceError::ExecutionPoisoned {
+                    reason: "invalid compilation options: injected failure after execution handoff".to_string(),
+                }),
+            );
+        }
+        assert_eq!(read_f32_array(&client, &post_handoff_read_only.read().unwrap()), vec![20.0]);
+
+        // A failure confined to public reconstruction occurs only after every hidden final state is installed.
+        let installed_first = new_reference(1.0);
+        let installed_second = new_reference(10.0);
+        let installed_read_only = new_reference(20.0);
+        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(installed_first.clone()),
+                    ArrayIrValue::Reference(installed_second.clone()),
+                    ArrayIrValue::Reference(installed_read_only.clone()),
+                    ArrayIrValue::Array(update),
+                ),
+            ),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "injected failure before public output reconstruction",
+        ));
+        assert_eq!(read_f32_array(&client, &installed_first.read().unwrap()), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &installed_second.read().unwrap()), vec![12.0]);
+        assert_eq!(read_f32_array(&client, &installed_read_only.read().unwrap()), vec![20.0]);
+    }
+
+    #[test]
+    fn test_stateful_multi_holder_preflight_failure_leaves_ready_peer_unchanged() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                first.read().map_err(Into::into)
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let frozen = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        frozen.freeze().unwrap();
+        let update = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (ArrayIrValue::Reference(first.clone()), ArrayIrValue::Reference(frozen), ArrayIrValue::Array(update),),
+            ),
+            Err(XlaDomainError::Reference(ryft_core::ReferenceError::Frozen)),
+        ));
+        assert_eq!(read_f32_array(&client, &first.read().unwrap()), vec![1.0]);
     }
 
     #[test]

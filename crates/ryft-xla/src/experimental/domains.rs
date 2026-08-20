@@ -12,14 +12,15 @@ use prost::Message;
 use ryft_core::macros::check_count;
 use ryft_core::operations::sort::SortDirection;
 use ryft_core::{
-    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, BatchingError,
+    AnalyzableCompilationDomain, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, BatchingError,
     BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
     Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DischargedReferenceProgram, DiskCache, Domain, DomainTracer, EagerContext, Effect,
-    InterpretableOperation, InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType,
-    ONE_OPERATION_NAME, Operation, Parameterized, Placeholder, ProgramError, ReductionKind, ScatterReductionKind,
-    Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StaticShape, StridedLayout, Tile, TileDimension,
+    DimensionVariable, DischargedReferenceProgram, DischargedReferenceState, DiskCache, Domain, DomainTracer,
+    EagerContext, Effect, InterpretableOperation, InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory,
+    MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation, Parameterized, Placeholder, ProgramError, ReductionKind,
+    ReferenceExecution, ReferenceGuard, ReferenceId, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension,
     TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
     ZeroOperationProvider,
 };
@@ -65,6 +66,10 @@ pub enum XlaDomainError {
     #[error("{0}")]
     Tracing(#[from] ProgramError),
 
+    /// Error surfaced while acquiring or updating an eager reference holder.
+    #[error("{0}")]
+    Reference(#[from] ryft_core::ReferenceError),
+
     /// Error surfaced by reverse-mode differentiation (e.g. a non-scalar gradient output).
     #[error("{0}")]
     Differentiation(#[from] DifferentiationError),
@@ -96,8 +101,7 @@ pub enum XlaDomainError {
     #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
     UnsupportedRuntimeAssertionPlatform { platform: String },
 
-    /// Reference discharge produced external state that the ordinary array-only XLA invocation boundary cannot
-    /// supply or install.
+    /// The selected XLA invocation or reference ABI does not support the requested external-state configuration.
     #[error("unsupported XLA reference ABI: {reason}")]
     UnsupportedReferenceAbi { reason: String },
 }
@@ -142,6 +146,36 @@ pub struct XlaDomain<'c> {
     marker: PhantomData<fn() -> Array<'c>>,
 }
 
+/// Deterministic stateful-runtime failure point used by transaction protocol regressions.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StatefulFailureInjection {
+    /// Fails after mutable inputs cross the execution handoff boundary.
+    AfterHandoff,
+
+    /// Fails after hidden final states are installed but before public outputs are reconstructed.
+    BeforePublicReconstruction,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// One-shot failure injection scoped to the invoking test thread.
+    static STATEFUL_FAILURE_INJECTION: std::cell::Cell<Option<StatefulFailureInjection>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn take_stateful_failure_injection(expected: StatefulFailureInjection) -> bool {
+    STATEFUL_FAILURE_INJECTION.with(|injection| {
+        if injection.get() != Some(expected) {
+            return false;
+        }
+        injection.set(None);
+        true
+    })
+}
+
 /// Tracer shape used while staging XLA programs directly from types.
 pub(crate) type XlaTracer<'context> = DomainTracer<XlaDomain<'context>>;
 
@@ -158,6 +192,12 @@ impl<'c> Clone for XlaDomain<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Injects one deterministic failure into the next stateful call on the current test thread.
+    #[cfg(test)]
+    pub(crate) fn inject_stateful_failure_for_test(failure: StatefulFailureInjection) {
+        STATEFUL_FAILURE_INJECTION.with(|injection| injection.set(Some(failure)));
+    }
+
     /// Returns the shared default [`CompilationOptions`] template.
     #[inline]
     fn default_compilation_options() -> Arc<CompilationOptions> {
@@ -1246,6 +1286,12 @@ pub struct XlaLoweredProgram {
     /// Effective logical output types after applying output-sharding overrides.
     output_types: Arc<[ArrayType]>,
 
+    /// Number of leading logical outputs exposed through the structured public function result.
+    public_output_count: usize,
+
+    /// Logical external reference-state binding recipes in canonical boundary order.
+    reference_states: Arc<[DischargedReferenceState]>,
+
     /// Effective logical input types, including captures first.
     input_types: Arc<[ArrayType]>,
 
@@ -1293,7 +1339,7 @@ impl XlaLoweredProgram {
     /// Returns the effective logical flat output types, including zero-space leaves erased from the executable ABI.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
-        &self.output_types
+        &self.output_types[..self.public_output_count]
     }
 
     /// Returns the device mesh this lowering targets.
@@ -1320,10 +1366,10 @@ impl XlaLoweredProgram {
     }
 }
 
-const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA5";
-const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 5;
-const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 2;
-const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 5;
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA6";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 6;
+const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 3;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 6;
 static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
     format!(
         "ryft-xla/{}/openxla/{}/jax/{}",
@@ -1422,8 +1468,9 @@ pub struct XlaOptimizedProgram {
     pub bytes: Vec<u8>,
 }
 
+/// Stable cache-key payload for the V6 executable and external-reference ABI.
 #[derive(Serialize)]
-struct XlaPersistentKeyV5<'a> {
+struct XlaPersistentKeyV6<'a> {
     schema_version: u32,
     stable_hlo: &'a str,
     compilation_options: &'a [u8],
@@ -1432,6 +1479,8 @@ struct XlaPersistentKeyV5<'a> {
     output_mapping: Vec<Option<u64>>,
     input_dimensions: Vec<PersistentBoundaryDimensionV5>,
     output_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    public_output_count: u64,
+    reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
     donation_flags: &'a [bool],
     capture_count: u64,
@@ -1444,8 +1493,9 @@ struct XlaPersistentKeyV5<'a> {
     xla_flags: &'a str,
 }
 
+/// Stable V6 metadata envelope stored before serialized PJRT executable bytes.
 #[derive(Serialize, Deserialize)]
-struct XlaPersistentExecutableMetadataV5 {
+struct XlaPersistentExecutableMetadataV6 {
     schema_version: u32,
     feature_flags: u64,
     compilation_options: Vec<u8>,
@@ -1454,6 +1504,8 @@ struct XlaPersistentExecutableMetadataV5 {
     output_mapping: Vec<Option<u64>>,
     input_dimensions: Vec<PersistentBoundaryDimensionV5>,
     output_dimensions: Vec<PersistentBoundaryDimensionV5>,
+    public_output_count: u64,
+    reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
     donation_flags: Vec<bool>,
     capture_count: u64,
@@ -1468,6 +1520,25 @@ struct XlaPersistentExecutableMetadataV5 {
     compiler_identity: String,
     xla_flags: String,
     compilation_duration_nanoseconds: Option<u64>,
+}
+
+/// Persisted holder-free source of one logical external reference state.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PersistentReferenceSourceV6 {
+    /// Runtime capture position.
+    Capture { index: u64 },
+
+    /// Runtime public-input position.
+    PublicInput { index: u64 },
+}
+
+/// Persisted logical reference-state binding recipe.
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistentReferenceStateV6 {
+    source: PersistentReferenceSourceV6,
+    logical_input_index: u64,
+    logical_output_index: Option<u64>,
 }
 
 /// Persisted logical-axis-to-hidden-physical-slot mapping for one bounded dynamic dimension.
@@ -1893,6 +1964,57 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Xla
         .collect()
 }
 
+/// Encodes holder-free logical reference-state slots.
+fn persistent_reference_states(
+    states: &[DischargedReferenceState],
+) -> Result<Vec<PersistentReferenceStateV6>, XlaDomainError> {
+    states
+        .iter()
+        .map(|state| {
+            let source = match state.source() {
+                ryft_core::ReferenceSource::Capture { index } => {
+                    PersistentReferenceSourceV6::Capture { index: index as u64 }
+                }
+                ryft_core::ReferenceSource::PublicInput { index } => {
+                    PersistentReferenceSourceV6::PublicInput { index: index as u64 }
+                }
+                source => {
+                    return Err(persistent_error(format!("unsupported persistent reference-state source `{source}`",)));
+                }
+            };
+            Ok(PersistentReferenceStateV6 {
+                source,
+                logical_input_index: state.discharged_input_index() as u64,
+                logical_output_index: state.final_state_output_index().map(|index| index as u64),
+            })
+        })
+        .collect()
+}
+
+/// Decodes holder-free logical reference-state slots.
+fn decode_persistent_reference_states(
+    states: Vec<PersistentReferenceStateV6>,
+) -> Result<Vec<DischargedReferenceState>, XlaDomainError> {
+    states
+        .into_iter()
+        .map(|state| {
+            let source = match state.source {
+                PersistentReferenceSourceV6::Capture { index } => {
+                    ryft_core::ReferenceSource::Capture { index: checked_usize(index)? }
+                }
+                PersistentReferenceSourceV6::PublicInput { index } => {
+                    ryft_core::ReferenceSource::PublicInput { index: checked_usize(index)? }
+                }
+            };
+            Ok(DischargedReferenceState::new(
+                source,
+                checked_usize(state.logical_input_index)?,
+                state.logical_output_index.map(checked_usize).transpose()?,
+            ))
+        })
+        .collect()
+}
+
 /// Encodes the hidden bounded-input extent slots of one executable signature.
 fn persistent_input_dimensions(signature: &XlaExecutableSignature) -> Vec<PersistentBoundaryDimensionV5> {
     signature
@@ -2016,6 +2138,8 @@ pub struct XlaCompiledProgram<'c> {
     executable: Arc<LoadedExecutable<'c>>,
     input_types: Arc<[ArrayType]>,
     output_types: Arc<[ArrayType]>,
+    public_output_count: usize,
+    reference_states: Arc<[DischargedReferenceState]>,
     signature: XlaExecutableSignature,
     requires_assertion_handler: bool,
     donation_flags: Arc<[bool]>,
@@ -2036,6 +2160,8 @@ pub struct XlaCompiledProgram<'c> {
 struct XlaInvocationMetadata<'a> {
     input_types: &'a [ArrayType],
     output_types: &'a [ArrayType],
+    public_output_count: usize,
+    reference_states: &'a [DischargedReferenceState],
     signature: &'a XlaExecutableSignature,
     donation_flags: &'a [bool],
     capture_count: usize,
@@ -2048,6 +2174,8 @@ impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
         Self {
             input_types: &program.input_types,
             output_types: &program.output_types,
+            public_output_count: program.public_output_count,
+            reference_states: &program.reference_states,
             signature: &program.signature,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count,
@@ -2065,6 +2193,10 @@ fn validate_xla_replacement_metadata(
         Some("input types")
     } else if current.output_types != replacement.output_types {
         Some("output types")
+    } else if current.public_output_count != replacement.public_output_count {
+        Some("public output count")
+    } else if current.reference_states != replacement.reference_states {
+        Some("reference-state signature")
     } else if current.signature != replacement.signature {
         Some("executable signature")
     } else if current.donation_flags != replacement.donation_flags {
@@ -2096,7 +2228,13 @@ impl<'c> XlaCompiledProgram<'c> {
     /// Returns the logical flat output types in user-visible order, including reconstructed zero-space leaves.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
-        &self.output_types
+        &self.output_types[..self.public_output_count]
+    }
+
+    /// Returns whether this executable requires a stateful holder invocation boundary.
+    #[inline]
+    pub(crate) fn requires_stateful_call(&self) -> bool {
+        !self.reference_states.is_empty()
     }
 
     /// Returns the mesh the compiled program runs against.
@@ -2155,6 +2293,52 @@ impl<'c> XlaDomain<'c> {
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
+        self.execute_compiled_async_with_state(program, inputs, &[], |_| {}, || {})
+    }
+
+    /// Enqueues a compiled program with logical donation overrides and an explicit PJRT handoff callback.
+    fn execute_compiled_async_with_state(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        inputs: Vec<Array<'c>>,
+        donation_overrides: &[(usize, bool)],
+        prepare_state: impl FnOnce(&mut Vec<Array<'c>>),
+        before_execute: impl FnOnce(),
+    ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
+        let (execution, input_refinements) = self.execute_compiled_buffers_async_with_state(
+            program,
+            inputs,
+            donation_overrides,
+            prepare_state,
+            before_execute,
+        )?;
+        let (physical_outputs, fence) = execution.into_parts();
+        let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
+        let outputs = reconstruct_compiled_outputs(
+            self.client()?,
+            program,
+            &mut physical_outputs,
+            fence.clone(),
+            0..program.output_types.len(),
+        )?;
+        validate_compiled_output_refinements(program, &input_refinements, program.output_types.as_ref(), &outputs)?;
+        if physical_outputs.iter().any(Option::is_some) {
+            return Err(
+                ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
+            );
+        }
+        Ok(Execution::new(outputs, fence))
+    }
+
+    /// Prepares inputs and submits a compiled execution without reconstructing its logical outputs.
+    fn execute_compiled_buffers_async_with_state(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        inputs: Vec<Array<'c>>,
+        donation_overrides: &[(usize, bool)],
+        prepare_state: impl FnOnce(&mut Vec<Array<'c>>),
+        before_execute: impl FnOnce(),
+    ) -> Result<(Execution<Vec<Vec<Buffer<'c>>>>, <ArrayType as Type>::Refinements), XlaDomainError> {
         self.validate_xla_program_owner(program)?;
         self.ensure_runtime_requirements(program.requires_assertion_handler, &program.platform_name)?;
         if inputs.len() != program.input_types.len() {
@@ -2192,9 +2376,17 @@ impl<'c> XlaDomain<'c> {
         .inputs;
         let inputs = materialize_zero_space_carriers(self.client()?, physical_input_types.as_slice(), inputs)?;
         let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
-        let logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
+        let mut logical_donation_flags = std::iter::repeat_n(false, program.capture_count)
             .chain(program.donation_flags.iter().copied())
             .collect::<Vec<_>>();
+        for &(logical_input_index, donation) in donation_overrides {
+            let flag = logical_donation_flags.get_mut(logical_input_index).ok_or_else(|| {
+                XlaDomainError::InvalidCompilationOptions {
+                    reason: format!("donation override input {logical_input_index} is out of range"),
+                }
+            })?;
+            *flag = donation;
+        }
         let mut donation_flags = program.signature.project_inputs(logical_donation_flags.as_slice());
         donation_flags.extend(std::iter::repeat_n(false, program.signature.input_dimensions().len()));
         for (donation, input_type) in donation_flags.iter_mut().zip(physical_input_types.iter()) {
@@ -2204,100 +2396,15 @@ impl<'c> XlaDomain<'c> {
         }
         let physical_output_count =
             program.signature.output_mapping().iter().flatten().count() + program.signature.output_dimensions().len();
-        let execution =
-            execute_pjrt_buffers(&program.executable, inputs, donation_flags.as_slice(), physical_output_count)?;
-        let (physical_outputs, fence) = execution.into_parts();
-        let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
-        let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh).map_err(ArrayError::from)?;
-        let mut output_extents = BTreeMap::new();
-        for output_dimension in program.signature.output_dimensions() {
-            let scalar = Array::from_canonical_addressable_buffers(
-                self.client()?,
-                scalar_type.clone(),
-                program.mesh.clone(),
-                physical_outputs[output_dimension.physical_output_index()].take().unwrap(),
-            )?
-            .with_execution_fence(fence.clone());
-            let bytes = materialize_dense_array_bytes(&scalar)?;
-            let extent = bytes
-                .get(..size_of::<i64>())
-                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
-                .and_then(|extent| usize::try_from(extent).ok())
-                .ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!(
-                        "runtime extent for output {} axis {} is negative, missing, or exceeds usize",
-                        output_dimension.logical_output_index(),
-                        output_dimension.axis(),
-                    ),
-                })?;
-            output_extents.insert((output_dimension.logical_output_index(), output_dimension.axis()), extent);
-        }
-
-        let mut outputs = Vec::with_capacity(program.output_types.len());
-        for (logical_index, (mapping, output_type)) in
-            program.signature.output_mapping().iter().zip(program.output_types.iter()).enumerate()
-        {
-            match mapping {
-                Some(physical_index) => {
-                    let dimensions = output_type
-                        .shape()
-                        .dimensions()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, dimension)| {
-                            dimension
-                                .value()
-                                .or_else(|| output_extents.get(&(logical_index, axis)).copied())
-                                .map_or_else(
-                                    || {
-                                        Err(ProgramError::MalformedProgram(format!(
-                                            "executable omitted runtime extent for output {logical_index} axis {axis}",
-                                        )))
-                                    },
-                                    |extent| Ok(Dimension::Static(extent)),
-                                )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let output_type = output_type.clone().with_shape(Shape::new(dimensions));
-                    let output_type = match output_type.sharding() {
-                        Some(_) => output_type,
-                        None => output_type.replicated(&program.mesh).map_err(ArrayError::from)?,
-                    };
-                    outputs.push(
-                        Array::from_canonical_addressable_buffers(
-                            self.client()?,
-                            output_type,
-                            program.mesh.clone(),
-                            physical_outputs[*physical_index].take().unwrap(),
-                        )?
-                        .with_execution_fence(fence.clone()),
-                    );
-                }
-                None => outputs.push(
-                    Array::from_zero_space(self.client()?, output_type.clone(), program.mesh.clone())?
-                        .with_execution_fence(fence.clone()),
-                ),
-            }
-        }
-        if physical_outputs.iter().any(Option::is_some) {
-            return Err(
-                ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
-            );
-        }
-        let mut closed_identities = Vec::new();
-        for (_, identity) in program.input_types.iter().chain(program.output_types.iter()).flat_map(Type::identities) {
-            if !closed_identities.contains(identity) {
-                closed_identities.push(identity.clone());
-            }
-        }
-        input_refinements
-            .validate(
-                program.output_types.iter(),
-                outputs.iter().map(|output| output.r#type().into_owned()),
-                closed_identities.as_slice(),
-            )
-            .map_err(ProgramError::from)?;
-        Ok(Execution::new(outputs, fence))
+        let execution = execute_pjrt_buffers(
+            &program.executable,
+            inputs,
+            donation_flags.as_slice(),
+            physical_output_count,
+            prepare_state,
+            before_execute,
+        )?;
+        Ok((execution, input_refinements))
     }
 }
 
@@ -2313,17 +2420,6 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         input_types: Vec<ArrayIrType>,
         options: &Self::Options,
     ) -> Result<(Self::DispatchKey, Arc<[ArrayIrType]>), Self::Error> {
-        // Reference inputs are rejected before any mesh- or option-specific constraint so they always receive the
-        // targeted discharge diagnostic instead of an unrelated bucketing or mesh error.
-        if let Some(reference_input) = input_types.iter().find(|r#type| r#type.is_reference()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "references must be discharged before XLA compilation, but dispatch input has type \
-                    `{reference_input}`",
-                ),
-            }
-            .into());
-        }
         let Some(bucketing) = options.input_bound_bucketing else {
             let input_types: Arc<[ArrayIrType]> = input_types.into();
             return Ok((XlaDispatchKey(XlaDispatchKeyKind::Exact(input_types.clone())), input_types));
@@ -2349,7 +2445,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
                     });
                 }
                 ArrayIrType::Reference(_) => {
-                    unreachable!("reference inputs are rejected at the `dispatch_signature` entry guard")
+                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                        reason: "external reference inputs do not support input-bound bucketing".to_string(),
+                    });
                 }
             };
             let dimensions = array_type
@@ -2392,18 +2490,12 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     where
         Request: StageRequest<Self>,
     {
-        // Reference-typed boundary leaves must receive the targeted discharge diagnostic before any sharding
-        // override is applied: the override path projects leaves to arrays and would otherwise fail with a generic
-        // `expected array type` error.
-        if let Some(reference) = request.input_types().parameters().find(|r#type| r#type.is_reference()) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "references must be discharged before XLA compilation, but staged input has type `{reference}`",
-                ),
-            }
-            .into());
-        }
         if let Some(in_shardings) = request.options().in_shardings.clone() {
+            if request.input_types().parameters().any(|r#type| r#type.is_reference()) {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: "external reference inputs do not support explicit input shardings".to_string(),
+                });
+            }
             let input_types = apply_signature_shardings(
                 request.input_types().parameters().cloned().collect(),
                 Some(in_shardings.as_slice()),
@@ -2463,6 +2555,11 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Request: CallRequest<Self>,
     {
         let executable = request.executable().clone();
+        if executable.compiled_program().requires_stateful_call() {
+            return Err(XlaDomainError::UnsupportedReferenceAbi {
+                reason: "external reference state requires `call_statefully`".to_string(),
+            });
+        }
         if request.inputs().len() != executable.input_types().len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: executable.input_types().len(),
@@ -2490,6 +2587,223 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Executes one request through the stateful surface, delegating reference-free requests to ordinary execution.
+    fn execute_stateful_request<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, XlaDomainError>
+    where
+        Request: CallRequest<Self>,
+    {
+        let executable = request.executable().clone();
+        let program = executable.compiled_program();
+        if program.reference_states.is_empty() {
+            return <Self as CompilationDomain>::call(self, request);
+        }
+        if request.inputs().len() != executable.input_types().len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: executable.input_types().len(),
+                actual: request.inputs().len(),
+            }
+            .into());
+        }
+        for (declared, actual) in executable.input_types().iter().zip(request.inputs().iter().map(Typed::r#type)) {
+            match (declared, actual.as_ref()) {
+                (ArrayIrType::Array(declared), ArrayIrType::Array(actual)) => {
+                    validate_xla_input_type(declared, actual)?;
+                }
+                (ArrayIrType::Reference(declared), ArrayIrType::Reference(actual)) => {
+                    validate_xla_input_type(declared.referent(), actual.referent())?;
+                }
+                _ => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!("runtime input type `{actual}` does not match declared type `{declared}`"),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let mut arguments = request.into_arguments();
+        let mut bindings =
+            Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
+        let mut seen = HashSet::with_capacity(program.reference_states.len());
+        for state in program.reference_states.iter() {
+            let logical_input_index = state.discharged_input_index();
+            let reference = match arguments.get(logical_input_index) {
+                Some(ArrayIrValue::Reference(reference)) => reference,
+                Some(value) => {
+                    return Err(XlaDomainError::UnsupportedReferenceAbi {
+                        reason: format!(
+                            "external state input {logical_input_index} must be a reference, but received `{}`",
+                            value.r#type(),
+                        ),
+                    });
+                }
+                None => {
+                    return Err(ProgramError::InvalidInputCount {
+                        expected: program.input_types.len(),
+                        actual: arguments.len(),
+                    }
+                    .into());
+                }
+            };
+            let physical_input_index = program.signature.input_mapping()[logical_input_index].unwrap();
+            let expected_sharding = &program.expected_argument_shardings[physical_input_index];
+            let declared_type = &program.input_types[logical_input_index];
+            let effective_type = if declared_type.sharding().is_some() {
+                declared_type.clone()
+            } else {
+                declared_type.clone().with_sharding(expected_sharding.clone()).map_err(ArrayError::from)?
+            };
+            let actual_type = reference.r#type();
+            if &effective_type != actual_type.referent() {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: format!(
+                        "external state input {logical_input_index} holder type `{}` does not match effective compiled \
+                         state type `{effective_type}`",
+                        actual_type.referent(),
+                    ),
+                });
+            }
+            if !reference.is_runtime_root_handle() {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: format!("external state input {logical_input_index} must be a root reference handle"),
+                });
+            }
+            if !seen.insert(reference.id()) {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: format!("reference holder {:?} is bound more than once in one invocation", reference.id()),
+                });
+            }
+            bindings.push((reference.id(), reference.clone()));
+        }
+        bindings.sort_by_key(|(id, _)| *id);
+        let mut guards = bindings
+            .iter()
+            .map(|(id, reference)| Ok((*id, reference.lock_root()?)))
+            .collect::<Result<Vec<(ReferenceId, ReferenceGuard<'_, Array<'c>>)>, ProgramError>>()?;
+        let guard_indices = guards.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
+
+        let mut mutated = Vec::<(usize, usize, usize)>::new();
+        let mut donation_overrides = Vec::with_capacity(program.reference_states.len());
+        for state in program.reference_states.iter() {
+            let logical_input_index = state.discharged_input_index();
+            let ArrayIrValue::Reference(reference) = &arguments[logical_input_index] else {
+                unreachable!("reference bindings were validated before holder acquisition")
+            };
+            let guard_index = guard_indices[&reference.id()];
+            let value = guards[guard_index].1.snapshot()?;
+            if let Some(logical_output_index) = state.final_state_output_index() {
+                mutated.push((guard_index, logical_output_index, logical_input_index));
+                donation_overrides.push((logical_input_index, true));
+            } else {
+                donation_overrides.push((logical_input_index, false));
+            }
+            arguments[logical_input_index] = ArrayIrValue::Array(value);
+        }
+        let arrays = arguments
+            .into_iter()
+            .map(ValueProjection::<ArrayType>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let handed_off = std::cell::Cell::new(false);
+        let execution = self.execute_compiled_buffers_async_with_state(
+            program,
+            arrays,
+            donation_overrides.as_slice(),
+            |physical_inputs| {
+                for &(guard_index, _, logical_input_index) in &mutated {
+                    let physical_input_index = program.signature.input_mapping()[logical_input_index].unwrap();
+                    // The snapshot pass established Ready for every guard while all guards remained held.
+                    physical_inputs[physical_input_index] = guards[guard_index].1.take().unwrap();
+                }
+            },
+            || handed_off.set(true),
+        );
+        let (execution, input_refinements) = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                if handed_off.get() {
+                    for &(guard_index, _, _) in &mutated {
+                        guards[guard_index].1.poison(error.to_string())?;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let (physical_outputs, fence) = execution.into_parts();
+        if let Err(error) = fence.block_until_ready() {
+            for &(guard_index, _, _) in &mutated {
+                guards[guard_index].1.poison(error.to_string())?;
+            }
+            return Err(error.into());
+        }
+
+        let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
+        let hidden_outputs = reconstruct_compiled_outputs(
+            self.client()?,
+            program,
+            &mut physical_outputs,
+            fence.clone(),
+            program.public_output_count..program.output_types.len(),
+        )?;
+        let mut hidden_outputs = (program.public_output_count..program.output_types.len())
+            .zip(hidden_outputs)
+            .collect::<BTreeMap<_, _>>();
+        let prepared = mutated
+            .iter()
+            .map(|(guard_index, logical_output_index, _)| {
+                let value = hidden_outputs.remove(logical_output_index).ok_or_else(|| {
+                    ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
+                })?;
+                guards[*guard_index]
+                    .1
+                    .prepare(value)
+                    .map(|value| (*guard_index, value))
+                    .map_err(ProgramError::custom)
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        for (guard_index, value) in &prepared {
+            guards[*guard_index].1.accepts(value)?;
+        }
+        for (guard_index, value) in prepared {
+            guards[guard_index].1.install(value)?;
+        }
+        #[cfg(test)]
+        if take_stateful_failure_injection(StatefulFailureInjection::BeforePublicReconstruction) {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: "injected failure before public output reconstruction".to_string(),
+            });
+        }
+        let public_outputs = reconstruct_compiled_outputs(
+            self.client()?,
+            program,
+            &mut physical_outputs,
+            fence,
+            0..program.public_output_count,
+        )?;
+        validate_compiled_output_refinements(program, &input_refinements, program.output_types(), &public_outputs)?;
+        if physical_outputs.iter().any(Option::is_some) {
+            return Err(
+                ProgramError::MalformedProgram("executable returned an unclaimed physical output".to_string()).into()
+            );
+        }
+        validate_runtime_outputs(program.output_types(), &public_outputs)?;
+        Request::reconstruct(&executable, public_outputs.into_iter().map(ArrayIrValue::Array).collect())
+    }
+}
+
+impl<'c> StatefulCompilationDomain for XlaDomain<'c> {
+    fn call_statefully_async<Request>(
+        &self,
+        request: Request,
+    ) -> ReferenceExecution<Request::RuntimeOutput, Self::Error>
+    where
+        Request: CallRequest<Self>,
+    {
+        ReferenceExecution::ready(self.execute_stateful_request(request))
+    }
+}
+
+impl<'c> XlaDomain<'c> {
     fn lower_xla_program(
         &self,
         program: &FlatXlaProgram,
@@ -2507,7 +2821,13 @@ impl<'c> XlaDomain<'c> {
         // Avoid cloning the dominant reference-free program path. Its discharge artifact is the identity with an
         // empty external-state list, so the same metadata can cross the lowering boundary by borrow.
         if !contains_unresolved_references(program) {
-            return self.lower_verified_reference_free_xla_program(program, capture_count, options);
+            return self.lower_verified_reference_free_xla_program(
+                program,
+                capture_count,
+                program.output_count(),
+                &[],
+                options,
+            );
         }
         // Discharge the exact lifted program so attached-region capture references resolve against the same lexical
         // capture prefixes used during staging. Programs that actually contain references are cloned because
@@ -2523,19 +2843,6 @@ impl<'c> XlaDomain<'c> {
         capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
-        if !discharged.external_states().is_empty() {
-            return Err(XlaDomainError::UnsupportedReferenceAbi {
-                reason: "external reference state requires a stateful XLA invocation boundary".to_string(),
-            });
-        }
-        if discharged.public_output_count() != discharged.program().output_count() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "local XLA reference discharge retained {} total outputs for {} public outputs",
-                discharged.program().output_count(),
-                discharged.public_output_count(),
-            ))
-            .into());
-        }
         // The backend verifier remains independent from core discharge and runs before boundary projection,
         // partitioner selection, or StableHLO construction. The reference scan runs first so a malformed artifact
         // containing both a reference and ordered state receives the more precise reference diagnostic.
@@ -2545,7 +2852,13 @@ impl<'c> XlaDomain<'c> {
             }
             .into());
         }
-        self.lower_verified_reference_free_xla_program(discharged.program(), capture_count, options)
+        self.lower_verified_reference_free_xla_program(
+            discharged.program(),
+            capture_count,
+            discharged.public_output_count(),
+            discharged.external_states(),
+            options,
+        )
     }
 
     /// Lowers one program after an independent verifier has established that it contains no references.
@@ -2553,6 +2866,8 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &FlatXlaProgram,
         capture_count: usize,
+        public_output_count: usize,
+        reference_states: &[DischargedReferenceState],
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
         if contains_unresolved_state(program) {
@@ -2562,6 +2877,18 @@ impl<'c> XlaDomain<'c> {
             .into());
         }
         validate_data_dependent_compilation(program)?;
+        if public_output_count > program.output_count() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "public output count {public_output_count} exceeds the discharged output count {}",
+                program.output_count(),
+            ))
+            .into());
+        }
+        if !reference_states.is_empty() && options.mesh.devices().len() != 1 {
+            return Err(XlaDomainError::UnsupportedReferenceAbi {
+                reason: "external reference state currently requires a single-device mesh".to_string(),
+            });
+        }
         let input_types = program.input_types();
         let (capture_types, public_input_types) = input_types.split_at(capture_count);
         if let Some(donation_flags) = &options.donation_flags
@@ -2588,18 +2915,78 @@ impl<'c> XlaDomain<'c> {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let program_output_types =
-            apply_signature_shardings(program.output_types().to_vec(), options.out_shardings.as_deref(), "out")?;
         let effective_input_types = effective_capture_types
             .iter()
             .cloned()
             .chain(effective_public_input_types.iter().cloned())
             .collect::<Vec<_>>();
-        let output_types = program_output_types
+        let reference_states = reference_states.to_vec();
+        if reference_states
+            .windows(2)
+            .any(|states| states[0].discharged_input_index() >= states[1].discharged_input_index())
+        {
+            return Err(ProgramError::MalformedProgram(
+                "external reference states must follow strictly increasing logical input order".to_string(),
+            )
+            .into());
+        }
+        let hidden_output_indices = reference_states
             .iter()
-            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?;
+            .filter_map(DischargedReferenceState::final_state_output_index)
+            .collect::<Vec<_>>();
+        if hidden_output_indices != (public_output_count..program.output_count()).collect::<Vec<_>>() {
+            return Err(ProgramError::MalformedProgram(
+                "hidden discharged outputs must be covered exactly once by mutated external state".to_string(),
+            )
+            .into());
+        }
+        for state in &reference_states {
+            let expected_input_index = match state.source() {
+                ryft_core::ReferenceSource::Capture { index } => index,
+                ryft_core::ReferenceSource::PublicInput { index } => {
+                    capture_count.checked_add(index).ok_or_else(|| {
+                        ProgramError::MalformedProgram("external reference input index overflows usize".to_string())
+                    })?
+                }
+                source => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "unsupported external reference source `{source}`",
+                    ))
+                    .into());
+                }
+            };
+            if state.discharged_input_index() != expected_input_index {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "external state from {} maps to logical input {} instead of {expected_input_index}",
+                    state.source(),
+                    state.discharged_input_index(),
+                ))
+                .into());
+            }
+            let input_type = effective_input_types.get(state.discharged_input_index()).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "external state logical input {} is out of range",
+                    state.discharged_input_index(),
+                ))
+            })?;
+            if input_type.static_shape().is_none()
+                || input_type.data_type().is_zero()
+                || input_type.memory() != Memory::Device
+            {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: format!(
+                        "external reference state at logical input {} must have a static non-zero device-memory type",
+                        state.discharged_input_index(),
+                    ),
+                });
+            }
+        }
+        let program_output_types = program.output_types();
+        let public_output_types = apply_signature_shardings(
+            program_output_types[..public_output_count].to_vec(),
+            options.out_shardings.as_deref(),
+            "out",
+        )?;
         let logical_argument_shardings = effective_input_types
             .iter()
             .map(|array_type| {
@@ -2608,8 +2995,49 @@ impl<'c> XlaDomain<'c> {
                 })
             })
             .collect::<Vec<_>>();
-        let result_shardings =
-            output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
+        for state in &reference_states {
+            let logical_input_index = state.discharged_input_index();
+            if !logical_argument_shardings[logical_input_index].is_replicated() {
+                return Err(XlaDomainError::UnsupportedReferenceAbi {
+                    reason: format!("external state input {logical_input_index} must use replicated sharding"),
+                });
+            }
+        }
+        let mut output_types = public_output_types
+            .iter()
+            .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        for logical_output_index in public_output_count..program.output_count() {
+            let state = reference_states
+                .iter()
+                .find(|state| state.final_state_output_index() == Some(logical_output_index))
+                .unwrap();
+            output_types.push(effective_input_types[state.discharged_input_index()].clone());
+        }
+        let result_shardings = if reference_states.is_empty() {
+            output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>()
+        } else {
+            Some(
+                output_types
+                    .iter()
+                    .enumerate()
+                    .map(|(logical_output_index, array_type)| {
+                        if logical_output_index < public_output_count {
+                            array_type.sharding().cloned().unwrap_or_else(|| {
+                                Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
+                            })
+                        } else {
+                            let state = reference_states
+                                .iter()
+                                .find(|state| state.final_state_output_index() == Some(logical_output_index))
+                                .unwrap();
+                            logical_argument_shardings[state.discharged_input_index()].clone()
+                        }
+                    })
+                    .collect(),
+            )
+        };
         // Shardy rejects bounded-dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
         // still has to take the replica path. This is why the whole region arena is inspected instead of just the
@@ -2652,7 +3080,7 @@ impl<'c> XlaDomain<'c> {
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
         let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
-        let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program(
+        let lowered_module = crate::experimental::lowering::lower_mlir_module_for_program_with_reference_state(
             program,
             effective_capture_types.as_slice(),
             &effective_public_input_types,
@@ -2661,6 +3089,7 @@ impl<'c> XlaDomain<'c> {
             lowered_argument_shardings,
             lowered_result_shardings,
             target_platform.as_deref(),
+            reference_states.as_slice(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
         let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
@@ -2677,6 +3106,8 @@ impl<'c> XlaDomain<'c> {
             compilation_options,
             input_types: effective_input_types.into(),
             output_types: output_types.into(),
+            public_output_count,
+            reference_states: reference_states.into(),
             signature,
             requires_assertion_handler,
             donation_flags: donation_flags.into(),
@@ -2693,7 +3124,7 @@ impl<'c> XlaDomain<'c> {
 
     fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let key = XlaPersistentKeyV5 {
+        let key = XlaPersistentKeyV6 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
             compilation_options: compilation_options.as_slice(),
@@ -2702,6 +3133,8 @@ impl<'c> XlaDomain<'c> {
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
+            public_output_count: program.public_output_count as u64,
+            reference_states: persistent_reference_states(&program.reference_states)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
@@ -2735,6 +3168,8 @@ impl<'c> XlaDomain<'c> {
             executable: Arc::new(executable),
             input_types: Arc::clone(&program.input_types),
             output_types: Arc::clone(&program.output_types),
+            public_output_count: program.public_output_count,
+            reference_states: Arc::clone(&program.reference_states),
             signature: program.signature.clone(),
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: Arc::clone(&program.donation_flags),
@@ -2789,7 +3224,7 @@ impl<'c> XlaDomain<'c> {
             Err(error) => return Err(error.into()),
         };
         let device_assignment = program.executable.device_assignment()?;
-        let metadata = XlaPersistentExecutableMetadataV5 {
+        let metadata = XlaPersistentExecutableMetadataV6 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
             feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
             compilation_options: program.compilation_options.encode_to_vec(),
@@ -2798,6 +3233,8 @@ impl<'c> XlaDomain<'c> {
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
+            public_output_count: program.public_output_count as u64,
+            reference_states: persistent_reference_states(&program.reference_states)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
@@ -2850,7 +3287,7 @@ impl<'c> XlaDomain<'c> {
             .checked_add(metadata_size)
             .filter(|metadata_end| *metadata_end <= bytes.len())
             .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
-        let metadata: XlaPersistentExecutableMetadataV5 = serde_json::from_slice(&bytes[header_size..metadata_end])
+        let metadata: XlaPersistentExecutableMetadataV6 = serde_json::from_slice(&bytes[header_size..metadata_end])
             .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
         if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
             || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
@@ -2900,12 +3337,10 @@ impl<'c> XlaDomain<'c> {
             return Err(persistent_error("argument sharding mesh does not match executable mesh"));
         }
         let capture_count = checked_usize(metadata.capture_count)?;
-        let replica_count = checked_usize(metadata.replica_count)?;
-        let partition_count = checked_usize(metadata.partition_count)?;
-        if replica_count.checked_mul(partition_count) != Some(mesh.device_count())
-            || metadata.device_assignment.len() != mesh.device_count()
-        {
-            return Err(persistent_error("device assignment does not match executable mesh"));
+        let public_output_count = checked_usize(metadata.public_output_count)?;
+        let reference_states = decode_persistent_reference_states(metadata.reference_states)?;
+        if public_output_count > output_types.len() || (!reference_states.is_empty() && mesh.device_count() != 1) {
+            return Err(persistent_error("reference-state metadata has an invalid public output or mesh count"));
         }
         let physical_input_count = signature.physical_input_count();
         if capture_count > input_types.len()
@@ -2913,6 +3348,85 @@ impl<'c> XlaDomain<'c> {
             || metadata.donation_flags.len() != input_types.len() - capture_count
         {
             return Err(persistent_error("capture or donation metadata has an invalid arity"));
+        }
+        if reference_states
+            .windows(2)
+            .any(|states| states[0].discharged_input_index() >= states[1].discharged_input_index())
+        {
+            return Err(persistent_error("reference states are not in canonical logical input order"));
+        }
+        let hidden_output_indices = reference_states
+            .iter()
+            .filter_map(DischargedReferenceState::final_state_output_index)
+            .collect::<Vec<_>>();
+        if hidden_output_indices != (public_output_count..output_types.len()).collect::<Vec<_>>() {
+            return Err(persistent_error("reference-state metadata does not cover the hidden output suffix"));
+        }
+        let mut physical_inputs = HashSet::new();
+        let mut physical_outputs = HashSet::new();
+        for state in &reference_states {
+            let expected_input_index = match state.source() {
+                ryft_core::ReferenceSource::Capture { index } => index,
+                ryft_core::ReferenceSource::PublicInput { index } => capture_count
+                    .checked_add(index)
+                    .ok_or_else(|| persistent_error("persistent reference input index overflows usize"))?,
+                source => {
+                    return Err(persistent_error(format!("unsupported persistent reference-state source `{source}`",)));
+                }
+            };
+            if state.discharged_input_index() != expected_input_index || expected_input_index >= input_types.len() {
+                return Err(persistent_error("reference-state source does not match its logical input"));
+            }
+            let physical_input = signature.input_mapping()[expected_input_index]
+                .ok_or_else(|| persistent_error("reference-state input is erased from the executable boundary"))?;
+            if !physical_inputs.insert(physical_input) {
+                return Err(persistent_error("reference-state inputs must be unique"));
+            }
+            let input_type = &input_types[expected_input_index];
+            let expected_sharding = &expected_argument_shardings[physical_input];
+            if !expected_sharding.is_replicated() {
+                return Err(persistent_error(format!(
+                    "reference-state input {expected_input_index} expected argument sharding is not replicated",
+                )));
+            }
+            if expected_sharding.rank() != input_type.rank()
+                || input_type.sharding().is_some_and(|sharding| sharding != expected_sharding)
+            {
+                return Err(persistent_error(format!(
+                    "reference-state input {expected_input_index} logical sharding does not match its expected \
+                     argument sharding",
+                )));
+            }
+            if input_type.static_shape().is_none()
+                || input_type.data_type().is_zero()
+                || input_type.memory() != Memory::Device
+            {
+                return Err(persistent_error("reference-state input is not a static device-memory array"));
+            }
+            if let Some(logical_output_index) = state.final_state_output_index() {
+                let physical_output = signature.output_mapping()[logical_output_index]
+                    .ok_or_else(|| persistent_error("reference-state output is erased from the executable boundary"))?;
+                let output_type = &output_types[logical_output_index];
+                if !physical_outputs.insert(physical_output) {
+                    return Err(persistent_error("reference-state output aliases are not injective"));
+                }
+                if output_type.sharding().is_some_and(|sharding| sharding != expected_sharding) {
+                    return Err(persistent_error(format!(
+                        "reference-state output {logical_output_index} logical sharding does not match state input \
+                         {expected_input_index}",
+                    )));
+                }
+                if input_type != output_type {
+                    return Err(persistent_error("reference-state output is not type-compatible with its input"));
+                }
+            }
+        }
+        let replica_count = checked_usize(metadata.replica_count)?;
+        let partition_count = checked_usize(metadata.partition_count)?;
+        if replica_count.checked_mul(partition_count) != Some(mesh.device_count())
+            || metadata.device_assignment.len() != mesh.device_count()
+        {
+            return Err(persistent_error("device assignment does not match executable mesh"));
         }
         let donation_flags = metadata.donation_flags;
         let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
@@ -2937,6 +3451,8 @@ impl<'c> XlaDomain<'c> {
             executable: Arc::new(executable),
             input_types: input_types.into(),
             output_types: output_types.into(),
+            public_output_count,
+            reference_states: reference_states.into(),
             signature,
             requires_assertion_handler: metadata.requires_assertion_handler,
             donation_flags: donation_flags.into(),
@@ -3383,6 +3899,8 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         },
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         XlaOperation::NewReference(_)
+        | XlaOperation::ReferenceIndex(_)
+        | XlaOperation::ReferenceSlice(_)
         | XlaOperation::ReferenceRead(_)
         | XlaOperation::ReferenceSwap(_)
         | XlaOperation::ReferenceAddUpdate(_)
@@ -4147,26 +4665,156 @@ fn materialize_zero_space_carriers<'c>(
         .collect()
 }
 
+/// Reconstructs selected logical outputs from one submitted execution's physical buffers.
+fn reconstruct_compiled_outputs<'c>(
+    client: &'c Client<'c>,
+    program: &XlaCompiledProgram<'c>,
+    physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
+    fence: ryft_pjrt::ExecutionFence,
+    logical_indices: impl IntoIterator<Item = usize>,
+) -> Result<Vec<Array<'c>>, XlaDomainError> {
+    let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
+    let scalar_type = ArrayType::scalar(DataType::I64).replicated(&program.mesh).map_err(ArrayError::from)?;
+    let mut output_extents = BTreeMap::new();
+    for output_dimension in program
+        .signature
+        .output_dimensions()
+        .iter()
+        .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
+    {
+        let scalar = Array::from_canonical_addressable_buffers(
+            client,
+            scalar_type.clone(),
+            program.mesh.clone(),
+            physical_outputs[output_dimension.physical_output_index()].take().unwrap(),
+        )?
+        .with_execution_fence(fence.clone());
+        let bytes = materialize_dense_array_bytes(&scalar)?;
+        let extent = bytes
+            .get(..size_of::<i64>())
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .and_then(|extent| usize::try_from(extent).ok())
+            .ok_or_else(|| ProgramError::InvalidArgument {
+                message: format!(
+                    "runtime extent for output {} axis {} is negative, missing, or exceeds usize",
+                    output_dimension.logical_output_index(),
+                    output_dimension.axis(),
+                ),
+            })?;
+        output_extents.insert((output_dimension.logical_output_index(), output_dimension.axis()), extent);
+    }
+
+    logical_indices
+        .into_iter()
+        .map(|logical_index| {
+            let output_type = &program.output_types[logical_index];
+            match program.signature.output_mapping()[logical_index] {
+                Some(physical_index) => {
+                    let dimensions = output_type
+                        .shape()
+                        .dimensions()
+                        .iter()
+                        .enumerate()
+                        .map(|(axis, dimension)| {
+                            dimension
+                                .value()
+                                .or_else(|| output_extents.get(&(logical_index, axis)).copied())
+                                .map_or_else(
+                                    || {
+                                        Err(ProgramError::MalformedProgram(format!(
+                                            "executable omitted runtime extent for output {logical_index} axis {axis}",
+                                        )))
+                                    },
+                                    |extent| Ok(Dimension::Static(extent)),
+                                )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let output_type = output_type.clone().with_shape(Shape::new(dimensions));
+                    let output_type = match output_type.sharding() {
+                        Some(_) => output_type,
+                        None => output_type.replicated(&program.mesh).map_err(ArrayError::from)?,
+                    };
+                    Ok(Array::from_canonical_addressable_buffers(
+                        client,
+                        output_type,
+                        program.mesh.clone(),
+                        physical_outputs[physical_index].take().unwrap(),
+                    )?
+                    .with_execution_fence(fence.clone()))
+                }
+                None => Ok(Array::from_zero_space(client, output_type.clone(), program.mesh.clone())?
+                    .with_execution_fence(fence.clone())),
+            }
+        })
+        .collect()
+}
+
+/// Validates reconstructed logical outputs against the runtime input refinements.
+fn validate_compiled_output_refinements(
+    program: &XlaCompiledProgram<'_>,
+    input_refinements: &<ArrayType as Type>::Refinements,
+    declared_output_types: &[ArrayType],
+    outputs: &[Array<'_>],
+) -> Result<(), XlaDomainError> {
+    let mut closed_identities = Vec::new();
+    for (_, identity) in program.input_types.iter().chain(program.output_types.iter()).flat_map(Type::identities) {
+        if !closed_identities.contains(identity) {
+            closed_identities.push(identity.clone());
+        }
+    }
+    input_refinements
+        .validate(
+            declared_output_types.iter(),
+            outputs.iter().map(|output| output.r#type().into_owned()),
+            closed_identities.as_slice(),
+        )
+        .map_err(ProgramError::from)
+        .map_err(Into::into)
+}
+
 /// Executes one PJRT executable and transposes device-major results into one buffer vector per physical output.
 fn execute_pjrt_buffers<'c>(
     executable: &LoadedExecutable<'c>,
-    inputs: Vec<Array<'c>>,
+    mut inputs: Vec<Array<'c>>,
     donation_flags: &[bool],
     output_count: usize,
+    prepare_inputs: impl FnOnce(&mut Vec<Array<'c>>),
+    before_execute: impl FnOnce(),
 ) -> Result<Execution<Vec<Vec<Buffer<'c>>>>, XlaDomainError> {
     let addressable_device_ids = executable
         .addressable_devices()?
         .iter()
         .map(|device| device.id().map_err(XlaDomainError::from))
         .collect::<Result<Vec<_>, _>>()?;
+    // Validate the complete fallible argument projection while external holders are still Ready. The transaction
+    // callback may then transfer uniquely owned holder buffers into the same validated physical slots without
+    // retaining a clone that would silently disable donation.
+    drop(Array::into_execute_arguments_with_donation(
+        inputs.clone(),
+        addressable_device_ids.as_slice(),
+        donation_flags,
+    )?);
+    prepare_inputs(&mut inputs);
     let arguments =
-        Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags)?;
+        Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags).unwrap();
+    // Crossing this callback marks the conservative donation handoff boundary. The safe PJRT wrapper owns all input
+    // handles from this point and drops them on an immediate execute error.
+    before_execute();
+    #[cfg(test)]
+    if take_stateful_failure_injection(StatefulFailureInjection::AfterHandoff) {
+        return Err(XlaDomainError::InvalidCompilationOptions {
+            reason: "injected failure after execution handoff".to_string(),
+        });
+    }
     let (device_outputs, fence) = executable
         .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
         .into_parts();
 
     for outputs in &device_outputs {
         if outputs.outputs.len() != output_count {
+            // Submission succeeded, so every holder guard owned by the caller must remain held until the device has
+            // stopped observing its inputs even when the returned output arity violates the compiled contract.
+            fence.block_until_ready()?;
             return Err(XlaDomainError::Pjrt(ryft_pjrt::Error::invalid_argument(format!(
                 "expected {output_count} output(s) per device, but got {}",
                 outputs.outputs.len(),
@@ -4200,17 +4848,18 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
-        AddOperation, AndOperation, ArrayOperation, Atan2Operation, CalleeRegionDriver, CaptureReference,
-        CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher, ConditionOperation,
-        ConstantOperation, ConvertElementTypeOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
-        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
-        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
-        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
-        FreezeReference, FreezeReferenceOperation, IotaOperation, MulOperation, NegOperation, NewReference,
-        NewReferenceOperation, OneOperation, PrintOperation, ReduceOperation, ReductionKind, Reference,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwapOperation,
-        ReferenceType, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation,
-        Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
+        AddOperation, AndOperation, ArrayOperation, ArraySliceAxis, Atan2Operation, CalleeRegionDriver,
+        CaptureReference, CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher,
+        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CustomJvpOperation, Dimension,
+        DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation,
+        DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+        DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+        DynamicShapeSliceOperation, Fill, FreezeReference, FreezeReferenceOperation, IotaOperation, MulOperation,
+        NegOperation, NewReference, NewReferenceOperation, OneOperation, PrintOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ScaledDotOperation,
+        ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension,
+        StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -4666,6 +5315,8 @@ mod tests {
         let current = XlaInvocationMetadata {
             input_types: &[],
             output_types: &[],
+            public_output_count: 0,
+            reference_states: &[],
             signature: &signature,
             donation_flags: &[false],
             capture_count: 0,
@@ -4676,7 +5327,21 @@ mod tests {
 
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
-            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason.contains("donation flags"),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible donation flags",
+        ));
+        let replacement = XlaInvocationMetadata { public_output_count: 1, ..current };
+        assert!(matches!(
+            validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible public output count",
+        ));
+        let state = DischargedReferenceState::new(ryft_core::ReferenceSource::PublicInput { index: 0 }, 0, None);
+        let replacement = XlaInvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
+        assert!(matches!(
+            validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "replacement executable has incompatible reference-state signature",
         ));
     }
 
@@ -7115,23 +7780,25 @@ mod tests {
                     dimension_type,
                 ),
         ));
-        // Reference inputs are rejected before any mesh- or option-specific constraint, so the same targeted
-        // diagnostic fires with bucketing options, without them, and on multi-device meshes whose bucketing
-        // rejection would otherwise come first.
+        // Exact dispatch admits structural reference types for the opt-in stateful call surface, while bucketed
+        // dispatch rejects them because holder state is not part of the array-only bucketing model.
         let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        for options in [
-            XlaOptions::new(single_device_mesh.clone()),
-            XlaOptions::new(single_device_mesh.clone()).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
-        ] {
-            assert!(matches!(
-                single_device_domain.dispatch_signature(vec![ArrayIrType::Reference(reference_type.clone())], &options),
-                Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                    if message == format!(
-                        "references must be discharged before XLA compilation, but dispatch input has type \
-                        `{reference_type}`",
-                    ),
-            ));
-        }
+        let reference_input_types: Arc<[ArrayIrType]> = vec![ArrayIrType::Reference(reference_type.clone())].into();
+        assert_eq!(
+            single_device_domain
+                .dispatch_signature(reference_input_types.to_vec(), &XlaOptions::new(single_device_mesh.clone()))
+                .unwrap(),
+            (XlaDispatchKey(XlaDispatchKeyKind::Exact(reference_input_types.clone())), reference_input_types,),
+        );
+        assert!(matches!(
+            single_device_domain.dispatch_signature(
+                vec![ArrayIrType::Reference(reference_type.clone())],
+                &XlaOptions::new(single_device_mesh.clone())
+                    .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
+            ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external reference inputs do not support input-bound bucketing",
+        ));
 
         let multi_device_client =
             plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
@@ -7148,19 +7815,16 @@ mod tests {
                     signatures require disabling the Shardy partitioner",
         ));
 
-        // A reference input on the same multi-device bucketing options still gets the targeted discharge diagnostic:
-        // the reference entry guard precedes the multi-device bucketing rejection asserted just above.
+        // Multi-device bucketing is rejected before inspecting individual input kinds.
         assert!(matches!(
             multi_device_domain.dispatch_signature(
                 vec![ArrayIrType::Reference(reference_type.clone())],
                 &XlaOptions::new(domain_mesh(&multi_device_client, "x", 2))
                     .with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo),
             ),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "references must be discharged before XLA compilation, but dispatch input has type \
-                    `{reference_type}`",
-                ),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "input-bound bucketing is unsupported on multi-device meshes because bucketed dynamic \
+                    signatures require disabling the Shardy partitioner",
         ));
     }
 
@@ -7507,7 +8171,7 @@ mod tests {
         let metadata_size =
             u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
         let metadata_end = header_size + metadata_size;
-        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV5 =
+        let mut invalid_signature_metadata: XlaPersistentExecutableMetadataV6 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         invalid_signature_metadata.input_mapping[0] = None;
         let invalid_signature_metadata = serde_json::to_vec(&invalid_signature_metadata).unwrap();
@@ -7520,7 +8184,7 @@ mod tests {
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
 
-        let mut incompatible_metadata: XlaPersistentExecutableMetadataV5 =
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV6 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         incompatible_metadata.platform_version.push_str("-incompatible");
         let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
@@ -7606,11 +8270,11 @@ mod tests {
             domain.deserialize_program(b"truncated"),
             Err(XlaDomainError::InvalidPersistentExecutable { .. }),
         ));
-        let mut legacy = b"RYFTXLA1".to_vec();
+        let mut legacy = b"RYFTXLA5".to_vec();
         legacy.extend_from_slice(&0u64.to_le_bytes());
         assert!(domain.deserialize_program(legacy.as_slice()).unwrap().is_none());
 
-        let metadata = XlaPersistentExecutableMetadataV5 {
+        let metadata = XlaPersistentExecutableMetadataV6 {
             schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
             feature_flags: 0,
             compilation_options: CompilationOptions::default().encode_to_vec(),
@@ -7619,6 +8283,8 @@ mod tests {
             output_mapping: Vec::new(),
             input_dimensions: Vec::new(),
             output_dimensions: Vec::new(),
+            public_output_count: 0,
+            reference_states: Vec::new(),
             requires_assertion_handler: false,
             donation_flags: Vec::new(),
             capture_count: 0,
@@ -7660,6 +8326,35 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_transaction_donation_respects_effective_buffer_ownership() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+
+        let unique = ArrayReference::new(f32_scalar(&client, &mesh, 1.0));
+        let mut unique_guard = unique.lock_root().unwrap();
+        let mut inputs = vec![unique_guard.snapshot().unwrap()];
+        drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
+        inputs[0] = unique_guard.take().unwrap();
+        let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
+        assert!(arguments.inputs_by_device()[0][0].donatable);
+        unique_guard.poison("test transaction consumed unique input").unwrap();
+
+        let shared_value = f32_scalar(&client, &mesh, 2.0);
+        let retained = shared_value.clone();
+        let shared = ArrayReference::new(shared_value);
+        let mut shared_guard = shared.lock_root().unwrap();
+        let mut inputs = vec![shared_guard.snapshot().unwrap()];
+        drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
+        inputs[0] = shared_guard.take().unwrap();
+        let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
+        assert!(!arguments.inputs_by_device()[0][0].donatable);
+        shared_guard.poison("test transaction consumed shared input").unwrap();
+        assert_eq!(read_f32s(&client, &retained), vec![2.0]);
+    }
+
+    #[test]
     fn test_eager_bind_rejects_unresolved_references_before_special_cases_or_tracing() {
         // The guard is operation-agnostic: it keys off unresolved reference state rather than the specific reference
         // operation, so one representative operation pins the diagnostic.
@@ -7674,7 +8369,7 @@ mod tests {
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
-        let reference = ArrayIrValue::Reference(Reference::new(f32_vector(&client, &mesh, &[1.0])));
+        let reference = ArrayIrValue::Reference(ArrayReference::new(f32_vector(&client, &mesh, &[1.0])));
         assert_eq!(
             domain.bind(AddOperation::new(), Vec::new(), &[reference]),
             Err(ProgramError::UnsupportedOperation {
@@ -7775,7 +8470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stage_rejects_reference_boundaries_before_sharding_projection() {
+    fn test_stage_enforces_reference_boundary_sharding_policy() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
@@ -7783,8 +8478,8 @@ mod tests {
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
 
-        // A reference input with `in_shardings` receives the targeted discharge diagnostic before the sharding
-        // override projects boundary leaves to arrays.
+        // Reference inputs are structurally valid for stateful staging, but user-provided input sharding overrides
+        // are not: holder state derives its effective sharding from the compiled reference ABI.
         fn forward<'c>(
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
@@ -7803,11 +8498,8 @@ mod tests {
                     ),
                 )
                 .map(|_| ()),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "references must be discharged before XLA compilation, but staged input has type \
-                    `{reference_type}`",
-                ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external reference inputs do not support explicit input shardings",
         ));
 
         // A reference output with `out_shardings` is likewise rejected before the output override runs.
@@ -7889,6 +8581,186 @@ mod tests {
         let eager_final = eager_reference.freeze().unwrap();
         assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(3.0f32)));
         assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(6.0f32)));
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_local_index_and_slice_reference_views() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let vector_type = replicated_vector_type(&mesh, 4);
+        let pair_type = replicated_vector_type(&mesh, 2);
+        let mut builder = XlaProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(pair_type.clone().into());
+        let update = builder.add_input(pair_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let indexed =
+            builder.add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference]).unwrap()[0];
+        let indexed_snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![indexed]).unwrap()[0];
+        let outer = builder
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
+                Vec::new(),
+                vec![reference],
+            )
+            .unwrap()[0];
+        let composed = builder
+            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]), Vec::new(), vec![outer])
+            .unwrap()[0];
+        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![composed, replacement]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![composed, update]).unwrap();
+        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![indexed_snapshot, old, final_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg1: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg2: tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = |result, target, update, index, target_size, update_size| {
+            format!(
+                "    %{result} = stablehlo.dynamic_update_slice %{target}, %{update}, %{index} : \
+                 (tensor<{target_size}xf32>, tensor<{update_size}xf32>, tensor<i64>) -> \
+                 tensor<{target_size}xf32>",
+            )
+        };
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = stablehlo.slice %arg0 [3:4] : (tensor<4xf32>) -> tensor<1xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<1xf32>) -> tensor<f32>
+                    %2 = stablehlo.slice %arg0 [1:4] : (tensor<4xf32>) -> tensor<3xf32>
+                    %3 = stablehlo.slice %2 [0:2] : (tensor<3xf32>) -> tensor<2xf32>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                @UPDATE0@
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE1@
+                    %6 = stablehlo.slice %5 [1:4] : (tensor<4xf32>) -> tensor<3xf32>
+                    %7 = stablehlo.slice %6 [0:2] : (tensor<3xf32>) -> tensor<2xf32>
+                    %8 = stablehlo.add %7, %arg2 : tensor<2xf32>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i64>
+                @UPDATE2@
+                    %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE3@
+                    return %1, %3, %10 : tensor<f32>, tensor<2xf32>, tensor<4xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE0@", &expected_update("4", "2", "arg1", "c", 3, 2))
+            .replace("@UPDATE1@", &expected_update("5", "arg0", "4", "c_0", 4, 3))
+            .replace("@UPDATE2@", &expected_update("9", "6", "8", "c_1", 3, 2))
+            .replace("@UPDATE3@", &expected_update("10", "5", "9", "c_2", 4, 3)),
+        );
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_xla_program(
+                &compiled,
+                vec![
+                    f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]),
+                    f32_vector(&client, &mesh, &[10.0, 20.0]),
+                    f32_vector(&client, &mesh, &[1.0, 2.0]),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![4.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![2.0, 3.0]);
+        assert_eq!(read_f32s(&client, &outputs[2]), vec![1.0, 11.0, 22.0, 4.0]);
+    }
+
+    #[test]
+    fn test_xla_lowering_executes_indexed_reference_mutation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let vector_type = replicated_vector_type(&mesh, 3);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let mut builder = XlaProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(scalar_type.clone().into());
+        let update = builder.add_input(scalar_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let indexed =
+            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
+        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![indexed, replacement]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![indexed, update]).unwrap();
+        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![old, final_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg2: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = |result, target, update, index| {
+            format!(
+                "    %{result} = stablehlo.dynamic_update_slice %{target}, %{update}, %{index} : \
+                 (tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> tensor<3xf32>",
+            )
+        };
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = stablehlo.slice %arg0 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                    %1 = stablehlo.reshape %0 : (tensor<1xf32>) -> tensor<f32>
+                    %2 = stablehlo.reshape %arg1 : (tensor<f32>) -> tensor<1xf32>
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE0@
+                    %4 = stablehlo.slice %3 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                    %5 = stablehlo.reshape %4 : (tensor<1xf32>) -> tensor<f32>
+                    %6 = stablehlo.add %5, %arg2 : tensor<f32>
+                    %7 = stablehlo.reshape %6 : (tensor<f32>) -> tensor<1xf32>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE1@
+                    return %1, %8 : tensor<f32>, tensor<3xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE0@", &expected_update("3", "arg0", "2", "c"))
+            .replace("@UPDATE1@", &expected_update("8", "3", "7", "c_0")),
+        );
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_xla_program(
+                &compiled,
+                vec![
+                    f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]),
+                    f32_scalar(&client, &mesh, 10.0),
+                    f32_scalar(&client, &mesh, 3.0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![2.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0, 13.0, 3.0]);
     }
 
     #[test]
@@ -8053,6 +8925,99 @@ mod tests {
             .unwrap();
         assert_eq!(read_f32s(&client, &false_outputs[0]), vec![10.0]);
         assert_eq!(read_f32s(&client, &false_outputs[1]), vec![10.0]);
+    }
+
+    #[test]
+    fn test_xla_condition_recreates_reference_view_inside_branch() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let vector_type = replicated_vector_type(&mesh, 3);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ReferenceType::new(vector_type.clone());
+        let true_branch = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let view =
+                builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
+            let update = builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new()).unwrap()[0];
+            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![view, update]).unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = XlaProgramBuilder::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
+        let initial = builder.add_input(vector_type.into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder
+            .add_instruction(
+                ConditionOperation::<XlaConstant>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let expected_signature = concat!(
+            "  func.func @main(%arg0: tensor<i1> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> ",
+            "(tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
+        );
+        let expected_update = concat!(
+            "      %5 = stablehlo.dynamic_update_slice %arg1, %4, %c : ",
+            "(tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> tensor<3xf32>",
+        );
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                @SIGNATURE@
+                    %0 = "stablehlo.if"(%arg0) ({
+                      %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                      %1 = stablehlo.slice %arg1 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                      %2 = stablehlo.reshape %1 : (tensor<1xf32>) -> tensor<f32>
+                      %3 = stablehlo.add %2, %cst : tensor<f32>
+                      %4 = stablehlo.reshape %3 : (tensor<f32>) -> tensor<1xf32>
+                      %c = stablehlo.constant dense<1> : tensor<i64>
+                @UPDATE@
+                      stablehlo.return %5 : tensor<3xf32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<3xf32>
+                    }) : (tensor<i1>) -> tensor<3xf32>
+                    return %0 : tensor<3xf32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature)
+            .replace("@UPDATE@", expected_update),
+        );
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        for (predicate, expected) in [(true, vec![1.0, 3.0, 3.0]), (false, vec![1.0, 2.0, 3.0])] {
+            let outputs = domain
+                .execute_xla_program(
+                    &compiled,
+                    vec![boolean_scalar(&client, &mesh, predicate), f32_vector(&client, &mesh, &[1.0, 2.0, 3.0])],
+                )
+                .unwrap();
+            assert_eq!(read_f32s(&client, &outputs[0]), expected);
+        }
     }
 
     #[test]
@@ -8269,7 +9234,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_lowering_rejects_external_reference_state_after_discharge() {
+    fn test_xla_lowering_carries_external_reference_state_metadata_after_discharge() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
@@ -8281,10 +9246,130 @@ mod tests {
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)).unwrap();
+        assert_eq!(lowered.public_output_count, 1);
+        assert_eq!(lowered.reference_states.len(), 1);
+        assert_eq!(lowered.reference_states[0].discharged_input_index(), 0);
+        assert_eq!(lowered.reference_states[0].final_state_output_index(), None);
+        assert!(!lowered.stable_hlo.contains("reference"));
+    }
+
+    #[test]
+    fn test_xla_persistent_v6_round_trips_and_validates_external_reference_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+
+        let mut builder = XlaProgramBuilder::new();
+        let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
+        let read_only = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type)));
+        let read_only_output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![read_only]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, read_only_output])
+            .unwrap();
+        let left = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, read_only_output]).unwrap()[0];
+        let program: FlatXlaProgram = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_xla_program(&program, 1, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
+        let restored = domain.deserialize_xla_program(bytes.as_slice()).unwrap().unwrap();
+        assert_eq!(compiled.public_output_count, 1);
+        assert_eq!(compiled.reference_states.len(), 2);
+        assert_eq!(compiled.reference_states[0].source(), ryft_core::ReferenceSource::Capture { index: 0 });
+        assert_eq!(compiled.reference_states[0].discharged_input_index(), 0);
+        assert_eq!(compiled.reference_states[0].final_state_output_index(), Some(1));
+        assert_eq!(compiled.reference_states[1].source(), ryft_core::ReferenceSource::PublicInput { index: 0 });
+        assert_eq!(compiled.reference_states[1].discharged_input_index(), 1);
+        assert_eq!(compiled.reference_states[1].final_state_output_index(), None);
+        assert_eq!(restored.public_output_count, compiled.public_output_count);
+        assert_eq!(restored.reference_states, compiled.reference_states);
+        let outputs = domain
+            .execute_xla_program(&restored, vec![f32_scalar(&client, &mesh, 1.0), f32_scalar(&client, &mesh, 2.0)])
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![3.0]);
+
+        let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
+        let metadata_size =
+            u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
+        let metadata_end = header_size + metadata_size;
+        let corrupt = |metadata: XlaPersistentExecutableMetadataV6| {
+            let metadata = serde_json::to_vec(&metadata).unwrap();
+            let mut corrupted = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+            corrupted.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+            corrupted.extend_from_slice(metadata.as_slice());
+            corrupted.extend_from_slice(&bytes[metadata_end..]);
+            corrupted
+        };
+        let mut metadata: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
+        let corrupted = corrupt(metadata);
         assert!(matches!(
-            domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external reference state requires a stateful XLA invocation boundary",
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state source does not match its logical input",
+        ));
+
+        let mut reordered: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        reordered.reference_states.swap(0, 1);
+        let corrupted = corrupt(reordered);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference states are not in canonical logical input order",
+        ));
+
+        let mut non_replicated: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        non_replicated.expected_argument_shardings[0].unreduced_axes.push("x".to_string());
+        let corrupted = corrupt(non_replicated);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state input 0 expected argument sharding is not replicated",
+        ));
+
+        let mut mismatched_input: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        mismatched_input.signature.input_types[0]
+            .sharding
+            .as_mut()
+            .unwrap()
+            .unreduced_axes
+            .push("x".to_string());
+        mismatched_input.signature.output_types[1]
+            .sharding
+            .as_mut()
+            .unwrap()
+            .unreduced_axes
+            .push("x".to_string());
+        let corrupted = corrupt(mismatched_input);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state input 0 logical sharding does not match its expected argument sharding",
+        ));
+
+        let mut mismatched_output: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        mismatched_output.signature.output_types[1]
+            .sharding
+            .as_mut()
+            .unwrap()
+            .unreduced_axes
+            .push("x".to_string());
+        let corrupted = corrupt(mismatched_output);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state output 1 logical sharding does not match state input 0",
         ));
     }
 

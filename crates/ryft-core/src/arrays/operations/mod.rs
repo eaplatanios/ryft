@@ -14,6 +14,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::reference_views::ArrayReferenceViewTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -49,13 +50,14 @@ use crate::operations::{
     GatherOperation, IotaOperation, Log, LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min,
     MinOperation, Mul, MulOperation, Neg, NegOperation, NewReference, NewReferenceOperation, Not, NotOperation,
     OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, Pow, PowOperation, PrintOperation,
-    Reduce, ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
-    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
-    SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Reduce, ReduceOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceIndex, ReferenceIndexOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSlice, ReferenceSliceOperation, ReferenceSwap,
+    ReferenceSwapOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation,
+    Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select,
+    SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
+    SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
@@ -409,13 +411,19 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Creates a new whole-array reference root.
     NewReference(NewReferenceOperation),
 
-    /// Reads the current whole-array value from a reference.
+    /// Reads the array value selected by a root reference or derived view.
     ReferenceRead(ReferenceReadOperation),
 
-    /// Replaces a whole-array reference and returns its previous value.
+    /// Derives an axis-removing indexed view of a reference.
+    ReferenceIndex(ReferenceIndexOperation),
+
+    /// Derives a rank-preserving static slice view of a reference.
+    ReferenceSlice(ReferenceSliceOperation),
+
+    /// Replaces the array value selected by a root reference or derived view and returns its previous value.
     ReferenceSwap(ReferenceSwapOperation),
 
-    /// Adds an array update into a whole-array reference in program order.
+    /// Adds an array update into the value selected by a root reference or derived view in program order.
     ReferenceAddUpdate(ReferenceAddUpdateOperation),
 
     /// Consumes a whole-array reference and returns its final value.
@@ -510,6 +518,9 @@ pub enum ReferenceDischargeRule {
     /// reference output classified as a new root, and no attached regions.
     NewReference,
 
+    /// Eliminate a pure root-preserving reference view after retaining its analyzed coordinate mapping.
+    View,
+
     /// Replace a reference read with the current immutable state. The operation must have one reference input with
     /// read access, one array output, and no attached regions.
     Read,
@@ -559,6 +570,7 @@ impl ReferenceDischargeRule {
         match self {
             Self::Ordinary => "ordinary",
             Self::NewReference => "new_reference",
+            Self::View => "view",
             Self::Read => "read",
             Self::Swap => "swap",
             Self::AddUpdate => "add_update",
@@ -571,16 +583,37 @@ impl ReferenceDischargeRule {
     }
 }
 
+/// Operation-family contract for array-reference analysis.
+///
+/// Generic [`Operation::reference_semantics`] identifies roots and aliases. This array-owned extension supplies the
+/// exact coordinate mapping for aliases classified as reference views, keeping array indexing metadata out of the
+/// generic program layer while giving every public analysis artifact a fully validated view mapping.
+pub trait ArrayReferenceOperation: Operation<Type = ArrayIrType> {
+    /// Returns the coordinate transform carried by a reference-view operation.
+    #[inline]
+    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
+        None
+    }
+}
+
 // TODO(eaplatanios): Does this belong in `ryft_core::operations::references` instead?
 /// Operation-family capability used by backend-neutral reference discharge.
 ///
-/// [`Operation::reference_semantics`] describes operation-local roots and accesses, while this trait selects the
-/// structural rewrite required to eliminate those semantics and widen higher-order state boundaries. Keeping this
-/// small contract on each closed operation family lets core Array IR and backend-owned supersets share one discharge
-/// algorithm without matching operation names or introducing backend concepts into core metadata.
-pub trait ReferenceDischargeOperation: Operation<Type = ArrayIrType> + Sized {
+/// This contract extends [`ArrayReferenceOperation`] with the structural rewrite required to eliminate reference
+/// semantics and widen higher-order state boundaries. Keeping it on each closed operation family lets core Array IR
+/// and backend-owned supersets share one discharge algorithm without matching operation names.
+pub trait ReferenceDischargeOperation: ArrayReferenceOperation + From<AddOperation<ArrayIrType>> + Sized {
     /// Returns the structural reference-discharge rule for this operation.
     fn reference_discharge_rule(&self) -> ReferenceDischargeRule;
+
+    /// Wraps a canonical homogeneous array reshape for reference-view discharge.
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array slice for reference-view discharge.
+    fn from_reference_slice(operation: SliceOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array update-slice for reference-view discharge.
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
 
     /// Returns this scan operation with `additional_carry_count` hidden reference-state carries added after its
     /// existing carries, preserving its length, direction, unroll factor, and capture payloads.
@@ -591,10 +624,21 @@ pub trait ReferenceDischargeOperation: Operation<Type = ArrayIrType> + Sized {
     fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError>;
 }
 
+impl<A: Value<Type = ArrayType>> ArrayReferenceOperation for ArrayIrOperation<A> {
+    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
+        match self {
+            Self::ReferenceIndex(operation) => Some(operation.transform()),
+            Self::ReferenceSlice(operation) => Some(operation.transform()),
+            _ => None,
+        }
+    }
+}
+
 impl<A: Value<Type = ArrayType>> ReferenceDischargeOperation for ArrayIrOperation<A> {
     fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
         match self {
             Self::NewReference(_) => ReferenceDischargeRule::NewReference,
+            Self::ReferenceIndex(_) | Self::ReferenceSlice(_) => ReferenceDischargeRule::View,
             Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
             Self::ReferenceSwap(_) => ReferenceDischargeRule::Swap,
             Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::AddUpdate,
@@ -604,6 +648,18 @@ impl<A: Value<Type = ArrayType>> ReferenceDischargeOperation for ArrayIrOperatio
             Self::Scan(operation) => ReferenceDischargeRule::Scan { carry_count: operation.carry_count() },
             _ => ReferenceDischargeRule::Ordinary,
         }
+    }
+
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+        Self::Array(ArrayOperation::Reshape(operation))
+    }
+
+    fn from_reference_slice(operation: SliceOperation) -> Self {
+        Self::Array(ArrayOperation::Slice(operation))
+    }
+
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::UpdateSlice(operation))
     }
 
     fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
@@ -704,7 +760,8 @@ pub trait ArrayIrOperations:
     + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
-    + NewReference + ReferenceRead + ReferenceSwap + ReferenceAddUpdate + FreezeReference
+    + NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceSwap + ReferenceAddUpdate
+    + FreezeReference
 {
 }
 
@@ -715,7 +772,8 @@ where
     V: Value<Type = ArrayIrType> + Compare,
     V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
-    V: NewReference + ReferenceRead + ReferenceSwap + ReferenceAddUpdate + FreezeReference,
+    V: NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceSwap + ReferenceAddUpdate,
+    V: FreezeReference,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
 {
@@ -1026,6 +1084,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayBatching, ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
@@ -2940,6 +2999,9 @@ mod tests {
         /// Creates a new reference root initialized from ordinary array data.
         ArrayToReference,
 
+        /// Derives a root-preserving reference view from another reference handle.
+        ReferenceToReference,
+
         /// Reads or consumes ordinary array data from a reference.
         ReferenceToArray,
 
@@ -2974,6 +3036,9 @@ mod tests {
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::NewReference(_) => MemberKindSignature::ArrayToReference,
+            ArrayIrOperation::ReferenceIndex(_) | ArrayIrOperation::ReferenceSlice(_) => {
+                MemberKindSignature::ReferenceToReference
+            }
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
             ArrayIrOperation::ReferenceAddUpdate(_) => MemberKindSignature::ReferenceAndArrayToUnit,
@@ -3039,6 +3104,14 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (ArrayIrOperation::NewReference(NewReferenceOperation), MemberKindSignature::ArrayToReference),
+            (
+                ArrayIrOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0)),
+                MemberKindSignature::ReferenceToReference,
+            ),
+            (
+                ArrayIrOperation::ReferenceSlice(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
+                MemberKindSignature::ReferenceToReference,
+            ),
             (ArrayIrOperation::ReferenceRead(ReferenceReadOperation), MemberKindSignature::ReferenceToArray),
             (ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation), MemberKindSignature::ReferenceAndArrayToArray),
             (
@@ -3136,7 +3209,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 31);
+        assert_eq!(expected.len(), 33);
         assert_eq!(
             expected
                 .iter()
@@ -3157,6 +3230,13 @@ mod tests {
         );
         assert_eq!(
             expected.iter().filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToArray).count(),
+            2,
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceToReference)
+                .count(),
             2,
         );
         assert_eq!(

@@ -15,14 +15,15 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
-    ArrayIrType, ArrayOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
-    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
-    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation,
-    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
-    ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, CustomJvpOperation, CustomVjpOperation,
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    ArrayIrType, ArrayOperation, ArrayReferenceOperation, ArrayReferenceViewTransform, ArrayType, Atan2Operation,
+    AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver,
+    BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation,
+    CollectiveOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable,
+    ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation, CoordinateBasisOperation,
+    CosOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation,
+    DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
@@ -32,14 +33,14 @@ use ryft_core::{
     OrOperation, OutputRegionProvenance, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
-    ReferenceAddUpdateOperation, ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceReadOperation,
-    ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
-    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
-    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
-    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
-    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    ReferenceAddUpdateOperation, ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceIndexOperation,
+    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation,
+    ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
 use ryft_macros::Parameter;
 
@@ -53,7 +54,7 @@ pub type XlaArrayConstant = CaptureReference<ArrayType>;
 /// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
-///   - **Captured runtime values:** array buffers and future external reference holders stay in the surrounding
+///   - **Captured runtime values:** array buffers and external reference holders stay in the surrounding
 ///     compiled function's capture table, while the program stores only a lifetime-free [`CaptureReference`] carrying
 ///     its index and structural [`ArrayIrType`]. This keeps runtime storage out of literal IR payloads. A captured
 ///     reference remains metadata only and must be validated and discharged before ordinary XLA lowering.
@@ -271,13 +272,19 @@ where
     /// Unresolved whole-array reference allocation retained until reference discharge.
     NewReference(NewReferenceOperation),
 
-    /// Unresolved whole-array reference read retained until reference discharge.
+    /// Unresolved axis-removing reference view retained until reference discharge.
+    ReferenceIndex(ReferenceIndexOperation),
+
+    /// Unresolved static slice reference view retained until reference discharge.
+    ReferenceSlice(ReferenceSliceOperation),
+
+    /// Unresolved read from a root reference or derived view retained until reference discharge.
     ReferenceRead(ReferenceReadOperation),
 
-    /// Unresolved whole-array reference replacement retained until reference discharge.
+    /// Unresolved replacement through a root reference or derived view retained until reference discharge.
     ReferenceSwap(ReferenceSwapOperation),
 
-    /// Unresolved whole-array additive reference update retained until reference discharge.
+    /// Unresolved additive update through a root reference or derived view retained until reference discharge.
     ReferenceAddUpdate(ReferenceAddUpdateOperation),
 
     /// Unresolved consuming whole-array reference freeze retained until reference discharge.
@@ -353,6 +360,19 @@ where
     ShardMap(Box<ShardMapOperation<C>>),
 }
 
+impl<Constant> ArrayReferenceOperation for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
+        match self {
+            Self::ReferenceIndex(operation) => Some(operation.transform()),
+            Self::ReferenceSlice(operation) => Some(operation.transform()),
+            _ => None,
+        }
+    }
+}
+
 impl<Constant> ReferenceDischargeOperation for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -363,6 +383,7 @@ where
         // or attached closure carries reference state before replaying it.
         match self {
             Self::NewReference(_) => ReferenceDischargeRule::NewReference,
+            Self::ReferenceIndex(_) | Self::ReferenceSlice(_) => ReferenceDischargeRule::View,
             Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
             Self::ReferenceSwap(_) => ReferenceDischargeRule::Swap,
             Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::AddUpdate,
@@ -373,6 +394,18 @@ where
             Self::JitCall(_) => ReferenceDischargeRule::Call,
             _ => ReferenceDischargeRule::Ordinary,
         }
+    }
+
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+        Self::Array(ArrayOperation::Reshape(operation))
+    }
+
+    fn from_reference_slice(operation: SliceOperation) -> Self {
+        Self::Array(ArrayOperation::Slice(operation))
+    }
+
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::UpdateSlice(operation))
     }
 
     fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
@@ -413,6 +446,8 @@ where
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::NewReference(operation) => Self::NewReference(operation),
+            ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
+            ArrayIrOperation::ReferenceSlice(operation) => Self::ReferenceSlice(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
             ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
             ArrayIrOperation::ReferenceAddUpdate(operation) => Self::ReferenceAddUpdate(operation),
@@ -687,6 +722,8 @@ where
             Self::Compare(operation) => ArrayIrOperation::Compare(operation.clone()),
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
             Self::NewReference(operation) => ArrayIrOperation::NewReference(*operation),
+            Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
+            Self::ReferenceSlice(operation) => ArrayIrOperation::ReferenceSlice(operation.clone()),
             Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
             Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
             Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
@@ -1307,18 +1344,19 @@ mod tests {
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
-        AtomId, CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation,
-        CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
-        DynamicBroadcastOperation, Effects, EmptyRegionDriver, FreezeReferenceOperation, InstructionId, LogicalMesh,
-        MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation, Operation, OutputRegionProvenance,
-        PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError,
-        ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
-        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
-        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-        WhileOperation, ZeroOperation,
+        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
+        ArrayReferenceOperation, ArrayReferenceViewTransform, ArraySliceAxis, ArrayType, AtomId, CaptureReference,
+        CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
+        EmptyRegionDriver, FreezeReferenceOperation, InstructionId, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, NewReferenceOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder,
+        ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceDischargeOperation,
+        ReferenceDischargeRule, ReferenceIndexOperation, ReferenceReadOperation, ReferenceRoot,
+        ReferenceSliceOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDriver, RegionInterface,
+        RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
+        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
+        ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1380,6 +1418,50 @@ mod tests {
             operation.output_region_provenance(2),
             vec![OutputRegionProvenance { region_index: 0, output_index: 2 }],
         );
+    }
+
+    #[test]
+    fn test_jit_call_residual_candidates_classify_through_callee_provenance() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use ryft_core::tracing_v2::{
+            NoStorage, PolicyFn, RematerializationCandidate, RematerializationDecision, RematerializationRejection,
+            rematerialize,
+        };
+
+        // `jit_call` reports positional output-region provenance, so a residual produced by a computed callee output
+        // is classified through the callee to that output's own leaf producer instead of to the opaque `jit_call`
+        // carrier. The rematerialized body squares its input inside the callee and squares the call's result outside
+        // it, so transposing the outer `mul` needs the call's output as a residual. This is the `jit_call` counterpart
+        // of the core loop pin in `test_while_residual_candidates_classify_through_loop_provenance`.
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![squared], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let names = Rc::new(RefCell::new(Vec::new()));
+        let recorded = names.clone();
+        let policy = PolicyFn::new(move |candidate: &RematerializationCandidate<'_, ArrayIrType, XlaOperation>| {
+            recorded
+                .borrow_mut()
+                .extend(candidate.producers().iter().map(|producer| producer.operation().name().to_string()));
+            Ok::<_, RematerializationRejection>(RematerializationDecision::<NoStorage>::Recompute)
+        });
+        let function = rematerialize::<XlaDomain<'static>, _, _, _>(move |x: XlaTracer<'static>| {
+            let context = x.context().clone();
+            let called = context.bind(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee.clone()], &[x])?;
+            let mut outputs = context.bind(MulOperation::new(), Vec::new(), &[called[0].clone(), called[0].clone()])?;
+            Ok(outputs.remove(0))
+        })
+        .with_policy(policy);
+        let root = DomainTracingContext::<XlaDomain<'static>>::new();
+        function.call(root.input(scalar_type)).unwrap();
+        assert_eq!(names.borrow().clone(), vec!["mul".to_string()]);
     }
 
     #[test]
@@ -2434,6 +2516,13 @@ mod tests {
             XlaOperation::<XlaConstant>::NewReference(NewReferenceOperation).reference_discharge_rule(),
             ReferenceDischargeRule::NewReference,
         );
+        let index = XlaOperation::<XlaConstant>::ReferenceIndex(ReferenceIndexOperation::new(0, 1));
+        assert_eq!(index.reference_discharge_rule(), ReferenceDischargeRule::View);
+        assert_eq!(index.reference_view_transform(), Some(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }),);
+        let axes = vec![ArraySliceAxis::new(1, 2, 1)];
+        let slice = XlaOperation::<XlaConstant>::ReferenceSlice(ReferenceSliceOperation::new(axes.clone()));
+        assert_eq!(slice.reference_discharge_rule(), ReferenceDischargeRule::View);
+        assert_eq!(slice.reference_view_transform(), Some(ArrayReferenceViewTransform::Slice { axes }),);
         assert_eq!(
             XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation).reference_discharge_rule(),
             ReferenceDischargeRule::Read,

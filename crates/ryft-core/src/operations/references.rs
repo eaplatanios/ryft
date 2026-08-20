@@ -1,7 +1,8 @@
-//! Whole-array reference [`Operation`]s: allocation ([`NewReferenceOperation`]), reading ([`ReferenceReadOperation`]),
-//! replacement ([`ReferenceSwapOperation`]), ordered additive update ([`ReferenceAddUpdateOperation`]), and consuming
-//! finalization ([`FreezeReferenceOperation`]), together with the capability traits that value families implement to
-//! execute them eagerly.
+//! Reference [`Operation`]s and eager capabilities: allocation ([`NewReferenceOperation`]), pure index and slice view
+//! creation ([`ReferenceIndexOperation`] and [`ReferenceSliceOperation`]), snapshot reading
+//! ([`ReferenceReadOperation`]), replacement ([`ReferenceSwapOperation`]), ordered additive update
+//! ([`ReferenceAddUpdateOperation`]), and consuming finalization ([`FreezeReferenceOperation`]). Mutating operations
+//! act on the selected view while resource identity and lifetime remain owned by the shared root.
 
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -9,7 +10,7 @@ use std::sync::LazyLock;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrType, ArrayType};
+use crate::arrays::{ArrayIrType, ArrayReferenceViewTransform, ArraySliceAxis, ArrayType};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -23,14 +24,21 @@ use crate::operations::math::add::AddOperation;
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Effects, Operation, ProgramError, ProjectedValue, ReferenceAccessMode, ReferenceInputAccess,
-    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType, RegionInterface, TypeError, Value,
+    Effect, Effects, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAccessMode,
+    ReferenceAliasKind, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType,
+    RegionInterface, TypeError, Value,
 };
 
 // TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`NewReferenceOperation`].
 pub const NEW_REFERENCE_OPERATION_NAME: &str = "new_reference";
+
+/// Canonical operation name for [`ReferenceIndexOperation`].
+pub const REFERENCE_INDEX_OPERATION_NAME: &str = "reference_index";
+
+/// Canonical operation name for [`ReferenceSliceOperation`].
+pub const REFERENCE_SLICE_OPERATION_NAME: &str = "reference_slice";
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
@@ -84,6 +92,64 @@ where
             .dispatch_domain()
             .bind(NewReferenceOperation, Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
+    }
+}
+
+/// Derives an axis-removing indexed view of a reference without accessing its state.
+pub trait ReferenceIndex<Output = Self>: Sized {
+    /// Returns a reference view selecting `index` on `axis`.
+    fn reference_index(&self, axis: usize, index: usize) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceIndex<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceIndexOperation>,
+{
+    fn reference_index(&self, axis: usize, index: usize) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceIndexOperation::new(axis, index), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceIndex<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceIndexOperation>,
+{
+    fn reference_index(&self, axis: usize, index: usize) -> Result<V, ProgramError> {
+        self.value().reference_index(axis, index)
+    }
+}
+
+/// Derives a rank-preserving static slice view of a reference without accessing its state.
+pub trait ReferenceSlice<Output = Self>: Sized {
+    /// Returns a reference view selecting `axes`, one static selection per input axis.
+    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceSlice<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceSliceOperation>,
+{
+    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceSliceOperation::new(axes.to_vec()), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceSlice<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceSliceOperation>,
+{
+    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<V, ProgramError> {
+        self.value().reference_slice(axes)
     }
 }
 
@@ -233,6 +299,13 @@ static NEW_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> 
     ReferenceOperationSemantics::new(vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }], Vec::new())
 });
 
+static REFERENCE_VIEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(
+        vec![ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
+        Vec::new(),
+    )
+});
+
 static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)])
 });
@@ -304,6 +377,173 @@ impl<C: Domain<Type = ArrayIrType, Value: NewReference<C::Value>>> Interpretable
     }
 }
 
+/// Pure reference-to-reference operation selecting one coordinate and removing its axis.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceIndexOperation {
+    /// Axis selected in the input reference view.
+    axis: usize,
+
+    /// Coordinate selected on `axis`.
+    index: usize,
+}
+
+impl ReferenceIndexOperation {
+    /// Creates a new reference index operation.
+    #[inline]
+    pub const fn new(axis: usize, index: usize) -> Self {
+        Self { axis, index }
+    }
+
+    /// Returns the selected input axis.
+    #[inline]
+    pub const fn axis(&self) -> usize {
+        self.axis
+    }
+
+    /// Returns the selected coordinate.
+    #[inline]
+    pub const fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Returns this operation's root-preserving view transform.
+    #[inline]
+    pub const fn transform(&self) -> ArrayReferenceViewTransform {
+        ArrayReferenceViewTransform::Index { axis: self.axis, index: self.index }
+    }
+}
+
+impl Display for ReferenceIndexOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ReferenceIndexOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REFERENCE_INDEX_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_SEMANTICS)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("axis", self.axis)?;
+            operation.field("index", self.index)
+        })
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> InterpretableOperation<C>
+    for ReferenceIndexOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].reference_index(self.axis, self.index)?])
+    }
+}
+
+/// Pure reference-to-reference operation selecting one static range on every axis.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceSliceOperation {
+    /// Per-axis selections in the input reference view.
+    axes: Vec<ArraySliceAxis>,
+}
+
+impl ReferenceSliceOperation {
+    /// Creates a new reference slice operation.
+    #[inline]
+    pub fn new(axes: Vec<ArraySliceAxis>) -> Self {
+        Self { axes }
+    }
+
+    /// Returns the per-axis slice selections.
+    #[inline]
+    pub fn axes(&self) -> &[ArraySliceAxis] {
+        self.axes.as_slice()
+    }
+
+    /// Returns this operation's root-preserving view transform.
+    #[inline]
+    pub fn transform(&self) -> ArrayReferenceViewTransform {
+        ArrayReferenceViewTransform::Slice { axes: self.axes.clone() }
+    }
+}
+
+impl Display for ReferenceSliceOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ReferenceSliceOperation {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REFERENCE_SLICE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 1, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_SEMANTICS)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("axes", format_args!("{:?}", self.axes)))
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> InterpretableOperation<C>
+    for ReferenceSliceOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].reference_slice(self.axes.as_slice())?])
+    }
+}
+
 /// Composite reference-to-array snapshot read operation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceReadOperation;
@@ -361,7 +601,8 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceRead<C::Value>>> Interpretabl
     }
 }
 
-/// Composite whole-array replacement operation that returns the value stored before the replacement.
+/// Composite replacement operation over a root reference or derived view that returns the selected value stored
+/// before the replacement.
 ///
 /// The replacement operand must have exactly the reference's declared referent type. No broadcasting, data-type
 /// promotion, layout change, sharding change, or memory change is implicit at this storage boundary.
@@ -428,7 +669,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSwap<C::Value>>> Interpretabl
     }
 }
 
-/// Composite ordered additive-update operation over a whole-array reference.
+/// Composite ordered additive-update operation over the value selected by a root reference or derived view.
 ///
 /// The update uses ordinary array addition type inference, but it is legal only when that addition produces exactly
 /// the reference's declared referent type. The operation has no result; later reads observe the updated state.
@@ -568,8 +809,8 @@ macro_rules! impl_unsupported_reference_transforms {
     (@each $operation:ty) => {
         impl_non_transposable_operation!($operation);
 
-        // The default `partially_evaluate` routes through `fold_or_residualize`, whose ordered-state gate produces
-        // the same discharge diagnostic for every reference operation, so only the trait obligation is declared here.
+        // Partial evaluation rejects this unresolved family centrally: stateful primitives trip the ordered-state
+        // gate, while pure view derivations trip the reference-type gate. Only the trait obligation is declared here.
         impl<C: Context<Type = ArrayIrType, Operation: From<$operation>>> PartiallyEvaluatableOperation<C>
             for $operation
         {
@@ -608,6 +849,8 @@ macro_rules! impl_unsupported_reference_transforms {
 
 impl_unsupported_reference_transforms!(
     NewReferenceOperation,
+    ReferenceIndexOperation,
+    ReferenceSliceOperation,
     ReferenceReadOperation,
     ReferenceSwapOperation,
     ReferenceAddUpdateOperation,
@@ -622,8 +865,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds,
-        DimensionVariable, ReferenceAnalysisError, ReferenceRoot, Shape,
+        Array, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayReference, ArraySliceAxis, DataType, Dimension,
+        DimensionBounds, DimensionVariable, ReferenceAnalysisError, ReferenceRoot, Shape,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{
@@ -637,7 +880,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue};
     use crate::programs::{
-        EmptyRegionDriver, InstructionId, Program, ProgramBuilder, Reference, RegionDriver, RegionRef, ValueProjection,
+        EmptyRegionDriver, InstructionId, Program, ProgramBuilder, RegionDriver, RegionRef, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -708,6 +951,58 @@ mod tests {
             ReferenceOperationSemantics::new(vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }], Vec::new()),
         );
         assert_eq!(NewReferenceOperation.to_string(), NEW_REFERENCE_OPERATION_NAME);
+    }
+
+    #[test]
+    fn test_reference_views() {
+        let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(root_type.clone()));
+        let index = ReferenceIndexOperation::new(0, 1);
+        assert_eq!(
+            index.infer_output_types(std::slice::from_ref(&reference_type), &[]),
+            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into()]),
+        );
+        assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
+        assert!(index.effects().is_pure());
+        assert_eq!(
+            index.reference_semantics().outputs(),
+            &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
+        );
+
+        let slice = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
+        assert_eq!(
+            slice.infer_output_types(std::slice::from_ref(&reference_type), &[]),
+            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])).into()]),
+        );
+        assert_eq!(
+            slice.to_string(),
+            concat!(
+                "reference_slice [\n",
+                "    axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }, ",
+                "ArraySliceAxis { start: 0, size: 3, stride: 1 }],\n",
+                "]",
+            ),
+        );
+        assert!(slice.effects().is_pure());
+        assert_eq!(slice.reference_semantics(), index.reference_semantics());
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let root = builder.add_input(reference_type);
+        let row = builder.add_instruction(index, Vec::new(), vec![root]).unwrap()[0];
+        let row_slice = builder
+            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]), Vec::new(), vec![row])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![row_slice], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[3, 4]> .
+                let %1:ref<f32[4]> = reference_index [axis=0, index=1] %0
+                    %2:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }]] %1
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -1137,8 +1432,8 @@ mod tests {
                 None,
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "program replay of external reference public input 0 is not supported before external \
-                          holder runtime integration"
+                message: "program replay cannot bind external reference public input 0; use a stateful compilation \
+                          domain"
                     .to_string(),
             }),
         );
@@ -1146,8 +1441,8 @@ mod tests {
         assert_eq!(
             program.interpret(vec![reference.clone(), ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),]),
             Err(ProgramError::UnsupportedOperation {
-                message: "program replay of external reference public input 0 is not supported before external \
-                          holder runtime integration"
+                message: "program replay cannot bind external reference public input 0; use a stateful compilation \
+                          domain"
                     .to_string(),
             }),
         );
@@ -1413,8 +1708,7 @@ mod tests {
     fn test_reference_operations_reject_transforms_until_discharge() {
         type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
         let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let (_, program) =
-            TestContext::trace(|input| input.new_reference()?.read(), input_type.clone()).unwrap();
+        let (_, program) = TestContext::trace(|input| input.new_reference()?.read(), input_type.clone()).unwrap();
         let program = program.into_flat_program();
 
         // Partial evaluation must never execute, fold, or split an unresolved state chain, regardless of whether the
@@ -1449,7 +1743,7 @@ mod tests {
             ArrayIrValue::Array(Array::scalar(2_i64)),
         );
         let error = batching_context
-            .lift(ArrayIrValue::Reference(Reference::new(Array::scalar(1.0_f32))))
+            .lift(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))))
             .map(|_| ())
             .unwrap_err();
         assert_eq!(

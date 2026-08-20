@@ -410,6 +410,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+    use crate::arrays::reference_views::ArrayReference;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -425,7 +426,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Program, ProgramBuilder, ProgramError, Reference, Typed};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;
@@ -1541,8 +1542,8 @@ mod tests {
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
 
         let predicate = ArrayIrValue::Array(Array::scalar(true));
-        let on_true = ArrayIrValue::Reference(Reference::new(Array::scalar(1.0_f32)));
-        let on_false = ArrayIrValue::Reference(Reference::new(Array::scalar(2.0_f32)));
+        let on_true = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let on_false = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
         assert_eq!(
             predicate.mask_select(&on_true, &on_false),
             Err(ProgramError::UnsupportedOperation {

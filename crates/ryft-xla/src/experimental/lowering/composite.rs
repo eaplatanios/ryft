@@ -545,6 +545,8 @@ where
             }
         }
         operation @ (ArrayIrOperation::NewReference(_)
+        | ArrayIrOperation::ReferenceIndex(_)
+        | ArrayIrOperation::ReferenceSlice(_)
         | ArrayIrOperation::ReferenceRead(_)
         | ArrayIrOperation::ReferenceSwap(_)
         | ArrayIrOperation::ReferenceAddUpdate(_)

@@ -24,16 +24,16 @@ use ryft_core::{
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureReference,
     CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
     ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension, DimensionOperation,
-    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
-    DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
-    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation,
-    LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation,
-    MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError,
-    ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, RegionId, RegionRef, RemOperation, ReshapeOperation,
-    RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation,
-    ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType,
-    Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
+    DischargedReferenceState, DivOperation, DomainTracingContext, DotOperation, Effect, Effects, ErfOperation,
+    ExpOperation, FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction,
+    IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
+    MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation,
+    Program, ProgramError, ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, RegionId, RegionRef,
+    RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
+    ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
+    TransposeOperation, Type as RyftType, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
@@ -160,6 +160,10 @@ pub(crate) enum LoweringError {
     /// Error returned when simplifying a staged program prior to lowering fails.
     #[error("failed to simplify staged XLA program before lowering: {message}")]
     SimplificationFailure { message: String },
+
+    /// Error returned when logical reference-state metadata cannot map to a safe executable alias.
+    #[error("invalid XLA reference-state ABI: {message}")]
+    InvalidReferenceStateAbi { message: String },
 
     /// Underlying tracing error returned while replaying a staged program through the generic
     /// [`Program::interpret_with`] domain.
@@ -4271,6 +4275,38 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
     S: AsRef<str>,
 {
+    lower_mlir_module_for_program_with_reference_state(
+        program,
+        capture_types,
+        global_input_types,
+        global_output_types,
+        function_name,
+        arg_shardings,
+        result_shardings,
+        target_platform,
+        &[],
+    )
+}
+
+/// Lowers a discharged program with logical external reference-state aliases on its entry boundary.
+pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Output, ProgramInput, ProgramOutput, S>(
+    program: &XlaProgram<ProgramInput, ProgramOutput>,
+    capture_types: &[ArrayType],
+    global_input_types: &Input,
+    global_output_types: &Output,
+    function_name: S,
+    arg_shardings: Option<&[Sharding]>,
+    result_shardings: Option<&[Sharding]>,
+    target_platform: Option<&str>,
+    reference_states: &[DischargedReferenceState],
+) -> Result<LoweredXlaModule, LoweringError>
+where
+    Input: Parameterized<ArrayType>,
+    Output: Parameterized<ArrayType>,
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+    S: AsRef<str>,
+{
     if contains_unresolved_references(program) {
         return Err(LoweringError::UnresolvedReference { construct: "program with unresolved references".to_string() });
     }
@@ -4283,6 +4319,102 @@ where
     let logical_argument_types =
         capture_types.iter().cloned().chain(global_input_types.iter().cloned()).collect::<Vec<_>>();
     let signature = XlaExecutableSignature::new(logical_argument_types.as_slice(), global_output_types.as_slice());
+    if let Some(shardings) = arg_shardings
+        && shardings.len() != logical_argument_types.len()
+    {
+        return Err(LoweringError::InvalidShardingCount {
+            kind: "argument",
+            expected: logical_argument_types.len(),
+            actual: shardings.len(),
+        });
+    }
+    if let Some(shardings) = result_shardings
+        && shardings.len() != global_output_types.len()
+    {
+        return Err(LoweringError::InvalidShardingCount {
+            kind: "result",
+            expected: global_output_types.len(),
+            actual: shardings.len(),
+        });
+    }
+    let mut aliases = HashMap::with_capacity(reference_states.len());
+    let mut state_inputs = HashSet::with_capacity(reference_states.len());
+    let mut aliased_outputs = HashSet::with_capacity(reference_states.len());
+    for state in reference_states {
+        let logical_input_index = state.discharged_input_index();
+        if !state_inputs.insert(logical_input_index) {
+            return Err(LoweringError::InvalidReferenceStateAbi {
+                message: format!("logical state input {logical_input_index} appears more than once"),
+            });
+        }
+        let input_type =
+            logical_argument_types
+                .get(logical_input_index)
+                .ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
+                    message: format!("logical input index {logical_input_index} is out of range"),
+                })?;
+        let physical_input_index =
+            signature.input_mapping()[logical_input_index].ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
+                message: format!("logical state input {logical_input_index} is erased from the executable boundary"),
+            })?;
+        match state.final_state_output_index() {
+            None => {}
+            Some(logical_output_index) => {
+                let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
+                    LoweringError::InvalidReferenceStateAbi {
+                        message: format!("logical output index {logical_output_index} is out of range"),
+                    }
+                })?;
+                let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
+                    LoweringError::InvalidReferenceStateAbi {
+                        message: format!(
+                            "logical state output {logical_output_index} is erased from the executable boundary",
+                        ),
+                    }
+                })?;
+                if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
+                    return Err(LoweringError::InvalidReferenceStateAbi {
+                        message: format!(
+                            "state input {logical_input_index} and output {logical_output_index} must be static",
+                        ),
+                    });
+                }
+                if input_type.data_type().is_zero() || output_type.data_type().is_zero() {
+                    return Err(LoweringError::InvalidReferenceStateAbi {
+                        message: format!(
+                            "state input {logical_input_index} and output {logical_output_index} must occupy device \
+                             memory",
+                        ),
+                    });
+                }
+                if input_type != output_type {
+                    return Err(LoweringError::InvalidReferenceStateAbi {
+                        message: format!(
+                            "state input {logical_input_index} type `{input_type}` is incompatible with output \
+                             {logical_output_index} type `{output_type}`",
+                        ),
+                    });
+                }
+                if let (Some(argument_shardings), Some(result_shardings)) = (arg_shardings, result_shardings)
+                    && argument_shardings[logical_input_index] != result_shardings[logical_output_index]
+                {
+                    return Err(LoweringError::InvalidReferenceStateAbi {
+                        message: format!(
+                            "state input {logical_input_index} and output {logical_output_index} must use the same \
+                             sharding",
+                        ),
+                    });
+                }
+                if aliases.insert(physical_input_index, physical_output_index).is_some()
+                    || !aliased_outputs.insert(physical_output_index)
+                {
+                    return Err(LoweringError::InvalidReferenceStateAbi {
+                        message: "reference-state aliases must be injective".to_string(),
+                    });
+                }
+            }
+        }
+    }
     let physical_argument_types = signature.physical_input_types(logical_argument_types.as_slice());
     let physical_output_types = signature.physical_output_types(global_output_types.as_slice());
 
@@ -4360,13 +4492,6 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let arg_sharding_attributes = match arg_shardings {
         Some(shardings) => {
-            if shardings.len() != logical_argument_types.len() {
-                return Err(LoweringError::InvalidShardingCount {
-                    kind: "argument",
-                    expected: logical_argument_types.len(),
-                    actual: shardings.len(),
-                });
-            }
             let physical_shardings = signature.physical_input_shardings(shardings);
             Some(
                 physical_shardings
@@ -4379,13 +4504,6 @@ where
     };
     let result_sharding_attributes = match result_shardings {
         Some(shardings) => {
-            if shardings.len() != global_output_types.len() {
-                return Err(LoweringError::InvalidShardingCount {
-                    kind: "result",
-                    expected: global_output_types.len(),
-                    actual: shardings.len(),
-                });
-            }
             let physical_shardings = signature.physical_output_shardings(shardings);
             Some(
                 physical_shardings
@@ -4400,9 +4518,17 @@ where
         .iter()
         .enumerate()
         .map(|(index, tensor_type)| {
-            let attributes = arg_sharding_attributes
-                .as_ref()
-                .map(|shardings| HashMap::from([("sdy.sharding".into(), shardings[index].as_ref())]));
+            let mut attributes = HashMap::new();
+            if let Some(shardings) = &arg_sharding_attributes {
+                attributes.insert("sdy.sharding".into(), shardings[index].as_ref());
+            }
+            if let Some(output_index) = aliases.get(&index) {
+                attributes.insert(
+                    "tf.aliasing_output".into(),
+                    context.integer_attribute(context.signless_integer_type(64), *output_index as i64).as_ref(),
+                );
+            }
+            let attributes = (!attributes.is_empty()).then_some(attributes);
             TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
         })
         .collect::<Vec<_>>();
@@ -9004,6 +9130,102 @@ mod tests {
             ),
             Err(LoweringError::UnresolvedReference { construct })
                 if construct == "program with unresolved references",
+        ));
+    }
+
+    #[test]
+    fn test_reference_state_aliases_use_physical_indices_and_preserve_shardings() {
+        use ryft_core::ReferenceSource;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
+        let state_type = ArrayType::scalar(DataType::F32);
+        let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+        let _zero = builder.add_input(ArrayIrType::Array(zero_type.clone()));
+        let mutated = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let _read_only = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let program: FlatXlaProgram = builder.build(vec![mutated], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+        let input_types = vec![zero_type.clone(), state_type.clone(), state_type.clone()];
+        let output_types = vec![state_type.clone()];
+        let argument_shardings = vec![
+            Sharding::replicated(mesh.clone(), 1),
+            Sharding::replicated(mesh.clone(), 0),
+            Sharding::replicated(mesh.clone(), 0),
+        ];
+        let result_shardings = vec![Sharding::replicated(mesh.clone(), 0)];
+        let states = [
+            DischargedReferenceState::new(ReferenceSource::PublicInput { index: 1 }, 1, Some(0)),
+            DischargedReferenceState::new(ReferenceSource::PublicInput { index: 2 }, 2, None),
+        ];
+
+        let lowered = lower_mlir_module_for_program_with_reference_state(
+            &program,
+            &[],
+            &input_types,
+            &output_types,
+            "main",
+            Some(argument_shardings.as_slice()),
+            Some(result_shardings.as_slice()),
+            None,
+            &states,
+        )
+        .unwrap();
+        assert_eq!(lowered.signature.input_mapping(), &[None, Some(0), Some(1)]);
+        assert_eq!(lowered.signature.output_mapping(), &[Some(0)]);
+        let expected_signature = concat!(
+            "  func.func @main(",
+            "%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>, ",
+            "tf.aliasing_output = 0 : i64}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) -> ",
+            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) {",
+        );
+        assert_eq!(
+            lowered.stable_hlo,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                @SIGNATURE@
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                    return %arg0 : tensor<f32>
+                  }
+                }
+            "#}
+            .replace("@SIGNATURE@", expected_signature),
+        );
+
+        let invalid_state = DischargedReferenceState::new(ReferenceSource::PublicInput { index: 0 }, 0, None);
+        assert!(matches!(
+            lower_mlir_module_for_program_with_reference_state(
+                &program,
+                &[],
+                &input_types,
+                &output_types,
+                "main",
+                Some(argument_shardings.as_slice()),
+                Some(result_shardings.as_slice()),
+                None,
+                std::slice::from_ref(&invalid_state),
+            ),
+            Err(LoweringError::InvalidReferenceStateAbi { message })
+                if message == "logical state input 0 is erased from the executable boundary",
+        ));
+
+        let mismatched_result_shardings = vec![Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap()];
+        assert!(matches!(
+            lower_mlir_module_for_program_with_reference_state(
+                &program,
+                &[],
+                &input_types,
+                &output_types,
+                "main",
+                Some(argument_shardings.as_slice()),
+                Some(mismatched_result_shardings.as_slice()),
+                None,
+                &states,
+            ),
+            Err(LoweringError::InvalidReferenceStateAbi { message })
+                if message == "state input 1 and output 0 must use the same sharding",
         ));
     }
 
