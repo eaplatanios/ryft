@@ -12,7 +12,7 @@ use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef};
+use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
@@ -132,18 +132,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             )));
         }
 
-        // Walk the attached-region graph from the entry. Shared descendants may be encountered through several
-        // instructions, so `reachable` both records the final closure and prevents traversing the same region twice.
-        let mut reachable = vec![false; regions.len()];
-        let mut pending = vec![entry];
-        while let Some(current) = pending.pop() {
-            if std::mem::replace(&mut reachable[current.index()], true) {
-                continue;
-            }
-            for instruction in regions[current.index()].instructions() {
-                pending.extend(instruction.regions().iter().copied());
-            }
-        }
+        // Walk the attached region graph from the entry region. The mask both records the final closure and prevents
+        // traversing one shared descendant twice.
+        let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
 
         // Reject sealed but orphaned regions. Requiring the arena to equal the entry's complete reachable closure
         // prevents dead nested programs from being retained or unexpectedly copied by whole-program transforms and
@@ -1945,16 +1936,7 @@ fn compact_regions<V: Typed + Parameter, O>(
     regions: Vec<Region<V, O>>,
     entry: RegionId,
 ) -> (Vec<Region<V, O>>, RegionId) {
-    let mut reachable = vec![false; regions.len()];
-    let mut pending = vec![entry];
-    while let Some(current) = pending.pop() {
-        if std::mem::replace(&mut reachable[current.index()], true) {
-            continue;
-        }
-        for instruction in &regions[current.index()].instructions {
-            pending.extend(instruction.regions().iter().copied());
-        }
-    }
+    let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
     let mut remapping = vec![None; regions.len()];
     let mut kept = 0usize;
     for (index, is_reachable) in reachable.iter().copied().enumerate() {
@@ -3365,12 +3347,13 @@ mod tests {
     #[test]
     fn test_program_instruction_effects_include_attached_regions() {
         // An instruction whose operation is pure but whose attached region contains an effectful instruction reports
-        // impure effects, while a sibling pure instruction stays pure.
+        // impure effects, while a sibling pure instruction stays pure. Using ordered state here also pins the effect
+        // class that pre-discharge simplification and rematerialization rely on.
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![region_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![region_input])
             .unwrap()[0];
         let region_program = region_builder
             .build::<Vec<Array>, Vec<Array>>(vec![region_output], vec![Placeholder], vec![Placeholder])
@@ -3391,36 +3374,9 @@ mod tests {
         let entry = program.entry();
         assert_eq!(
             program.instruction_effects(InstructionId::new(entry, 0)).unwrap(),
-            Effects::single(Effect::OrderedIo),
-        );
-        assert_eq!(program.instruction_effects(InstructionId::new(entry, 1)).unwrap(), Effects::PURE);
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedIo));
-
-        // Ordered state in an executable region participates in the same seal-time summary. This explicit state case
-        // pins the effect class that pre-discharge simplification and rematerialization rely on.
-        let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let body_output = body_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![body_input])
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let body_region = builder.import_region(body.entry_region_ref());
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(
-                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
-                vec![body_region],
-                vec![input],
-            )
-            .unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(),
             Effects::single(Effect::OrderedState),
         );
+        assert_eq!(program.instruction_effects(InstructionId::new(entry, 1)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
 
         // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
