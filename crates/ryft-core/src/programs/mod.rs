@@ -183,6 +183,13 @@ pub enum ProgramError {
     #[error("encountered program builder that escaped its scope")]
     EscapedProgramBuilder,
 
+    #[error(
+        "trace registered {count} runtime capture(s) through a trace entry point that discards its capture table; \
+         capture-owning traces must construct their `TracingContext` directly and pair the traced program with that \
+         context's capture table"
+    )]
+    DiscardedCaptures { count: usize },
+
     #[error("encountered poisoned value where a live value was required")]
     PoisonedValue,
 

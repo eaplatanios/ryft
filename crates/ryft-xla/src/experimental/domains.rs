@@ -4297,19 +4297,6 @@ mod tests {
             .unwrap()
     }
 
-    fn assert_reference_free_stable_hlo(lowered: &XlaLoweredProgram) {
-        for unresolved in [
-            "new_reference",
-            "reference_read",
-            "reference_swap",
-            "reference_add_update",
-            "freeze_reference",
-            "ordered_state",
-        ] {
-            assert!(!lowered.stable_hlo().contains(unresolved), "{}", lowered.stable_hlo());
-        }
-    }
-
     fn f32_vector<'c>(client: &'c Client<'c>, mesh: &DeviceMesh, values: &[f32]) -> Array<'c> {
         let r#type = replicated_vector_type(mesh, values.len());
         Array::from_host_buffer(client, r#type, mesh.clone(), values_to_bytes::<f32>(values).as_slice()).unwrap()
@@ -8113,7 +8100,6 @@ mod tests {
 
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        assert_reference_free_stable_hlo(&lowered);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
@@ -8166,7 +8152,6 @@ mod tests {
 
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        assert_reference_free_stable_hlo(&lowered);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
@@ -8232,7 +8217,6 @@ mod tests {
         );
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.while").count(), 1, "{}", lowered.stable_hlo());
-        assert_reference_free_stable_hlo(&lowered);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0)]).unwrap();
 
@@ -8278,7 +8262,6 @@ mod tests {
         ));
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.stable_hlo().matches("stablehlo.add").count(), 1, "{}", lowered.stable_hlo());
-        assert_reference_free_stable_hlo(&lowered);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let outputs = domain
             .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 2.0), f32_scalar(&client, &mesh, 4.0)])

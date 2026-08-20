@@ -724,22 +724,32 @@ impl OperationEnum {
         })
     }
 
+    /// Generates one forwarding match arm per variant, dispatching the [`Operation`] method named by `method` to
+    /// the variant payload with the provided trailing argument tokens (a possibly empty `, argument, ...` list).
+    fn operation_forwarding_arms(&self, method: TokenStream, arguments: TokenStream) -> Vec<TokenStream> {
+        let ryft = &self.ryft_crate;
+        self.variants
+            .iter()
+            .map(|variant| {
+                let variant_ident = &variant.ident;
+                let payload_type = &variant.payload_type;
+                let receiver = variant.receiver();
+                quote! {
+                    Self::#variant_ident(operation) => {
+                        <#payload_type as #ryft::Operation>::#method(#receiver #arguments)
+                    },
+                }
+            })
+            .collect()
+    }
+
     /// Generates the base [`Operation`] dispatcher.
     fn generate_operation_dispatcher(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
         let operation_self_type = &self.self_type;
         let (impl_generics, _, where_clause) = self.operation_generics.split_for_impl();
-        let name_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::name(#receiver)
-                },
-            }
-        });
+        let name_arms = self.operation_forwarding_arms(quote!(name), quote!());
         let infer_output_type_arms = self.variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let payload_type = &variant.payload_type;
@@ -844,83 +854,23 @@ impl OperationEnum {
                 },
             }
         });
-        let region_slot_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::region_slots(#receiver)
-                },
-            }
-        });
-        let input_region_provenance_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::input_region_provenance(
-                        #receiver,
-                        region_index,
-                        input_index,
-                    )
-                },
-            }
-        });
-        let output_region_provenance_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::output_region_provenance(
-                        #receiver,
-                        output_index,
-                    )
-                },
-            }
-        });
-        let is_zero_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::is_zero(#receiver, output_index)
-                },
-            }
-        });
-        let reference_semantics_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::reference_semantics(#receiver)
-                },
-            }
-        });
-        let effects_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::effects(#receiver)
-                },
-            }
-        });
-        let render_arms = self.variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let payload_type = &variant.payload_type;
-            let receiver = variant.receiver();
-            quote! {
-                Self::#variant_ident(operation) => {
-                    <#payload_type as #ryft::Operation>::render(#receiver, formatter, indentation)
-                },
-            }
-        });
+        let region_slot_arms = self.operation_forwarding_arms(quote!(region_slots), quote!());
+        let input_region_provenance_arms =
+            self.operation_forwarding_arms(quote!(input_region_provenance), quote!(, region_index, input_index));
+        let output_region_provenance_arms =
+            self.operation_forwarding_arms(quote!(output_region_provenance), quote!(, output_index));
+        let is_zero_arms = self.operation_forwarding_arms(quote!(is_zero), quote!(, output_index));
+        let region_capture_input_count_arms =
+            self.operation_forwarding_arms(quote!(region_capture_input_count), quote!(, region_index));
+        let reference_output_identity_input_arms =
+            self.operation_forwarding_arms(quote!(reference_output_identity_input), quote!(, output_index));
+        let allows_reference_access_through_region_input_arms = self.operation_forwarding_arms(
+            quote!(allows_reference_access_through_region_input),
+            quote!(, region_index, mode),
+        );
+        let reference_semantics_arms = self.operation_forwarding_arms(quote!(reference_semantics), quote!());
+        let effects_arms = self.operation_forwarding_arms(quote!(effects), quote!());
+        let render_arms = self.operation_forwarding_arms(quote!(render), quote!(, formatter, indentation));
 
         quote! {
             #[automatically_derived]
@@ -973,6 +923,22 @@ impl OperationEnum {
 
                 fn is_zero(&self, output_index: usize) -> bool {
                     match self { #(#is_zero_arms)* }
+                }
+
+                fn region_capture_input_count(&self, region_index: usize) -> ::std::option::Option<usize> {
+                    match self { #(#region_capture_input_count_arms)* }
+                }
+
+                fn reference_output_identity_input(&self, output_index: usize) -> ::std::option::Option<usize> {
+                    match self { #(#reference_output_identity_input_arms)* }
+                }
+
+                fn allows_reference_access_through_region_input(
+                    &self,
+                    region_index: usize,
+                    mode: #ryft::ReferenceAccessMode,
+                ) -> bool {
+                    match self { #(#allows_reference_access_through_region_input_arms)* }
                 }
 
                 fn reference_semantics(&self) -> std::borrow::Cow<'_, #ryft::ReferenceOperationSemantics> {

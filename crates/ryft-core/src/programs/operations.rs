@@ -568,7 +568,7 @@ pub trait Operation: Clone {
     /// ```
     ///
     /// The body may update the values stored in `A` and `B`. It must only preserve which root occupies each carry.
-    /// Consequently, output `0` declares input `0`, and output `1` declares input `1`.
+    /// Consequently, this function returns `Some(0)` for output `0` and `Some(1)` for output `1`.
     ///
     /// A body that instead exchanges the roots is invalid:
     ///
@@ -591,19 +591,58 @@ pub trait Operation: Clone {
         None
     }
 
-    /// Returns whether an access with `mode` may target a reference root supplied through an input of the
-    /// `region_index`-th attached [`Region`](crate::Region).
+    /// Returns whether the `region_index`-th attached [`Region`](crate::Region) may perform an access with the provided
+    /// [`ReferenceAccessMode`] through one of its reference inputs. Here, "through" means that the accessed reference
+    /// root entered the region from the parent instruction rather than being allocated locally inside the region. The
+    /// default permits every access mode.
     ///
-    /// Override this only when an attached region has an asymmetric state contract. For example, a `while` condition
-    /// may read entering reference state but may not mutate, accumulate into, or consume it because the final false
-    /// invocation has no state output through which such a change could be published. The loop body uses the permissive
-    /// default.
+    /// Override this function only when an attached region has an asymmetric state contract. A `while` operation is
+    /// the canonical example. Its condition region may observe an entering reference `A`, and its body may update and
+    /// return `A`:
     ///
-    /// This policy applies only to roots entering through the region boundary. It does not restrict references
-    /// allocated and consumed entirely inside one region invocation, and it does not describe how values enter the
-    /// region. Instead, use [`Self::input_region_provenance`] for that.
+    /// ```text
+    /// while state: A
+    ///
+    /// condition(A):
+    ///     value = read(A)
+    ///     return predicate(value)
+    ///
+    /// body(A):
+    ///     add_update(A, 1)
+    ///     return A
+    /// ```
+    ///
+    /// The condition therefore permits [`ReferenceAccessMode::Read`] through its input. It rejects
+    /// [`ReferenceAccessMode::Write`], [`ReferenceAccessMode::Accumulate`], and [`ReferenceAccessMode::Consume`].
+    /// A `while` implementation consequently reports:
+    ///
+    /// ```text
+    /// condition + read:  true
+    /// condition + write: false
+    /// body + write:      true
+    /// ```
+    ///
+    /// A mutating condition would be invalid:
+    ///
+    /// ```text
+    /// condition(A):
+    ///     swap(A, replacement)
+    ///     return false
+    /// ```
+    ///
+    /// When that condition returns `false`, the loop exits without invoking the body. Because the condition returns
+    /// only the predicate, it has no state output through which the updated `A` could be published. The body does
+    /// return its state carries, so it retains the permissive default.
+    ///
+    /// The policy does not restrict references allocated and consumed entirely within the region. For example, a
+    /// condition may allocate, update, read, and freeze a temporary reference because that root never enters through
+    /// a region input. The policy applies transitively to accesses in the region's nested computations.
+    ///
+    /// This function does not describe how values enter the region; use [`Self::input_region_provenance`] for that.
+    /// It also does not describe reference accesses performed intrinsically by this operation. Instead, use
+    /// [`Self::reference_semantics`] for those.
     #[inline]
-    fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
         let _ = (region_index, mode);
         true
     }
@@ -622,7 +661,7 @@ pub trait Operation: Clone {
     /// This descriptor covers reference behavior intrinsic to the operation itself. Operations whose attached regions
     /// establish capture namespaces, require outputs to preserve entering reference identities, or restrict accesses
     /// to entering roots must additionally implement [`Self::region_capture_input_count`],
-    /// [`Self::reference_output_identity_input`], or [`Self::allows_reference_access_to_region_input`],
+    /// [`Self::reference_output_identity_input`], or [`Self::allows_reference_access_through_region_input`],
     /// respectively.
     #[inline]
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
@@ -750,8 +789,8 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
-        self.as_ref().allows_reference_access_to_region_input(region_index, mode)
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        self.as_ref().allows_reference_access_through_region_input(region_index, mode)
     }
 
     #[inline]
@@ -1068,7 +1107,7 @@ mod tests {
             (output_index == 3).then_some(1)
         }
 
-        fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
             region_index == 0 && mode == ReferenceAccessMode::Read
         }
 
@@ -1183,7 +1222,7 @@ mod tests {
         assert_eq!(operation.output_region_provenance(0), Vec::new());
         assert_eq!(operation.region_capture_input_count(0), None);
         assert_eq!(operation.reference_output_identity_input(0), None);
-        assert!(operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Write));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(!operation.is_zero(0));
         assert_eq!(operation.effects(), Effects::PURE);
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
@@ -1218,15 +1257,15 @@ mod tests {
             operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
         );
+        assert!(!operation.is_zero(1));
+        assert!(operation.is_zero(2));
         assert_eq!(operation.region_capture_input_count(0), Some(2));
         assert_eq!(operation.region_capture_input_count(1), None);
         assert_eq!(operation.reference_output_identity_input(3), Some(1));
         assert_eq!(operation.reference_output_identity_input(2), None);
-        assert!(operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Read));
-        assert!(!operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Write));
-        assert!(!operation.allows_reference_access_to_region_input(1, ReferenceAccessMode::Read));
-        assert!(!operation.is_zero(1));
-        assert!(operation.is_zero(2));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
         let semantics = operation.reference_semantics();
         assert_eq!(semantics.outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }]);
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));

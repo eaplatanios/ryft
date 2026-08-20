@@ -288,6 +288,21 @@ trait Operation: Clone {
         Vec::new()
     }
 
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        let _ = region_index;
+        None
+    }
+
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        let _ = output_index;
+        None
+    }
+
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        let _ = (region_index, mode);
+        true
+    }
+
     fn is_zero(&self, output_index: usize) -> bool {
         let _ = output_index;
         false
@@ -312,6 +327,13 @@ trait Operation: Clone {
         let _ = indentation;
         formatter.write_str(self.name())
     }
+}
+
+/// Stand-in for `ryft_core::ReferenceAccessMode`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ReferenceAccessMode {
+    Read,
+    Write,
 }
 
 /// Stand-in for `ryft_core::OperationProjection`.
@@ -1002,6 +1024,18 @@ impl Operation for PrintOperation {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(2)
+    }
+
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        (output_index == 3).then_some(1)
+    }
+
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        region_index == 0 && mode == ReferenceAccessMode::Read
+    }
+
     fn is_zero(&self, output_index: usize) -> bool {
         output_index == 3
     }
@@ -1376,6 +1410,15 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(print.rename_type_identities(&TypeIdentityRenaming::new()), Ok(print.clone()));
     assert_eq!(print.infer_region_input_types(&[DataType], &[]), Ok(vec![Some(vec![DataType])]));
     assert_eq!(print.output_region_provenance(3), vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],);
+    assert_eq!(add.region_capture_input_count(0), None);
+    assert_eq!(print.region_capture_input_count(0), Some(2));
+    assert_eq!(print.region_capture_input_count(1), None);
+    assert_eq!(add.reference_output_identity_input(3), None);
+    assert_eq!(print.reference_output_identity_input(3), Some(1));
+    assert!(add.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+    assert!(print.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
+    assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+    assert!(!print.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
     assert_eq!(add.input_region_provenance(0, 0), None);
     assert_eq!(print.input_region_provenance(0, 2), Some(2));
     assert_eq!(print.input_region_provenance(1, 2), None);

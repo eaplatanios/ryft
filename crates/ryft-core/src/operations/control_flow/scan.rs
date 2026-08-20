@@ -822,6 +822,8 @@ where
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        // Only the leading carries forward parent operands positionally; the trailing body inputs receive sliced
+        // views of the stacked operands, which are transformed rather than forwarded.
         (region_index == 0 && input_index < self.carry_count).then_some(input_index)
     }
 
@@ -830,7 +832,9 @@ where
     }
 
     #[inline]
-    fn reference_output_root_input(&self, output_index: usize) -> Option<usize> {
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        // Only the leading carries preserve their input roots positionally; stacked per-step outputs are fresh
+        // values with no identity constraint.
         (output_index < self.carry_count).then_some(output_index)
     }
 
@@ -3177,8 +3181,8 @@ mod tests {
             operation.output_region_provenance(1),
             vec![OutputRegionProvenance { region_index: 0, output_index: 1 }],
         );
-        assert_eq!(operation.reference_output_root_input(0), Some(0));
-        assert_eq!(operation.reference_output_root_input(1), None);
+        assert_eq!(operation.reference_output_identity_input(0), Some(0));
+        assert_eq!(operation.reference_output_identity_input(1), None);
         assert_eq!(operation.carry_count(), 1);
         assert_eq!(operation.length(), &Dimension::Static(3));
         assert!(!operation.reverse());

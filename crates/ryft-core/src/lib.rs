@@ -27,15 +27,16 @@ pub use arrays::{
     ArrayIrTypeRefinements, ArrayIrValue, ArrayOperation, ArrayOperations, ArraySliceAxis, ArrayTracingContext,
     ArrayType, ArrayTypeRefinements, Broadcastable, BroadcastingError, Complex, DataType, DataTypeError, Device,
     DeviceId, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionOperation, DimensionOperations,
-    DimensionSource, DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable, ExactShape,
-    ExactShapeDimension, ExternalReferenceRoot, Layout, LayoutError, LinearResiduals, LogicalMesh,
-    MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, RaggedArrayBatchingPolicy, RaggedAxis,
-    ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding, ReferenceRoot,
-    ReferenceSource, ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError,
-    ShardingVisualization, StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout,
-    bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn,
-    f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4,
-    materialize_array_tangent, u1, u2, u4, validate_storage_bytes,
+    DimensionSource, DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable,
+    DischargedReferenceProgram, DischargedReferenceState, ExactShape, ExactShapeDimension, ExternalReferenceRoot,
+    Layout, LayoutError, LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType,
+    ProcessIndex, RaggedArrayBatchingPolicy, RaggedAxis, ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError,
+    ReferenceDischargeOperation, ReferenceDischargeRule, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess,
+    ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization,
+    StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements,
+    decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
+    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1,
+    u2, u4, validate_storage_bytes,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -184,18 +185,22 @@ pub(crate) mod tests {
     use std::fmt::Debug;
     use std::sync::{Arc, Weak};
 
-    use crate::arrays::ArrayType;
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver, RecursiveBatchingPolicy,
     };
     use crate::contexts::Context;
     use crate::macros::check_count;
-    use crate::parameters::Parameter;
+    use crate::operations::{
+        ConditionOperation, FreezeReferenceOperation, NewReferenceOperation, ReferenceAddUpdateOperation,
+        ReferenceReadOperation, ReferenceSwapOperation,
+    };
+    use crate::parameters::{Parameter, Placeholder};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        Effect, Effects, Operation, Program, Region, RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform,
-        TransformArtifact, TypeError, Typed, Value,
+        Effect, Effects, Operation, Program, ProgramBuilder, ReferenceType, Region, RegionDriver, RegionInterface,
+        RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
 
@@ -468,5 +473,57 @@ pub(crate) mod tests {
             assert_eq!(programs.len(), 1);
             programs.pop().unwrap()
         }
+    }
+
+    /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary.
+    /// shared by the transform adapters that must discharge local references before transforming. The program takes
+    /// a Boolean predicate and an `f32[]` initial value, allocates one local reference from that initial value, and
+    /// passes the reference into a condition whose branches access it with unequal modes. The `true` branch accumulates
+    /// `1.0` and reads the reference, while the `false` branch swaps in `9.0` and yields the replaced value. Its two
+    /// outputs are the condition's snapshot followed by the frozen final state, so a discharged program must thread
+    /// identical state through both branches and keep both public outputs interpretable. On `[true, 4.0]` the outputs
+    /// are `[5.0, 5.0]`, and on `[false, 4.0]` they are `[4.0, 9.0]`.
+    pub(crate) fn test_condition_program()
+    -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        true_builder
+            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .unwrap();
+        let snapshot = true_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = false_builder.add_input(reference_type.into());
+        let replacement = false_builder.add_constant(TestValue::Array(Array::scalar(9.0_f32)));
+        let snapshot = false_builder
+            .add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement])
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![predicate, reference])
+            .unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap()
     }
 }

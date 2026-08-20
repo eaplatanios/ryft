@@ -1992,18 +1992,17 @@ where
     where
         D: Context<Type = ArrayIrType, Constant = V, Operation = O>,
     {
-        let (program, _, external_states) = self.discharge_references(capture_count)?.into_parts();
-        if let Some(state) = external_states.first() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "rematerialization supports only local references, but the program uses external `{}`",
-                    state.source(),
-                ),
-            });
-        }
+        let program = self.discharge_local_references(capture_count, "rematerialization")?;
         Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
-            let context =
-                inputs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context().clone();
+            // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always
+            // recoverable; the error names the actual cause for direct callers of the body closure.
+            let context = inputs
+                .first()
+                .ok_or_else(|| ProgramError::UnsupportedOperation {
+                    message: "rematerialization cannot recover an execution context without inputs".to_string(),
+                })?
+                .context()
+                .clone();
             program.interpret_in_context(&context, inputs)
         }))
     }

@@ -390,11 +390,12 @@ impl<
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
-                let driver = if requires_validation {
-                    ReplayRegionDriver::new_validated(source, instruction.regions(), &region_mappings)?
-                } else {
-                    ReplayRegionDriver::new(source, instruction.regions(), &region_mappings)?
-                };
+                let driver = ReplayRegionDriver::with_validation(
+                    source,
+                    instruction.regions(),
+                    &region_mappings,
+                    requires_validation,
+                )?;
                 context.bind(instruction.operation().clone(), driver, inputs)
             },
         )?;
@@ -562,11 +563,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             inputs,
             |_, constant| context.lift(constant.clone()),
             |instruction, inputs| {
-                let driver = if validated {
-                    ReplayRegionDriver::new_validated(self, instruction.regions(), &region_mappings)?
-                } else {
-                    ReplayRegionDriver::new(self, instruction.regions(), &region_mappings)?
-                };
+                let driver =
+                    ReplayRegionDriver::with_validation(self, instruction.regions(), &region_mappings, validated)?;
                 context.bind(instruction.operation().clone(), driver, inputs)
             },
         )?;

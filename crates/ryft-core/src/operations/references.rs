@@ -1513,7 +1513,9 @@ mod tests {
     fn test_operation_local_custom_derivative_guards_reject_state_in_nested_dormant_rules() {
         type TestContext = EagerContext<TestValue, TestOperation>;
 
+        /// Test-only differentiation driver serving the custom-derivative rule regions directly.
         struct TestDifferentiationDriver {
+            /// Attached rule-region programs in operation-defined order.
             programs: Vec<TestProgram>,
         }
 

@@ -402,8 +402,8 @@ const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
 /// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
 pub trait CompiledCallOperation<Constant: Value>: Operation<Type = Constant::Type> + Sized {
     /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee through a shared-callee
-    /// region driver.
-    fn compiled_call() -> Self;
+    /// region driver, while `capture_count` records the exact leading lifted-capture prefix of that callee boundary.
+    fn compiled_call(capture_count: usize) -> Self;
 }
 
 /// Staged, unlowered form of one compiled function.
@@ -554,13 +554,14 @@ where
             .cloned()
             .map(|capture| context.capture(capture))
             .collect::<Result<Vec<_>, _>>()?;
+        let capture_count = capture_references.len();
         let mut flat_inputs = capture_references
             .into_iter()
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
         let outputs = context.bind(
-            D::Operation::compiled_call(),
+            D::Operation::compiled_call(capture_count),
             CalleeRegionDriver::new(&[self.lifted_program()?]),
             flat_inputs.as_slice(),
         )?;
@@ -624,7 +625,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
         context.bind(
-            D::Operation::compiled_call(),
+            D::Operation::compiled_call(captures.len()),
             CalleeRegionDriver::new(&[self.lifted_program()?]),
             flat_inputs.as_slice(),
         )

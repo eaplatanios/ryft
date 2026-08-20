@@ -505,6 +505,9 @@ where
     ProgramInput: Parameterized<XlaConstant>,
     ProgramOutput: Parameterized<XlaConstant>,
 {
+    // The atom scan dominates for every well-formed program (reference operations always touch a reference-typed
+    // atom); the semantics scan is the independent-verifier arm that still catches a core discharge bug which
+    // retyped the boundary atoms but left a reference operation behind.
     program.entry_region_ref().contains_atom_type_in_closure(RyftType::is_reference)
         || program.regions().iter().any(|region| {
             region
@@ -4480,7 +4483,12 @@ where
             // Ordinary module callers lower an unlifted program whose entry inputs are only the public arguments.
             // The compilation domain instead supplies the capture-lifted program so core reference discharge and
             // lowering observe the same arena; in that form the complete logical argument list is also the entry
-            // input list, while the leading prefix still serves attached `CaptureReference` constants.
+            // input list, while the leading prefix still serves attached `CaptureReference` constants. No third
+            // boundary form exists, so the entry input count must match one of those two shapes exactly.
+            debug_assert!(
+                program.input_count() == logical_argument_values.len()
+                    || program.input_count() == public_input_values.len(),
+            );
             let input_values = if program.input_count() == logical_argument_values.len() {
                 logical_argument_values.as_slice()
             } else {
@@ -6660,10 +6668,8 @@ where
         let mut body_block_ref = body_block.as_ref();
         // Shard-map bodies lower with shard-local types, so their `jit_call`s always inline; do not thread the
         // module's deduplicated functions (which are typed against global shapes) into them. The body is traced
-        // through a fresh-root context and is therefore capture-free by construction (the trace boundary rejects
-        // bodies that register captures), so it lowers with an empty capture namespace: any capture-referencing
-        // constant that still sneaks in fails loudly with `MissingCapturedConstant` instead of silently aliasing
-        // the enclosing function's captures.
+        // through a fresh-root context and lowers with an empty capture namespace; refer to the `CustomJvp` arm of
+        // `lower_operation` for the rationale.
         let body_collective_state = collective_state.enter_manual_region(shard_map.clone());
         let body_outputs = lower_program_outputs(
             program,
@@ -9761,7 +9767,7 @@ mod tests {
     #[test]
     fn test_rematerialize_lowering_inlines_primal_effects_on_the_enclosing_token_chain() {
         use ryft_core::PrintOperation;
-        use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
+        use ryft_core::RematerializeOperation;
 
         // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its primal region,
         // so prints immediately before, inside, and after the call must form one ordered-I/O token chain.
@@ -9809,7 +9815,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_rejects_capture_constants_in_its_regions() {
-        use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
+        use ryft_core::RematerializeOperation;
 
         // Rematerialized regions are traced through fresh-root contexts and can therefore never legally reference
         // the enclosing function's captures. A capture constant smuggled into such a region must fail loudly

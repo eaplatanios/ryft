@@ -366,14 +366,14 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
     }
 
     #[inline]
-    fn reference_output_root_input(&self, output_index: usize) -> Option<usize> {
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
         // Every `while` output is a loop carry aligned with the same-position input, so the root constraint maps
         // positionally for any output the operation actually declares.
         Some(output_index)
     }
 
     #[inline]
-    fn allows_region_input_reference_access(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
         region_index != 0 || mode == ReferenceAccessMode::Read
     }
 
@@ -2654,12 +2654,12 @@ mod tests {
             operation.output_region_provenance(0),
             vec![OutputRegionProvenance { region_index: 1, output_index: 0 }],
         );
-        assert_eq!(operation.reference_output_root_input(0), Some(0));
-        assert!(operation.allows_region_input_reference_access(0, ReferenceAccessMode::Read));
-        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Write));
-        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Accumulate));
-        assert!(!operation.allows_region_input_reference_access(0, ReferenceAccessMode::Consume));
-        assert!(operation.allows_region_input_reference_access(1, ReferenceAccessMode::Write));
+        assert_eq!(operation.reference_output_identity_input(0), Some(0));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Accumulate));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Consume));
+        assert!(operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Write));
         assert_eq!(format!("{operation}"), "while");
 
         // Type inference validates the region interfaces and the input types, and returns the state types.

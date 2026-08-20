@@ -9,11 +9,9 @@ use crate::operations::{
 };
 use crate::programs::{Operation, ProgramError, Reference, ReferenceType, Typed, Value, ValueProjection};
 
-// TODO(eaplatanios): Review this module.
-
 impl<A: Value<Type = ArrayType>> NewReference for ArrayIrValue<A> {
     fn new_reference(&self) -> Result<Self, ProgramError> {
-        NewReferenceOperation.infer_output_types(std::slice::from_ref(&self.r#type().into_owned()), &[])?;
+        NewReferenceOperation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let value = <Self as ValueProjection<ArrayType>>::projected(self)?.clone();
         Ok(Self::Reference(Reference::new(value)))
     }
@@ -21,7 +19,7 @@ impl<A: Value<Type = ArrayType>> NewReference for ArrayIrValue<A> {
 
 impl<A: Value<Type = ArrayType>> ReferenceRead for ArrayIrValue<A> {
     fn read(&self) -> Result<Self, ProgramError> {
-        ReferenceReadOperation.infer_output_types(std::slice::from_ref(&self.r#type().into_owned()), &[])?;
+        ReferenceReadOperation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Array(reference.read().map_err(ProgramError::custom)?))
     }
@@ -49,7 +47,7 @@ impl<A: Value<Type = ArrayType> + Add> ReferenceAddUpdate for ArrayIrValue<A> {
 
 impl<A: Value<Type = ArrayType>> FreezeReference for ArrayIrValue<A> {
     fn freeze(&self) -> Result<Self, ProgramError> {
-        FreezeReferenceOperation.infer_output_types(std::slice::from_ref(&self.r#type().into_owned()), &[])?;
+        FreezeReferenceOperation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Array(reference.freeze().map_err(ProgramError::custom)?))
     }
@@ -72,41 +70,32 @@ mod tests {
         let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
         let reference = initial.new_reference().unwrap();
         assert!(matches!(reference, ArrayIrValue::Reference(_)));
-        assert_eq!(ReferenceRead::read(&reference).unwrap(), initial);
+        assert_eq!(reference.read().unwrap(), initial);
     }
 
     #[test]
     fn test_eager_reference_operations_reject_mismatched_member_kinds() {
         let array = ArrayIrValue::<Array>::Array(Array::scalar(1.0_f32));
-        assert_eq!(
-            ReferenceRead::read(&array),
-            Err(TypeError::invalid("expected reference type but got array type").into()),
-        );
+        assert_eq!(array.read(), Err(TypeError::invalid("expected reference type but got array type").into()));
         let reference = array.new_reference().unwrap();
         assert_eq!(
             reference.new_reference(),
             Err(TypeError::invalid("expected array type but got reference type").into()),
         );
+        assert_eq!(array.swap(&array), Err(TypeError::invalid("expected reference type but got array type").into()));
         assert_eq!(
-            ReferenceSwap::swap(&array, &array),
-            Err(TypeError::invalid("expected reference type but got array type").into()),
-        );
-        assert_eq!(
-            ReferenceSwap::swap(&reference, &reference),
+            reference.swap(&reference),
             Err(TypeError::invalid("expected array type but got reference type").into()),
         );
         assert_eq!(
-            ReferenceAddUpdate::add_update(&array, &array),
+            array.add_update(&array),
             Err(TypeError::invalid("expected reference type but got array type").into()),
         );
         assert_eq!(
-            ReferenceAddUpdate::add_update(&reference, &reference),
+            reference.add_update(&reference),
             Err(TypeError::invalid("expected array type but got reference type").into()),
         );
-        assert_eq!(
-            FreezeReference::freeze(&array),
-            Err(TypeError::invalid("expected reference type but got array type").into()),
-        );
+        assert_eq!(array.freeze(), Err(TypeError::invalid("expected reference type but got array type").into()));
     }
 
     #[test]
@@ -114,8 +103,7 @@ mod tests {
         let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
         let reference = initial.new_reference().unwrap();
 
-        let error =
-            ReferenceSwap::swap(&reference, &ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        let error = reference.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
         assert_eq!(
             error,
             TypeError::invalid(
@@ -123,10 +111,9 @@ mod tests {
             )
             .into(),
         );
-        assert_eq!(ReferenceRead::read(&reference), Ok(initial.clone()));
+        assert_eq!(reference.read(), Ok(initial.clone()));
 
-        let error = ReferenceAddUpdate::add_update(&reference, &ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0])))
-            .unwrap_err();
+        let error = reference.add_update(&ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]))).unwrap_err();
         assert_eq!(
             error,
             TypeError::invalid(
@@ -135,26 +122,26 @@ mod tests {
             )
             .into(),
         );
-        assert_eq!(ReferenceRead::read(&reference), Ok(initial));
+        assert_eq!(reference.read(), Ok(initial));
 
         // Broadcasting is valid only because the computed result preserves the exact stored type.
-        assert_eq!(ReferenceAddUpdate::add_update(&reference, &ArrayIrValue::Array(Array::scalar(1.0_f32))), Ok(()),);
-        assert_eq!(ReferenceRead::read(&reference), Ok(ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]))),);
+        assert_eq!(reference.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32))), Ok(()));
+        assert_eq!(reference.read(), Ok(ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0]))));
     }
 
     #[test]
     fn test_eager_reference_freeze_invalidates_composite_aliases() {
         let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).new_reference().unwrap();
         let alias = reference.clone();
-        assert_eq!(FreezeReference::freeze(&reference), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))),);
+        assert_eq!(reference.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))));
 
-        let error = ReferenceRead::read(&alias).unwrap_err();
+        let error = alias.read().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        let error = ReferenceSwap::swap(&alias, &ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))).unwrap_err();
+        let error = alias.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        let error = ReferenceAddUpdate::add_update(&alias, &ArrayIrValue::Array(Array::scalar(1.0_f32))).unwrap_err();
+        let error = alias.add_update(&ArrayIrValue::Array(Array::scalar(1.0_f32))).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        let error = FreezeReference::freeze(&alias).unwrap_err();
+        let error = alias.freeze().unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
@@ -176,21 +163,21 @@ mod tests {
         let dynamic_reference = ArrayIrValue::Reference(Reference::new(CaptureReference::new(0, dynamic_type.clone())));
         let replacement = ArrayIrValue::Array(CaptureReference::new(1, dynamic_type.clone()));
         assert_eq!(
-            ReferenceRead::read(&dynamic_reference),
+            dynamic_reference.read(),
             Err(TypeError::invalid(
                 "`reference_read` does not support dynamically shaped reference referent type `f32[length]`",
             )
             .into()),
         );
         assert_eq!(
-            ReferenceSwap::swap(&dynamic_reference, &replacement),
+            dynamic_reference.swap(&replacement),
             Err(TypeError::invalid(
                 "`reference_swap` does not support dynamically shaped reference referent type `f32[length]`",
             )
             .into()),
         );
         assert_eq!(
-            FreezeReference::freeze(&dynamic_reference),
+            dynamic_reference.freeze(),
             Err(TypeError::invalid(
                 "`freeze_reference` does not support dynamically shaped reference referent type `f32[length]`",
             )

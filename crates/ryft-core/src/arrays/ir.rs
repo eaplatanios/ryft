@@ -125,8 +125,8 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
     fn validate_eager_replay<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
         region: RegionRef<'_, V, O>,
     ) -> Result<(), ProgramError> {
-        // TODO(eaplatanios): Phase 4 capture lifting must thread the lifted-capture count here so that external-root
-        //  diagnostics name captures instead of public inputs.
+        // TODO(eaplatanios): Phase 9 external-holder runtime integration must thread the lifted-capture count here so
+        //  that eager-replay diagnostics name captures instead of public inputs.
         let analysis = region.analyze_references(0)?;
         if let Some(external) = analysis.external_roots().first() {
             return Err(ProgramError::UnsupportedOperation {

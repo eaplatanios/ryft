@@ -492,6 +492,131 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
+/// Operation-family rule selected by backend-neutral reference discharge.
+///
+/// The rule identifies only the operation shapes whose value graph or attached-region boundary changes during
+/// discharge. [`Ordinary`](Self::Ordinary) operations are replayed unchanged. The descriptor contains no root,
+/// runtime-holder, or physical-backend metadata; those belong to reference analysis and later backend adapters.
+/// Eliminated primitive rules must carry exactly [`Effect::OrderedState`](crate::programs::Effect::OrderedState),
+/// because discharge removes their operations. Retained rules may preserve other effects but must not carry
+/// `OrderedState` intrinsically; all state they thread must come from their attached regions.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReferenceDischargeRule {
+    /// Replay the operation unchanged after remapping its ordinary inputs and attached regions.
+    Ordinary,
+
+    /// Replace a local reference allocation with its initializer state. The operation must have one array input, one
+    /// reference output classified as a new root, and no attached regions.
+    NewReference,
+
+    /// Replace a reference read with the current immutable state. The operation must have one reference input with
+    /// read access, one array output, and no attached regions.
+    Read,
+
+    /// Return the current state and replace it with the operation's array operand. The operation must have a reference
+    /// input followed by an array replacement, one array output, and no attached regions.
+    Swap,
+
+    /// Replace the current state with its sum with the operation's update operand. The operation must have a reference
+    /// input followed by an array update, no outputs, and no attached regions.
+    AddUpdate,
+
+    /// Return and close a local root's current state. The operation must have one consumed reference input, one array
+    /// output, and no attached regions.
+    Freeze,
+
+    /// Thread the union of branch state through both condition regions. The operation must attach exactly two branch
+    /// regions after one leading predicate operand, have no intrinsic reference semantics, forward its remaining
+    /// operands positionally into both branches, and report positional output provenance from both branches.
+    Condition,
+
+    /// Add referenced state to the loop-carried values of a while operation. The operation must attach condition and
+    /// body regions in that order, have no intrinsic reference semantics, forward its operands positionally into both
+    /// regions, report positional output provenance from the body, and constrain each reference result to preserve
+    /// the corresponding input root.
+    While,
+
+    /// Add referenced state to the leading scan carries while preserving the source scan's public carries. The
+    /// operation must attach exactly one body region of matching input and output arity, have no intrinsic reference
+    /// semantics, forward its leading `carry_count` operands positionally into the body, report positional output
+    /// provenance from the body, and constrain each of its first `carry_count` reference results to preserve the
+    /// corresponding input root.
+    Scan {
+        /// Number of source-program scan carries before discharge adds hidden state carries.
+        carry_count: usize,
+    },
+
+    /// Rewrite an attached callee and consume its hidden final-state outputs at the call site. The operation must
+    /// attach exactly one callee region of matching input and output arity, have no intrinsic reference semantics,
+    /// forward its operands positionally into the callee, and report positional output provenance from it.
+    Call,
+}
+
+impl ReferenceDischargeRule {
+    /// Returns this rule's stable diagnostic name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ordinary => "ordinary",
+            Self::NewReference => "new_reference",
+            Self::Read => "read",
+            Self::Swap => "swap",
+            Self::AddUpdate => "add_update",
+            Self::Freeze => "freeze",
+            Self::Condition => "condition",
+            Self::While => "while",
+            Self::Scan { .. } => "scan",
+            Self::Call => "call",
+        }
+    }
+}
+
+// TODO(eaplatanios): Does this belong in `ryft_core::operations::references` instead?
+/// Operation-family capability used by backend-neutral reference discharge.
+///
+/// [`Operation::reference_semantics`] describes operation-local roots and accesses, while this trait selects the
+/// structural rewrite required to eliminate those semantics and widen higher-order state boundaries. Keeping this
+/// small contract on each closed operation family lets core Array IR and backend-owned supersets share one discharge
+/// algorithm without matching operation names or introducing backend concepts into core metadata.
+pub trait ReferenceDischargeOperation: Operation<Type = ArrayIrType> + Sized {
+    /// Returns the structural reference-discharge rule for this operation.
+    fn reference_discharge_rule(&self) -> ReferenceDischargeRule;
+
+    /// Returns this scan operation with `additional_carry_count` hidden reference-state carries added after its
+    /// existing carries, preserving its length, direction, unroll factor, and capture payloads.
+    ///
+    /// Calling this method for a non-scan operation is a malformed-transform error. The split between classification
+    /// and reconstruction keeps [`ReferenceDischargeRule`] lifetime-free and makes accidental reconstruction of an
+    /// ordinary operation fail explicitly.
+    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError>;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceDischargeOperation for ArrayIrOperation<A> {
+    fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
+        match self {
+            Self::NewReference(_) => ReferenceDischargeRule::NewReference,
+            Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
+            Self::ReferenceSwap(_) => ReferenceDischargeRule::Swap,
+            Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::AddUpdate,
+            Self::FreezeReference(_) => ReferenceDischargeRule::Freeze,
+            Self::Condition(_) => ReferenceDischargeRule::Condition,
+            Self::While(_) => ReferenceDischargeRule::While,
+            Self::Scan(operation) => ReferenceDischargeRule::Scan { carry_count: operation.carry_count() },
+            _ => ReferenceDischargeRule::Ordinary,
+        }
+    }
+
+    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
+        let Self::Scan(operation) = self else {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` is not a scan and cannot carry discharged reference state",
+                self.name(),
+            )));
+        };
+        Ok(Self::Scan(operation.with_added_carries(additional_carry_count)?))
+    }
+}
+
 /// Value-level capability bundle paired with the [`ArrayIrOperation`] family.
 ///
 /// [`ArrayIrOperations`] is to [`ArrayIrOperation`] what [`ArrayOperations`] is to [`ArrayOperation`]: a pure bundle
@@ -1326,6 +1451,88 @@ mod tests {
                     .with_memory(Memory::Host { pinned: true })
                     .into()
             ]),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_rules() {
+        // Each reference operation classifies into its own discharge rule, region carriers classify into the
+        // region-aware rules, a scan additionally reports its current carry count, and every other operation family
+        // falls back to `Ordinary`. This mapping is written arm by arm, so a mis-paired arm would still compile.
+        assert_eq!(
+            ArrayIrOperation::<Array>::NewReference(NewReferenceOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::NewReference,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::ReferenceRead(ReferenceReadOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Read,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::ReferenceSwap(ReferenceSwapOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Swap,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::ReferenceAddUpdate(ReferenceAddUpdateOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::AddUpdate,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::FreezeReference(FreezeReferenceOperation).reference_discharge_rule(),
+            ReferenceDischargeRule::Freeze,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::Condition(ConditionOperation::new()).reference_discharge_rule(),
+            ReferenceDischargeRule::Condition,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::While(WhileOperation::new()).reference_discharge_rule(),
+            ReferenceDischargeRule::While,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::Array(ArrayOperation::Add(AddOperation::new())).reference_discharge_rule(),
+            ReferenceDischargeRule::Ordinary,
+        );
+        assert_eq!(
+            ArrayIrOperation::<Array>::Scan(ScanOperation::new(2, 4)).reference_discharge_rule(),
+            ReferenceDischargeRule::Scan { carry_count: 2 },
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_carry_widening() {
+        // Widening a scan's carry list preserves every other payload field, non-scan operations are rejected instead
+        // of silently accepting discharged state, and an overflowing carry count is reported instead of wrapping.
+        let capture = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let scan = ArrayIrOperation::Scan(
+            ScanOperation::<TestValue>::new(2, 4)
+                .with_reverse(true)
+                .with_unroll(2)
+                .unwrap()
+                .with_captures(vec![capture.clone()]),
+        );
+        let widened = scan.with_added_reference_scan_carries(3).unwrap();
+        let ArrayIrOperation::Scan(widened) = widened else {
+            panic!("expected a widened scan operation");
+        };
+        assert_eq!(widened.carry_count(), 5);
+        assert_eq!(widened.length(), &Dimension::Static(4));
+        assert!(widened.reverse());
+        assert_eq!(widened.unroll(), 2);
+        assert_eq!(widened.captures(), &[capture]);
+
+        let add = ArrayIrOperation::<Array>::Array(ArrayOperation::Add(AddOperation::new()));
+        assert_eq!(
+            add.with_added_reference_scan_carries(1).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "operation `add` is not a scan and cannot carry discharged reference state".to_string(),
+            ),
+        );
+        let overflowing_scan = ArrayIrOperation::<Array>::Scan(ScanOperation::new(usize::MAX, 4));
+        assert_eq!(
+            overflowing_scan.with_added_reference_scan_carries(1).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "`scan` carry count {} overflows when adding 1 discharged reference state carries",
+                usize::MAX,
+            )),
         );
     }
 
@@ -2805,10 +3012,10 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
 
         // One instance of every variant, in declaration order, paired with its hand-maintained expected member-kind
-        // signature. Exactly two variants may turn a dimension value into array data (the explicit `dimension_to_scalar`
-        // gateway and the deliberately composite-level dimension comparison) and exactly one may turn array data into a
-        // dimension value (the checked `dimension_from_scalar` gateway). Everything else either stays inside one
-        // homogeneous member family, treats dimensions as geometry, or forwards regions.
+        // signature. Exactly two variants may turn a dimension value into array data (the explicit
+        // `dimension_to_scalar` gateway and the deliberately composite-level dimension comparison) and exactly one may
+        // turn array data into a dimension value (the checked `dimension_from_scalar` gateway). Everything else either
+        // stays inside one homogeneous member family, treats dimensions as geometry, or forwards regions.
         let expected: Vec<(ArrayIrOperation<Array>, MemberKindSignature)> = vec![
             (ArrayIrOperation::Zero(ZeroOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),
             (ArrayIrOperation::DynamicOne(OneOperation::new(dynamic_type.clone())), MemberKindSignature::GeometryMixed),

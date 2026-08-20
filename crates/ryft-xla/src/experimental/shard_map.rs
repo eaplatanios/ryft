@@ -2210,11 +2210,9 @@ mod tests {
     fn test_shard_map_rejects_captures_registered_in_its_body() {
         use ryft_core::{CaptureReference, CapturingContext};
 
-        // The shard-map body is traced through a fresh-root context whose capture table is local to that trace and
-        // discarded. A capture registered inside the body would therefore leave a `capture#0` constant in the body
-        // region that XLA lowering later resolves against whatever capture prefix surrounds the enclosing compiled
-        // function — silently aliasing an unrelated captured value — so the body trace is rejected at trace time
-        // instead.
+        // The shard-map body is traced through a fresh-root context whose capture table is discarded, so a
+        // capturing body is rejected at trace time; refer to `TracingContext::trace_with_named_axes` for the full
+        // silent-aliasing rationale.
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
         let mesh = test_logical_mesh_2x2();
         let captured_value = XlaConstant::Captured(CaptureReference::new(

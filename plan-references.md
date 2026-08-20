@@ -1,7 +1,7 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** Phases 0 through 3 implemented and verified; discharge, external runtime integration, and preserved kernel
-lowering remain planned
+**Status:** Phases 0 through 7 implemented and verified. Views, external runtime integration, and preserved kernel
+lowering remain planned.
 
 **Research snapshot:** 2026-08-14
 
@@ -469,9 +469,9 @@ The validator proves:
 - region captures and inputs do not create forbidden static aliases;
 - while conditions do not write, accumulate into, or consume roots that enter the condition evaluation, because the
   Boolean-only condition boundary cannot return their final state. A condition-local allocation that neither escapes
-  nor survives the evaluation is externally pure and may remain supported. Phase 2's second-class boundary rules make
-  entering condition references unrepresentable; recursive capture normalization and discharge enforce this policy
-  when Phase 5 makes those roots explicit;
+  nor survives the evaluation is externally pure and may remain supported. Phase 2's operation-owned access policy
+  validates explicit and captured entering roots, and capture-aware discharge makes their read-only state flow
+  explicit in Phase 5;
 - transform/backend-specific restrictions are satisfied before the corresponding pipeline starts.
 
 Diagnostics must name the operation, root source, scope, and violated rule. Generic “expected array” errors are
@@ -503,50 +503,47 @@ re-registers callee captures in the caller's table and attaches the callee's mem
 cache rather than invalidating it. One gap is real, however: `to_program_with_lifted_captures` rewrites
 capture-referencing constants only in the entry region, while `CaptureReference`s inside attached regions are
 preserved verbatim and resolved later against the hidden capture-argument prefix (`captures.rs:546-551`). The "no
-reference-typed `CaptureReference` survives lifting" invariant therefore does not hold automatically. Phase 4 closes
-it temporarily in the validator: reject any reference-typed `CaptureReference` occurring inside an attached region
-after lifting. Phase 5 then adds recursive attached-region capture lifting/substitution and removes that rejection —
-captured references used directly inside `condition`/`while`/`scan` bodies are a flagship use case (the JAX analogue
-is closed-over refs in loop bodies), not a non-goal. The pipeline order is canonical and fixed: recursive capture
-normalization first (entry lifting plus, from Phase 5, attached-region lifting), then `ReferenceAnalysis` and
-validation over the normalized program, then discharge of exactly that normalized program using exactly that analysis
-artifact — any structural rewrite after analysis would leave the artifact stale against renumbered atoms and region
-boundaries. The resulting ordinary
-program may contain array inputs/captures but no rewritten capture table containing mutable array contents, keeping
-`ClosedProgram`'s capture type/value invariant intact and giving core discharged interpretation and XLA compilation
-one boundary contract.
+reference-typed `CaptureReference` survives lifting" invariant therefore does not hold automatically. Phases 4 and 5
+are implemented together, so they skip temporary reject-then-remove churn. Capture-aware `ReferenceAnalysis`
+resolves an attached-region `CaptureReference` against its active lexical scope: ordinary structured regions inherit
+the enclosing scope, while nested calls establish a callee scope rooted at their leading lifted inputs. Per-invocation
+bindings then translate those formal roots into the caller namespace. Discharge consumes that exact artifact while
+introducing the explicit immutable array carries required by each enclosing condition, loop, scan, or call boundary.
+This is closure conversion during the one-shot discharge, not a separately materialized reference-bearing
+intermediate program: it avoids making while captures into invalid reference results or misclassifying scan captures
+as stacked sequences. Captured references used directly inside `condition`/`while`/`scan` bodies and nested calls
+remain flagship use cases. The pipeline order is canonical and fixed: entry capture lifting, capture-aware
+`ReferenceAnalysis` over the exact lifted source arena, then discharge using exactly that analysis artifact. The
+resulting ordinary program may contain array inputs/captures but no rewritten capture table containing mutable array
+contents, keeping `ClosedProgram`'s capture type/value invariant intact and giving core discharged interpretation and
+XLA compilation one boundary contract.
 
 ### 8.2 Result contract
 
 Discharge belongs in `ryft-core`. It returns a reference-free program and logical external-state metadata:
 
 ```rust
-pub struct DischargedReferenceProgram<O> {
+pub struct DischargedReferenceProgram<V, O> {
     program: Program<...>,
     public_output_count: usize,
     external_states: Vec<DischargedReferenceState>,
 }
 
 pub enum ReferenceSource {
-    Capture(usize),
-    PublicInput(usize),
+    Capture { index: usize },
+    PublicInput { index: usize },
 }
 
 pub struct DischargedReferenceState {
-    slot: usize,
     source: ReferenceSource,
     discharged_input_index: usize,
-    access: ExternalReferenceAccess,
     final_state_output_index: Option<usize>,
-}
-
-pub enum ExternalReferenceAccess {
-    ReadOnly,
-    Mutated,
 }
 ```
 
-Names and generic details remain subject to implementation review. The contract is:
+The implemented API keeps these fields private and exposes read-only accessors; the state's list position is its
+logical slot, and `is_mutated()` derives the access disposition from the presence of a hidden final-state output.
+The contract is:
 
 - discharge consumes the validated `ReferenceAnalysis` artifact as its input; it never re-derives root resolution,
   alias structure, or region access summaries independently, so the validator and the rewrite cannot drift;
@@ -574,8 +571,8 @@ freeze(root)          -> result = current[root]; close root
 ```
 
 Views translate reads and updates through canonical slice/gather/scatter/update operations while updating the same
-root state. Preserve array data type, dimension identities, layout, sharding, memory, source locations, and all
-non-state effects.
+root state. Preserve array data type, dimension identities, layout, sharding, memory, operation payloads, and all
+non-state effects. Instructions currently carry no source-location field.
 
 ### 8.4 Regions and calls
 
@@ -1075,78 +1072,86 @@ invalid programs fail before any mutation or replay.
 
 ### Phase 4: Implement straight-line discharge
 
-- [ ] Add a core discharge module and result metadata types.
-- [ ] Integrate discharge after `ClosedProgram::to_program_with_lifted_captures` and return the canonical
+- [x] Add a core discharge module and result metadata types.
+- [x] Integrate discharge after `ClosedProgram::to_program_with_lifted_captures` and return the canonical
       capture/public-holder binding recipe without rewriting concrete capture tables.
-- [ ] Validate the complete program before constructing output.
-- [ ] Consume the validated `ReferenceAnalysis` artifact as the discharge input contract; do not re-resolve roots,
+- [x] Validate the complete program before constructing output.
+- [x] Consume the validated `ReferenceAnalysis` artifact as the discharge input contract; do not re-resolve roots,
       aliases, or accesses inside the rewrite.
-- [ ] Temporarily reject reference-typed `CaptureReference`s inside attached regions (entry-region lifting only,
-      `captures.rs:546-551`); Phase 5 removes this via recursive attached-region lifting.
-- [ ] Track one immutable current array per root.
-- [ ] Rewrite each whole-array operation according to the state-passing semantics.
-- [ ] Eliminate local create/freeze state and preserve mutated external state as hidden outputs.
-- [ ] Preserve non-state effects, source locations, identities, layout, sharding, and memory.
-- [ ] Verify that successful output contains no reference artifacts or ordered-state effect.
-- [ ] Implement `Operation::render` for the reference and view operations per the fingerprint contract
-      (`programs/operations.rs:521-539`), and give the discharge metadata — which is not an operation — deterministic
-      `Debug`, serialization, and equality instead; add determinism tests. Renderings back the debug-assertions
-      transform-cache determinism recheck (`programs/transforms.rs:591-618`) and rendered-program test assertions —
-      they are not production cache keys.
-- [ ] Add property tests over short generated straight-line state programs against eager and hand-written oracles.
+- [x] Resolve reference-typed `CaptureReference`s inside attached regions through the final Phase 5 capture-aware
+      analysis/discharge route; do not add a temporary reject-then-remove validator.
+- [x] Track one immutable current array per root.
+- [x] Rewrite each whole-array operation according to the state-passing semantics.
+- [x] Eliminate local create/freeze state and preserve mutated external state as hidden outputs.
+- [x] Preserve non-state effects, operation payloads, identities, layout, sharding, and memory. Instructions currently
+      carry no source-location field, so discharge must not invent one.
+- [x] Verify that successful output contains no reference artifacts or ordered-state effect.
+- [x] Verify the existing distinct-name default `Operation::render` output for reference operations, and give the
+      discharge metadata — which is not an operation — deterministic `Debug`, serialization, and equality; add
+      determinism tests. Renderings back the debug-assertions transform-cache determinism recheck
+      (`programs/transforms.rs:591-618`) and rendered-program test assertions — they are not production cache keys.
+- [x] Add exhaustive generated tests over short straight-line state programs against eager and hand-written oracles.
 
 **Exit criterion:** straight-line local and external reference programs produce a deterministic reference-free core
 program plus complete logical state metadata.
 
 ### Phase 5: Extend discharge through regions and calls
 
-- [ ] Thread canonical state through condition branches and joins.
-- [ ] Thread body-mutated state through while carries.
-- [ ] Allow while conditions to read current entering state and reject writes, accumulations, or consumption of that
+- [x] Thread canonical state through condition branches and joins.
+- [x] Thread body-mutated state through while carries.
+- [x] Allow while conditions to read current entering state and reject writes, accumulations, or consumption of that
       entering state; condition-local nonescaping state remains legal.
-- [ ] Thread scan-mutated state as carries, separate from per-step values.
-- [ ] Rewrite nested calls and substitute callee root mappings into callers.
-- [ ] Derive every nested-region and callee root substitution from the same `ReferenceAnalysis` summaries used by
+- [x] Thread scan-mutated state as carries, separate from per-step values.
+- [x] Rewrite nested calls and substitute callee root mappings into callers.
+- [x] Derive every nested-region and callee root substitution from the same `ReferenceAnalysis` summaries used by
       validation; never re-resolve locally.
-- [ ] Add recursive attached-region capture lifting/substitution so reference-typed captures work directly inside
-      `condition`/`while`/`scan` bodies, and remove the temporary Phase 4 validator rejection. Normalization runs
-      before `ReferenceAnalysis`, so analysis and discharge always see the same normalized program (§8.1).
-- [ ] Handle captures and local region allocations without escape.
-- [ ] Preserve zero-iteration and untaken-branch state exactly.
-- [ ] Test one and multiple roots, different branch write sets/counts, nested regions, nested calls, and invalid escapes.
-- [ ] Add generated small-control-flow equivalence tests where practical.
+- [x] Resolve attached-region reference captures against their lifted entry or nested-call lexical scope in
+      `ReferenceAnalysis`, and have discharge add the explicit immutable array state inputs/outputs required by
+      `condition`/`while`/`scan`/call boundaries. Keep analysis and discharge paired on the exact same lifted source
+      arena (§8.1).
+- [x] Handle captures and local region allocations without escape.
+- [x] Preserve zero-iteration and untaken-branch state exactly.
+- [x] Test one and multiple roots, different branch write sets/counts, nested regions, nested calls, and invalid
+      escapes.
+- [x] Add explicit small-control-flow equivalence cases covering both branches, zero and many loop iterations, and
+      zero and nonzero scans.
 
 **Exit criterion:** every supported higher-order reference program has an equivalent reference-free array program, and
 all unsupported ownership/control-flow patterns fail before replay.
 
 ### Phase 6: Integrate generic transforms safely
 
-- [ ] Route staged local-reference simplification through the documented pre/post-discharge behavior.
-- [ ] Route externally pure local-reference partial evaluation through discharge and reject every remaining
+- [x] Route staged local-reference simplification through the documented pre/post-discharge behavior.
+- [x] Route externally pure local-reference partial evaluation through discharge and reject every remaining
       reference-bearing case. Do not use the generic default rule or claim whole-chain residualization in the MVP.
-- [ ] Add trace -> validate -> discharge -> replay support for forward and reverse AD entry points.
-- [ ] Add the corresponding route for direct/eager differentiation APIs or reject them explicitly until it exists.
-- [ ] Route local-reference batching through discharge; reject external/mapped/shared reference batching.
-- [ ] Route rematerialization through discharge; reject externally stateful rematerialization.
-- [ ] Reject references in custom derivative/rule regions.
-- [ ] Add guards proving no reference reaches generic AD representational rules. For batching, the projection is
+- [x] Add trace -> validate -> discharge -> replay support for forward and reverse AD entry points.
+- [x] Add the corresponding route for direct/eager differentiation APIs or reject them explicitly until it exists.
+- [x] Route local-reference batching through discharge; reject external/mapped/shared reference batching.
+- [x] Route rematerialization through discharge; reject externally stateful rematerialization.
+- [x] Reject references in custom derivative/rule regions.
+- [x] Add guards proving no reference reaches generic AD representational rules. For batching, the projection is
       already compile-time absent (`BatchingPolicyProjection` covers only `ArrayType` and `DimensionType`,
       `arrays/batching.rs:2429-2493`), but opaque replicated carriers bypass member projection; checked batching entry,
       replay, and output boundaries remain required for prevention as well as error quality.
-- [ ] Test nested transform orderings: discharge/JVP/transpose, discharge/batch, discharge/remat, and transforms around
+- [x] Test nested transform orderings: discharge/JVP/transpose, discharge/batch, discharge/remat, and transforms around
       condition/while/scan.
 
 **Exit criterion:** every public transform has a documented successful path or targeted rejection; no reference case
 succeeds by accidental structural or zero-space treatment.
 
+Known limitation: operations without a dedicated discharge rule (`shard_map`, rematerialization, linear-call, and
+custom-derivative carriers) conservatively reject reference state anywhere in their attached-region closures, even
+state that is allocated, mutated, and consumed entirely inside the region. Supporting region-local references there
+requires per-family rules and is deferred.
+
 ### Phase 7: Compile local references through XLA
 
-- [ ] Invoke core validation/discharge before the current array-only XLA boundary.
-- [ ] Carry discharge metadata into lowering even when no external states exist.
-- [ ] Add an explicit verifier rejecting surviving references before StableHLO construction.
-- [ ] Keep public array-only JIT input/output APIs unchanged.
-- [ ] Test static fixed-shape local refs through straight-line and control-flow programs.
-- [ ] Snapshot reference-free StableHLO and compare execution with eager/discharged core interpretation.
+- [x] Invoke core validation/discharge before the current array-only XLA boundary.
+- [x] Carry discharge metadata into lowering even when no external states exist.
+- [x] Add an explicit verifier rejecting surviving references before StableHLO construction.
+- [x] Keep public array-only JIT input/output APIs unchanged.
+- [x] Test static fixed-shape local refs through straight-line and control-flow programs.
+- [x] Snapshot reference-free StableHLO and compare execution with eager/discharged core interpretation.
 
 **Exit criterion:** local reference programs compile and run through ordinary XLA without adding a StableHLO reference
 representation or changing the executable ABI.
@@ -1365,10 +1370,10 @@ Use named families rather than an uncontrolled Cartesian product.
 | Aliases/views | base/view mutual observation; composed and disjoint views share root | implicit alias; escaping view; unsupported transform/overlap |
 | Effects/liveness | unused write retained; read/write order; I/O plus state | folding, DCE, duplication, speculation, rematerialization |
 | Straight-line discharge | each primitive; one/two roots; local/external; read-only/mutated | unresolved root; partial replay on validation failure |
-| Condition | then/else/both/neither writes; different write counts; two roots | reference branch result; mismatched root order |
-| While | condition reads; body writes; zero/one/many iterations; nested condition | condition write; reference carry/result; escaping iteration allocation |
-| Scan | zero/nonzero steps; state plus per-step output; nested condition | reference sequence/output; capture alias ambiguity |
-| Nested call | argument/capture read/write; two-level call; caller observes state | argument-plus-capture alias; reference result; inconsistent summary |
+| Condition | branch write combinations; two roots; fixed-root forwarding | inconsistent/duplicate roots; escape |
+| While | condition read; body write; zero/many; fixed carry | condition write; permutation; escape |
+| Scan | zero/nonzero; step output; fixed carry | sequence output; permutation; alias |
+| Nested call | argument/capture; two levels; observed state | capture alias; escape; bad provenance |
 | Partial evaluation | discharged local refs with known/mixed inputs | trace-time external mutation; split unresolved state chain |
 | Batching | discharged local function equals per-example loop | external/mapped/captured ref; replicated write; lane conflict |
 | JVP/VJP | local read/overwrite/swap/accumulate; condition/bounded while/scan; pure oracle | external ref; tangent ref; custom-rule ref; silent zero derivative; unbounded while transpose |
@@ -1591,7 +1596,8 @@ At each checkpoint, ask:
       submission-time lease publication in Phase 10; scoped implicit scope-exit invalidation to program execution
       (directly eager references live until freeze or last drop); made the MVP reject non-identity renames of eager
       references and scheduled the root-shared/handle-local split before views; moved recursive attached-region
-      capture lifting into Phase 5 (Phase 4 rejection is temporary); chose a separate stateful call method as the
+      capture lifting into Phase 5 (the temporary Phase 4 rejection was superseded by the one-shot capture-aware
+      Phase 4–5 implementation recorded below); chose a separate stateful call method as the
       compilation seam and added `ryft-core::compilation` to the change surface; added the dead-old-result
       `swap`-to-write-only canonicalization for preserved kernels; folded `source_parameter_index` into
       `ReferenceSource`; corrected V5-modify wording to a new `XlaPersistentKeyV6`; declared `OrderedState` token-free
@@ -1803,6 +1809,95 @@ At each checkpoint, ask:
       completed full core, macro, and XLA test suites plus three independent simplification reviews, including their
       final fixes for borrowed capture projection, zero construction, batched-`while` reference diagnostics, and stale
       projection/member-kind documentation.
+- [x] 2026-08-19 combined Phase 4–5 implementation/review pass 16: implemented one analysis-coupled, all-or-nothing
+      reference-discharge pipeline that rewrites whole-array references into immutable array SSA state and emits
+      deterministic logical metadata for external roots. Extended `ReferenceAnalysis` with deterministic transitive
+      summaries, exact nested-call capture scopes, structured-output provenance, fixed-point loop-carry constraints,
+      and operation-owned access policy; discharge consumes those facts without re-resolving roots and threads
+      canonical state through conditions, while loops, scans, calls, and recursively captured regions. Kept
+      reference-free programs unchanged, preserved ordinary payloads and non-state effects, rejected malformed public
+      operation-family rules before constructing output, and verified every artifact is free of references and ordered
+      state. Focused coverage includes every primitive, retained snapshots, external metadata ordering, exhaustive
+      short straight-line sequences, branch joins, zero/many loop iterations, zero/nonzero scans, nested calls and
+      captures, shared-region specialization, fixed-point identity, malformed provenance, and transactional failures.
+      Full verification passed: formatting and `git diff --check`; 1,435 core tests plus 3 ignored; the complete macro
+      integration and compile-fail suites; XLA all-target compilation; 485 XLA tests plus 5 ignored; and core
+      documentation generation with 95 pre-existing warnings, none in the reference modules. Three final independent
+      audits of correctness, conventions/API design, and simplification reported no remaining actionable findings.
+- [x] 2026-08-19 combined Phase 2–5 independent re-audit pass 17: three fresh independent audits over the Phase 4–5
+      discharge work plus the committed Phase 2–3 reference modules. No exploitable correctness defect; fixes landed
+      for every finding. Production: reverted an accidental rematerialization policy regression by pinning the
+      intended pass-through provenance classification instead of changing the framework; consolidated scan carry
+      widening onto one canonical `ScanOperation::with_added_carries` so backend rebuilds cannot silently drop future
+      scan fields; validated the positional-provenance/arity alignment the condition/call rewrites rely on; routed
+      `jit_call` rendering through `OperationFormatter`; replaced the wrapper summary type, derived access enum,
+      logical slot, and dead binding fields/accessors with the minimal analysis/discharge metadata surface; gated the
+      discharge fast path on the analysis fast path; removed the per-nesting re-verification, duplicate layout arms,
+      duplicated root resolution and error constructions, and the module-local reference-type helper in favor of
+      `Type::is_reference`; named discharge rules in diagnostics; and moved the discharge tests after the
+      implementation. Committed-code cleanups: deleted the dead per-replayed-instruction and duplicate entry
+      partial-evaluation gates, reduced the reference transform-rejection macro's partial-evaluation arm to the trait
+      default, collapsed identical lowering arms, adopted one shared `reachable_region_mask` closure walk at five
+      sites, consolidated the replay-driver constructors, and removed stale review markers and the dead holder-id
+      `Display`. Tests: split the five-operation omnibus into per-operation tests on the official inference macro;
+      pinned discharged program shapes with rendered fixtures; added eager-versus-discharged equivalence for
+      condition and scan plus a hand-written immutable-loop oracle for `while` (eager replay of reference-carrying
+      `while` predicates is intentionally undefined); covered the mutated-capture synthesized-carry path, ambiguous
+      shared capture scopes, nested-binding lookup, the XLA discharge-rule mapping and scan-metadata preservation;
+      trimmed operation enumerations of operation-agnostic guards to representatives; and merged the duplicate
+      seal-time effect-fold block while keeping the ordered-state pin. A second audit round over the fixed tree found
+      no correctness defect and converged on residual polish, all applied: primitive discharge rules now validate
+      against the canonical core operations through one object-safe contract oracle instead of hand-copied arity and
+      type patterns; `ReferenceOperationSemantics::is_empty` replaced six spelled-out predicates; the derive macro's
+      eleven identical forwarding-arm generators collapsed onto one helper; the reference transform-rejection macro
+      takes the whole operation family in one invocation; the XLA reference scan delegates to the core closure
+      helper; `region_summary` went crate-private; owner-module tests landed for `ScanOperation::with_added_carries`
+      and `reachable_region_mask`; tautological reference-free assertions, triplicated carry pins, duplicated
+      custom-derivative fixtures, and the remaining omnibus rejection tests were deduplicated or split; and this
+      section's earlier discharge-metadata sketch was aligned with the shipped surface. Third and fourth audit rounds
+      then converged: round three surfaced five residual polish items (a doc reflow, helper placement, one remaining
+      spelled-out emptiness predicate, a canonical-inference rejection case proven to kill its target mutation, and
+      owner-module `is_empty` assertions), all fixed and verified; round four reported no findings. Final
+      verification passed: formatting and `git diff --check`; 1,473 core tests plus 3 ignored; the complete macro
+      integration and compile-fail suites; 487 XLA tests plus 5 ignored; and zero compiler warnings across all
+      targets. A colleague review then surfaced two correctness gaps and three cleanups, all fixed with regressions:
+      `jit_call` lowering now takes its capture prefix from the operation payload instead of scanning capture-constant
+      indices across the callee arena (which conflated nested calls' independent capture namespaces), discharge
+      validation now pins the exact result-region arity and positional output provenance that the higher-order replay
+      zips against (plus positional inputs for `while` and the scan carry prefix), the nested-binding query became the
+      keyed public `region_root_for_source` with the flat binding list crate-private, the scan overflow expectation is
+      target-width portable, and the single-input eager capability checks borrow their type instead of cloning it.
+      A final verification audit confirmed all six fixes and surfaced three residual polish items, also fixed: the
+      linearize-primal and partial-evaluation known-side derived calls now declare their true surviving capture-prefix
+      lengths (with accurate invariant comments on the tangent/residual/transpose boundaries that genuinely have
+      none), the stale `linear_jit_call` doc clause is gone, and the invocation-lossy binding record went
+      crate-private with its dead accessors deleted. The audit also forwarded one pre-existing out-of-scope hazard
+      (fresh-root traced region bodies silently recording captures into throwaway tables) as a separate tracked task.
+      A follow-up colleague round then closed the remaining capture-scope and preflight gaps: mixed partial
+      evaluation preserves the original `jit_call` boundary whenever the callee closure retains a capture constant
+      (partitioning does not remap absolute capture indices; guarded through the new
+      `RegionRef::contains_atom_in_closure` and pinned by a preserved-boundary regression, with the split test's
+      fixture made capture-free), the discharge preflight accepts the dynamic-length scan's trailing runtime-length
+      operand (pinned by an eager-equivalence regression), and the fresh-root capture-rejection additions received
+      their convention polish (rustdoc on the counting trace helper, a `where`-clause bound, and line-width fixes).
+      Post-fix verification: 1,476 core tests plus 3 ignored, 492 XLA tests plus 5 ignored, all macro suites,
+      formatting, `git diff --check`, and zero warnings.
+- [x] 2026-08-20 combined Phase 6–7 implementation/review pass 18: added explicit flat Array-IR adapters that
+      discharge local whole-array references before partial evaluation and partitioning, JVP and linearization,
+      structural batching, and rematerialization, while rejecting public/captured external holders before generic
+      transform replay. Preserved the generic engines and their direct unresolved-state rejections; added focused
+      condition, bounded-while, scan, and rematerialized primal/JVP/VJP composition coverage. Integrated capture-aware
+      discharge into ordinary XLA lowering before array projection, retained a borrowed single-scan path for the
+      reference-free majority, independently verified rewritten artifacts, and rejected nonempty external-state
+      metadata without adding Phase 9 runtime/alias machinery. Fixed lifted capture namespaces in attached regions,
+      preserved capture-count diagnostic precedence, kept the public JIT array ABI unchanged, and pinned exact
+      straight-line and condition StableHLO plus compiled condition/while/static-scan/dynamic-scan/nested-call/public-
+      JIT behavior. Three independent audit loops covered correctness, conventions/API/testing, and architecture/
+      simplicity; every finding was fixed and all final passes reported clean. Final verification passed: 1,488 core
+      tests plus 3 ignored; 501 XLA tests plus 5 ignored; 20 macro integration tests including the complete trybuild
+      compile-fail suite; core and XLA all-target checks; core documentation with 95 pre-existing warnings and
+      warning-free XLA documentation; formatting, stale-identifier and added-line-width audits; and
+      `git diff --check`.
 
 Unchecked implementation items above remain future execution work. Completed items record code and verification that
 landed with the corresponding phase summary.

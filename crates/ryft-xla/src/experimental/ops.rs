@@ -843,7 +843,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
     }
 
     #[inline]
-    fn region_capture_count(&self, region_index: usize) -> Option<usize> {
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
         (region_index == 0).then_some(self.capture_count)
     }
 
@@ -1370,8 +1370,8 @@ mod tests {
         let operation = JitCallOperation::<ArrayIrType>::new(2);
         assert_eq!(operation.input_region_provenance(0, 3), Some(3));
         assert_eq!(operation.input_region_provenance(1, 3), None);
-        assert_eq!(operation.region_capture_count(0), Some(2));
-        assert_eq!(operation.region_capture_count(1), None);
+        assert_eq!(operation.region_capture_input_count(0), Some(2));
+        assert_eq!(operation.region_capture_input_count(1), None);
         assert_eq!(
             std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(),
             "jit_call [capture_count=2]",
@@ -1637,11 +1637,9 @@ mod tests {
     fn test_rematerialize_rejects_captures_registered_in_its_body() {
         use ryft_core::tracing_v2::rematerialize;
 
-        // The rematerialized body is traced through a fresh-root context whose capture table is local to that trace
-        // and discarded. A capture registered inside the body would therefore leave a `capture#0` constant in the
-        // rematerialized region that XLA lowering later resolves against whatever capture prefix surrounds the
-        // enclosing compiled function — silently aliasing an unrelated captured value — so the body trace is
-        // rejected at trace time instead.
+        // The rematerialized body is traced through a fresh-root context whose capture table is discarded, so a
+        // capturing body is rejected at trace time; refer to `TracingContext::trace_with_named_axes` for the full
+        // silent-aliasing rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = XlaConstant::Captured(CaptureReference::new(0, scalar_type.clone()));
         let function = rematerialize::<XlaDomain<'static>, _, _, _>(
@@ -2135,8 +2133,6 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_preserves_boundary_for_capture_bearing_callees() {
-        use ryft_core::{StagingContext, TracingContext};
-
         // Partitioning does not remap the absolute indices of retained capture constants, so a mixed call whose
         // callee still holds one must keep its original boundary instead of splitting into derived callees whose
         // compacted or absent capture prefixes those indices would misname.
