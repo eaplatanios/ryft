@@ -5,7 +5,7 @@ use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::Program;
-use crate::programs::references::ReferenceOperationSemantics;
+use crate::programs::references::{ReferenceAccessMode, ReferenceOperationSemantics};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
@@ -539,6 +539,75 @@ pub trait Operation: Clone {
         false
     }
 
+    /// Returns the exact number of leading inputs that establish a fresh lexical capture namespace for the
+    /// `region_index`-th attached [`Region`](crate::Region), or [`None`] when that region inherits the namespace
+    /// active at instructions involving this [`Operation`].
+    ///
+    /// Override this function only for call-like operations that attach independently lifted callees. Return `Some(0)`
+    /// when the attached region establishes a fresh namespace containing no captures. `None` implies inheritance and
+    /// is therefore semantically different. A returned count must not exceed the attached region's input count.
+    /// Conditions, loops, scans, and other nested control flow operations normally inherit their parent's namespace
+    /// and should retain the default.
+    #[inline]
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        let _ = region_index;
+        None
+    }
+
+    /// Returns the [`Operation`] input whose reference identity must be preserved by reference-typed output
+    /// `output_index`, or [`None`] when the output has no such identity constraint.
+    ///
+    /// This function constrains the identity of the reference root, not the value stored in that reference. Override
+    /// it for operations with a bypass or zero-iteration path that can return entering state unchanged. For example,
+    /// consider a `while` operation with two reference carries `A` and `B`. An identity-preserving body is valid:
+    ///
+    /// ```text
+    /// input references:  [A, B]
+    /// body references:   [A, B] -> [A, B]
+    /// output references: [A, B]
+    /// ```
+    ///
+    /// The body may update the values stored in `A` and `B`. It must only preserve which root occupies each carry.
+    /// Consequently, output `0` declares input `0`, and output `1` declares input `1`.
+    ///
+    /// A body that instead exchanges the roots is invalid:
+    ///
+    /// ```text
+    /// input references: [A, B]
+    /// body references:  [A, B] -> [B, A]
+    /// ```
+    ///
+    /// Output `0` would identify `A` after zero iterations, `B` after one iteration, and `A` again after two. Static
+    /// reference analysis therefore could not assign that output one canonical root. Declaring the positional identity
+    /// constraint lets analysis reject the body instead.
+    ///
+    /// Every `while` output has this constraint. Only the carry prefix of a `scan` has it, because stacked sequence
+    /// outputs do not preserve an entering reference identity. Ordinary array and dimension outputs are unaffected.
+    /// Do not use this function to describe ordinary forwarding from an attached region. Instead, use
+    /// [`Self::output_region_provenance`] for that.
+    #[inline]
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        let _ = output_index;
+        None
+    }
+
+    /// Returns whether an access with `mode` may target a reference root supplied through an input of the
+    /// `region_index`-th attached [`Region`](crate::Region).
+    ///
+    /// Override this only when an attached region has an asymmetric state contract. For example, a `while` condition
+    /// may read entering reference state but may not mutate, accumulate into, or consume it because the final false
+    /// invocation has no state output through which such a change could be published. The loop body uses the permissive
+    /// default.
+    ///
+    /// This policy applies only to roots entering through the region boundary. It does not restrict references
+    /// allocated and consumed entirely inside one region invocation, and it does not describe how values enter the
+    /// region. Instead, use [`Self::input_region_provenance`] for that.
+    #[inline]
+    fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        let _ = (region_index, mode);
+        true
+    }
+
     /// Returns this operation's local [`ReferenceOperationSemantics`] (i.e., output root/alias classification and input
     /// accesses) in operand/result index space. Refer to the documentation of [`ReferenceOperationSemantics`] for more
     /// information and per-operation examples. The empty default is correct for operations that do not themselves
@@ -549,6 +618,12 @@ pub trait Operation: Clone {
     /// returned [`Cow`] borrows at `self`'s lifetime so implementations can hand out shared static descriptors _or_
     /// borrow descriptors stored in their own payloads (e.g., custom-call or kernel operations with payload-dependent
     /// semantics) without cloning on every query.
+    ///
+    /// This descriptor covers reference behavior intrinsic to the operation itself. Operations whose attached regions
+    /// establish capture namespaces, require outputs to preserve entering reference identities, or restrict accesses
+    /// to entering roots must additionally implement [`Self::region_capture_input_count`],
+    /// [`Self::reference_output_identity_input`], or [`Self::allows_reference_access_to_region_input`],
+    /// respectively.
     #[inline]
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
         Cow::Borrowed(ReferenceOperationSemantics::empty())
@@ -662,6 +737,21 @@ impl<O: Operation> Operation for Box<O> {
     #[inline]
     fn is_zero(&self, output_index: usize) -> bool {
         self.as_ref().is_zero(output_index)
+    }
+
+    #[inline]
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        self.as_ref().region_capture_input_count(region_index)
+    }
+
+    #[inline]
+    fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+        self.as_ref().reference_output_identity_input(output_index)
+    }
+
+    #[inline]
+    fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        self.as_ref().allows_reference_access_to_region_input(region_index, mode)
     }
 
     #[inline]
@@ -970,6 +1060,18 @@ mod tests {
             output_index == 2
         }
 
+        fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+            (region_index == 0).then_some(2)
+        }
+
+        fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+            (output_index == 3).then_some(1)
+        }
+
+        fn allows_reference_access_to_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+            region_index == 0 && mode == ReferenceAccessMode::Read
+        }
+
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             Cow::Owned(ReferenceOperationSemantics::new(
                 vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
@@ -1079,6 +1181,9 @@ mod tests {
         );
         assert_eq!(operation.infer_region_input_types(&[DataType::F64], &region_interfaces), Ok(vec![None, None]),);
         assert_eq!(operation.output_region_provenance(0), Vec::new());
+        assert_eq!(operation.region_capture_input_count(0), None);
+        assert_eq!(operation.reference_output_identity_input(0), None);
+        assert!(operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Write));
         assert!(!operation.is_zero(0));
         assert_eq!(operation.effects(), Effects::PURE);
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
@@ -1113,9 +1218,17 @@ mod tests {
             operation.output_region_provenance(3),
             vec![OutputRegionProvenance { region_index: 0, output_index: 3 }],
         );
+        assert_eq!(operation.region_capture_input_count(0), Some(2));
+        assert_eq!(operation.region_capture_input_count(1), None);
+        assert_eq!(operation.reference_output_identity_input(3), Some(1));
+        assert_eq!(operation.reference_output_identity_input(2), None);
+        assert!(operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Read));
+        assert!(!operation.allows_reference_access_to_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_to_region_input(1, ReferenceAccessMode::Read));
         assert!(!operation.is_zero(1));
         assert!(operation.is_zero(2));
-        assert_eq!(operation.reference_semantics().outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }],);
+        let semantics = operation.reference_semantics();
+        assert_eq!(semantics.outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }]);
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),
