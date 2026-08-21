@@ -4289,6 +4289,15 @@ where
 }
 
 /// Lowers a discharged program with logical external reference-state aliases on its entry boundary.
+///
+/// `reference_states` are the discharge artifact's external-state recipes; each must name a distinct logical state
+/// input. Each state input must survive the executable boundary. A mutated state must be a static
+/// device array and name a hidden output of the identical type and sharding; mutated pairs are recorded as
+/// `tf.aliasing_output` input-output aliases, which are non-semantic may-alias hints that merely permit backend buffer
+/// reuse. The runtime never donates reference-state inputs, so an alias never authorizes in-place mutation of the
+/// caller's state buffer. Read-only state may be finite bounded-dynamic because it has no hidden alias. The validation
+/// here owns the physical alias contract;
+/// the XLA domain additionally enforces the supported memory, sharding, and dynamic-shape classes before calling it.
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Output, ProgramInput, ProgramOutput, S>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     capture_types: &[ArrayType],
@@ -4357,46 +4366,46 @@ where
             signature.input_mapping()[logical_input_index].ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} is erased from the executable boundary"),
             })?;
-        match state.final_state_output_index() {
-            None => {}
-            Some(logical_output_index) => {
-                let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
-                    LoweringError::InvalidReferenceStateAbi {
-                        message: format!("logical output index {logical_output_index} is out of range"),
-                    }
-                })?;
-                let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
-                    LoweringError::InvalidReferenceStateAbi {
-                        message: format!(
-                            "logical state output {logical_output_index} is erased from the executable boundary",
-                        ),
-                    }
-                })?;
-                if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
-                    return Err(LoweringError::InvalidReferenceStateAbi {
-                        message: format!(
-                            "state input {logical_input_index} and output {logical_output_index} must be static",
-                        ),
-                    });
+        if let Some(logical_output_index) = state.final_state_output_index() {
+            let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
+                LoweringError::InvalidReferenceStateAbi {
+                    message: format!("logical output index {logical_output_index} is out of range"),
                 }
-                if input_type.data_type().is_zero() || output_type.data_type().is_zero() {
-                    return Err(LoweringError::InvalidReferenceStateAbi {
-                        message: format!(
-                            "state input {logical_input_index} and output {logical_output_index} must occupy device \
-                             memory",
-                        ),
-                    });
+            })?;
+            let physical_output_index = signature.output_mapping()[logical_output_index].ok_or_else(|| {
+                LoweringError::InvalidReferenceStateAbi {
+                    message: format!(
+                        "logical state output {logical_output_index} is erased from the executable boundary",
+                    ),
                 }
-                if input_type != output_type {
-                    return Err(LoweringError::InvalidReferenceStateAbi {
-                        message: format!(
-                            "state input {logical_input_index} type `{input_type}` is incompatible with output \
-                             {logical_output_index} type `{output_type}`",
-                        ),
-                    });
-                }
-                if let (Some(argument_shardings), Some(result_shardings)) = (arg_shardings, result_shardings)
-                    && argument_shardings[logical_input_index] != result_shardings[logical_output_index]
+            })?;
+            if input_type.static_shape().is_none() || output_type.static_shape().is_none() {
+                return Err(LoweringError::InvalidReferenceStateAbi {
+                    message: format!(
+                        "state input {logical_input_index} and output {logical_output_index} must be static because \
+                         bounded-dynamic mutation alias compatibility is unsupported",
+                    ),
+                });
+            }
+            if input_type.memory() != Memory::Device || output_type.memory() != Memory::Device {
+                return Err(LoweringError::InvalidReferenceStateAbi {
+                    message: format!(
+                        "state input {logical_input_index} and output {logical_output_index} must use device \
+                         memory",
+                    ),
+                });
+            }
+            if input_type != output_type {
+                return Err(LoweringError::InvalidReferenceStateAbi {
+                    message: format!(
+                        "state input {logical_input_index} type `{input_type}` is incompatible with output \
+                         {logical_output_index} type `{output_type}`",
+                    ),
+                });
+            }
+            match (arg_shardings, result_shardings) {
+                (Some(argument_shardings), Some(result_shardings))
+                    if argument_shardings[logical_input_index] != result_shardings[logical_output_index] =>
                 {
                     return Err(LoweringError::InvalidReferenceStateAbi {
                         message: format!(
@@ -4405,14 +4414,23 @@ where
                         ),
                     });
                 }
-                if aliases.insert(physical_input_index, physical_output_index).is_some()
-                    || !aliased_outputs.insert(physical_output_index)
-                {
+                (Some(_), None) | (None, Some(_)) => {
                     return Err(LoweringError::InvalidReferenceStateAbi {
-                        message: "reference-state aliases must be injective".to_string(),
+                        message:
+                            "reference-state aliases require both argument and result sharding metadata or neither"
+                                .to_string(),
                     });
                 }
+                _ => {}
             }
+            if !aliased_outputs.insert(physical_output_index) {
+                return Err(LoweringError::InvalidReferenceStateAbi {
+                    message: "reference-state aliases must be injective".to_string(),
+                });
+            }
+            // Distinct logical inputs (enforced through `state_inputs` above) map to distinct physical inputs, so
+            // this insertion can never displace an earlier alias.
+            aliases.insert(physical_input_index, physical_output_index);
         }
     }
     let physical_argument_types = signature.physical_input_types(logical_argument_types.as_slice());
@@ -9139,7 +9157,7 @@ mod tests {
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
-        let state_type = ArrayType::scalar(DataType::F32);
+        let state_type = ArrayType::new_static(DataType::F32, [4]);
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let _zero = builder.add_input(ArrayIrType::Array(zero_type.clone()));
         let mutated = builder.add_input(ArrayIrType::Array(state_type.clone()));
@@ -9149,10 +9167,10 @@ mod tests {
         let output_types = vec![state_type.clone()];
         let argument_shardings = vec![
             Sharding::replicated(mesh.clone(), 1),
-            Sharding::replicated(mesh.clone(), 0),
-            Sharding::replicated(mesh.clone(), 0),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
         ];
-        let result_shardings = vec![Sharding::replicated(mesh.clone(), 0)];
+        let result_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let states = [
             DischargedReferenceState::new(ReferenceSource::PublicInput { index: 1 }, 1, Some(0)),
             DischargedReferenceState::new(ReferenceSource::PublicInput { index: 2 }, 2, None),
@@ -9174,10 +9192,10 @@ mod tests {
         assert_eq!(lowered.signature.output_mapping(), &[Some(0)]);
         let expected_signature = concat!(
             "  func.func @main(",
-            "%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>, ",
+            "%arg0: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>, ",
             "tf.aliasing_output = 0 : i64}, ",
-            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) -> ",
-            "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) {",
+            "%arg1: tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) -> ",
+            "(tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{\"x\"}]>}) {",
         );
         assert_eq!(
             lowered.stable_hlo,
@@ -9187,7 +9205,7 @@ mod tests {
                 @SIGNATURE@
                     %c = stablehlo.constant dense<false> : tensor<i1>
                     %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
-                    return %arg0 : tensor<f32>
+                    return %arg0 : tensor<4xf32>
                   }
                 }
             "#}
@@ -9211,7 +9229,29 @@ mod tests {
                 if message == "logical state input 0 is erased from the executable boundary",
         ));
 
-        let mismatched_result_shardings = vec![Sharding::replicated(mesh, 0).with_unreduced_axes(["x"]).unwrap()];
+        let asymmetric_sharding_message =
+            "reference-state aliases require both argument and result sharding metadata or neither";
+        for (argument_shardings, result_shardings) in
+            [(Some(argument_shardings.as_slice()), None), (None, Some(result_shardings.as_slice()))]
+        {
+            assert!(matches!(
+                lower_mlir_module_for_program_with_reference_state(
+                    &program,
+                    &[],
+                    &input_types,
+                    &output_types,
+                    "main",
+                    argument_shardings,
+                    result_shardings,
+                    None,
+                    &states,
+                ),
+                Err(LoweringError::InvalidReferenceStateAbi { message })
+                    if message == asymmetric_sharding_message,
+            ));
+        }
+
+        let mismatched_result_shardings = vec![Sharding::replicated(mesh, 1)];
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
                 &program,
@@ -9226,6 +9266,37 @@ mod tests {
             ),
             Err(LoweringError::InvalidReferenceStateAbi { message })
                 if message == "state input 1 and output 0 must use the same sharding",
+        ));
+    }
+
+    #[test]
+    fn test_bounded_dynamic_reference_state_alias_is_rejected_before_lowering() {
+        use ryft_core::ReferenceSource;
+
+        let extent = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let state_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 1);
+        let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
+        let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
+        let program: FlatXlaProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
+        let reference_state = DischargedReferenceState::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(0));
+
+        assert!(matches!(
+            lower_mlir_module_for_program_with_reference_state(
+                &program,
+                &[],
+                &vec![state_type.clone()],
+                &vec![state_type],
+                "main",
+                Some(std::slice::from_ref(&sharding)),
+                Some(std::slice::from_ref(&sharding)),
+                None,
+                std::slice::from_ref(&reference_state),
+            ),
+            Err(LoweringError::InvalidReferenceStateAbi { message })
+                if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
+                               compatibility is unsupported",
         ));
     }
 

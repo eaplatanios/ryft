@@ -3,6 +3,7 @@
 
 // TODO(eaplatanios): Review this module.
 
+use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
 use crate::arrays::reference_views::{ArrayReference, ArrayReferenceViewTransform};
 use crate::arrays::types::arrays::ArrayType;
@@ -21,7 +22,7 @@ impl<A: Value<Type = ArrayType>> NewReference for ArrayIrValue<A> {
     }
 }
 
-impl<A: Reshape + Slice + Value<Type = ArrayType>> ReferenceRead for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValue<A> {
     fn read(&self) -> Result<Self, ProgramError> {
         ReferenceReadOperation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
@@ -29,7 +30,7 @@ impl<A: Reshape + Slice + Value<Type = ArrayType>> ReferenceRead for ArrayIrValu
     }
 }
 
-impl<A: Reshape + Slice + UpdateSlice + Value<Type = ArrayType>> ReferenceSwap for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceSwap for ArrayIrValue<A> {
     fn swap(&self, replacement: &Self) -> Result<Self, ProgramError> {
         ReferenceSwapOperation
             .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
@@ -39,7 +40,7 @@ impl<A: Reshape + Slice + UpdateSlice + Value<Type = ArrayType>> ReferenceSwap f
     }
 }
 
-impl<A: Add + Reshape + Slice + UpdateSlice + Value<Type = ArrayType>> ReferenceAddUpdate for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> ReferenceAddUpdate for ArrayIrValue<A> {
     fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
         ReferenceAddUpdateOperation
             .infer_output_types(&[self.r#type().into_owned(), update.r#type().into_owned()], &[])?;
@@ -67,7 +68,7 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
 }
 
 impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
-    fn reference_slice(&self, axes: &[crate::arrays::ArraySliceAxis]) -> Result<Self, ProgramError> {
+    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
         let operation = ReferenceSliceOperation::new(axes.to_vec());
         operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
@@ -81,12 +82,10 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
     use crate::arrays::reference_views::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::captures::CaptureReference;
     use crate::programs::{ReferenceError, TypeError};
 
     use super::*;
@@ -297,41 +296,17 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_reference_operations_reject_dynamic_referents() {
+    fn test_eager_reference_operations_preserve_dynamic_referents() {
         let dynamic_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
-        let dynamic_value = ArrayIrValue::Array(CaptureReference::new(0, dynamic_type.clone()));
-        assert_eq!(
-            dynamic_value.new_reference(),
-            Err(TypeError::invalid(
-                "`new_reference` does not support dynamically shaped reference referent type `f32[length]`",
-            )
-            .into()),
-        );
+        let dynamic_value = ArrayIrValue::Array(dynamic_type.clone());
+        let replacement = ArrayIrValue::Array(dynamic_type);
+        let reference = dynamic_value.new_reference().unwrap();
 
-        let dynamic_reference =
-            ArrayIrValue::Reference(ArrayReference::new(CaptureReference::new(0, dynamic_type.clone())));
-        assert_eq!(
-            ReferenceReadOperation.infer_output_types(std::slice::from_ref(dynamic_reference.r#type().as_ref()), &[]),
-            Err(TypeError::invalid(
-                "`reference_read` does not support dynamically shaped reference referent type `f32[length]`",
-            )),
-        );
-        assert_eq!(
-            ReferenceSwapOperation
-                .infer_output_types(&[dynamic_reference.r#type().into_owned(), dynamic_type.clone().into()], &[],),
-            Err(TypeError::invalid(
-                "`reference_swap` does not support dynamically shaped reference referent type `f32[length]`",
-            )),
-        );
-        assert_eq!(
-            dynamic_reference.freeze(),
-            Err(TypeError::invalid(
-                "`freeze_reference` does not support dynamically shaped reference referent type `f32[length]`",
-            )
-            .into()),
-        );
+        assert_eq!(reference.read(), Ok(dynamic_value.clone()));
+        assert_eq!(reference.swap(&replacement), Ok(dynamic_value));
+        assert_eq!(reference.freeze(), Ok(replacement));
     }
 }

@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 use thiserror::Error;
@@ -15,8 +16,8 @@ use crate::arrays::types::dimensions::{Dimension, Shape};
 use crate::operations::{Add, Reshape, Slice, UpdateSlice};
 use crate::parameters::Parameter;
 use crate::programs::{
-    ProgramError, Reference, ReferenceGuard, ReferenceId, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed,
-    Value,
+    ProgramError, Reference, ReferenceError, ReferenceGuard, ReferenceId, ReferenceType, Type, TypeError,
+    TypeIdentityRenaming, Typed, Value,
 };
 
 /// Error produced by an invalid eager array-reference view operation.
@@ -36,7 +37,17 @@ pub enum ArrayReferenceViewError {
     InvalidRuntimeRoot,
 }
 
-/// One root-preserving coordinate transform in an [`ArrayReferenceView`].
+/// One validated coordinate transform in an [`ArrayReferenceView`]'s root-to-handle mapping.
+///
+/// A transform describes both directions of one view step: applying it extracts a selected child value from its
+/// parent, while replacing that child reconstructs a value with exactly the parent's original type. This
+/// bidirectional contract lets reference reads operate on the selected value and lets swaps or additive updates write
+/// the result back into the shared root without changing the root's declared type.
+///
+/// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one statically selected
+/// axis; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis.
+/// Dynamic indexing and strided slicing are intentionally not represented until their inverse update semantics are
+/// supported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceViewTransform {
@@ -56,10 +67,42 @@ pub enum ArrayReferenceViewTransform {
     },
 }
 
+/// Normalized coordinates of one [`ArrayReferenceViewTransform`] applied to one statically shaped input.
+///
+/// Both transform kinds reduce to slicing one unit-stride hyper-rectangle out of the input, optionally followed by
+/// squeezing the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
+/// eager update reconstruction, and staged discharge) share one validation and address computation.
+pub(crate) struct ViewSelection {
+    /// Inclusive slice start per input axis.
+    pub(crate) starts: Vec<usize>,
+
+    /// Exclusive slice limit per input axis.
+    pub(crate) limits: Vec<usize>,
+
+    /// Exact static output shape after squeezing the indexed axis, for
+    /// [`ArrayReferenceViewTransform::Index`] transforms only; [`None`] for rank-preserving slices, whose output
+    /// shape is exactly [`Self::update_shape`].
+    pub(crate) squeezed_output_shape: Option<Shape>,
+}
+
+impl ViewSelection {
+    /// Returns the static shape of the sliced hyper-rectangle before squeezing (i.e., the update shape that writes
+    /// back into the selected coordinates).
+    pub(crate) fn update_shape(&self) -> Shape {
+        Shape::new(
+            self.starts
+                .iter()
+                .zip(self.limits.iter())
+                .map(|(start, limit)| Dimension::Static(limit - start))
+                .collect(),
+        )
+    }
+}
+
 impl ArrayReferenceViewTransform {
-    /// Returns the exact canonical array type produced from `input`.
-    pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
-        let output = match self {
+    /// Validates this transform against `input` and returns its normalized selection coordinates.
+    pub(crate) fn selection(&self, input: &ArrayType) -> Result<ViewSelection, TypeError> {
+        match self {
             Self::Index { axis, index } => {
                 let shape = input.static_shape().ok_or_else(|| {
                     TypeError::invalid(format!("reference indexing requires a static referent type but got `{input}`",))
@@ -80,9 +123,6 @@ impl ArrayReferenceViewTransform {
                 starts[*axis] = *index;
                 let mut limits = shape.dimensions().to_vec();
                 limits[*axis] = index + 1;
-                let sliced = input
-                    .slice(starts.as_slice(), limits.as_slice(), &vec![1; shape.rank()])
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
                 let output_shape = Shape::new(
                     shape
                         .dimensions()
@@ -91,7 +131,7 @@ impl ArrayReferenceViewTransform {
                         .filter_map(|(candidate, size)| (candidate != *axis).then_some(Dimension::Static(*size)))
                         .collect(),
                 );
-                sliced.reshape(output_shape).map_err(|error| TypeError::invalid(error.to_string()))?
+                Ok(ViewSelection { starts, limits, squeezed_output_shape: Some(output_shape) })
             }
             Self::Slice { axes } => {
                 let shape = input.static_shape().ok_or_else(|| {
@@ -114,7 +154,7 @@ impl ArrayReferenceViewTransform {
                         )));
                     }
                     let limit = selection.start().checked_add(selection.size()).ok_or_else(|| {
-                        TypeError::invalid(format!("reference slice limit overflows usize on axis {axis}"))
+                        TypeError::invalid(format!("reference slice limit overflows `usize` on axis {axis}"))
                     })?;
                     if limit > *input_size {
                         return Err(TypeError::invalid(format!(
@@ -126,86 +166,78 @@ impl ArrayReferenceViewTransform {
                     starts.push(selection.start());
                     limits.push(limit);
                 }
-                input
-                    .slice(starts.as_slice(), limits.as_slice(), &vec![1; shape.rank()])
-                    .map_err(|error| TypeError::invalid(error.to_string()))?
-            }
-        };
-        self.validate_reconstruction(input, &output)?;
-        Ok(output)
-    }
-
-    /// Applies this transform to one immutable value snapshot.
-    pub(crate) fn apply<A>(&self, input: &A) -> Result<A, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice,
-    {
-        match self {
-            Self::Index { axis, index } => {
-                let shape = input.r#type().static_shape().unwrap();
-                let mut starts = vec![0; shape.rank()];
-                starts[*axis] = *index;
-                let mut limits = shape.dimensions().to_vec();
-                limits[*axis] = index + 1;
-                let sliced = input.slice(starts.as_slice(), limits.as_slice(), &vec![1; shape.rank()])?;
-                sliced.reshape(Shape::new(
-                    shape
-                        .dimensions()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(candidate, size)| (candidate != *axis).then_some(Dimension::Static(*size)))
-                        .collect(),
-                ))
-            }
-            Self::Slice { axes } => {
-                let starts = axes.iter().map(|axis| axis.start()).collect::<Vec<_>>();
-                let limits = axes.iter().map(|axis| axis.start() + axis.size()).collect::<Vec<_>>();
-                input.slice(starts.as_slice(), limits.as_slice(), &vec![1; axes.len()])
+                Ok(ViewSelection { starts, limits, squeezed_output_shape: None })
             }
         }
     }
 
-    /// Reconstructs `input` after replacing exactly the coordinates selected by this transform.
-    pub(crate) fn replace<A>(&self, input: &A, replacement: &A) -> Result<A, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + UpdateSlice,
-    {
-        match self {
-            Self::Index { axis, index } => {
-                let input_shape = input.r#type().static_shape().unwrap();
-                let mut update_shape = input_shape.dimensions().to_vec();
-                update_shape[*axis] = 1;
-                let replacement =
-                    replacement.reshape(Shape::new(update_shape.into_iter().map(Dimension::Static).collect()))?;
-                let mut starts = vec![0; input_shape.rank()];
-                starts[*axis] = *index;
-                input.update_slice(&replacement, starts.as_slice())
+    /// Returns the exact canonical array type produced from `input`.
+    pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
+        let selection = self.selection(input)?;
+        let sliced = input
+            .slice(selection.starts.as_slice(), selection.limits.as_slice(), &vec![1; selection.starts.len()])
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        let output = match &selection.squeezed_output_shape {
+            Some(shape) => sliced.reshape(shape.clone()).map_err(|error| TypeError::invalid(error.to_string()))?,
+            None => sliced,
+        };
+        self.validate_reconstruction(input, &output, &selection)?;
+        Ok(output)
+    }
+
+    /// Applies this transform to one carried parent value.
+    pub(crate) fn apply_in<C: ViewReadCarrier>(
+        &self,
+        carrier: &mut C,
+        input: &C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let selection = self.selection(&carrier.array_type(input)?)?;
+        let sliced = carrier.slice(input, selection.starts, selection.limits)?;
+        match selection.squeezed_output_shape {
+            Some(shape) => carrier.reshape(&sliced, shape),
+            None => Ok(sliced),
+        }
+    }
+
+    /// Reconstructs the carried parent after replacing exactly the coordinates selected by this transform.
+    pub(crate) fn replace_in<C: ViewWriteCarrier>(
+        &self,
+        carrier: &mut C,
+        input: &C::Value,
+        replacement: &C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let selection = self.selection(&carrier.array_type(input)?)?;
+        match selection.squeezed_output_shape {
+            Some(_) => {
+                let update = carrier.reshape(replacement, selection.update_shape())?;
+                carrier.update_slice(input, &update, selection.starts)
             }
-            Self::Slice { axes } => {
-                let starts = axes.iter().map(|axis| axis.start()).collect::<Vec<_>>();
-                input.update_slice(replacement, starts.as_slice())
-            }
+            None => carrier.update_slice(input, replacement, selection.starts),
         }
     }
 
     /// Proves that updating the selected child reconstructs the exact parent storage type.
-    fn validate_reconstruction(&self, input: &ArrayType, output: &ArrayType) -> Result<(), TypeError> {
-        let reconstructed = match self {
-            Self::Index { axis, .. } => {
-                let input_shape = input.static_shape().unwrap();
-                let mut update_shape = input_shape.dimensions().to_vec();
-                update_shape[*axis] = 1;
-                let update = output
-                    .reshape(Shape::new(update_shape.into_iter().map(Dimension::Static).collect()))
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                input
-                    .update_slice(&update, &vec![0; input.rank()])
-                    .map_err(|error| TypeError::invalid(error.to_string()))?
+    ///
+    /// Shape arithmetic alone cannot guarantee this: [`ArrayType`] also carries layouts, shardings, and other
+    /// metadata whose slice and update-slice derivations are owned by the type system, so this check catches any
+    /// transform whose forward selection and inverse update do not round-trip on that metadata. Because derived
+    /// view types are computed once when a handle or staged view is created, the proof runs once per composition
+    /// step rather than per access.
+    fn validate_reconstruction(
+        &self,
+        input: &ArrayType,
+        output: &ArrayType,
+        selection: &ViewSelection,
+    ) -> Result<(), TypeError> {
+        let update = match selection.squeezed_output_shape {
+            Some(_) => {
+                output.reshape(selection.update_shape()).map_err(|error| TypeError::invalid(error.to_string()))?
             }
-            Self::Slice { axes } => input
-                .update_slice(output, &axes.iter().map(|axis| axis.start()).collect::<Vec<_>>())
-                .map_err(|error| TypeError::invalid(error.to_string()))?,
+            None => output.clone(),
         };
+        let reconstructed = input
+            .update_slice(&update, selection.starts.as_slice())
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
         if &reconstructed == input {
             return Ok(());
         }
@@ -215,7 +247,22 @@ impl ArrayReferenceViewTransform {
     }
 }
 
-/// Ordered coordinate mapping from one array-reference handle back to its shared root.
+/// Immutable coordinate mapping between a shared array-reference root and one derived handle.
+///
+/// The mapping stores validated [`ArrayReferenceViewTransform`] values in root-to-handle order. The empty mapping is
+/// the identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
+/// indexing or slicing an already-derived [`ArrayReference`] composes onto the same shared root rather than creating
+/// another mutable resource.
+///
+/// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
+/// or synchronization state. [`ArrayReference`] pairs it with the identity-bearing shared holder. The view determines
+/// that handle's referent type and selected coordinates; mutations reconstruct the root by applying the inverse update
+/// of each transform in reverse order. Consequently, overlapping handles may select the same root coordinates and
+/// observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
+///
+/// Views currently support composed static indexing and static unit-stride slicing. Derived views cannot themselves
+/// cross attached-region or external runtime state boundaries: pass the root handle across the boundary and recreate
+/// the view within the destination scope.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub struct ArrayReferenceView {
     /// Validated transforms applied from the root outward.
@@ -248,20 +295,8 @@ impl ArrayReferenceView {
             .try_fold(root_type.clone(), |r#type, transform| transform.output_type(&r#type))
     }
 
-    /// Returns this mapping with `transform` appended after validating the complete composition.
-    pub fn with_transform(
-        &self,
-        root_type: &ArrayType,
-        transform: ArrayReferenceViewTransform,
-    ) -> Result<Self, TypeError> {
-        transform.output_type(&self.output_type(root_type)?)?;
-        let mut transforms = self.transforms.clone();
-        transforms.push(transform);
-        Ok(Self { transforms })
-    }
-
-    /// Appends a transform whose local input/output types were validated by its owning operation.
-    pub(crate) fn with_validated_transform(&self, transform: ArrayReferenceViewTransform) -> Self {
+    /// Appends a transform whose local input/output types were already validated by the caller.
+    pub(crate) fn with_transform_unchecked(&self, transform: ArrayReferenceViewTransform) -> Self {
         let mut transforms = self.transforms.clone();
         transforms.push(transform);
         Self { transforms }
@@ -272,7 +307,10 @@ impl ArrayReferenceView {
     where
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
-        self.transforms.iter().try_fold(root.clone(), |value, transform| transform.apply(&value))
+        let mut carrier = EagerViewCarrier(PhantomData);
+        self.transforms
+            .iter()
+            .try_fold(root.clone(), |value, transform| transform.apply_in(&mut carrier, &value))
     }
 
     /// Replaces this view and returns the reconstructed root plus its old view snapshot.
@@ -280,37 +318,122 @@ impl ArrayReferenceView {
     where
         A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
     {
-        let intermediates = self.intermediates(root)?;
+        let mut carrier = EagerViewCarrier(PhantomData);
+        let intermediates = self.intermediates_in(&mut carrier, root.clone())?;
         let old = intermediates.last().unwrap().clone();
-        let reconstructed = self.reconstruct(intermediates.as_slice(), replacement)?;
+        let reconstructed = self.reconstruct_in(&mut carrier, intermediates.as_slice(), replacement.clone())?;
         Ok((reconstructed, old))
     }
 
-    /// Materializes each parent-to-child snapshot once for update reconstruction.
-    fn intermediates<A>(&self, root: &A) -> Result<Vec<A>, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice,
-    {
+    /// Materializes each parent-to-child snapshot once for update reconstruction, in root-to-view order starting
+    /// with `root` itself.
+    pub(crate) fn intermediates_in<C: ViewReadCarrier>(
+        &self,
+        carrier: &mut C,
+        root: C::Value,
+    ) -> Result<Vec<C::Value>, ProgramError> {
         let mut intermediates = Vec::with_capacity(self.transforms.len() + 1);
-        intermediates.push(root.clone());
+        intermediates.push(root);
         for transform in &self.transforms {
-            let child = transform.apply(intermediates.last().unwrap())?;
+            let child = transform.apply_in(carrier, intermediates.last().unwrap())?;
             intermediates.push(child);
         }
         Ok(intermediates)
     }
 
     /// Reconstructs a root from precomputed view intermediates and a replacement leaf.
-    fn reconstruct<A>(&self, intermediates: &[A], replacement: &A) -> Result<A, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + UpdateSlice,
-    {
-        let mut reconstructed = replacement.clone();
+    pub(crate) fn reconstruct_in<C: ViewWriteCarrier>(
+        &self,
+        carrier: &mut C,
+        intermediates: &[C::Value],
+        replacement: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let mut reconstructed = replacement;
         for transform_index in (0..self.transforms.len()).rev() {
-            reconstructed =
-                self.transforms[transform_index].replace(&intermediates[transform_index], &reconstructed)?;
+            reconstructed = self.transforms[transform_index].replace_in(
+                carrier,
+                &intermediates[transform_index],
+                &reconstructed,
+            )?;
         }
         Ok(reconstructed)
+    }
+
+    /// Materializes each parent-to-child eager snapshot once for update reconstruction.
+    fn intermediates<A>(&self, root: &A) -> Result<Vec<A>, ProgramError>
+    where
+        A: Value<Type = ArrayType> + Reshape + Slice,
+    {
+        self.intermediates_in(&mut EagerViewCarrier(PhantomData), root.clone())
+    }
+
+    /// Reconstructs an eager root from precomputed view intermediates and a replacement leaf.
+    fn reconstruct<A>(&self, intermediates: &[A], replacement: &A) -> Result<A, ProgramError>
+    where
+        A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
+    {
+        self.reconstruct_in(&mut EagerViewCarrier(PhantomData), intermediates, replacement.clone())
+    }
+}
+
+/// One value carrier through which a reference view maps between a shared root and one derived handle.
+///
+/// The root-to-view push-forward and the reverse update-slice reconstruction each exist exactly once, on
+/// [`ArrayReferenceView`], generically over this carrier: the eager carrier operates on concrete values with the
+/// array-manipulation capabilities, while reference discharge stages the identical instruction sequence into a
+/// program builder. Keeping one traversal guarantees the staged and eager semantics cannot drift apart.
+pub(crate) trait ViewReadCarrier {
+    /// Value representation carried through the traversal.
+    type Value;
+
+    /// Returns the carried value's array type.
+    fn array_type(&self, value: &Self::Value) -> Result<ArrayType, ProgramError>;
+
+    /// Slices one unit-stride hyper-rectangle out of `input`.
+    fn slice(
+        &mut self,
+        input: &Self::Value,
+        starts: Vec<usize>,
+        limits: Vec<usize>,
+    ) -> Result<Self::Value, ProgramError>;
+
+    /// Reshapes `input` to `shape`.
+    fn reshape(&mut self, input: &Self::Value, shape: Shape) -> Result<Self::Value, ProgramError>;
+}
+
+/// A [`ViewReadCarrier`] that can also write a selected hyper-rectangle back into its parent.
+pub(crate) trait ViewWriteCarrier: ViewReadCarrier {
+    /// Returns `target` with `update` written at `starts`.
+    fn update_slice(
+        &mut self,
+        target: &Self::Value,
+        update: &Self::Value,
+        starts: Vec<usize>,
+    ) -> Result<Self::Value, ProgramError>;
+}
+
+/// Stateless eager carrier over one concrete array value family.
+struct EagerViewCarrier<A>(PhantomData<A>);
+
+impl<A: Value<Type = ArrayType> + Reshape + Slice> ViewReadCarrier for EagerViewCarrier<A> {
+    type Value = A;
+
+    fn array_type(&self, value: &A) -> Result<ArrayType, ProgramError> {
+        Ok(value.r#type().into_owned())
+    }
+
+    fn slice(&mut self, input: &A, starts: Vec<usize>, limits: Vec<usize>) -> Result<A, ProgramError> {
+        input.slice(starts.as_slice(), limits.as_slice(), &vec![1; starts.len()])
+    }
+
+    fn reshape(&mut self, input: &A, shape: Shape) -> Result<A, ProgramError> {
+        input.reshape(shape)
+    }
+}
+
+impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrier for EagerViewCarrier<A> {
+    fn update_slice(&mut self, target: &A, update: &A, starts: Vec<usize>) -> Result<A, ProgramError> {
+        target.update_slice(update, starts.as_slice())
     }
 }
 
@@ -321,31 +444,26 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
 
     /// Ordered mapping from the shared root to this handle's referent.
     view: ArrayReferenceView,
+
+    /// Exact handle type derived once from the root type and view, so that repeated [`r#type`](Typed::type) calls
+    /// stay
+    /// borrow-cheap instead of re-deriving the complete transform chain.
+    r#type: ReferenceType<ArrayType>,
 }
 
 impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// Creates a new root reference initialized with `value`.
     #[inline]
     pub fn new(value: A) -> Self {
-        Self { root: Reference::new(value), view: ArrayReferenceView::root() }
+        let root = Reference::new(value);
+        let r#type = root.r#type().into_owned();
+        Self { root, view: ArrayReferenceView::root(), r#type }
     }
 
     /// Returns this shared holder's process-local identity.
     #[inline]
     pub fn id(&self) -> ReferenceId {
         self.root.id()
-    }
-
-    /// Returns this handle's root-relative view mapping.
-    #[inline]
-    pub fn view(&self) -> &ArrayReferenceView {
-        &self.view
-    }
-
-    /// Returns whether this handle denotes the complete root value.
-    #[inline]
-    pub fn is_root(&self) -> bool {
-        self.view.is_root()
     }
 
     /// Returns whether this is an unrenamed root handle accepted at a backend runtime state boundary.
@@ -364,12 +482,23 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.root.lock().map_err(ProgramError::custom)
     }
 
+    /// Waits until an unrenamed root has left its short submitted-before-install reservation window.
+    #[doc(hidden)]
+    pub fn wait_until_runtime_accessible(&self) -> Result<(), ProgramError> {
+        if !self.is_runtime_root_handle() {
+            return Err(ProgramError::custom(ArrayReferenceViewError::InvalidRuntimeRoot));
+        }
+        self.root.wait_until_accessible().map_err(ProgramError::custom)
+    }
+
     /// Returns a derived handle after appending `transform` without creating a resource.
     pub fn with_transform(&self, transform: ArrayReferenceViewTransform) -> Result<Self, ProgramError> {
         self.root.validate_live().map_err(ProgramError::custom)?;
-        let root_type = self.root.r#type();
-        let view = self.view.with_transform(root_type.referent(), transform)?;
-        Ok(Self { root: self.root.clone(), view })
+        // The cached handle type already reflects every earlier transform, so composition validates and derives
+        // incrementally instead of re-folding the complete chain from the root type.
+        let referent = transform.output_type(self.r#type.referent())?;
+        let view = self.view.with_transform_unchecked(transform);
+        Ok(Self { root: self.root.clone(), view, r#type: ReferenceType::new(referent) })
     }
 
     /// Returns an immutable root snapshot without requiring array-manipulation capabilities.
@@ -388,6 +517,21 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.view.apply(&self.root.read().map_err(ProgramError::custom)?)
     }
 
+    /// Validates that `value` exactly matches this handle's derived referent type. The root paths inherit this rule
+    /// from the shared holder, but derived-view mutations must enforce it themselves: the update-slice reconstruction
+    /// only requires the written value to fit inside the selected coordinates, so a smaller replacement would
+    /// otherwise silently write a partial update.
+    fn validate_view_referent_type(&self, value: &A) -> Result<(), ProgramError> {
+        let actual = value.r#type();
+        if actual.as_ref() == self.r#type.referent() {
+            return Ok(());
+        }
+        Err(ProgramError::custom(ReferenceError::ReferentTypeMismatch {
+            expected: self.r#type.referent().to_string(),
+            actual: actual.to_string(),
+        }))
+    }
+
     /// Replaces this handle's selected coordinates and returns their previous snapshot.
     pub fn swap(&self, replacement: A) -> Result<A, ProgramError>
     where
@@ -396,10 +540,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if self.view.is_root() {
             return self.root.swap(replacement).map_err(ProgramError::custom);
         }
-        self.root.update_with_result(|current| {
-            let (updated, old) = self.view.swap(current, &replacement)?;
-            Ok((updated, old))
-        })
+        self.validate_view_referent_type(&replacement)?;
+        self.root.update_with_result(|current| self.view.swap(current, &replacement))
     }
 
     /// Adds `update` into this handle's selected coordinates.
@@ -414,6 +556,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             let intermediates = self.view.intermediates(current)?;
             let current_view = intermediates.last().unwrap();
             let updated_view = current_view.add(update)?;
+            self.validate_view_referent_type(&updated_view)?;
             self.view.reconstruct(intermediates.as_slice(), &updated_view)
         })
     }
@@ -432,15 +575,15 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         let root = self.root.rename_type_identities(renaming)?;
-        self.view.output_type(root.r#type().referent())?;
-        Ok(Self { root, view: self.view.clone() })
+        let referent = self.view.output_type(root.r#type().referent())?;
+        Ok(Self { root, view: self.view.clone(), r#type: ReferenceType::new(referent) })
     }
 }
 
 impl<A: Value<Type = ArrayType>> Clone for ArrayReference<A> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { root: self.root.clone(), view: self.view.clone() }
+        Self { root: self.root.clone(), view: self.view.clone(), r#type: self.r#type.clone() }
     }
 }
 
@@ -476,10 +619,212 @@ impl<A: Value<Type = ArrayType>> Hash for ArrayReference<A> {
 
 impl<A: Value<Type = ArrayType>> Parameter for ArrayReference<A> {}
 
+// The cached type is derived deterministically from the root type and view at construction, so equality and hashing
+// over `(root, view)` remain consistent with it.
 impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
     type Type = ReferenceType<ArrayType>;
 
     fn r#type(&self) -> Cow<'_, Self::Type> {
-        Cow::Owned(ReferenceType::new(self.view.output_type(self.root.r#type().referent()).unwrap()))
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::arrays::Array;
+    use crate::arrays::types::data::DataType;
+
+    use super::*;
+
+    #[test]
+    fn test_array_reference_view_transform_rejects_invalid_selections() {
+        let matrix_type = ArrayType::new_static(DataType::F32, [3, 4]);
+        let vector_type = ArrayType::new_static(DataType::F32, [3]);
+
+        // Static indexing selects one existing coordinate on one existing axis.
+        assert_eq!(
+            ArrayReferenceViewTransform::Index { axis: 2, index: 0 }.output_type(&matrix_type),
+            Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
+        );
+        assert_eq!(
+            ArrayReferenceViewTransform::Index { axis: 0, index: 3 }.output_type(&matrix_type),
+            Err(TypeError::invalid("reference index 3 on axis 0 is out of bounds for size 3")),
+        );
+
+        // Static slicing is rank-preserving, so it declares exactly one unit-stride selection per input axis and
+        // stays inside every axis of the input.
+        assert_eq!(
+            ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }.output_type(&matrix_type),
+            Err(TypeError::invalid("reference slice has 1 axes but its input has rank 2")),
+        );
+        assert_eq!(
+            ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 2)] }.output_type(&vector_type),
+            Err(TypeError::invalid(
+                "reference slice axis 0 stride must be 1 until scatter-backed strided updates are supported",
+            )),
+        );
+        assert_eq!(
+            ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(2, 3, 1)] }.output_type(&vector_type),
+            Err(TypeError::invalid("reference slice on axis 0 with start 2 and size 3 exceeds input size 3")),
+        );
+
+        // The exclusive limit is computed as `start + size`, so an unrepresentable limit is rejected before it can
+        // wrap around into an apparently valid selection.
+        assert_eq!(
+            ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(usize::MAX, 1, 1)] }
+                .output_type(&vector_type),
+            Err(TypeError::invalid("reference slice limit overflows `usize` on axis 0")),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_view_composition() {
+        let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
+        let root = ArrayReferenceView::root();
+        assert!(root.is_root());
+        assert!(root.transforms().is_empty());
+        assert_eq!(root.output_type(&root_type), Ok(root_type.clone()));
+
+        // Each transform applies to the preceding view, so the slice narrows both axes and the index then removes
+        // the leading axis of the already-narrowed view.
+        let slice = ArrayReferenceViewTransform::Slice {
+            axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)],
+        };
+        let index = ArrayReferenceViewTransform::Index { axis: 0, index: 1 };
+        let sliced = root.with_transform_unchecked(slice.clone());
+        let indexed = sliced.with_transform_unchecked(index.clone());
+        assert!(!sliced.is_root());
+        assert_eq!(sliced.transforms(), &[slice.clone()]);
+        assert_eq!(sliced.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [2, 3])));
+        assert_eq!(indexed.transforms(), &[slice.clone(), index.clone()]);
+        assert_eq!(indexed.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [3])));
+
+        // Composition validates each appended transform against the preceding view's derived type, so an
+        // out-of-bounds coordinate of the derived view is rejected even though it exists in the root.
+        let handle = ArrayReference::new(Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect()))
+            .with_transform(slice.clone())
+            .unwrap();
+        assert_eq!(
+            handle.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 2 }).unwrap_err(),
+            TypeError::invalid("reference index 2 on axis 0 is out of bounds for size 2").into(),
+        );
+
+        // Equality and hashing distinguish transform sequences, including the two orders of the same two transforms.
+        let reversed = root
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 })
+            .with_transform_unchecked(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] });
+        assert_eq!(indexed, indexed.clone());
+        assert_ne!(indexed, sliced);
+        assert_ne!(indexed, reversed);
+        assert_eq!(indexed.output_type(&root_type), reversed.output_type(&root_type));
+        let views = HashMap::from([
+            (root.clone(), "root"),
+            (sliced.clone(), "sliced"),
+            (indexed.clone(), "indexed"),
+            (reversed.clone(), "reversed"),
+        ]);
+        assert_eq!(views.len(), 4);
+        assert_eq!(views.get(&indexed), Some(&"indexed"));
+        assert_eq!(views.get(&reversed), Some(&"reversed"));
+    }
+
+    #[test]
+    fn test_array_reference_read_requires_the_root_handle() {
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let derived = root
+            .with_transform(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
+            .unwrap();
+
+        // The bound-free accessor returns the complete root snapshot and rejects every derived handle, because
+        // selecting a view requires the array-manipulation capabilities that this accessor deliberately does not bind.
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(
+            derived.read().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
+            Some(&ArrayReferenceViewError::CannotReadViewDirectly),
+        );
+        assert_eq!(
+            derived.read().unwrap_err().to_string(),
+            "cannot read a reference view directly; use array reference operations instead",
+        );
+    }
+
+    #[test]
+    fn test_array_reference_view_mutation_requires_the_exact_derived_referent_type() {
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let view = root
+            .with_transform(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] })
+            .unwrap();
+
+        // The update-slice reconstruction only requires the written value to fit inside the selected coordinates, so
+        // the derived handle enforces exact referent equality itself and leaves the shared root untouched.
+        let error = view.swap(Array::vector(vec![10.0_f32, 20.0])).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ReferentTypeMismatch {
+                expected: "f32[3]".to_string(),
+                actual: "f32[2]".to_string(),
+            }),
+        );
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+
+        // An additive update whose result type drifts away from the view's element data type is rejected by the same
+        // check, after the addition itself succeeded, so the holder still retains its previous value.
+        let error = view.add_update(&Array::vector(vec![1.0_f64, 2.0, 3.0])).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ReferentTypeMismatch {
+                expected: "f32[3]".to_string(),
+                actual: "f64[3]".to_string(),
+            }),
+        );
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+
+        // A replacement of exactly the derived type returns the previous view snapshot and writes back into exactly
+        // the selected root coordinates.
+        assert_eq!(view.swap(Array::vector(vec![10.0_f32, 20.0, 30.0])), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
+    }
+
+    #[test]
+    fn test_array_reference_composed_index_of_slice_update_reconstructs_the_root() {
+        let root_type = ArrayType::new_static(DataType::F32, [3, 3]);
+        let root = ArrayReference::new(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect()));
+        let view = root
+            .with_transform(ArrayReferenceViewTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
+            })
+            .unwrap()
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 1 })
+            .unwrap();
+        assert_eq!(view.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+
+        // The composed mapping selects row 2 of the sliced view, which is the leading pair of the root's last row, so
+        // the additive update writes back through both view steps and leaves every other coordinate unchanged.
+        view.add_update(&Array::vector(vec![10.0_f32, 20.0])).unwrap();
+        assert_eq!(root.read(), Ok(Array::from_f64s(root_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 17.0, 28.0, 9.0])),);
+    }
+
+    #[test]
+    fn test_array_reference_caches_its_derived_type() {
+        let root_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let root = ArrayReference::new(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let slice = ArrayReferenceViewTransform::Slice {
+            axes: vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)],
+        };
+        let index = ArrayReferenceViewTransform::Index { axis: 0, index: 1 };
+        let handle = root.with_transform(slice.clone()).unwrap().with_transform(index.clone()).unwrap();
+
+        // Composition derives each handle type incrementally, which must agree with folding the complete mapping
+        // over the root type in one step.
+        let view = ArrayReferenceView::root().with_transform_unchecked(slice).with_transform_unchecked(index);
+        assert_eq!(root.r#type().as_ref(), &ReferenceType::new(root_type.clone()));
+        assert_eq!(handle.r#type().as_ref(), &ReferenceType::new(view.output_type(&root_type).unwrap()));
+        assert_eq!(handle.clone().r#type(), handle.r#type());
+        assert_eq!(handle.to_string(), "ref<f32[2]>");
+        assert_eq!(root.to_string(), "ref<f32[2, 3]>");
     }
 }

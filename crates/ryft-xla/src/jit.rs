@@ -10,9 +10,71 @@
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 //!
 //! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array-reference
-//! holders. Stateful calls hold every participating root transaction through execution completion, install hidden
-//! final state before reconstructing public outputs, and return the completion-bearing [`ReferenceExecution`] shape;
-//! Phase 9 performs that transaction synchronously, so the wrapper is already complete when returned.
+//! holders. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
+//! after submission, install hidden final states without holding host mutexes through device execution, and return a
+//! [`ReferenceExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
+//! protocol.
+//!
+//! # External Reference ABI
+//!
+//! The stateful surface is experimental. Its names and serialized executable metadata may change while external
+//! automatic differentiation and preserved-kernel semantics remain under development. Ordinary array-only staging,
+//! compilation, and execution are unaffected.
+//!
+//! Reference lowering opens each external holder as an ordinary array input. A read-only holder has no hidden result.
+//! A mutated holder gains one hidden final-state output after the public output prefix, and the runtime installs that
+//! value atomically into the same holder after execution. The entry argument also receives a `tf.aliasing_output`
+//! relation to the hidden result. That relation is a non-semantic may-alias hint: it permits, but never requires,
+//! backend buffer reuse, and it never promises physical in-place mutation. Reference-state inputs are themselves never
+//! donated, so their holders keep the snapshot they passed in, and correctness always comes from installing the
+//! returned final value. Read snapshots and retained initializers consequently remain immutable even when a backend
+//! chooses to reuse storage.
+//!
+//! Calls reject unsupported state before launch. The admitted boundary is device-memory state on a fully addressable,
+//! single-process mesh: static references may be replicated or sharded with identical input/final-state sharding;
+//! finite bounded-dynamic references are read-only and replicated. Zero-space, host-memory, unbounded-dynamic,
+//! dynamic nonreplicated, input-bucketed, foreign/non-addressable-mesh, multi-host, and bounded-dynamic mutation cases
+//! are rejected. Reference arguments must be distinct root handles; views remain an internal program construct and
+//! are discharged before this boundary.
+//!
+//! # Stateful Call Shape
+//!
+//! ```text
+//! compile_statefully(|(state, update)| {
+//!     old = state.swap(update)
+//!     return old                       // public result
+//! })
+//!
+//! call_statefully((holder, update))
+//!     -> execute(array(holder), update)
+//!     -> receive(old, hidden_final_state)
+//!     -> install hidden_final_state into holder
+//!     -> return old
+//!
+//! compile_statefully_with_captures(
+//!     |captures, input| captures[0].add_update(input),
+//!     captures = [holder],
+//! )
+//! call_statefully(input)
+//!     -> lift holder as the leading executable input
+//!     -> install its hidden final state through the same transaction
+//! ```
+//!
+//! Captured holders use the same protocol after capture lifting and cannot also appear as public arguments. Calls
+//! that use the same mutable holder dependency-chain their generations; read-only calls publish leases and may
+//! overlap. Dropping [`ReferenceExecution`] does not cancel work. Awaiting it reports whole-invocation failure. A
+//! failure between submission handoff and hidden-state installation poisons the complete affected mutation group so
+//! later holder access cannot silently observe stale state; poisoning is terminal there because no buffer can be
+//! proven current after that boundary, and recovery requires constructing a new holder from independently trusted
+//! state. Once the hidden final states are installed the pending generations are disarmed, so a later failure—such as
+//! public-output reconstruction—surfaces as an ordinary error while the installed holder state stays valid.
+//!
+//! Local references—including local views and references inside supported conditions, bounded loops, scans, and
+//! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
+//! lowering and do not change the public ABI. Local-reference batching and automatic differentiation likewise
+//! discharge first. External reference AD, mapped/shared reference batching, custom-derivative rule references,
+//! externally stateful rematerialization, and preserved references outside the experimental kernel boundary are
+//! rejected explicitly.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -34,14 +96,15 @@ use crate::experimental::domains::XlaCompiledProgram;
 use crate::experimental::ops::{XlaConstant, XlaOperation};
 use crate::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction, Array, XlaDomain, XlaOptions};
 
-/// Composite tracer retained by the production XLA program.
+/// Composite tracer retained by the experimental stateful XLA program.
+///
+/// # Stability
+///
+/// This alias is experimental while the external-reference ABI is evolving.
 pub type XlaStatefulCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, ArrayIrValue<Array<'c>>>>;
 
-/// Internal name for the production composite tracer.
-type XlaProgramTracer<'c> = XlaStatefulCompileTracer<'c>;
-
 /// Tracer leaf exposed by the public array-only XLA compilation facade.
-pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaProgramTracer<'c>>;
+pub type XlaCompileTracer<'c> = ProjectedValue<ArrayType, XlaStatefulCompileTracer<'c>>;
 
 /// Internal reparameterization of one public array parameter tree into the production composite type family.
 type XlaProgramParameters<P> = <P as Parameterized<ArrayType>>::To<ArrayIrType>;
@@ -53,6 +116,10 @@ type XlaProgramParameterValues<P, V> = <XlaProgramParameters<P> as Parameterized
 type XlaProgramConstants<P> = XlaProgramParameterValues<P, XlaConstant>;
 
 /// Heterogeneous XLA runtime value used by the stateful compilation facade.
+///
+/// # Stability
+///
+/// This alias is experimental while the external-reference ABI is evolving.
 pub type XlaStatefulValue<'c> = ArrayIrValue<Array<'c>>;
 
 /// Traced output tree produced by one heterogeneous stateful XLA closure.
@@ -61,16 +128,13 @@ type XlaStatefulTraceOutput<'c, P> = <P as Parameterized<ArrayIrType>>::To<XlaSt
 /// Fallible traced output of one heterogeneous stateful XLA closure.
 type XlaStatefulTraceResult<'c, P> = Result<XlaStatefulTraceOutput<'c, P>, XlaDomainError>;
 
-/// Concrete runtime value retained by the production composite domain.
-type XlaProgramValue<'c> = XlaStatefulValue<'c>;
-
 /// Projects one internal composite tracer tree to the public array-only tracer tree.
 fn project_tracers<'c, P>(
-    values: XlaProgramParameterValues<P, XlaProgramTracer<'c>>,
+    values: XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>,
 ) -> Result<P::To<XlaCompileTracer<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
-    P::Family: ParameterizedFamily<XlaProgramTracer<'c>>
+    P::Family: ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>
         + ParameterizedFamily<ArrayIrType>,
 {
@@ -87,16 +151,16 @@ where
 /// Lifts one public array-only tracer tree back into the internal composite tracer tree.
 fn lift_tracers<'c, P>(
     values: P::To<XlaCompileTracer<'c>>,
-) -> Result<XlaProgramParameterValues<P, XlaProgramTracer<'c>>, XlaDomainError>
+) -> Result<XlaProgramParameterValues<P, XlaStatefulCompileTracer<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
     P::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values.into_parameters().map(ProjectedValue::into_value);
-    XlaProgramParameterValues::<P, XlaProgramTracer<'c>>::from_parameters(structure, parameters)
+    XlaProgramParameterValues::<P, XlaStatefulCompileTracer<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
@@ -104,27 +168,27 @@ where
 /// Lifts one public runtime array tree into the production composite value family.
 fn lift_arrays<'c, P>(
     values: P::To<Array<'c>>,
-) -> Result<XlaProgramParameterValues<P, XlaProgramValue<'c>>, XlaDomainError>
+) -> Result<XlaProgramParameterValues<P, XlaStatefulValue<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
     P::Family:
-        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaProgramValue<'c>>,
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<Array<'c>> + ParameterizedFamily<XlaStatefulValue<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values.into_parameters().map(ArrayIrValue::Array);
-    XlaProgramParameterValues::<P, XlaProgramValue<'c>>::from_parameters(structure, parameters)
+    XlaProgramParameterValues::<P, XlaStatefulValue<'c>>::from_parameters(structure, parameters)
         .map_err(ProgramError::from)
         .map_err(Into::into)
 }
 
 /// Projects one production composite output tree back to public runtime arrays.
 fn project_arrays<'c, P>(
-    values: XlaProgramParameterValues<P, XlaProgramValue<'c>>,
+    values: XlaProgramParameterValues<P, XlaStatefulValue<'c>>,
 ) -> Result<P::To<Array<'c>>, XlaDomainError>
 where
     P: Parameterized<ArrayType>,
     P::Family:
-        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaProgramValue<'c>> + ParameterizedFamily<Array<'c>>,
+        ParameterizedFamily<ArrayIrType> + ParameterizedFamily<XlaStatefulValue<'c>> + ParameterizedFamily<Array<'c>>,
 {
     let structure = values.parameter_structure();
     let parameters = values
@@ -182,14 +246,14 @@ where
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<XlaProgramValue<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulValue<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<Array<'c>>
-        + ParameterizedFamily<XlaProgramValue<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulValue<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
     /// Calls this dispatcher with public array inputs and projects its composite runtime outputs back to arrays.
     pub fn call(
@@ -201,14 +265,14 @@ where
         XlaOptions: Clone,
         F: Fn(
             Static,
-            XlaProgramParameterValues<In, XlaProgramTracer<'c>>,
-        ) -> Result<XlaProgramParameterValues<Out, XlaProgramTracer<'c>>, XlaDomainError>,
+            XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
+        ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
         XlaProgramParameters<In>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<In>>,
         XlaProgramParameters<Out>: Parameterized<ArrayIrType, To<ArrayIrType> = XlaProgramParameters<Out>>,
-        XlaProgramParameterValues<In, XlaProgramValue<'c>>:
-            Parameterized<XlaProgramValue<'c>, To<ArrayIrType> = XlaProgramParameters<In>>,
-        XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-                XlaProgramTracer<'c>,
+        XlaProgramParameterValues<In, XlaStatefulValue<'c>>:
+            Parameterized<XlaStatefulValue<'c>, To<ArrayIrType> = XlaProgramParameters<In>>,
+        XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+                XlaStatefulCompileTracer<'c>,
                 To<ArrayIrType> = XlaProgramParameters<Out>,
                 To<XlaConstant> = XlaProgramConstants<Out>,
             >,
@@ -233,8 +297,8 @@ pub fn try_jitted_with_options<'c, F, Static, In, Out>(
     'c,
     impl Fn(
         Static,
-        XlaProgramParameterValues<In, XlaProgramTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaProgramTracer<'c>>, XlaDomainError>,
+        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
+    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     Static,
     In,
     Out,
@@ -246,12 +310,12 @@ where
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     let function = move |static_parameters, inputs| {
@@ -270,8 +334,8 @@ pub fn jitted_with_options<'c, F, Static, In, Out>(
     'c,
     impl Fn(
         Static,
-        XlaProgramParameterValues<In, XlaProgramTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaProgramTracer<'c>>, XlaDomainError>,
+        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
+    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     Static,
     In,
     Out,
@@ -283,12 +347,12 @@ where
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     try_jitted_with_options(move |static_parameters, inputs| Ok(function(static_parameters, inputs)), domain, options)
@@ -304,8 +368,8 @@ pub fn jitted<'c, F, Static, In, Out>(
     'c,
     impl Fn(
         Static,
-        XlaProgramParameterValues<In, XlaProgramTracer<'c>>,
-    ) -> Result<XlaProgramParameterValues<Out, XlaProgramTracer<'c>>, XlaDomainError>,
+        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>,
+    ) -> Result<XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>, XlaDomainError>,
     Static,
     In,
     Out,
@@ -317,18 +381,31 @@ where
     In::ParameterStructure: Eq + Hash,
     In::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
     Out: Parameterized<ArrayType>,
     Out::Family: ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>
         + ParameterizedFamily<XlaCompileTracer<'c>>,
 {
     jitted_with_options(function, domain, XlaOptions::new(mesh))
 }
 
 /// Retained heterogeneous XLA JIT dispatcher whose calls may bind external reference holders.
+///
+/// The dispatcher retains one compiled specialization per static-parameter and input-type combination, exactly like
+/// the array-only JIT surface, but its boundary is the heterogeneous [`XlaStatefulValue`] family: reference-typed
+/// leaves bind live [`ryft_core::ArrayReference`] holders at call time instead of immutable arrays. Every reference
+/// leaf must be an unrenamed root handle whose type refines the effective compiled boundary, including its declared
+/// sharding and memory. A read-only bounded-dynamic holder may refine its finite replicated declaration. The runtime
+/// snapshots every holder, releases the holder locks at the backend submission handoff, and publishes
+/// completion-bearing read leases or hidden final states before public outputs are exposed.
+///
+/// # Stability
+///
+/// This external-state surface is experimental. Ordinary [`JittedXlaFunction`] calls remain the stable array-only
+/// boundary.
 pub struct StatefulJittedXlaFunction<
     'c,
     F,
@@ -384,6 +461,12 @@ where
         Parameterized<XlaStatefulCompileTracer<'c>, To<ArrayIrType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
 {
     /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
+    ///
+    /// The call snapshots every bound holder in ascending identity order, completes fallible preparation without
+    /// retaining holder locks, and revalidates holder generations before submission. It waits for the asynchronous
+    /// completion returned by [`Self::call_statefully_async`], so completion errors are reported and read-only leases
+    /// have completed before it returns. Mutated holders reconcile their ready or poisoned state lazily on their next
+    /// access.
     pub fn call_statefully(
         &self,
         static_parameters: Static,
@@ -400,6 +483,10 @@ where
     }
 
     /// Returns the completion-bearing stateful call shape for one retained specialization.
+    ///
+    /// The returned [`ReferenceExecution`] may already carry reconstructed public outputs backed by pending device
+    /// values; awaiting it observes whole-invocation completion, including asynchronous execution errors that would
+    /// otherwise surface only through holder poisoning. Dropping the result never cancels submitted work.
     pub fn call_statefully_async(
         &self,
         static_parameters: Static,
@@ -423,6 +510,10 @@ where
 }
 
 /// Constructs a retained stateful dispatcher for a fallible heterogeneous XLA closure.
+///
+/// # Stability
+///
+/// This external-state entry point is experimental.
 pub fn try_jitted_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &XlaDomain<'c>,
@@ -448,6 +539,10 @@ where
 }
 
 /// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure.
+///
+/// # Stability
+///
+/// This external-state entry point is experimental.
 pub fn jitted_statefully_with_options<'c, F, Static, In, Out>(
     function: F,
     domain: &XlaDomain<'c>,
@@ -480,6 +575,10 @@ where
 }
 
 /// Constructs a retained stateful dispatcher for an infallible heterogeneous XLA closure on `mesh`.
+///
+/// # Stability
+///
+/// This external-state entry point is experimental.
 #[inline]
 pub fn jitted_statefully<'c, F, Static, In, Out>(
     function: F,
@@ -509,6 +608,17 @@ where
 }
 
 /// Compiled heterogeneous XLA function whose invocation may bind external reference holders.
+///
+/// This is the ahead-of-time counterpart of [`StatefulJittedXlaFunction`] for one fixed signature: reference-typed
+/// input leaves bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled
+/// boundary, including its declared sharding and memory. Read-only bounded-dynamic holders may refine finite
+/// replicated declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous
+/// publication, and completion protocol as the retained dispatcher.
+///
+/// # Stability
+///
+/// This external-state surface is experimental. Ordinary [`CompiledXlaFunction`] calls remain the stable array-only
+/// boundary.
 pub struct StatefulCompiledXlaFunction<'c, In: Parameterized<ArrayIrType>, Out: Parameterized<ArrayIrType>>
 where
     In::Family: ParameterizedFamily<XlaConstant>,
@@ -520,12 +630,13 @@ where
 
 impl<'c, In, Out> StatefulCompiledXlaFunction<'c, In, Out>
 where
-    In: Parameterized<ArrayIrType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaProgramValue<'c>>>,
-    Out:
-        Parameterized<ArrayIrType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaProgramValue<'c>>>,
-    In::To<XlaProgramValue<'c>>: Parameterized<XlaProgramValue<'c>>,
-    Out::To<XlaProgramValue<'c>>:
-        Parameterized<XlaProgramValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    In: Parameterized<ArrayIrType>,
+    Out: Parameterized<ArrayIrType>,
+    In::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulValue<'c>>,
+    Out::Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaStatefulValue<'c>>,
+    In::To<XlaStatefulValue<'c>>: Parameterized<XlaStatefulValue<'c>>,
+    Out::To<XlaStatefulValue<'c>>:
+        Parameterized<XlaStatefulValue<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
 {
     /// Returns the runtime-only executable handle.
     #[inline]
@@ -533,7 +644,11 @@ where
         self.function.executable_function()
     }
 
-    /// Executes synchronously and returns public outputs after holder installation.
+    /// Executes synchronously and returns public outputs after holder completion.
+    ///
+    /// The call waits for the completion-bearing protocol after pending holder state and read leases are published.
+    /// A failed completion therefore cannot leave silently stale holder state behind. Refer to the documentation of
+    /// [`StatefulJittedXlaFunction::call_statefully`] for the complete transaction contract.
     pub fn call_statefully(
         &self,
         domain: &XlaDomain<'c>,
@@ -542,7 +657,10 @@ where
         call_function_statefully(domain, self.function.executable_function(), inputs)
     }
 
-    /// Returns the completion-bearing stateful call shape, already completed by the synchronous Phase 9 runtime.
+    /// Submits a stateful call and returns its non-cancelling completion-bearing result.
+    ///
+    /// Refer to the documentation of [`StatefulJittedXlaFunction::call_statefully_async`] for the completion and
+    /// error-observation contract.
     pub fn call_statefully_async(
         &self,
         domain: &XlaDomain<'c>,
@@ -551,7 +669,8 @@ where
         call_function_statefully_async(domain, self.function.executable_function(), inputs)
     }
 
-    /// Returns the public flat output types.
+    /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
+    /// discharge appends for mutated external holders.
     #[inline]
     pub fn output_types(&self) -> &[ArrayIrType] {
         self.function.executable_function().output_types()
@@ -559,6 +678,10 @@ where
 }
 
 /// Compiles one heterogeneous signature for stateful invocation.
+///
+/// # Stability
+///
+/// This external-state entry point is experimental.
 pub fn compile_statefully<'domain, 'c: 'domain, F, In, Out>(
     function: F,
     input_types: In,
@@ -579,6 +702,11 @@ where
 }
 
 /// Compiles one heterogeneous signature with explicit array or reference captures for stateful invocation.
+///
+/// # Stability
+///
+/// This external-state entry point is experimental. A captured reference participates in the same holder transaction
+/// as a public reference input and cannot alias any other capture or public argument in the invocation.
 pub fn compile_statefully_with_captures<'domain, 'c: 'domain, F, In, Out>(
     function: F,
     captures: Vec<XlaStatefulValue<'c>>,
@@ -652,7 +780,7 @@ where
     pub fn source_program(
         &self,
     ) -> &ClosedProgram<
-        XlaProgramValue<'c>,
+        XlaStatefulValue<'c>,
         XlaConstant,
         XlaOperation,
         XlaProgramConstants<In>,
@@ -677,7 +805,7 @@ where
     where
         V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
         V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Capture = XlaProgramValue<'c>>
+            + CapturingContext<Capture = XlaStatefulValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
         Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -792,14 +920,14 @@ impl<'c> XlaDomain<'c> {
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<XlaProgramValue<'c>>,
+                            + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<XlaProgramValue<'c>>,
+                            + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
@@ -820,18 +948,23 @@ impl<'c> XlaDomain<'c> {
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<XlaProgramValue<'c>>,
+                            + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out: Parameterized<
                 ArrayType,
                 Family: ParameterizedFamily<ArrayIrType>
                             + ParameterizedFamily<XlaConstant>
                             + ParameterizedFamily<Array<'c>>
-                            + ParameterizedFamily<XlaProgramValue<'c>>,
+                            + ParameterizedFamily<XlaStatefulValue<'c>>,
             >,
         Out::To<Array<'c>>:
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
+        if executable.function.compiled_program().requires_stateful_call() {
+            return Err(XlaDomainError::UnsupportedReferenceAbi {
+                reason: "external reference state requires `call_statefully`".to_string(),
+            });
+        }
         let flat_inputs = lift_arrays::<In>(inputs)?.into_parameters().collect::<Vec<_>>();
         executable.function.validate_flat_input_count(flat_inputs.as_slice())?;
         for (expected, actual) in executable.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
@@ -1048,7 +1181,7 @@ where
     pub fn source_program(
         &self,
     ) -> &ClosedProgram<
-        XlaProgramValue<'c>,
+        XlaStatefulValue<'c>,
         XlaConstant,
         XlaOperation,
         XlaProgramConstants<In>,
@@ -1075,7 +1208,7 @@ where
     where
         V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
         V::DispatchDomain: Context<Type = ArrayIrType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Capture = XlaProgramValue<'c>>
+            + CapturingContext<Capture = XlaStatefulValue<'c>>
             + Constant<V, XlaConstant>,
         In::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
         Out::Family: ParameterizedFamily<V> + ParameterizedFamily<ProjectedValue<ArrayType, V>>,
@@ -1092,7 +1225,7 @@ where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
 {
     /// Returns a new compiled function that computes the reverse-mode gradient of `self` with
@@ -1125,8 +1258,8 @@ where
                 To<ArrayType> = In,
                 To<XlaConstant> = In::To<XlaConstant>,
             >,
-        XlaProgramParameterValues<In, XlaProgramTracer<'c>>: Parameterized<
-                XlaProgramTracer<'c>,
+        XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>: Parameterized<
+                XlaStatefulCompileTracer<'c>,
                 To<ArrayIrType> = XlaProgramParameters<In>,
                 To<XlaConstant> = XlaProgramConstants<In>,
             >,
@@ -1210,12 +1343,12 @@ where
     In::Family: ParameterizedFamily<ArrayType, To = In>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: std::fmt::Debug + Hash + PartialEq,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
 {
     /// Returns a new compiled function that computes the forward-mode JVP of `self`. Mirrors
     /// `jax.jvp(f, primals, tangents)` packaged into one compiled function: the returned handle
@@ -1250,8 +1383,8 @@ where
                 To<ArrayType> = Out,
                 To<XlaConstant> = Out::To<XlaConstant>,
             >,
-        XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-                XlaProgramTracer<'c>,
+        XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+                XlaStatefulCompileTracer<'c>,
                 To<ArrayIrType> = XlaProgramParameters<Out>,
                 To<XlaConstant> = XlaProgramConstants<Out>,
             >,
@@ -1332,8 +1465,8 @@ where
     /// every output leaf is materialized with the batched axis at position 0. The batched
     /// leading axis is replicated for now.
     ///
-    /// Composite-region batching is assigned to Phase 5. Until that support lands, this method returns a precise
-    /// unsupported-operation diagnostic instead of reinterpreting projected batching values.
+    /// Composite compiled-function batching is not implemented. This method returns a precise unsupported-operation
+    /// diagnostic instead of reinterpreting projected batching values.
     ///
     /// Homogeneous static-extent array regions already retain structurally batched programs through
     /// `ryft_core::programs::transforms::Transform`. Composite XLA batching must additionally define how its live
@@ -1358,7 +1491,7 @@ where
     {
         let _ = (self, domain, axis_size);
         Err(ProgramError::UnsupportedOperation {
-            message: "compiled XLA batching requires Phase 5 composite batching support".to_string(),
+            message: "compiled XLA batching does not support composite region boundaries".to_string(),
         }
         .into())
     }
@@ -1387,17 +1520,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1424,17 +1557,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1463,17 +1596,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1499,17 +1632,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1538,17 +1671,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1575,17 +1708,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1617,17 +1750,17 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     In::ParameterStructure: Hash,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'c>>
-        + ParameterizedFamily<XlaProgramTracer<'c>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'c>>,
     Out::To<XlaCompileTracer<'c>>:
         Parameterized<XlaCompileTracer<'c>, To<ArrayType> = Out, To<XlaConstant> = Out::To<XlaConstant>>,
-    XlaProgramParameterValues<Out, XlaProgramTracer<'c>>: Parameterized<
-            XlaProgramTracer<'c>,
+    XlaProgramParameterValues<Out, XlaStatefulCompileTracer<'c>>: Parameterized<
+            XlaStatefulCompileTracer<'c>,
             To<ArrayIrType> = XlaProgramParameters<Out>,
             To<XlaConstant> = XlaProgramConstants<Out>,
         >,
@@ -1640,8 +1773,8 @@ where
     )
     .map_err(ProgramError::from)?;
     let function = move |capture_references,
-                         capture_tracers: Vec<XlaProgramTracer<'c>>,
-                         inputs: XlaProgramParameterValues<In, XlaProgramTracer<'c>>| {
+                         capture_tracers: Vec<XlaStatefulCompileTracer<'c>>,
+                         inputs: XlaProgramParameterValues<In, XlaStatefulCompileTracer<'c>>| {
         let capture_tracers = capture_tracers
             .into_iter()
             .map(ValueProjection::<ArrayType>::into_projected)
@@ -1667,12 +1800,12 @@ where
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'static>>
-        + ParameterizedFamily<XlaProgramTracer<'static>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'static>>,
     Out::Family: ParameterizedFamily<ArrayType>
         + ParameterizedFamily<ArrayIrType>
         + ParameterizedFamily<XlaConstant>
         + ParameterizedFamily<XlaCompileTracer<'static>>
-        + ParameterizedFamily<XlaProgramTracer<'static>>,
+        + ParameterizedFamily<XlaStatefulCompileTracer<'static>>,
     Out::To<XlaCompileTracer<'static>>: Parameterized<XlaCompileTracer<'static>, To<ArrayType> = Out>,
 {
     let input_structure = input_types.parameter_structure();
@@ -1680,7 +1813,7 @@ where
         input_structure,
         input_types.into_parameters().map(ArrayIrType::from),
     )?;
-    let output_types = DomainTracingContext::<XlaDomain<'static>, XlaProgramValue<'static>>::infer_output_type(
+    let output_types = DomainTracingContext::<XlaDomain<'static>, XlaStatefulValue<'static>>::infer_output_type(
         |tracers| {
             let input_structure = tracers.parameter_structure();
             let input_parameters = tracers
@@ -1690,7 +1823,7 @@ where
             let tracers = In::To::<XlaCompileTracer<'static>>::from_parameters(input_structure, input_parameters)?;
             let outputs = function(tracers);
             let output_structure = outputs.parameter_structure();
-            XlaProgramParameterValues::<Out, XlaProgramTracer<'static>>::from_parameters(
+            XlaProgramParameterValues::<Out, XlaStatefulCompileTracer<'static>>::from_parameters(
                 output_structure,
                 outputs.into_parameters().map(ProjectedValue::into_value),
             )
@@ -1708,7 +1841,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
+
+    use pretty_assertions::assert_eq;
 
     use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
     use ryft_core::operations::random::Random;
@@ -1716,12 +1852,13 @@ mod tests {
     use ryft_core::{
         Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceViewTransform,
         ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device,
-        DeviceMesh, DifferentiableType, Differentiate, Dimension, Div, DomainTracingContext, Dot, DotDimensionNumbers,
-        DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, FreezeReference, Hessian,
-        Iota, Jacobian, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, NewReference, OneLike, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceRead, ReferenceType, Reshape, Select,
-        Shape, Sharding, ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike,
+        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
+        DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill,
+        ForwardModeDifferentiate, FreezeReference, Hessian, Iota, Jacobian, LogicalMesh, Logistic, MeshAxis,
+        MeshAxisType, Mul, NewReference, OneLike, ProgramError, ProjectedValue, Reduce, ReductionKind,
+        ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
+        ReferenceCompletionResult, ReferenceError, ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding,
+        ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1736,7 +1873,103 @@ mod tests {
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{AdaptiveProfileGuidedOptions, Array, FromPjrt, XlaDomain, XlaOptions};
 
-    use super::XlaProgramTracer;
+    /// Deterministic completion gate used by stateful asynchronous integration tests.
+    #[derive(Clone)]
+    struct ControlledReferenceCompletion {
+        /// Shared terminal result, wait notification, and deferred callbacks.
+        state: Arc<(Mutex<ControlledReferenceCompletionState>, Condvar)>,
+    }
+
+    /// Mutable state of one [`ControlledReferenceCompletion`].
+    struct ControlledReferenceCompletionState {
+        /// Terminal result, absent while the completion is pending.
+        result: Option<ReferenceCompletionResult>,
+
+        /// Callbacks waiting for the terminal result.
+        callbacks: Vec<ReferenceCompletionCallback>,
+
+        /// Optional one-shot notification emitted when a caller starts waiting.
+        await_started: Option<mpsc::Sender<()>>,
+    }
+
+    impl ControlledReferenceCompletion {
+        /// Creates a pending completion gate.
+        fn new() -> Self {
+            Self {
+                state: Arc::new((
+                    Mutex::new(ControlledReferenceCompletionState {
+                        result: None,
+                        callbacks: Vec::new(),
+                        await_started: None,
+                    }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        /// Creates a pending completion that reports when its blocking wait begins.
+        fn with_await_notification(await_started: mpsc::Sender<()>) -> Self {
+            Self {
+                state: Arc::new((
+                    Mutex::new(ControlledReferenceCompletionState {
+                        result: None,
+                        callbacks: Vec::new(),
+                        await_started: Some(await_started),
+                    }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        /// Completes this gate exactly once and invokes deferred callbacks outside its mutex.
+        fn complete(&self, result: ReferenceCompletionResult) {
+            let callbacks = {
+                let (state, ready) = &*self.state;
+                let mut state = state.lock().unwrap();
+                assert!(state.result.is_none());
+                state.result = Some(result.clone());
+                ready.notify_all();
+                std::mem::take(&mut state.callbacks)
+            };
+            for callback in callbacks {
+                callback(result.clone());
+            }
+        }
+    }
+
+    impl ReferenceCompletionBackend for ControlledReferenceCompletion {
+        fn r#await(&self) -> ReferenceCompletionResult {
+            let (state, ready) = &*self.state;
+            let mut state = state.lock().unwrap();
+            if let Some(await_started) = state.await_started.take() {
+                await_started.send(()).unwrap();
+            }
+            while state.result.is_none() {
+                state = ready.wait(state).unwrap();
+            }
+            state.result.clone().unwrap()
+        }
+
+        fn is_ready(&self) -> Result<bool, Arc<str>> {
+            let state = self.state.0.lock().unwrap();
+            state.result.clone().map_or(Ok(false), |result| result.map(|_| true))
+        }
+
+        fn on_ready(&self, callback: ReferenceCompletionCallback) {
+            let callback = {
+                let mut state = self.state.0.lock().unwrap();
+                if let Some(result) = &state.result {
+                    Some((callback, result.clone()))
+                } else {
+                    state.callbacks.push(callback);
+                    None
+                }
+            };
+            if let Some((callback, result)) = callback {
+                callback(result);
+            }
+        }
+    }
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -1773,6 +2006,23 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f32>(shard_bytes.as_slice())
+    }
+
+    fn read_sharded_f32_array(array: &Array<'_>) -> Vec<f32> {
+        let mut values = Vec::new();
+        for device in array.mesh().devices() {
+            let shard_bytes = array
+                .device_shard(device.id())
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            values.extend(values_from_bytes::<f32>(shard_bytes.as_slice()));
+        }
+        values
     }
 
     fn read_f64_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f64> {
@@ -1935,6 +2185,36 @@ mod tests {
     }
 
     #[test]
+    fn test_stateful_async_reference_free_signature_reports_completion_through_its_await() {
+        // A reference-free invocation binds no holders, but the asynchronous surface still promises that awaiting the
+        // returned execution observes whole-invocation completion, so it returns a pending execution carrying the
+        // execution fence rather than an already-completed result.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from)?;
+                Ok((input.clone() + input).into_value())
+            },
+            ArrayIrType::Array(array_type.clone()),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let input =
+            Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        let output = compiled.call_statefully_async(&domain, ArrayIrValue::Array(input)).r#await().unwrap();
+        let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
+        assert_eq!(read_f32_array(&client, &output), vec![6.0]);
+    }
+
+    #[test]
     fn test_stateful_read_only_holder_remains_ready_across_calls() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1962,6 +2242,72 @@ mod tests {
     }
 
     #[test]
+    fn test_stateful_async_read_leases_overlap_and_block_mutation_until_both_complete() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            reference_type.clone(),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let mutate = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let (wait_started, wait_observed) = mpsc::channel();
+        let first_gate = ControlledReferenceCompletion::with_await_notification(wait_started.clone());
+        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(first_gate.clone()));
+        let first_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
+        let second_gate = ControlledReferenceCompletion::with_await_notification(wait_started);
+        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(second_gate.clone()));
+        let second_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
+
+        std::thread::scope(|scope| {
+            let (mutation_finished, mutation_result) = mpsc::channel();
+            let mutation_reference = reference.clone();
+            let client = &client;
+            let domain = &domain;
+            let mutate = &mutate;
+            scope.spawn(move || {
+                let update =
+                    Array::from_host_buffer(client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                mutation_finished
+                    .send(mutate.call_statefully(
+                        domain,
+                        (ArrayIrValue::Reference(mutation_reference), ArrayIrValue::Array(update)),
+                    ))
+                    .unwrap();
+            });
+
+            wait_observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            first_gate.complete(Ok(()));
+            wait_observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            second_gate.complete(Ok(()));
+            mutation_result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        });
+        first_read.r#await().unwrap();
+        second_read.r#await().unwrap();
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
     fn test_stateful_zero_public_output_waits_for_holder_installation() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1986,6 +2332,91 @@ mod tests {
             .call_statefully_async(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
             .r#await()
             .unwrap();
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_stateful_async_chains_unawaited_mutations_and_preserves_prior_failure() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let predecessor = ControlledReferenceCompletion::new();
+        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(predecessor.clone()));
+        let first_update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        let first = compiled.call_statefully_async(
+            &domain,
+            (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(first_update)),
+        );
+        let second_update =
+            Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let second = compiled.call_statefully_async(
+            &domain,
+            (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(second_update)),
+        );
+
+        predecessor.complete(Err(Arc::from("injected predecessor failure")));
+        for execution in [first, second] {
+            assert!(matches!(
+                execution.r#await(),
+                Err(XlaDomainError::AsynchronousReferenceExecution { reason })
+                    if reason == "injected predecessor failure",
+            ));
+        }
+        let error = reference.read().unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ExecutionPoisoned { reason: "injected predecessor failure".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_stateful_async_drop_still_reconciles_pending_holder_on_access() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let completion = ControlledReferenceCompletion::new();
+        XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(completion.clone()));
+        let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        drop(
+            compiled.call_statefully_async(
+                &domain,
+                (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)),
+            ),
+        );
+
+        completion.complete(Ok(()));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![3.0]);
     }
 
@@ -2022,7 +2453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_external_holder_requires_the_exact_replicated_compiled_type() {
+    fn test_stateful_external_holder_accepts_static_sharding_and_rejects_mismatched_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2034,25 +2465,9 @@ mod tests {
         let alternate_type = ArrayType::new(DataType::F32, shape)
             .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
-        assert!(matches!(
-            compile_statefully::<_, ArrayIrType, ArrayIrType>(
-                |reference| reference.read().map_err(Into::into),
-                ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
-                &domain,
-                XlaOptions::new(mesh.clone()),
-            ),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external state input 0 must use replicated sharding",
-        ));
-        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
-            |(reference, update)| {
-                reference.add_update(&update)?;
-                reference.read().map_err(Into::into)
-            },
-            (
-                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
-                ArrayIrType::Array(replicated_type.clone()),
-            ),
+        let sharded = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
             &domain,
             XlaOptions::new(mesh.clone()),
         )
@@ -2066,6 +2481,25 @@ mod tests {
             )
             .unwrap(),
         );
+        let ArrayIrValue::Array(output) =
+            sharded.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap()
+        else {
+            panic!("stateful read output must be an array")
+        };
+        assert_eq!(read_f32_array(&client, &output), vec![1.0, 2.0]);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
+            },
+            (
+                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
+                ArrayIrType::Array(replicated_type.clone()),
+            ),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
         let update = Array::from_host_buffer(
             &client,
             replicated_type.clone(),
@@ -2080,11 +2514,140 @@ mod tests {
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == format!(
-                    "external state input 0 holder type `{alternate_type}` does not match effective compiled state \
+                    "external state input 0 holder type `{alternate_type}` does not refine effective compiled state \
                      type `{replicated_type}`",
                 ),
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_stateful_external_holder_updates_two_device_sharded_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
+            },
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &client,
+                array_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &client,
+            array_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+
+        let ArrayIrValue::Array(output) = compiled
+            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+            .unwrap()
+        else {
+            panic!("stateful sharded output must be an array")
+        };
+        let expected = vec![11.0, 22.0, 33.0, 44.0];
+        assert_eq!(read_sharded_f32_array(&output), expected);
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), expected);
+
+        let reversed_mesh =
+            DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
+        let reversed_reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &client,
+                array_type.clone(),
+                reversed_mesh,
+                values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &client,
+            array_type,
+            mesh,
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (ArrayIrValue::Reference(reversed_reference.clone()), ArrayIrValue::Array(update)),
+            ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external state input 0 holder mesh does not match the compiled device mesh",
+        ));
+        assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
+    }
+
+    #[test]
+    fn test_stateful_external_holder_reads_bounded_dynamic_state_and_rejects_mutation() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let declared_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(declared_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let mutation = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(declared_type.clone())), ArrayIrType::Array(declared_type)),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        );
+        assert!(matches!(
+            mutation,
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "mutated bounded-dynamic external state input 0 is unsupported because backend alias \
+                              compatibility has not been verified",
+        ));
+
+        for expected in [vec![1.0_f32, 2.0], vec![1.0_f32, 2.0, 3.0, 4.0]] {
+            let actual_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(expected.len())]))
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap();
+            let reference = ArrayReference::new(
+                Array::from_host_buffer(
+                    &client,
+                    actual_type,
+                    mesh.clone(),
+                    values_to_bytes(expected.as_slice()).as_slice(),
+                )
+                .unwrap(),
+            );
+            let ArrayIrValue::Array(output) =
+                read.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).unwrap()
+            else {
+                panic!("stateful bounded-dynamic output must be an array")
+            };
+            assert_eq!(read_f32_array(&client, &output), expected);
+            assert_eq!(read_f32_array(&client, &reference.read().unwrap()), expected);
+        }
     }
 
     #[test]
@@ -2184,7 +2747,7 @@ mod tests {
             compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == format!(
-                    "reference holder {:?} is bound more than once in one invocation",
+                    "reference holder `{:?}` is bound more than once in one invocation",
                     reference.id(),
                 ),
         ));
@@ -2305,6 +2868,31 @@ mod tests {
         assert_eq!(read_f32_array(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
         assert_eq!(read_f32_array(&client, &pre_handoff_read_only.read().unwrap()), vec![20.0]);
 
+        // A fully prepared call that fails before PJRT submission publishes no lease or mutation reservation.
+        let pre_submission_first = new_reference(1.0);
+        let pre_submission_second = new_reference(10.0);
+        let pre_submission_read_only = new_reference(20.0);
+        let update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeSubmission);
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(pre_submission_first.clone()),
+                    ArrayIrValue::Reference(pre_submission_second.clone()),
+                    ArrayIrValue::Reference(pre_submission_read_only.clone()),
+                    ArrayIrValue::Array(update),
+                ),
+            ),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "injected failure before execution submission",
+        ));
+        assert_eq!(read_f32_array(&client, &pre_submission_first.read().unwrap()), vec![1.0]);
+        assert_eq!(read_f32_array(&client, &pre_submission_second.read().unwrap()), vec![10.0]);
+        assert_eq!(read_f32_array(&client, &pre_submission_read_only.read().unwrap()), vec![20.0]);
+
         // Once mutable buffers cross the execution handoff, every mutated holder is poisoned together while a
         // read-only peer remains Ready.
         let post_handoff_first = new_reference(1.0);
@@ -2330,8 +2918,8 @@ mod tests {
         for reference in [&post_handoff_first, &post_handoff_second] {
             let Err(error) = reference.read() else { panic!("mutated holder must be poisoned after handoff") };
             assert_eq!(
-                error.downcast_custom::<ryft_core::ReferenceError>(),
-                Some(&ryft_core::ReferenceError::ExecutionPoisoned {
+                error.downcast_custom::<ReferenceError>(),
+                Some(&ReferenceError::ExecutionPoisoned {
                     reason: "invalid compilation options: injected failure after execution handoff".to_string(),
                 }),
             );
@@ -2398,7 +2986,7 @@ mod tests {
                 &domain,
                 (ArrayIrValue::Reference(first.clone()), ArrayIrValue::Reference(frozen), ArrayIrValue::Array(update),),
             ),
-            Err(XlaDomainError::Reference(ryft_core::ReferenceError::Frozen)),
+            Err(XlaDomainError::Reference(ReferenceError::Frozen)),
         ));
         assert_eq!(read_f32_array(&client, &first.read().unwrap()), vec![1.0]);
     }
@@ -3685,9 +4273,9 @@ mod tests {
         }
     }
 
-    /// Compiled-function batching remains an explicit Phase 5 boundary until composite region batching lands.
     #[test]
-    fn test_batch_method_reports_composite_region_deferral() {
+    fn test_batch_method_rejects_composite_region_boundaries() {
+        // Compiled-function batching reports its unsupported composite-region boundary directly.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -3700,10 +4288,10 @@ mod tests {
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), scalar_input_type, &engine, mesh.clone()).unwrap();
         let error = match inner.batch(&engine, 4) {
-            Ok(_) => panic!("compiled batching should remain deferred until Phase 5"),
+            Ok(_) => panic!("compiled batching should reject unsupported composite region boundaries"),
             Err(error) => error,
         };
-        assert_eq!(error.to_string(), "compiled XLA batching requires Phase 5 composite batching support");
+        assert_eq!(error.to_string(), "compiled XLA batching does not support composite region boundaries");
     }
 
     #[test]
@@ -4913,7 +5501,7 @@ mod tests {
         let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
         let steps = configuration.steps;
         let (_, condition) = <DecodeTraceContext<'c>>::trace(
-            |state: Vec<XlaProgramTracer<'c>>| {
+            |state: Vec<XlaStatefulCompileTracer<'c>>| {
                 let state = state
                     .into_iter()
                     .map(|value| {
@@ -4929,7 +5517,7 @@ mod tests {
         )
         .unwrap();
         let (_, body) = <DecodeTraceContext<'c>>::trace(
-            |state: Vec<XlaProgramTracer<'c>>| {
+            |state: Vec<XlaStatefulCompileTracer<'c>>| {
                 let state = state
                     .into_iter()
                     .map(|value| {

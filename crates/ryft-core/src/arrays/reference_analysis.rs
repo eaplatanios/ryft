@@ -186,7 +186,8 @@ pub enum ReferenceAnalysisError {
         root: ReferenceRoot,
     },
 
-    /// References are second-class and cannot cross a region's result boundary.
+    /// References are second-class and cannot cross a region's result boundary, unless the enclosing operation
+    /// declares the result as a root-preserving forward of an input handle (as fixed loop and scan carries do).
     #[error("reference output {output_index} of region `{region}` exposes root `{root}`")]
     ReferenceOutput {
         /// Region exposing the reference.
@@ -591,10 +592,10 @@ pub enum ReferenceAnalysisError {
         mode: ReferenceAccessMode,
     },
 
-    /// Reference state is not allowed in dormant transformation-rule regions.
-    #[error("reference state in dormant rule region `{region}` is not supported")]
+    /// Reference state is not allowed anywhere inside a dormant transformation-rule closure.
+    #[error("reference state in region `{region}` inside a dormant rule closure is not supported")]
     RuleRegion {
-        /// Dormant rule region containing reference state.
+        /// Region carrying the reference state, which may sit arbitrarily deep inside the dormant rule closure.
         region: RegionId,
     },
 }
@@ -640,7 +641,6 @@ impl Display for ReferenceRoot {
 /// Invocation source of one external reference root.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum ReferenceSource {
     /// Capture lifted into the entry boundary before public arguments.
     Capture {
@@ -754,14 +754,11 @@ impl ReferenceTransitiveAccess {
     }
 }
 
-/// Substitution from a nested region's parameterized root to one caller root. The invoking instruction and attached
-/// region are the analysis lookup keys and are not repeated here; the public
-/// [`ReferenceAnalysis::region_root_for_source`] query resolves one substitution by its full invocation identity.
+/// Analysis-local substitution from a nested region's parameterized root to one caller root, keyed during the pass
+/// by its invoking instruction and attached-region position. Only the source-to-region direction outlives the pass,
+/// through [`ReferenceAnalysis::region_root_for_source`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ReferenceRegionInputBinding {
-    /// Parameterized root inside the attached region.
-    region_root: ReferenceRoot,
-
+struct ReferenceRegionInputBinding {
     /// Parent instruction operand that supplies the root.
     source_input_index: usize,
 
@@ -801,11 +798,8 @@ pub struct ReferenceAnalysis {
     /// Validated accesses in arena and instruction order.
     accesses: Vec<ReferenceAccess>,
 
-    /// Nested-region root substitutions in caller instruction order.
-    bindings: Vec<ReferenceRegionInputBinding>,
-
-    /// Indexed lookup from one caller root to its formal root for a specific attached-region invocation.
-    source_binding_indices: BTreeMap<(InstructionId, usize, ReferenceRoot), usize>,
+    /// Formal attached-region root substituted for one caller root at a specific attached-region invocation.
+    region_roots_for_sources: BTreeMap<(InstructionId, usize, ReferenceRoot), ReferenceRoot>,
 
     /// External roots in entry-boundary order.
     external_roots: Vec<ExternalReferenceRoot>,
@@ -849,9 +843,7 @@ impl ReferenceAnalysis {
         region_index: usize,
         source_root: ReferenceRoot,
     ) -> Option<ReferenceRoot> {
-        self.source_binding_indices
-            .get(&(instruction, region_index, source_root))
-            .map(|index| self.bindings[*index].region_root)
+        self.region_roots_for_sources.get(&(instruction, region_index, source_root)).copied()
     }
 
     /// Returns external roots in entry-boundary order.
@@ -974,6 +966,11 @@ where
     ///     reference-typed constant as a scoped capture handle resolved against the active lifted entry or
     ///     nested-call capture scope; returning [`None`] makes any reference-typed constant a hard
     ///     [`ReferenceAnalysisError::ReferenceConstant`] error, which is correct for ordinary value families.
+    ///   - `validate_views`: Whether view-alias outputs must re-derive and match their operation's declared view
+    ///     transform. Discharge requires the derived views, while eager lifetime validation skips them because the
+    ///     replayed handles re-derive their own views.
+    ///   - `reference_view_transform`: Projects one operation onto its root-preserving view transform, if it declares
+    ///     one. Used only when `validate_views` is set.
     fn analyze_references_with_capture_indices<F, G>(
         self,
         capture_count: usize,
@@ -1008,8 +1005,7 @@ where
                 roots: Vec::new(),
                 views: Vec::new(),
                 accesses: Vec::new(),
-                bindings: Vec::new(),
-                source_binding_indices: BTreeMap::new(),
+                region_roots_for_sources: BTreeMap::new(),
                 external_roots: Vec::new(),
                 instruction_summaries: Vec::new(),
                 instruction_summary_indices: Vec::new(),
@@ -1051,9 +1047,8 @@ where
         }
         let mut handles = regions.iter().map(|region| vec![None; region.atoms().len()]).collect::<Vec<_>>();
         let mut accesses = Vec::new();
-        let mut bindings = Vec::new();
         let mut binding_indices = HashMap::new();
-        let mut source_binding_indices = BTreeMap::new();
+        let mut region_roots_for_sources = BTreeMap::new();
         let mut external_roots = Vec::new();
         let mut region_capture_roots = vec![Vec::<(ReferenceRoot, ValueId)>::new(); regions.len()];
         let mut pending_rule_regions = Vec::new();
@@ -1080,14 +1075,18 @@ where
                 continue;
             }
             let region_id = RegionId::new(region_index);
-            let mut live_roots = HashSet::new();
+            // Consumption is the only way a root stops being live, and `InvalidConsume` restricts it to allocations
+            // owned by this region, so liveness is tracked as the complement of a consumed set. Tracking the consumed
+            // set (instead of seeding a live set) keeps roots that enter through any handle-producing path — region
+            // inputs, capture constants, allocations, aliases, and root-preserving forwards out of arbitrarily nested
+            // regions — live by construction.
+            let mut consumed_roots = HashSet::new();
 
             for (input_index, atom) in region.input_ids().iter().copied().enumerate() {
                 if region.atoms()[atom.index()].r#type().is_reference() {
                     let root = ReferenceRoot::RegionInput { region: region_id, input_index };
                     handles[region_index][atom.index()] =
                         Some(ReferenceHandle { root, view: ArrayReferenceView::root(), is_root: true, is_view: false });
-                    live_roots.insert(root);
                 }
             }
 
@@ -1163,7 +1162,6 @@ where
                 region_capture_roots[region_index].push((root, ValueId::new(region_id, atom)));
                 handles[region_index][atom_index] =
                     Some(ReferenceHandle { root, view: ArrayReferenceView::root(), is_root: true, is_view: false });
-                live_roots.insert(root);
             }
 
             if rule_regions[region_index]
@@ -1232,7 +1230,6 @@ where
                     let handle = match output {
                         ReferenceOutputSemantics::NewRoot { .. } => {
                             let root = ReferenceRoot::Allocation { instruction: instruction_id, output_index };
-                            live_roots.insert(root);
                             ReferenceHandle { root, view: ArrayReferenceView::root(), is_root: true, is_view: false }
                         }
                         ReferenceOutputSemantics::Alias { input_index, kind, .. } => {
@@ -1251,7 +1248,7 @@ where
                                     input_index,
                                 }));
                             };
-                            if !live_roots.contains(&source.root) {
+                            if consumed_roots.contains(&source.root) {
                                 return Err(ProgramError::custom(ReferenceAnalysisError::UseAfterConsume {
                                     instruction: instruction_id,
                                     operation: operation_name.to_string(),
@@ -1279,7 +1276,7 @@ where
                                         output_type: output_type.to_string(),
                                     }));
                                 }
-                                source.view.with_validated_transform(transform)
+                                source.view.with_transform_unchecked(transform)
                             } else if kind == ReferenceAliasKind::View || input_type.as_ref() == output_type.as_ref() {
                                 source.view.clone()
                             } else {
@@ -1325,7 +1322,7 @@ where
                     // Region inputs are initialized before replay, and every preceding reference output must have
                     // declared root/alias semantics before this instruction can be reached.
                     let handle = handles[region_index][input_atom.index()].clone().unwrap();
-                    if !live_roots.contains(&handle.root) {
+                    if consumed_roots.contains(&handle.root) {
                         return Err(ProgramError::custom(ReferenceAnalysisError::UseAfterConsume {
                             instruction: instruction_id,
                             operation: operation_name.to_string(),
@@ -1349,7 +1346,7 @@ where
                                 root: handle.root,
                             }));
                         }
-                        live_roots.remove(&handle.root);
+                        consumed_roots.insert(handle.root);
                     }
                     classified_inputs[input_index] = true;
                     accesses.push(ReferenceAccess {
@@ -1396,7 +1393,7 @@ where
                         let source_handle = handles[region_index][source_atom.index()]
                             .clone()
                             .ok_or_else(invalid_region_input_source)?;
-                        if !live_roots.contains(&source_handle.root) {
+                        if consumed_roots.contains(&source_handle.root) {
                             return Err(ProgramError::custom(ReferenceAnalysisError::UseAfterConsume {
                                 instruction: instruction_id,
                                 operation: operation_name.to_string(),
@@ -1441,18 +1438,14 @@ where
                             }));
                         }
                         classified_inputs[source_input_index] = true;
-                        let binding = ReferenceRegionInputBinding {
-                            region_root: ReferenceRoot::RegionInput {
-                                region: attached,
-                                input_index: region_input_index,
-                            },
-                            source_input_index,
-                            source_root: source_handle.root,
-                        };
-                        binding_indices.insert((instruction_id, attached_index, binding.region_root), bindings.len());
-                        source_binding_indices
-                            .insert((instruction_id, attached_index, binding.source_root), bindings.len());
-                        bindings.push(binding);
+                        let region_root =
+                            ReferenceRoot::RegionInput { region: attached, input_index: region_input_index };
+                        binding_indices.insert(
+                            (instruction_id, attached_index, region_root),
+                            ReferenceRegionInputBinding { source_input_index, source_root: source_handle.root },
+                        );
+                        region_roots_for_sources
+                            .insert((instruction_id, attached_index, source_handle.root), region_root);
                     }
                 }
 
@@ -1506,7 +1499,6 @@ where
                             ReferenceRoot::RegionInput { region: source_region, .. } if source_region == attached => {
                                 let binding = binding_indices
                                     .get(&(instruction_id, source.region_index, source_handle.root))
-                                    .map(|index| &bindings[*index])
                                     .ok_or_else(|| {
                                         ProgramError::MalformedProgram(format!(
                                             "reference result of attached region {} has no caller-root binding",
@@ -1683,7 +1675,7 @@ where
                             ReferenceRoot::RegionInput { region: source_region, .. } if source_region == attached => {
                                 binding_indices
                                     .get(&(instruction_id, attached_index, access.root))
-                                    .map(|index| bindings[*index].source_root)
+                                    .map(|binding| binding.source_root)
                                     .ok_or_else(|| {
                                         ProgramError::MalformedProgram(format!(
                                             "reference access in attached region {attached_index} has no caller-root \
@@ -1756,8 +1748,7 @@ where
             roots,
             views,
             accesses,
-            bindings,
-            source_binding_indices,
+            region_roots_for_sources,
             external_roots,
             instruction_summaries,
             instruction_summary_indices,
@@ -1776,7 +1767,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::ArrayIrOperation;
-    use crate::arrays::types::arrays::ArrayType;
+    use crate::arrays::reference_views::ArrayReference;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, Shape};
     use crate::captures::CaptureReference;
@@ -1787,7 +1778,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         Effects, OutputRegionProvenance, ProgramBuilder, ReferenceInputAccess, ReferenceOperationSemantics,
-        ReferenceType, RegionArena, RegionInterface, RegionSlot, TypeError,
+        RegionArena, RegionInterface, RegionSlot, TypeError,
     };
 
     use super::*;
@@ -2120,16 +2111,8 @@ mod tests {
 
         let analysis = program.analyze_references(0).unwrap();
         let expected = ArrayReferenceView::root()
-            .with_transform(
-                &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])),
-                ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] },
-            )
-            .unwrap()
-            .with_transform(
-                &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])),
-                ArrayReferenceViewTransform::Index { axis: 0, index: 1 },
-            )
-            .unwrap();
+            .with_transform_unchecked(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 3, 1)] })
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
         assert_eq!(analysis.view(ValueId::new(program.entry(), root)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.view(ValueId::new(program.entry(), indexed)), Some(&expected));
         assert_eq!(
@@ -2177,9 +2160,7 @@ mod tests {
         let replay_error = program
             .interpret(vec![
                 ArrayIrValue::Array(Array::scalar(true)),
-                ArrayIrValue::Reference(crate::arrays::reference_views::ArrayReference::new(Array::vector(vec![
-                    1.0_f32, 2.0, 3.0,
-                ]))),
+                ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]))),
             ])
             .unwrap_err();
         assert_eq!(replay_error.downcast_custom::<ReferenceAnalysisError>(), error.downcast_custom());
@@ -2248,9 +2229,7 @@ mod tests {
         let replay_error = program
             .interpret(vec![
                 ArrayIrValue::Array(Array::scalar(true)),
-                ArrayIrValue::Reference(crate::arrays::reference_views::ArrayReference::new(Array::vector(vec![
-                    1.0_f32, 2.0, 3.0,
-                ]))),
+                ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]))),
             ])
             .unwrap_err();
         assert_eq!(replay_error.downcast_custom::<ReferenceAnalysisError>(), error.downcast_custom());
@@ -2366,11 +2345,11 @@ mod tests {
         let source_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 1 };
         let branch_root = ReferenceRoot::RegionInput { region: branch, input_index: 0 };
         assert_eq!(
-            analysis.bindings,
-            &[
-                ReferenceRegionInputBinding { region_root: branch_root, source_input_index: 1, source_root },
-                ReferenceRegionInputBinding { region_root: branch_root, source_input_index: 1, source_root },
-            ],
+            analysis.region_roots_for_sources,
+            std::collections::BTreeMap::from([
+                ((instruction, 0, source_root), branch_root),
+                ((instruction, 1, source_root), branch_root),
+            ]),
         );
         assert_eq!(analysis.accesses()[0].root(), branch_root);
 
@@ -2519,6 +2498,66 @@ mod tests {
         assert_eq!(
             analysis.instruction_summary(InstructionId::new(program.entry(), 0)).unwrap(),
             &[ReferenceTransitiveAccess { root, mode: ReferenceAccessMode::Read }],
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_forwards_a_capture_root_out_of_a_doubly_nested_region() {
+        // A root reaching a region only as a forwarded result of a doubly nested condition is still usable there.
+        // Liveness is the complement of consumption, so every handle-producing path — including a root forwarded out
+        // of an arbitrarily deep region — yields a live handle, even though the middle region neither declares the
+        // root as a formal input nor names it with a capture constant of its own.
+        let reference_type = ReferenceType::new(scalar_type());
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let mut inner_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
+        let captured = inner_builder.add_constant(Capture::new(0, reference_type.clone().into()));
+        let inner = inner_builder
+            .build::<Vec<Capture>, Vec<Capture>>(vec![captured], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut middle_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
+        let inner = middle_builder.import_region(inner.entry_region_ref());
+        let inner_predicate = middle_builder.add_constant(Capture::new(1, predicate_type.clone().into()));
+        let forwarded = middle_builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<CaptureArray>>::new(),
+                vec![inner, inner],
+                vec![inner_predicate],
+            )
+            .unwrap()[0];
+        let value = middle_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![forwarded]).unwrap()[0];
+        let middle = middle_builder
+            .build::<Vec<Capture>, Vec<Capture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Capture, CaptureOperation>::new();
+        let middle = builder.import_region(middle.entry_region_ref());
+        builder.add_input(reference_type.into());
+        let predicate = builder.add_input(predicate_type.into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<CaptureArray>>::new(),
+                vec![middle, middle],
+                vec![predicate],
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Capture>, Vec<Capture>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let analysis = program.analyze_references_with_lifted_captures(2).unwrap();
+        let inner = program.regions()[middle.index()].instructions()[0].regions()[0];
+        let root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 };
+        assert_eq!(analysis.root(ValueId::new(inner, captured)), Some(root));
+        assert_eq!(analysis.root(ValueId::new(middle, forwarded)), Some(root));
+        assert_eq!(
+            analysis.accesses(),
+            &[ReferenceAccess {
+                instruction: InstructionId::new(middle, 1),
+                input_index: 0,
+                root,
+                mode: ReferenceAccessMode::Read,
+            }],
         );
     }
 
@@ -3409,6 +3448,56 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_analysis_rejects_an_alias_of_an_unresolved_source() {
+        // An alias source must already carry a resolved handle. A non-reference operand never receives one, so the
+        // alias is reported as unresolved instead of silently inventing a root for the reference-typed result.
+        let mut builder = ProgramBuilder::<TestValue, MalformedReferenceOperation>::new();
+        let array = builder.add_input(scalar_type().into());
+        builder.add_instruction(MalformedReferenceOperation::BadAlias, Vec::new(), vec![array]).unwrap();
+        let program =
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let error = program.analyze_references(0).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceAnalysisError>(),
+            Some(&ReferenceAnalysisError::UnresolvedAlias {
+                instruction: InstructionId::new(program.entry(), 0),
+                operation: "bad_reference_alias".to_string(),
+                input_index: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_diagnostics_render_canonical_roots() {
+        // Both canonical root kinds appear verbatim in user-facing diagnostics, so their rendering is pinned here
+        // alongside the surrounding message rather than only through structural variant assertions.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(scalar_type().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let read = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen, read], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.analyze_references(0).unwrap_err().to_string(),
+            "reference input 0 of `reference_read` at `^0[2]` uses consumed root `^0[0] output 0`",
+        );
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let external = builder.add_input(ReferenceType::new(scalar_type()).into());
+        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![external]).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.analyze_references(0).unwrap_err().to_string(),
+            "`freeze_reference` at `^0[0]` can consume only a local root handle, but input 0 resolves to \
+             `^0 input 0`",
+        );
+    }
+
+    #[test]
     fn test_reference_analysis_rejects_missing_or_invalid_input_region_provenance() {
         let mut body_builder = ProgramBuilder::<TestValue, MalformedReferenceOperation>::new();
         body_builder.add_input(ReferenceType::new(scalar_type()).into());
@@ -3416,6 +3505,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
 
+        // The table enumerates the two unusable region-input provenance contracts, one declaring no parent
+        // provenance at all and one naming a parent operand that is not a reference operand.
         for (operation, expected) in [
             (
                 MalformedReferenceOperation::ComputationCarrier,

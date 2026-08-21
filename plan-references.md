@@ -1,7 +1,7 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** Phases 0 through 9 implemented and verified. The asynchronous external runtime protocol and preserved
-kernel lowering remain planned.
+**Status:** Phases 0 through 13 implemented and verified. The reference architecture and implementation plan is
+complete; a production Pallas-style kernel language remains a separate future program.
 
 **Research snapshot:** 2026-08-14
 
@@ -79,7 +79,9 @@ ordinary StableHLO lowering path may silently receive unresolved references.
 - References to dimensions, references, Lists, tuples, or arbitrary `ArrayIrType` values.
 - Returning references from public computations or higher-order regions.
 - Arbitrary aliases, alias merging, reference equality operations, or user-observable raw resource identifiers.
-- Dynamic-shape, sharded, multi-host, or zero-space external reference aliases in the first XLA slice.
+- Bounded-dynamic mutation, unbounded or nonreplicated dynamic state, multi-host state, and zero-space external
+  references. Static replicated/sharded state and finite replicated bounded-dynamic read-only state are supported on
+  fully addressable single-process meshes.
 - Writes from a while-loop condition region.
 - External reference mutation under automatic differentiation.
 - Native tangent/cotangent references, gradient references, or a `vjp.with_refs` analogue.
@@ -204,8 +206,8 @@ Requirements:
 - A reference handle is not a numeric scalar or complex value, even when it refers to a scalar or complex array.
   `Type::is_scalar()` and `Type::is_complex()` return `false`.
 
-For the first XLA slice, mutation requires exact physical referent compatibility. Dynamic refinement may remain valid
-for type checking, but external input/output aliasing is admitted only after physical shape, layout, sharding, and
+External XLA state mutation requires exact physical referent compatibility. Dynamic refinement may remain valid for
+type checking, but external input/output aliasing is admitted only after physical shape, layout, sharding, and
 dynamic-extent compatibility have been proven.
 
 ### 5.2 Runtime value and identity
@@ -228,8 +230,9 @@ include the exact view. The synchronization primitive remains private, but the s
 - `new_reference(value)` does not invalidate or make later mutations observable through the initializer `value`.
   Likewise, two distinct roots initialized from storage-sharing values remain logically independent. Physical reuse
   must copy-protect whenever either invariant would otherwise be violated.
-- The declared referent type remains invariant for the reference's lifetime. A future dynamic-shape policy may permit
-  different concrete runtime refinements within that declaration, but the fixed-shape MVP does not.
+- The declared referent type remains invariant for the reference's lifetime. Finite bounded-dynamic declarations may
+  admit different concrete runtime refinements only on a backend path that preserves their extents; XLA currently
+  admits that class for replicated read-only external state and rejects mutation.
 - Frozen, failed, or otherwise invalid state produces an explicit error rather than panicking or returning stale data.
 - The holder is an opaque `Parameter` leaf. This is free: `Parameter` is a bare marker trait (`parameters.rs:153`),
   so a leaf implementation exposes nothing and there is no traversal behavior to suppress.
@@ -304,9 +307,10 @@ operations makes it useful.
 Replacement/update type legality is stricter than `ArrayType::is_compatible_with`:
 
 - `write` and `swap` perform no implicit broadcasting or data-type promotion. The stored value must have the same
-  instantiated referent type and, in the fixed-shape MVP, the same exact runtime extents, layout, sharding, and memory.
-- For a future dynamic referent, an input may refine the declared referent only when the holder and selected backend
-  explicitly support changing concrete extents within that declaration. This is rejected until Phase 11.
+  instantiated referent type and the same exact runtime extents, layout, sharding, and memory.
+- A finite bounded-dynamic input may refine a declared referent only for a backend path that preserves its runtime
+  extents. XLA admits replicated external references read-only; bounded-dynamic mutation remains rejected because the
+  backend does not preserve the aliased runtime extent.
 - `add_update` may use ordinary array addition semantics internally only when the inferred addition result has exactly
   the current instantiated referent type. Any promoted or broadcast result that would change stored type is rejected.
 - Reference-type compatibility/refinement is not a substitute for these operation-specific storage checks.
@@ -750,9 +754,9 @@ hidden final-state outputs) on the other, split by a validated `public_output_co
 execution, persistence, and executable replacement. Lowering validates the staged public signature and applies user
 `out_shardings` only to that public prefix; each hidden state output inherits its paired input's effective sharding.
 
-Reject any external reference whose physical input is erased, including zero-space references, until Phase 11 defines
-another representation. A read-only slot is never donated or aliased. A mutated slot has exactly one hidden output and
-one may-alias relation.
+Reject any external reference whose physical input is erased, including zero-space references: the current holder ABI
+requires one executable device buffer per logical state slot and defines no erased-state representation. A read-only
+slot is never donated or aliased. A mutated slot has exactly one hidden output and one may-alias relation.
 
 Entry lowering attaches `tf.aliasing_output = <physical output index>` to each mutated physical external-state input,
 merged with existing argument attributes such as sharding. Read-only slots carry no alias. Aliases must be injective,
@@ -783,13 +787,18 @@ For each invocation:
 2. Reject duplicate holders before snapshotting or extracting any state.
 3. Acquire multiple holders in stable `ReferenceId` order.
 4. For a read-only slot, clone/snapshot the current array and its dependency without taking ownership. For a mutated
-   slot, transactionally take the current array and dependency.
+   slot, Phase 10 likewise retains a copy-protecting holder snapshot through submission, so an immediate execute error
+   leaves the holder ready. The synchronous Phase 9 implementation transactionally takes the current array while its
+   long-held guard remains live.
 5. Build ordinary physical arguments through `XlaExecutableSignature`.
 6. Construct logical donation flags in flattened capture-plus-public-input order, then project them through
    `XlaExecutableSignature`: ordinary captures and dimensions are `false`; ordinary public arrays use the user's flag;
-   read-only reference inputs are `false`; mutated reference inputs are internally `true` subject to safe uniqueness
-   downgrade; hidden extent carriers are `false`.
-7. Cross one explicit irreversibility boundary when donatable inputs are handed to the PJRT execute call.
+   reference inputs are `false` in Phase 10 because their holder-owned snapshots remain available across immediate
+   submission failure; hidden extent carriers are `false`. Phase 9's earlier synchronous extraction path requested
+   mutation donation subject to safe uniqueness downgrade.
+7. Submit the copy-protected Phase 10 reference inputs to PJRT. Successful submission is the asynchronous protocol's
+   irreversibility boundary; the transitional Phase 9 protocol conservatively marks handoff before the execute call
+   because it may pass an extracted donatable holder value.
 8. Immediately after successful PJRT submission, while the ordered holder guards remain held, atomically publish the
    execution fence as a read lease on every read-only holder and reserve a pending generation on every mutated
    holder; then release the guards. Nothing fallible precedes this step — today's output splitting constructs
@@ -803,19 +812,20 @@ For each invocation:
 
 Required failure semantics:
 
-- Before the PJRT irreversibility boundary, every extracted mutated state is restored.
-- Passing prepared arguments to `PJRT_LoadedExecutable_Execute` is the Phase 9 irreversibility boundary. An immediate
-  execute error without a fence therefore poisons every extracted mutated holder conservatively; it does not restore
-  potentially donated storage. Read-only values are never donated and remain ready: Ryft's safe
-  `LoadedExecutable::execute` wrapper drops its retained input-buffer `Arc`s on this error path, whose memory-safety
-  contract therefore already requires that an immediate error retain no asynchronous device access. A narrower
-  mutated-state restore rule requires an explicit PJRT guarantee that donation was not accepted.
-- After that boundary, Ryft does not claim it can restore a potentially donated input. If all hidden final states can be
+- Before the protocol's applicable irreversibility boundary, every extracted mutated state is restored.
+- Passing prepared arguments to `PJRT_LoadedExecutable_Execute` remains the transitional Phase 9 irreversibility
+  boundary because that implementation may pass extracted donatable holder storage. Phase 10 instead retains the
+  holder's copy-protecting snapshot through submission, which safely downgrades reference-state donation when storage
+  is shared. An immediate execute error without a fence therefore leaves every mutated and read-only holder ready and
+  publishes neither generations nor leases. Ryft's safe `LoadedExecutable::execute` wrapper drops its retained input-
+  buffer `Arc`s on this error path, whose memory-safety contract requires that an immediate error retain no
+  asynchronous device access.
+- After successful Phase 10 submission, Ryft does not roll back the logical mutation. If all hidden final states can be
   constructed, it installs them even when later public-output reconstruction or refinement fails. If any hidden state
   cannot be constructed or validated, it poisons every mutated holder in the invocation.
-- If future PJRT APIs can prove that a failed submission did not accept donation and return recoverable inputs, a
-  narrower restore path may be added. Until then, execute-call failure after handoff conservatively poisons mutated
-  holders.
+- A failure reported by the submitted execution fence poisons the complete cumulative mutation chain. An immediate
+  execute error that returns no fence is not an asynchronous execution failure and leaves Phase 10 holders ready under
+  the copy-protected policy above.
 - Asynchronous execution failure poisons mutated holders with the execution error; later reads/writes fail until an
   explicit replacement/reset API exists. Read-only participants are not poisoned by this invocation's failure.
 - The completion-bearing call reports launch, public reconstruction, read-only execution, and asynchronous errors even
@@ -829,8 +839,10 @@ Required failure semantics:
   Independent holders may execute concurrently.
 - Phase 10 replaces those long-held guards with pending states and generation-safe cumulative dependency/error chains.
   If call B consumes call A's pending result and A later fails, B cannot overwrite or hide that failure; the holder
-  remains poisoned. Older completion callbacks cannot mutate a newer generation. Read-only calls may overlap only
-  after the holder tracks every outstanding read lease and mutations wait or dependency-chain those leases.
+  remains poisoned. The backend completion callback owns only its type-erased token; typed holder state reconciles the
+  matching generation lazily on the next holder access, so no callback captures a non-`'static` array holder and an
+  older completion can never mutate a newer generation. Read-only calls may overlap only after the
+  holder tracks every outstanding read lease and mutations wait or dependency-chain those leases.
 
 In the Phase 10 asynchronous protocol, do not hold a host mutex for device execution duration. Install pending
 generation/event state and read leases, then let later accesses await or dependency-chain them. Phase 9 deliberately
@@ -853,7 +865,7 @@ mappings and referent types derive from the persisted signature and input types.
 index ranges, alias injectivity, public/hidden output counts, physical compatibility, and signature arity before an
 executable can be invoked.
 
-### 11.5 XLA support order
+### 11.5 XLA support progression
 
 1. Local fixed-shape references, which disappear before XLA lowering.
 2. One fixed-shape unsharded external reference, synchronous protocol, with copy-protection fallback.
@@ -862,11 +874,14 @@ executable can be invoked.
 5. Persistent executable round trips and replacement compatibility.
 6. Asynchronous sequencing: pending states, read leases, and overlapping-call semantics.
 7. Sharded references with atomic whole-shard-set holder updates.
-8. Bounded-dynamic references after physical alias compatibility is proven.
+8. Finite replicated bounded-dynamic references for read-only state; mutation remains rejected until physical alias
+   compatibility is proven.
 9. A deliberate zero-space-reference policy.
-10. Multi-device and multi-host failure propagation.
+10. Multi-device execution on fully addressable single-process meshes, with explicit multi-host rejection.
 
-Each later class remains rejected at lowering until its ABI and runtime tests land.
+The resulting ABI admits the supported classes above only after their runtime checks pass. Zero-space, non-device,
+unbounded or nonreplicated dynamic, input-bucketed, foreign/non-addressable-mesh, and multi-host state remain explicit
+prelaunch rejections.
 
 ## 12. Pallas-ready preserved-reference path
 
@@ -879,8 +894,9 @@ discharge inside an explicitly validated kernel region.
 - Root identity, access modes, lifetime checks, and view composition come from the same `ReferenceAnalysis`.
 - Ordinary and kernel lowering share read/write/swap/accumulate semantics.
 - `ArrayType` remains the canonical source of element, shape, layout, sharding, and memory information.
-- The canonical `Memory` vocabulary may later be generalized for target-neutral global, workgroup/shared, and
-  private/local spaces; no parallel reference-memory enum is introduced.
+- The canonical `Memory` vocabulary remains the source of physical array placement. The experimental kernel boundary
+  uses `KernelAddressSpace` only as target-eligibility metadata for how an operand or future scratch allocation may be
+  exposed; it is not stored in a reference and does not introduce a parallel reference-memory model.
 
 ### Kernel-owned concepts
 
@@ -894,10 +910,12 @@ The following do not belong in `ReferenceType<T>`:
 
 They belong to a future higher-order kernel-call operation and its attached kernel region.
 
-### Future kernel phases
+### Kernel roadmap
 
-1. Define a kernel-call boundary whose operands are read-only, write-only, read/write, and scratch references.
-2. Define preserved-reference eligibility and prohibit references outside validated kernel regions.
+1. The experimental Phase 12 kernel-call boundary defines read-only, write-only, read/write, and scratch parameter
+   contracts while keeping its outer ABI array-based; scratch bindings remain explicitly unsupported.
+2. The Phase 12 validator preserves references only inside a validated standalone kernel body and ordinary XLA
+   rejects that same unresolved body.
 3. Add scoped uninitialized scratch allocation and non-escape validation. **Access-mode revisit trigger:** when
    uninitialized allocation (`empty_reference`-style scratch) lands, read-before-initialization becomes an error
    worth catching, and a `Write`-classified used-result `swap` reads uninitialized memory — at that point either a
@@ -913,8 +931,9 @@ They belong to a future higher-order kernel-call operation and its attached kern
    buffer reuse, and executable-entry `tf.aliasing_output`, which is reserved for external Ryft reference mutation.
    Kernel-internal preserved references never create `XlaReferenceStateSignature` slots or entry aliases.
 
-Architecture acceptance does not require implementing these phases now. It requires proving that the ordinary
-reference design contains no XLA-functionalization-specific field or assumption that would force replacement later.
+The preserved-reference contract proves that the ordinary reference design contains no XLA-functionalization-specific
+field or assumption that would force replacement by a future kernel layer. A production kernel compiler, launch model,
+and scheduler remain separate work.
 
 ## 13. Relationship to future first-class Lists
 
@@ -925,9 +944,9 @@ A future `List` can also become an `ArrayIrType`/`ArrayIrValue` member. Referenc
 - transform legality gates;
 - backend-specific physicalization.
 
-They do not share semantics. A reference is an identity-bearing effect capability over fixed-shape storage. A List is
-a persistent variable-cardinality computational value. Do not model a logical List as `Reference<List<T>>` or make List
-operations stateful.
+They do not share semantics. A reference is an identity-bearing effect capability over array storage with one invariant
+declared type; a List is a persistent variable-cardinality computational value. Do not model a logical List as
+`Reference<List<T>>` or make List operations stateful.
 
 The List design should continue to reuse `Size` for logical length and derive packed capacity only during lowering;
 it should not introduce a parallel public `ListCapacity`. That work is outside this reference plan, but reference
@@ -1242,70 +1261,80 @@ physical alias reuse does not occur; persisted/replaced executables cannot carry
 
 ### Phase 10: Add the asynchronous external runtime protocol
 
-- [ ] Add pending generation/event holder states: reserve generations at submission time under the held guards
+- [x] Add pending generation/event holder states: reserve generations at submission time under the held guards
       (§11.3 step 8) and replace reservations with pending final values after result construction (§11.3 step 10),
       poisoning all mutated holders when construction or validation fails.
-- [ ] Track read-only execution leases, published atomically with the mutated-holder generation reservations while
+- [x] Track read-only execution leases, published atomically with the mutated-holder generation reservations while
       the ordered guards are still held — immediately after successful submission and before any fallible result
       processing (§11.3 step 8) — and require later mutations to wait or dependency-chain them before donation.
-- [ ] Define the immediate-execute-error-without-fence policy: restore mutated states and conservatively quarantine
-      read-only participants behind a synthetic lease unless the PJRT contract proves no device access was accepted
-      (§11.3 failure semantics).
-- [ ] Use generation-safe cumulative dependency/error state so a failure in an earlier pending mutation cannot be
-      hidden by a later chained call or stale callback.
-- [ ] Serialize conflicting same-holder calls while allowing safe read overlap and independent-holder concurrency.
-- [ ] Make multi-holder pending installation logically atomic on the same submitted execution.
-- [ ] Define asynchronous-execution failure poisoning and dropped-completion semantics; dropping a completion handle
+- [x] Implement the copy-protected immediate-execute-error-without-fence policy: retain mutated holder snapshots
+      through submission so every holder remains ready when PJRT returns no fence, publishing no synthetic read lease;
+      after successful submission, asynchronous failures poison the complete cumulative mutation chain (§11.3).
+- [x] Use generation-safe cumulative dependency/error state so a failure in an earlier pending mutation cannot be
+      hidden by a later chained call. Reconcile typed holder generations lazily on holder access; backend callbacks
+      update only the type-erased completion token and never capture a non-`'static` holder.
+- [x] Serialize conflicting same-holder calls while allowing safe read overlap and independent-holder concurrency.
+- [x] Make multi-holder pending installation logically atomic on the same submitted execution.
+- [x] Define asynchronous-execution failure poisoning and dropped-completion semantics; dropping a completion handle
       after the irreversibility boundary neither cancels nor rolls back the mutation.
-- [ ] Introduce the type-erased completion/dependency token in `ryft-core` (§5.2) and implement it in `ryft-xla` over
+- [x] Introduce the type-erased completion/dependency token in `ryft-core` (§5.2) and implement it in `ryft-xla` over
       `ExecutionFence`; pending holder states and read leases store the token directly, with no backend side map
       keyed by `ReferenceId`.
-- [ ] Do not hold a host mutex for device execution duration; later accesses await or dependency-chain pending state.
-- [ ] Add concurrency, overlap, asynchronous failure, chained-failure, and stale-callback/generation tests.
+- [x] Do not hold a host mutex for device execution duration; later accesses await or dependency-chain pending state.
+- [x] Add concurrency, overlap, asynchronous failure, chained-failure, and stale-callback/generation tests.
 
 **Exit criterion:** overlapping calls have defined sequencing and failure semantics; asynchronous failures poison
 exactly the involved mutated holders; no stale callback or chained call can hide or overwrite an earlier failure.
 
 ### Phase 11: Expand XLA shape and distribution support
 
-- [ ] Add sharded references with identical input/final-state sharding and atomic holder updates across shards.
-- [ ] Add bounded-dynamic references after alias shape/extent compatibility is proven.
-- [ ] Define and implement or explicitly reject zero-space references.
-- [ ] Validate memory placement and input-bound bucketing interactions.
-- [ ] Add multi-device and multi-host sequencing/failure behavior.
-- [ ] Add each class independently with lowering and runtime conformance tests.
+- [x] Admit static device-memory references with replicated or sharded distribution only when the logical sharding
+      uses the selected compilation mesh, mutated input/final-state shardings are identical, and the runtime holder's
+      physical `DeviceMesh` exactly matches the compiled device ordering. Update complete shard sets atomically.
+- [x] Add finite bounded-dynamic read-only references with replicated sharding. Reject bounded-dynamic mutation before
+      lowering because CPU backend execution does not preserve the required aliased runtime extent; retain the exact
+      low-level alias rejection until backend compatibility is proven.
+- [x] Reject zero-space and non-device-memory external state before lowering because each holder slot requires an
+      executable device buffer.
+- [x] Reject input-bound bucketing whenever discharged external state is present, including capture-only reference
+      state that is absent from the public dispatch signature.
+- [x] Admit fully addressable, single-process multi-device meshes. Reject foreign logical/physical meshes,
+      non-addressable devices, and multi-host meshes before launch because holder identity and poisoning are
+      process-local.
+- [x] Add each class independently with lowering and runtime conformance tests.
 
 **Exit criterion:** every admitted shape/sharding/memory class has a documented ABI, and unsupported classes fail during
 validation/lowering rather than after launch.
 
 ### Phase 12: Establish the preserved-reference kernel contract
 
-- [ ] Add a mock/kernel eligibility validator using the same roots, views, and access summaries.
-- [ ] Define a higher-order kernel-call region boundary and operand access modes.
-- [ ] Prove ordinary XLA rejects preserved refs outside that boundary.
-- [ ] Define scratch allocation/non-escape, address spaces, atomics, synchronization, and view alignment as separate
-      kernel contracts.
-- [ ] Lower `swap` by result liveness — exchange when the old value is live, plain store when it is provably dead
+- [x] Add a mock/kernel eligibility validator using the same roots, views, and access summaries.
+- [x] Define a higher-order kernel-call region boundary and operand access modes.
+- [x] Prove ordinary XLA rejects preserved refs outside that boundary.
+- [x] Define scratch/non-escape eligibility, address spaces, atomics, synchronization, and view alignment as separate
+      kernel contracts, rejecting scratch bindings until uninitialized allocation semantics exist.
+- [x] Lower `swap` by result liveness — exchange when the old value is live, plain store when it is provably dead
       (§5.3, §6.2) — so write-only and scratch operands never require readable previous contents.
-- [ ] Lower one conformance program both through ordinary discharge and through a preserved mock/Mosaic path.
-- [ ] Keep all grid/launch/backend concepts outside the core reference type.
+- [x] Lower one conformance program both through ordinary discharge and through a preserved mock/Mosaic path.
+- [x] Keep all grid/launch/backend concepts outside the core reference type.
 
 **Exit criterion:** a future Pallas layer can preserve and lower the existing logical reference IR without replacing
 the type, operation, identity, effect, or view model.
 
 ### Phase 13: Stabilize APIs and documentation
 
-- [ ] Document local purity versus external impurity.
-- [ ] Document second-class restrictions, freeze/invalidation, snapshot, sequencing, and failure semantics.
-- [ ] Document transform support and precise unsupported combinations.
-- [ ] Document XLA hidden-state and may-alias behavior without promising physical in-place reuse.
-- [ ] Add end-to-end local, external, captured, control-flow, AD, batching, and view examples for the supported subset.
-- [ ] Remove temporary scaffolding and compatibility layers; every such layer must have been marked at creation with a
+- [x] Document local purity versus external impurity.
+- [x] Document second-class restrictions, freeze/invalidation, snapshot, sequencing, and failure semantics.
+- [x] Document transform support and precise unsupported combinations.
+- [x] Document XLA hidden-state and may-alias behavior without promising physical in-place reuse.
+- [x] Add end-to-end local, external, captured, control-flow, AD, batching, and view examples for the supported subset.
+- [x] Remove temporary scaffolding and compatibility layers; every such layer must have been marked at creation with a
       `TODO(eaplatanios)` naming the phase that deletes it, and this phase verifies by search that none remain.
-- [ ] Reassess which APIs should remain experimental until external AD and kernel semantics mature.
+- [x] Reassess which APIs should remain experimental until external AD and kernel semantics mature.
 
 **Exit criterion:** the supported contract is comprehensible without reading implementation code and does not imply
-support for deferred aliases, transforms, dynamic shapes, or kernel operations.
+support for deferred aliases or transforms, bounded-dynamic mutation, unbounded or nonreplicated dynamic state, or
+kernel operations beyond the explicitly validated preserved-reference boundary.
 
 ## 15. Likely change surface
 
@@ -1370,7 +1399,7 @@ Use named families rather than an uncontrolled Cartesian product.
 | Area | Positive cases | Negative/safety cases |
 |---|---|---|
 | Type/member | reference projection; dynamic referent refinement; shared dimension identities | every cross-kind projection/refinement; numeric use of a reference |
-| Primitive ordering | create/read; write/read; swap old/new; ordered accumulates; interleaved roots | promoted/broadcast replacement; update result type change; dynamic extent change in MVP; use/view after freeze |
+| Primitive ops | create/read/write/swap/add; interleaved roots | bad type; dynamic mutation; frozen use |
 | Views | base/view and composed/overlapping observation | implicit/escaping view; bad transform |
 | Effects/liveness | unused write retained; read/write order; I/O plus state | folding, DCE, duplication, speculation, rematerialization |
 | Straight-line discharge | each primitive; one/two roots; local/external; read-only/mutated | unresolved root; partial replay on validation failure |
@@ -1382,9 +1411,9 @@ Use named families rather than an uncontrolled Cartesian product.
 | Batching | discharged local function equals per-example loop | external/mapped/captured ref; replicated write; lane conflict |
 | JVP/VJP | local read/overwrite/swap/accumulate; condition/bounded while/scan; pure oracle | external ref; tangent ref; custom-rule ref; silent zero derivative; unbounded while transpose |
 | Rematerialization | discharged local result matches baseline | preserved mutation recomputed or duplicated |
-| XLA lowering | local refs; external state; aliases with zero-space index shifts | surviving ref; out-of-range/wrong alias; unsupported dynamic/sharded ref |
-| XLA runtime | consecutive calls; retained initializer/read snapshots; distinct roots sharing initial storage; unique/shared buffer; captures; read lease before mutation | duplicate holder; pre/post-handoff failure; async failure; chained earlier failure; stale callback/generation; stale donated state |
-| Persistence | new-schema round trip; replacement compatibility | old/corrupt schema; duplicate alias; type/sharding mismatch |
+| XLA lowering | local; static sharded; finite dynamic reads | surviving refs; unsupported storage/topology |
+| XLA runtime | calls, captures, snapshots, leases, sharded updates | duplicates; failure, stale state, multi-host |
+| Persistence | V6 dynamic-read/static-sharded round trips | old/corrupt schema; alias/type/sharding/mesh mismatch |
 | Pallas contract | same root/view/access summary under preservation | preserved ref accepted by ordinary XLA; kernel metadata in core type |
 
 Add property/equivalence tests for short generated straight-line programs and small conditions/loops/scans:
@@ -1401,31 +1430,31 @@ This is the strongest practical check against ordering and hidden-state-threadin
 
 For each implementation phase:
 
-- [ ] Inspect `git diff` and classify every changed file by the phase's declared ownership.
-- [ ] Run targeted tests before broad crate tests.
-- [ ] Search all `ArrayIrType`/`ArrayIrValue` exhaustive matches after adding the variant and inspect every remaining
+- [x] Inspect `git diff` and classify every changed file by the phase's declared ownership.
+- [x] Run targeted tests before broad crate tests.
+- [x] Search all `ArrayIrType`/`ArrayIrValue` exhaustive matches after adding the variant and inspect every remaining
       array/dimension-only assumption.
-- [ ] Verify no old `AtomType`, `ProgramType`, or parallel reference-universe scaffolding was introduced.
-- [ ] Verify source rendering distinguishes all semantics-bearing reference/view metadata. Renderings back the
+- [x] Verify no old `AtomType`, `ProgramType`, or parallel reference-universe scaffolding was introduced.
+- [x] Verify source rendering distinguishes all semantics-bearing reference/view metadata. Renderings back the
       debug-assertions transform-cache determinism recheck (`transforms.rs:591-618`) and rendered-program test
       assertions; production cache keys are argument-based (`ErasedTransformArguments`), StableHLO-text-based
       (`XlaPersistentKeyV6`), and dispatch-signature-based (`XlaDispatchKey`) — reference ABI metadata participates
       in the persistent key schema, not the rendering.
-- [ ] Verify invalid programs fail before mutation, replay, or backend lowering.
-- [ ] Verify ordinary StableHLO contains no reference types or operations.
-- [ ] Inspect translated/optimized HLO for exact input/output alias configuration when external refs land.
-- [ ] Run each potentially expensive command with a 300-second timeout.
+- [x] Verify invalid programs fail before mutation, replay, or backend lowering.
+- [x] Verify ordinary StableHLO contains no reference types or operations.
+- [x] Inspect translated/optimized HLO for exact input/output alias configuration when external refs land.
+- [x] Run each potentially expensive command with a 300-second timeout.
 
 Expected command progression:
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo test -p ryft-core --lib`
-- [ ] `cargo test -p ryft-macros --lib` and `cargo test -p ryft-macros-tests` when derive contracts change
-- [ ] `cargo test -p ryft-xla --lib`
-- [ ] `cargo test -p ryft --lib`
-- [ ] `cargo test -p ryft-mlir --lib` when function attributes or Mosaic wrappers change
-- [ ] `cargo test -p ryft-pjrt --lib` when execution/donation APIs change
-- [ ] `git diff --check`
+- [x] `cargo fmt --check`
+- [x] `cargo test -p ryft-core --lib`
+- [x] `cargo test -p ryft-macros --lib` and `cargo test -p ryft-macros-tests` when derive contracts change
+- [x] `cargo test -p ryft-xla --lib`
+- [x] `cargo test -p ryft --lib`
+- [x] `cargo test -p ryft-mlir --lib` when function attributes or Mosaic wrappers change (not applicable: unchanged)
+- [x] `cargo test -p ryft-pjrt --lib` when execution/donation APIs change
+- [x] `git diff --check`
 
 ## 18. Delivery milestones and effort split
 
@@ -1612,7 +1641,7 @@ At each checkpoint, ask:
       produce `n -> m`; composite arm uses `ArrayType::extend_identity_renaming`) and removed the contradictory
       compatibility-delegation wording; restructured the async protocol so lease publication and mutated-generation
       reservation happen atomically under the held guards immediately after submission, before all fallible result
-      processing, with a conservative quarantine policy for immediate execute errors without a fence; chose the
+      processing, with a copy-protected policy that leaves holders ready on immediate execute errors without a fence;
       type-erased core completion/dependency token (XLA implements it over `ExecutionFence`, no side maps); fixed
       the pipeline order to capture-normalization before `ReferenceAnalysis` before discharge; renamed the stateful
       call surface (`call_statefully`/`call_statefully_async` on an opt-in `StatefulCompilationDomain`, shared
@@ -1947,7 +1976,116 @@ At each checkpoint, ask:
       operation-macro integration tests and 17 parameter-macro tests including all trybuild cases; core and XLA
       all-target checks; core documentation with 95 pre-existing warnings and warning-free XLA documentation;
       formatting, stale-identifier, added-line-width, and `git diff --check` audits. Phase 10 asynchronous leases and
-      generations plus Phase 11 preserved-reference kernel lowering remain deferred.
+      generations plus Phase 11 shape and distribution support were deferred by this pass and are now in progress;
+      the Phase 12 preserved-reference kernel contract remains planned.
 
-Unchecked implementation items above remain future execution work. Completed items record code and verification that
-landed with the corresponding phase summary.
+- [x] 2026-08-20 combined Phase 2–9 re-audit fix pass 21: three independent correctness, conventions,
+      and simplification audits over phases 8–9 (re-flagging 2–7) produced a consolidated fix inventory; per an
+      explicit owner directive, changelog entries are excluded from this pass because the owner writes them manually,
+      and Phase 10/11 development proceeds concurrently in the same files. Correctness wave: `ReferenceGuard::poison`
+      is infallible so failure paths cannot trade the backend error for a guard-state error; the stateful transaction
+      window poisons with its actual cause from extraction through installation (the tautological `accepts` pre-pass
+      was deleted and `accepts` narrowed to `pub(crate)`; the structure was subsequently absorbed by the Phase 10
+      reservation/generation rework, which preserves poison-with-cause); zero-public-output synchronous execution now
+      blocks on the execution fence so asynchronous errors are not lost; `interpret_async` rejects stateful
+      executables; compile-time cache resolution cross-checks restored/shared executables against the requesting
+      lowering's invocation metadata (shared `incompatible_xla_invocation_field`), and replacement compatibility now
+      includes `requires_assertion_handler`; the zero-space state diagnostic names the real condition and the dead
+      input-side alias-injectivity check was replaced by an invariant comment. Simplification wave: view transforms
+      normalize through one `ViewSelection` (starts/limits/squeezed-axis/output-shape) shared by type derivation,
+      eager apply/replace, and reconstruction proof, with `validate_reconstruction` documented as the metadata
+      round-trip guard that runs once per composition; `ArrayReference` caches its derived `ReferenceType` (borrowed
+      `Typed::r#type`, incremental `with_transform` validation, no per-access re-fold);
+      `with_validated_transform` was renamed `with_transform_unchecked`; dead `ArrayReference::{view, is_root}` and
+      `Reference{Index,Slice}Operation` field accessors were deleted; the two view operations share one
+      `infer_view_output_types`; the read/swap/add-update discharge arms share `stage_view_access`; the duplicate
+      `XlaProgramTracer`/`XlaProgramValue` aliases were renamed away (91 sites); `ReferenceSource` dropped
+      `#[non_exhaustive]` and its three unreachable catch-alls. Conventions wave: byte-identical discharge impl
+      headers merged; `# Parameters` completed for `discharge_local_references` and
+      `analyze_references_with_capture_indices`; misplaced `discharge_region` doc restored and
+      `stage_reference_view_transform` documented; `ReferenceSource`/`ReferenceError`/`ReferenceOutputSemantics`/
+      `ReferenceAliasKind`/`ArraySliceAxis`/`Effect` import normalization; stale public/hidden `output_types` docs and
+      the `execute_compiled_async` stateless contract documented; batching "lanes" wording replaced and its reference
+      probe uses `is_reference`; the rematerialization context recovery uses an invariant `unwrap` and its
+      discharge-owned assertions were trimmed; backticks added for `usize` and holder-identity diagnostics; bound
+      order and `impl<C>` naming fixed in the eager capability impls and `XlaOperation` reference impls. Deliberately
+      kept: the `from_reference_*` named constructors (they document the canonical staged operation set and the
+      nested enums have no matching `From` impls). Findings against the pre-Phase-10 execution plumbing
+      (`prepare_state` naming, guard-vector shape, state-ABI validator unification, jit stateful dead API) were
+      obsoleted by the concurrent Phase 10 rework and intentionally not applied. Test wave: `reference_views` gained
+      its owner tests (transform rejections incl. the `usize`-overflow pin, composition algebra and hashing, the
+      root-only `read` gate, cached-type consistency, and the derived-view rejection pinned through the live
+      `ArrayReference::with_transform` path); the operation tests were split per operation with
+      `check_operation_type_inference!` and `indoc!` fixtures; discharge gained a `View`-rule rejection case, a
+      core-owned `Call`-rule end-to-end widening test, and the composed index-of-slice swap case; plus analysis and
+      tracing comment/import touch-ups. Re-audit rounds: round one found that the staged discharge path still
+      re-derived view addresses by hand, that `ViewSelection` carried dead payloads, that the superseded
+      `ArrayReferenceView::with_transform` composer survived, and — critically — that the new compile cross-check
+      compared boundary types with `ArrayType`'s dimension-variable *identity* equality, false-positively rejecting
+      legitimate in-memory and persistent cache hits for bounded-dynamic boundaries. Fixes: staged discharge now
+      stages through `ArrayReferenceViewTransform::selection` (one shared normalization with a merged
+      `squeezed_output_shape` payload); the superseded composer was deleted; invocation-metadata boundary types are
+      compared through the alpha-normalized persistent signature encoding (`canonical_boundary_types`, one "boundary
+      types" arm, pinned by a fresh-variable compatibility regression test); the replacement-metadata test covers the
+      assertion-handler field; the with-reference-state lowering doc no longer claims an unenforced ordering; the
+      stateful dispatcher doc states the real lock-release point; and the `XlaOperation` constant parameter is
+      uniformly named `Constant` (the `C`/`Capture` spellings are gone; `C` remains reserved for contexts). Round two
+      reported no correctness defects and round three confirmed the residual mechanical fixes. Verification: 1,519
+      core, 529 XLA, 17 + 20 macro integration tests; zero warnings; formatting, whitespace, orphan-identifier, and
+      line-width audits clean. Changelogs were deliberately left untouched for the owner to write manually.
+
+- [x] 2026-08-20 combined Phase 10–11 implementation/review pass 22: replaced the synchronous holder-lock protocol
+      with a type-erased completion contract, cumulative pending generations, read leases, and atomic reservation and
+      installation transitions. XLA publishes the complete dependency immediately after successful submission,
+      prepares device inputs without holding holder mutexes, revalidates optimistic snapshots by generation, preserves
+      ordinary donation, and leaves holders ready when execution returns no fence. Submitted failures poison the
+      complete mutated group, dropped completion handles do not cancel work, chained failures remain observable, and
+      typed holder state reconciles generation-safely on its next access. PJRT execution fences now provide exact
+      all-event readiness, callbacks, dropped-handle keepalive, and ordered error propagation.
+
+      Phase 11 admits static device-memory state with replicated or sharded distribution on fully addressable
+      single-process meshes when logical and physical mesh identities match exactly; multi-shard mutation installs
+      atomically. Finite replicated bounded-dynamic state is admitted read-only, while mutation remains rejected until
+      backend alias compatibility is proven. Zero-space, non-device, unbounded dynamic, dynamic non-replicated,
+      bucketing, asymmetric alias-sharding metadata, foreign/non-addressable mesh, and multi-host state all fail before
+      launch. V6 persistence revalidates the same state ABI, round-trips bounded-dynamic read-only state, and preserves
+      real two-device sharded mutation metadata when the backend exposes executable serialization. No changelog was
+      modified, as explicitly requested.
+
+      Independent Phase 10 correctness, Phase 11 ABI/runtime, and conventions/simplicity audit loops fixed every
+      finding and each final pass reported clean. Final verification passed: 1,519 core tests plus 3 ignored; 128 PJRT
+      tests; 529 XLA tests plus 5 ignored; 20 operation-macro integration tests and 17 parameter-macro tests including
+      all trybuild cases; core, PJRT, and XLA all-target checks; documentation generation with 95 pre-existing core
+      warnings, 3 pre-existing PJRT warnings, and warning-free XLA docs; formatting, added-line-width, stale-contract,
+      and `git diff --check` audits.
+
+- [x] 2026-08-20 combined Phase 12–13 implementation/review pass 23: added an explicitly experimental XLA-owned
+      preserved-reference kernel boundary with an array outer ABI and a standalone reference body. Its validator
+      consumes the canonical core root, view, access, and source analysis; distinguishes read-only, write-only, and
+      read/write operands; records scratch/address-space/alignment/atomic/synchronization requirements only as kernel
+      eligibility metadata; and rejects unsupported scratch and target contracts. A deterministic mock artifact
+      preserves root-relative views and lowers live-result swap to exchange, dead-result swap to store, reads, and
+      ordered accumulation. Complete primitive-contract validation prevents custom public operation families from
+      lying about rule shape, accesses, semantics, types, or effects. Exact tests use the same external-root body for
+      preserved execution, ordinary discharge, and the immutable oracle, while ordinary XLA rejects the unresolved
+      body and the discharged sibling has no entry aliases or kernel state slots.
+
+      Phase 13 stabilizes the documented contract: backend-neutral core reference semantics remain public, backend
+      transaction SPI is hidden, and external XLA state plus preserved-kernel APIs are explicitly experimental. Public
+      docs now cover local purity, caller-owned impurity, lifetime/freeze/snapshot rules, conditions/loops/scans,
+      local AD and batching, captures, asynchronous leases/generations/failures, hidden final-state outputs, and the
+      non-semantic nature of may-alias/donation. Phase-targeted reference TODOs and compatibility scaffolding were
+      removed. No changelog was modified, as explicitly requested.
+
+      Three independent correctness/architecture, API/docs, and conventions/simplicity audit streams iterated until
+      every finding was fixed and the final frozen-tree passes reported no actionable findings. Verification passed:
+      1,519 core tests plus 3 ignored; 537 XLA tests plus 5 ignored; 128 PJRT tests; 57 macro unit tests; 20 operation-
+      macro integration tests and 17 parameter-macro tests including trybuild; 8 focused preserved-kernel tests; and
+      the zero-test facade library. Core, XLA, and facade all-target checks passed. Core doctests passed 69 with 16
+      ignored; XLA/facade doctests passed; documentation generation reported only 95 pre-existing core warnings and
+      no XLA/facade warnings. Formatting, `git diff --check`, source-rendering, ordinary-reference rejection,
+      stale/scaffolding/parallel-universe, added-line-width, and changelog-diff audits were clean.
+
+All implementation and verification items in this reference plan are complete. The production Pallas-style kernel
+language, launch model, and scheduler described by the roadmap remain a separate future program rather than unchecked
+work in this plan.

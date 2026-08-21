@@ -52,16 +52,6 @@ pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
 /// Canonical operation name for [`FreezeReferenceOperation`].
 pub const FREEZE_REFERENCE_OPERATION_NAME: &str = "freeze_reference";
 
-/// Rejects dynamic referents until runtime extent preservation is explicitly represented and validated.
-fn require_static_referent(operation: &str, referent: &ArrayType) -> Result<(), TypeError> {
-    if referent.static_shape().is_some() {
-        return Ok(());
-    }
-    Err(TypeError::invalid(format!(
-        "`{operation}` does not support dynamically shaped reference referent type `{referent}`",
-    )))
-}
-
 /// Creates a new reference initialized from this value.
 pub trait NewReference<Output = Self>: Sized {
     /// Creates an independent reference whose initial state is this value.
@@ -349,7 +339,6 @@ impl Operation for NewReferenceOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let referent = <&ArrayType>::try_from(&input_types[0])?;
-        require_static_referent(NEW_REFERENCE_OPERATION_NAME, referent)?;
         Ok(vec![ReferenceType::new(referent.clone()).into()])
     }
 
@@ -377,6 +366,19 @@ impl<C: Domain<Type = ArrayIrType, Value: NewReference<C::Value>>> Interpretable
     }
 }
 
+/// Infers the derived reference type produced by one root-preserving view transform, shared by
+/// [`ReferenceIndexOperation`] and [`ReferenceSliceOperation`].
+fn infer_view_output_types(
+    transform: ArrayReferenceViewTransform,
+    input_types: &[ArrayIrType],
+    region_interfaces: &[RegionInterface<ArrayIrType>],
+) -> Result<Vec<ArrayIrType>, TypeError> {
+    check_count!("input", input_types, 1, TypeError);
+    check_count!("region", region_interfaces, 0, TypeError);
+    let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+    Ok(vec![ReferenceType::new(transform.output_type(reference.referent())?).into()])
+}
+
 /// Pure reference-to-reference operation selecting one coordinate and removing its axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceIndexOperation {
@@ -392,18 +394,6 @@ impl ReferenceIndexOperation {
     #[inline]
     pub const fn new(axis: usize, index: usize) -> Self {
         Self { axis, index }
-    }
-
-    /// Returns the selected input axis.
-    #[inline]
-    pub const fn axis(&self) -> usize {
-        self.axis
-    }
-
-    /// Returns the selected coordinate.
-    #[inline]
-    pub const fn index(&self) -> usize {
-        self.index
     }
 
     /// Returns this operation's root-preserving view transform.
@@ -433,10 +423,7 @@ impl Operation for ReferenceIndexOperation {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
-        Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
+        infer_view_output_types(self.transform(), input_types, region_interfaces)
     }
 
     #[inline]
@@ -480,12 +467,6 @@ impl ReferenceSliceOperation {
         Self { axes }
     }
 
-    /// Returns the per-axis slice selections.
-    #[inline]
-    pub fn axes(&self) -> &[ArraySliceAxis] {
-        self.axes.as_slice()
-    }
-
     /// Returns this operation's root-preserving view transform.
     #[inline]
     pub fn transform(&self) -> ArrayReferenceViewTransform {
@@ -513,10 +494,7 @@ impl Operation for ReferenceSliceOperation {
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        check_count!("region", region_interfaces, 0, TypeError);
-        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
-        Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
+        infer_view_output_types(self.transform(), input_types, region_interfaces)
     }
 
     #[inline]
@@ -571,7 +549,6 @@ impl Operation for ReferenceReadOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
-        require_static_referent(REFERENCE_READ_OPERATION_NAME, reference.referent())?;
         Ok(vec![reference.referent().clone().into()])
     }
 
@@ -633,7 +610,6 @@ impl Operation for ReferenceSwapOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
         let replacement = <&ArrayType>::try_from(&input_types[1])?;
-        require_static_referent(REFERENCE_SWAP_OPERATION_NAME, reference.referent())?;
         if replacement != reference.referent() {
             return Err(TypeError::invalid(format!(
                 "`{REFERENCE_SWAP_OPERATION_NAME}` replacement type `{replacement}` must exactly match reference \
@@ -700,7 +676,6 @@ impl Operation for ReferenceAddUpdateOperation {
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
         let update = <&ArrayType>::try_from(&input_types[1])?;
-        require_static_referent(REFERENCE_ADD_UPDATE_OPERATION_NAME, reference.referent())?;
         let addition_result = AddOperation::<ArrayType>::new()
             .infer_output_types(&[reference.referent().clone(), update.clone()], &[])?
             .remove(0);
@@ -768,7 +743,6 @@ impl Operation for FreezeReferenceOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
-        require_static_referent(FREEZE_REFERENCE_OPERATION_NAME, reference.referent())?;
         Ok(vec![reference.referent().clone().into()])
     }
 
@@ -804,8 +778,9 @@ macro_rules! impl_unsupported_reference_transforms {
     };
 
     // Installs the same conservative transform rejections for one unresolved reference operation. Transposition
-    // reuses the shared non-transposable diagnostic: reference operations never transpose directly because
-    // reverse-mode differentiation always discharges them first (refer to `plan-references.md`).
+    // reuses the shared non-transposable diagnostic: reference operations are state-threading primitives with no
+    // linear structure to transpose, and discharge rewrites them into pure array SSA before any transposition runs,
+    // so a direct transpose rule would never be reached and is deliberately unsupported.
     (@each $operation:ty) => {
         impl_non_transposable_operation!($operation);
 
@@ -890,7 +865,7 @@ mod tests {
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
-    // Dynamically shaped referent fixture shared by the five per-operation type-inference rejections.
+    // Dynamically shaped referent fixture shared by the per-operation type-inference cases.
     fn dynamic_referent_type() -> ArrayType {
         ArrayType::new(
             DataType::F32,
@@ -931,6 +906,7 @@ mod tests {
     #[test]
     fn test_new_reference() {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let dynamic_type = dynamic_referent_type();
         check_operation_type_inference!(
             operation = NewReferenceOperation,
             cases = [
@@ -939,9 +915,8 @@ mod tests {
                     output_types = [ReferenceType::new(array_type).into()],
                 },
                 {
-                    input_types = [dynamic_referent_type().into()],
-                    error = "`new_reference` does not support dynamically shaped reference referent type \
-                             `f32[length]`",
+                    input_types = [dynamic_type.clone().into()],
+                    output_types = [ReferenceType::new(dynamic_type).into()],
                 },
             ],
         );
@@ -954,53 +929,111 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_views() {
+    fn test_reference_index() {
         let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(root_type.clone()));
-        let index = ReferenceIndexOperation::new(0, 1);
-        assert_eq!(
-            index.infer_output_types(std::slice::from_ref(&reference_type), &[]),
-            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into()]),
+        let operation = ReferenceIndexOperation::new(0, 1);
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [ReferenceType::new(root_type.clone()).into()],
+                    output_types = [ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into()],
+                },
+                {
+                    input_types = [root_type.clone().into()],
+                    error = "expected reference type but got array type",
+                },
+                {
+                    input_types = [ReferenceType::new(dynamic_referent_type()).into()],
+                    error = "reference indexing requires a static referent type but got `f32[length]`",
+                },
+            ],
         );
-        assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
-        assert!(index.effects().is_pure());
+        assert!(operation.effects().is_pure());
         assert_eq!(
-            index.reference_semantics().outputs(),
+            operation.reference_semantics().outputs(),
             &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
         );
+        assert!(operation.reference_semantics().accesses().is_empty());
+        assert_eq!(operation.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+        assert_eq!(operation.to_string(), "reference_index [axis=0, index=1]");
 
-        let slice = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
-        assert_eq!(
-            slice.infer_output_types(std::slice::from_ref(&reference_type), &[]),
-            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])).into()]),
-        );
-        assert_eq!(
-            slice.to_string(),
-            concat!(
-                "reference_slice [\n",
-                "    axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }, ",
-                "ArraySliceAxis { start: 0, size: 3, stride: 1 }],\n",
-                "]",
-            ),
-        );
-        assert!(slice.effects().is_pure());
-        assert_eq!(slice.reference_semantics(), index.reference_semantics());
-
+        // Indexing an already-derived handle composes onto the same root instead of allocating another reference.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let root = builder.add_input(reference_type);
-        let row = builder.add_instruction(index, Vec::new(), vec![root]).unwrap()[0];
-        let row_slice = builder
-            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]), Vec::new(), vec![row])
-            .unwrap()[0];
+        let root = builder.add_input(ReferenceType::new(root_type).into());
+        let row = builder.add_instruction(operation, Vec::new(), vec![root]).unwrap()[0];
+        let element = builder.add_instruction(ReferenceIndexOperation::new(0, 2), Vec::new(), vec![row]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![row_slice], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![element], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:ref<f32[3, 4]> .
                 let %1:ref<f32[4]> = reference_index [axis=0, index=1] %0
-                    %2:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }]] %1
+                    %2:ref<f32[]> = reference_index [axis=0, index=2] %1
+                in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_reference_slice() {
+        let root_type = ArrayType::new_static(DataType::F32, [3, 4]);
+        let operation = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
+        check_operation_type_inference!(
+            operation = operation.clone(),
+            cases = [
+                {
+                    input_types = [ReferenceType::new(root_type).into()],
+                    output_types = [ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3])).into()],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F32, [3, 4]).into()],
+                    error = "expected reference type but got array type",
+                },
+                {
+                    input_types = [ReferenceType::new(dynamic_referent_type()).into()],
+                    error = "reference slicing requires a static referent type but got `f32[length]`",
+                },
+            ],
+        );
+        assert!(operation.effects().is_pure());
+        assert_eq!(
+            operation.reference_semantics().outputs(),
+            &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
+        );
+        assert!(operation.reference_semantics().accesses().is_empty());
+        assert_eq!(
+            operation.transform(),
+            ArrayReferenceViewTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)],
+            },
+        );
+        // The standalone rendering wraps its per-axis selections once the single-line form grows too long.
+        let expected_rendering = indoc! {"
+            reference_slice [
+                axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }, ArraySliceAxis { start: 0, size: 3, stride: 1 }],
+            ]"};
+        assert_eq!(operation.to_string(), expected_rendering);
+
+        // Slicing an already-derived handle composes onto the same root instead of allocating another reference.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let root = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [4])).into());
+        let outer = builder
+            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]), Vec::new(), vec![root])
+            .unwrap()[0];
+        let inner = builder
+            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]), Vec::new(), vec![outer])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![inner], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[4]> .
+                let %1:ref<f32[3]> = reference_slice [axes=[ArraySliceAxis { start: 1, size: 3, stride: 1 }]] %0
+                    %2:ref<f32[2]> = reference_slice [axes=[ArraySliceAxis { start: 0, size: 2, stride: 1 }]] %1
                 in (%2)"},
         );
     }
@@ -1008,6 +1041,7 @@ mod tests {
     #[test]
     fn test_reference_read() {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let dynamic_type = dynamic_referent_type();
         check_operation_type_inference!(
             operation = ReferenceReadOperation,
             cases = [
@@ -1016,9 +1050,8 @@ mod tests {
                     output_types = [array_type.into()],
                 },
                 {
-                    input_types = [ReferenceType::new(dynamic_referent_type()).into()],
-                    error = "`reference_read` does not support dynamically shaped reference referent type \
-                             `f32[length]`",
+                    input_types = [ReferenceType::new(dynamic_type.clone()).into()],
+                    output_types = [dynamic_type.into()],
                 },
             ],
         );
@@ -1054,9 +1087,8 @@ mod tests {
                     error = "expected reference type but got array type",
                 },
                 {
-                    input_types = [ReferenceType::new(dynamic_type.clone()).into(), dynamic_type.into()],
-                    error = "`reference_swap` does not support dynamically shaped reference referent type \
-                             `f32[length]`",
+                    input_types = [ReferenceType::new(dynamic_type.clone()).into(), dynamic_type.clone().into()],
+                    output_types = [dynamic_type.into()],
                 },
             ],
         );
@@ -1102,8 +1134,7 @@ mod tests {
                 },
                 {
                     input_types = [ReferenceType::new(dynamic_type.clone()).into(), dynamic_type.into()],
-                    error = "`reference_add_update` does not support dynamically shaped reference referent type \
-                             `f32[length]`",
+                    output_types = [],
                 },
             ],
         );
@@ -1121,6 +1152,7 @@ mod tests {
     #[test]
     fn test_freeze_reference() {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let dynamic_type = dynamic_referent_type();
         check_operation_type_inference!(
             operation = FreezeReferenceOperation,
             cases = [
@@ -1133,9 +1165,8 @@ mod tests {
                     error = "expected reference type but got array type",
                 },
                 {
-                    input_types = [ReferenceType::new(dynamic_referent_type()).into()],
-                    error = "`freeze_reference` does not support dynamically shaped reference referent type \
-                             `f32[length]`",
+                    input_types = [ReferenceType::new(dynamic_type.clone()).into()],
+                    output_types = [dynamic_type.into()],
                 },
             ],
         );
@@ -1432,7 +1463,7 @@ mod tests {
                 None,
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "program replay cannot bind external reference public input 0; use a stateful compilation \
+                message: "program replay cannot bind external reference `public input 0`; use a stateful compilation \
                           domain"
                     .to_string(),
             }),
@@ -1441,7 +1472,7 @@ mod tests {
         assert_eq!(
             program.interpret(vec![reference.clone(), ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),]),
             Err(ProgramError::UnsupportedOperation {
-                message: "program replay cannot bind external reference public input 0; use a stateful compilation \
+                message: "program replay cannot bind external reference `public input 0`; use a stateful compilation \
                           domain"
                     .to_string(),
             }),

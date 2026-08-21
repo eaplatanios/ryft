@@ -233,12 +233,12 @@ impl Concretizable<bool> for XlaConstant {
 /// stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero and
 /// residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
 #[derive(Clone, Debug, ryft_macros::Operation)]
-#[ryft(crate = "ryft_core", type = ArrayIrType, constant = C)]
+#[ryft(crate = "ryft_core", type = ArrayIrType, constant = Constant)]
 #[ryft(members(ArrayType, structural(DimensionType)))]
 #[ryft(dispatch(differentiation, transposition))]
-pub enum XlaOperation<C = XlaConstant>
+pub enum XlaOperation<Constant = XlaConstant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
@@ -257,7 +257,7 @@ where
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed composite carrier when an
     /// array operation is lifted into this family.
     #[ryft(projected(ArrayType), skip_from)]
-    Array(ArrayOperation<C::Projected>),
+    Array(ArrayOperation<Constant::Projected>),
 
     /// Homogeneous first-class-dimension operation.
     #[ryft(projected(DimensionType, structural))]
@@ -330,13 +330,13 @@ where
     AllToAll(AllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
-    Condition(ConditionOperation<C>),
+    Condition(ConditionOperation<Constant>),
 
     /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
     While(WhileOperation<ArrayIrType>),
 
     /// Backend-owned scan whose attached body region can contain XLA operations.
-    Scan(ScanOperation<C>),
+    Scan(ScanOperation<Constant>),
 
     /// Backend-owned custom JVP call whose attached regions can contain XLA operations.
     CustomJvp(CustomJvpOperation<ArrayIrType>),
@@ -357,7 +357,7 @@ where
     JitCall(JitCallOperation<ArrayIrType>),
 
     /// XLA-specific `shard_map`.
-    ShardMap(Box<ShardMapOperation<C>>),
+    ShardMap(Box<ShardMapOperation<Constant>>),
 }
 
 impl<Constant> ArrayReferenceOperation for XlaOperation<Constant>
@@ -419,24 +419,24 @@ where
     }
 }
 
-impl<C> From<ArrayOperation<C::Projected>> for XlaOperation<C>
+impl<Constant> From<ArrayOperation<Constant::Projected>> for XlaOperation<Constant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
-    fn from(operation: ArrayOperation<C::Projected>) -> Self {
+    fn from(operation: ArrayOperation<Constant::Projected>) -> Self {
         // Delegating to the composite family's conversion keeps constructor normalization and member control-flow
         // promotion identical across both families: `Condition`, `While`, and `Scan` must become composite carriers
         // because the projected `Array` variant cannot own composite regions.
-        ArrayIrOperation::<C::Projected>::from(operation).into()
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
     }
 }
 
-impl<C> From<ArrayIrOperation<C::Projected>> for XlaOperation<C>
+impl<Constant> From<ArrayIrOperation<Constant::Projected>> for XlaOperation<Constant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn from(operation: ArrayIrOperation<C::Projected>) -> Self {
+    fn from(operation: ArrayIrOperation<Constant::Projected>) -> Self {
         match operation {
             ArrayIrOperation::Zero(operation) => Self::Zero(operation),
             ArrayIrOperation::DynamicOne(operation) => Self::DynamicOne(operation),
@@ -472,7 +472,7 @@ where
                     .iter()
                     .cloned()
                     .map(|capture| match capture {
-                        ryft_core::arrays::ArrayIrValue::Array(capture) => C::from_projected(capture),
+                        ryft_core::arrays::ArrayIrValue::Array(capture) => Constant::from_projected(capture),
                         ryft_core::arrays::ArrayIrValue::Dimension(_)
                         | ryft_core::arrays::ArrayIrValue::Reference(_) => {
                             // Scan captures are validated as stacked arrays during `infer_output_types`
@@ -486,7 +486,7 @@ where
                     })
                     .collect();
                 Self::Scan(
-                    ScanOperation::<C>::new(operation.carry_count(), operation.length())
+                    ScanOperation::<Constant>::new(operation.carry_count(), operation.length())
                         .with_reverse(operation.reverse())
                         .with_unroll(operation.unroll())
                         .unwrap()
@@ -501,9 +501,9 @@ where
     }
 }
 
-impl<C> From<DimensionRequirementOperation> for XlaOperation<C>
+impl<Constant> From<DimensionRequirementOperation> for XlaOperation<Constant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: DimensionRequirementOperation) -> Self {
@@ -513,9 +513,9 @@ where
 
 // Dimension constants additionally lift directly, so that generic staging code (e.g., `ExactShape::dimensions`)
 // can bound only `From<ConstantOperation<DimensionValue>>` without naming this family's dimension member.
-impl<C> From<ConstantOperation<DimensionValue>> for XlaOperation<C>
+impl<Constant> From<ConstantOperation<DimensionValue>> for XlaOperation<Constant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: ConstantOperation<DimensionValue>) -> Self {
@@ -529,13 +529,13 @@ macro_rules! impl_composite_operation_conversion {
     // homogeneous-array payload forms of mixed operations whose canonical composite payload is type-promoted.
     ($($operation:ty),+ $(,)?) => {
         $(
-            impl<C> From<$operation> for XlaOperation<C>
+            impl<Constant> From<$operation> for XlaOperation<Constant>
             where
-                C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             {
                 #[inline]
                 fn from(operation: $operation) -> Self {
-                    ArrayIrOperation::<C::Projected>::from(operation).into()
+                    ArrayIrOperation::<Constant::Projected>::from(operation).into()
                 }
             }
         )+
@@ -572,13 +572,13 @@ macro_rules! impl_array_operation_conversion {
     // Generates homogeneous array-operation conversions through the canonical projected member family.
     ($($operation:ty),+ $(,)?) => {
         $(
-            impl<C> From<$operation> for XlaOperation<C>
+            impl<Constant> From<$operation> for XlaOperation<Constant>
             where
-                C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             {
                 #[inline]
                 fn from(operation: $operation) -> Self {
-                    ArrayOperation::<C::Projected>::from(operation).into()
+                    ArrayOperation::<Constant::Projected>::from(operation).into()
                 }
             }
         )+
@@ -649,31 +649,31 @@ impl_array_operation_conversion!(
     PrintOperation<ArrayType>,
 );
 
-impl<Capture> ZeroOperationProvider<ArrayIrType> for XlaOperation<Capture>
+impl<Constant> ZeroOperationProvider<ArrayIrType> for XlaOperation<Constant>
 where
-    Capture: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Capture::Projected>::zero_operation(r#type)?.into())
+        Ok(ArrayIrOperation::<Constant::Projected>::zero_operation(r#type)?.into())
     }
 }
 
-impl<Capture> From<AddOperation<ArrayIrType>> for XlaOperation<Capture>
+impl<Constant> From<AddOperation<ArrayIrType>> for XlaOperation<Constant>
 where
-    Capture: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     #[inline]
     fn from(operation: AddOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Capture::Projected>::from(operation).into()
+        ArrayIrOperation::<Constant::Projected>::from(operation).into()
     }
 }
 
-impl<Capture> ResidualZeroProvider<ArrayIrType> for XlaOperation<Capture>
+impl<Constant> ResidualZeroProvider<ArrayIrType> for XlaOperation<Constant>
 where
-    Capture: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
-        <ArrayIrOperation<Capture::Projected> as ResidualZeroProvider<ArrayIrType>>::zero_residual_types(r#type)
+        <ArrayIrOperation<Constant::Projected> as ResidualZeroProvider<ArrayIrType>>::zero_residual_types(r#type)
     }
 
     fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
@@ -681,7 +681,7 @@ where
         source: ryft_core::AtomId,
         r#type: &ArrayIrType,
     ) -> Result<Vec<ryft_core::AtomId>, ProgramError> {
-        ArrayIrOperation::<Capture::Projected>::capture_zero_residuals(builder, source, r#type)
+        ArrayIrOperation::<Constant::Projected>::capture_zero_residuals(builder, source, r#type)
     }
 
     fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = Self>>(
@@ -689,7 +689,7 @@ where
         source: &C::Value,
         residual_type: &ArrayIrType,
     ) -> Result<Option<C::Value>, ProgramError> {
-        ArrayIrOperation::<Capture::Projected>::capture_zero_residual_value(context, source, residual_type)
+        ArrayIrOperation::<Constant::Projected>::capture_zero_residual_value(context, source, residual_type)
     }
 
     fn zero_operation_with_residuals<R: Clone>(
@@ -697,14 +697,14 @@ where
         residuals: &[R],
     ) -> Result<(Self, Vec<R>), ProgramError> {
         let (operation, operands) =
-            ArrayIrOperation::<Capture::Projected>::zero_operation_with_residuals(r#type, residuals)?;
+            ArrayIrOperation::<Constant::Projected>::zero_operation_with_residuals(r#type, residuals)?;
         Ok((operation.into(), operands))
     }
 }
 
-impl<C> XlaOperation<C>
+impl<Constant> XlaOperation<Constant>
 where
-    C: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     /// Returns the canonical core operation for a member or mixed primitive, or `None` for an XLA-owned
     /// higher-order operation.
@@ -712,7 +712,7 @@ where
     /// This conversion clones the payload, so it is reserved for methods that need the composite family's boundary
     /// projection or reconstruct an operation anyway (e.g., type inference, identity renaming, interpretation, and
     /// partial evaluation). Cheap per-instruction accessors dispatch to the borrowed payload directly instead.
-    pub(crate) fn to_core_operation(&self) -> Option<ArrayIrOperation<C::Projected>> {
+    pub(crate) fn to_core_operation(&self) -> Option<ArrayIrOperation<Constant::Projected>> {
         Some(match self {
             Self::Zero(operation) => ArrayIrOperation::Zero(operation.clone()),
             Self::DynamicOne(operation) => ArrayIrOperation::DynamicOne(operation.clone()),

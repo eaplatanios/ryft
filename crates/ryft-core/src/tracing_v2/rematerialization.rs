@@ -1994,15 +1994,8 @@ where
     {
         let program = self.discharge_local_references(capture_count, "rematerialization")?;
         Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
-            // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always
-            // recoverable; the error names the actual cause for direct callers of the body closure.
-            let context = inputs
-                .first()
-                .ok_or_else(|| ProgramError::UnsupportedOperation {
-                    message: "rematerialization cannot recover an execution context without inputs".to_string(),
-                })?
-                .context()
-                .clone();
+            // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always recoverable.
+            let context = inputs.first().unwrap().context().clone();
             program.interpret_in_context(&context, inputs)
         }))
     }
@@ -2326,7 +2319,7 @@ mod tests {
         ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, Sin, Tag,
     };
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{ReferenceType, RegionRole};
+    use crate::programs::{Effect, ReferenceType, RegionRole};
     use crate::tests::TestOrderedStateOperation;
 
     use super::*;
@@ -4187,7 +4180,7 @@ mod tests {
         // rematerialization derivation can run without any reference-specific rule.
         let pre_discharge = source.simplified().unwrap();
         assert_eq!(pre_discharge.instructions().len(), 3);
-        assert!(pre_discharge.effects().contains(crate::programs::Effect::OrderedState));
+        assert!(pre_discharge.effects().contains(Effect::OrderedState));
         let unresolved = rematerialize::<TestContext, _, _, _>(|input: DomainTracer<TestContext>| {
             let reference = input.new_reference()?;
             reference.add_update(&input)?;
@@ -4200,12 +4193,6 @@ mod tests {
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "program carries unresolved state and must be discharged before differentiation",
         ));
-
-        let (pure, public_output_count, external_states) = source.clone().discharge_references(0).unwrap().into_parts();
-        assert_eq!(public_output_count, 1);
-        assert!(external_states.is_empty());
-        let pure = pure.into_simplified().unwrap();
-        assert!(pure.effects().is_pure());
 
         let rematerialized = source.rematerialize_with_local_references::<TestContext>(0).unwrap();
         let wrong_context = TracingContext::<TestValue, TestOperation>::new();
@@ -4284,9 +4271,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // Routing pin only: the rematerialization adapter delegates to the shared discharge gate under the
-        // `rematerialization` transform name. The complete boundary-source semantics live in
-        // `Program::discharge_local_references`'s owner test in `arrays::reference_discharge`.
+        // Routing pin only: delegates to the shared discharge gate (owner tests in `arrays::reference_discharge`)
+        // under the `rematerialization` transform name.
         assert!(matches!(
             external.rematerialize_with_local_references::<TestContext>(0),
             Err(ProgramError::UnsupportedOperation { message })

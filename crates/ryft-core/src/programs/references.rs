@@ -29,13 +29,57 @@
 //! discharge. Local references compose with the supported program transforms only after that discharge. External
 //! holders use guarded state transactions around compiled execution. Views remain root-local across structured-region
 //! boundaries: a region must receive the root handle and recreate any index or slice view inside its own body.
+//!
+//! # Local Purity and External State
+//!
+//! A reference allocated inside a program is an implementation detail when it is frozen or discarded without
+//! escaping: discharge rewrites the complete lifetime into immutable array SSA, so the enclosing callable remains
+//! pure to its caller. A reference supplied as a public input or capture is different. Reads observe caller-owned
+//! state and mutations install a new value into that holder, so the enclosing callable is externally stateful and
+//! must use a backend's explicit stateful invocation surface.
+//!
+//! # Lifetime and Snapshot Rules
+//!
+//! References are second-class. They cannot be public outputs or constants, nested inside references or list values,
+//! duplicated at region boundaries, or selected from multiple possible roots. [`Reference::freeze`] consumes a
+//! locally owned root and invalidates every clone and view in its alias family; external roots cannot be frozen by a
+//! program. A read or the old value returned by a swap is an immutable snapshot: later mutation of the holder never
+//! changes a snapshot that has already been returned. Direct eager handles have no implicit program scope and remain
+//! live until an explicit freeze or the last handle is dropped.
+//!
+//! ```
+//! use ryft_core::{
+//!     Array, ArrayIrValue, ArraySliceAxis, FreezeReference, NewReference, ReferenceRead, ReferenceSlice,
+//!     ReferenceSwap,
+//! };
+//!
+//! let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
+//! let root = initial.new_reference()?;
+//! let tail = root.reference_slice(&[ArraySliceAxis::new(1, 2, 1)])?;
+//! let snapshot = tail.read()?;
+//! tail.write(&ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0])))?;
+//!
+//! assert_eq!(snapshot, ArrayIrValue::Array(Array::vector(vec![2.0_f32, 3.0])));
+//! assert_eq!(root.freeze()?, ArrayIrValue::Array(Array::vector(vec![1.0_f32, 4.0, 5.0])));
+//! # Ok::<(), ryft_core::ProgramError>(())
+//! ```
+//!
+//! # Backend State Protocol
+//!
+//! Stateful compilation backends coordinate external holders through generation-checked reservations, cumulative
+//! completion dependencies, and read leases. Once a backend crosses its submission boundary, failure cannot restore
+//! an unambiguously current value; the affected mutated holders become poisoned and every later access reports the
+//! failure. Poisoning is terminal; recovery means constructing a new holder from independently trusted state. These
+//! transaction types are a hidden, unstable backend service-provider interface. User code should use the stateful
+//! call surface and await its [`ReferenceExecution`](crate::compilation::ReferenceExecution) instead of acquiring
+//! holder guards directly.
 
 // TODO(eaplatanios): Review this module.
 
 use std::borrow::{Borrow, Cow};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use ryft_macros::Parameter;
 use thiserror::Error;
@@ -65,9 +109,17 @@ pub enum ReferenceError {
         reason: String,
     },
 
-    /// A guarded transaction attempted an operation that is incompatible with the holder's current state.
-    #[error("reference holder already has an extracted transaction value")]
+    /// A guarded transaction attempted an operation incompatible with an extraction, reservation, or active lease.
+    #[error("reference holder has a conflicting transaction or execution lease")]
     TransactionInProgress,
+
+    /// The holder exhausted its monotonically increasing mutation generation space.
+    #[error("reference holder mutation generation is exhausted")]
+    GenerationExhausted,
+
+    /// A pending value or completion targeted an older holder generation.
+    #[error("reference completion targets a stale holder generation")]
+    StaleGeneration,
 
     /// A prepared replacement belongs to a different holder transaction.
     #[error("prepared reference value belongs to a different holder")]
@@ -89,6 +141,201 @@ pub enum ReferenceError {
         /// Underlying value-family reconstruction diagnostic.
         message: String,
     },
+}
+
+/// Result reported by a backend-neutral reference completion token.
+#[doc(hidden)]
+pub type ReferenceCompletionResult = Result<(), Arc<str>>;
+
+/// Callback invoked exactly once when a [`ReferenceCompletion`] finishes.
+#[doc(hidden)]
+pub type ReferenceCompletionCallback = Box<dyn FnOnce(ReferenceCompletionResult) + Send + 'static>;
+
+/// Backend implementation stored behind a type-erased [`ReferenceCompletion`].
+///
+/// Implementations must make every method observe the same immutable terminal result. Callback registration may
+/// invoke `callback` before returning when completion has already occurred.
+#[doc(hidden)]
+pub trait ReferenceCompletionBackend: Send + Sync + 'static {
+    /// Blocks until completion and returns its terminal result.
+    fn r#await(&self) -> ReferenceCompletionResult;
+
+    /// Returns `false` while pending, `true` after successful completion, or the terminal failure.
+    fn is_ready(&self) -> Result<bool, Arc<str>>;
+
+    /// Registers a callback that is invoked exactly once with the terminal result.
+    fn on_ready(&self, callback: ReferenceCompletionCallback);
+}
+
+/// Cloneable backend-neutral dependency and completion token used by external reference holders.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ReferenceCompletion {
+    /// Primitive backend or core-owned flattened join.
+    storage: ReferenceCompletionStorage,
+}
+
+/// Private storage prevents third-party backends from misrepresenting a primitive dependency as a join.
+#[derive(Clone)]
+enum ReferenceCompletionStorage {
+    /// One backend completion.
+    Backend(Arc<dyn ReferenceCompletionBackend>),
+
+    /// Flat ordered primitive completions.
+    Joined(Arc<JoinedReferenceCompletion>),
+}
+
+impl ReferenceCompletion {
+    /// Erases `backend` behind a cloneable completion token.
+    pub fn new(backend: impl ReferenceCompletionBackend) -> Self {
+        Self { storage: ReferenceCompletionStorage::Backend(Arc::new(backend)) }
+    }
+
+    /// Creates an already-completed token.
+    pub fn ready(result: ReferenceCompletionResult) -> Self {
+        Self::new(ReadyReferenceCompletion(result))
+    }
+
+    /// Joins `completions`, preserving the first failure in input order.
+    pub fn join(completions: impl IntoIterator<Item = Self>) -> Self {
+        let mut flattened = Vec::new();
+        for completion in completions {
+            match &completion.storage {
+                ReferenceCompletionStorage::Backend(_) => flattened.push(completion),
+                ReferenceCompletionStorage::Joined(joined) => flattened.extend(joined.completions.iter().cloned()),
+            }
+        }
+        let completions = flattened;
+        match completions.len() {
+            0 => Self::ready(Ok(())),
+            1 => completions.into_iter().next().unwrap(),
+            _ => Self {
+                storage: ReferenceCompletionStorage::Joined(Arc::new(JoinedReferenceCompletion { completions })),
+            },
+        }
+    }
+
+    /// Blocks until completion and returns its terminal result.
+    #[inline]
+    pub fn r#await(&self) -> ReferenceCompletionResult {
+        match &self.storage {
+            ReferenceCompletionStorage::Backend(backend) => backend.r#await(),
+            ReferenceCompletionStorage::Joined(joined) => joined.r#await(),
+        }
+    }
+
+    /// Returns `false` while pending, `true` after successful completion, or the terminal failure.
+    #[inline]
+    pub fn is_ready(&self) -> Result<bool, Arc<str>> {
+        match &self.storage {
+            ReferenceCompletionStorage::Backend(backend) => backend.is_ready(),
+            ReferenceCompletionStorage::Joined(joined) => joined.is_ready(),
+        }
+    }
+
+    /// Registers a callback that is invoked exactly once with the terminal result.
+    #[inline]
+    pub fn on_ready(&self, callback: ReferenceCompletionCallback) {
+        match &self.storage {
+            ReferenceCompletionStorage::Backend(backend) => backend.on_ready(callback),
+            ReferenceCompletionStorage::Joined(joined) => joined.on_ready(callback),
+        }
+    }
+}
+
+impl Debug for ReferenceCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ReferenceCompletion").field("is_ready", &self.is_ready()).finish()
+    }
+}
+
+/// Already-completed backend used by [`ReferenceCompletion::ready`].
+struct ReadyReferenceCompletion(ReferenceCompletionResult);
+
+impl ReferenceCompletionBackend for ReadyReferenceCompletion {
+    fn r#await(&self) -> ReferenceCompletionResult {
+        self.0.clone()
+    }
+
+    fn is_ready(&self) -> Result<bool, Arc<str>> {
+        self.0.clone().map(|_| true)
+    }
+
+    fn on_ready(&self, callback: ReferenceCompletionCallback) {
+        callback(self.0.clone())
+    }
+}
+
+/// Composite backend used by [`ReferenceCompletion::join`].
+struct JoinedReferenceCompletion {
+    /// Ordered completions whose first failure is retained.
+    completions: Vec<ReferenceCompletion>,
+}
+
+impl ReferenceCompletionBackend for JoinedReferenceCompletion {
+    fn r#await(&self) -> ReferenceCompletionResult {
+        let mut result = Ok(());
+        for completion in &self.completions {
+            if let Err(error) = completion.r#await()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
+    fn is_ready(&self) -> Result<bool, Arc<str>> {
+        let mut result = Ok(true);
+        for completion in &self.completions {
+            match completion.is_ready() {
+                Ok(false) => return Ok(false),
+                Ok(true) => {}
+                Err(error) if result.is_ok() => result = Err(error),
+                Err(_) => {}
+            }
+        }
+        result
+    }
+
+    fn on_ready(&self, callback: ReferenceCompletionCallback) {
+        struct State {
+            remaining: usize,
+            results: Vec<Option<ReferenceCompletionResult>>,
+            callback: Option<ReferenceCompletionCallback>,
+        }
+
+        let state = Arc::new(Mutex::new(State {
+            remaining: self.completions.len(),
+            results: vec![None; self.completions.len()],
+            callback: Some(callback),
+        }));
+        for (index, completion) in self.completions.iter().enumerate() {
+            let state = Arc::clone(&state);
+            completion.on_ready(Box::new(move |result| {
+                let callback_and_result = {
+                    let mut state = state.lock().expect("joined reference completion callback mutex poisoned");
+                    if state.results[index].is_some() {
+                        return;
+                    }
+                    state.results[index] = Some(result);
+                    state.remaining -= 1;
+                    (state.remaining == 0).then(|| {
+                        let result = state
+                            .results
+                            .iter()
+                            .filter_map(Option::as_ref)
+                            .find_map(|result| result.as_ref().err().cloned())
+                            .map_or(Ok(()), Err);
+                        (state.callback.take().unwrap(), result)
+                    })
+                };
+                if let Some((callback, result)) = callback_and_result {
+                    callback(result);
+                }
+            }));
+        }
+    }
 }
 
 /// Meaning of one reference input access performed by an operation.
@@ -321,7 +568,7 @@ impl ReferenceOperationSemantics {
 /// does not affect structural equality, hashing, or retained-program specialization. Compatibility is exact because a
 /// reference cannot implicitly broadcast or promote its storage, while refinement and identity handling delegate to
 /// the referent type. Exactness deliberately spans the referent's optional layout, sharding, and memory metadata as
-/// well: the first XLA slice requires exact physical referent compatibility for mutation, so a metadata-tolerant
+/// well: the external-state mutation ABI requires exact physical referent compatibility, so a metadata-tolerant
 /// relation would overpromise. Revisit this if a compatibility consumer ever needs the tolerant reading.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceType<T: Type> {
@@ -459,6 +706,19 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceId(usize);
 
+/// Monotonic generation of one holder mutation reservation.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceGeneration(u64);
+
+impl ReferenceGeneration {
+    /// Returns the successor generation, or [`None`] when the monotonic counter is exhausted.
+    #[inline]
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+}
+
 /// Cloneable identity-bearing holder for a referenced [`Value`].
 ///
 /// Cloning a reference aliases the same holder. Reading clones the current value. Reference referents are expected to
@@ -471,7 +731,7 @@ pub struct ReferenceId(usize);
 /// implicitly discarded when their nonescaping interpretation environment is released.
 pub struct Reference<V: Value> {
     /// Shared mutable holder whose allocation defines this reference's runtime identity.
-    holder: Arc<Mutex<ReferenceState<V>>>,
+    holder: Arc<ReferenceHolder<V>>,
 
     /// Handle-local structural referent type.
     r#type: ReferenceType<V::Type>,
@@ -486,13 +746,58 @@ pub struct Reference<V: Value> {
     handle_to_root: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 }
 
+/// Synchronization state shared by one reference alias family.
+struct ReferenceHolder<V: Value> {
+    /// Holder lifecycle state.
+    state: Mutex<ReferenceState<V>>,
+
+    /// Notification used only for the short submitted-before-install reservation window.
+    installed: Condvar,
+}
+
 /// Lifecycle state shared by every handle in one reference alias family.
 enum ReferenceState<V: Value> {
     /// Live reference containing its current immutable value snapshot.
-    Ready(V),
+    Ready {
+        /// Current immutable value.
+        value: V,
+
+        /// Most recently reserved mutation generation.
+        generation: ReferenceGeneration,
+
+        /// Submitted read-only executions that may still observe `value`.
+        read_leases: Vec<ReferenceCompletion>,
+    },
+
+    /// Live value produced by an execution whose cumulative completion is still pending.
+    Pending {
+        /// Current possibly-pending immutable value.
+        value: V,
+
+        /// Generation that installed `value`.
+        generation: ReferenceGeneration,
+
+        /// Cumulative completion chain for this generation.
+        completion: ReferenceCompletion,
+
+        /// Submitted read-only executions that may still observe `value`.
+        read_leases: Vec<ReferenceCompletion>,
+    },
 
     /// Value temporarily extracted by a synchronous backend transaction holding this holder's mutex.
-    Taken,
+    Taken {
+        /// Generation preserved across the synchronous transaction.
+        generation: ReferenceGeneration,
+    },
+
+    /// Post-submission mutation reservation awaiting validated hidden final state construction.
+    Reserved {
+        /// Reserved generation.
+        generation: ReferenceGeneration,
+
+        /// Cumulative completion chain for the submitted mutation.
+        completion: ReferenceCompletion,
+    },
 
     /// Value that may have been consumed by an irreversible failed backend invocation.
     ExecutionPoisoned(Arc<str>),
@@ -507,7 +812,14 @@ impl<V: Value> Reference<V> {
         let root_type = value.r#type().into_owned();
         let r#type = ReferenceType::new(root_type.clone());
         Self {
-            holder: Arc::new(Mutex::new(ReferenceState::Ready(value))),
+            holder: Arc::new(ReferenceHolder {
+                state: Mutex::new(ReferenceState::Ready {
+                    value,
+                    generation: ReferenceGeneration(0),
+                    read_leases: Vec::new(),
+                }),
+                installed: Condvar::new(),
+            }),
             r#type,
             root_type,
             root_to_handle: TypeIdentityRenaming::new(),
@@ -536,22 +848,42 @@ impl<V: Value> Reference<V> {
             root_type: &self.root_type,
             root_to_handle: &self.root_to_handle,
             handle_to_root: &self.handle_to_root,
-            state: self.holder.lock().map_err(|_| ReferenceError::Poisoned)?,
+            installed: &self.holder.installed,
+            state: self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)?,
         })
     }
 
-    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
-    pub fn read(&self) -> Result<V, ReferenceError> {
-        match &*self.holder.lock().map_err(|_| ReferenceError::Poisoned)? {
-            ReferenceState::Ready(value) => value
-                .rename_type_identities(&self.root_to_handle)
-                .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() }),
+    /// Waits until the short post-submission reservation window has installed a pending value.
+    ///
+    /// Multi-holder runtimes call this before taking any ordered guards so they never wait while retaining another
+    /// holder lock needed by the installer.
+    #[doc(hidden)]
+    pub fn wait_until_accessible(&self) -> Result<(), ReferenceError> {
+        let mut state = self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)?;
+        while matches!(*state, ReferenceState::Reserved { .. }) {
+            state = self.holder.installed.wait(state).map_err(|_| ReferenceError::Poisoned)?;
+        }
+        match &*state {
+            ReferenceState::Ready { .. } | ReferenceState::Pending { .. } => Ok(()),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::ExecutionPoisoned(reason) => {
                 Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
             }
-            ReferenceState::Taken => Err(ReferenceError::TransactionInProgress),
+            // `Taken` exists only while a guard holds this mutex, and the wait loop above exits only once the state
+            // is no longer `Reserved`; both arms are defensive.
+            ReferenceState::Taken { .. } | ReferenceState::Reserved { .. } => {
+                Err(ReferenceError::TransactionInProgress)
+            }
         }
+    }
+
+    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
+    pub fn read(&self) -> Result<V, ReferenceError> {
+        let state = self.lock_ready(false)?;
+        let ReferenceState::Ready { value, .. } = &*state else { unreachable!("lock_ready yields only ready states") };
+        value
+            .rename_type_identities(&self.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
     }
 
     /// Atomically replaces the stored value and returns the previous referent value.
@@ -559,26 +891,22 @@ impl<V: Value> Reference<V> {
     /// The replacement must have exactly the declared referent type. A rejected replacement leaves the live holder
     /// unchanged.
     pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
-        let mut state = self.holder.lock().map_err(|_| ReferenceError::Poisoned)?;
-        match &mut *state {
-            ReferenceState::Ready(current) => {
-                self.validate_referent_type(&replacement)?;
-                let stored_replacement = replacement
-                    .rename_type_identities(&self.handle_to_root)
-                    .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
-                self.validate_root_type(&stored_replacement)?;
-                let old = current
-                    .rename_type_identities(&self.root_to_handle)
-                    .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
-                *current = stored_replacement;
-                Ok(old)
-            }
-            ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
-            }
-            ReferenceState::Taken => Err(ReferenceError::TransactionInProgress),
-        }
+        let mut state = self.lock_ready(true)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("lock_ready yields only ready states")
+        };
+        self.validate_referent_type(&replacement)?;
+        let stored_replacement = replacement
+            .rename_type_identities(&self.handle_to_root)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        self.validate_root_type(&stored_replacement)?;
+        let old = current
+            .rename_type_identities(&self.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        let next_generation = generation.next().ok_or(ReferenceError::GenerationExhausted)?;
+        *current = stored_replacement;
+        *generation = next_generation;
+        Ok(old)
     }
 
     /// Atomically computes and installs an updated value while retaining the old value on every failure.
@@ -598,46 +926,35 @@ impl<V: Value> Reference<V> {
         &self,
         update: impl FnOnce(&V) -> Result<(V, R), ProgramError>,
     ) -> Result<R, ProgramError> {
-        let mut state = self.holder.lock().map_err(|_| ProgramError::custom(ReferenceError::Poisoned))?;
-        match &mut *state {
-            ReferenceState::Ready(current) => {
-                let local = current.rename_type_identities(&self.root_to_handle).map_err(|error| {
-                    ProgramError::custom(ReferenceError::ValueReconstruction { message: error.to_string() })
-                })?;
-                let (updated, result) = update(&local)?;
-                self.validate_referent_type(&updated).map_err(ProgramError::custom)?;
-                let stored = updated.rename_type_identities(&self.handle_to_root).map_err(|error| {
-                    ProgramError::custom(ReferenceError::ValueReconstruction { message: error.to_string() })
-                })?;
-                self.validate_root_type(&stored).map_err(ProgramError::custom)?;
-                *current = stored;
-                Ok(result)
-            }
-            ReferenceState::Frozen => Err(ProgramError::custom(ReferenceError::Frozen)),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ProgramError::custom(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }))
-            }
-            ReferenceState::Taken => Err(ProgramError::custom(ReferenceError::TransactionInProgress)),
-        }
+        let mut state = self.lock_ready(true).map_err(ProgramError::custom)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("lock_ready yields only ready states")
+        };
+        let local = current.rename_type_identities(&self.root_to_handle).map_err(|error| {
+            ProgramError::custom(ReferenceError::ValueReconstruction { message: error.to_string() })
+        })?;
+        let (updated, result) = update(&local)?;
+        self.validate_referent_type(&updated).map_err(ProgramError::custom)?;
+        let stored = updated.rename_type_identities(&self.handle_to_root).map_err(|error| {
+            ProgramError::custom(ReferenceError::ValueReconstruction { message: error.to_string() })
+        })?;
+        self.validate_root_type(&stored).map_err(ProgramError::custom)?;
+        let next_generation =
+            generation.next().ok_or_else(|| ProgramError::custom(ReferenceError::GenerationExhausted))?;
+        *current = stored;
+        *generation = next_generation;
+        Ok(result)
     }
 
     /// Consumes this reference's current value and invalidates every handle in its alias family.
     pub fn freeze(&self) -> Result<V, ReferenceError> {
-        let mut state = self.holder.lock().map_err(|_| ReferenceError::Poisoned)?;
-        match &*state {
-            ReferenceState::Ready(value) => {
-                let value = value
-                    .rename_type_identities(&self.root_to_handle)
-                    .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
-                *state = ReferenceState::Frozen;
-                Ok(value)
-            }
-            ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
-            }
-            ReferenceState::Taken => Err(ReferenceError::TransactionInProgress),
-        }
+        let mut state = self.lock_ready(true)?;
+        let ReferenceState::Ready { value, .. } = &*state else { unreachable!("lock_ready yields only ready states") };
+        let value = value
+            .rename_type_identities(&self.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        *state = ReferenceState::Frozen;
+        Ok(value)
     }
 
     /// Returns a handle-local identity-renamed view of this same shared holder.
@@ -647,6 +964,22 @@ impl<V: Value> Reference<V> {
     ) -> Result<Self, TypeError> {
         let current_type = self.r#type.referent();
         let renamed_type = current_type.rename_identities(renaming)?;
+        // A renaming that merges two of the referent's identities cannot be inverted for value reconstruction.
+        // Detect the collision here and report it in the caller's direction; deriving the inverse below would
+        // otherwise surface it backwards, as a target renamed to two sources.
+        let mut renamed_identities: Vec<(<V::Type as Type>::Identity, <V::Type as Type>::Identity)> = Vec::new();
+        for (_, identity) in current_type.identities() {
+            let renamed = renaming.rename(identity);
+            match renamed_identities.iter().find(|(existing, _)| *existing == renamed) {
+                Some((_, previous)) if previous != identity => {
+                    return Err(TypeError::invalid(format!(
+                        "type identities `{previous}` and `{identity}` are both renamed to `{renamed}`",
+                    )));
+                }
+                Some(_) => {}
+                None => renamed_identities.push((renamed, identity.clone())),
+            }
+        }
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
         let root_to_handle = Self::compose_renamings(
@@ -675,16 +1008,92 @@ impl<V: Value> Reference<V> {
         })
     }
 
-    /// Returns whether this holder is still live without reading or changing its value.
+    /// Fails if this holder has reached a terminal state, without reading or changing its value and without waiting.
+    ///
+    /// Pure state-free consumers such as view derivation call this: a holder with a pending completion or a
+    /// submitted reservation is still live (its next value access resolves those), so this check must never block
+    /// on device work the caller does not observe.
     pub(crate) fn validate_live(&self) -> Result<(), ReferenceError> {
-        match &*self.holder.lock().map_err(|_| ReferenceError::Poisoned)? {
-            ReferenceState::Ready(_) => Ok(()),
+        match &*self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)? {
+            ReferenceState::Ready { .. }
+            | ReferenceState::Taken { .. }
+            | ReferenceState::Reserved { .. }
+            | ReferenceState::Pending { .. } => Ok(()),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::ExecutionPoisoned(reason) => {
                 Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
             }
-            ReferenceState::Taken => Err(ReferenceError::TransactionInProgress),
         }
+    }
+
+    /// Locks this holder after resolving a pending mutation and, when requested, every active read lease.
+    fn lock_ready(&self, wait_for_read_leases: bool) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
+        loop {
+            let mut state = self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)?;
+            let wait = match &mut *state {
+                ReferenceState::Ready { read_leases, .. } if wait_for_read_leases => {
+                    read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
+                    (!read_leases.is_empty()).then(|| (None, read_leases.clone()))
+                }
+                ReferenceState::Ready { .. } => return Ok(state),
+                ReferenceState::Pending { generation, completion, .. } => {
+                    Some((Some((*generation, completion.clone())), Vec::new()))
+                }
+                ReferenceState::Frozen => return Err(ReferenceError::Frozen),
+                ReferenceState::ExecutionPoisoned(reason) => {
+                    return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
+                }
+                ReferenceState::Taken { .. } => {
+                    return Err(ReferenceError::TransactionInProgress);
+                }
+                ReferenceState::Reserved { .. } => {
+                    state = self.holder.installed.wait(state).map_err(|_| ReferenceError::Poisoned)?;
+                    drop(state);
+                    continue;
+                }
+            };
+            let Some((pending, read_leases)) = wait else {
+                return Ok(state);
+            };
+            drop(state);
+            if let Some((generation, completion)) = pending {
+                let result = completion.r#await();
+                let mut state = self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)?;
+                Self::apply_completion(&mut state, generation, result);
+            } else {
+                for lease in read_leases {
+                    match lease.r#await() {
+                        Ok(()) | Err(_) => {
+                            // A completed read lease is safe to release regardless of its owning execution result.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies `result` only when `generation` remains the holder's current generation.
+    fn apply_completion(
+        state: &mut ReferenceState<V>,
+        generation: ReferenceGeneration,
+        result: ReferenceCompletionResult,
+    ) -> bool {
+        if !matches!(state, ReferenceState::Pending { generation: current, .. } if *current == generation) {
+            return false;
+        }
+        match result {
+            Ok(()) => {
+                // The placeholder is unobservable: the state mutex is held and `*state` is rewritten immediately in
+                // both directions below, so no other thread can see the transient `Frozen`.
+                let previous = std::mem::replace(state, ReferenceState::Frozen);
+                let ReferenceState::Pending { value, generation, read_leases, .. } = previous else {
+                    unreachable!("completion generation was validated as pending")
+                };
+                *state = ReferenceState::Ready { value, generation, read_leases };
+            }
+            Err(reason) => *state = ReferenceState::ExecutionPoisoned(reason),
+        }
+        true
     }
 
     /// Composes two simultaneous identity mappings over the provided source identities.
@@ -725,10 +1134,14 @@ impl<V: Value> Reference<V> {
     }
 }
 
-/// Exclusive holder guard used by synchronous stateful compilation backends.
+/// Exclusive holder guard used by stateful compilation backends.
 ///
-/// A backend may extract the current value, but must then either install a type-compatible replacement or poison the
-/// holder before dropping the guard. Dropping a guard with an extracted value poisons the holder defensively.
+/// Synchronous backends may extract the current value, but must then either install a type-compatible replacement or
+/// poison the holder before dropping the guard. Asynchronous backends acquire multiple guards in stable
+/// [`ReferenceId`] order, validate every lease publication or generation transition first, and then use the matching
+/// unchecked commit methods while those same guards remain held. They release every guard immediately after
+/// submission-time publication and never retain a holder mutex through device execution. Dropping a guard with an
+/// extracted synchronous value poisons the holder defensively.
 #[doc(hidden)]
 pub struct ReferenceGuard<'a, V: Value> {
     /// Identity of the locked shared holder.
@@ -748,6 +1161,9 @@ pub struct ReferenceGuard<'a, V: Value> {
 
     /// Locked holder lifecycle state.
     state: MutexGuard<'a, ReferenceState<V>>,
+
+    /// Notification for a completed reservation installation.
+    installed: &'a Condvar,
 }
 
 /// Root-normalized holder value whose fallible reconstruction and type validation have completed.
@@ -761,30 +1177,213 @@ pub struct PreparedReferenceValue<V: Value> {
 }
 
 impl<V: Value> ReferenceGuard<'_, V> {
+    /// Returns whether this guard observes the short submitted-before-install reservation state.
+    #[inline]
+    pub fn reservation_pending(&self) -> bool {
+        matches!(*self.state, ReferenceState::Reserved { .. })
+    }
+
+    /// Returns the generation of the current ready or installed pending value.
+    pub fn current_generation(&self) -> Result<ReferenceGeneration, ReferenceError> {
+        match &*self.state {
+            ReferenceState::Ready { generation, .. } => Ok(*generation),
+            ReferenceState::Pending { generation, .. } => Ok(*generation),
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+            ReferenceState::ExecutionPoisoned(reason) => {
+                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
+            }
+            ReferenceState::Taken { .. } | ReferenceState::Reserved { .. } => {
+                Err(ReferenceError::TransactionInProgress)
+            }
+        }
+    }
+
     /// Returns a handle-local immutable snapshot without extracting holder state.
     pub fn snapshot(&self) -> Result<V, ReferenceError> {
         match &*self.state {
-            ReferenceState::Ready(value) => value
+            ReferenceState::Ready { value, .. } | ReferenceState::Pending { value, .. } => value
                 .rename_type_identities(self.root_to_handle)
                 .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() }),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::ExecutionPoisoned(reason) => {
                 Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
             }
-            ReferenceState::Taken => Err(ReferenceError::TransactionInProgress),
-        }
-    }
-
-    /// Extracts the handle-local current value for a potentially donating backend invocation.
-    pub fn take(&mut self) -> Result<V, ReferenceError> {
-        let local = self.snapshot()?;
-        match std::mem::replace(&mut *self.state, ReferenceState::Taken) {
-            ReferenceState::Ready(_) => Ok(local),
-            state => {
-                *self.state = state;
+            ReferenceState::Taken { .. } | ReferenceState::Reserved { .. } => {
                 Err(ReferenceError::TransactionInProgress)
             }
         }
+    }
+
+    /// Returns the cumulative dependency of the current snapshot, if it was produced by a pending mutation.
+    pub fn dependency(&self) -> Option<ReferenceCompletion> {
+        match &*self.state {
+            ReferenceState::Pending { completion, .. } => Some(completion.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns outstanding read leases after pruning every lease whose execution has completed.
+    pub fn active_read_leases(&mut self) -> Vec<ReferenceCompletion> {
+        let read_leases = match &mut *self.state {
+            ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => read_leases,
+            _ => return Vec::new(),
+        };
+        read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
+        read_leases.clone()
+    }
+
+    /// Validates read-lease publication without changing holder state.
+    pub fn validate_read_lease_publication(&self) -> Result<(), ReferenceError> {
+        match &*self.state {
+            ReferenceState::Ready { .. } | ReferenceState::Pending { .. } => Ok(()),
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+            ReferenceState::ExecutionPoisoned(reason) => {
+                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
+            }
+            ReferenceState::Taken { .. } | ReferenceState::Reserved { .. } => {
+                Err(ReferenceError::TransactionInProgress)
+            }
+        }
+    }
+
+    /// Publishes a lease after [`Self::validate_read_lease_publication`] succeeded under this same guard.
+    pub fn publish_read_lease_unchecked(&mut self, lease: ReferenceCompletion) {
+        match &mut *self.state {
+            ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => {
+                read_leases.push(lease);
+            }
+            _ => unreachable!("read lease publication was validated under the same holder guard"),
+        }
+    }
+
+    /// Reserves the next mutation generation after successful backend submission. Test-only convenience combinator
+    /// for the production validate-then-commit protocol.
+    ///
+    /// `completion` must include this holder's prior pending dependency and the newly submitted execution.
+    #[cfg(test)]
+    fn reserve_pending(&mut self, completion: ReferenceCompletion) -> Result<ReferenceGeneration, ReferenceError> {
+        let generation = self.next_generation()?;
+        self.reserve_pending_unchecked(generation, completion);
+        Ok(generation)
+    }
+
+    /// Validates a mutation reservation and returns its next generation without changing holder state.
+    pub fn next_generation(&self) -> Result<ReferenceGeneration, ReferenceError> {
+        let generation = match &*self.state {
+            ReferenceState::Ready { generation, read_leases, .. } => {
+                if !read_leases.is_empty() {
+                    return Err(ReferenceError::TransactionInProgress);
+                }
+                generation.next().ok_or(ReferenceError::GenerationExhausted)?
+            }
+            ReferenceState::Pending { generation, read_leases, .. } => {
+                if !read_leases.is_empty() {
+                    return Err(ReferenceError::TransactionInProgress);
+                }
+                generation.next().ok_or(ReferenceError::GenerationExhausted)?
+            }
+            ReferenceState::Frozen => return Err(ReferenceError::Frozen),
+            ReferenceState::ExecutionPoisoned(reason) => {
+                return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
+            }
+            ReferenceState::Taken { .. } | ReferenceState::Reserved { .. } => {
+                return Err(ReferenceError::TransactionInProgress);
+            }
+        };
+        Ok(generation)
+    }
+
+    /// Commits a reservation after [`Self::next_generation`] succeeded under this same guard.
+    pub fn reserve_pending_unchecked(&mut self, generation: ReferenceGeneration, completion: ReferenceCompletion) {
+        debug_assert_eq!(self.next_generation(), Ok(generation));
+        *self.state = ReferenceState::Reserved { generation, completion };
+    }
+
+    /// Installs a prepared final value for `generation` while leaving it pending on its cumulative completion.
+    /// Test-only convenience combinator for the production validate-then-commit protocol.
+    #[cfg(test)]
+    fn install_pending(
+        &mut self,
+        generation: ReferenceGeneration,
+        value: PreparedReferenceValue<V>,
+    ) -> Result<(), ReferenceError> {
+        self.validate_pending_install(generation, &value)?;
+        self.install_pending_unchecked(generation, value);
+        Ok(())
+    }
+
+    /// Validates one prepared pending-value installation without changing holder state.
+    pub fn validate_pending_install(
+        &self,
+        generation: ReferenceGeneration,
+        value: &PreparedReferenceValue<V>,
+    ) -> Result<(), ReferenceError> {
+        self.accepts(value)?;
+        let ReferenceState::Reserved { generation: current, .. } = &*self.state else {
+            return Err(ReferenceError::TransactionInProgress);
+        };
+        if *current != generation {
+            return Err(ReferenceError::StaleGeneration);
+        }
+        Ok(())
+    }
+
+    /// Commits a prepared value after [`Self::validate_pending_install`] succeeded under this same guard.
+    pub fn install_pending_unchecked(&mut self, generation: ReferenceGeneration, value: PreparedReferenceValue<V>) {
+        debug_assert!(self.validate_pending_install(generation, &value).is_ok());
+        let ReferenceState::Reserved { completion, .. } = &*self.state else {
+            unreachable!("pending installation was validated under the same holder guard")
+        };
+        *self.state = ReferenceState::Pending {
+            value: value.value,
+            generation,
+            completion: completion.clone(),
+            read_leases: Vec::new(),
+        };
+        self.installed.notify_all();
+    }
+
+    /// Applies a completion result only if `generation` is still current. Test-only entry into the lazy completion
+    /// reconciliation that value accesses perform through `lock_ready`.
+    #[cfg(test)]
+    fn complete(&mut self, generation: ReferenceGeneration, result: ReferenceCompletionResult) -> bool {
+        Reference::<V>::apply_completion(&mut self.state, generation, result)
+    }
+
+    /// Poisons a matching reserved or installed pending generation without affecting any newer generation.
+    ///
+    /// This is the generation-safe failure path for errors after submission publication but before or after hidden
+    /// final-state installation. A matching reservation wakes every waiter blocked on its installation window.
+    pub fn poison_pending(&mut self, generation: ReferenceGeneration, reason: impl Into<Arc<str>>) -> bool {
+        if !matches!(
+            *self.state,
+            ReferenceState::Reserved { generation: current, .. }
+                | ReferenceState::Pending { generation: current, .. }
+                if current == generation
+        ) {
+            return false;
+        }
+        *self.state = ReferenceState::ExecutionPoisoned(reason.into());
+        self.installed.notify_all();
+        true
+    }
+
+    /// Extracts the handle-local current value for a potentially donating backend invocation.
+    ///
+    /// Extraction is rejected while any published read lease is still active: a leased snapshot pins the current
+    /// value, and handing its buffers to a donating execution would let the device mutate storage a submitted
+    /// read-only execution still observes. Completed leases are pruned rather than counted.
+    pub fn take(&mut self) -> Result<V, ReferenceError> {
+        if !self.active_read_leases().is_empty() {
+            return Err(ReferenceError::TransactionInProgress);
+        }
+        let local = self.snapshot()?;
+        let generation = match &*self.state {
+            ReferenceState::Ready { generation, .. } => generation.next().ok_or(ReferenceError::GenerationExhausted)?,
+            _ => return Err(ReferenceError::TransactionInProgress),
+        };
+        *self.state = ReferenceState::Taken { generation };
+        Ok(local)
     }
 
     /// Validates a prospective restored or installed value without changing holder state.
@@ -810,7 +1409,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     }
 
     /// Validates that `value` was prepared against this exact holder.
-    pub fn accepts(&self, value: &PreparedReferenceValue<V>) -> Result<(), ReferenceError> {
+    pub(crate) fn accepts(&self, value: &PreparedReferenceValue<V>) -> Result<(), ReferenceError> {
         if value.reference_id == self.id { Ok(()) } else { Err(ReferenceError::TransactionHolderMismatch) }
     }
 
@@ -819,28 +1418,33 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// Installation fails when `value` was prepared for another holder or this guard does not own an extracted value.
     pub fn install(&mut self, value: PreparedReferenceValue<V>) -> Result<(), ReferenceError> {
         self.accepts(&value)?;
-        if !matches!(*self.state, ReferenceState::Taken) {
+        let ReferenceState::Taken { generation } = *self.state else {
             return Err(ReferenceError::TransactionInProgress);
-        }
-        *self.state = ReferenceState::Ready(value.value);
+        };
+        *self.state = ReferenceState::Ready { value: value.value, generation, read_leases: Vec::new() };
+        self.installed.notify_all();
         Ok(())
     }
 
-    /// Invalidates an extracted value after an irreversible backend failure.
-    pub fn poison(&mut self, reason: impl Into<Arc<str>>) -> Result<(), ReferenceError> {
-        if !matches!(*self.state, ReferenceState::Taken) {
-            return Err(ReferenceError::TransactionInProgress);
+    /// Invalidates an extracted value or a submitted mutation reservation after an irreversible backend failure,
+    /// recording `reason` as the cause every later holder access reports. Poisoning is infallible so that failure
+    /// paths can never trade the original backend error for a guard-state error: a guard that neither extracted a
+    /// value nor holds a reservation has nothing to invalidate and is deliberately left untouched, and a pending
+    /// completion is poisoned through the generation-checked [`Self::poison_pending`] instead.
+    pub fn poison(&mut self, reason: impl Into<Arc<str>>) {
+        if matches!(*self.state, ReferenceState::Taken { .. } | ReferenceState::Reserved { .. }) {
+            *self.state = ReferenceState::ExecutionPoisoned(reason.into());
+            self.installed.notify_all();
         }
-        *self.state = ReferenceState::ExecutionPoisoned(reason.into());
-        Ok(())
     }
 }
 
 impl<V: Value> Drop for ReferenceGuard<'_, V> {
     fn drop(&mut self) {
-        if matches!(*self.state, ReferenceState::Taken) {
+        if matches!(*self.state, ReferenceState::Taken { .. }) {
             *self.state =
                 ReferenceState::ExecutionPoisoned("stateful transaction ended without restoring state".into());
+            self.installed.notify_all();
         }
     }
 }
@@ -921,6 +1525,72 @@ mod tests {
     use crate::programs::regions::RegionInterface;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct ControlledCompletion {
+        state: Arc<(Mutex<ControlledCompletionState>, Condvar)>,
+    }
+
+    struct ControlledCompletionState {
+        result: Option<ReferenceCompletionResult>,
+        callbacks: Vec<ReferenceCompletionCallback>,
+    }
+
+    impl ControlledCompletion {
+        fn new() -> Self {
+            Self {
+                state: Arc::new((
+                    Mutex::new(ControlledCompletionState { result: None, callbacks: Vec::new() }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        fn complete(&self, result: ReferenceCompletionResult) {
+            let callbacks = {
+                let (state, ready) = &*self.state;
+                let mut state = state.lock().unwrap();
+                assert!(state.result.is_none());
+                state.result = Some(result.clone());
+                ready.notify_all();
+                std::mem::take(&mut state.callbacks)
+            };
+            for callback in callbacks {
+                callback(result.clone());
+            }
+        }
+    }
+
+    impl ReferenceCompletionBackend for ControlledCompletion {
+        fn r#await(&self) -> ReferenceCompletionResult {
+            let (state, ready) = &*self.state;
+            let mut state = state.lock().unwrap();
+            while state.result.is_none() {
+                state = ready.wait(state).unwrap();
+            }
+            state.result.clone().unwrap()
+        }
+
+        fn is_ready(&self) -> Result<bool, Arc<str>> {
+            let state = self.state.0.lock().unwrap();
+            state.result.clone().map_or(Ok(false), |result| result.map(|_| true))
+        }
+
+        fn on_ready(&self, callback: ReferenceCompletionCallback) {
+            let callback = {
+                let mut state = self.state.0.lock().unwrap();
+                if let Some(result) = &state.result {
+                    Some((callback, result.clone()))
+                } else {
+                    state.callbacks.push(callback);
+                    None
+                }
+            };
+            if let Some((callback, result)) = callback {
+                callback(result);
+            }
+        }
+    }
 
     #[test]
     fn test_reference_type_delegates_identity_and_refinement_without_implicit_compatibility() {
@@ -1073,12 +1743,33 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_generation_advances_only_after_committed_mutations() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let initial_generation = reference.lock().unwrap().current_generation().unwrap();
+
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.lock().unwrap().current_generation(), Ok(initial_generation));
+
+        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
+        let swapped_generation = reference.lock().unwrap().current_generation().unwrap();
+        assert!(swapped_generation > initial_generation);
+
+        let rejected = ProgramError::InvalidArgument { message: "rejected update".to_string() };
+        assert_eq!(reference.update_with(|_| Err(rejected.clone())), Err(rejected));
+        assert_eq!(reference.lock().unwrap().current_generation(), Ok(swapped_generation));
+
+        reference.update_with(|_| Ok(Array::scalar(3.0_f32))).unwrap();
+        let updated_generation = reference.lock().unwrap().current_generation().unwrap();
+        assert!(updated_generation > swapped_generation);
+    }
+
+    #[test]
     fn test_reference_read_reports_a_poisoned_holder() {
         let reference = Reference::new(Array::scalar(1.0_f32));
         let holder = Arc::clone(&reference.holder);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                let _guard = holder.lock().unwrap();
+                let _guard = holder.state.lock().unwrap();
                 panic!("poison reference holder");
             }))
             .is_err(),
@@ -1103,13 +1794,294 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_completion_join_preserves_ordered_failure() {
+        let completion = ReferenceCompletion::join([
+            ReferenceCompletion::ready(Ok(())),
+            ReferenceCompletion::ready(Err("first failure".into())),
+            ReferenceCompletion::ready(Err("second failure".into())),
+        ]);
+        assert_eq!(completion.is_ready(), Err(Arc::<str>::from("first failure")));
+        assert_eq!(completion.r#await(), Err(Arc::<str>::from("first failure")));
+
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        completion.on_ready(Box::new(move |result| {
+            *callback_observed.lock().unwrap() = Some(result);
+        }));
+        assert_eq!(*observed.lock().unwrap(), Some(Err(Arc::<str>::from("first failure"))));
+    }
+
+    #[test]
+    fn test_reference_completion_reports_deferred_callback_once() {
+        let backend = ControlledCompletion::new();
+        let completion = ReferenceCompletion::new(backend.clone());
+        assert_eq!(completion.is_ready(), Ok(false));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_observed = Arc::clone(&observed);
+        completion.on_ready(Box::new(move |result| callback_observed.lock().unwrap().push(result)));
+        assert!(observed.lock().unwrap().is_empty());
+        backend.complete(Ok(()));
+        assert_eq!(*observed.lock().unwrap(), vec![Ok(())]);
+        assert_eq!(completion.is_ready(), Ok(true));
+        assert_eq!(completion.r#await(), Ok(()));
+    }
+
+    #[test]
+    fn test_reference_completion_flat_join_waits_for_all_and_preserves_input_failure_order() {
+        let first = ControlledCompletion::new();
+        let second = ControlledCompletion::new();
+        let third = ControlledCompletion::new();
+        let joined = ReferenceCompletion::join([
+            ReferenceCompletion::join([
+                ReferenceCompletion::new(first.clone()),
+                ReferenceCompletion::new(second.clone()),
+            ]),
+            ReferenceCompletion::new(third.clone()),
+        ]);
+        let observed = Arc::new(Mutex::new(None));
+        let callback_observed = Arc::clone(&observed);
+        joined.on_ready(Box::new(move |result| *callback_observed.lock().unwrap() = Some(result)));
+        third.complete(Err("third failure".into()));
+        second.complete(Err("second failure".into()));
+        assert_eq!(joined.is_ready(), Ok(false));
+        assert_eq!(*observed.lock().unwrap(), None);
+        first.complete(Err("first failure".into()));
+        assert_eq!(joined.r#await(), Err(Arc::<str>::from("first failure")));
+        assert_eq!(*observed.lock().unwrap(), Some(Err(Arc::<str>::from("first failure"))));
+    }
+
+    #[test]
+    fn test_reference_pending_generations_ignore_stale_completion() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let mut guard = reference.lock().unwrap();
+        let first = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(first, first_value).unwrap();
+
+        let second = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let second_value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        guard.install_pending(second, second_value).unwrap();
+        assert!(!guard.complete(first, Err("stale failure".into())));
+        assert!(guard.complete(second, Ok(())));
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_pending_poison_is_generation_safe() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let mut guard = reference.lock().unwrap();
+        let first = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(first, first_value).unwrap();
+        let second = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let second_value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        guard.install_pending(second, second_value).unwrap();
+        assert!(!guard.poison_pending(first, "stale failure"));
+        assert!(guard.poison_pending(second, "current failure"));
+        drop(guard);
+        assert_eq!(reference.read(), Err(ReferenceError::ExecutionPoisoned { reason: "current failure".to_string() }),);
+    }
+
+    #[test]
+    fn test_reference_reservation_waiter_wakes_after_installation() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let generation = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let waiting_reference = Arc::clone(&reference);
+        let waiting_barrier = Arc::clone(&barrier);
+        let waiter = std::thread::spawn(move || {
+            waiting_barrier.wait();
+            waiting_reference.wait_until_accessible()
+        });
+        barrier.wait();
+        let mut guard = reference.lock().unwrap();
+        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(generation, value).unwrap();
+        drop(guard);
+        assert_eq!(waiter.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn test_reference_read_lease_must_be_pruned_before_mutation_reservation() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::ready(Ok(())));
+        assert_eq!(
+            guard.reserve_pending(ReferenceCompletion::ready(Ok(()))),
+            Err(ReferenceError::TransactionInProgress),
+        );
+        assert!(guard.active_read_leases().is_empty());
+        assert!(guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).is_ok());
+        guard.poison("test cleanup");
+    }
+
+    #[test]
+    fn test_reference_read_awaits_a_pending_completion_resolved_by_another_thread() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let generation = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
+        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(generation, value).unwrap();
+        drop(guard);
+
+        // A read cannot return before the installed value's cumulative completion resolves, so the reader's slot is
+        // guaranteed to still be empty here regardless of how far the spawned thread has progressed.
+        let observed = Arc::new(Mutex::new(None));
+        let reader_reference = Arc::clone(&reference);
+        let reader_observed = Arc::clone(&observed);
+        let reader = std::thread::spawn(move || {
+            let value = reader_reference.read();
+            *reader_observed.lock().unwrap() = Some(value);
+        });
+        assert_eq!(*observed.lock().unwrap(), None);
+        backend.complete(Ok(()));
+        reader.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(2.0_f32))));
+
+        // The successful completion was applied to the holder, so the value is now ready without any dependency.
+        assert!(reference.lock().unwrap().dependency().is_none());
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_read_reports_a_failed_pending_completion_as_execution_poisoned() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let generation = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
+        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(generation, value).unwrap();
+        drop(guard);
+
+        // The completion resolves before the read reaches it, so the read observes the failure through the same lazy
+        // reconciliation path and reports the backend-owned reason. Poisoning is terminal for every later access.
+        backend.complete(Err("device execution failed".into()));
+        let poisoned = ReferenceError::ExecutionPoisoned { reason: "device execution failed".to_string() };
+        assert_eq!(reference.read(), Err(poisoned.clone()));
+        assert_eq!(reference.swap(Array::scalar(3.0_f32)), Err(poisoned.clone()));
+        assert_eq!(reference.freeze(), Err(poisoned));
+    }
+
+    #[test]
+    fn test_reference_swap_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        // A leased snapshot pins the current value, so the replacement cannot be installed until the lease completes.
+        let observed = Arc::new(Mutex::new(None));
+        let swapping_reference = Arc::clone(&reference);
+        let swapping_observed = Arc::clone(&observed);
+        let swapper = std::thread::spawn(move || {
+            let old = swapping_reference.swap(Array::scalar(2.0_f32));
+            *swapping_observed.lock().unwrap() = Some(old);
+        });
+        assert_eq!(*observed.lock().unwrap(), None);
+        lease.complete(Ok(()));
+        swapper.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(1.0_f32))));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_freeze_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        // Consumption is a mutation of the alias family, so it waits for the same leases a replacement would.
+        let observed = Arc::new(Mutex::new(None));
+        let freezing_reference = Arc::clone(&reference);
+        let freezing_observed = Arc::clone(&observed);
+        let freezer = std::thread::spawn(move || {
+            let value = freezing_reference.freeze();
+            *freezing_observed.lock().unwrap() = Some(value);
+        });
+        assert_eq!(*observed.lock().unwrap(), None);
+        lease.complete(Ok(()));
+        freezer.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(1.0_f32))));
+        assert_eq!(reference.read(), Err(ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_poisoning_a_reservation_wakes_an_accessibility_waiter() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let generation = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let waiting_reference = Arc::clone(&reference);
+        let waiting_barrier = Arc::clone(&barrier);
+        let waiter = std::thread::spawn(move || {
+            waiting_barrier.wait();
+            waiting_reference.wait_until_accessible()
+        });
+        barrier.wait();
+
+        // A reservation that fails after submission never installs a value, so its waiter must be woken with the
+        // terminal failure instead of blocking forever on an installation that will never happen.
+        let mut guard = reference.lock().unwrap();
+        assert!(guard.poison_pending(generation, "submission failed"));
+        drop(guard);
+        assert_eq!(
+            waiter.join().unwrap(),
+            Err(ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_reference_pending_install_rejects_a_stale_generation() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let mut guard = reference.lock().unwrap();
+        let first = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(first, first_value).unwrap();
+        let second = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+
+        // A late installation for the superseded generation is rejected without changing holder state, so the current
+        // reservation still installs its own value.
+        let value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        assert_eq!(guard.validate_pending_install(first, &value), Err(ReferenceError::StaleGeneration));
+        guard.install_pending(second, value).unwrap();
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_take_rejects_an_active_read_lease() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+
+        // Handing leased buffers to a donating execution would let the device mutate storage a submitted read-only
+        // execution still observes, so extraction is rejected until the lease completes and is pruned.
+        assert_eq!(guard.take(), Err(ReferenceError::TransactionInProgress));
+        lease.complete(Ok(()));
+        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
+        let restored = guard.prepare(Array::scalar(4.0_f32)).unwrap();
+        guard.install(restored).unwrap();
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
+    }
+
+    #[test]
     fn test_reference_guard_poison_isolated_to_the_extracted_holder() {
         let first = Reference::new(Array::scalar(1.0_f32));
         let second = Reference::new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         first_guard.take().unwrap();
-        first_guard.poison("test execution failed").unwrap();
+        first_guard.poison("test execution failed");
         drop(first_guard);
         drop(second_guard);
         assert_eq!(
