@@ -2086,6 +2086,55 @@ At each checkpoint, ask:
       no XLA/facade warnings. Formatting, `git diff --check`, source-rendering, ordinary-reference rejection,
       stale/scaffolding/parallel-universe, added-line-width, and changelog-diff audits were clean.
 
+- [ ] 2026-08-21 whole-plan independent re-audit fix pass 24 (in progress): three fresh independent Opus audits over
+      the complete uncommitted feature (core reference semantics and the phase-10 holder state machine, the
+      compilation/PJRT/XLA runtime stack, and the phase-12 kernels plus phase-13 docs with a cross-cutting sweep)
+      produced roughly sixty verified findings; no changelog was touched, per the standing owner instruction.
+      Correctness: the PJRT execution fence no longer destroys the completing event from inside its own native
+      `OnReady` callback (retained events are released on a detached thread, and the already-terminal registration
+      race no longer leaks the state cycle) and `is_ready` reports the callback-joined terminal result through a
+      plain lock; reference analysis tracks consumed roots instead of exhaustively seeded live roots, so a root
+      forwarded out of a depth-two nested region is usable where it lands; derived-view `swap`/`add_update` enforce
+      the exact derived referent type (update-slice fit alone allowed silent partial writes); `ReferenceGuard::take`
+      rejects extraction while a read lease is active; `Reference::validate_live` no longer blocks view derivation on
+      pending completions or reservations; non-bijective handle renamings are reported in the caller's direction;
+      the reference-free stateful async path carries the whole-execution fence as its completion (awaiting a
+      reference-free `call_statefully_async` observes asynchronous errors, and the shared `call_stateless_request`
+      body keeps the zero-output blocking rule); `PendingXlaReferenceReservations` poisoning is non-panicking so an
+      unwind cannot abort with holders reserved; the post-snapshot argument projection propagates instead of
+      unwrapping; and the V6 sharding-arity diagnostic no longer reuses the donation-arity message. Docs contradicted
+      by code were corrected: donation is never applied to reference-state inputs (`tf.aliasing_output` is a
+      non-semantic hint), post-installation failures do not poison, the discharge schematic now names the real
+      `*_with_local_references` adapters (reverse mode goes through `Pullback`; there is deliberately no direct
+      `vjp` adapter), the deleted fixed-shape restriction and the unenforced ordering claim are gone,
+      `ReferenceOutput` and `RuleRegion` describe the forwarding exemption and closure scope accurately, the
+      predecessor dependency is chained (never awaited), and `ExecutionFence::on_ready` documents inline delivery,
+      exactly-once, and dropped-handle keepalive. Simplifications: `ReferenceGeneration` is used uniformly (no bare
+      `u64` twins), `lock_ready` callers collapse to one `let`-`else`, the checked guard combinators became test-only
+      (the unused lease variant was deleted) while `validate_*` plus `*_unchecked` remain the documented backend
+      protocol, the dead `execute_compiled_async_with_state` hop and the per-execution clone-and-discard argument dry
+      run were removed, read-only roots no longer receive dead synthesized condition/call state outputs, one shared
+      carrier-generic view traversal now serves both the eager values and staged discharge (`ViewReadCarrier`/
+      `ViewWriteCarrier` with the staged carrier over the program builder), the analysis binding relation collapsed
+      to one map, the redundant per-instruction partial-evaluation gate and the vacuous kernel ABI cross-check plus
+      its dead error variant and dead match arms were deleted, `batched_with_local_references` takes the batch-axis
+      sharding like `Program::batched` (unnamed axis documented), and the five-fold adapter classification sentence
+      and four routing-pin comments dedup into the discharge module doc. Conventions: `ReferenceError` sits after the
+      imports, facade paths and test imports normalized, diagnostics backtick their identifiers, the kernels module
+      doc line and `validate_xla_replacement_metadata` doc were added, stateful test naming/rustdoc style fixed, and
+      the vacuous sharded V6 round-trip guard now asserts the exact unsupported-serialization reason. Tests: fifteen
+      regression tests plus the first discharge module doctest pin the concurrency contract (pending await, lease
+      waits, poison wakeups, stale generations, lease-blocked extraction), raw-handle view mutation typing, depth-two
+      forwarding, `UnresolvedAlias`, rendered-root diagnostics, the scan synthesized-carry offset, read-only
+      condition boundaries, kernel ordinary-instruction retention and the full forbidden-access matrix, and the
+      reference-free async await path. Deliberately kept with rationale: the completion `on_ready` callback surface
+      (a documented phase-10 deliverable), the `Taken` holder state (the honest placeholder while a value is
+      extracted for donation), the cross-crate `ControlledCompletion` test double (sharing it would add public
+      test-support surface), and the batching adapter's internal tracing context (the batching context is the
+      canonical axis-metadata carrier). Verification so far: 1,535 core, 540 XLA, 128 PJRT, 20 + 17 macro tests, 70
+      core doctests plus 16 ignored, zero warnings, formatting and whitespace clean. Remaining: convergence re-audit
+      rounds over this pass's fixes.
+
 All implementation and verification items in this reference plan are complete. The production Pallas-style kernel
 language, launch model, and scheduler described by the roadmap remain a separate future program rather than unchecked
 work in this plan.

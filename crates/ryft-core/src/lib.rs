@@ -162,13 +162,14 @@ pub use programs::{
     Instruction, InstructionId, MaybeZero, MemberOperation, NoIdentity, Operation, OperationFormatter,
     OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection, PreparedReferenceValue,
     Program, ProgramBuilder, ProgramError, ProgramLiveSets, ProgramStatistics, ProjectedValue, Reference,
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceError, ReferenceGuard, ReferenceId, ReferenceInputAccess,
-    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, Transform, TransformArtifact,
-    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
-    TypeRefinements, Typed, Value, ValueId, ValueProjection, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    ReferenceAccessMode, ReferenceAliasKind, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError, ReferenceGeneration, ReferenceGuard,
+    ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType,
+    ReferenceTypeRefinements, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
+    Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId, ValueProjection,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -478,7 +479,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary.
+    /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary,
     /// shared by the transform adapters that must discharge local references before transforming. The program takes
     /// a Boolean predicate and an `f32[]` initial value, allocates one local reference from that initial value, and
     /// passes the reference into a condition whose branches access it with unequal modes. The `true` branch accumulates

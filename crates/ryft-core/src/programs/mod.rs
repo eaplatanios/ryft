@@ -146,7 +146,9 @@ pub use operations::{
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use references::{
-    Reference, ReferenceAccessMode, ReferenceError, ReferenceInputAccess, ReferenceOperationSemantics,
+    PreparedReferenceValue, Reference, ReferenceAccessMode, ReferenceAliasKind, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError,
+    ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics,
     ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements,
 };
 pub use regions::{

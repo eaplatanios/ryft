@@ -2206,8 +2206,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let input =
-            Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        let input = Array::from_host_buffer(&client, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
 
         let output = compiled.call_statefully_async(&domain, ArrayIrValue::Array(input)).r#await().unwrap();
         let ArrayIrValue::Array(output) = output else { panic!("stateful all-array output must be an array") };
