@@ -20,8 +20,9 @@ understand) and their validation against lying third-party families. When each s
 itself — as it already batches and differentiates itself — the planner-specific discharge *layout contracts*
 disappear (generic region provenance remains, with its independent consumers). The planning logic itself does not
 vanish; it separates into three named responsibilities: a summary analysis (root access and transitive mutation
-facts, computed generically from `reference_semantics`), the per-operation rules (which decide and emit the
-rewrite), and driver services (checked summaries, transactional forks, unions, and boundary assembly).
+facts, computed generically from `reference_semantics`, the region-provenance hooks, reference-output identity, and
+recursive region summaries), the per-operation rules (which decide and emit the rewrite), and driver services
+(checked summaries, transactional forks, unions, and boundary assembly).
 
 The interpreter shape also makes partial discharge natural: unselected roots keep reference values whose accesses
 replay verbatim, which is what the future kernel pipeline needs (JAX precedent: `should_discharge` in
@@ -76,52 +77,117 @@ dedicated lightweight query (entry reference positions plus allocation-rule inst
 the full analysis, so it survives the phase-6 reduction. Tests cover identical allocation operations at distinct
 sites, non-allocation and out-of-range sites, duplicate sites, and allocation inside a shared nested region.
 
-**The family capability.** One trait owns every family-varying type, on the batching-policy precedent
-(`ArrayBatching`/`ArrayIrBatching` are exactly this shape), so the value, context, driver, and rule signatures all
-name a single family parameter instead of loose generics — and so a non-array family is a first-class instantiation
-rather than an afterthought:
+**The discharge policy.** One trait owns every universe-varying type, named and shaped on the batching-policy
+precedent (`ArrayBatchingPolicy`/`RecursiveBatchingPolicy`, whose implementors are zero-sized markers generic over
+the context — deliberately *not* a context capability, because one marker's single generic impl covers every
+context of its type system, while a context-implemented capability would need a coherence-foreclosing blanket to do
+the same). The value, context, driver, and rule signatures all name a single policy parameter instead of loose
+generics, so a non-array universe is a first-class instantiation rather than an afterthought:
 
 ```rust
-/// Family capability naming the types one reference universe threads through discharge.
-pub trait ReferenceDischargeFamily<C> {
-    /// Referent type system of this family's references.
+/// Policy naming the types and alias mechanics one reference universe threads through discharge, implemented by
+/// zero-sized markers such as the arrays universe's `ArrayReferenceDischarge`.
+pub trait ReferenceDischargePolicy<C> {
+    /// Referent type system of this universe's references.
     type Referent: Type;
 
     /// Composed alias metadata carried by one flowing handle (the view chain, for arrays; `()` for
     /// view-less families).
     type Alias: Clone + Parameter;
 
-    /// Embeds a reference type into the destination type universe.
-    fn embed_reference_type(r#type: ReferenceType<Self::Referent>) -> C::Type;
+    /// Returns the identity alias of an unviewed root with the provided referent type, used by allocation and
+    /// entry-boundary binding. Infallible by design: referent validity is type inference's job, and identity-alias
+    /// construction for a validated referent is total (phase 0 revisits only if a genuinely fallible derivation
+    /// appears in a real universe).
+    fn root_alias(referent: &Self::Referent) -> Self::Alias;
 
-    /// Projects a destination type back onto a reference type, when it is one. The embed/project pair is the
-    /// conversion seam access rules use to type-check operands.
+    /// Lifts a reference type into the destination type universe.
+    fn lift_reference_type(r#type: ReferenceType<Self::Referent>) -> C::Type;
+
+    /// Projects a destination type back onto a reference type, when it is one. The lift/project pair is the
+    /// conversion seam access rules use to type-check operands. (Phase 0 settles whether projection returns
+    /// `Option` or mirrors the `TryFrom`-with-`TypeError` idiom, against what the operand-check call sites need.)
     fn project_reference_type(r#type: &C::Type) -> Option<ReferenceType<Self::Referent>>;
+
+    /// Applies this universe's alias metadata to one immutable state value, returning the selected value.
+    fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError>;
+
+    /// Replaces the coordinates selected by `alias`, returning the previous selection and the successor state.
+    fn replace(
+        context: &C,
+        current: &C::Value,
+        replacement: C::Value,
+        alias: &Self::Alias,
+    ) -> Result<(C::Value, C::Value), ProgramError>;
+
+    /// Accumulates `update` into the coordinates selected by `alias`, returning the successor state. The
+    /// method-level bound restores per-method capability granularity: a context whose value type cannot add keeps
+    /// the full policy for reads and replacements, and only call sites that actually accumulate must prove `Add`.
+    fn accumulate(
+        context: &C,
+        current: &C::Value,
+        update: C::Value,
+        alias: &Self::Alias,
+    ) -> Result<C::Value, ProgramError>
+    where
+        C::Value: Add;
 }
 ```
 
-**Values and environment.**
+The alias-application methods are what keep the generic primitive rules genuinely generic: without them, read,
+swap, and add-update would be implicitly array-owned. Capability bounds are placed for per-method granularity, not
+as one impl-level union: `accumulate` carries a trait-level method `where C::Value: Add` clause (the fallible core
+capability, which `Tracer` implements by staging, so one policy impl covers staged and eager destination contexts
+alike), while the arrays policy's `impl` block demands only its view mechanics (`Reshape + Slice + UpdateSlice`).
+A context whose value type supports views but not addition therefore keeps reads and replacements, and a program
+containing `reference_add_update` fails to discharge for it at compile time, scoped to exactly the unsupported
+operation. Two recorded caveats: closed operation-enum dispatch reintroduces the union for enums whose members
+include add-update (a pre-existing property of enum dispatch, identical to interpretation today), and dtype-level
+incompatibilities still surface as runtime `Result`s through the fallible capability even where the bound holds.
+The two unavailability cases stay distinct: a `C::Value` without `Add` makes accumulation unavailable at compile
+time through the method bound, while a universe whose references forbid accumulation even though its values can add
+implements `accumulate` as an explicit runtime `UnsupportedOperation` rejection. The
+arrays policy delegates to the existing shared view carriers; the exact placement of the `C` bound (the policy
+uses `C::Type` and `C::Value`, so `C` needs its domain/context relationship declared somewhere non-recursive) is a
+phase-0 exit criterion under the same capability-only-bounds discipline as the rule trait.
+
+**Values and environment.** The flowing value is a context-stamped tracer, on the `BatchingTracer`/
+`DifferentiationTracer` precedent — the eager `ArrayIrValue` is the wrong model, because eager values self-dispatch
+while a discharge value must dispatch through the live context that owns the root environment (`Value` requires
+reporting the active dispatch domain, which cannot be reconstructed from a root handle). The wrapper cannot reuse
+the generic `Tracer<C>` either: a discharged reference handle has no destination atom to wrap, which is precisely
+the case the generic tracer cannot represent.
 
 ```rust
-/// One value flowing through a reference-discharge replay.
-pub enum ReferenceDischargeValue<C, F: ReferenceDischargeFamily<C>> {
+/// Context-stamped discharge value; implements `Value` and dispatches through its context.
+pub struct ReferenceDischargeTracer<C, P: ReferenceDischargePolicy<C>> {
+    context: ReferenceDischargeContext<C, P>,
+    value: ReferenceDischargeValue<C, P>,
+}
+
+/// Context-free carrier inside one [`ReferenceDischargeTracer`].
+enum ReferenceDischargeValue<C, P: ReferenceDischargePolicy<C>> {
     /// Ordinary pure value, replayed as-is.
     Pure(C::Value),
 
     /// Handle to one live root, mirroring the eager `ArrayReference` shape: root identity, the composed
-    /// family-owned alias metadata, and the derived reference type this exact handle exposes. Root identity alone
-    /// cannot implement `Typed` or tell an access rule which composed view to apply while Track A retains SSA
-    /// views. The per-root state lives in the context environment so every handle to one root observes every
-    /// ordered update.
+    /// policy-owned alias metadata, and the derived reference type this exact handle exposes (which differs from
+    /// the root type under a composed view). The per-root state lives in the context environment so every handle
+    /// to one root observes every ordered update.
     Reference {
         root: ReferenceRootHandle,
-        alias: F::Alias,
-        r#type: ReferenceType<F::Referent>,
+        alias: P::Alias,
+        r#type: ReferenceType<P::Referent>,
+        /// For a preserved root, the exact destination reference value this handle denotes: the entry binding for
+        /// the root handle, or the bound output of the replayed view operation for a derived handle. Later
+        /// accesses consume this exact value; re-deriving the chain per access would duplicate and reorder view
+        /// operations. Invariant: `None` exactly when the root is `Discharged`, `Some` exactly when `Preserved`.
+        preserved: Option<C::Value>,
     },
 }
 
 /// Environment entry for one live root.
-enum RootState<A> {
+enum ReferenceRootState<A> {
     /// Selected for discharge: threads as immutable state.
     Discharged {
         /// Current immutable state value.
@@ -130,17 +196,28 @@ enum RootState<A> {
         mutated: bool,
     },
 
-    /// Not selected: survives as a destination reference value whose accesses replay verbatim.
+    /// Not selected: survives in the destination; this is the root's own destination reference value, used for
+    /// boundary threading. Derived preserved handles carry their own exact destination values in the flowing
+    /// `preserved` field.
     Preserved {
-        /// Destination reference-typed value.
+        /// Destination reference-typed root value.
         reference: A,
     },
 }
 ```
 
-The flowing value is a full `Value` family (Section 8, decision 2), with the reference arm reporting the exact
-handle type (which differs from the root type under a composed view); the exact impl set, the minimal family
-bounds, and a verified non-array test family are phase-0 prototype deliverables, not implementation details to
+The tracer implements `Value` (Section 8, decision 2); the enum is merely its carrier — and because the public
+rule trait names it in signatures, the carrier, the opaque `ReferenceRootHandle`, and every type a third-party rule
+touches must themselves be public with private fields (a public trait cannot name private types, and XLA and custom
+backends are external crates). Construction stays checked: rules obtain and produce values only through public
+context/driver methods, never by building roots or environment entries directly. Phase 0 explicitly decides and
+tests the complete downstream surface — public carrier and handle, rule-safe context accessors and constructors,
+the driver services third-party structured rules need, and the `C: Domain`/`C: Context` bound placement required to
+name `C::Type` and `C::Value` — and proves it with a downstream-style compile test: an external operation family
+plus a non-array policy implementing the complete capability from an integration-test crate position, where the
+compiler itself enforces that no private API is reachable. The exact impl set, the
+minimal policy bounds, and a non-array test policy that exercises root-alias construction, read, replacement, and
+accumulation — not merely type instantiation — are phase-0 prototype deliverables, not implementation details to
 discover late.
 
 **Rule trait and bounds.** The per-operation rule follows the transform-rule shape, and the discharge context
@@ -148,13 +225,15 @@ implements `Context` (Section 8, decision 2), so discharge runs through `interpr
 differentiation and rules can bind through the context directly:
 
 ```rust
-pub trait ReferenceDischargeableOperation<C, F: ReferenceDischargeFamily<C>>: Operation {
-    fn discharge<D: ReferenceDischargeDriver<C, F>>(
+pub trait ReferenceDischargeableOperation<C, P: ReferenceDischargePolicy<C>>: Operation {
+    // Named after the program-level entry, following the same-verb-at-both-levels precedent of `jvp` and
+    // `partially_evaluate`.
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
-        context: &ReferenceDischargeContext<C, F>,
+        context: &ReferenceDischargeContext<C, P>,
         driver: &D,
-        inputs: &[ReferenceDischargeValue<C, F>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, F>>, ProgramError>;
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>;
 }
 ```
 
@@ -168,20 +247,25 @@ with three constraints that are exit criteria for the phase-0 prototype, not aft
 context parameter carries capability-only bounds (never `C: Context` on the trait — the pattern that keeps the
 dispatch derives clear of trait-solver recursion); the default pure-replay rule's conversion from `Self` into
 `C::Operation` uses the established conversion seam and its `Self::Type`/`C::Type` relationship is explicit; and
-`ReferenceDischargeValue` proves out as a real `Value` family on the `ArrayIrValue` heterogeneous-value precedent
-(capabilities delegate on `Pure`, error on `Reference`, and the reference arm types as `ReferenceType`).
+`ReferenceDischargeTracer` proves out as a real `Value` (capabilities delegate on `Pure`, error on `Reference`,
+and the reference arm types as the exact handle type).
 
 **Driver services, not contracts.** Structured rules (condition, while, scan, call) own their widening, but the
 planning-shaped logic they share is provided once by the driver, as services rules compose — the same division the
 batching and partial-evaluation drivers already use:
 
-- transactional region forks: structured replay runs against an environment *snapshot* and returns the region's
-  outputs and final states without committing anything to the parent environment; only the owning rule merges the
-  returned states. This is a hard isolation contract, not `Context` cloning (stateful context clones share active
-  transform state, which is exactly wrong here): both condition branches must observe the same entering
-  environment, speculative while probes must commit nothing, and a failed replay must leave the parent environment
-  untouched. Discharge needs this where batching and differentiation do not because its state lives in the context
-  environment rather than riding in per-value tracers;
+- transactional region forks: structured replay runs against an environment *snapshot* and returns only sealed
+  artifacts — the discharged region program, plain `C::Value`s, and state summaries. Child-context-stamped tracers
+  never escape a fork: a returned tracer would keep mutating the abandoned child environment, so the fork result
+  type simply does not carry them, and the owning rule binds the rebuilt structured operation in the *parent*
+  context, producing fresh parent-stamped tracers. Only the owning rule merges returned final states. This is a
+  hard isolation contract, not `Context` cloning (stateful context clones share active transform state, which is
+  exactly wrong here): both condition branches must observe the same entering environment, speculative while
+  probes must commit nothing, and a failed replay must leave the parent environment untouched and yield no usable
+  child values. Discharge needs this where batching and differentiation do not because its state lives in the
+  context environment rather than riding in per-value tracers. Pinned by tests: identical branch snapshots,
+  parent-stamped branch outputs after the rebuilt condition binds, no child-tracer leakage from while probes, no
+  parent mutation or usable values after failed replay, and no escape of branch-local allocations through merge;
 - transitive closure summaries: which roots a region closure reads, writes, or accumulates, which a while rule
   must know *before* widening. This is retained reference analysis, acknowledged as such, and its inputs are named
   precisely: operation-local `reference_semantics`, input-region provenance, output-region provenance,
@@ -211,9 +295,12 @@ builder-time type checking, the result envelopes, and oracles — not per-operat
 - SSA view operations are retained in Track A, with their own rules: `reference_index` and `reference_slice`
   preserve the incoming root handle, validate and compose the transform onto the flowing `alias` (rejecting invalid
   composition before binding the output, with the same math as eager `with_transform`), and record the derived
-  reference type. The flowing `alias` field is the single authoritative view chain during discharge; the analysis
-  never supplies view resolution to the transform (it remains the lint's and the summaries' concern), so a handle's
-  view has exactly one source of truth.
+  reference type. On a discharged root the rule only composes metadata and binds nothing; on a preserved root it
+  additionally replays the view operation into the destination and stores the bound output as the handle's exact
+  `preserved` value, so later accesses consume that value instead of re-deriving the chain. The flowing `alias`
+  field is the single authoritative view chain during discharge; the analysis never supplies view resolution to
+  the transform (it remains the lint's and the summaries' concern), so a handle's view has exactly one source of
+  truth.
 
 ### 2.3 What survives, with consumers named
 
@@ -255,9 +342,9 @@ happens only on a clear net simplification, after Track A is stable.
 
 ## 4. Implementation phases
 
-- [ ] **Phase 0 — contract prototypes.** Type-check the family/value/context/driver/trait surfaces against the
+- [ ] **Phase 0 — contract prototypes.** Type-check the policy/value/context/driver/trait surfaces against the
       partial-evaluation precedent (including the capability-only-bounds and conversion-seam exit criteria above);
-      verify a minimal non-array family instantiation so the architecture is provably not array-shaped; land the
+      verify a minimal non-array policy instantiation so the architecture is provably not array-shaped; land the
       two result envelopes and the `ReferenceDischargeSite` vocabulary with its validation; prototype one
       structured fixed point (while) end to end on the test operation family. No production wiring.
 - [ ] **Phase 1 — flat interpreter discharge.** Allocation, read, swap, add-update, freeze, and the SSA view-rule
@@ -313,33 +400,42 @@ review record below.
 ## 6. Phase ownership and estimates
 
 Owning files per phase, with rough size estimates (production/tests). Exclusions apply to every phase: the holder
-runtime (`programs/references/runtime.rs`), the external-state ABI and V6 persistence, the XLA transaction, and all
-changelogs (owner-written).
+runtime (`programs/references/runtime.rs`), the external-state ABI and V6 persistence, the XLA transaction, and
+all changelog files: excluded; no changes.
 
-Estimates are production/tests/docs line ranges.
+Estimates are midpoint production/tests/docs line counts, not ranges; deletions are reported separately at the
+end rather than as negative production.
 
-- **Phase 0:** `programs/references/discharge.rs` (family, value, context, driver, envelopes, sites;
-  ~350/300/100) plus a throwaway prototype module for the while fixed point and the non-array family check
-  (deleted at phase exit).
+- **Phase 0:** `programs/references/discharge.rs` (policy, value, context, driver, envelopes, sites;
+  ~350/300/100) plus a throwaway prototype module for the while fixed point (deleted once the real structured
+  rules supersede it). The minimal non-array policy and its read/replace/accumulate tests are permanent — they are
+  the standing proof that the architecture has not silently become array-specific.
 - **Phase 1:** `programs/references/discharge.rs` (context, environment, flat services; ~400/300/80),
   `programs/references/operations.rs` and `arrays`-side view/access rules (~250/250/60), `ryft-macros` +
   `ryft-macros-tests` (`dispatch(discharge)`; ~150/100/20), dual-run harness (~0/150/0).
 - **Phase 2:** structured-operation modules under `operations/control_flow/` and the call carriers (rules;
   ~400/350/80), driver fork/summary services (~200/150/40).
-- **Phase 3:** `arrays/reference_discharge.rs` (cutover and deletion; net-negative production delta expected;
-  ~-600/100/40).
+- **Phase 3:** `arrays/reference_discharge.rs` (cutover; ~100/100/40, with the planner deletion reported below).
 - **Phase 4:** `programs/references/discharge.rs` (selection, partial envelope, `try_into_full`; ~250/300/60),
   `ryft-xla/src/experimental/reference_kernels.rs` (consumer integration; ~100/150/30).
 - **Phase 4b:** structured-rule and summary extensions for mixed carries (~250/300/40).
-- **Phase 5 (Track B):** prototype under `arrays/` only, with a fixed budget of ~500/200/0 and a hard deletion
-  criterion: the prototype is deleted at the phase-5 decision regardless of outcome, and an adopting migration is
-  sized and planned as its own follow-up from the prototype's findings.
+- **Phase 5 (Track B):** prototype spanning a test-only generic access-operation fixture in
+  `programs/references` plus an array specialization — the descriptor parameter lives on the universe-generic
+  access operations, so an arrays-only prototype could not test the dependency boundary the phase exists to
+  evaluate. Fixed budget of ~500/200/0 and a hard deletion criterion: the prototype is deleted at the phase-5
+  decision regardless of outcome, and an adopting migration is sized and planned as its own follow-up from the
+  prototype's findings.
 - **Phase 6:** `arrays/reference_views.rs`, tracing handle modules, `programs/references/analysis.rs`
-  (reduction; net-negative), lint surface (~-300/200/60).
+  (reduction), lint surface, and the by-value `freeze` migration, which changes the generic `FreezeReference`
+  capability contract in `programs/references/operations.rs` and therefore every implementation and call site
+  (eager, traced, capability impls, tests) — named here so the API migration and its tests are owned, not
+  discovered (~250/300/60, deletions reported below).
 - **Phase 7:** documentation and audits across the touched files; no new production surface (~0/100/300).
 
-Rough total (excluding phase 5's unadopted prototype and phase 3/6 deletions): ~2,000 production, ~2,400 test, and
-~900 documentation lines.
+Rough planned-work totals (phase 5's prototype is mandatory work even though it is deleted at the decision):
+~3,200 production, ~3,050 test, and ~900 documentation lines written, against roughly 900 production lines deleted
+(the planner and bespoke replay in phase 3, the analysis reduction in phase 6). The retained baseline excluding the
+prototype is ~2,700/~2,850/~900.
 
 ## 7. Risks and mitigations
 
@@ -362,10 +458,13 @@ Rough total (excluding phase 5's unadopted prototype and phase 3/6 deletions): ~
 2. **The discharge context implements `Context` (decided, phase 0 validates).** Discharge is a single
    program-to-program interpretation, so it runs through `interpret_in_context` like batching and differentiation
    rather than through a bespoke replay like partial evaluation (whose wrapper shape is justified only because
-   partitioning is not a single interpretation). `ReferenceDischargeValue` becomes a real `Value` family on the
-   `ArrayIrValue` heterogeneous-value precedent: capabilities delegate on `Pure` and error on `Reference`, and the
-   reference arm types as `ReferenceType`. Phase 0 validates the value-family impls and the capability-only-bounds
-   discipline; most driver services from Section 2.1 become context methods.
+   partitioning is not a single interpretation). The context's value is the context-stamped
+   `ReferenceDischargeTracer` on the `BatchingTracer`/`DifferentiationTracer` precedent — not an eager-style
+   contextless enum, because discharge values must dispatch through the live context that owns the root
+   environment, and not the generic `Tracer<C>`, because a discharged handle has no destination atom to wrap.
+   Capabilities delegate on `Pure` and error on `Reference`, and the reference arm types as the exact handle type.
+   Phase 0 validates the tracer impls and the capability-only-bounds discipline; most driver services from
+   Section 2.1 become context methods.
 3. **Partial-discharge selection (decided).** The full selection surface ships immediately through the checked
    `ReferenceDischargeSite` vocabulary (externals plus allocation sites; nested formal roots are deliberately not
    selectable) — externals-only would force a second API migration for the kernel pipeline without avoiding the
