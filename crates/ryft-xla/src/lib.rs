@@ -34,7 +34,7 @@ pub use profile_guided::{
     AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState, AdaptiveProfileGuidedStatistics,
     AdaptiveProfileGuidedXlaFunction,
 };
-pub use telemetry::live_array_count;
+pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
 
 #[cfg(test)]
 pub(crate) mod tests {

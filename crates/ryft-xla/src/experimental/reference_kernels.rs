@@ -1181,8 +1181,8 @@ mod tests {
         AddOperation, Array as CpuArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceOperation,
         ArrayReferenceViewTransform, ArraySliceAxis, ConditionOperation, DataType, Dimension, Effects,
         FreezeReferenceOperation, NewReferenceOperation, Placeholder, PrintOperation, Program, ProgramBuilder,
-        ReferenceAnalysisError, ReferenceDischarge, ReferenceOperationSemantics, ReferenceSliceOperation,
-        ReshapeOperation, Shape, SliceOperation, UpdateSliceOperation, ValueProjection,
+        ReferenceAnalysisError, ReferenceDischarge, ReferenceDischargeSite, ReferenceOperationSemantics,
+        ReferenceSliceOperation, ReferenceSource, Shape, ValueProjection,
     };
 
     use crate::experimental::lowering::{LoweringError, lower_mlir_module_for_program};
@@ -1301,22 +1301,6 @@ mod tests {
                 Self::WrongTypeRead(_) => ReferenceDischargeRule::Read,
                 Self::Native(operation) => operation.reference_discharge_rule(),
             }
-        }
-
-        fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-            Self::Native(TestOperation::from_reference_reshape(operation))
-        }
-
-        fn from_reference_slice(operation: SliceOperation) -> Self {
-            Self::Native(TestOperation::from_reference_slice(operation))
-        }
-
-        fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-            Self::Native(TestOperation::from_reference_update_slice(operation))
-        }
-
-        fn with_added_reference_scan_carries(&self, _additional_carry_count: usize) -> Result<Self, ProgramError> {
-            Ok(self.clone())
         }
     }
 
@@ -2161,6 +2145,48 @@ mod tests {
         // discharged external-state slots or executable-entry alias metadata.
         assert_eq!(kernel.bindings().len(), 2);
         assert_eq!(operation.output_operand_aliases().len(), 1);
+    }
+
+    #[test]
+    fn test_preserved_reference_kernel_validates_a_partially_discharged_body() {
+        // The kernel path is a *consumer* of partial reference discharge: a pipeline normalizes the state it owns and
+        // leaves the references a kernel addresses alone, so the selection a pipeline hands to discharge is exactly
+        // the complement of the kernel's own parameters. This pins both halves of that contract on one body.
+        let body = read_store_body();
+        let operation = PreservedReferenceKernelOperation::new(vec![
+            operand(KernelOperandAccess::ReadOnly),
+            operand(KernelOperandAccess::WriteOnly),
+        ]);
+        let expected = operation.validate_body(body.entry_region_ref()).unwrap();
+
+        // Preserving every parameter leaves a program the validator still accepts, with the same bindings and the
+        // same lowering it derives from the source body. Discharge normalized nothing here, so it reports no
+        // external state either.
+        let sites = body.reference_discharge_sites(0).unwrap();
+        assert_eq!(
+            sites,
+            vec![
+                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 0 }),
+                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 1 }),
+            ],
+        );
+        let preserved = body.clone().partially_discharge_references(0, &[]).unwrap();
+        assert_eq!(preserved.public_output_count(), 0);
+        assert_eq!(preserved.external_states(), &[]);
+        let kernel = operation.validate_body(preserved.program().entry_region_ref()).unwrap();
+        assert_eq!(kernel.bindings(), expected.bindings());
+        assert_eq!(kernel.lowering(), expected.lowering());
+
+        // Discharging one of them instead turns that parameter into ordinary array state, which the kernel contract
+        // does not describe: a kernel parameter is a reference, so the validator rejects the mixed boundary by name.
+        // That is the boundary between the two vocabularies, and it is why the pipeline's selection must omit every
+        // root its kernels address.
+        let mixed = body.partially_discharge_references(0, &sites[..1]).unwrap();
+        let error = operation.validate_body(mixed.program().entry_region_ref()).unwrap_err();
+        assert!(matches!(
+            kernel_error(&error),
+            KernelReferenceError::NonReferenceInput { parameter_index: 0, actual } if actual == "f32[]",
+        ));
     }
 
     #[test]

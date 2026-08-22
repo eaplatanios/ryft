@@ -3179,8 +3179,8 @@ impl<'c> XlaDomain<'c> {
                 ),
             });
         }
-        // Avoid cloning the dominant reference-free program path. Its discharge artifact is the identity with an
-        // empty external-state list, so the same metadata can cross the lowering boundary by borrow.
+        // Avoid cloning the dominant reference-free program path. Discharge returns such a program untouched with an
+        // empty external-state list, so the same metadata can cross the lowering boundary by borrow instead.
         if !contains_unresolved_references(program) {
             return self.lower_verified_reference_free_xla_program(
                 program,
@@ -4245,7 +4245,6 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::OneLike(_)
         | ArrayOperation::Constant(_)
         | ArrayOperation::Iota(_)
-        | ArrayOperation::CoordinateBasis(_)
         | ArrayOperation::Abs(_)
         | ArrayOperation::Neg(_)
         | ArrayOperation::Add(_)

@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use ryft_core::macros::check_count;
+use ryft_core::macros::{check_count, impl_reference_free_dischargeable_operation};
 use ryft_core::{
     ArrayIrType, ArrayType, CalleeRegionDriver, CaptureConstant, Concretizable, Context, DifferentiableOperation,
     DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError, LogicalMesh, MaybeZero,
@@ -293,6 +293,12 @@ impl<V: Clone> Operation for ShardMapOperation<V> {
         .collect())
     }
 }
+
+// A shard map replays verbatim. Its body executes once per device shard over a manual SPMD boundary, so a reference
+// crossing that boundary would have to describe which shard owns the referent and how per-shard updates recombine,
+// which the manual-sharding contract does not define. The shared reference-free rule therefore copies its body across
+// unchanged and rejects the application by name if a reference reaches that closure.
+impl_reference_free_dischargeable_operation!(<V> ShardMapOperation<V> where V: Clone);
 
 /// Online partial-evaluation rule for a staged `shard_map` — the map-boundary sibling of the
 /// [`JitCallOperation`](crate::experimental::ops::JitCallOperation) call rule: it splits the local body against the

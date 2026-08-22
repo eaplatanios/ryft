@@ -283,7 +283,7 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, CoordinateBasisOperation, Cos, Device, DeviceMesh, Differentiate, Dimension,
+        ConvertElementType, Cos, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
         DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Log, LogicalMesh, Logistic, Max, MeshAxis,
         MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
         ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
@@ -1945,26 +1945,60 @@ mod tests {
             let array = Array::from_host_buffer(&client, r#type, mesh.clone(), bytes.as_slice()).unwrap();
             assert_eq!(read_f64_coordinates(&array), vec![1.0, 2.0, 3.0]);
 
-            let basis = array
-                .execution_domain()
-                .bind(CoordinateBasisOperation::new(array.r#type().into_owned(), 0, 3), Vec::new(), &[])
-                .unwrap()
-                .remove(0);
+            let r#type = array.r#type().into_owned();
+            let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+                &array.execution_domain(),
+                &r#type,
+                &r#type,
+                0,
+                3,
+            )
+            .unwrap()
+            .into_value();
             assert_eq!(basis.data_type(), data_type);
             assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
             assert_eq!(read_f64_coordinates(&basis), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
         }
+
+        // A rank-two leaf exercises the rectangular basis construction and final reshape with a nonzero packed offset.
+        let matrix_type = replicated_type(&mesh, DataType::F32, &[2, 3]);
+        let matrix = Array::from_host_buffer(
+            &client,
+            matrix_type,
+            mesh.clone(),
+            values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        let matrix_type = matrix.r#type().into_owned();
+        let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+            &matrix.execution_domain(),
+            &matrix_type,
+            &matrix_type,
+            1,
+            8,
+        )
+        .unwrap()
+        .into_value();
+        let expected =
+            (0..48).map(|index| if index / 6 == index % 6 + 1 { 1.0f64 } else { 0.0f64 }).collect::<Vec<_>>();
+        assert_eq!(basis.shape(), StaticShape::new(vec![8, 2, 3]));
+        assert_eq!(read_f64_coordinates(&basis), expected);
 
         // Complex leaves use the same integer index graph and select typed complex one/zero values.
         let complex_type = replicated_type(&mesh, DataType::C64, &[2]);
         let complex_values = [num_complex::Complex::new(2.0f32, 1.0), num_complex::Complex::new(-1.0, 3.0)];
         let complex =
             Array::from_host_buffer(&client, complex_type, mesh.clone(), values_to_bytes(&complex_values)).unwrap();
-        let basis = complex
-            .execution_domain()
-            .bind(CoordinateBasisOperation::new(complex.r#type().into_owned(), 0, 2), Vec::new(), &[])
-            .unwrap()
-            .remove(0);
+        let complex_type = complex.r#type().into_owned();
+        let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+            &complex.execution_domain(),
+            &complex_type,
+            &complex_type,
+            0,
+            2,
+        )
+        .unwrap()
+        .into_value();
         assert_eq!(
             read_c64s(&basis),
             vec![

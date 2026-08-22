@@ -23,17 +23,17 @@ use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureReference,
     CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
-    ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension, DimensionOperation,
-    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
-    DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
-    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation,
-    LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation,
-    MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError,
-    ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, ReferenceStateBinding, RegionId, RegionRef,
-    RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
-    ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
-    ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
-    TransposeOperation, Type as RyftType, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
+    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotOperation,
+    Effect, Effects, ErfOperation, ExpOperation, FloorOperation, GATHER_OPERATION_NAME, GatherOperation,
+    GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation,
+    MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
+    PadOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, REMATERIALIZE_OPERATION_NAME,
+    ReductionKind, ReferenceStateBinding, RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation,
+    RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterOperation,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, Typed, Value,
+    WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
@@ -1425,19 +1425,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType
             lowerer.context,
             lowerer.location,
         )?])
-    }
-}
-
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for CoordinateBasisOperation<ArrayType> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        check_count!("input", input_values, 0, ProgramError);
-        lower_coordinate_basis_to_mlir(self, output_types, &mut lowerer.block, lowerer.context, lowerer.location)
     }
 }
 
@@ -2987,15 +2974,6 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
-            ArrayOperation::CoordinateBasis(operation) => {
-                <CoordinateBasisOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
             ArrayOperation::Add(operation) => <AddOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -7162,106 +7140,6 @@ impl ToMlir for ComparisonDirection {
     }
 }
 
-/// Lowers a packed [`CoordinateBasisOperation`] directly into the current StableHLO block.
-fn lower_coordinate_basis_to_mlir<'b, 'c: 'b, 't: 'c, B, L>(
-    operation: &CoordinateBasisOperation<ArrayType>,
-    output_types: &[ArrayType],
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    check_count!("output", output_types, 1, ProgramError);
-    let output_type = &output_types[0];
-    let value_dimensions = operation
-        .value_type()
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension_size| match dimension_size {
-            Dimension::Static(dimension_size) => Ok(*dimension_size),
-            Dimension::Dynamic(_) => Err(ProgramError::InvalidArgument {
-                message: format!(
-                    "coordinate basis requires a fully static value type but got {}",
-                    operation.value_type(),
-                ),
-            }),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // A zero-sized value contributes no local coordinates. Lowering its fragment directly as a typed empty zero avoids
-    // constructing irrelevant row-major index arithmetic and, in particular, makes stride computation independent of
-    // where the zero-sized dimension occurs.
-    if value_dimensions.contains(&0) {
-        return lower_constant_output(output_types, 0, block, context, location);
-    }
-
-    let index_type = output_type.clone().with_data_type(DataType::U64);
-    let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
-    let basis_index = block.append_operation(stable_hlo::iota(index_tensor_type, 0, location)?)?;
-    let basis_index = basis_index.result(0).expect("stablehlo.iota should return one result").as_ref();
-
-    // Compute each value element's row-major flat coordinate in the physical `[basis] ++ value_shape` tensor. Keeping
-    // all index arithmetic in u64 preserves exact coordinates throughout the generated graph.
-    let mut flat_coordinate = None;
-    let mut stride = 1u64;
-    for (value_axis, dimension_size) in value_dimensions.iter().copied().enumerate().rev() {
-        let coordinate = block.append_operation(stable_hlo::iota(index_tensor_type, value_axis + 1, location)?)?;
-        let coordinate = coordinate.result(0).expect("stablehlo.iota should return one result").as_ref();
-        let coordinate = if stride == 1 {
-            coordinate
-        } else {
-            let stride_value =
-                lower_u64_constant_splat(stride, &index_type, index_tensor_type, block, context, location)?;
-            let product = block.append_operation(stable_hlo::multiply(coordinate, stride_value, location)?)?;
-            product.result(0).expect("stablehlo.multiply should return one result").as_ref()
-        };
-        flat_coordinate = Some(match flat_coordinate {
-            Some(accumulated) => {
-                let sum = block.append_operation(stable_hlo::add(accumulated, coordinate, location)?)?;
-                sum.result(0).expect("stablehlo.add should return one result").as_ref()
-            }
-            None => coordinate,
-        });
-        stride = stride
-            .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
-                message: format!("value dimension {dimension_size} does not fit in u64"),
-            })?)
-            .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("coordinate count overflows u64 for value type {}", operation.value_type()),
-            })?;
-    }
-    let mut flat_coordinate = match flat_coordinate {
-        Some(flat_coordinate) => flat_coordinate,
-        None => lower_u64_constant_splat(0, &index_type, index_tensor_type, block, context, location)?,
-    };
-    if operation.basis_offset() != 0 {
-        let offset = u64::try_from(operation.basis_offset()).map_err(|_| ProgramError::InvalidArgument {
-            message: format!("basis offset {} does not fit in u64", operation.basis_offset()),
-        })?;
-        let offset = lower_u64_constant_splat(offset, &index_type, index_tensor_type, block, context, location)?;
-        let sum = block.append_operation(stable_hlo::add(flat_coordinate, offset, location)?)?;
-        flat_coordinate = sum.result(0).expect("stablehlo.add should return one result").as_ref();
-    }
-
-    let selected = block.append_operation(stable_hlo::compare(
-        basis_index,
-        flat_coordinate,
-        stable_hlo::ComparisonDirection::Equal,
-        stable_hlo::ComparisonType::Unsigned,
-        location,
-    )?)?;
-    let selected = selected.result(0).expect("stablehlo.compare should return one result").as_ref();
-    let one = lower_unplaced_constant_output(output_types, 1, block, context, location)?[0];
-    let zero = lower_unplaced_constant_output(output_types, 0, block, context, location)?[0];
-    let result = block.append_operation(stable_hlo::select(selected, one, zero, location)?)?;
-    let result = result.result(0).expect("stablehlo.select should return one result").as_ref();
-    Ok(vec![annotate_output_memory(result, output_type, block, context, location)?])
-}
-
 /// Lowers an exact `u64` value as a splatted constant of `output_type`.
 fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     value: u64,
@@ -9751,19 +9629,6 @@ mod tests {
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
-    /// Builds a nullary callee that materializes one scalar value's fragment of a packed coordinate basis.
-    fn xla_coordinate_basis_callee(basis_offset: usize) -> Arc<FlatXlaProgram> {
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let output = builder
-            .add_instruction(
-                CoordinateBasisOperation::new(ArrayType::scalar(DataType::F32), basis_offset, 2),
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap()[0];
-        Arc::new(builder.build(vec![output], Vec::new(), vec![Placeholder]).unwrap())
-    }
-
     /// Stages one `jit_call` to `callee` (interned as a shared callee root region) over `inputs` in `builder`.
     fn add_xla_jit_call(
         builder: &mut CompositeXlaProgramBuilder,
@@ -9888,30 +9753,6 @@ mod tests {
                 }
             "#},
         );
-    }
-
-    #[test]
-    fn test_jit_call_dedup_distinguishes_coordinate_basis_attributes() {
-        let first_callee = xla_coordinate_basis_callee(0);
-        let second_callee = xla_coordinate_basis_callee(1);
-        assert!(jit_call_program_key(&first_callee) != jit_call_program_key(&second_callee));
-
-        let mut builder = CompositeXlaProgramBuilder::new();
-        let first = add_xla_jit_call(&mut builder, &first_callee, Vec::new());
-        let second = add_xla_jit_call(&mut builder, &second_callee, Vec::new());
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second]).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], Vec::new(), vec![Placeholder])
-            .unwrap();
-        let input_types = Vec::<ArrayType>::new();
-        let output_types = vec![test_vector_type(2)];
-        let module =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
-
-        // Each semantic basis operation occurs only once, so both callees inline rather than incorrectly sharing a
-        // private function under a cache key that omits the coordinate offset.
-        assert!(!module.contains("func.func private"), "{module}");
-        assert!(!module.contains("call @jit_call"), "{module}");
     }
 
     #[test]
@@ -10430,29 +10271,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_coordinate_basis() {
-        let mut builder = XlaProgramBuilder::new();
-        let output = builder
-            .add_instruction(
-                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(test_matrix_type(2, 3), 1, 8)),
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert_eq!(stablehlo.matches("stablehlo.iota").count(), 3);
-        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 1);
-        assert_eq!(stablehlo.matches("stablehlo.add").count(), 2);
-        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 1);
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 1);
-        assert!(stablehlo.contains("tensor<8x2x3xf32>"), "{stablehlo}");
-    }
-
-    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_complex_sine_and_cosine() {
         let complex_type = ArrayType::scalar(DataType::C64);
         let mut builder = XlaProgramBuilder::new();
@@ -10853,34 +10671,6 @@ mod tests {
         );
         assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).is_ok());
         assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Min, vec![0], vec![0]).is_ok());
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_zero_sized_coordinate_basis() {
-        let value_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![Dimension::Static(2), Dimension::Static(0), Dimension::Static(3)]),
-        );
-        let mut builder = XlaProgramBuilder::new();
-        let output = builder
-            .add_instruction(
-                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(value_type, 0, 0)),
-                Vec::new(),
-                Vec::new(),
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert_eq!(stablehlo.matches("stablehlo.iota").count(), 0);
-        assert_eq!(stablehlo.matches("stablehlo.multiply").count(), 0);
-        assert_eq!(stablehlo.matches("stablehlo.add").count(), 0);
-        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 0);
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 0);
-        assert_eq!(stablehlo.matches("stablehlo.broadcast_in_dim").count(), 1);
-        assert!(stablehlo.contains("tensor<0x2x0x3xf32>"), "{stablehlo}");
     }
 
     #[test]

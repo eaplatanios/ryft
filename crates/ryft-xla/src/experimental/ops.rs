@@ -16,11 +16,11 @@ use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
     ArrayIrType, ArrayOperation, ArrayReferenceDischargeOperation, ArrayReferenceOperation,
-    ArrayReferenceViewTransform, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation,
-    BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BroadcastOperation,
-    CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation, CompareOperation,
-    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
-    ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, CustomJvpOperation, CustomVjpOperation,
+    ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis,
+    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation,
+    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CustomJvpOperation, CustomVjpOperation,
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
     DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
@@ -33,14 +33,15 @@ use ryft_core::{
     OrOperation, OutputRegionProvenance, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
-    ReferenceAddUpdateOperation, ReferenceDischargeRule, ReferenceIndexOperation, ReferenceReadOperation,
-    ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
-    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type,
-    TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation,
-    Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeRule, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation,
+    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation,
+    ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver,
+    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
+    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -235,7 +236,7 @@ impl Concretizable<bool> for XlaConstant {
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(crate = "ryft_core", type = ArrayIrType, constant = Constant)]
 #[ryft(members(ArrayType, structural(DimensionType)))]
-#[ryft(dispatch(differentiation, transposition))]
+#[ryft(dispatch(discharge, differentiation, transposition))]
 pub enum XlaOperation<Constant = XlaConstant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -373,6 +374,23 @@ where
     }
 }
 
+impl<Constant> ArrayReferenceViewOperation for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+        Self::Array(ArrayOperation::Reshape(operation))
+    }
+
+    fn from_reference_slice(operation: SliceOperation) -> Self {
+        Self::Array(ArrayOperation::Slice(operation))
+    }
+
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::UpdateSlice(operation))
+    }
+}
+
 impl<Constant> ArrayReferenceDischargeOperation for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -394,28 +412,6 @@ where
             Self::JitCall(_) => ReferenceDischargeRule::Call,
             _ => ReferenceDischargeRule::Ordinary,
         }
-    }
-
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-        Self::Array(ArrayOperation::Reshape(operation))
-    }
-
-    fn from_reference_slice(operation: SliceOperation) -> Self {
-        Self::Array(ArrayOperation::Slice(operation))
-    }
-
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
-        let Self::Scan(operation) = self else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` is not a scan and cannot carry discharged reference state",
-                self.name(),
-            )));
-        };
-        Ok(Self::Scan(operation.with_added_carries(additional_carry_count)?))
     }
 }
 
@@ -589,7 +585,6 @@ impl_array_operation_conversion!(
     ZeroLikeOperation<ArrayType>,
     OneLikeOperation<ArrayType>,
     ConstantOperation<ReferenceArray>,
-    CoordinateBasisOperation<ArrayType>,
     AbsOperation<ArrayType>,
     NegOperation<ArrayType>,
     SubOperation<ArrayType>,
@@ -891,6 +886,27 @@ impl<T: Type> Operation for JitCallOperation<T> {
         } else {
             operation.bracketed(|operation| operation.field("capture_count", self.capture_count))
         }
+    }
+}
+
+// A jitted call forwards its operands onto its callee's inputs one for one and reports the callee's outputs as its
+// own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands. The
+// callee's lifted capture prefix is unaffected: threaded state is appended after every declared operand, so the prefix
+// keeps its positions.
+impl<T, C, P> ReferenceDischargeableOperation<C, P> for JitCallOperation<T>
+where
+    T: Type,
+    JitCallOperation<T>: Operation<Type = C::Type>,
+    C: Context<Operation: From<JitCallOperation<T>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_positional_region_operation(self, context, driver, inputs, 0)
     }
 }
 
@@ -1342,6 +1358,7 @@ where
 mod tests {
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
@@ -1353,10 +1370,10 @@ mod tests {
         MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation, Operation, OutputRegionProvenance,
         PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError,
         ReferenceDischarge, ReferenceDischargeRule, ReferenceIndexOperation, ReferenceReadOperation, ReferenceRoot,
-        ReferenceSliceOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDriver, RegionInterface,
-        RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension,
-        StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value,
-        ValueProjection, WhileOperation, ZeroOperation,
+        ReferenceSliceOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
+        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
+        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1632,6 +1649,58 @@ mod tests {
             ArrayIrOperation::<XlaArrayConstant>::FreezeReference(FreezeReferenceOperation::new()).into();
         assert!(matches!(&freeze, XlaOperation::FreezeReference(_)));
         assert!(matches!(freeze.to_core_operation(), Some(ArrayIrOperation::FreezeReference(_)),));
+    }
+
+    #[test]
+    fn test_xla_reference_discharge_rewrites_the_flat_reference_language() {
+        // The backend operation family participates in reference discharge through its generated `discharge`
+        // dispatcher, so a flat backend program rewrites into explicit immutable state with its external root
+        // entering at its own boundary position and publishing one hidden final-state output.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = XlaProgramBuilder::new();
+        let external = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
+        let initial = builder.add_input(ArrayIrType::Array(scalar_type.clone()));
+        let update = builder.add_input(ArrayIrType::Array(scalar_type));
+        let root = builder
+            .add_instruction(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), vec![initial])
+            .unwrap()[0];
+        builder
+            .add_instruction(
+                XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                Vec::new(),
+                vec![root, update],
+            )
+            .unwrap();
+        let local = builder
+            .add_instruction(XlaOperation::FreezeReference(FreezeReferenceOperation::new()), Vec::new(), vec![root])
+            .unwrap()[0];
+        let previous = builder
+            .add_instruction(
+                XlaOperation::ReferenceSwap(ReferenceSwapOperation::new()),
+                Vec::new(),
+                vec![external, local],
+            )
+            .unwrap()[0];
+        let source: XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>> =
+            builder.build(vec![previous], vec![Placeholder; 3], vec![Placeholder]).unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+
+        // The one external root is written, so it enters as state at its own boundary position and publishes its
+        // final state as the single hidden output after the public prefix, while the local root's allocation,
+        // accumulation, and consumption become ordinary array SSA.
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(
+            discharged.external_states(),
+            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(1))],
+        );
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[] .
+                let %3:f32[] = add %1 %2
+                in (%0, %3)"},
+        );
     }
 
     #[test]
@@ -2557,6 +2626,49 @@ mod tests {
             XlaOperation::<XlaConstant>::Array(ArrayOperation::Add(AddOperation::new())).reference_discharge_rule(),
             ReferenceDischargeRule::Ordinary,
         );
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_widens_its_callee_with_the_final_state() {
+        // `jit_call` forwards its operands onto its callee one for one and reports the callee's outputs as its own, so
+        // the shared positional rewrite threads state through it: the callee gains the entering state after its
+        // declared inputs and publishes the final state after its declared outputs, while the call site keeps its own
+        // operand and output contract. The callee mutates the root and returns only the previous snapshot, so the
+        // final state is exactly what the call site would otherwise have lost.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee_reference = callee_builder.add_input(reference_type.into());
+        let callee_update = callee_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let previous = callee_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![callee_reference, callee_update])
+            .unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_program(callee);
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let previous = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update])
+            .unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root]).unwrap()[0];
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![previous, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // The callee's local root is allocated, mutated, and consumed inside the call, so widening the boundary
+        // leaves no external state behind and the rewritten call is the entry region's only instruction.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.program().output_types().len(), 2);
+        assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
     }
 
     #[test]

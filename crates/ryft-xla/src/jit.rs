@@ -3093,19 +3093,22 @@ mod tests {
         assert_eq!(domain.cache_size(), 2, "an equivalent dense transform should reuse its enclosing compilation");
 
         assert!(forward.source_program().program().regions().iter().any(|region| {
-            region.instructions().iter().any(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::CoordinateBasis(_)))
-            })
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
         }));
         assert!(reverse.source_program().program().regions().iter().any(|region| {
-            region.instructions().iter().any(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::CoordinateBasis(_)))
-            })
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
         }));
         assert!(second.source_program().program().regions().iter().any(|region| {
-            region.instructions().iter().any(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::CoordinateBasis(_)))
-            })
+            region
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), XlaOperation::Array(ArrayOperation::Iota(_))))
         }));
 
         for (compiled, expected) in [(forward, 6.0), (reverse, 6.0)] {
