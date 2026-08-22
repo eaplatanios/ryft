@@ -9,6 +9,7 @@
 //! [`iteration_bound`](WhileOperation::with_iteration_bound) support reverse-mode differentiation through a staged
 //! masked tangent scan.
 
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -52,8 +53,10 @@ use crate::partial::{
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
-    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, RegionInterface, RegionRef,
-    RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeInput, RegionInterface, RegionRef, RegionSlot, Type,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -921,6 +924,136 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(outputs))
+}
+
+// A `while`'s boundaries are all one state signature: its operands, its outputs, its condition's inputs, and its
+// body's inputs and outputs carry the same carries at the same positions. Threading discharged state therefore appends
+// the same carries to every one of them, and the loop deliberately applies no read-only pruning: a root the loop
+// merely reads still occupies a carry position, because dropping it would leave the body's boundary disagreeing with
+// the condition's. The one asymmetry is forced by the operation's own contract — the condition returns only a
+// predicate, so it receives the entering state and publishes none, which is also why a mutating condition is rejected
+// rather than widened.
+impl<T, C, P> ReferenceDischargeableOperation<C, P> for WhileOperation<T>
+where
+    T: Type,
+    WhileOperation<T>: Operation<Type = C::Type>,
+    C: Context<Operation: From<WhileOperation<T>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        let name = self.name();
+        self.validate_region_count(driver.region_count())?;
+        let carries = inputs.iter().map(|input| context.operand_root(input, name)).collect::<Result<Vec<_>, _>>()?;
+
+        // Both regions observe the same entering state, so one summary of the two sizes one boundary.
+        let condition = driver.region(0)?;
+        let body = driver.region(1)?;
+        check_count!("input", condition.input_ids(), inputs.len(), ProgramError);
+        check_count!("input", body.input_ids(), inputs.len(), ProgramError);
+        check_count!("output", body.output_ids(), inputs.len(), ProgramError);
+        let condition_summary = context.region_summary(self, 0, condition, carries.as_slice())?;
+
+        // The condition returns only a predicate, so it has nowhere to publish a successor state and a loop that
+        // exits on its first test would lose the write entirely. This restates the operation's own
+        // `allows_reference_access_through_region_input` contract where the offending region can still be named; the
+        // rebuilt condition is held to it again below, against what its replay actually did.
+        if let Some(root) = condition_summary.accessed().find(|root| condition_summary.is_mutated(*root)) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` observes entering state in its condition but can publish none from it, so its \
+                 condition may not mutate {root}",
+            )));
+        }
+        let summary = condition_summary.merged(&context.region_summary(self, 1, body, carries.as_slice())?);
+
+        // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
+        // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
+        // resolve. This is the same threaded set the shared positional rewrite builds.
+        let threaded =
+            summary.accessed().chain(summary.output_roots().iter().copied().flatten()).collect::<BTreeSet<_>>();
+        context.validate_threaded_roots(threaded.iter().copied(), name)?;
+        let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
+        let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
+
+        let region_inputs = inputs.iter().map(ReferenceRegionDischargeInput::from_operand).collect::<Vec<_>>();
+        let condition_fork = driver.discharge_region_program(
+            context,
+            0,
+            &ReferenceRegionDischargeBoundary::new(
+                self,
+                0,
+                region_inputs.clone(),
+                entering.clone(),
+                inputs.len(),
+                Vec::new(),
+                condition.output_ids().len(),
+            ),
+        )?;
+        condition_fork.validate_predicted_mutations(&[], name)?;
+        let body_fork = driver.discharge_region_program(
+            context,
+            1,
+            &ReferenceRegionDischargeBoundary::new(
+                self,
+                1,
+                region_inputs,
+                entering.clone(),
+                inputs.len(),
+                entering.clone(),
+                inputs.len(),
+            ),
+        )?;
+        body_fork.validate_predicted_mutations(published.as_slice(), name)?;
+
+        // Every carry must leave the body as the reference it entered with, or the loop's state has no fixed point and
+        // its zero-iteration result would not be its entering state.
+        for (position, (returned, carry)) in body_fork.output_roots().iter().zip(&carries).enumerate() {
+            if returned != carry {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{name}` does not return carry {position} as the reference it entered with, so its \
+                     loop state has no fixed point",
+                )));
+            }
+        }
+
+        let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+        for input in inputs {
+            operands.push(context.operand_state(input)?);
+        }
+        for root in &entering {
+            operands.push(context.discharged_state(*root)?);
+        }
+        let outputs = context.parent().bind(
+            *self,
+            vec![condition_fork.into_program(), body_fork.into_program()],
+            operands.as_slice(),
+        )?;
+        check_count!("output", outputs, inputs.len() + entering.len(), ProgramError);
+
+        // A symmetric boundary returns a successor state for every carried root, including ones the loop only read,
+        // so the merge records a mutation exactly where the summary saw one. Marking a read-only carry as written
+        // would publish a hidden final-state output for a root the program never writes.
+        let mut results = Vec::with_capacity(inputs.len());
+        for (position, output) in outputs.into_iter().enumerate() {
+            match carries.get(position).copied().flatten() {
+                Some(root) => {
+                    context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                    results.push(inputs[position].clone());
+                }
+                None if position < inputs.len() => results.push(ReferenceDischargeValue::Pure(output)),
+                None => {
+                    let root = entering[position - inputs.len()];
+                    context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 /// Batching rule for [`WhileOperation`]. The rule builds batched loop *structure* and binds it into the parent
@@ -2492,8 +2625,8 @@ mod tests {
     use ryft_macros::Parameter;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, Dimension, DimensionBounds,
+        DimensionType, DimensionVariable, Shape,
     };
     use crate::batching::batch;
     use crate::contexts::{EagerContext, StagingContext};
@@ -2510,7 +2643,7 @@ mod tests {
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
-    use crate::programs::{Effects, ReferenceType};
+    use crate::programs::{Effects, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType};
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
@@ -4613,6 +4746,145 @@ mod tests {
                 == "while does not support transposition (reverse-mode differentiation through staged unbounded \
                     while loops is not supported; eager differentiation executes concrete duals, and loops built \
                     with `with_iteration_bound` stage a transposable masked scan)",
+        ));
+    }
+
+    #[test]
+    fn test_while_reference_discharge() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        // A loop applies no read-only pruning. The condition merely reads the root and the body never touches it, yet
+        // the root keeps a carry position in every boundary, because a carry must exist in the condition's and the
+        // body's boundaries or in neither. The asymmetry the operation's own contract forces is visible beside it: the
+        // condition region receives the entering state and publishes none, returning exactly one Boolean.
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let counter = condition_builder.add_input(scalar_type.clone().into());
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        let threshold = condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap()[0];
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
+                Vec::new(),
+                vec![counter, threshold],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let counter = body_builder.add_input(scalar_type.clone().into());
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let step = body_builder.add_constant(TestValue::Array(Array::scalar(-1.0f32)));
+        let next_counter = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![next_counter, reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let reference = builder.add_input(reference_type.clone().into());
+        let counter = builder.add_input(scalar_type.clone().into());
+        let final_counter = builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![counter, reference])
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![final_counter], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = while %1 %0 [
+                    condition={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:bool[] = compare [direction=GreaterThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f32[], %1:f32[] .
+                        let %2:f32[] = const -1.0
+                            %3:f32[] = add %0 %2
+                        in (%3, %1)
+                    },
+                ]
+                in (%2)"},
+        );
+
+        // The carry survives inside the loop, but the *entry* boundary is a different question: nothing writes the
+        // root, so it publishes no hidden final-state output and its caller's holder is left alone. Symmetry is a
+        // property of the loop's own boundaries, not a claim that the loop wrote what it carried.
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.program().output_types().len(), 1);
+        assert_eq!(discharged.external_states().len(), 1);
+        assert!(!discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(
+            discharged
+                .program()
+                .interpret(vec![TestValue::Array(Array::scalar(2.0f32)), TestValue::Array(Array::scalar(5.0f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0f32))]),
+        );
+
+        // A condition that mutates a root is rejected rather than widened, because the condition's boundary returns
+        // only a predicate and so can publish no successor state: a loop that exits on its first test would lose the
+        // write entirely. The summary reports it while the offending region can still be named, and the rebuilt
+        // condition is held to the same fact again afterwards against what its replay actually did.
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        let update = condition_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
+        condition_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .unwrap();
+        let current = condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap()[0];
+        let limit = condition_builder.add_constant(TestValue::Array(Array::scalar(3.0f32)));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![current, limit],
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let reference = builder.add_input(reference_type.into());
+        let reference = builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference])
+            .unwrap()[0];
+        let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
+            Err(ProgramError::MalformedProgram(message))
+                if message.starts_with(
+                    "operation `while` observes entering state in its condition but can publish none from it, so its \
+                     condition may not mutate reference root ",
+                ),
         ));
     }
 }

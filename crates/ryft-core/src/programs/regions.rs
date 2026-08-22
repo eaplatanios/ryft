@@ -1990,7 +1990,112 @@ mod tests {
     }
 
     #[test]
-    fn test_region_contains_effect_in_closure_descends_rule_regions_across_shared_and_deep_closures() {
+    fn test_region_ref() {
+        let program = program_with_reused_region();
+        let region = program.entry_region_ref();
+        assert_eq!(region.id(), program.entry());
+        assert_eq!(region.arena().len(), program.regions().len());
+        assert_eq!(region.atoms().len(), program.atoms().len());
+        assert_eq!(region.input_ids(), program.input_ids());
+        assert_eq!(region.input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(region.output_ids(), program.output_ids());
+        assert_eq!(region.output_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(region.instructions().len(), 2);
+        let interface = region.interface();
+        assert_eq!(interface.input_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(interface.effects(), Effects::PURE);
+    }
+
+    #[test]
+    fn test_region_ref_instructions_in_closure() {
+        let shared = RegionId::new(0);
+        let first = RegionId::new(1);
+        let second = RegionId::new(2);
+        let root = RegionId::new(3);
+        let shared_slot = const { &[RegionSlot::computation("shared")] };
+        let regions = vec![
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    Instruction::new(
+                        TestRegionOperation::Effectful(Effect::OrderedIo),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    Instruction::new(
+                        TestRegionOperation::Effectful(Effect::OrderedState),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(shared_slot),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![shared],
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(shared_slot),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![shared],
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(
+                        const { &[RegionSlot::computation("first"), RegionSlot::rule("second")] },
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![first, second],
+                )],
+            ),
+        ];
+        let arena = RegionArena::from_regions(regions).unwrap();
+        let mut instructions = RegionRef::new(&arena, root)
+            .unwrap()
+            .instructions_in_closure()
+            .map(|(id, instruction)| (id, instruction.operation().clone()))
+            .collect::<Vec<_>>();
+        instructions.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            instructions,
+            vec![
+                (InstructionId::new(shared, 0), TestRegionOperation::Effectful(Effect::OrderedIo)),
+                (InstructionId::new(shared, 1), TestRegionOperation::Effectful(Effect::OrderedState)),
+                (InstructionId::new(first, 0), TestRegionOperation::WithRegions(shared_slot)),
+                (InstructionId::new(second, 0), TestRegionOperation::WithRegions(shared_slot)),
+                (
+                    InstructionId::new(root, 0),
+                    TestRegionOperation::WithRegions(
+                        const { &[RegionSlot::computation("first"), RegionSlot::rule("second")] },
+                    ),
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_region_ref_contains_effect_in_closure_descends_rule_regions_across_shared_and_deep_closures() {
         // The leaf carries an effectful instruction, and every level above attaches the previous level _twice_ through
         // two dormant rule slots. Sealed effects therefore stay pure at every level (rule regions are excluded from
         // the fold), shared attachments form a diamond at each step, and a per-path recursion would take `2^DEPTH`
@@ -2033,24 +2138,6 @@ mod tests {
         assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
         assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
         assert_eq!(top.effect_occurrences_in_closure(Effect::OrderedState).count(), 0);
-    }
-
-    #[test]
-    fn test_region_ref() {
-        let program = program_with_reused_region();
-        let region = program.entry_region_ref();
-        assert_eq!(region.id(), program.entry());
-        assert_eq!(region.arena().len(), program.regions().len());
-        assert_eq!(region.atoms().len(), program.atoms().len());
-        assert_eq!(region.input_ids(), program.input_ids());
-        assert_eq!(region.input_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert_eq!(region.output_ids(), program.output_ids());
-        assert_eq!(region.output_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert_eq!(region.instructions().len(), 2);
-        let interface = region.interface();
-        assert_eq!(interface.input_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(interface.effects(), Effects::PURE);
     }
 
     #[test]

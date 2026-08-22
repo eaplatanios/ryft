@@ -37,7 +37,9 @@ use crate::partial::{
 };
 use crate::programs::{
     CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationProjection, OutputRegionProvenance, Program,
-    ProgramBuilder, ProgramError, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionSlot, Type, TypeError, Typed,
+    Value, ValueProjection, discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -832,6 +834,27 @@ fn reconcile_branch<C: Context>(
     )
 }
 
+// A condition's branches mirror its operand list after the leading predicate, and its results are each branch's own
+// outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
+// therefore receive one shared state boundary: every root either branch touches enters, and only the roots one of them
+// mutates are published back, so a condition whose branches merely read keeps its source boundary unchanged.
+impl<F, C, P> ReferenceDischargeableOperation<C, P> for ConditionOperation<F>
+where
+    F: Value,
+    ConditionOperation<F>: Operation<Type = C::Type>,
+    C: Context<Operation: From<ConditionOperation<F>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_positional_region_operation(self, context, driver, inputs, 1)
+    }
+}
+
 /// Batching rule for [`ConditionOperation`]. The rule builds batched condition *structure* and binds it into the
 /// parent context — interpreted eagerly under an eager parent and staged into the enclosing trace under a staging
 /// parent:
@@ -1385,8 +1408,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType,
+        Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
+        Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -1401,7 +1425,10 @@ mod tests {
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Effects, ProgramBuilder};
+    use crate::programs::{
+        Effects, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceType,
+    };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::{DomainTracingContext, Trace};
 
@@ -2485,6 +2512,196 @@ mod tests {
              {small_mean:.3}, {large_operations}-op branches {large_mean:.3}, per branch operation {:.4}",
             OUTER_SPECIALIZATIONS,
             (large_mean - small_mean) / (large_operations - small_operations) as f64,
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let boolean_type = ArrayType::scalar(DataType::Boolean);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        // Read-only pruning. Both branches merely read the root, so the shared state boundary enters both branches but
+        // publishes nothing back: the rebuilt branches gain no appended output, the discharged condition keeps the
+        // source output boundary exactly, and the entry root receives no hidden final-state output.
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let snapshot =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let doubled = true_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot])
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = false_builder.add_input(reference_type.clone().into());
+        let snapshot =
+            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_program(true_branch);
+        let false_branch = builder.import_program(false_branch);
+        let predicate = builder.add_input(boolean_type.clone().into());
+        let reference = builder.add_input(reference_type.clone().into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[] .
+                        let %1:f32[] = add %0 %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.program().output_types().len(), 1);
+        assert_eq!(discharged.external_states().len(), 1);
+        assert!(!discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+
+        // A root one branch mutates is published instead. Exactly one output is appended, and both branches receive
+        // the identical widened boundary even though only the true branch writes: the reading branch republishes the
+        // state it received, which is what keeps the two branch interfaces agreeing after the rewrite.
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let replacement = true_builder.add_constant(TestValue::Array(Array::scalar(7.0f32)));
+        let snapshot = true_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = false_builder.add_input(reference_type.clone().into());
+        let snapshot =
+            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_program(true_branch);
+        let false_branch = builder.import_program(false_branch);
+        let predicate = builder.add_input(boolean_type.clone().into());
+        let reference = builder.add_input(reference_type.clone().into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[], %3:f32[] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 7.0
+                        in (%0, %1)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        in (%0, %0)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
+
+        // Pruning is decided per root rather than for the operation as a whole. Two roots enter as operands and both
+        // branches reach both of them, but only the second is ever written, so only the second gains an appended
+        // output while the first keeps crossing the boundary as a read-only state.
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = true_builder.add_input(reference_type.clone().into());
+        let second = true_builder.add_input(reference_type.clone().into());
+        let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
+        let snapshot = true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first]).unwrap()[0];
+        true_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![second, update])
+            .unwrap();
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = false_builder.add_input(reference_type.clone().into());
+        let second = false_builder.add_input(reference_type.clone().into());
+        false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first]).unwrap();
+        let snapshot =
+            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second]).unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_program(true_branch);
+        let false_branch = builder.import_program(false_branch);
+        let predicate = builder.add_input(boolean_type.into());
+        let first = builder.add_input(reference_type.clone().into());
+        let second = builder.add_input(reference_type.into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, first, second],
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.external_states().len(), 2);
+        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(1));
+
+        // The true branch reports the first root's state and accumulates into the second; the false branch reports the
+        // second root's state and writes nothing, so its appended final state is the value that entered.
+        let inputs = vec![
+            TestValue::Array(Array::scalar(true)),
+            TestValue::Array(Array::scalar(10.0f32)),
+            TestValue::Array(Array::scalar(20.0f32)),
+        ];
+        assert_eq!(
+            discharged.program().interpret(inputs),
+            Ok(vec![TestValue::Array(Array::scalar(10.0f32)), TestValue::Array(Array::scalar(21.0f32))]),
+        );
+        let inputs = vec![
+            TestValue::Array(Array::scalar(false)),
+            TestValue::Array(Array::scalar(10.0f32)),
+            TestValue::Array(Array::scalar(20.0f32)),
+        ];
+        assert_eq!(
+            discharged.program().interpret(inputs),
+            Ok(vec![TestValue::Array(Array::scalar(20.0f32)), TestValue::Array(Array::scalar(20.0f32))]),
         );
     }
 }

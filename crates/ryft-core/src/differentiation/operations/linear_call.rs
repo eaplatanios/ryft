@@ -12,7 +12,7 @@ use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
+use crate::macros::{check_count, check_types, impl_reference_free_dischargeable_operation};
 use crate::operations::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -585,6 +585,11 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
     PartiallyEvaluatableOperation<C> for LinearCallOperation<C::Type>
 {
 }
+
+// A linear call's regions carry no reference state, and its transpose region is a dormant derivative rule for which
+// mutation has no defined meaning, so it replays verbatim: the shared reference-free rule copies its regions across
+// unchanged and rejects the application by name if a reference ever reaches its closure.
+impl_reference_free_dischargeable_operation!(<T> LinearCallOperation<T> where T: DifferentiableType);
 
 impl<
     T: DifferentiableType,

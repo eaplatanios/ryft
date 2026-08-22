@@ -1160,6 +1160,25 @@ mod tests {
     }
 
     #[test]
+    fn test_jacobian_reverse_nested_in_batch() {
+        let jacobian = batch(
+            |input| {
+                let context = input.context().clone();
+                context
+                    .differentiate_at(input)
+                    .jacobian_reverse(|value| Ok(value.clone() * value))
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
+            },
+            Array::vector(vec![1.0, 2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(jacobian.iter_blocks().next().unwrap().value().to_f64s(), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
     fn test_jacobian_forward_nested_in_jacobian_reverse() {
         // For f(x) = x², the forward Jacobian is f′(x) = 2x. Differentiating that materialized Jacobian with a
         // reverse Jacobian computes the second derivative f″(x) = 2.
@@ -1169,6 +1188,24 @@ mod tests {
                 let jacobian = context
                     .differentiate_at(input)
                     .jacobian_forward(|value| Ok(value.clone() * value))
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                Ok(jacobian.into_values().remove(0))
+            })
+            .unwrap();
+        assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_jacobian_reverse_nested_in_jacobian_forward() {
+        // This is the opposite nesting order from the one in `test_jacobian_forward_nested_in_jacobian_reverse`. The
+        // reverse Jacobian materializes 2x, and the enclosing forward Jacobian differentiates that primitive-only basis
+        // replay to obtain 2.
+        let derivative = differentiate_at(Array::scalar(3.0))
+            .jacobian_forward(|input| {
+                let context = input.context().clone();
+                let jacobian = context
+                    .differentiate_at(input)
+                    .jacobian_reverse(|value| Ok(value.clone() * value))
                     .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
                 Ok(jacobian.into_values().remove(0))
             })

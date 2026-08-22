@@ -6,6 +6,7 @@
 //! `reverse` and the lowering-only `unroll` factor) and lowers to a
 //! [StableHLO `while`](https://openxla.org/stablehlo/spec#while) loop with counter-indexed slice reads and writes.
 
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
@@ -41,8 +42,10 @@ use crate::partial::{
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
-    Program, ProgramBuilder, ProgramError, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
-    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeInput, RegionInterface, RegionRef, RegionSlot, Type,
+    TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1691,6 +1694,137 @@ where
         .collect()
 }
 
+// A scan carries state in its leading carry prefix, so discharged state joins that prefix rather than following the
+// declared operands: the synthesized carries are inserted immediately after the source carries, in the parent operand
+// list, in the body's input boundary, and in both output boundaries, and the payload's carry count grows to match.
+// Everything after the prefix is a stacked operand or a per-iteration slice of one and is therefore never a reference.
+// Like `while`, a scan applies no read-only pruning, because a carry position exists in both boundaries or in neither.
+impl<Capture, C, P> ReferenceDischargeableOperation<C, P> for ScanOperation<Capture>
+where
+    Capture: Value,
+    ScanOperation<Capture>: Operation<Type = C::Type>,
+    C: Context<Operation: From<ScanOperation<Capture>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        let name = self.name();
+        self.validate_region_count(driver.region_count())?;
+        let carry_count = self.carry_count();
+        if inputs.len() < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but the application has {} operands",
+                inputs.len(),
+            )));
+        }
+        let (carry_operands, stacked_operands) = inputs.split_at(carry_count);
+        let carries = carry_operands
+            .iter()
+            .map(|input| context.operand_root(input, name))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Only the carries forward positionally into the body. Every remaining body input is a per-iteration slice of
+        // a stacked operand, so it enters as an ordinary value of the type the body already declares for it.
+        let body = driver.region(0)?;
+        let body_input_types = body.input_types();
+        if body_input_types.len() < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but its body declares {} inputs",
+                body_input_types.len(),
+            )));
+        }
+        let mut body_roots = carries.clone();
+        body_roots.resize(body_input_types.len(), None);
+        let summary = context.region_summary(self, 0, body, body_roots.as_slice())?;
+
+        // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
+        // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
+        // resolve. This is the same threaded set the shared positional rewrite builds.
+        let threaded =
+            summary.accessed().chain(summary.output_roots().iter().copied().flatten()).collect::<BTreeSet<_>>();
+        context.validate_threaded_roots(threaded.iter().copied(), name)?;
+        let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
+        let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
+
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            self,
+            0,
+            carry_operands
+                .iter()
+                .map(ReferenceRegionDischargeInput::from_operand)
+                .chain(body_input_types[carry_count..].iter().cloned().map(ReferenceRegionDischargeInput::Value))
+                .collect(),
+            entering.clone(),
+            carry_count,
+            entering.clone(),
+            carry_count,
+        );
+        let fork = driver.discharge_region_program(context, 0, &boundary)?;
+        fork.validate_predicted_mutations(published.as_slice(), name)?;
+        fork.validate_predicted_output_roots(summary.output_roots(), name)?;
+
+        // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
+        // entering state.
+        let source_output_count = fork.output_roots().len();
+        if source_output_count < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but its body declares {source_output_count} outputs",
+            )));
+        }
+        for (position, (returned, carry)) in fork.output_roots()[..carry_count].iter().zip(&carries).enumerate() {
+            if returned != carry {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{name}` does not return carry {position} as the reference it entered with, so its \
+                     scan state has no fixed point",
+                )));
+            }
+        }
+
+        let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+        for input in carry_operands {
+            operands.push(context.operand_state(input)?);
+        }
+        for root in &entering {
+            operands.push(context.discharged_state(*root)?);
+        }
+        for (position, input) in stacked_operands.iter().enumerate() {
+            operands.push(
+                input.expect_pure(&format!("an ordinary operand {} of `{name}`", carry_count + position))?.clone(),
+            );
+        }
+        let outputs = context.parent().bind(
+            self.with_added_carries(entering.len())?,
+            vec![fork.into_program()],
+            operands.as_slice(),
+        )?;
+        check_count!("output", outputs, source_output_count + entering.len(), ProgramError);
+
+        let mut results = Vec::with_capacity(source_output_count);
+        for (position, output) in outputs.into_iter().enumerate() {
+            if position < carry_count {
+                match carries[position] {
+                    Some(root) => {
+                        context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                        results.push(carry_operands[position].clone());
+                    }
+                    None => results.push(ReferenceDischargeValue::Pure(output)),
+                }
+            } else if position < carry_count + entering.len() {
+                let root = entering[position - carry_count];
+                context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+            } else {
+                results.push(ReferenceDischargeValue::Pure(output));
+            }
+        }
+        Ok(results)
+    }
+}
+
 /// Batching rule for [`ScanOperation`]. Under a *staging* parent, a capture-free scan is batched *structurally*,
 /// staging one batched scan into the enclosing trace (the shape of JAX's `_scan_batching_rule`), so the batched
 /// program's size stays independent of the trip count:
@@ -2953,8 +3087,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
-        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, DimensionBounds,
+        DimensionType, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -2969,7 +3103,10 @@ mod tests {
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Effects, Program, ProgramBuilder};
+    use crate::programs::{
+        Effects, FreezeReferenceOperation, NewReferenceOperation, Program, ProgramBuilder, ReferenceAddUpdateOperation,
+        ReferenceReadOperation, ReferenceType,
+    };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::{DomainTracingContext, Trace};
 
@@ -5045,5 +5182,109 @@ mod tests {
             OUTER_SPECIALIZATIONS,
             (large_mean - small_mean) / (large_operations - small_operations) as f64,
         );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let stacked_type = ArrayType::new_static(DataType::F32, [3]);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+
+        // A scan carries reference state in its leading carry prefix rather than after its declared operands. The body
+        // declares one ordinary carry, one reference carry, and one per-iteration slice of a stacked operand, and the
+        // rewrite keeps that split intact: the state joins the carry prefix on the parent operand list, on the body's
+        // input boundary, and on the body's output boundary, while the stacked operand and the stacked output stay
+        // behind the prefix on their own side.
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let carry = body_builder.add_input(scalar_type.clone().into());
+        let reference = body_builder.add_input(reference_type.into());
+        let element = body_builder.add_input(scalar_type.clone().into());
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element])
+            .unwrap();
+        let current =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let next_carry = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element])
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![next_carry, reference, current],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        // The rewritten payload keeps every attribute that is not about state: a reversed, fully unrolled scan of the
+        // same length stays exactly that, and only its carry count would move if a root reached the body without
+        // being one of its declared carries.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let body = builder.import_program(body);
+        let initial_carry = builder.add_input(scalar_type.clone().into());
+        let initial_state = builder.add_input(scalar_type.into());
+        let elements = builder.add_input(stacked_type.into());
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial_state]).unwrap()[0];
+        let operation = ScanOperation::<TestValue>::new(2, 3).with_reverse(true).with_unroll(3).unwrap();
+        let outputs = builder.add_instruction(operation, vec![body], vec![initial_carry, reference, elements]).unwrap();
+        let final_carry = outputs[0];
+        let final_reference = outputs[1];
+        let stacked = outputs[2];
+        let frozen =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![final_reference]).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![final_carry, stacked, frozen],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let inputs = vec![
+            TestValue::Array(Array::scalar(0.0f32)),
+            TestValue::Array(Array::scalar(10.0f32)),
+            TestValue::Array(Array::vector(vec![1.0f32, 2.0, 3.0])),
+        ];
+        let expected = source.clone().interpret(inputs.clone()).unwrap();
+        assert_eq!(
+            expected,
+            vec![
+                TestValue::Array(Array::scalar(6.0f32)),
+                TestValue::Array(Array::vector(vec![16.0f32, 15.0, 13.0])),
+                TestValue::Array(Array::scalar(16.0f32)),
+            ],
+        );
+
+        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[3] .
+                let %3:f32[], %4:f32[], %5:f32[3] = scan [carry_count=2, length=3, reverse=true, unroll=3] %0 %1 %2 [
+                    body={
+                        lambda %0:f32[], %1:f32[], %2:f32[] .
+                        let %3:f32[] = add %1 %2
+                            %4:f32[] = add %0 %2
+                        in (%4, %3, %3)
+                    },
+                ]
+                in (%3, %5, %4)"},
+        );
+        let ArrayIrOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
+            panic!("expected a discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 2);
+        assert_eq!(scan.length(), &Dimension::Static(3));
+        assert!(scan.reverse());
+        assert_eq!(scan.unroll(), 3);
+
+        // The root is local to the program, so nothing crosses the entry boundary and the rewritten program must
+        // reproduce the eager reference execution output for output.
+        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
     }
 }

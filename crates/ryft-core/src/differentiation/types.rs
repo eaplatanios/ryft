@@ -1154,7 +1154,7 @@ mod tests {
 
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["iota", "iota", "compare", "one", "zero", "select", "reshape"],
+            vec!["iota", "iota", "compare", "zero", "one", "select", "reshape"],
         );
     }
 
