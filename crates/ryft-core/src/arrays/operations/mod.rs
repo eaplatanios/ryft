@@ -684,8 +684,9 @@ impl<A: Value<Type = ArrayType>> ReferenceDischargeOperation for ArrayIrOperatio
 ///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
-///     [`DynamicReshape`], and the whole-value reference capabilities [`NewReference`], [`ReferenceRead`],
-///     [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`].
+///     [`DynamicReshape`], the whole-value reference capabilities [`NewReference`], [`ReferenceRead`],
+///     [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`], and the reference view derivations
+///     [`ReferenceIndex`] and [`ReferenceSlice`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
 ///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand

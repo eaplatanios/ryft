@@ -297,16 +297,39 @@ mod tests {
 
     #[test]
     fn test_eager_reference_operations_preserve_dynamic_referents() {
+        // Equality over a dynamically typed `Array` cannot address its elements, so every referent this test observes
+        // is unwrapped here and then compared by its declared type and its exact physical storage.
+        fn referent(value: ArrayIrValue<Array>) -> Array {
+            <ArrayIrValue<Array> as ValueProjection<ArrayType>>::into_projected(value).unwrap()
+        }
+
         let dynamic_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
-        let dynamic_value = ArrayIrValue::Array(dynamic_type.clone());
-        let replacement = ArrayIrValue::Array(dynamic_type);
-        let reference = dynamic_value.new_reference().unwrap();
+        let initial_bytes = 1.0_f32.to_le_bytes().to_vec();
+        let replacement_bytes = 2.0_f32.to_le_bytes().to_vec();
 
-        assert_eq!(reference.read(), Ok(dynamic_value.clone()));
-        assert_eq!(reference.swap(&replacement), Ok(dynamic_value));
-        assert_eq!(reference.freeze(), Ok(replacement));
+        // `Array`'s checked constructors reject dynamically shaped types, so both referents come from the test-only
+        // unchecked hatch. They declare exactly the same dynamic type, which is what makes each holder transition
+        // observable only through the payload it returns.
+        let initial = Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone());
+        let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
+        let reference = ArrayIrValue::Array(initial).new_reference().unwrap();
+
+        let read = referent(reference.read().unwrap());
+        assert_eq!(read.r#type().into_owned(), dynamic_type);
+        assert_eq!(read.storage_bytes(), initial_bytes.as_slice());
+
+        // Swapping installs the replacement and hands back exactly the previous payload, so the later freeze consumes
+        // the installed replacement rather than the original value.
+        let old = referent(reference.swap(&ArrayIrValue::Array(replacement)).unwrap());
+        assert_eq!(old.r#type().into_owned(), dynamic_type);
+        assert_eq!(old.storage_bytes(), initial_bytes.as_slice());
+        let frozen = referent(reference.freeze().unwrap());
+        assert_eq!(frozen.r#type().into_owned(), dynamic_type);
+        assert_eq!(frozen.storage_bytes(), replacement_bytes.as_slice());
+        let error = reference.read().unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 }

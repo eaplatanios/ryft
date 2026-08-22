@@ -72,23 +72,23 @@ pub enum ArrayReferenceViewTransform {
 /// Both transform kinds reduce to slicing one unit-stride hyper-rectangle out of the input, optionally followed by
 /// squeezing the indexed axis. Normalizing to this shared form lets every consumer (type derivation, eager reads,
 /// eager update reconstruction, and staged discharge) share one validation and address computation.
-pub(crate) struct ViewSelection {
+struct ViewSelection {
     /// Inclusive slice start per input axis.
-    pub(crate) starts: Vec<usize>,
+    starts: Vec<usize>,
 
     /// Exclusive slice limit per input axis.
-    pub(crate) limits: Vec<usize>,
+    limits: Vec<usize>,
 
     /// Exact static output shape after squeezing the indexed axis, for
     /// [`ArrayReferenceViewTransform::Index`] transforms only; [`None`] for rank-preserving slices, whose output
     /// shape is exactly [`Self::update_shape`].
-    pub(crate) squeezed_output_shape: Option<Shape>,
+    squeezed_output_shape: Option<Shape>,
 }
 
 impl ViewSelection {
     /// Returns the static shape of the sliced hyper-rectangle before squeezing (i.e., the update shape that writes
     /// back into the selected coordinates).
-    pub(crate) fn update_shape(&self) -> Shape {
+    fn update_shape(&self) -> Shape {
         Shape::new(
             self.starts
                 .iter()
@@ -101,7 +101,7 @@ impl ViewSelection {
 
 impl ArrayReferenceViewTransform {
     /// Validates this transform against `input` and returns its normalized selection coordinates.
-    pub(crate) fn selection(&self, input: &ArrayType) -> Result<ViewSelection, TypeError> {
+    fn selection(&self, input: &ArrayType) -> Result<ViewSelection, TypeError> {
         match self {
             Self::Index { axis, index } => {
                 let shape = input.static_shape().ok_or_else(|| {
@@ -186,12 +186,8 @@ impl ArrayReferenceViewTransform {
     }
 
     /// Applies this transform to one carried parent value.
-    pub(crate) fn apply_in<C: ViewReadCarrier>(
-        &self,
-        carrier: &mut C,
-        input: &C::Value,
-    ) -> Result<C::Value, ProgramError> {
-        let selection = self.selection(&carrier.array_type(input)?)?;
+    fn apply_in<C: ViewReadCarrier>(&self, carrier: &mut C, input: &C::Value) -> Result<C::Value, ProgramError> {
+        let selection = self.selection(carrier.array_type(input)?.as_ref())?;
         let sliced = carrier.slice(input, selection.starts, selection.limits)?;
         match selection.squeezed_output_shape {
             Some(shape) => carrier.reshape(&sliced, shape),
@@ -200,13 +196,13 @@ impl ArrayReferenceViewTransform {
     }
 
     /// Reconstructs the carried parent after replacing exactly the coordinates selected by this transform.
-    pub(crate) fn replace_in<C: ViewWriteCarrier>(
+    fn replace_in<C: ViewWriteCarrier>(
         &self,
         carrier: &mut C,
         input: &C::Value,
         replacement: &C::Value,
     ) -> Result<C::Value, ProgramError> {
-        let selection = self.selection(&carrier.array_type(input)?)?;
+        let selection = self.selection(carrier.array_type(input)?.as_ref())?;
         match selection.squeezed_output_shape {
             Some(_) => {
                 let update = carrier.reshape(replacement, selection.update_shape())?;
@@ -318,10 +314,9 @@ impl ArrayReferenceView {
     where
         A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
     {
-        let mut carrier = EagerViewCarrier(PhantomData);
-        let intermediates = self.intermediates_in(&mut carrier, root.clone())?;
+        let intermediates = self.intermediates(root)?;
         let old = intermediates.last().unwrap().clone();
-        let reconstructed = self.reconstruct_in(&mut carrier, intermediates.as_slice(), replacement.clone())?;
+        let reconstructed = self.reconstruct(intermediates.as_slice(), replacement)?;
         Ok((reconstructed, old))
     }
 
@@ -386,8 +381,8 @@ pub(crate) trait ViewReadCarrier {
     /// Value representation carried through the traversal.
     type Value;
 
-    /// Returns the carried value's array type.
-    fn array_type(&self, value: &Self::Value) -> Result<ArrayType, ProgramError>;
+    /// Returns the carried value's array type, borrowing from the carrier or the value where possible.
+    fn array_type<'c>(&'c self, value: &'c Self::Value) -> Result<Cow<'c, ArrayType>, ProgramError>;
 
     /// Slices one unit-stride hyper-rectangle out of `input`.
     fn slice(
@@ -418,8 +413,8 @@ struct EagerViewCarrier<A>(PhantomData<A>);
 impl<A: Value<Type = ArrayType> + Reshape + Slice> ViewReadCarrier for EagerViewCarrier<A> {
     type Value = A;
 
-    fn array_type(&self, value: &A) -> Result<ArrayType, ProgramError> {
-        Ok(value.r#type().into_owned())
+    fn array_type<'c>(&'c self, value: &'c A) -> Result<Cow<'c, ArrayType>, ProgramError> {
+        Ok(value.r#type())
     }
 
     fn slice(&mut self, input: &A, starts: Vec<usize>, limits: Vec<usize>) -> Result<A, ProgramError> {
@@ -446,8 +441,7 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
     view: ArrayReferenceView,
 
     /// Exact handle type derived once from the root type and view, so that repeated [`r#type`](Typed::type) calls
-    /// stay
-    /// borrow-cheap instead of re-deriving the complete transform chain.
+    /// stay borrow-cheap instead of re-deriving the complete transform chain.
     r#type: ReferenceType<ArrayType>,
 }
 
@@ -540,8 +534,12 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         if self.view.is_root() {
             return self.root.swap(replacement).map_err(ProgramError::custom);
         }
-        self.validate_view_referent_type(&replacement)?;
-        self.root.update_with_result(|current| self.view.swap(current, &replacement))
+        // Validating inside the update keeps holder-state errors (frozen, poisoned, mid-transaction) ahead of the
+        // replacement-type diagnostic, matching the root path.
+        self.root.update_with_result(|current| {
+            self.validate_view_referent_type(&replacement)?;
+            self.view.swap(current, &replacement)
+        })
     }
 
     /// Adds `update` into this handle's selected coordinates.
@@ -637,6 +635,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::types::data::DataType;
+    use crate::programs::ReferenceCompletion;
 
     use super::*;
 
@@ -787,6 +786,12 @@ mod tests {
         // the selected root coordinates.
         assert_eq!(view.swap(Array::vector(vec![10.0_f32, 20.0, 30.0])), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0])));
         assert_eq!(root.read(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
+
+        // Holder-state errors take precedence over the replacement-type diagnostic: a frozen root swapped through a
+        // derived view with a wrongly typed replacement reports the terminal state, not a shape to fix.
+        assert_eq!(root.freeze(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
+        let error = view.swap(Array::vector(vec![1.0_f32, 2.0])).unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
 
     #[test]
@@ -806,6 +811,38 @@ mod tests {
         // the additive update writes back through both view steps and leaves every other coordinate unchanged.
         view.add_update(&Array::vector(vec![10.0_f32, 20.0])).unwrap();
         assert_eq!(root.read(), Ok(Array::from_f64s(root_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 17.0, 28.0, 9.0])),);
+    }
+
+    #[test]
+    fn test_array_reference_view_derivation_never_resolves_holder_state() {
+        let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
+        let mut guard = root.lock_root().unwrap();
+        let generation = guard.next_generation().unwrap();
+        guard.reserve_pending_unchecked(generation, ReferenceCompletion::ready(Ok(())));
+        drop(guard);
+
+        // A derived handle is pure structural metadata over a live holder, so composing one must never resolve the
+        // holder's submitted work. The holder is parked in its submitted-before-install reservation window, where
+        // every value access blocks until an installation that this test never performs, and the derivation still
+        // completes and derives its exact referent type.
+        let transform = ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
+        let derived = root.with_transform(transform).unwrap();
+        assert_eq!(derived.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+
+        // Failing the reservation is terminal for the alias family, so the next read reports that failure instead of
+        // the stale value, and further view derivation is rejected with the same reason.
+        let mut guard = root.lock_root().unwrap();
+        assert!(guard.poison_pending(generation, "submission failed"));
+        drop(guard);
+        let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
+        assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
+        assert_eq!(
+            derived
+                .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 })
+                .unwrap_err()
+                .downcast_custom::<ReferenceError>(),
+            Some(&poisoned),
+        );
     }
 
     #[test]

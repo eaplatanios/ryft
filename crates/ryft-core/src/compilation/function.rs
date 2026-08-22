@@ -7,16 +7,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::captures::{CapturingContext, ClosedProgram};
+use crate::compilation::contexts::{CompilationDomain, StatefulCompilationDomain};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
-use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, Typed, Value};
+use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value};
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
-
-use super::contexts::CompilationDomain;
 
 /// Cache key identifying one specialization of a retained function. Cache reuse is authorized only when
 /// all three components below agree. Equal keys must identify calls that can safely share the same staged
@@ -202,6 +201,60 @@ pub struct CompilationCall<D: CompilationDomain, Input: Parameterized<D::Type>, 
 
     /// Flat public runtime inputs, excluding captures.
     inputs: Vec<D::Value>,
+}
+
+/// Completion-bearing result of one externally stateful compiled invocation.
+///
+/// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
+/// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
+/// the holders used by the invocation, not only the most recently submitted backend event. Dropping this wrapper never
+/// cancels submitted work or rolls holder state back; callers that need to observe asynchronous failure must await it.
+/// A backend may also record a post-submission failure on the affected mutated holders so subsequent accesses report
+/// the same poisoned-state cause.
+#[must_use = "stateful execution errors are observed by awaiting this completion"]
+pub struct ReferenceExecution<Output, Error> {
+    /// Public output or reconstruction failure prepared after submission.
+    result: Result<Output, Error>,
+
+    /// Whole-invocation completion and its backend error conversion, absent only for already-completed results.
+    completion: Option<(ReferenceCompletion, fn(Arc<str>) -> Error)>,
+}
+
+impl<Output, Error> ReferenceExecution<Output, Error> {
+    /// Creates an already-completed stateful invocation result.
+    #[inline]
+    #[doc(hidden)]
+    pub fn ready(result: Result<Output, Error>) -> Self {
+        Self { result, completion: None }
+    }
+
+    /// Creates a submitted invocation whose public result is already reconstructed but whose execution remains
+    /// pending. Completion failure takes precedence over `result` because it may invalidate every pending output.
+    ///
+    /// # Parameters
+    ///
+    ///   - `result`: Public output or reconstruction failure prepared right after submission.
+    ///   - `completion`: Whole-invocation completion, including every cumulative holder predecessor dependency.
+    ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
+    ///     only when the completion itself fails, and its result then replaces `result`.
+    #[doc(hidden)]
+    pub fn pending(
+        result: Result<Output, Error>,
+        completion: ReferenceCompletion,
+        completion_error: fn(Arc<str>) -> Error,
+    ) -> Self {
+        Self { result, completion: Some((completion, completion_error)) }
+    }
+
+    /// Waits for the whole execution and its cumulative dependencies, then returns the public output.
+    pub fn r#await(self) -> Result<Output, Error> {
+        if let Some((completion, completion_error)) = self.completion
+            && let Err(error) = completion.r#await()
+        {
+            return Err(completion_error(error));
+        }
+        self.result
+    }
 }
 
 impl<D, Input, Output> CompilationCall<D, Input, Output>
@@ -1217,8 +1270,12 @@ where
         self.state.specializations.invalidate_entries_if(|key| key.static_parameters() == static_parameters)
     }
 
-    /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
-    pub fn call(&self, static_parameters: Static, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
+    /// Acquires or produces the executable specialization for one runtime input signature.
+    fn specialization(
+        &self,
+        static_parameters: Static,
+        inputs: &Input::To<D::Value>,
+    ) -> Result<ExecutableFunction<D, Input, Output>, D::Error>
     where
         D::Options: Clone,
         F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
@@ -1252,7 +1309,7 @@ where
         let producer = match entry {
             Ok(SpecializationCacheEntry::Occupied(executable)) => {
                 JitCacheStatisticsState::increment(&self.state.statistics.dispatch_hits);
-                return call_function(&self.state.domain, &executable, inputs);
+                return Ok(executable);
             }
             Ok(SpecializationCacheEntry::Vacant(producer)) => {
                 JitCacheStatisticsState::increment(&self.state.statistics.dispatch_misses);
@@ -1305,8 +1362,92 @@ where
         };
         JitCacheStatisticsState::increment(&self.state.statistics.compilation_requests);
         let compiled = self.state.domain.compile(lowered)?;
-        let executable = producer.insert(compiled.into_executable_function());
+        Ok(producer.insert(compiled.into_executable_function()))
+    }
+
+    /// Calls this dispatcher with explicit host-side `static_parameters` and dynamic runtime `inputs`.
+    pub fn call(&self, static_parameters: Static, inputs: Input::To<D::Value>) -> Result<Output::To<D::Value>, D::Error>
+    where
+        D::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
+        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Input::To<D::Value>: Parameterized<
+                D::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<D::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Output::To<D::Value>:
+            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<D>>:
+            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+    {
+        let executable = self.specialization(static_parameters, &inputs)?;
         call_function(&self.state.domain, &executable, inputs)
+    }
+
+    /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
+    ///
+    /// Submission publishes the domain's holder dependencies before this function returns. The returned completion
+    /// must be awaited to observe asynchronous failure; dropping it does not cancel the invocation.
+    pub fn call_statefully_async(
+        &self,
+        static_parameters: Static,
+        inputs: Input::To<D::Value>,
+    ) -> ReferenceExecution<Output::To<D::Value>, D::Error>
+    where
+        D: StatefulCompilationDomain,
+        D::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
+        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Input::To<D::Value>: Parameterized<
+                D::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<D::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Output::To<D::Value>:
+            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<D>>:
+            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+    {
+        let executable = match self.specialization(static_parameters, &inputs) {
+            Ok(executable) => executable,
+            Err(error) => return ReferenceExecution::ready(Err(error)),
+        };
+        call_function_statefully_async(&self.state.domain, &executable, inputs)
+    }
+
+    /// Calls this dispatcher statefully and waits for whole-invocation completion.
+    ///
+    /// This routes through [`StatefulCompilationDomain::call_statefully`], so it reports asynchronous execution errors
+    /// before returning and does not weaken the domain's holder sequencing contract.
+    pub fn call_statefully(
+        &self,
+        static_parameters: Static,
+        inputs: Input::To<D::Value>,
+    ) -> Result<Output::To<D::Value>, D::Error>
+    where
+        D: StatefulCompilationDomain,
+        D::Options: Clone,
+        F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
+        Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Input::To<D::Value>: Parameterized<
+                D::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<D::Type> = Input,
+            >,
+        Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
+        Output::To<D::Value>:
+            Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+        Output::To<CompilationTracer<D>>:
+            Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
+    {
+        let executable = self.specialization(static_parameters, &inputs)?;
+        call_function_statefully(&self.state.domain, &executable, inputs)
     }
 }
 
@@ -1450,6 +1591,45 @@ where
         Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
 {
     domain.call(CompilationCall::new(executable, inputs))
+}
+
+/// Executes a completion-bearing structured runtime call through a stateful domain.
+///
+/// The returned completion owns error observation, not cancellation. Submission and holder publication semantics are
+/// defined by [`StatefulCompilationDomain::call_statefully_async`].
+pub fn call_function_statefully_async<D, Input, Output>(
+    domain: &D,
+    executable: &ExecutableFunction<D, Input, Output>,
+    inputs: Input::To<D::Value>,
+) -> ReferenceExecution<Output::To<D::Value>, D::Error>
+where
+    D: StatefulCompilationDomain,
+    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
+    Input::To<D::Value>: Parameterized<D::Value>,
+    Output::To<D::Value>:
+        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+{
+    domain.call_statefully_async(CompilationCall::new(executable, inputs))
+}
+
+/// Executes a structured runtime call and waits for whole-invocation completion.
+///
+/// This is the blocking form of [`call_function_statefully_async`].
+pub fn call_function_statefully<D, Input, Output>(
+    domain: &D,
+    executable: &ExecutableFunction<D, Input, Output>,
+    inputs: Input::To<D::Value>,
+) -> Result<Output::To<D::Value>, D::Error>
+where
+    D: StatefulCompilationDomain,
+    Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
+    Input::To<D::Value>: Parameterized<D::Value>,
+    Output::To<D::Value>:
+        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+{
+    domain.call_statefully(CompilationCall::new(executable, inputs))
 }
 
 /// Constructs a staged function from types already prepared by a compilation domain.
@@ -1769,6 +1949,42 @@ mod tests {
         )
         .unwrap();
         domain.compile(domain.lower(staged).unwrap()).unwrap()
+    }
+
+    fn reference_completion_error(reason: Arc<str>) -> ProgramError {
+        ProgramError::InvalidArgument { message: reason.to_string() }
+    }
+
+    #[test]
+    fn test_reference_execution_returns_a_ready_result_without_a_completion() {
+        // A ready execution carries no completion at all, so awaiting it just yields the stored result.
+        let execution: ReferenceExecution<u32, ProgramError> = ReferenceExecution::ready(Ok(7));
+        assert_eq!(execution.r#await(), Ok(7));
+
+        let execution: ReferenceExecution<u32, ProgramError> =
+            ReferenceExecution::ready(Err(ProgramError::MalformedProgram("specialization failed".to_string())));
+        let expected = Err(ProgramError::MalformedProgram("specialization failed".to_string()));
+        assert_eq!(execution.r#await(), expected);
+    }
+
+    #[test]
+    fn test_reference_execution_returns_the_public_result_after_a_successful_completion() {
+        // A successful completion never rewrites the reconstructed public output.
+        let execution: ReferenceExecution<u32, ProgramError> =
+            ReferenceExecution::pending(Ok(11), ReferenceCompletion::ready(Ok(())), reference_completion_error);
+        assert_eq!(execution.r#await(), Ok(11));
+    }
+
+    #[test]
+    fn test_reference_execution_waits_and_prioritizes_completion_failure() {
+        // A completion failure may invalidate every pending output, so it replaces the reconstruction error.
+        let execution: ReferenceExecution<(), ProgramError> = ReferenceExecution::pending(
+            Err(ProgramError::MalformedProgram("public reconstruction failed".to_string())),
+            ReferenceCompletion::ready(Err("execution failed".into())),
+            reference_completion_error,
+        );
+        let expected = Err(ProgramError::InvalidArgument { message: "execution failed".to_string() });
+        assert_eq!(execution.r#await(), expected);
     }
 
     #[test]

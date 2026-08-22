@@ -1,7 +1,8 @@
 # Ryft References: Architecture and Implementation Plan
 
-**Status:** Phases 0 through 13 implemented and verified. The reference architecture and implementation plan is
-complete; a production Pallas-style kernel language remains a separate future program.
+**Status:** Phases 0 through 13 implemented and verified. Phase 14 is a deferred ownership refactor to begin only
+after the pending whole-plan review and concurrent changes settle. A production Pallas-style kernel language remains
+a separate future program.
 
 **Research snapshot:** 2026-08-14
 
@@ -1336,12 +1337,202 @@ the type, operation, identity, effect, or view model.
 support for deferred aliases or transforms, bounded-dynamic mutation, unbounded or nonreplicated dynamic state, or
 kernel operations beyond the explicitly validated preserved-reference boundary.
 
+### Phase 14: Generalize reference topology analysis and discharge planning
+
+**Status:** planned and deliberately deferred until the whole-plan pass 24 review converges and the pending concurrent
+changes leave a compile-clean baseline. This phase is an ownership and reuse refactor; it must not change observable
+reference semantics, the XLA state ABI, persistence, or supported transform matrix.
+
+**Objective:** move the genuinely value-family-independent root, alias, access, lifetime, capture, and structured-region
+analysis into the program reference subsystem. Extract the similarly generic discharge *planning* layer—state roots,
+region widening, and hidden-state layout—without pretending that array view geometry or array operation replay is
+generic.
+
+Additional array backends already share the array-owned analysis and discharge implementation. This refactor is
+valuable because it lets non-array value families and future preserved-resource boundaries reuse the graph semantics,
+not merely because the source files move to a more general-looking module.
+
+#### Planned module structure and visibility
+
+Turn the existing `src/programs/references.rs` file into one directory-backed `programs::references` module:
+
+```text
+crates/ryft-core/src/programs/references/
+├── mod.rs
+├── semantics.rs
+├── runtime.rs
+├── analysis.rs
+└── discharge.rs
+```
+
+The child modules are implementation owners, not five new public namespaces. Declare them privately from `mod.rs` and
+curate the established public surface with `pub use`. Consequently, existing paths such as
+`ryft_core::programs::references::ReferenceType` and facade imports such as `ryft_core::programs::ReferenceType`
+remain canonical; callers do not need to choose between `references::semantics`, `references::runtime`, and other
+internal paths. `src/programs/mod.rs` continues to re-export the intended reference API, and `src/lib.rs` continues its
+named downstream re-exports. Do not add parallel exports from `arrays` for artifacts whose canonical owner moves here.
+
+The planned ownership is:
+
+- `mod.rs`: subsystem-level documentation, private child-module declarations, and the curated re-export list. It
+  contains no analyzer, holder, or planner implementation.
+- `semantics.rs`: `ReferenceType`, `ReferenceTypeRefinements`, `ReferenceAccessMode`, `ReferenceAliasKind`,
+  `ReferenceOutputSemantics`, `ReferenceInputAccess`, and `ReferenceOperationSemantics`. This is the type-level and
+  operation-local reference vocabulary; it contains no holder state, program traversal, or array view geometry.
+- `runtime.rs`: `ReferenceError`, `ReferenceId`, `ReferenceGeneration`, `Reference<V>`, completion tokens and backend
+  callbacks, guards, prepared values, leases, reservations, and the private holder state machine. The filename names
+  the complete runtime lifecycle rather than implying that the module only stores values. Existing hidden backend SPI
+  remains hidden, and typed values remain separate from topology analysis artifacts.
+- `analysis.rs`: `ReferenceAnalysisError`, `ReferenceRoot`, `ReferenceSource`, `ExternalReferenceRoot`,
+  `ReferenceAccess`, `ReferenceTransitiveAccess`, `ReferenceAnalysis`, and private traversal/binding/fixed-point data.
+  It owns topology, lifetime, capture, region-boundary, and transitive-access analysis, but no coordinate transforms.
+- `discharge.rs`: the generic structural `ReferenceDischargeRule`, logical external-state binding type,
+  `ReferenceDischargePlan`, and private per-region state-threading layouts/substitutions. Despite the broader filename,
+  this program-level module computes only what must be threaded and where; it neither constructs destination
+  operations nor depends on array or XLA types.
+
+Keep the concrete array side in its existing focused modules:
+
+```text
+crates/ryft-core/src/arrays/
+├── reference_views.rs       # array handle, view transforms, selection, and inverse reconstruction
+├── reference_analysis.rs    # ArrayReferenceAnalysis overlay and view-type validation
+└── reference_discharge.rs   # array operation validation and immutable replay emission
+```
+
+`ArrayReferenceOperation` and the array emitter capability remain arrays-owned because they expose view transforms and
+construct reshape, slice, update-slice, addition, and scan operations. They may return the generic structural rule,
+but the generic planner never imports those array capabilities. `DischargedReferenceProgram` remains arrays-owned
+because its payload is a reference-free `ArrayIrType` program; only its logical external-state binding recipe moves to
+`discharge.rs` under a generic name.
+
+Within `programs`, implementation files import sibling-owned items through their defining child modules, following the
+same-top-level import convention. Other top-level core modules import the public types through the `crate::programs`
+facade. Planner builders, traversal handles, region layouts, holder states, and temporary migration adapters stay
+private or `pub(crate)`; only stable semantic artifacts and intentionally public analysis/plan results are re-exported.
+
+#### Generic program-level reference analysis
+
+- [ ] Perform the directory-backed split above mechanically before changing ownership or semantics. Move each existing
+      owner test beside its implementation, keep public paths stable through `references/mod.rs`, and prove this first
+      step with focused reference tests so later analysis failures are not conflated with the file move.
+- [ ] Move `ReferenceRoot`, `ReferenceSource`, `ExternalReferenceRoot`, `ReferenceAccess`,
+      `ReferenceTransitiveAccess`, and their value-family-independent diagnostics from `arrays` into the program
+      reference subsystem.
+- [ ] Make the topology analyzer generic over the program's `Value`, `Type`, and `Operation` families. It should rely
+      only on `Type::is_reference`, `Operation::reference_semantics`, effects, region roles, capture/provenance hooks,
+      and ordinary program identifiers.
+- [ ] Preserve the complete existing contract: canonical roots, new-root and alias propagation, ordered-state
+      validation, capture scopes, external-source classification, duplicate-handle rejection, consume/use-after-
+      consume, second-class boundaries, root-preserving fixed-point carries, nested-region substitution, dormant-rule
+      rejection, and deterministic instruction/region transitive-access summaries.
+- [ ] Record reference alias edges and `ReferenceAliasKind` independently of view geometry. Identity aliases must keep
+      exact structural type equality. View aliases may change their referent type, but their family-specific type and
+      coordinate validation is delegated to the owning overlay.
+- [ ] Retain the generic `is_view`/derived-alias marker used by root-only structured-region boundaries. The generic
+      analyzer must reject a derived view crossing a root-only boundary without knowing how that view selects data.
+- [ ] Make eager lifetime validation use only this generic topology analysis. It must not construct an empty array
+      view table or invoke an array-specific operation capability merely to enforce root lifetime rules.
+
+#### Array-owned view-analysis overlay
+
+- [ ] Keep `ArrayReference`, `ArrayReferenceView`, `ArrayReferenceViewTransform`, `ViewSelection`, index/slice bounds,
+      shape derivation, and inverse reconstruction in `ryft_core::arrays`.
+- [ ] Replace the current view-bearing analysis internals with a composed `ArrayReferenceAnalysis` overlay, or an
+      equivalently small array-owned artifact, that contains the generic `ReferenceAnalysis` plus the validated
+      `ValueId -> ArrayReferenceView` table.
+- [ ] Derive that table from the generic alias edges and `ArrayReferenceOperation::reference_view_transform`; fold
+      transforms in root-to-handle order, re-derive each output referent type, and reject missing transforms or type
+      mismatches exactly as today.
+- [ ] Keep one authoritative view table. Discharge, preserved-kernel validation, diagnostics, and public array
+      analysis accessors must consume the overlay rather than independently re-walking index/slice operations.
+- [ ] Do not generalize view extraction/replacement into a universal lens abstraction until a second concrete value
+      family demonstrates compatible type derivation and inverse reconstruction semantics.
+
+#### Generic discharge planning, array-owned replay
+
+- [ ] Move the logical external-state binding recipe—source, entering-state input position, and optional final-state
+      output position—into the program reference subsystem under a value-family-independent name. Keep physical XLA
+      indices, donation, shardings, and runtime holders out of it.
+- [ ] Extract a generic `ReferenceDischargePlan` that consumes the generic analysis and structural rewrite
+      classifications. It should compute deterministic root order, per-region entering/current/final state sets,
+      attached-region substitutions, condition/while/scan/call widening, source-output positions, hidden-state output
+      positions, and external-state bindings without constructing destination operations.
+- [ ] Move the structural rule vocabulary needed by that planner into the program reference subsystem, using generic
+      concepts such as ordinary, new root, alias, read, replace, accumulate, consume, condition, while, scan, and call.
+      Array `add_update` maps to accumulate; the planner does not name `AddOperation`, `SliceOperation`, or other array
+      payloads.
+- [ ] Keep primitive contract validation and replay emission array-owned. `ArrayIrType` referent projection,
+      `ArrayReferenceView` traversal, reshape/slice/update-slice reconstruction, array addition, destination builder
+      operations, scan operation reconstruction, and final reference-free array-program verification remain in
+      `arrays/reference_discharge.rs`.
+- [ ] Make array discharge consume the generic plan and the array view overlay. The resulting program, public-output
+      prefix, hidden final states, ordering, diagnostics, and rendered IR must remain byte-for-byte or structurally
+      identical wherever identifiers are intentionally renamed.
+- [ ] Do not add a callback-heavy `ReferenceDischargePolicy` whose methods merely mirror every array operation. A
+      future non-array emitter may reuse the plan directly; only then should common emission behavior be promoted.
+
+#### API ownership and migration
+
+- [ ] Re-export generic analysis and plan artifacts through `ryft_core::programs` and the intentional crate-root API.
+      Keep array view artifacts under `ryft_core::arrays`.
+- [ ] Migrate in dependency order: first split `programs/references.rs` without behavior changes; then move generic
+      analysis and introduce the array overlay; then extract the generic discharge plan and switch array replay; last,
+      update facades and downstream imports and delete superseded array-owned definitions. No step may leave two
+      authoritative analyzers or planners in the completed tree.
+- [ ] Update every in-repo import to the new canonical owner. Do not retain parallel array-owned aliases or deprecated
+      module-path compatibility shims unless an explicit public compatibility decision is recorded before work begins.
+- [ ] Preserve the established public names where their semantics remain generic. Use distinct names such as
+      `ArrayReferenceAnalysis` only for artifacts that actually contain array view metadata.
+- [ ] Keep `Reference<V>` as the generic root holder and `ArrayReference<A>` as the array-specific root-plus-view
+      handle. This phase must not add a generic `Reference<V, View>` carrier or move array coordinate metadata into the
+      holder runtime protocol.
+
+#### Tests and verification
+
+- [ ] Add an owner-module generic test value/type/operation family that is not `ArrayIrType` and prove new-root,
+      identity alias, view-alias marking, read/write/accumulate/consume, captures, external sources, use-after-consume,
+      duplicate aliases, condition, while, scan, call, and transitive summaries.
+- [ ] Pin exact generic diagnostics for malformed semantics, reference constants, capture scope, region provenance,
+      fixed-point root mismatch, derived-view region crossing, and dormant rule closures.
+- [ ] Add parity tests showing the generic topology artifact for representative array programs has exactly the same
+      roots, external sources, accesses, substitutions, and summaries as the pre-refactor analysis.
+- [ ] Keep exact array overlay tests for root, index, slice, composed views, overlapping sibling views, identity
+      aliases, output-type mismatch, and view entry/exit region rejection.
+- [ ] Test the generic discharge plan independently with a small non-array fake emitter or immutable state machine;
+      compare its region layouts, root ordering, hidden outputs, and external bindings with the array discharge path.
+- [ ] Re-run eager/discharged/immutable-oracle equivalence for straight-line programs and condition/while/scan/call,
+      including local, public, captured, read-only, mutated, and multiple roots.
+- [ ] Verify the preserved-reference kernel boundary consumes the array overlay plus generic access summaries without a
+      second root/view analysis.
+- [ ] Search the new generic modules for `ArrayType`, `ArrayIrType`, `ArrayReferenceView`, `SliceOperation`,
+      `ReshapeOperation`, `UpdateSliceOperation`, and XLA types; every occurrence must be absent or an intentional
+      documentation link.
+- [ ] Run focused reference analysis/discharge tests, the full `ryft-core` and `ryft-xla` library suites, facade and
+      all-target checks, doctests/rustdoc for moved public paths, formatting, added-line width, stale-path searches, and
+      `git diff --check`, using the repository's 300-second command bound.
+
+**Explicit exclusions:** new reference semantics, new view kinds, dynamic/strided view reconstruction, generic holder
+views, a second operation universe, changes to XLA execution or persistence, compatibility shims, and a universal
+discharge-emitter trait without a second production consumer.
+
+**Estimated size:** 700-1,200 production lines materially rewritten or newly introduced; 900-1,500 test lines; 200-350
+documentation and migration lines. Most work is movement and decomposition, so deleted/moved lines are not counted as
+negative implementation size.
+
+**Exit criterion:** a non-array operation family exercises the complete generic topology/lifetime/access analysis;
+array views are validated once by one array-owned overlay; array discharge consumes one generic state-threading plan
+without genericizing slice/reshape/update-slice emission; existing eager, discharge, transform, preserved-kernel, XLA,
+and runtime behavior remains unchanged; and independent correctness, conventions, and simplicity reviews report no
+remaining findings.
+
 ## 15. Likely change surface
 
 ### `ryft-core`
 
-- `src/programs/references.rs`: generic `ReferenceType<T>` with `ReferenceTypeRefinements<T>`, `Reference<V>` with
-  `Arc`-pointer identity, and the derived `ReferenceId` handle.
+- `src/programs/references.rs` or cohesive child modules: generic `ReferenceType<T>` with
+  `ReferenceTypeRefinements<T>`, `Reference<V>` with `Arc`-pointer identity, the derived `ReferenceId` handle, generic
+  root/access/lifetime analysis, and the value-family-independent discharge plan added by Phase 14.
 - `src/compilation/function.rs` and `src/compilation/contexts.rs`: the opt-in `StatefulCompilationDomain` capability
   with `call_statefully`/`call_statefully_async`, sharing the specialization/dispatcher pipeline with the unchanged
   pure output-only call (§10 Stage C); the type-erased completion/dependency token lives beside `Reference<V>` in the
@@ -1354,11 +1545,13 @@ kernel operations beyond the explicitly validated preserved-reference boundary.
 - `src/programs/effects.rs`: `OrderedState`.
 - `src/programs/operations.rs` or a focused reference module: reusable semantic-access contract if it is genuinely
   operation-family-wide.
-- `src/arrays/reference_analysis.rs`: roots, aliases, scopes, accesses, validation.
+- `src/arrays/reference_analysis.rs`: the Phase 14 array view-analysis overlay and array-specific view type validation;
+  generic roots, aliases, scopes, accesses, and lifetime validation move to the program reference subsystem.
 - `src/programs/values.rs`, `src/interpretation.rs`, `src/contexts.rs`, and `src/programs/regions.rs`: the generic
   value-family preflight hook, checked eager root/direct-bind replay, explicit prevalidated replay provenance, shared
   closure traversal, and canonical region sealing invariants needed to guarantee validation before mutation.
-- `src/arrays/reference_discharge.rs`: region-aware replay and logical external-state metadata.
+- `src/arrays/reference_discharge.rs`: array-specific replay over the generic Phase 14 discharge plan, including view
+  extraction/reconstruction and canonical array operation emission.
 - `src/partial.rs`, `src/arrays/batching.rs`, differentiation modules, and rematerialization: routing/guards.
 - condition, while, and scan implementations: only generic boundary-widening hooks proven necessary by discharge.
 - tracing, captures, and exports: projections/tests and public integration.
@@ -1398,6 +1591,9 @@ Use named families rather than an uncontrolled Cartesian product.
 
 | Area | Positive cases | Negative/safety cases |
 |---|---|---|
+| Generic topology | non-array roots, aliases, captures, summaries | malformed semantics, duplicates, lifetime |
+| Array view overlay | composed views from generic alias edges | bad transform, type, or boundary |
+| Discharge plan | root order, region widening, hidden outputs | bad carries or source/output mapping |
 | Type/member | reference projection; dynamic referent refinement; shared dimension identities | every cross-kind projection/refinement; numeric use of a reference |
 | Primitive ops | create/read/write/swap/add; interleaved roots | bad type; dynamic mutation; frozen use |
 | Views | base/view and composed/overlapping observation | implicit/escaping view; bad transform |
@@ -1507,6 +1703,18 @@ ABI/runtime integration.
 Phase 12 proves preservation viability. A complete Pallas layer is a separate large program with substantially more
 `ryft-xla` and `ryft-mlir` ownership.
 
+### Milestone G: generic reference-analysis ownership
+
+Phase 14 begins only after the pending whole-plan review and concurrent edits settle. It moves topology, lifetime,
+access, capture, and state-threading planning into the generic program reference subsystem while retaining array view
+geometry and replay emission in `arrays`.
+
+Estimated ownership:
+
+- `ryft-core::programs`: 45-55% generic analysis and planning;
+- `ryft-core::arrays`: 40-50% view overlay and replay integration;
+- `ryft-xla`: 0-5% import and preserved-kernel integration updates only.
+
 For a static fixed-shape reference MVP including local semantics, structured discharge, one external holder, aliases,
 captures, and basic legality, the overall estimate remains approximately:
 
@@ -1569,6 +1777,14 @@ stabilization.
 **Mitigation:** share roots/views/accesses only; keep kernel launch and synchronization in a separate higher-order
 operation/lowering policy.
 
+### Generic abstraction that only disguises arrays
+
+**Risk:** a large policy trait moves array slice, reshape, update-slice, and addition behind callbacks without gaining
+a real second consumer, increasing generic complexity while preserving the same coupling.
+
+**Mitigation:** extract topology analysis and a data-only discharge plan first. Keep array replay concrete, and promote
+emission behavior only after another production value family demonstrates identical semantics.
+
 ### Accidental scope expansion into Lists
 
 **Risk:** reference implementation attempts to solve dynamic collections and loop tapes simultaneously.
@@ -1588,6 +1804,8 @@ Do not begin the next checkpoint until the prior one is reviewed:
 6. **External runtime review:** holder ownership, failure, concurrency, hidden results, donation, and aliases.
 7. **Persistence/distribution review:** cache identity, schema validation, sharding, and dynamic extents.
 8. **Pallas-readiness review:** preserved-reference eligibility without kernel concerns in core types.
+9. **Generic-ownership review:** non-array topology conformance, one array view overlay, one discharge plan, and no
+   array operation vocabulary leaking into generic program modules.
 
 At each checkpoint, ask:
 
@@ -1596,6 +1814,7 @@ At each checkpoint, ask:
 - Can every reference operand be resolved to one root?
 - Can every generic transform prove that references were discharged, or reject them explicitly?
 - Would the same type/operation/view contract still make sense inside a kernel region?
+- Did this code move because its semantics are generic, or merely because a trait can be made to type-check?
 - Are deferred behaviors rejected at the earliest responsible boundary?
 
 ## 21. Plan review record
@@ -1609,6 +1828,9 @@ At each checkpoint, ask:
 - [x] Added explicit lifecycle, transform, control-flow, async failure, concurrency, persistence, and Pallas-readiness
       proof obligations.
 - [x] Kept first-class Lists outside implementation scope while preserving the shared Array IR/replay path.
+- [x] Added deferred Phase 14 after the Phase 0-13 implementation: generic topology/lifetime/access analysis and
+      discharge planning move to the program reference subsystem, while array view geometry and replay remain
+      array-owned until a second production emitter proves a smaller shared abstraction.
 - [x] 2026-08-16 review pass 1: made `swap` the sole replacement primitive (`write`/`set` as binding sugar); bounded
       the read-ordering cost note; made discharge consume `ReferenceAnalysis` an explicit contract; added the Phase 0
       `tf.aliasing_output` seam prototype; moved views ahead of the external runtime; split the external runtime into
@@ -2086,7 +2308,7 @@ At each checkpoint, ask:
       no XLA/facade warnings. Formatting, `git diff --check`, source-rendering, ordinary-reference rejection,
       stale/scaffolding/parallel-universe, added-line-width, and changelog-diff audits were clean.
 
-- [ ] 2026-08-21 whole-plan independent re-audit fix pass 24 (in progress): three fresh independent Opus audits over
+- [x] 2026-08-21 whole-plan independent re-audit fix pass 24: three fresh independent Opus audits over
       the complete uncommitted feature (core reference semantics and the phase-10 holder state machine, the
       compilation/PJRT/XLA runtime stack, and the phase-12 kernels plus phase-13 docs with a cross-cutting sweep)
       produced roughly sixty verified findings; no changelog was touched, per the standing owner instruction.
@@ -2132,9 +2354,38 @@ At each checkpoint, ask:
       extracted for donation), the cross-crate `ControlledCompletion` test double (sharing it would add public
       test-support surface), and the batching adapter's internal tracing context (the batching context is the
       canonical axis-metadata carrier). Verification so far: 1,535 core, 540 XLA, 128 PJRT, 20 + 17 macro tests, 70
-      core doctests plus 16 ignored, zero warnings, formatting and whitespace clean. Remaining: convergence re-audit
-      rounds over this pass's fixes.
+      core doctests plus 16 ignored, zero warnings, formatting and whitespace clean.
 
-All implementation and verification items in this reference plan are complete. The production Pallas-style kernel
-language, launch model, and scheduler described by the roadmap remain a separate future program rather than unchecked
-work in this plan.
+      A second convergence audit over the first round's fixes surfaced thirty-two residual findings, all resolved or
+      consciously kept. Corrections to the first round's own fixes: the fence's detached-thread event release was
+      unsound reasoning and is replaced by in-callback release with the sanctioning upstream contract documented
+      (`ConvertCEventToCppFuture` destroys events inside their own `PJRT_Event_OnReady` callbacks), with the
+      never-completing-event cycle documented as the same by-design leak a bare pending event has; read-lease
+      publication now prunes completed leases, fixing unbounded lease (and pinned fence) growth on holders that are
+      only ever read, and `next_generation` documents the drain-then-validate protocol; derived-view `swap` validates
+      inside the holder update so state errors keep precedence over the type diagnostic; `validate_live` treats the
+      guard-local `Taken` state defensively; the carrier traversal borrows types through `Cow` instead of cloning per
+      step, the carrier internals returned to file-private visibility, and the eager wrappers are used uniformly; the
+      sharded V6 skip arm tolerates either unimplemented step while pinning the reason; kernel diagnostics backtick
+      uniformly through a new `Display for ReferenceAccessMode`; and dead derives, a stale qualified path, comment
+      reflows, and the redundant staged-intermediates wrapper were cleaned up. Coverage findings closed with
+      seventeen further tests: zero-event and concurrently-observed fences, depth-two forwarding summaries, idle-guard
+      poison no-ops, non-blocking view derivation on a reserved holder, handle-local rename-collision direction,
+      publication-time lease pruning (witnessed through backend `Arc` counts), both new V6 corruption messages, the
+      cache cross-check exercised end-to-end through the artifact-exchange tier (the disk tier re-validates key
+      digests and cannot deliver a colliding entry), `interpret_async` stateful rejection, the two-gate lease test
+      made order-deterministic, distinct-payload dynamic-referent swap/freeze semantics via the `with_unchecked_type`
+      hatch, the operation-named unresolved-reference partial-evaluation diagnostic, and the preserved-kernel
+      metadata accessors now exercised by the owner tests. Kept with rationale: `ReferenceSource` stays exhaustive
+      (its variants are a closed persisted vocabulary; pass 21 removed `#[non_exhaustive]` deliberately). Final
+      verification: 1,538 core, 542 XLA, 130 PJRT, 20 + 17 macro tests, 70 core doctests plus 16 ignored, zero
+      warnings, formatting and whitespace clean. A third confirmation audit verified every second-round fix
+      (including the exactly-once fence-release invariant, publication-time lease pruning, borrow safety of the
+      carrier traversal, and the exchange-driven cache cross-check reaching the real compile path) and left four
+      mechanical residuals — two comment repairs, a frozen-precedence regression pin for derived-view swaps, and an
+      honestly scoped fence-readiness test — which a final micro-confirmation then reported clean apart from one
+      comment clause, softened in place. The re-audit cycle is converged.
+
+Phases 0 through 13 are implemented and verified. Phase 14 is intentionally unchecked and deferred until the pending
+whole-plan review and concurrent edits converge. The production Pallas-style kernel language, launch model, and
+scheduler remain a separate future program.

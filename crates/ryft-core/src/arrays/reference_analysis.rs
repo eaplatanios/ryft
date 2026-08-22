@@ -757,7 +757,6 @@ impl ReferenceTransitiveAccess {
 /// Analysis-local substitution from a nested region's parameterized root to one caller root, keyed during the pass
 /// by its invoking instruction and attached-region position. Only the source-to-region direction outlives the pass,
 /// through [`ReferenceAnalysis::region_root_for_source`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct ReferenceRegionInputBinding {
     /// Parent instruction operand that supplies the root.
     source_input_index: usize,
@@ -2346,7 +2345,7 @@ mod tests {
         let branch_root = ReferenceRoot::RegionInput { region: branch, input_index: 0 };
         assert_eq!(
             analysis.region_roots_for_sources,
-            std::collections::BTreeMap::from([
+            BTreeMap::from([
                 ((instruction, 0, source_root), branch_root),
                 ((instruction, 1, source_root), branch_root),
             ]),
@@ -2559,6 +2558,17 @@ mod tests {
                 mode: ReferenceAccessMode::Read,
             }],
         );
+
+        // The summaries translate the same access outward through both region levels. The read is local to the middle
+        // region, so the inner condition contributes nothing, and every enclosing summary names the entry root rather
+        // than a region-local formal of the middle region.
+        let expected = [ReferenceTransitiveAccess { root, mode: ReferenceAccessMode::Read }];
+        assert_eq!(analysis.instruction_summary(InstructionId::new(middle, 0)), None);
+        assert_eq!(analysis.instruction_summary(InstructionId::new(middle, 1)).unwrap(), &expected);
+        assert_eq!(analysis.instruction_summary(InstructionId::new(program.entry(), 0)).unwrap(), &expected);
+        assert_eq!(analysis.region_summary(inner).unwrap(), &[]);
+        assert_eq!(analysis.region_summary(middle).unwrap(), &expected);
+        assert_eq!(analysis.region_summary(program.entry()).unwrap(), &expected);
     }
 
     #[test]

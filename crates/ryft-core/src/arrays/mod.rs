@@ -10,6 +10,7 @@ pub mod macros;
 pub mod operations;
 pub mod reference_analysis;
 pub mod reference_discharge;
+pub mod reference_views;
 pub mod sharding;
 pub mod types;
 
@@ -30,14 +31,16 @@ pub use encoding::{
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayTracingContext, DimensionOperation,
-    DimensionOperations, DimensionTracingContext, ReferenceDischargeOperation, ReferenceDischargeRule,
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceOperation, ArrayTracingContext,
+    DimensionOperation, DimensionOperations, DimensionTracingContext, ReferenceDischargeOperation,
+    ReferenceDischargeRule,
 };
 pub use reference_analysis::{
     ExternalReferenceRoot, ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRoot, ReferenceSource,
     ReferenceTransitiveAccess,
 };
 pub use reference_discharge::{DischargedReferenceProgram, DischargedReferenceState};
+pub use reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform};
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
     ShardingError, ShardingVisualization,

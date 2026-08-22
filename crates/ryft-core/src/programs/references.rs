@@ -373,6 +373,17 @@ pub enum ReferenceAccessMode {
     Consume,
 }
 
+impl Display for ReferenceAccessMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read => write!(formatter, "read"),
+            Self::Write => write!(formatter, "write"),
+            Self::Accumulate => write!(formatter, "accumulate"),
+            Self::Consume => write!(formatter, "consume"),
+        }
+    }
+}
+
 /// Kind of one root-preserving reference alias edge.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1015,14 +1026,14 @@ impl<V: Value> Reference<V> {
     /// on device work the caller does not observe.
     pub(crate) fn validate_live(&self) -> Result<(), ReferenceError> {
         match &*self.holder.state.lock().map_err(|_| ReferenceError::Poisoned)? {
-            ReferenceState::Ready { .. }
-            | ReferenceState::Taken { .. }
-            | ReferenceState::Reserved { .. }
-            | ReferenceState::Pending { .. } => Ok(()),
+            ReferenceState::Ready { .. } | ReferenceState::Reserved { .. } | ReferenceState::Pending { .. } => Ok(()),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::ExecutionPoisoned(reason) => {
                 Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
             }
+            // `Taken` exists only while a guard holds this mutex, so this arm is defensive and mirrors every other
+            // non-guard access.
+            ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
         }
     }
 
@@ -1250,6 +1261,11 @@ impl<V: Value> ReferenceGuard<'_, V> {
     pub fn publish_read_lease_unchecked(&mut self, lease: ReferenceCompletion) {
         match &mut *self.state {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => {
+                // Publication is the one point every read-only invocation passes through, so completed leases are
+                // pruned here: a holder that is only ever read never takes the mutation paths that otherwise prune,
+                // and an unpruned vector would grow (and pin each lease's backend completion) once per invocation
+                // forever.
+                read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
                 read_leases.push(lease);
             }
             _ => unreachable!("read lease publication was validated under the same holder guard"),
@@ -1268,6 +1284,12 @@ impl<V: Value> ReferenceGuard<'_, V> {
     }
 
     /// Validates a mutation reservation and returns its next generation without changing holder state.
+    ///
+    /// Any published lease still recorded on the holder rejects the reservation, including one whose execution has
+    /// already completed: this borrows the holder immutably and therefore cannot prune. Backends must drain
+    /// completed leases through [`Self::active_read_leases`] (releasing the guard and awaiting the returned
+    /// completions when any remain) before validating a reservation, exactly as the multi-holder retry protocol
+    /// does.
     pub fn next_generation(&self) -> Result<ReferenceGeneration, ReferenceError> {
         let generation = match &*self.state {
             ReferenceState::Ready { generation, read_leases, .. } => {
@@ -2089,6 +2111,58 @@ mod tests {
             Err(ReferenceError::ExecutionPoisoned { reason: "test execution failed".to_string() }),
         );
         assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_poison_leaves_an_idle_holder_untouched() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let mut guard = reference.lock().unwrap();
+        let generation = guard.current_generation().unwrap();
+
+        // Poisoning is infallible so that a failure path can never trade the original backend error for a guard-state
+        // error. A guard that neither extracted a value nor holds a reservation has nothing to invalidate, so the
+        // holder must stay ready at its current generation and remain readable afterwards.
+        guard.poison("unrelated backend failure");
+        assert_eq!(guard.current_generation(), Ok(generation));
+        assert_eq!(guard.snapshot(), Ok(Array::scalar(1.0_f32)));
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
+    }
+
+    #[test]
+    fn test_read_lease_publication_releases_completed_leases() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let first = ControlledCompletion::new();
+        let second = ControlledCompletion::new();
+        let third = ControlledCompletion::new();
+        first.complete(Ok(()));
+        second.complete(Ok(()));
+
+        // Publication is the one point every read-only invocation passes through, so a holder that is only ever read
+        // must release each completed lease there instead of pinning its backend completion forever. Each backend's
+        // shared state is retained exactly while the holder still holds that lease, so the strong count observes the
+        // release directly.
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(first.clone()));
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(second.clone()));
+        assert_eq!(Arc::strong_count(&first.state), 1);
+        assert_eq!(Arc::strong_count(&second.state), 2);
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(third.clone()));
+        assert_eq!(Arc::strong_count(&second.state), 1);
+        assert_eq!(Arc::strong_count(&third.state), 2);
+
+        // Only the one still-running lease remains recorded, and it alone blocks the next mutation reservation until
+        // it completes and the holder prunes it.
+        assert_eq!(guard.active_read_leases().len(), 1);
+        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
+        third.complete(Ok(()));
+        assert!(guard.active_read_leases().is_empty());
+        assert_eq!(Arc::strong_count(&third.state), 1);
+        assert!(guard.next_generation().is_ok());
     }
 
     #[test]

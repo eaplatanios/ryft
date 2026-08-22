@@ -360,8 +360,8 @@ struct DischargedRegion<V: Value<Type = ArrayIrType>, O: ReferenceDischargeOpera
 /// Object-safe view of one canonical reference operation used as the validation oracle for a primitive discharge
 /// rule. Each primitive rule must match its canonical core operation exactly: the canonical descriptor pins the
 /// access classification, and the canonical regionless inference re-derives the recorded boundary types (including
-/// referent equality), so a third-party operation cannot drift from the semantics
-/// the rewrite assumes without being rejected.
+/// referent equality), so a third-party operation cannot drift from the semantics the rewrite assumes without being
+/// rejected.
 trait PrimitiveReferenceContract {
     /// Returns the canonical operation-local reference semantics.
     fn contract_semantics(&self) -> Cow<'_, ReferenceOperationSemantics>;
@@ -661,10 +661,10 @@ where
 
 /// Staged view carrier that emits the canonical slice, reshape, and update-slice instructions into a program
 /// builder, sharing the single [`ArrayReferenceView`] traversal with the eager value carrier.
-struct StagedViewCarrier<'b, V, O>(&'b mut ProgramBuilder<V, O>)
-where
-    V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation;
+struct StagedViewCarrier<'b, V: Value<Type = ArrayIrType>, O: ReferenceDischargeOperation>(
+    /// Destination builder receiving the staged view instructions.
+    &'b mut ProgramBuilder<V, O>,
+);
 
 impl<V, O> ViewReadCarrier for StagedViewCarrier<'_, V, O>
 where
@@ -673,9 +673,11 @@ where
 {
     type Value = AtomId;
 
-    fn array_type(&self, value: &AtomId) -> Result<ArrayType, ProgramError> {
-        let r#type = self.0.atoms()[value.index()].r#type();
-        Ok(<&ArrayType>::try_from(r#type.as_ref())?.clone())
+    fn array_type<'c>(&'c self, value: &'c AtomId) -> Result<Cow<'c, ArrayType>, ProgramError> {
+        match self.0.atoms()[value.index()].r#type() {
+            Cow::Borrowed(r#type) => Ok(Cow::Borrowed(<&ArrayType>::try_from(r#type)?)),
+            Cow::Owned(r#type) => Ok(Cow::Owned(<&ArrayType>::try_from(&r#type)?.clone())),
+        }
     }
 
     fn slice(&mut self, input: &AtomId, starts: Vec<usize>, limits: Vec<usize>) -> Result<AtomId, ProgramError> {
@@ -735,21 +737,8 @@ where
     let view = analysis
         .view(ValueId::new(source.id(), input))
         .ok_or_else(|| ProgramError::MalformedProgram(format!("reference {access} has no analyzed view")))?;
-    let intermediates = stage_reference_view_intermediates(builder, state, view)?;
+    let intermediates = view.intermediates_in(&mut StagedViewCarrier(builder), state)?;
     Ok((root, view, intermediates))
-}
-
-/// Stages each root-to-view intermediate exactly once.
-fn stage_reference_view_intermediates<V, O>(
-    builder: &mut ProgramBuilder<V, O>,
-    root: AtomId,
-    view: &ArrayReferenceView,
-) -> Result<Vec<AtomId>, ProgramError>
-where
-    V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
-{
-    view.intermediates_in(&mut StagedViewCarrier(builder), root)
 }
 
 /// Reconstructs a root from already staged view intermediates and one replacement leaf.
@@ -2996,8 +2985,8 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_threads_reference_captures_through_scan() {
-        // A capture read by a scan body becomes a synthesized carry appended after the declared carry prefix, which raises
-        // the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
+        // A capture read by a scan body becomes a synthesized carry appended after the declared carry prefix,
+        // which raises the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
         let reference_type = ReferenceType::new(scalar_type());
         let concrete_reference = ArrayReference::new(Array::scalar(4.0f32));
         let mut body_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
@@ -3030,11 +3019,11 @@ mod tests {
 
     #[test]
     fn test_closed_program_discharge_threads_mutated_reference_capture_through_scan() {
-        // A capture that a scan body accumulates into reaches that body only through a synthesized carry, which is the
-        // most involved discharge path: the state must enter the scan appended after the declared carry prefix, be updated
-        // inside the body, leave through the matching synthesized carry output, and reach the hidden entry final-state
-        // output after the public prefix. The capture value family carries no data, so the rendered program rather than
-        // an interpretation pins the resulting state flow.
+        // A capture that a scan body accumulates into reaches that body only through a synthesized carry, which is
+        // the most involved discharge path: the state enters the scan appended after the declared carry prefix, is
+        // updated inside the body, leaves through the matching synthesized carry output, and reaches the hidden
+        // entry final-state output after the public prefix. The capture value family carries no data, so the
+        // rendered program rather than an interpretation pins the resulting state flow.
         let reference_type = ReferenceType::new(scalar_type());
         let mut body_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = body_builder.add_constant(Capture::new(0, reference_type.into()));

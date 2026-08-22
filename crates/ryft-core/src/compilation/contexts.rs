@@ -19,8 +19,8 @@ use crate::parameters::Parameterized;
 use crate::programs::{ProgramError, Type};
 
 use super::function::{
-    CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest, StageRequest,
-    StagedFunction,
+    CallRequest, CompileRequest, CompiledFunction, ExecutableFunction, LoweredFunction, LoweringRequest,
+    ReferenceExecution, StageRequest, StagedFunction,
 };
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
@@ -107,6 +107,31 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     where
         Self: Sized,
         Request: CallRequest<Self>;
+}
+
+/// Optional execution capability for compiled functions that bind external mutable reference holders.
+///
+/// Implementations must keep hidden state results out of [`CallRequest::RuntimeOutput`] and preserve their holder
+/// transaction guarantees even when the public output has no leaves or fails reconstruction.
+pub trait StatefulCompilationDomain: CompilationDomain {
+    /// Performs a completion-bearing stateful structured execution transition.
+    fn call_statefully_async<Request>(
+        &self,
+        request: Request,
+    ) -> ReferenceExecution<Request::RuntimeOutput, Self::Error>
+    where
+        Self: Sized,
+        Request: CallRequest<Self>;
+
+    /// Executes a stateful call and waits for whole-invocation completion before returning.
+    #[inline]
+    fn call_statefully<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
+    where
+        Self: Sized,
+        Request: CallRequest<Self>,
+    {
+        self.call_statefully_async(request).r#await()
+    }
 }
 
 /// Optional capability for caching backend-compiled programs.
@@ -562,8 +587,8 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
     /// Attaches a distributed compiled-artifact exchange using `policy`.
     ///
     /// The exchange is used only when the domain supplies stable bytes through
-    /// [`CompilationCacheDomain::persistent_cache_key`] and can serialize and deserialize compiled programs. Process zero
-    /// compiles and publishes; follower processes receive and restore. A single-process exchange is ignored.
+    /// [`CompilationCacheDomain::persistent_cache_key`] and can serialize and deserialize compiled programs. Process
+    /// zero compiles and publishes; follower processes receive and restore. A single-process exchange is ignored.
     pub fn with_artifact_exchange(
         mut self,
         exchange: Arc<dyn CompilationArtifactExchange>,
