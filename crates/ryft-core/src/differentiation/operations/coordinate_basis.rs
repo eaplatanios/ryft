@@ -100,8 +100,6 @@ impl<T: Type> Display for CoordinateBasisOperation<T> {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
 impl Operation for CoordinateBasisOperation<ArrayType> {
     type Type = ArrayType;
 
@@ -138,7 +136,7 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
                 self.value_type
             )));
         }
-        let coordinate_count = if dimensions.contains(&Dimension::Static(0)) {
+        let value_coordinate_count = if dimensions.contains(&Dimension::Static(0)) {
             0
         } else {
             dimensions.iter().try_fold(1usize, |count, size| match size {
@@ -148,13 +146,13 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
                 Dimension::Dynamic(_) => unreachable!("dynamic dimensions were rejected above"),
             })?
         };
-        let basis_end = self.basis_offset.checked_add(coordinate_count).ok_or_else(|| {
+        let basis_end = self.basis_offset.checked_add(value_coordinate_count).ok_or_else(|| {
             TypeError::invalid(format!("basis range overflows usize for value type {}", self.value_type))
         })?;
         if basis_end > self.basis_size {
             return Err(TypeError::invalid(format!(
-                "basis range [{}, {basis_end}) exceeds basis size {}",
-                self.basis_offset, self.basis_size,
+                "basis range [{}, {}) exceeds basis size {}",
+                self.basis_offset, basis_end, self.basis_size,
             )));
         }
         Ok(vec![self.value_type.with_inserted_dimension(0, Dimension::Static(self.basis_size))?])
@@ -181,6 +179,8 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
         })
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 impl<C> InterpretableOperation<C> for CoordinateBasisOperation<ArrayType>
 where
