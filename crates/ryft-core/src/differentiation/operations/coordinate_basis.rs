@@ -180,12 +180,13 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
-impl<C> InterpretableOperation<C> for CoordinateBasisOperation<ArrayType>
-where
-    C: Domain<Type = ArrayType> + Fill<u64, C::Value> + Iota<C::Value> + One<C::Value> + Zero<C::Value>,
-    C::Value: Add<Output = C::Value> + Mul<Output = C::Value> + Compare<C::Value> + Select,
+impl<
+    C: Domain<Type = ArrayType, Value: Add<Output = C::Value> + Mul<Output = C::Value> + Compare<C::Value> + Select>
+        + One<C::Value>
+        + Zero<C::Value>
+        + Iota<C::Value>
+        + Fill<u64, C::Value>,
+> InterpretableOperation<C> for CoordinateBasisOperation<ArrayType>
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -202,7 +203,7 @@ where
             .ok_or_else(|| {
                 TypeError::invalid(format!(
                     "coordinate basis requires a fully static value type but got {}",
-                    self.value_type
+                    self.value_type,
                 ))
             })?
             .dimensions()
@@ -220,12 +221,7 @@ where
         let mut stride = 1u64;
         for (value_axis, dimension_size) in value_dimensions.iter().copied().enumerate().rev() {
             let coordinate = context.iota(&index_type, value_axis + 1)?;
-            let coordinate = if stride == 1 {
-                coordinate
-            } else {
-                let stride_value = context.fill(&index_type, stride)?;
-                coordinate * stride_value
-            };
+            let coordinate = if stride == 1 { coordinate } else { coordinate * context.fill(&index_type, stride)? };
             flat_coordinate = Some(match flat_coordinate {
                 Some(accumulated) => accumulated + coordinate,
                 None => coordinate,
@@ -238,10 +234,7 @@ where
                     message: format!("coordinate count overflows u64 for value type {}", self.value_type),
                 })?;
         }
-        let mut flat_coordinate = match flat_coordinate {
-            Some(flat_coordinate) => flat_coordinate,
-            None => context.fill(&index_type, 0u64)?,
-        };
+        let mut flat_coordinate = flat_coordinate.map_or_else(|| context.fill(&index_type, 0u64), Ok)?;
         if self.basis_offset != 0 {
             let offset = u64::try_from(self.basis_offset).map_err(|_| ProgramError::InvalidArgument {
                 message: format!("basis offset {} does not fit in u64", self.basis_offset),
@@ -256,6 +249,8 @@ where
         Ok(vec![C::Value::select(&selected, &one, &zero)?])
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 // Keep the dedicated operation intact when batching into a staging parent so that backends can lower the packed basis
 // directly. The generic replicated-nullary rule interprets its operation and would expand this primitive instead.
