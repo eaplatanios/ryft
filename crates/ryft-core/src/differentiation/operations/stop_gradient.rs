@@ -16,12 +16,12 @@ pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 /// [`Operation`] that returns its input unchanged while severing gradient propagation. The `T` parameter fixes the
 /// operation's type universe at construction time, so each zero-sized payload implements exactly one [`Operation`]
 /// contract. Interpretation and backend lowering treat this operation as the identity function. Batching preserves
-/// its mapped axis and rebinds the barrier through the parent transform. The Jacobian-Vector Product (JVP) rule (i.e.,
-/// the [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes the primal through unchanged
+/// its mapped axis and rebinds the barrier through the parent transform. Its Jacobian-Vector Product (JVP) rule (i.e.,
+/// its [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes the primal through unchanged
 /// and replaces the tangent with a structural zero, so that no derivative flows through the marked value in either
-/// forward or reverse automatic differentiation. Because the rule stages only that zero tangent,
-/// [`StopGradientOperation`] can never appear in a valid tangent program, and its
-/// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
+/// forward- or reverse-mode differentiation. Because the rule stages only that zero tangent, [`StopGradientOperation`]
+/// can never appear in a valid tangent program, and its [`TransposableOperation`](crate::TransposableOperation)
+/// implementation reports an error.
 #[derive(Clone, Debug)]
 pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
@@ -61,8 +61,7 @@ impl<T: Type> Operation for StopGradientOperation<T> {
         input_types: &[T],
         _region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
+        Ok(input_types.to_vec())
     }
 }
 
@@ -74,8 +73,7 @@ impl<T: Type, C: Domain<Type = T>> InterpretableOperation<C> for StopGradientOpe
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone()])
+        Ok(inputs.to_vec())
     }
 }
 
@@ -97,6 +95,8 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         // parent context. Rebinding is essential when the parent value is itself a differentiation or batching tracer.
         // That is because treating the packed value as an ordinary interpreted identity would clone that tracer and
         // silently expose its tangent to an enclosing transform.
+        // TODO(eaplatanios): Make this operate over an arbitrary number of inputs and only `check_count!` for `outputs`
+        //  matching the number if `inputs`.
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
