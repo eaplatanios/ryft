@@ -197,16 +197,28 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// `#[ryft(dispatch(...))]` selects the optional transform dispatchers, in any order:
 ///
-/// | Token             | Generated Dispatcher                                        |
-/// | ----------------- | ----------------------------------------------------------- |
-/// | `batching`        | [`BatchableOperation`](crate::BatchableOperation)           |
-/// | `differentiation` | [`DifferentiableOperation`](crate::DifferentiableOperation) |
-/// | `transposition`   | [`TransposableOperation`](crate::TransposableOperation)     |
+/// | Token             | Generated Dispatcher                                                        |
+/// | ----------------- | --------------------------------------------------------------------------- |
+/// | `discharge`       | [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) |
+/// | `batching`        | [`BatchableOperation`](crate::BatchableOperation)                           |
+/// | `differentiation` | [`DifferentiableOperation`](crate::DifferentiableOperation)                 |
+/// | `transposition`   | [`TransposableOperation`](crate::TransposableOperation)                     |
 ///
 /// An empty list, an unknown token, and a repeated token are all compilation errors. Interpretation and partial
 /// evaluation implementations are always generated and therefore never appear in `dispatch(...)`. The selected
 /// dispatchers generate the following per-variant arms:
 ///
+///   - `discharge` delegates native variants to the payload's own
+///     [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) implementation, and replays every
+///     member variant and every bare generic extension variant as the complete enum through
+///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation), which rewrites nothing and
+///     instead rejects an application that carries regions or receives a live reference handle as an operand. The
+///     dispatcher stays generic over the [`ReferenceDischargePolicy`](crate::ReferenceDischargePolicy) it threads,
+///     because a policy names the reference universe being discharged rather than the element universe the family's
+///     values belong to. It also leaves the destination context's constant type free, unlike the interpretation and
+///     partial evaluation implementations, which pin it: no discharge rule reads a constant, and pinning it would
+///     exclude a capture-lifted program, whose constants name its caller's captures rather than carrying the family's
+///     values.
 ///   - `batching` delegates native variants to the payload's own [`BatchableOperation`](crate::BatchableOperation)
 ///     implementation, batches projected variants in either role through
 ///     [`batch_projected_operation`](crate::batch_projected_operation) under the policy projection named by
@@ -304,7 +316,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - A canonical [`OperationProjection<U>`] implementation for every projected member variant, in either role, naming
 ///     that variant's payload family as the enum's projection into `U`. Native and mixed variants do not define a
 ///     homogeneous operation-family projection.
-///   - [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
+///   - [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation),
+///     [`BatchableOperation`](crate::BatchableOperation), [`DifferentiableOperation`](crate::DifferentiableOperation),
 ///     and [`TransposableOperation`](crate::TransposableOperation) dispatchers selected through
 ///     [`#[ryft(dispatch(...))]`](#transform-dispatchers).
 ///   - A [`Display`](std::fmt::Display) implementation that renders through [`Operation::render`] with zero
@@ -339,8 +352,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Generated semantic dispatchers place their required bounds on the participating payloads. Payload-specific
 ///     value and context requirements belong on the payload's own semantic-trait implementation; the enum does not
 ///     duplicate them.
-///   - Batching, differentiation, and transposition require selecting the corresponding dispatcher. Interpretation
-///     and partial evaluation are always generated and therefore do not appear in the `dispatch(...)` attribute.
+///   - Reference discharge, batching, differentiation, and transposition require selecting the corresponding
+///     dispatcher. Interpretation and partial evaluation are always generated and therefore do not appear in the
+///     `dispatch(...)` attribute.
 ///
 /// ## Examples
 ///
@@ -1198,12 +1212,14 @@ mod tests {
     fn test_operation() {
         let operation = StopGradientOperation::<DataType>::new();
 
-        // Check required inference and the default operation contract.
+        // Check required inference and the default operation contract. The fixture operation is variadic,
+        // so its inference forwards every operand type, including for an empty operand list.
         assert_eq!(operation.infer_output_types(&[DataType::F64], &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid("expected 1 input but got 0".to_string())),
+            operation.infer_output_types(&[DataType::F64, DataType::I32], &[]),
+            Ok(vec![DataType::F64, DataType::I32]),
         );
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(Vec::new()));
         let region_interfaces = [
             RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE),
             RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
