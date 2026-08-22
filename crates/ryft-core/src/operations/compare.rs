@@ -5,7 +5,10 @@ use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Broad
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_free_dischargeable_operation,
+};
 use crate::operations::ElementwiseOperation;
 use crate::operations::manipulation::conversion::ElementType;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -188,8 +191,9 @@ where
 {
 }
 
-crate::impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
-crate::impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
+impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Type);
+impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
+impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
 
 /// Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
 /// therefore remain replicated; their Boolean array result is replicated ordinary data.

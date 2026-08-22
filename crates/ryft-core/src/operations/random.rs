@@ -11,7 +11,7 @@ use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingCon
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation};
+use crate::macros::{check_count, impl_non_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -289,6 +289,8 @@ where
     RngBitGeneratorOperation<T>: Operation<Type = T>,
 {
 }
+
+impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 

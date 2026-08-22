@@ -15,7 +15,10 @@ use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_free_dischargeable_operation,
+};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -250,6 +253,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
     for DimensionSizeOperation
 {
 }
+
+impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
 
 /// Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
 /// or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its

@@ -14,7 +14,7 @@ use crate::differentiation::{
     transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -186,6 +186,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
         context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
+
+impl_reference_free_dischargeable_operation!(DynamicBroadcastOperation);
 
 /// Batching rule for [`DynamicBroadcastOperation`]. A mapped input is canonicalized to a leading batch axis, which is
 /// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its

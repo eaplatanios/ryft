@@ -16,7 +16,7 @@ use crate::differentiation::{
     TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
@@ -297,6 +297,8 @@ impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for Dynami
     C::Operation: From<DynamicShapeSliceOperation>
 {
 }
+
+impl_reference_free_dischargeable_operation!(DynamicShapeSliceOperation);
 
 /// Forward-mode rule for [`DynamicShapeSliceOperation`]. The array operand is linear while the first-class starts and
 /// sizes are discrete shape metadata, so the primal and materialized array tangent are sliced with the same geometry.

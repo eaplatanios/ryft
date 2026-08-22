@@ -14,7 +14,9 @@ use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDr
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
+};
 use crate::operations::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -301,6 +303,12 @@ where
     // otherwise residualize the complete custom-VJP call so its forward and backward regions remain attached for a
     // later reverse-mode transformation.
 }
+
+// A custom VJP replays verbatim, for the reason its JVP sibling does: its dormant `forward` and `backward` rule
+// regions would have to define a derivative for a mutation that a user-supplied rule does not describe. The shared
+// reference-free rule copies all three regions across unchanged and rejects the application by name if a reference
+// reaches any of their closures.
+impl_reference_free_dischargeable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
     for CustomVjpOperation<T>
@@ -748,9 +756,15 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType, Dimension, Shape, ShardingDimension};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, Shape,
+        ShardingDimension,
+    };
     use crate::batching::{Batch, BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::operations::tests::{
+        ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
+    };
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
     };
@@ -1010,6 +1024,41 @@ mod tests {
                 if message == "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
                                reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \
                                `jacobian_reverse`)",
+        ));
+    }
+
+    #[test]
+    fn test_custom_vjp_operation_rejects_unresolved_references_in_dormant_rules() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = DifferentiationDual::new(
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+        )
+        .unwrap();
+
+        // Both the forward and backward custom VJP rules are validated even though forward-mode only replays one
+        // rule after the guard succeeds.
+        let primal = array_ir_identity_program(&scalar_type);
+        let forward = nested_custom_derivative_state_program(&scalar_type, false);
+        let backward = array_ir_identity_program(&scalar_type);
+        assert!(forward.effects().is_pure());
+        let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, forward, backward] };
+        assert!(matches!(
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_vjp` rule regions must not contain unresolved state",
+        ));
+
+        let primal = array_ir_identity_program(&scalar_type);
+        let forward = array_ir_identity_program(&scalar_type);
+        let backward = nested_custom_derivative_state_program(&scalar_type, false);
+        assert!(backward.effects().is_pure());
+        let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, forward, backward] };
+        assert!(matches!(
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_vjp` rule regions must not contain unresolved state",
         ));
     }
 

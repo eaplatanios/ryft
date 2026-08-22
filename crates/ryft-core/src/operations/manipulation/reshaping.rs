@@ -15,7 +15,7 @@ use crate::differentiation::{
     transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
@@ -202,6 +202,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
         context.fold_or_residualize(self.clone(), driver.regions().map(|region| region.to_program()).collect(), inputs)
     }
 }
+
+impl_reference_free_dischargeable_operation!(DynamicReshapeOperation);
 
 /// Batching rule for [`DynamicReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped
 /// input is canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and the

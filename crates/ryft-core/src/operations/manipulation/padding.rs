@@ -19,7 +19,7 @@ use crate::differentiation::{
     TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::check_count;
+use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::{One, OneOperation};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -370,6 +370,8 @@ where
     PadOperation<T>: Operation<Type = T>,
 {
 }
+
+impl_reference_free_dischargeable_operation!(<T> PadOperation<T> where T: Type);
 
 /// Forward-mode rule for [`PadOperation`]: `pad` is linear in both the operand and the padding value, so the
 /// tangent pads the operand tangent with the padding-value tangent using the same padding amounts.

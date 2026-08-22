@@ -17,7 +17,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::operations::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
@@ -693,6 +693,8 @@ where
     CustomCallOperation<T>: Operation<Type = T>,
 {
 }
+
+impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
 
 impl_differentiable_operation! {
     <T> CustomCallOperation<T>,

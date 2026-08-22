@@ -6,7 +6,10 @@ use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataT
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_free_dischargeable_operation,
+};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -135,6 +138,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
     for DimensionToScalarOperation
 {
 }
+
+impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
 
 /// Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
 /// stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value

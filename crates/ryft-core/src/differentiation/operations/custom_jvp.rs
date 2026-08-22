@@ -13,7 +13,9 @@ use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDr
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
+};
 use crate::operations::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -245,6 +247,12 @@ where
     // otherwise residualize the complete custom-JVP call so its attached derivative rule remains available to later
     // differentiation.
 }
+
+// A custom JVP replays verbatim. Its primal region could in principle thread state but its dormant `jvp` rule region
+// would then have to carry a derivative for that mutation, which a user-supplied rule does not define, so the shared
+// reference-free rule copies both regions across unchanged and rejects the application by name if a reference reaches
+// either closure.
+impl_reference_free_dischargeable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for CustomJvpOperation<T>
@@ -569,13 +577,17 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayOperation, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
         Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
     };
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::operations::tests::{
+        ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
+    };
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
     use crate::operations::{
         Cos, CosOperation, Dot, DotDimensionNumbers, MulOperation, Reduce, ReductionKind, Sin, SinOperation,
@@ -1007,6 +1019,29 @@ mod tests {
         assert!(matches!(
             result,
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
+        ));
+    }
+
+    #[test]
+    fn test_custom_jvp_operation_rejects_unresolved_references_in_dormant_rules() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = DifferentiationDual::new(
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+        )
+        .unwrap();
+
+        // The custom-JVP guard validates the complete nested rule closure before recursively differentiating it.
+        let primal = array_ir_identity_program(&scalar_type);
+        let jvp = nested_custom_derivative_state_program(&scalar_type, true);
+        assert!(jvp.effects().is_pure());
+        assert!(jvp.entry_region_ref().contains_effect_in_closure(Effect::OrderedState));
+        let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, jvp] };
+        assert!(matches!(
+            CustomJvpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_jvp` rule regions must not contain unresolved state",
         ));
     }
 

@@ -19,7 +19,7 @@ use crate::differentiation::{
     TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -287,6 +287,8 @@ where
     ConcatenateOperation<T>: Operation<Type = T>,
 {
 }
+
+impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
 
 impl_differentiable_operation! {
     ConcatenateOperation<ArrayType>,

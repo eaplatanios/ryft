@@ -15,7 +15,10 @@ use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_differentiable_operation, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
+    impl_reference_free_dischargeable_operation,
+};
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation,
     TransposeOperation,
@@ -206,6 +209,8 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
     for DimensionFromScalarOperation
 {
 }
+
+impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
 
 /// Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary packed
 /// integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to

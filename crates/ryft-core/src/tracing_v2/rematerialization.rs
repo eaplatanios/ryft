@@ -54,7 +54,7 @@ use crate::differentiation::{
     DifferentiationError, ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
+use crate::macros::{check_count, check_types, impl_reference_free_dischargeable_operation};
 use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemoryOperation, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -348,6 +348,11 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::
     C::Operation: From<RematerializeOperation<C::Type>>
 {
 }
+
+// Rematerialization replays verbatim. Recomputing a region is only sound when recomputing it has no observable effect,
+// which a mutation is, so the shared reference-free rule copies its primal region and its three dormant rule regions
+// across unchanged and rejects the application by name if a reference reaches any of their closures.
+impl_reference_free_dischargeable_operation!(<T> RematerializeOperation<T> where T: Type);
 
 /// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
 /// programs through the active context, staging their operations in the shared builder.
