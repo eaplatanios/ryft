@@ -1,7 +1,5 @@
-use std::fmt::{Display, Formatter};
+use std::fmt::Display;
 use std::ops::{Add, Mul};
-
-// TODO(eaplatanios): Review this module.
 
 use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -15,23 +13,46 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
 };
 
-// TODO(eaplatanios): Review this.
+// TODO(eaplatanios): Review from this point onwards.
 
 /// Canonical operation name for [`CoordinateBasisOperation`].
 pub const COORDINATE_BASIS_OPERATION_NAME: &str = "coordinate_basis";
 
-/// Nullary operation that materializes one leaf's fragment of a packed global coordinate basis.
+/// Materializes a value's contribution to the standard basis used to seed packed dense differentiation (e.g.,
+/// [`jacobian_forward`](crate::DifferentiationBuilder::jacobian_forward)). A dense derivative transform logically
+/// flattens all differentiable parameters in its [`Parameterized`](crate::Parameterized) input or output into one
+/// coordinate vector. It could replay the derivative program separately for every standard-basis direction of that
+/// vector. Instead, Ryft packs all directions along a leading array axis and uses batching to replay them together.
+/// Because the structure's parameters remain separate program values, one [`CoordinateBasisOperation`] represents the
+/// portion of that shared basis belonging to one parameter. [`Self::coordinate_offset`] locates the parameter's first
+/// row-major coordinate in the shared vector, and [`Self::basis_size`] is the vector's total coordinate count.
 ///
-/// For a leaf with `n` row-major coordinates, the array specialization produces one value with physical type
-/// `[basis_size] ++ leaf_type.shape`. Global row `k` contains the leaf-local one-hot coordinate
-/// `k - coordinate_offset` when that coordinate belongs to the leaf and zero otherwise. This representation lets a
-/// dense derivative transform replay all structured input or output coordinates in one batching transform.
+/// For an array parameter with shape `S` and `n` elements, this operation returns an array with shape
+/// `[basis_size] ++ S`. Direction `k` contains the parameter-local one-hot value at flattened coordinate
+/// `k - coordinate_offset` when `coordinate_offset <= k < coordinate_offset + n`. It contains zeros when direction
+/// `k` belongs to another parameter. For example, a two-element parameter at offset `0` followed by a scalar parameter
+/// at offset `2` will result in a basis size of `3` and the following coordinate bases:
+///
+/// ```text
+/// two_element_parameter = [[1, 0],
+///                          [0, 1],
+///                          [0, 0]]
+/// scalar_parameter      = [0, 0, 1]
+/// ```
+///
+/// The three leading-axis rows therefore seed the first element, the second element, and the scalar, respectively.
+/// Forward-mode Jacobians use these rows as Jacobian-Vector Product (JVP) tangent inputs, while reverse-mode Jacobians
+/// use them as Vector-Jacobian Product (VJP) cotangent inputs. This operation does not transform coordinates or consume
+/// a primal value. It is nullary because each basis value depends only on its type and coordinate-range attributes.
+/// Keeping basis construction as an explicit operation also lets tracing and Just-In-Time (JIT) compilation backends
+/// preserve it in the program and materialize it directly on the target device instead of requiring a host-provided
+/// constant.
 #[derive(Clone, Debug)]
 pub struct CoordinateBasisOperation<T: Type> {
-    /// Unpacked type of the represented leaf.
+    /// Unpacked tangent or cotangent value type that corresponds to this basis fragment.
     leaf_type: T,
 
-    /// Offset of this leaf's first coordinate in the global packed basis.
+    /// Offset of the corresponding parameter's first coordinate in the global packed basis.
     coordinate_offset: usize,
 
     /// Total number of coordinates in the global packed basis.
@@ -43,7 +64,7 @@ impl<T: Type> CoordinateBasisOperation<T> {
     ///
     /// # Parameters
     ///
-    ///   - `leaf_type`: Unpacked type of the represented leaf.
+    ///   - `leaf_type`: Unpacked tangent or cotangent value type stored in this leaf's basis fragment.
     ///   - `coordinate_offset`: Offset of this leaf's first coordinate in the global packed basis.
     ///   - `basis_size`: Total number of coordinates in the global packed basis.
     #[inline]
@@ -51,7 +72,7 @@ impl<T: Type> CoordinateBasisOperation<T> {
         Self { leaf_type, coordinate_offset, basis_size }
     }
 
-    /// Returns the unpacked type of the represented leaf.
+    /// Returns the unpacked tangent or cotangent value type stored in this leaf's basis fragment.
     #[inline]
     pub fn leaf_type(&self) -> &T {
         &self.leaf_type
@@ -72,7 +93,7 @@ impl<T: Type> CoordinateBasisOperation<T> {
 
 impl<T: Type> Display for CoordinateBasisOperation<T> {
     #[inline]
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         OperationFormatter::new(formatter, 0, COORDINATE_BASIS_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("leaf_type", &self.leaf_type)?;
             operation.field("coordinate_offset", self.coordinate_offset)?;
