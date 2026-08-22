@@ -1,18 +1,16 @@
 //! Differentiation-specific operation families.
 //!
-//! This module owns custom JVP and VJP calls, residual-parameterized linear calls, coordinate-basis construction, and
-//! gradient barriers. Differentiation algorithms and transform contexts remain in the parent module, while the
-//! transform-wide residual-zero protocol is owned separately by `differentiation::zeros`.
+//! This module owns custom JVP and VJP calls, residual-parameterized linear calls, and gradient barriers.
+//! Differentiation algorithms and transform contexts remain in the parent module, while the transform-wide
+//! residual-zero protocol is owned separately by `differentiation::zeros`.
 
 // TODO(eaplatanios): Review this module.
 
-pub mod coordinate_basis;
 pub mod custom_jvp;
 pub mod custom_vjp;
 pub mod linear_call;
 pub mod stop_gradient;
 
-pub use coordinate_basis::{COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOperation};
 pub use custom_jvp::{CUSTOM_JVP_OPERATION_NAME, CustomJvp, CustomJvpOperation, custom_jvp};
 pub use custom_vjp::{CUSTOM_VJP_OPERATION_NAME, CustomVjp, CustomVjpOperation, custom_vjp};
 pub use linear_call::LinearCallOperation;

@@ -166,9 +166,8 @@ pub use forward::{
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
 pub use operations::{
-    COORDINATE_BASIS_OPERATION_NAME, CoordinateBasisOperation, CustomJvp, CustomJvpOperation, CustomVjp,
-    CustomVjpOperation, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
-    StopGradients, custom_jvp, custom_vjp,
+    CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME,
+    StopGradient, StopGradientOperation, StopGradients, custom_jvp, custom_vjp,
 };
 pub use reverse::{
     Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, transpose_mixed_operation,

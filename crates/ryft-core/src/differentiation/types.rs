@@ -1,12 +1,15 @@
+use std::ops::{Add, Mul};
+
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
-use crate::differentiation::operations::CoordinateBasisOperation;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
-use crate::macros::check_count;
-use crate::operations::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, TransposeOperation};
+use crate::operations::{
+    Broadcast, BroadcastOperation, Compare, ComparisonDirection, Fill, Iota, One, Reshape, ReshapeParameters, Select,
+    Slice, Transpose, TransposeOperation, Zero,
+};
 use crate::parameters::ParameterPath;
 use crate::programs::{ProgramError, RegionRef, Type, TypeError, Typed, Value};
 use crate::tracing::TracingContext;
@@ -213,10 +216,27 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ) -> Result<usize, DifferentiationError>;
 
     /// Constructs the portion of a packed global coordinate basis that belongs to one differentiated value.
-    /// If the value occupies `d` coordinates beginning at `basis_offset`, the returned value represents
-    /// `packed_direction_count` directions (i.e., directions in `basis_offset..basis_offset + d` form
-    /// the value's scalar identity basis, while every other direction is zero). `coordinate_type` determines which
+    /// If the value occupies `c` coordinates beginning at `coordinate_offset`, the returned value represents the
+    /// `coordinate_count` standard-basis directions. Directions in `coordinate_offset..coordinate_offset + c` form
+    /// the value's scalar identity basis, while every other direction is zero. `coordinate_type` determines which
     /// coordinates are enumerated, while `value_type` determines the differential values stored in the basis.
+    ///
+    /// For a value with shape `S`, this method returns a physical value with shape `[coordinate_count] ++ S`.
+    /// Its element at `[k, i...]` is one exactly when `k == coordinate_offset + flatten_row_major(i...)`, and zero
+    /// otherwise. For example, a two-element value at offset `0` followed by a scalar value at offset `2` produces
+    /// three packed directions whose two fragments are:
+    ///
+    /// ```text
+    /// two_element_value = [[1, 0],
+    ///                      [0, 1],
+    ///                      [0, 0]]
+    /// scalar_value      = [0, 0, 1]
+    /// ```
+    ///
+    /// Forward-mode Jacobians use these values as packed Jacobian-Vector Product (JVP) tangents, while reverse-mode
+    /// Jacobians use them as packed Vector-Jacobian Product (VJP) cotangents. Implementations construct the basis
+    /// through ordinary context/value capabilities so a staging context records the constituent operations directly
+    /// in the surrounding program.
     ///
     /// # Parameters
     ///
@@ -224,14 +244,14 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ///   - `coordinate_type`: Type whose finite coordinate space is being enumerated.
     ///   - `value_type`: Type of the basis values. Forward bases use the primal tangent type,
     ///     while reverse bases use the coordinate type's cotangent type.
-    ///   - `basis_offset`: Index of the first packed direction belonging to `coordinate_type`.
-    ///   - `packed_direction_count`: Number of coordinate directions packed across the differentiated structure.
+    ///   - `coordinate_offset`: Index of `coordinate_type`'s first coordinate in the global coordinate space.
+    ///   - `coordinate_count`: Total number of coordinates across the differentiated structure.
     fn coordinate_basis(
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
-        basis_offset: usize,
-        packed_direction_count: usize,
+        coordinate_offset: usize,
+        coordinate_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError>;
 
     /// Wraps an ordinary value as a packed replay value that is shared unchanged by every packed coordinate direction.
@@ -339,10 +359,17 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
 
 impl<C: Context<Type = ArrayType>> DenseDifferentiableType<C> for ArrayType
 where
-    C::Value: Broadcast + Reshape + Slice + Transpose,
+    C: One<C::Value> + Zero<C::Value> + Iota<C::Value> + Fill<u64, C::Value>,
+    C::Value: Add<Output = C::Value>
+        + Mul<Output = C::Value>
+        + Compare<C::Value>
+        + Select
+        + Broadcast
+        + Reshape
+        + Slice
+        + Transpose,
     C::Operation: BatchableOperation<C, ArrayBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
-        + From<CoordinateBasisOperation<ArrayType>>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
@@ -377,8 +404,8 @@ where
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
-        basis_offset: usize,
-        packed_direction_count: usize,
+        coordinate_offset: usize,
+        coordinate_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError> {
         if coordinate_type.shape() != value_type.shape() {
             return Err(TypeError::invalid(format!(
@@ -386,14 +413,124 @@ where
             ))
             .into());
         }
-        let expected_type = value_type.with_inserted_dimension(0, Dimension::Static(packed_direction_count))?;
-        let mut outputs = context.bind(
-            CoordinateBasisOperation::new(value_type.clone(), basis_offset, packed_direction_count),
-            Vec::new(),
-            &[],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        let value = outputs.remove(0);
+        let cotangent_data_type = value_type.data_type().cotangent()?;
+        if cotangent_data_type.is_zero_space() {
+            return Err(TypeError::invalid(format!(
+                "coordinate basis requires a differentiable value type but got {value_type}",
+            ))
+            .into());
+        }
+        if cotangent_data_type != value_type.data_type() {
+            return Err(TypeError::invalid(format!(
+                "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
+                value_type,
+                value_type.clone().with_data_type(cotangent_data_type),
+            ))
+            .into());
+        }
+        let value_dimensions = value_type.static_shape().ok_or_else(|| {
+            TypeError::invalid(format!("coordinate basis requires a fully static value type but got {value_type}"))
+        })?;
+        let value_coordinate_count = if value_dimensions.dimensions().contains(&0) {
+            0
+        } else {
+            value_dimensions.dimensions().iter().copied().try_fold(1usize, |count, size| {
+                count.checked_mul(size).ok_or_else(|| {
+                    TypeError::invalid(format!("coordinate count overflows usize for value type {value_type}"))
+                })
+            })?
+        };
+        let coordinate_end = coordinate_offset.checked_add(value_coordinate_count).ok_or_else(|| {
+            TypeError::invalid(format!("coordinate range overflows usize for value type {value_type}"))
+        })?;
+        if coordinate_end > coordinate_count {
+            return Err(TypeError::invalid(format!(
+                "coordinate range [{coordinate_offset}, {coordinate_end}) exceeds coordinate count {coordinate_count}",
+            ))
+            .into());
+        }
+
+        // TODO(eaplatanios): Review this portion.
+        let expected_type = value_type.with_inserted_dimension(0, Dimension::Static(coordinate_count))?;
+        let value = if value_coordinate_count == 0 {
+            context.zero(&expected_type)?
+        } else {
+            // Prefer a rank-independent rectangular identity fragment. Plan both reshapes before emitting values so
+            // this path is used only when flattening preserves the exact output placement and layout type.
+            let rectangular_shape =
+                Shape::new(vec![Dimension::Static(coordinate_count), Dimension::Static(value_coordinate_count)]);
+            let rectangular_type = if expected_type.layout().is_none() {
+                match expected_type.reshape(rectangular_shape) {
+                    Ok(rectangular_type) => Some(rectangular_type),
+                    Err(_reshape_error) => None,
+                }
+            } else {
+                None
+            };
+            let rectangular_plan = rectangular_type.and_then(|rectangular_type| {
+                let output_reshape_parameters =
+                    if expected_type.sharding().is_some_and(|sharding| sharding.references_auto_axis()) {
+                        ReshapeParameters::new(expected_type.shape().clone())
+                    } else {
+                        ReshapeParameters::new(expected_type.shape().clone())
+                            .with_output_sharding(expected_type.sharding().cloned())
+                    };
+                rectangular_type
+                    .reshape(output_reshape_parameters.clone())
+                    .is_ok_and(|restored_type| restored_type == expected_type)
+                    .then_some((rectangular_type, output_reshape_parameters))
+            });
+            if let Some((rectangular_type, output_reshape)) = rectangular_plan {
+                let index_type = rectangular_type.clone().with_data_type(DataType::U64);
+                let direction_index = context.iota(&index_type, 0)?;
+                let mut value_coordinate_index = context.iota(&index_type, 1)?;
+                if coordinate_offset != 0 {
+                    let offset = u64::try_from(coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
+                        message: format!("coordinate offset {coordinate_offset} does not fit in u64"),
+                    })?;
+                    value_coordinate_index = value_coordinate_index + context.fill(&index_type, offset)?;
+                }
+                let selected = direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
+                let zero = context.zero(&rectangular_type)?;
+                let one = context.one(&rectangular_type)?;
+                C::Value::select(&selected, &one, &zero)?.reshape(output_reshape)?
+            } else {
+                // Flattening is not a placement-preserving reshape for every explicit layout or non-contiguous and
+                // unconstrained sharding. Construct the same row-major coordinates directly in the output shape.
+                let index_type = expected_type.clone().with_data_type(DataType::U64);
+                let direction_index = context.iota(&index_type, 0)?;
+                let mut flat_coordinate = None;
+                let mut stride = 1u64;
+                for (value_axis, dimension_size) in value_dimensions.dimensions().iter().copied().enumerate().rev() {
+                    let coordinate = context.iota(&index_type, value_axis + 1)?;
+                    let coordinate =
+                        if stride == 1 { coordinate } else { coordinate * context.fill(&index_type, stride)? };
+                    flat_coordinate = Some(match flat_coordinate {
+                        Some(accumulated) => accumulated + coordinate,
+                        None => coordinate,
+                    });
+                    stride = stride
+                        .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
+                            message: format!("value dimension {dimension_size} does not fit in u64"),
+                        })?)
+                        .ok_or_else(|| ProgramError::InvalidArgument {
+                            message: format!("coordinate count overflows u64 for value type {value_type}"),
+                        })?;
+                }
+                let mut flat_coordinate = flat_coordinate.map_or_else(|| context.fill(&index_type, 0u64), Ok)?;
+                if coordinate_offset != 0 {
+                    let offset = u64::try_from(coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
+                        message: format!("coordinate offset {coordinate_offset} does not fit in u64"),
+                    })?;
+                    flat_coordinate = flat_coordinate + context.fill(&index_type, offset)?;
+                }
+                let selected = direction_index.compare(&flat_coordinate, ComparisonDirection::Equal)?;
+                let one = context.one(&expected_type)?;
+                let zero = context.zero(&expected_type)?;
+                C::Value::select(&selected, &one, &zero)?
+            }
+        };
+
         if value.r#type().as_ref() != &expected_type {
             return Err(TypeError::invalid(format!(
                 "coordinate basis for value type {} has type {} but expected {}",
@@ -403,6 +540,7 @@ where
             ))
             .into());
         }
+
         Ok(ArrayBatch::new(value, Some(0)).map_err(ProgramError::from)?)
     }
 
@@ -660,11 +798,12 @@ mod tests {
     use crate::arrays::DataType::*;
     use crate::arrays::{
         Array, ArrayBatch, ArrayOperation, ArrayType, Dimension, DimensionBounds, DimensionVariable, Layout,
-        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f6e2m3fn,
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
-    use crate::programs::ReferenceType;
+    use crate::programs::{Operation, ReferenceType};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -948,6 +1087,131 @@ mod tests {
                 1,
             )
             .unwrap();
+        assert_eq!(basis.unbatched_type(), value_type);
+    }
+
+    #[test]
+    fn test_dense_array_coordinate_basis_materializes_packed_fragments() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+
+        // A rank-two value with a nonzero global coordinate offset exercises the rectangular two-iota path.
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &value_type, &value_type, 1, 8)
+                .unwrap();
+        let expected =
+            (0..48).map(|index| if index / 6 == index % 6 + 1 { 1.0f32 } else { 0.0f32 }).collect::<Vec<_>>();
+        assert_eq!(basis.value().elements::<f32>().unwrap(), expected);
+        assert_eq!(basis.value().r#type().as_ref().static_shape().unwrap().dimensions(), &[8, 2, 3]);
+        assert_eq!(basis.batch_axis(), BatchAxis::new(0));
+
+        // Low-precision differential values retain their exact typed zero/one encodings.
+        let value_type = ArrayType::new(F6E2M3FN, Shape::new(vec![Dimension::Static(2)]));
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &value_type, &value_type, 1, 4)
+                .unwrap();
+        let zero = f6e2m3fn::from_bits(0).unwrap();
+        let one = f6e2m3fn::from_bits(0x08).unwrap();
+        assert_eq!(basis.value().elements::<f6e2m3fn>().unwrap(), vec![zero, zero, one, zero, zero, one, zero, zero]);
+    }
+
+    #[test]
+    fn test_dense_array_coordinate_basis_preserves_non_contiguous_sharding() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap(),
+            )
+            .unwrap();
+        let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &value_type,
+            &value_type,
+            0,
+            6,
+        )
+        .unwrap();
+        let expected = (0..36).map(|index| if index / 6 == index % 6 { 1.0f32 } else { 0.0f32 }).collect::<Vec<_>>();
+        assert_eq!(basis.value().elements::<f32>().unwrap(), expected);
+        assert_eq!(basis.unbatched_type(), value_type);
+    }
+
+    #[test]
+    fn test_dense_array_coordinate_basis_stages_ordinary_primitives() {
+        type ArrayTracingContext = TracingContext<Array, ArrayOperation<Array>>;
+
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let (_, program) = ArrayTracingContext::trace(
+            |input| {
+                let context = input.context().clone();
+                <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &value_type, &value_type, 0, 6)
+                    .map(ArrayBatch::into_value)
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
+            },
+            ArrayType::scalar(F32),
+        )
+        .unwrap();
+
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["iota", "iota", "compare", "one", "zero", "select", "reshape"],
+        );
+    }
+
+    #[test]
+    fn test_dense_array_coordinate_basis_validates_its_coordinate_range() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let boolean_type = ArrayType::scalar(Boolean);
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &boolean_type, &boolean_type, 0, 1,)
+                .unwrap_err()
+                .to_string(),
+            "coordinate basis requires a differentiable value type but got bool[]",
+        );
+
+        let narrow_type = ArrayType::scalar(F8E8M0FNU);
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &narrow_type, &narrow_type, 0, 1,)
+                .unwrap_err()
+                .to_string(),
+            "coordinate basis values of type f8e8m0fnu[] cannot represent their own cotangents; use f32[] instead",
+        );
+
+        let dynamic_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
+        );
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &dynamic_type, &dynamic_type, 0, 1,)
+                .unwrap_err()
+                .to_string(),
+            "coordinate basis requires a fully static value type but got f32[dynamic]",
+        );
+
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
+        assert_eq!(
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &value_type, &value_type, 2, 4,)
+                .unwrap_err()
+                .to_string(),
+            "coordinate range [2, 5) exceeds coordinate count 4",
+        );
+    }
+
+    #[test]
+    fn test_dense_array_coordinate_basis_handles_zero_sized_values_without_coordinate_overflow() {
+        let value_type = ArrayType::new(
+            F32,
+            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(usize::MAX), Dimension::Static(0)]),
+        );
+        let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &value_type,
+            &value_type,
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(basis.value().elements::<f32>().unwrap().is_empty());
         assert_eq!(basis.unbatched_type(), value_type);
     }
 
