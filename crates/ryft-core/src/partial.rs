@@ -1115,6 +1115,10 @@ impl<C: Context> PartialEvaluationContext<C> {
         C::Operation:
             PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
     {
+        // This replay loop and `Context::bind` are the only two production paths into partial evaluation rules, so
+        // rejecting unresolved state and references once over the complete entering closure here (with
+        // `fold_or_residualize` and `residualize` retaining their own gates as direct invocation defense) covers all
+        // higher-order operations centrally, including future ones that would otherwise each need a per-rule preamble.
         if let Some(occurrence) = region.effect_occurrences_in_closure(Effect::OrderedState).next() {
             // TODO(eaplatanios): Aggregate all effect occurrences into one diagnostic once `ProgramError` supports
             //  multi-diagnostic reporting.
@@ -1137,11 +1141,6 @@ impl<C: Context> PartialEvaluationContext<C> {
             |_, constant| Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant.clone())?)),
             |instruction, inputs| {
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                // This replay loop and `Context::bind` are the only two production paths into partial-evaluation rules,
-                // so gating every replayed instruction here (with `fold_or_residualize` retaining its own gate as
-                // direct-invocation defense) covers all higher-order operations centrally (including future ones that
-                // would otherwise each have to remember a per-rule preamble).
-                self.validate_no_unresolved_references_or_state(instruction.operation(), inputs, regions.regions())?;
                 let driver = RecursivePartialEvaluationDriver { driver: &regions };
                 instruction.operation().partially_evaluate(self, &driver, inputs)
             },
@@ -1726,22 +1725,6 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
         }
 
-        if let Some(occurrence) = self.effect_occurrences_in_closure(Effect::OrderedState).next() {
-            // TODO(eaplatanios): Aggregate all effect occurrences into one diagnostic once `ProgramError` supports
-            //  multi-diagnostic reporting.
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` must be discharged before partial evaluation", occurrence.operation().name()),
-            });
-        }
-
-        if inputs.iter().any(|input| input.r#type().is_reference())
-            || self.contains_atom_type_in_closure(Type::is_reference)
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before partial evaluation".to_string(),
-            });
-        }
-
         let context = PartialEvaluationContext::new(context.clone());
         let mut seed = Vec::with_capacity(inputs.len());
         for (index, knowledge) in inputs.iter().enumerate() {
@@ -1934,18 +1917,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayTracingContext, ArrayType, DataType,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayTracingContext,
+        ArrayType, DataType,
     };
     use crate::contexts::{Context, StagingContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, ConditionOperation, ConstantOperation, MulOperation, NegOperation, PrintOperation, SinOperation,
-        Zero,
+        AddOperation, ConditionOperation, ConstantOperation, FreezeReference, FreezeReferenceOperation, MulOperation,
+        NegOperation, NewReference, NewReferenceOperation, PrintOperation, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceIndexOperation, ScanOperation, SinOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Concretizable, Effects, ProgramBuilder, ProgramError, Reference, ReferenceType, RegionInterface,
-        RegionSlot,
+        AtomId, Concretizable, Effects, ProgramBuilder, ProgramError, ReferenceType, RegionInterface, RegionSlot,
     };
 
     use super::*;
@@ -2468,7 +2452,7 @@ mod tests {
         let array_passthrough = array_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let concrete_reference = TestValue::Reference(Reference::new(Array::scalar(1.0_f32)));
+        let concrete_reference = TestValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
         assert_eq!(
             array_passthrough.partially_evaluate(&[PartialValue::Known(concrete_reference.clone())]).map(|_| ()),
             Err(expected.clone()),
@@ -2480,6 +2464,20 @@ mod tests {
 
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
         let unknown_reference = context.unknown_input(reference_type, 0);
+
+        // A reference-view operation is pure, so it never reaches the ordered-state rejection above. The
+        // reference-typed operand itself is what the operation-named diagnostic reports at the fold boundary.
+        assert!(matches!(
+            context.fold_or_residualize(
+                TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0)),
+                Vec::new(),
+                std::slice::from_ref(&unknown_reference),
+            ),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`reference_index` consumes unresolved references and must be discharged before \
+                    partial evaluation",
+        ));
+
         let observer = context.clone();
         assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(expected.clone()));
         let builder = observer.builder.borrow();
@@ -2512,6 +2510,119 @@ mod tests {
         assert!(builder.input_ids().is_empty());
         assert!(builder.instructions().is_empty());
         assert_eq!(builder.regions.len(), 1);
+    }
+
+    #[test]
+    fn test_partial_evaluation_with_local_references_discharges_before_transforming() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+        type TestContext = TracingContext<TestValue, TestOperation>;
+
+        let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let (_, source) = TestContext::trace(
+            |input| {
+                let reference = input.new_reference()?;
+                reference.add_update(&input)?;
+                reference.freeze()
+            },
+            input_type.clone(),
+        )
+        .unwrap();
+        let source = source.to_flat_program();
+
+        // Partial evaluation itself has no reference rules, so the ordinary entry point rejects the allocation
+        // instead of silently folding state; discharge is the caller's explicit choice.
+        assert!(matches!(
+            source.partially_evaluate(&[PartialValue::Known(TestValue::Array(Array::scalar(3.0_f32)))]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`new_reference` must be discharged before partial evaluation",
+        ));
+
+        // With the reference discharged, an all-known input folds the accumulation completely on the host.
+        let evaluation = source
+            .clone()
+            .partially_evaluate_with_local_references(
+                0,
+                &[PartialValue::Known(TestValue::Array(Array::scalar(3.0_f32)))],
+            )
+            .unwrap();
+        assert!(!evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert!(evaluation.program().effects().is_pure());
+        assert!(matches!(
+            evaluation.outputs(),
+            [PartialEvaluationOutput::Known(TestValue::Array(output))] if output == &Array::scalar(6.0_f32),
+        ));
+
+        // The live-context entry point residualizes the same discharged program against an outer trace, so the
+        // staged residual is pure, reference-free, and reproduces the eager result when interpreted.
+        let tracing_context = TestContext::new();
+        let staged_evaluation = source
+            .clone()
+            .partially_evaluate_with_local_references_in_context(
+                &tracing_context,
+                0,
+                &[PartialValue::Unknown(input_type.clone())],
+            )
+            .unwrap();
+        assert!(!staged_evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert!(staged_evaluation.program().effects().is_pure());
+        assert_eq!(
+            staged_evaluation.program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]).unwrap(),
+            vec![TestValue::Array(Array::scalar(6.0_f32))],
+        );
+
+        // Partitioning the same discharged program against an entirely unknown boundary leaves both halves pure and
+        // reference-free, with the whole accumulation in the residual program.
+        let partition = source.partition_with_local_references(0, &[false]).unwrap();
+        assert!(partition.known_program.effects().is_pure());
+        assert!(partition.residual_program.effects().is_pure());
+        assert!(!partition.known_program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert!(!partition.residual_program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert_eq!(
+            partition.residual_program.interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]).unwrap(),
+            vec![TestValue::Array(Array::scalar(6.0_f32))],
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_with_local_references_across_scan() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
+        let body = builder.import_region(body.entry_region_ref());
+        let reference =
+            builder.add_instruction(ScanOperation::<TestValue>::new(1, 3), vec![body], vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Discharge turns the scan's mutated reference into an ordinary carry before partial evaluation runs, so an
+        // unknown boundary residualizes the whole three-iteration loop as a pure reference-free program.
+        let evaluation = source
+            .partially_evaluate_with_local_references(0, &[PartialValue::Unknown(array_type.into())])
+            .unwrap();
+        assert!(evaluation.program().effects().is_pure());
+        assert!(!evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert_eq!(
+            evaluation.program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(6.0_f32))]),
+        );
     }
 
     #[test]
