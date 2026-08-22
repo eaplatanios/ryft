@@ -417,8 +417,7 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::ForwardModeDifferentiate;
-    use crate::differentiation::StopGradientOperation;
+    use crate::differentiation::{ForwardModeDifferentiate, StopGradientOperation};
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,

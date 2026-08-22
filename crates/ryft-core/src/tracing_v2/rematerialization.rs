@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayIrType, ArrayType, Memory, ReferenceDischargeOperation};
+use crate::arrays::{ArrayType, Memory};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -59,8 +59,8 @@ use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemo
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, InstructionId, Operation, OperationFormatter, Program, ProgramBuilder, ProgramError, Region,
-    RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    Atom, AtomId, InstructionId, Operation, OperationFormatter, Program, ProgramBuilder, ProgramError,
+    ReferenceDischarge, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -1964,15 +1964,16 @@ where
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
-    V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    V: Value,
+    O: Operation<Type = V::Type>,
+    Self: ReferenceDischarge<DischargedProgram = Self>,
 {
-    /// Builds a rematerialized flat-vector function after discharging every local reference into immutable array
-    /// state. External reference inputs and captures are rejected because rematerialization has no caller-visible
-    /// state write-back contract. The returned wrapper delegates derivation, caching, policy selection, and
-    /// `prevent_cse` behavior to the ordinary [`Rematerialize`] implementation. `capture_count` classifies leading
-    /// boundary inputs that have already been lifted; this ordinary-value adapter does not accept capture-reference
-    /// constants retained in attached regions.
+    /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
+    /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible
+    /// state write-back contract; ordinary non-reference captures remain valid. The returned wrapper delegates
+    /// derivation, caching, policy selection, and `prevent_cse` behavior to the ordinary [`Rematerialize`]
+    /// implementation. `capture_count` classifies leading boundary inputs that have already been lifted; this
+    /// ordinary-value adapter does not accept capture-reference constants retained in attached regions.
     ///
     /// # Parameters
     ///
@@ -1990,7 +1991,7 @@ where
         ProgramError,
     >
     where
-        D: Context<Type = ArrayIrType, Constant = V, Operation = O>,
+        D: Context<Type = V::Type, Constant = V, Operation = O>,
     {
         let program = self.discharge_local_references(capture_count, "rematerialization")?;
         Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
@@ -2314,12 +2315,12 @@ mod tests {
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
-    use crate::operations::{
-        Cos, Dot, DotDimensionNumbers, FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, Sin, Tag,
-    };
+    use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Effect, ReferenceType, RegionRole};
+    use crate::programs::{
+        Effect, FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType, RegionRole,
+    };
     use crate::tests::TestOrderedStateOperation;
 
     use super::*;
@@ -2407,6 +2408,10 @@ mod tests {
     fn vector_type(size: usize) -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
     }
+
+    type ReferenceTestValue = ArrayIrValue<Array>;
+    type ReferenceTestOperation = ArrayIrOperation<Array>;
+    type ReferenceTestContext = EagerContext<ReferenceTestValue, ReferenceTestOperation>;
 
     #[test]
     fn test_rematerialize_effects_only_include_the_primal_region() {
@@ -4160,19 +4165,21 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialization_accepts_local_references_only_after_whole_program_discharge() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-        type TestContext = EagerContext<TestValue, TestOperation>;
-
+    fn test_program_rematerialize_with_local_references() {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let input = builder.add_input(scalar_type);
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![input]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, input]).unwrap();
-        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
 
         // Before discharge, simplification retains the complete ordered state chain and generic rematerialization
@@ -4181,12 +4188,12 @@ mod tests {
         let pre_discharge = source.simplified().unwrap();
         assert_eq!(pre_discharge.instructions().len(), 3);
         assert!(pre_discharge.effects().contains(Effect::OrderedState));
-        let unresolved = rematerialize::<TestContext, _, _, _>(|input: DomainTracer<TestContext>| {
+        let unresolved = rematerialize::<ReferenceTestContext, _, _, _>(|input: DomainTracer<ReferenceTestContext>| {
             let reference = input.new_reference()?;
             reference.add_update(&input)?;
             reference.freeze()
         });
-        let unresolved_context = TracingContext::<TestValue, TestOperation>::new();
+        let unresolved_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let unresolved_input = unresolved_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         assert!(matches!(
             unresolved.call(unresolved_input),
@@ -4194,8 +4201,8 @@ mod tests {
                 if message == "program carries unresolved state and must be discharged before differentiation",
         ));
 
-        let rematerialized = source.rematerialize_with_local_references::<TestContext>(0).unwrap();
-        let wrong_context = TracingContext::<TestValue, TestOperation>::new();
+        let rematerialized = source.rematerialize_with_local_references::<ReferenceTestContext>(0).unwrap();
+        let wrong_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let wrong_input = wrong_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         assert!(matches!(
             rematerialized.call(vec![wrong_input]),
@@ -4203,7 +4210,7 @@ mod tests {
                 if message == "encountered input type bool[] which is incompatible with the program's declared type \
                     f32[]",
         ));
-        let (_, staged) = TracingContext::<TestValue, TestOperation>::trace(
+        let (_, staged) = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::trace(
             |input| {
                 let mut outputs = rematerialized.call(vec![input])?;
                 Ok(outputs.pop().unwrap())
@@ -4211,13 +4218,13 @@ mod tests {
             ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
         )
         .unwrap();
-        assert!(matches!(staged.instructions()[0].operation(), TestOperation::Rematerialize(_)));
+        assert!(matches!(staged.instructions()[0].operation(), ReferenceTestOperation::Rematerialize(_)));
         assert_eq!(
-            staged.interpret(TestValue::Array(Array::scalar(3.0_f32))),
-            Ok(TestValue::Array(Array::scalar(6.0_f32))),
+            staged.interpret(ReferenceTestValue::Array(Array::scalar(3.0_f32))),
+            Ok(ReferenceTestValue::Array(Array::scalar(6.0_f32))),
         );
 
-        let (_, repeated) = TracingContext::<TestValue, TestOperation>::trace(
+        let (_, repeated) = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::trace(
             |input| {
                 let mut outputs = rematerialized.call(vec![input])?;
                 Ok(outputs.pop().unwrap())
@@ -4227,54 +4234,53 @@ mod tests {
         .unwrap();
         assert_eq!(repeated.to_string(), staged.to_string());
 
-        let domain = TestContext::new();
+        let domain = ReferenceTestContext::new();
         let (primal, tangent) = domain
             .jvp(
                 |input, ()| {
                     let mut outputs = rematerialized.call(vec![input])?;
                     Ok(outputs.pop().unwrap())
                 },
-                TestValue::Array(Array::scalar(3.0_f32)),
-                TestValue::Array(Array::scalar(1.0_f32)),
+                ReferenceTestValue::Array(Array::scalar(3.0_f32)),
+                ReferenceTestValue::Array(Array::scalar(1.0_f32)),
                 (),
             )
             .unwrap();
-        assert_eq!(primal, TestValue::Array(Array::scalar(6.0_f32)));
-        assert_eq!(tangent, TestValue::Array(Array::scalar(2.0_f32)));
+        assert_eq!(primal, ReferenceTestValue::Array(Array::scalar(6.0_f32)));
+        assert_eq!(tangent, ReferenceTestValue::Array(Array::scalar(2.0_f32)));
         let (_, pullback) = domain
             .vjp(
                 |input, ()| {
                     let mut outputs = rematerialized.call(vec![input])?;
                     Ok(outputs.pop().unwrap())
                 },
-                TestValue::Array(Array::scalar(3.0_f32)),
+                ReferenceTestValue::Array(Array::scalar(3.0_f32)),
                 (),
             )
             .unwrap();
         assert_eq!(
-            pullback.apply(TestValue::Array(Array::scalar(4.0_f32))).unwrap(),
-            TestValue::Array(Array::scalar(8.0_f32)),
+            pullback.apply(ReferenceTestValue::Array(Array::scalar(4.0_f32))).unwrap(),
+            ReferenceTestValue::Array(Array::scalar(8.0_f32)),
         );
     }
 
     #[test]
-    fn test_rematerialization_with_local_references_rejects_external_roots() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-        type TestContext = EagerContext<TestValue, TestOperation>;
-
+    fn test_program_rematerialize_with_local_references_rejects_external_roots() {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let reference = builder.add_input(reference_type);
-        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let external = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
 
-        // Routing pin only: delegates to the shared discharge gate (owner tests in `arrays::reference_discharge`)
-        // under the `rematerialization` transform name.
+        // External holders require runtime state plumbing that rematerialization does not own.
         assert!(matches!(
-            external.rematerialize_with_local_references::<TestContext>(0),
+            external.rematerialize_with_local_references::<ReferenceTestContext>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "rematerialization supports only local references, but the program uses external \
                     `public input 0`",

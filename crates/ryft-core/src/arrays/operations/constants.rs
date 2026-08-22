@@ -287,10 +287,9 @@ mod tests {
         StagedFunction, try_jit,
     };
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
-    use crate::differentiation::StopGradientOperation;
     use crate::differentiation::{
         DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
-        TransposableOperation, differentiate_at,
+        StopGradientOperation, TransposableOperation, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
