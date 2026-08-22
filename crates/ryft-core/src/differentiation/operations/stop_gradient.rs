@@ -91,18 +91,21 @@ impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayTyp
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        // Batching preserves the operand's mapped axis while recursively rebinding the gradient barrier through the
-        // parent context. Rebinding is essential when the parent value is itself a differentiation or batching tracer.
-        // That is because treating the packed value as an ordinary interpreted identity would clone that tracer and
-        // silently expose its tangent to an enclosing transform.
-        // TODO(eaplatanios): Make this operate over an arbitrary number of inputs and only `check_count!` for `outputs`
-        //  matching the number if `inputs`.
-        check_count!("input", inputs, 1, ProgramError);
-        let input = &inputs[0];
-        let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(input.value()))?;
-        check_count!("output", outputs, 1, ProgramError);
-        let output = outputs.remove(0);
-        Ok(vec![ArrayBatch::new(output, input.batch_axis())?].into())
+        // Batching preserves every operand's batch metadata while recursively rebinding the gradient barrier through
+        // the parent context. Rebinding is essential when a packed value is itself a differentiation or batching
+        // tracer, because treating it as an interpreted identity would silently expose its tangent to an enclosing
+        // transform.
+        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let output_values = context.parent().bind(self.clone(), Vec::new(), input_values.as_slice())?;
+        check_count!("output", output_values, inputs.len(), ProgramError);
+        let outputs = output_values
+            .into_iter()
+            .zip(inputs)
+            .map(|(output, input)| {
+                ArrayBatch::new(output, input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        Ok(outputs.into())
     }
 }
 
