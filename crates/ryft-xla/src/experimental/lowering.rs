@@ -7181,8 +7181,8 @@ where
 {
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
-    let leaf_dimensions = operation
-        .leaf_type()
+    let value_dimensions = operation
+        .value_type()
         .shape()
         .dimensions()
         .iter()
@@ -7190,17 +7190,17 @@ where
             Dimension::Static(dimension_size) => Ok(*dimension_size),
             Dimension::Dynamic(_) => Err(ProgramError::InvalidArgument {
                 message: format!(
-                    "coordinate basis requires a fully static leaf type but got {}",
-                    operation.leaf_type(),
+                    "coordinate basis requires a fully static value type but got {}",
+                    operation.value_type(),
                 ),
             }),
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // A zero-sized leaf contributes no local coordinates. Lowering its fragment directly as a typed empty zero avoids
+    // A zero-sized value contributes no local coordinates. Lowering its fragment directly as a typed empty zero avoids
     // constructing irrelevant row-major index arithmetic and, in particular, makes stride computation independent of
     // where the zero-sized dimension occurs.
-    if leaf_dimensions.contains(&0) {
+    if value_dimensions.contains(&0) {
         return lower_constant_output(output_types, 0, block, context, location);
     }
 
@@ -7209,12 +7209,12 @@ where
     let basis_index = block.append_operation(stable_hlo::iota(index_tensor_type, 0, location)?)?;
     let basis_index = basis_index.result(0).expect("stablehlo.iota should return one result").as_ref();
 
-    // Compute each leaf element's row-major flat coordinate in the physical `[basis] ++ leaf_shape` tensor. Keeping
+    // Compute each value element's row-major flat coordinate in the physical `[basis] ++ value_shape` tensor. Keeping
     // all index arithmetic in u64 preserves exact coordinates throughout the generated graph.
     let mut flat_coordinate = None;
     let mut stride = 1u64;
-    for (leaf_axis, dimension_size) in leaf_dimensions.iter().copied().enumerate().rev() {
-        let coordinate = block.append_operation(stable_hlo::iota(index_tensor_type, leaf_axis + 1, location)?)?;
+    for (value_axis, dimension_size) in value_dimensions.iter().copied().enumerate().rev() {
+        let coordinate = block.append_operation(stable_hlo::iota(index_tensor_type, value_axis + 1, location)?)?;
         let coordinate = coordinate.result(0).expect("stablehlo.iota should return one result").as_ref();
         let coordinate = if stride == 1 {
             coordinate
@@ -7233,19 +7233,19 @@ where
         });
         stride = stride
             .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
-                message: format!("leaf dimension {dimension_size} does not fit in u64"),
+                message: format!("value dimension {dimension_size} does not fit in u64"),
             })?)
             .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!("coordinate count overflows u64 for leaf type {}", operation.leaf_type()),
+                message: format!("coordinate count overflows u64 for value type {}", operation.value_type()),
             })?;
     }
     let mut flat_coordinate = match flat_coordinate {
         Some(flat_coordinate) => flat_coordinate,
         None => lower_u64_constant_splat(0, &index_type, index_tensor_type, block, context, location)?,
     };
-    if operation.coordinate_offset() != 0 {
-        let offset = u64::try_from(operation.coordinate_offset()).map_err(|_| ProgramError::InvalidArgument {
-            message: format!("coordinate offset {} does not fit in u64", operation.coordinate_offset()),
+    if operation.basis_offset() != 0 {
+        let offset = u64::try_from(operation.basis_offset()).map_err(|_| ProgramError::InvalidArgument {
+            message: format!("basis offset {} does not fit in u64", operation.basis_offset()),
         })?;
         let offset = lower_u64_constant_splat(offset, &index_type, index_tensor_type, block, context, location)?;
         let sum = block.append_operation(stable_hlo::add(flat_coordinate, offset, location)?)?;
@@ -9756,12 +9756,12 @@ mod tests {
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
-    /// Builds a nullary callee that materializes one scalar leaf's fragment of a packed coordinate basis.
-    fn xla_coordinate_basis_callee(coordinate_offset: usize) -> Arc<FlatXlaProgram> {
+    /// Builds a nullary callee that materializes one scalar value's fragment of a packed coordinate basis.
+    fn xla_coordinate_basis_callee(basis_offset: usize) -> Arc<FlatXlaProgram> {
         let mut builder = CompositeXlaProgramBuilder::new();
         let output = builder
             .add_instruction(
-                CoordinateBasisOperation::new(ArrayType::scalar(DataType::F32), coordinate_offset, 2),
+                CoordinateBasisOperation::new(ArrayType::scalar(DataType::F32), basis_offset, 2),
                 Vec::new(),
                 Vec::new(),
             )
@@ -10862,14 +10862,14 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_zero_sized_coordinate_basis() {
-        let leaf_type = ArrayType::new(
+        let value_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![Dimension::Static(2), Dimension::Static(0), Dimension::Static(3)]),
         );
         let mut builder = XlaProgramBuilder::new();
         let output = builder
             .add_instruction(
-                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(leaf_type, 0, 0)),
+                ArrayOperation::CoordinateBasis(CoordinateBasisOperation::new(value_type, 0, 0)),
                 Vec::new(),
                 Vec::new(),
             )

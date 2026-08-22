@@ -13,8 +13,6 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming,
 };
 
-// TODO(eaplatanios): Review from this point onwards.
-
 /// Canonical operation name for [`CoordinateBasisOperation`].
 pub const COORDINATE_BASIS_OPERATION_NAME: &str = "coordinate_basis";
 
@@ -24,14 +22,14 @@ pub const COORDINATE_BASIS_OPERATION_NAME: &str = "coordinate_basis";
 /// coordinate vector. It could replay the derivative program separately for every standard-basis direction of that
 /// vector. Instead, Ryft packs all directions along a leading array axis and uses batching to replay them together.
 /// Because the structure's parameters remain separate program values, one [`CoordinateBasisOperation`] represents the
-/// portion of that shared basis belonging to one parameter. [`Self::coordinate_offset`] locates the parameter's first
+/// portion of that shared basis belonging to one parameter. [`Self::basis_offset`] locates the parameter's first
 /// row-major coordinate in the shared vector, and [`Self::basis_size`] is the vector's total coordinate count.
 ///
 /// For an array parameter with shape `S` and `n` elements, this operation returns an array with shape
 /// `[basis_size] ++ S`. Direction `k` contains the parameter-local one-hot value at flattened coordinate
-/// `k - coordinate_offset` when `coordinate_offset <= k < coordinate_offset + n`. It contains zeros when direction
-/// `k` belongs to another parameter. For example, a two-element parameter at offset `0` followed by a scalar parameter
-/// at offset `2` will result in a basis size of `3` and the following coordinate bases:
+/// `k - basis_offset` when `basis_offset <= k < basis_offset + n`. It contains zeros when direction `k` belongs to
+/// another parameter. For example, a two-element parameter at offset `0` followed by a scalar parameter at offset `2`
+/// will result in a basis size of `3` and the following coordinate bases:
 ///
 /// ```text
 /// two_element_parameter = [[1, 0],
@@ -49,39 +47,39 @@ pub const COORDINATE_BASIS_OPERATION_NAME: &str = "coordinate_basis";
 /// constant.
 #[derive(Clone, Debug)]
 pub struct CoordinateBasisOperation<T: Type> {
-    /// Unpacked tangent or cotangent value type that corresponds to this basis fragment.
-    leaf_type: T,
+    /// Unpacked tangent or cotangent value [`Type`] that corresponds to this basis fragment.
+    value_type: T,
 
     /// Offset of the corresponding parameter's first coordinate in the global packed basis.
-    coordinate_offset: usize,
+    basis_offset: usize,
 
     /// Total number of coordinates in the global packed basis.
     basis_size: usize,
 }
 
 impl<T: Type> CoordinateBasisOperation<T> {
-    /// Creates a packed coordinate-basis operation.
+    /// Creates a new [`CoordinateBasisOperation`].
     ///
     /// # Parameters
     ///
-    ///   - `leaf_type`: Unpacked tangent or cotangent value type stored in this leaf's basis fragment.
-    ///   - `coordinate_offset`: Offset of this leaf's first coordinate in the global packed basis.
+    ///   - `value_type`: Unpacked tangent or cotangent value type stored in this parameter's basis fragment.
+    ///   - `basis_offset`: Offset of this parameter's first coordinate in the global packed basis.
     ///   - `basis_size`: Total number of coordinates in the global packed basis.
     #[inline]
-    pub fn new(leaf_type: T, coordinate_offset: usize, basis_size: usize) -> Self {
-        Self { leaf_type, coordinate_offset, basis_size }
+    pub fn new(value_type: T, basis_offset: usize, basis_size: usize) -> Self {
+        Self { value_type, basis_offset, basis_size }
     }
 
-    /// Returns the unpacked tangent or cotangent value type stored in this leaf's basis fragment.
+    /// Returns the unpacked tangent or cotangent value [`Type`] stored in this parameter's basis fragment.
     #[inline]
-    pub fn leaf_type(&self) -> &T {
-        &self.leaf_type
+    pub fn value_type(&self) -> &T {
+        &self.value_type
     }
 
-    /// Returns the offset of this leaf's first coordinate in the global packed basis.
+    /// Returns the offset of this parameter's first coordinate in the global packed basis.
     #[inline]
-    pub fn coordinate_offset(&self) -> usize {
-        self.coordinate_offset
+    pub fn basis_offset(&self) -> usize {
+        self.basis_offset
     }
 
     /// Returns the total number of coordinates in the global packed basis.
@@ -95,12 +93,14 @@ impl<T: Type> Display for CoordinateBasisOperation<T> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         OperationFormatter::new(formatter, 0, COORDINATE_BASIS_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("leaf_type", &self.leaf_type)?;
-            operation.field("coordinate_offset", self.coordinate_offset)?;
+            operation.field("value_type", &self.value_type)?;
+            operation.field("basis_offset", self.basis_offset)?;
             operation.field("basis_size", self.basis_size)
         })
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 impl Operation for CoordinateBasisOperation<ArrayType> {
     type Type = ArrayType;
@@ -117,25 +117,25 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 0, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
-        let cotangent_data_type = self.leaf_type.data_type().cotangent()?;
+        let cotangent_data_type = self.value_type.data_type().cotangent()?;
         if cotangent_data_type.is_zero_space() {
             return Err(TypeError::invalid(format!(
-                "coordinate basis requires a differentiable leaf type but got {}",
-                self.leaf_type,
+                "coordinate basis requires a differentiable value type but got {}",
+                self.value_type,
             )));
         }
-        if cotangent_data_type != self.leaf_type.data_type() {
+        if cotangent_data_type != self.value_type.data_type() {
             return Err(TypeError::invalid(format!(
                 "coordinate basis values of type {} cannot represent their own cotangents; use {} instead",
-                self.leaf_type,
-                self.leaf_type.clone().with_data_type(cotangent_data_type),
+                self.value_type,
+                self.value_type.clone().with_data_type(cotangent_data_type),
             )));
         }
-        let dimensions = self.leaf_type.shape().dimensions();
+        let dimensions = self.value_type.shape().dimensions();
         if dimensions.iter().any(|size| matches!(size, Dimension::Dynamic(_))) {
             return Err(TypeError::invalid(format!(
-                "coordinate basis requires a fully static leaf type but got {}",
-                self.leaf_type
+                "coordinate basis requires a fully static value type but got {}",
+                self.value_type
             )));
         }
         let coordinate_count = if dimensions.contains(&Dimension::Static(0)) {
@@ -143,21 +143,21 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
         } else {
             dimensions.iter().try_fold(1usize, |count, size| match size {
                 Dimension::Static(size) => count.checked_mul(*size).ok_or_else(|| {
-                    TypeError::invalid(format!("coordinate count overflows usize for leaf type {}", self.leaf_type))
+                    TypeError::invalid(format!("coordinate count overflows usize for value type {}", self.value_type))
                 }),
                 Dimension::Dynamic(_) => unreachable!("dynamic dimensions were rejected above"),
             })?
         };
-        let coordinate_end = self.coordinate_offset.checked_add(coordinate_count).ok_or_else(|| {
-            TypeError::invalid(format!("coordinate range overflows usize for leaf type {}", self.leaf_type))
+        let basis_end = self.basis_offset.checked_add(coordinate_count).ok_or_else(|| {
+            TypeError::invalid(format!("basis range overflows usize for value type {}", self.value_type))
         })?;
-        if coordinate_end > self.basis_size {
+        if basis_end > self.basis_size {
             return Err(TypeError::invalid(format!(
-                "coordinate range [{}, {coordinate_end}) exceeds basis size {}",
-                self.coordinate_offset, self.basis_size,
+                "basis range [{}, {basis_end}) exceeds basis size {}",
+                self.basis_offset, self.basis_size,
             )));
         }
-        Ok(vec![self.leaf_type.with_inserted_dimension(0, Dimension::Static(self.basis_size))?])
+        Ok(vec![self.value_type.with_inserted_dimension(0, Dimension::Static(self.basis_size))?])
     }
 
     #[inline]
@@ -166,8 +166,8 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
         renaming: &TypeIdentityRenaming<<ArrayType as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         Ok(Self {
-            leaf_type: self.leaf_type.rename_identities(renaming)?,
-            coordinate_offset: self.coordinate_offset,
+            value_type: self.value_type.rename_identities(renaming)?,
+            basis_offset: self.basis_offset,
             basis_size: self.basis_size,
         })
     }
@@ -175,8 +175,8 @@ impl Operation for CoordinateBasisOperation<ArrayType> {
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, COORDINATE_BASIS_OPERATION_NAME)?.bracketed(|operation| {
-            operation.field("leaf_type", &self.leaf_type)?;
-            operation.field("coordinate_offset", self.coordinate_offset)?;
+            operation.field("value_type", &self.value_type)?;
+            operation.field("basis_offset", self.basis_offset)?;
             operation.field("basis_size", self.basis_size)
         })
     }
@@ -196,30 +196,30 @@ where
         check_count!("input", inputs, 0, ProgramError);
         let basis_type = self.infer_output_types(&[], &[])?.remove(0);
         let index_type = basis_type.clone().with_data_type(DataType::U64);
-        let leaf_dimensions = self
-            .leaf_type
+        let value_dimensions = self
+            .value_type
             .static_shape()
             .ok_or_else(|| {
                 TypeError::invalid(format!(
-                    "coordinate basis requires a fully static leaf type but got {}",
-                    self.leaf_type
+                    "coordinate basis requires a fully static value type but got {}",
+                    self.value_type
                 ))
             })?
             .dimensions()
             .to_vec();
 
-        // A zero-sized leaf has no local coordinates, so its packed basis fragment is the typed empty zero value.
+        // A zero-sized value has no local coordinates, so its packed basis fragment is the typed empty zero value.
         // Returning before row-major stride construction also makes the result independent of where the zero-sized
         // dimension appears and prevents irrelevant dimensions from overflowing the stride accumulator.
-        if leaf_dimensions.contains(&0) {
+        if value_dimensions.contains(&0) {
             return Ok(vec![context.zero(&basis_type)?]);
         }
 
         let basis_index = context.iota(&index_type, 0)?;
         let mut flat_coordinate = None;
         let mut stride = 1u64;
-        for (leaf_axis, dimension_size) in leaf_dimensions.iter().copied().enumerate().rev() {
-            let coordinate = context.iota(&index_type, leaf_axis + 1)?;
+        for (value_axis, dimension_size) in value_dimensions.iter().copied().enumerate().rev() {
+            let coordinate = context.iota(&index_type, value_axis + 1)?;
             let coordinate = if stride == 1 {
                 coordinate
             } else {
@@ -232,19 +232,19 @@ where
             });
             stride = stride
                 .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
-                    message: format!("leaf dimension {dimension_size} does not fit in u64"),
+                    message: format!("value dimension {dimension_size} does not fit in u64"),
                 })?)
                 .ok_or_else(|| ProgramError::InvalidArgument {
-                    message: format!("coordinate count overflows u64 for leaf type {}", self.leaf_type),
+                    message: format!("coordinate count overflows u64 for value type {}", self.value_type),
                 })?;
         }
         let mut flat_coordinate = match flat_coordinate {
             Some(flat_coordinate) => flat_coordinate,
             None => context.fill(&index_type, 0u64)?,
         };
-        if self.coordinate_offset != 0 {
-            let offset = u64::try_from(self.coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
-                message: format!("coordinate offset {} does not fit in u64", self.coordinate_offset),
+        if self.basis_offset != 0 {
+            let offset = u64::try_from(self.basis_offset).map_err(|_| ProgramError::InvalidArgument {
+                message: format!("basis offset {} does not fit in u64", self.basis_offset),
             })?;
             let offset_value = context.fill(&index_type, offset)?;
             flat_coordinate = flat_coordinate + offset_value;
@@ -305,14 +305,14 @@ mod tests {
 
     #[test]
     fn test_coordinate_basis_operation_infers_packed_type() {
-        let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        let operation = CoordinateBasisOperation::new(leaf_type.clone(), 4, 10);
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let operation = CoordinateBasisOperation::new(value_type.clone(), 4, 10);
         check_operation_type_inference!(
             operation = operation,
             cases = [{
                 type = ArrayType,
                 input_types = [],
-                output_types = [leaf_type.with_inserted_dimension(0, Dimension::Static(10)).unwrap()],
+                output_types = [value_type.with_inserted_dimension(0, Dimension::Static(10)).unwrap()],
             }],
         );
     }
@@ -325,14 +325,14 @@ mod tests {
             10,
         );
 
-        assert_eq!(operation.to_string(), "coordinate_basis [leaf_type=f32[2, 3], coordinate_offset=4, basis_size=10]",);
+        assert_eq!(operation.to_string(), "coordinate_basis [value_type=f32[2, 3], basis_offset=4, basis_size=10]",);
     }
 
     #[test]
     fn test_coordinate_basis_operation_interprets_fp6_packed_fragments() {
-        let leaf_type = ArrayType::new(F6E2M3FN, Shape::new(vec![Dimension::Static(2)]));
-        let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
-        let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
+        let value_type = ArrayType::new(F6E2M3FN, Shape::new(vec![Dimension::Static(2)]));
+        let basis_type = value_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
+        let operation = CoordinateBasisOperation::new(value_type, 1, 4);
         let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
         let zero = f6e2m3fn::from_bits(0).unwrap();
         let one = f6e2m3fn::from_bits(0x08).unwrap();
@@ -341,9 +341,9 @@ mod tests {
             Ok(vec![Array::from_elements(basis_type, &[zero, zero, one, zero, zero, one, zero, zero]).unwrap()]),
         );
 
-        let leaf_type = ArrayType::new(F6E3M2FN, Shape::new(vec![Dimension::Static(2)]));
-        let basis_type = leaf_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
-        let operation = CoordinateBasisOperation::new(leaf_type, 1, 4);
+        let value_type = ArrayType::new(F6E3M2FN, Shape::new(vec![Dimension::Static(2)]));
+        let basis_type = value_type.with_inserted_dimension(0, Dimension::Static(4)).unwrap();
+        let operation = CoordinateBasisOperation::new(value_type, 1, 4);
         let zero = f6e3m2fn::from_bits(0).unwrap();
         let one = f6e3m2fn::from_bits(0x0c).unwrap();
         assert_eq!(
@@ -386,13 +386,13 @@ mod tests {
     #[test]
     fn test_coordinate_basis_operation_rejects_non_finite_or_out_of_range_coordinates() {
         for data_type in [Boolean, I32] {
-            let leaf_type = ArrayType::scalar(data_type);
+            let value_type = ArrayType::scalar(data_type);
             assert_eq!(
-                CoordinateBasisOperation::new(leaf_type.clone(), 0, 1)
+                CoordinateBasisOperation::new(value_type.clone(), 0, 1)
                     .infer_output_types(&[], &[])
                     .unwrap_err()
                     .to_string(),
-                format!("coordinate basis requires a differentiable leaf type but got {leaf_type}"),
+                format!("coordinate basis requires a differentiable value type but got {value_type}"),
             );
         }
 
@@ -417,13 +417,16 @@ mod tests {
                 .infer_output_types(&[], &[])
                 .unwrap_err()
                 .to_string(),
-            "coordinate basis requires a fully static leaf type but got f32[dynamic]",
+            "coordinate basis requires a fully static value type but got f32[dynamic]",
         );
 
-        let leaf_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
+        let value_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(3)]));
         assert_eq!(
-            CoordinateBasisOperation::new(leaf_type, 2, 4).infer_output_types(&[], &[]).unwrap_err().to_string(),
-            "coordinate range [2, 5) exceeds basis size 4",
+            CoordinateBasisOperation::new(value_type, 2, 4)
+                .infer_output_types(&[], &[])
+                .unwrap_err()
+                .to_string(),
+            "basis range [2, 5) exceeds basis size 4",
         );
 
         let overflowing_type =
@@ -433,32 +436,32 @@ mod tests {
                 .infer_output_types(&[], &[])
                 .unwrap_err()
                 .to_string(),
-            format!("coordinate count overflows usize for leaf type f32[{}, 2]", usize::MAX),
+            format!("coordinate count overflows usize for value type f32[{}, 2]", usize::MAX),
         );
 
-        let zero_coordinate_type = ArrayType::new(
+        let zero_value_type = ArrayType::new(
             F32,
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
         );
         assert_eq!(
-            CoordinateBasisOperation::new(zero_coordinate_type.clone(), usize::MAX, usize::MAX)
+            CoordinateBasisOperation::new(zero_value_type.clone(), usize::MAX, usize::MAX)
                 .infer_output_types(&[], &[])
                 .unwrap(),
-            vec![zero_coordinate_type.with_inserted_dimension(0, Dimension::Static(usize::MAX)).unwrap()],
+            vec![zero_value_type.with_inserted_dimension(0, Dimension::Static(usize::MAX)).unwrap()],
         );
     }
 
     #[test]
-    fn test_coordinate_basis_operation_interprets_zero_sized_leaf_without_stride_overflow() {
-        let leaf_type = ArrayType::new(
+    fn test_coordinate_basis_operation_interprets_zero_sized_value_without_stride_overflow() {
+        let value_type = ArrayType::new(
             F32,
             Shape::new(vec![Dimension::Static(0), Dimension::Static(usize::MAX), Dimension::Static(2)]),
         );
-        let operation = CoordinateBasisOperation::new(leaf_type.clone(), 0, 0);
+        let operation = CoordinateBasisOperation::new(value_type.clone(), 0, 0);
         let context = EagerContext::<Array, CoordinateBasisOperation<ArrayType>>::new();
         assert_eq!(
             operation.interpret(&context, &EmptyRegionDriver, &[]).unwrap(),
-            vec![Array::from_f64s(leaf_type.with_inserted_dimension(0, Dimension::Static(0)).unwrap(), Vec::new(),)],
+            vec![Array::from_f64s(value_type.with_inserted_dimension(0, Dimension::Static(0)).unwrap(), Vec::new(),)],
         );
     }
 }

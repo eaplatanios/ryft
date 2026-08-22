@@ -212,9 +212,9 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
         path: &ParameterPath,
     ) -> Result<usize, DifferentiationError>;
 
-    /// Constructs the portion of a packed global coordinate basis that belongs to one differentiated value. If the
-    /// value occupies `d` coordinates beginning at `coordinate_offset`, the returned value represents
-    /// `packed_direction_count` directions (i.e., directions in `coordinate_offset..coordinate_offset + d` form
+    /// Constructs the portion of a packed global coordinate basis that belongs to one differentiated value.
+    /// If the value occupies `d` coordinates beginning at `basis_offset`, the returned value represents
+    /// `packed_direction_count` directions (i.e., directions in `basis_offset..basis_offset + d` form
     /// the value's scalar identity basis, while every other direction is zero). `coordinate_type` determines which
     /// coordinates are enumerated, while `value_type` determines the differential values stored in the basis.
     ///
@@ -224,13 +224,13 @@ pub trait DenseDifferentiableType<C: Context<Type = Self>>: DifferentiableType {
     ///   - `coordinate_type`: Type whose finite coordinate space is being enumerated.
     ///   - `value_type`: Type of the basis values. Forward bases use the primal tangent type,
     ///     while reverse bases use the coordinate type's cotangent type.
-    ///   - `coordinate_offset`: Index of the first packed direction belonging to `coordinate_type`.
+    ///   - `basis_offset`: Index of the first packed direction belonging to `coordinate_type`.
     ///   - `packed_direction_count`: Number of coordinate directions packed across the differentiated structure.
     fn coordinate_basis(
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
-        coordinate_offset: usize,
+        basis_offset: usize,
         packed_direction_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError>;
 
@@ -377,7 +377,7 @@ where
         context: &C,
         coordinate_type: &Self,
         value_type: &Self,
-        coordinate_offset: usize,
+        basis_offset: usize,
         packed_direction_count: usize,
     ) -> Result<Self::PackedValue, DifferentiationError> {
         if coordinate_type.shape() != value_type.shape() {
@@ -388,7 +388,7 @@ where
         }
         let expected_type = value_type.with_inserted_dimension(0, Dimension::Static(packed_direction_count))?;
         let mut outputs = context.bind(
-            CoordinateBasisOperation::new(value_type.clone(), coordinate_offset, packed_direction_count),
+            CoordinateBasisOperation::new(value_type.clone(), basis_offset, packed_direction_count),
             Vec::new(),
             &[],
         )?;
@@ -396,7 +396,7 @@ where
         let value = outputs.remove(0);
         if value.r#type().as_ref() != &expected_type {
             return Err(TypeError::invalid(format!(
-                "coordinate basis for leaf type {} has type {} but expected {}",
+                "coordinate basis for value type {} has type {} but expected {}",
                 value_type,
                 value.r#type().as_ref(),
                 expected_type,
