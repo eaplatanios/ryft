@@ -199,8 +199,7 @@ mod tests {
     use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::ArrayIrOperation;
-    use crate::arrays::operations::references::{ReferenceIndexOperation, ReferenceSliceOperation};
+    use crate::arrays::operations::{ArrayIrOperation, ReferenceIndexOperation, ReferenceSliceOperation};
     use crate::arrays::reference_views::ArrayReference;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, Shape};

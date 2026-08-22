@@ -31,15 +31,12 @@ pub use encoding::{
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceOperation, ArrayTracingContext,
-    DimensionOperation, DimensionOperations, DimensionTracingContext, ReferenceDischargeOperation,
-    ReferenceDischargeRule,
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceDischargeOperation,
+    ArrayReferenceOperation, ArrayTracingContext, DimensionOperation, DimensionOperations, DimensionTracingContext,
+    REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
+    ReferenceSlice, ReferenceSliceOperation,
 };
-pub use reference_analysis::{
-    ExternalReferenceRoot, ReferenceAccess, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRoot, ReferenceSource,
-    ReferenceTransitiveAccess,
-};
-pub use reference_discharge::{DischargedReferenceProgram, DischargedReferenceState};
+pub use reference_analysis::ArrayReferenceAnalysis;
 pub use reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform};
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
