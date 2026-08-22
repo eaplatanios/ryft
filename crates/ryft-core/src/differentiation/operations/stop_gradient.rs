@@ -13,15 +13,15 @@ use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError,
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 
-/// [`Operation`] that returns its input unchanged while severing gradient propagation. The `T` parameter fixes the
-/// operation's type universe at construction time, so each zero-sized payload implements exactly one [`Operation`]
-/// contract. Interpretation and backend lowering treat this operation as the identity function. Batching preserves
-/// its mapped axis and rebinds the barrier through the parent transform. Its Jacobian-Vector Product (JVP) rule (i.e.,
-/// its [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes the primal through unchanged
-/// and replaces the tangent with a structural zero, so that no derivative flows through the marked value in either
-/// forward- or reverse-mode differentiation. Because the rule stages only that zero tangent, [`StopGradientOperation`]
-/// can never appear in a valid tangent program, and its [`TransposableOperation`](crate::TransposableOperation)
-/// implementation reports an error.
+/// Variadic [`Operation`] that returns each input unchanged while severing gradient propagation. The `T` parameter
+/// fixes the operation's type universe at construction time, so each zero-sized payload implements exactly one
+/// [`Operation`] contract. Interpretation and backend lowering treat this operation as the identity function. Batching
+/// preserves each mapped axis and rebinds the barrier through the parent transform. Its Jacobian-Vector Product (JVP)
+/// rule (i.e., its [`DifferentiableOperation`](crate::DifferentiableOperation) implementation) passes each primal
+/// through unchanged and replaces each tangent with a structural zero, so that no derivative flows through the marked
+/// values in either forward- or reverse-mode differentiation. Because the rule stages only those zero tangents,
+/// [`StopGradientOperation`] can never appear in a valid tangent program, and its
+/// [`TransposableOperation`](crate::TransposableOperation) implementation reports an error.
 #[derive(Clone, Debug)]
 pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
@@ -193,6 +193,7 @@ mod tests {
             ),
             Ok(vec![Array::scalar(2.0)]),
         );
+
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &array_operation,
@@ -201,6 +202,17 @@ mod tests {
                 &[Array::scalar(Complex::new(1.0f64, -2.0))],
             ),
             Ok(vec![Array::scalar(Complex::new(1.0f64, -2.0))]),
+        );
+
+        let inputs = vec![Array::scalar(2.0f32), Array::vector(vec![true, false])];
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &array_operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                inputs.as_slice(),
+            ),
+            Ok(inputs),
         );
 
         let input = Array::vector(vec![1.0, -2.0]);
@@ -220,6 +232,17 @@ mod tests {
                 }],
             );
         }
+
+        // A single operation may stop gradients through heterogeneous inputs without changing their types or order.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let vector_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(2)]));
+        check_operation_type_inference!(
+            operation = StopGradientOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [scalar_type.clone(), vector_type.clone()],
+                output_types = [scalar_type, vector_type],
+            }],
+        );
 
         // Partial-sum and reduced markers pass through unchanged.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -270,10 +293,22 @@ mod tests {
             @approx(epsilon = 1e-9),
             operation = StopGradientOperation::<ArrayType>::new(),
             axis_size = 2,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
-            }],
+            cases = [
+                {
+                    inputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![1.0, -2.0]))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                },
+            ],
         );
 
         // Program batching must preserve the barrier in the staged physical program so later differentiation still

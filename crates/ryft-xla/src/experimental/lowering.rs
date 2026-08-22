@@ -3201,13 +3201,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )
             }
             // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
-            // forward the operand without emitting any MLIR operation (matching JAX's lowering).
-            ArrayOperation::StopGradient(_) => {
-                if input_values.len() != 1 {
-                    return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
-                }
-                Ok(vec![input_values[0]])
-            }
+            // forward every operand without emitting any MLIR operation (matching JAX's lowering).
+            ArrayOperation::StopGradient(_) => Ok(input_values.to_vec()),
             // `tag` only affects rematerialization policies; by lowering time it is the identity, so
             // forward the operand without emitting any MLIR operation.
             ArrayOperation::Tag(_) => {

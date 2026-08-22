@@ -1858,7 +1858,8 @@ mod tests {
         MeshAxisType, Mul, NewReference, OneLike, ProgramError, ProjectedValue, Reduce, ReductionKind,
         ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
         ReferenceCompletionResult, ReferenceError, ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding,
-        ShardingDimension, Sin, StopGradient, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -3346,9 +3347,13 @@ mod tests {
             compile(|x| x.clone() * x.stop_gradient(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
         let values = [0.0f32, 0.5, 1.0, 1.5];
-        let source =
-            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
-                .unwrap();
+        let source = Array::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
         let output = engine.interpret(&compiled.executable_function(), source).unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -3366,6 +3371,35 @@ mod tests {
             let expected = input * input;
             assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
         }
+
+        // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
+        let variadic: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(first, second)| {
+                let context = first.dispatch_domain();
+                let mut outputs = context.bind(StopGradientOperation::new(), Vec::new(), &[first, second]).unwrap();
+                let second = outputs.pop().unwrap();
+                let first = outputs.pop().unwrap();
+                (first, second)
+            },
+            (input_type.clone(), input_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let other_values = [4.0f32, 3.0, 2.0, 1.0];
+        let first = Array::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let second =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+                .unwrap();
+        let (first, second) = engine.interpret(&variadic.executable_function(), (first, second)).unwrap();
+        assert_eq!(read_f32_array(&client, &first), values);
+        assert_eq!(read_f32_array(&client, &second), other_values);
     }
 
     #[test]
