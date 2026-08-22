@@ -1888,8 +1888,9 @@ mod tests {
         /// Callbacks waiting for the terminal result.
         callbacks: Vec<ReferenceCompletionCallback>,
 
-        /// Optional one-shot notification emitted when a caller starts waiting.
-        await_started: Option<mpsc::Sender<()>>,
+        /// Optional one-shot notification emitted when a caller starts waiting, carrying this gate's label so that
+        /// tests sharing one channel across several gates can pin which gate was awaited first.
+        await_started: Option<(&'static str, mpsc::Sender<&'static str>)>,
     }
 
     impl ControlledReferenceCompletion {
@@ -1907,14 +1908,14 @@ mod tests {
             }
         }
 
-        /// Creates a pending completion that reports when its blocking wait begins.
-        fn with_await_notification(await_started: mpsc::Sender<()>) -> Self {
+        /// Creates a pending completion that reports `label` when its blocking wait begins.
+        fn with_await_notification(label: &'static str, await_started: mpsc::Sender<&'static str>) -> Self {
             Self {
                 state: Arc::new((
                     Mutex::new(ControlledReferenceCompletionState {
                         result: None,
                         callbacks: Vec::new(),
-                        await_started: Some(await_started),
+                        await_started: Some((label, await_started)),
                     }),
                     Condvar::new(),
                 )),
@@ -1941,8 +1942,8 @@ mod tests {
         fn r#await(&self) -> ReferenceCompletionResult {
             let (state, ready) = &*self.state;
             let mut state = state.lock().unwrap();
-            if let Some(await_started) = state.await_started.take() {
-                await_started.send(()).unwrap();
+            if let Some((label, await_started)) = state.await_started.take() {
+                await_started.send(label).unwrap();
             }
             while state.result.is_none() {
                 state = ready.wait(state).unwrap();
@@ -2241,6 +2242,36 @@ mod tests {
     }
 
     #[test]
+    fn test_interpret_async_rejects_a_reference_bearing_executable() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+
+        // A stateful compilation produces an ordinary runtime executable over the same flat signature, so the
+        // array-only asynchronous entry point is reachable and must refuse the holder transaction up front rather
+        // than enqueueing an execution whose hidden final-state outputs nothing would publish.
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+            ExecutableXlaFunction { function: compiled.executable_function().clone() };
+        let input = Array::from_host_buffer(&client, array_type, mesh, 7.0f32.to_ne_bytes().as_slice()).unwrap();
+        assert!(matches!(
+            domain.interpret_async(&executable, input),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "external reference state requires `call_statefully`",
+        ));
+    }
+
+    #[test]
     fn test_stateful_async_read_leases_overlap_and_block_mutation_until_both_complete() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2268,11 +2299,13 @@ mod tests {
             Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
                 .unwrap(),
         );
-        let (wait_started, wait_observed) = mpsc::channel();
-        let first_gate = ControlledReferenceCompletion::with_await_notification(wait_started.clone());
+        // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
+        // blocks on first instead of silently depending on the order the transaction awaits its leases.
+        let (await_started, await_observed) = mpsc::channel();
+        let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(first_gate.clone()));
         let first_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
-        let second_gate = ControlledReferenceCompletion::with_await_notification(wait_started);
+        let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
         XlaDomain::inject_stateful_completion_for_test(ReferenceCompletion::new(second_gate.clone()));
         let second_read = read.call_statefully_async(&domain, ArrayIrValue::Reference(reference.clone()));
 
@@ -2293,10 +2326,10 @@ mod tests {
                     .unwrap();
             });
 
-            wait_observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(await_observed.recv_timeout(Duration::from_secs(5)).unwrap(), "first read");
             assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
             first_gate.complete(Ok(()));
-            wait_observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(await_observed.recv_timeout(Duration::from_secs(5)).unwrap(), "second read");
             assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
             second_gate.complete(Ok(()));
             mutation_result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();

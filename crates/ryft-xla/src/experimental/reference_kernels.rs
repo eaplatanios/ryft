@@ -67,7 +67,7 @@ pub enum KernelReferenceError {
     },
 
     /// An outer array operand requested a non-global kernel address space.
-    #[error("kernel operand {parameter_index} must use global address space, but requested {address_space}")]
+    #[error("kernel operand {parameter_index} must use global address space, but requested `{address_space}`")]
     OperandAddressSpace {
         /// Operand parameter position.
         parameter_index: usize,
@@ -125,7 +125,7 @@ pub enum KernelReferenceError {
     },
 
     /// One boundary capability does not permit an analyzed logical access.
-    #[error("kernel parameter {parameter_index} with {access} access cannot perform reference access `{mode:?}`")]
+    #[error("kernel parameter {parameter_index} with `{access}` access cannot perform reference access `{mode}`")]
     ForbiddenAccess {
         /// Body parameter position.
         parameter_index: usize,
@@ -1370,6 +1370,30 @@ mod tests {
             ),
         ])
         .with_synchronization(KernelSynchronization::Barrier);
+
+        // The declared contracts are readable through the public accessor surface, which is what a future lowerer
+        // consumes: builder defaults stay global, byte-aligned, and ordered unless overridden.
+        let [
+            KernelParameterContract::Operand(read_only),
+            KernelParameterContract::Operand(read_write),
+            KernelParameterContract::Scratch(scratch),
+        ] = operation.parameters()
+        else {
+            panic!("the kernel declares two operand parameters followed by one scratch parameter")
+        };
+        assert_eq!(read_only.access(), KernelOperandAccess::ReadOnly);
+        assert_eq!(read_only.address_space(), KernelAddressSpace::Global);
+        assert_eq!(read_only.view_alignment(), KernelViewAlignment::BYTE);
+        assert_eq!(read_only.view_alignment().bytes().get(), 1);
+        assert_eq!(read_only.atomicity(), KernelAtomicity::Ordered);
+        assert_eq!(read_write.access(), KernelOperandAccess::ReadWrite);
+        assert_eq!(read_write.address_space(), KernelAddressSpace::Global);
+        assert_eq!(read_write.view_alignment(), alignment);
+        assert_eq!(read_write.atomicity(), KernelAtomicity::Atomic);
+        assert_eq!(scratch.r#type(), &scalar_type());
+        assert_eq!(scratch.address_space(), KernelAddressSpace::Shared);
+        assert_eq!(scratch.alignment(), alignment);
+
         assert_eq!(
             operation.to_string(),
             concat!(
@@ -1393,10 +1417,11 @@ mod tests {
             operation.infer_output_types(&[scalar.clone(), scalar], std::slice::from_ref(&interface)),
             Ok(vec![ArrayIrType::Array(scalar_type())]),
         );
-        assert_eq!(
-            operation.output_operand_aliases(),
-            vec![KernelOutputOperandAlias { operand_index: 1, output_index: 0 }],
-        );
+        // Only the mutable operand publishes a reuse alias, and it names the single outer result position.
+        let aliases = operation.output_operand_aliases();
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0].operand_index(), 1);
+        assert_eq!(aliases[0].output_index(), 0);
 
         let bad_interface = RegionInterface::new(
             vec![reference_type(scalar_type()), ArrayIrType::Array(scalar_type()), reference_type(scalar_type())],
@@ -1426,23 +1451,16 @@ mod tests {
         let entry = body.entry();
         let source_root = ReferenceRoot::RegionInput { region: entry, input_index: 0 };
         let destination_root = ReferenceRoot::RegionInput { region: entry, input_index: 1 };
-        assert_eq!(
-            kernel.bindings(),
-            &[
-                KernelReferenceBinding {
-                    parameter_index: 0,
-                    operand_index: 0,
-                    root: source_root,
-                    access: KernelOperandAccess::ReadOnly,
-                },
-                KernelReferenceBinding {
-                    parameter_index: 1,
-                    operand_index: 1,
-                    root: destination_root,
-                    access: KernelOperandAccess::WriteOnly,
-                },
-            ],
-        );
+        let bindings = kernel.bindings();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].parameter_index(), 0);
+        assert_eq!(bindings[0].operand_index(), 0);
+        assert_eq!(bindings[0].root(), source_root);
+        assert_eq!(bindings[0].access(), KernelOperandAccess::ReadOnly);
+        assert_eq!(bindings[1].parameter_index(), 1);
+        assert_eq!(bindings[1].operand_index(), 1);
+        assert_eq!(bindings[1].root(), destination_root);
+        assert_eq!(bindings[1].access(), KernelOperandAccess::WriteOnly);
         assert_eq!(
             kernel.lowering(),
             &[

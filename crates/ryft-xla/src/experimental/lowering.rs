@@ -4291,13 +4291,13 @@ where
 /// Lowers a discharged program with logical external reference-state aliases on its entry boundary.
 ///
 /// `reference_states` are the discharge artifact's external-state recipes; each must name a distinct logical state
-/// input. Each state input must survive the executable boundary. A mutated state must be a static
-/// device array and name a hidden output of the identical type and sharding; mutated pairs are recorded as
-/// `tf.aliasing_output` input-output aliases, which are non-semantic may-alias hints that merely permit backend buffer
-/// reuse. The runtime never donates reference-state inputs, so an alias never authorizes in-place mutation of the
-/// caller's state buffer. Read-only state may be finite bounded-dynamic because it has no hidden alias. The validation
-/// here owns the physical alias contract;
-/// the XLA domain additionally enforces the supported memory, sharding, and dynamic-shape classes before calling it.
+/// input. Each state input must survive the executable boundary. A mutated state must be a static device array and
+/// name a hidden output of the identical type and sharding; mutated pairs are recorded as `tf.aliasing_output`
+/// input-output aliases, which are non-semantic may-alias hints that merely permit backend buffer reuse. The runtime
+/// never donates reference-state inputs, so an alias never authorizes in-place mutation of the caller's state buffer.
+/// Read-only state may be finite bounded-dynamic because it has no hidden alias. The validation here owns the
+/// physical alias contract; the XLA domain additionally enforces the supported memory, sharding, and dynamic-shape
+/// classes before calling it.
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Output, ProgramInput, ProgramOutput, S>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     capture_types: &[ArrayType],

@@ -8724,6 +8724,94 @@ mod tests {
     }
 
     #[test]
+    fn test_xla_compile_rejects_a_cached_executable_with_a_foreign_invocation_contract() {
+        use ryft_core::{
+            CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError, Sin,
+        };
+
+        // Follower-side exchange that answers every key with one fixed artifact. This is the reachable stand-in for
+        // a colliding or corrupted persistent entry: the disk tier keys entries by the digest of the canonical key
+        // bytes and re-validates that digest inside the stored envelope, so a planted disk entry can only ever be
+        // rejected as corrupt, never resolved as a foreign executable.
+        struct CollidingArtifactExchange {
+            /// Serialized executable handed back for every requested key.
+            artifact: Vec<u8>,
+        }
+
+        impl CompilationArtifactExchange for CollidingArtifactExchange {
+            fn process_index(&self) -> usize {
+                1
+            }
+
+            fn process_count(&self) -> usize {
+                2
+            }
+
+            fn publish(&self, _key: &[u8], _artifact: &[u8]) -> Result<(), CompilationExchangeError> {
+                Ok(())
+            }
+
+            fn receive(&self, _key: &[u8], _timeout: Duration) -> Result<Option<Vec<u8>>, CompilationExchangeError> {
+                Ok(Some(self.artifact.clone()))
+            }
+        }
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+
+        // The foreign executable keeps the requesting lowering's boundary types so that it loads and passes every
+        // core-level output-type check, and differs only in the donation contract the runtime call path trusts.
+        let producer = XlaDomain::new(&client);
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |x| x.sin().unwrap(),
+            input_type.clone(),
+            &producer,
+            XlaOptions::new(mesh.clone()).with_donate(true),
+        )
+        .unwrap()
+        .into_inner();
+        let foreign: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> =
+            producer.compile(producer.lower(staged).unwrap()).unwrap();
+        let artifact = producer.serialize_program(foreign.compiled_program()).unwrap().unwrap();
+
+        let exchange: Arc<dyn CompilationArtifactExchange> = Arc::new(CollidingArtifactExchange { artifact });
+        let consumer = XlaDomain::with_shared_cache(
+            &client,
+            Arc::new(CompilationContext::new().with_artifact_exchange(
+                exchange,
+                CompilationArtifactExchangePolicy::PreferSharing {
+                    timeout: Duration::from_secs(5),
+                    fallback_to_local_compile: true,
+                },
+            )),
+        );
+        let staged = crate::jit::stage::<_, ArrayType, ArrayType>(
+            |x| x.sin().unwrap(),
+            input_type,
+            &consumer,
+            XlaOptions::new(mesh),
+        )
+        .unwrap()
+        .into_inner();
+        let lowered = consumer.lower(staged).unwrap();
+
+        // The resolved executable loads cleanly and reports matching boundary types, so only the compile-time
+        // cross-check against the requesting lowering can catch the foreign invocation contract.
+        assert!(matches!(
+            consumer.compile(lowered),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "cached executable has incompatible donation flags",
+        ));
+        let statistics = consumer.cache.statistics();
+        assert_eq!(statistics.exchange_hits, 1);
+        assert_eq!(statistics.compilations, 0, "a resolved artifact must not fall back to backend compilation");
+    }
+
+    #[test]
     fn test_xla_persistent_executable_rejects_malformed_and_incompatible_metadata() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -9897,6 +9985,30 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
+        // A public output count beyond the decoded output arity cannot name a hidden final-state suffix at all.
+        let mut invalid_public_outputs: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        invalid_public_outputs.public_output_count = 3;
+        let corrupted = corrupt(invalid_public_outputs);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state metadata has an invalid public output count",
+        ));
+
+        // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
+        // no reference-state input could be checked against its own expected sharding.
+        let mut truncated_expected_shardings: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert_eq!(truncated_expected_shardings.expected_argument_shardings.len(), 2);
+        truncated_expected_shardings.expected_argument_shardings.pop();
+        let corrupted = corrupt(truncated_expected_shardings);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "expected argument shardings do not match the physical input count",
+        ));
+
         let mut reordered: XlaPersistentExecutableMetadataV6 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         reordered.reference_states.swap(0, 1);
@@ -10104,11 +10216,13 @@ mod tests {
             }
             None => {
                 // The CPU plugin does not implement executable serialization for this two-device program, so `None`
-                // is the documented optional-capability answer rather than a silently skipped round trip.
-                assert!(matches!(
-                    compiled.executable().executable().unwrap().serialize(),
-                    Err(ryft_pjrt::Error::Unimplemented { .. }),
-                ));
+                // is the documented optional-capability answer rather than a silently skipped round trip. Either the
+                // executable query or its serialization may be the unimplemented step.
+                let unsupported = match compiled.executable().executable() {
+                    Ok(executable) => executable.serialize().err(),
+                    Err(error) => Some(error),
+                };
+                assert!(matches!(unsupported, Some(ryft_pjrt::Error::Unimplemented { .. })));
             }
         }
     }
