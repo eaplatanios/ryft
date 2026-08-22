@@ -165,25 +165,35 @@ pub struct ReferenceDischargeTracer<C, P: ReferenceDischargePolicy<C>> {
     value: ReferenceDischargeValue<C, P>,
 }
 
-/// Context-free carrier inside one [`ReferenceDischargeTracer`].
-enum ReferenceDischargeValue<C, P: ReferenceDischargePolicy<C>> {
+/// Context-free carrier inside one [`ReferenceDischargeTracer`]. Public because the rule trait names it, but
+/// enum variant fields are always as public as the enum, so the reference payload is an opaque struct: downstream
+/// code can match and read handles but cannot fabricate roots, aliases, types, or preserved values, preserving the
+/// checked-construction contract (pinned by a trybuild compile-fail test).
+pub enum ReferenceDischargeValue<C, P: ReferenceDischargePolicy<C>> {
     /// Ordinary pure value, replayed as-is.
     Pure(C::Value),
 
-    /// Handle to one live root, mirroring the eager `ArrayReference` shape: root identity, the composed
-    /// policy-owned alias metadata, and the derived reference type this exact handle exposes (which differs from
-    /// the root type under a composed view). The per-root state lives in the context environment so every handle
-    /// to one root observes every ordered update.
-    Reference {
-        root: ReferenceRootHandle,
-        alias: P::Alias,
-        r#type: ReferenceType<P::Referent>,
-        /// For a preserved root, the exact destination reference value this handle denotes: the entry binding for
-        /// the root handle, or the bound output of the replayed view operation for a derived handle. Later
-        /// accesses consume this exact value; re-deriving the chain per access would duplicate and reorder view
-        /// operations. Invariant: `None` exactly when the root is `Discharged`, `Some` exactly when `Preserved`.
-        preserved: Option<C::Value>,
-    },
+    /// Handle to one live root.
+    Reference(ReferenceDischargeReference<C, P>),
+}
+
+/// Opaque reference handle mirroring the eager `ArrayReference` shape, with private fields and read-only
+/// accessors; only the discharge context constructs it.
+pub struct ReferenceDischargeReference<C, P: ReferenceDischargePolicy<C>> {
+    /// Root identity.
+    root: ReferenceRootHandle,
+
+    /// Composed policy-owned alias metadata.
+    alias: P::Alias,
+
+    /// Derived reference type this exact handle exposes (differs from the root type under a composed view).
+    r#type: ReferenceType<P::Referent>,
+
+    /// For a preserved root, the exact destination reference value this handle denotes: the entry binding for the
+    /// root handle, or the bound output of the replayed view operation for a derived handle. Later accesses consume
+    /// this exact value; re-deriving the chain per access would duplicate and reorder view operations. Invariant:
+    /// `None` exactly when the root is `Discharged`, `Some` exactly when `Preserved`.
+    preserved: Option<C::Value>,
 }
 
 /// Environment entry for one live root.
@@ -254,11 +264,14 @@ and the reference arm types as the exact handle type).
 planning-shaped logic they share is provided once by the driver, as services rules compose — the same division the
 batching and partial-evaluation drivers already use:
 
-- transactional region forks: structured replay runs against an environment *snapshot* and returns only sealed
-  artifacts — the discharged region program, plain `C::Value`s, and state summaries. Child-context-stamped tracers
-  never escape a fork: a returned tracer would keep mutating the abandoned child environment, so the fork result
-  type simply does not carry them, and the owning rule binds the rebuilt structured operation in the *parent*
-  context, producing fresh parent-stamped tracers. Only the owning rule merges returned final states. This is a
+- transactional region forks: structured replay runs against an environment *snapshot* and returns only sealed,
+  context-free artifacts — the discharged region program, boundary descriptors (types and positions), and state
+  summaries. The fork result carries no values of any kind: child discharge tracers would keep mutating the
+  abandoned child environment, and even a "plain" `C::Value` is not detached under a staging destination (it is
+  itself a tracer stamped with the child's destination builder), so the result type structurally excludes both.
+  The owning rule binds the rebuilt structured operation in the *parent* context, producing fresh parent-stamped
+  tracers; should a future need for returning values arise, it requires an explicit detach/rebind operation with a
+  stated invariant proving the child context is unreachable. Only the owning rule merges returned final states. This is a
   hard isolation contract, not `Context` cloning (stateful context clones share active transform state, which is
   exactly wrong here): both condition branches must observe the same entering environment, speculative while
   probes must commit nothing, and a failed replay must leave the parent environment untouched and yield no usable
@@ -453,8 +466,9 @@ prototype is ~2,700/~2,850/~900.
 
 ## 8. Resolved design decisions
 
-1. **Naming (decided).** The rule trait is `ReferenceDischargeableOperation`; the flowing value is
-   `ReferenceDischargeValue::{Pure, Reference}`.
+1. **Naming (decided).** The rule trait is `ReferenceDischargeableOperation` with rule method
+   `discharge_references`; the flowing `Value` is the context-stamped `ReferenceDischargeTracer`, whose
+   context-free inner carrier is `ReferenceDischargeValue::{Pure, Reference}`.
 2. **The discharge context implements `Context` (decided, phase 0 validates).** Discharge is a single
    program-to-program interpretation, so it runs through `interpret_in_context` like batching and differentiation
    rather than through a bespoke replay like partial evaluation (whose wrapper shape is justified only because
