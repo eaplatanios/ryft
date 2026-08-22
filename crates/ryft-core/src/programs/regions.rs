@@ -850,20 +850,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.effects(self.id).unwrap()
     }
 
-    /// Returns `true` if any instruction in this [`Region`]'s complete attached region closure (dormant rule regions
-    /// included) carries the provided [`Effect`]. [`RegionRef::effects`] deliberately excludes dormant rule regions
-    /// because merely attaching a rule does not execute it, but transforms that may activate those rules later (most
-    /// importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
-    /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
-    #[inline]
-    pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
-        self.any_region_in_closure(|region| region.effects().contains(effect))
-    }
-
-    /// Returns the operations in this region's complete attached region closure that intrinsically carry `effect`.
-    /// Each occurrence retains its source [`InstructionId`], and shared descendants are visited once. Attached region
-    /// effects are inspected through their own operations rather than attributed to the enclosing carrier.
-    pub fn effect_occurrences_in_closure(self, effect: Effect) -> impl Iterator<Item = EffectOccurrence<'r, O>> {
+    /// Returns every [`Instruction`] in this [`Region`]'s complete attached region closure, paired with its source
+    /// [`InstructionId`]. Every attached region is traversed regardless of [`RegionRole`], so dormant transformation
+    /// rules are included, and shared descendants are visited once. Instructions of one region are yielded in program
+    /// order, but the relative order of distinct regions is an unspecified traversal order.
+    pub fn instructions_in_closure(self) -> impl Iterator<Item = (InstructionId, &'r Instruction<O>)> {
+        // Region attachments form a Directed Acyclic Graph (DAG) in which one shared region can be reachable through
+        // many paths, so this is an iterative worklist with an arena-indexed visited set rather than a recursion that
+        // would revisit shared regions once per path. `current` holds the region being walked and its next instruction
+        // index so that the iterator can resume mid-region across calls. An attachment that names no arena region is
+        // skipped rather than resolved, which keeps this traversal usable from validation entry points that must
+        // survive a malformed arena. Sealing rejects such attachments, so a well-formed arena never reaches that
+        // branch.
         let mut visited = vec![false; self.arena.len()];
         let mut pending = vec![self.id];
         let mut current = None;
@@ -872,26 +870,43 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                 if let Some((region_id, instruction_index)) = current.as_mut() {
                     let region = RegionRef::new(self.arena, *region_id).unwrap();
                     if let Some(instruction) = region.instructions().get(*instruction_index) {
-                        let occurrence = EffectOccurrence::new(
-                            InstructionId::new(*region_id, *instruction_index),
-                            instruction.operation(),
-                        );
+                        let id = InstructionId::new(*region_id, *instruction_index);
                         *instruction_index += 1;
                         pending.extend(instruction.regions().iter().copied());
-                        if occurrence.operation().effects().contains(effect) {
-                            return Some(occurrence);
-                        }
-                        continue;
+                        return Some((id, instruction));
                     }
                     current = None;
                 }
                 let region_id = pending.pop()?;
-                if std::mem::replace(&mut visited[region_id.index()], true) {
+                let Some(visited) = visited.get_mut(region_id.index()) else {
+                    continue;
+                };
+                if std::mem::replace(visited, true) {
                     continue;
                 }
                 current = Some((region_id, 0));
             }
         })
+    }
+
+    /// Returns the operations in this region's complete attached region closure that intrinsically carry `effect`.
+    /// Each occurrence retains its source [`InstructionId`], and shared descendants are visited once. Attached region
+    /// effects are inspected through their own operations rather than attributed to the enclosing carrier.
+    #[inline]
+    pub fn effect_occurrences_in_closure(self, effect: Effect) -> impl Iterator<Item = EffectOccurrence<'r, O>> {
+        self.instructions_in_closure()
+            .filter(move |(_, instruction)| instruction.operation().effects().contains(effect))
+            .map(|(id, instruction)| EffectOccurrence::new(id, instruction.operation()))
+    }
+
+    /// Returns `true` if any instruction in this [`Region`]'s complete attached region closure (dormant rule regions
+    /// included) carries the provided [`Effect`]. [`RegionRef::effects`] deliberately excludes dormant rule regions
+    /// because merely attaching a rule does not execute it, but transforms that may activate those rules later (most
+    /// importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
+    /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
+    #[inline]
+    pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
+        self.any_region_in_closure(|region| region.effects().contains(effect))
     }
 
     /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure is accepted by `predicate`.
