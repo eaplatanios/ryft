@@ -422,6 +422,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let parent_operation = C::Operation::from(self.clone());
             return Ok(forward_collective_to_parent(context, parent_operation, inputs)?.into());
@@ -443,6 +444,28 @@ where
     }
 }
 
+/// Rejects ragged collective operands before any parent binding can stage or execute collective work.
+fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
+    operation_name: &str,
+    inputs: &[ArrayBatch<V>],
+) -> Result<(), BatchingError> {
+    if let Some((index, ragged_axis)) = inputs
+        .iter()
+        .enumerate()
+        .find_map(|(index, input)| input.ragged_axes().first().map(|ragged_axis| (index, ragged_axis)))
+    {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{}` does not support bounded ragged dimension `{}` on operand {}",
+                operation_name,
+                ragged_axis.dimension(),
+                index,
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Re-stages a collective that targets a different (outer) named axis into the batching context's parent.
 ///
 /// Under nested `batch` levels, a collective is consumed by the level whose
@@ -460,6 +483,7 @@ pub fn forward_collective_to_parent<C, P: ArrayBatchingPolicy<C>>(
 where
     C: Context<Type = ArrayType>,
 {
+    reject_ragged_collective_inputs(parent_operation.name(), inputs)?;
     let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
     let parent_outputs = context.parent().bind(parent_operation, Vec::new(), &parent_input_values)?;
     check_count!("output", parent_outputs, inputs.len(), ProgramError);
@@ -3088,6 +3112,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3153,6 +3178,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3211,6 +3237,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
         }
@@ -3294,6 +3321,7 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -3338,13 +3366,23 @@ where
 }
 
 /// Validates a mixed collective's array operand and replicated result extents.
-fn explicit_collective_inputs<V: Value<Type = ArrayIrType>>(
-    inputs: &[ArrayIrBatch<V>],
-) -> Result<(&ArrayIrBatch<V>, &[ArrayIrBatch<V>]), BatchingError> {
+fn explicit_collective_inputs<'a, V: Value<Type = ArrayIrType>>(
+    operation_name: &str,
+    inputs: &'a [ArrayIrBatch<V>],
+) -> Result<(&'a ArrayIrBatch<V>, &'a [ArrayIrBatch<V>]), BatchingError> {
     let Some((array, output_extents)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
     <&ArrayType>::try_from(&array.unbatched_type())?;
+    if let Some(ragged_axis) = array.ragged_axes().first() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{}` does not support bounded ragged dimension `{}` on operand 0",
+                operation_name,
+                ragged_axis.dimension(),
+            ),
+        });
+    }
     for output_extent in output_extents {
         output_extent.validate_replicated_dimension()?;
     }
@@ -3404,7 +3442,7 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        let (array, output_extents) = explicit_collective_inputs(self.name(), inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
@@ -3487,7 +3525,7 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        let (array, output_extents) = explicit_collective_inputs(self.name(), inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_psum_scatter_output_types(self, logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
@@ -3569,7 +3607,7 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        let (array, output_extents) = explicit_collective_inputs(self.name(), inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
@@ -3783,8 +3821,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, RaggedAxis, Shape, Sharding,
     };
     use crate::batching::{
         BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingTracer, batch,
@@ -3862,6 +3900,26 @@ mod tests {
         assert_eq!(values.len(), 1);
         let delta = (values[0] - 4.0).abs();
         assert!(delta < 1e-9, "expected pmean = 4.0, got {}", values[0]);
+    }
+
+    #[test]
+    fn test_collective_batching_rejects_ragged_operands_before_binding() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .unwrap();
+
+        assert_eq!(
+            CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(
+                &batching_context(2),
+                &crate::EmptyRegionDriver,
+                &[input]
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`psum` does not support bounded ragged dimension `length` on operand 0".to_string(),
+            }),
+        );
     }
 
     #[test]

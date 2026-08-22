@@ -1,8 +1,8 @@
 //! Backend-neutral discharge of array references and their views into explicit immutable array state.
 //!
 //! [`Program::discharge_references`] consumes a flat, capture-lifted array-IR program, validates its complete
-//! reference language through [`ReferenceAnalysis`], and rewrites reference state into ordinary array Single Static
-//! Assignment (SSA) values. Index and static unit-stride slice views lower through canonical slice, reshape, and
+//! reference language through [`ArrayReferenceAnalysis`], and rewrites reference state into ordinary array SSA
+//! values. Index and static unit-stride slice views lower through canonical slice, reshape, and
 //! update-slice operations. Conditions, loops, scans, and calls receive explicit immutable root-state boundaries
 //! derived from the same analysis artifact; derived views must be recreated inside each attached region. The result
 //! keeps the original public outputs as a prefix and appends one hidden final-state output for every mutated external
@@ -41,15 +41,12 @@
 //! ```
 //!
 //! Representative supported compositions are shown below. The value-level transform capabilities themselves reject
-//! reference operations outright ("must be discharged before differentiation/batching"); the working entry points
-//! are the program-level adapters that first prove every root local and discharge:
-//! [`Program::jvp_with_local_references`](crate::Program::jvp_with_local_references) and
-//! [`Program::linearize_with_local_references`](crate::Program::linearize_with_local_references) for forward mode,
-//! [`Pullback`](crate::Pullback) obtained from the linearization for reverse mode (there is deliberately no direct
-//! `vjp`-shaped reference adapter),
+//! reference operations outright ("must be discharged before differentiation/batching"). First call
+//! [`ReferenceDischarge::discharge_local_references`], then use the ordinary transform: [`Program::jvp`] or
+//! [`Program::linearize`] for forward mode, [`Pullback`](crate::Pullback) obtained from the linearization for reverse
+//! mode,
 //! [`Program::batched_with_local_references`](crate::Program::batched_with_local_references) for batching,
-//! [`Program::partially_evaluate_with_local_references`](crate::Program::partially_evaluate_with_local_references)
-//! for partial evaluation, and
+//! [`Program::partially_evaluate`] for partial evaluation, and
 //! [`Program::rematerialize_with_local_references`](crate::Program::rematerialize_with_local_references) for
 //! rematerialization.
 //!
@@ -61,8 +58,9 @@
 //! scan(inputs) { |input| state.add_update(input); read(state) }
 //!     -> explicit immutable state carries at every attached-region boundary
 //!
-//! program.jvp_with_local_references(...)          // state = new_reference(x); state.add_update(x); freeze(state)
-//! program.linearize_with_local_references(...).pullback()
+//! let program = program.discharge_local_references(capture_count, "differentiation")?;
+//! program.jvp()?                                  // state = new_reference(x); state.add_update(x); freeze(state)
+//! program.linearize()?.pullback()
 //!     -> discharge local state -> differentiate the reference-free program
 //!
 //! program.batched_with_local_references(...)
@@ -75,15 +73,15 @@
 //! ```
 //! use ryft_core::{
 //!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, FreezeReferenceOperation, NewReferenceOperation,
-//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
+//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischarge,
 //! };
 //!
 //! let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 //! let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
 //! let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-//! let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial])?[0];
-//! builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])?;
-//! let total = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference])?[0];
+//! let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial])?[0];
+//! builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])?;
+//! let total = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference])?[0];
 //! let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
 //!     vec![total],
 //!     vec![Placeholder; 2],
@@ -110,185 +108,46 @@
 //  Also, is all of this specific to "array IR" or can some of it be moved to core?
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 
-use serde::Serialize;
-
-use crate::arrays::operations::{ReferenceDischargeOperation, ReferenceDischargeRule};
-use crate::arrays::reference_analysis::{ReferenceAnalysis, ReferenceRoot, ReferenceSource};
+use crate::arrays::operations::ArrayReferenceDischargeOperation;
+use crate::arrays::reference_analysis::ArrayReferenceAnalysis;
 use crate::arrays::reference_views::{ArrayReferenceView, ViewReadCarrier, ViewWriteCarrier};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::Shape;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::captures::{CaptureConstant, ClosedProgram};
-use crate::operations::{
-    AddOperation, FreezeReferenceOperation, NewReferenceOperation, ReferenceAddUpdateOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
-};
+use crate::operations::{AddOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation};
 use crate::parameters::{Parameterized, Placeholder};
 use crate::programs::{
-    Atom, AtomId, Effect, Effects, Instruction, InstructionId, Operation, Program, ProgramBuilder, ProgramError,
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceOperationSemantics, ReferenceOutputSemantics, RegionId,
-    RegionRef, Type, TypeError, Typed, Value, ValueId,
+    Atom, AtomId, Effect, Effects, FreezeReferenceOperation, Instruction, InstructionId, NewReferenceOperation,
+    Operation, Program, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAliasKind,
+    ReferenceDischarge, ReferenceDischargePlan, ReferenceDischargeResult, ReferenceDischargeRule,
+    ReferenceInstructionDischargePlan, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceReadOperation,
+    ReferenceRegionDischargePlan, ReferenceRoot, ReferenceSwapOperation, RegionId, RegionRef, Type, TypeError, Typed,
+    Value, ValueId,
 };
 
-/// Logical binding recipe for one external reference root in a discharged program, in canonical entry-boundary
-/// (external-state list) order.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-pub struct DischargedReferenceState {
-    /// Capture or public argument that supplies the runtime reference holder.
-    source: ReferenceSource,
-
-    /// Flat input position that receives the holder's entering immutable array value.
-    discharged_input_index: usize,
-
-    /// Hidden flat output position containing the final state, or [`None`] for a read-only root.
-    final_state_output_index: Option<usize>,
-}
-
-impl DischargedReferenceState {
-    /// Reconstructs a persisted logical external-state binding recipe.
-    #[doc(hidden)]
-    pub const fn new(
-        source: ReferenceSource,
-        discharged_input_index: usize,
-        final_state_output_index: Option<usize>,
-    ) -> Self {
-        Self { source, discharged_input_index, final_state_output_index }
-    }
-
-    /// Returns the capture or public argument that supplies the runtime reference holder.
-    #[inline]
-    pub const fn source(&self) -> ReferenceSource {
-        self.source
-    }
-
-    /// Returns the flat discharged-program input position receiving the entering state.
-    #[inline]
-    pub const fn discharged_input_index(&self) -> usize {
-        self.discharged_input_index
-    }
-
-    /// Returns whether the program replaces or accumulates into this external state, in which case its final value is
-    /// returned through the hidden output named by
-    /// [`final_state_output_index`](Self::final_state_output_index).
-    #[inline]
-    pub const fn is_mutated(&self) -> bool {
-        self.final_state_output_index.is_some()
-    }
-
-    /// Returns the hidden final-state output position, or [`None`] when the state is read-only.
-    #[inline]
-    pub const fn final_state_output_index(&self) -> Option<usize> {
-        self.final_state_output_index
-    }
-}
-
-/// Reference-free program and logical external-state metadata produced by reference discharge.
-#[derive(Debug)]
-pub struct DischargedReferenceProgram<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> {
-    /// Reference-free flat program whose public outputs form a prefix of its complete outputs.
-    program: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Number of public output leaves before hidden final-state outputs.
-    public_output_count: usize,
-
-    /// External reference binding recipes in canonical entry-boundary order.
-    external_states: Vec<DischargedReferenceState>,
-}
-
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> DischargedReferenceProgram<V, O> {
-    /// Returns the reference-free flat program.
-    #[inline]
-    pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.program
-    }
-
-    /// Returns the number of public outputs at the front of the program's output boundary.
-    #[inline]
-    pub const fn public_output_count(&self) -> usize {
-        self.public_output_count
-    }
-
-    /// Returns external reference binding recipes in canonical entry-boundary order.
-    #[inline]
-    pub fn external_states(&self) -> &[DischargedReferenceState] {
-        self.external_states.as_slice()
-    }
-
-    /// Consumes this discharge artifact and returns its reference-free program, public-output prefix length, and
-    /// logical external-state binding recipes.
-    #[inline]
-    pub(crate) fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, Vec<DischargedReferenceState>) {
-        (self.program, self.public_output_count, self.external_states)
-    }
-}
-
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
+impl<V, O> ReferenceDischarge for Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
-    /// Consumes this flat program and discharges array references and their views into immutable array SSA.
-    ///
-    /// `capture_count` classifies the leading input prefix as capture sources and the remaining inputs as public
-    /// arguments. This ordinary-value entry rejects reference-typed constants everywhere. A program produced by
-    /// [`ClosedProgram::to_program_with_lifted_captures`] may retain capture-reference constants in attached regions
-    /// and must instead use [`Program::discharge_references_with_lifted_captures`]. Reference inputs are replaced
-    /// one-for-one by their referent array types, while mutated external roots receive hidden final-state outputs
-    /// after the original public-output prefix. Analysis and every operation-family support check complete before
-    /// replay begins.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    pub fn discharge_references(self, capture_count: usize) -> Result<DischargedReferenceProgram<V, O>, ProgramError> {
-        let analysis = self.analyze_references(capture_count)?;
+    type DischargedProgram = Self;
+
+    fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<Self>, ProgramError> {
+        // The ordinary-value entry rejects reference-typed constants. Capture-lifted programs use the specialized
+        // inherent entry point below, while both routes share the same analysis-before-replay ordering.
+        let analysis = self.analyze_array_references(capture_count)?;
         validate_discharge_support(&self, &analysis)?;
         discharge_with_analysis(self, analysis)
-    }
-
-    /// Discharges this program's local array references on behalf of the generic `transform`, rejecting every
-    /// caller-owned external reference root and returning the reference-free program with its boundary unchanged.
-    ///
-    /// The rejection and the appended-output invariant live here so that every transform adapter shares one gate: an
-    /// external root would require runtime holder plumbing the transforms do not have, and a discharge that appended
-    /// hidden final-state outputs despite empty external metadata would otherwise silently widen the adapter's
-    /// public output boundary instead of erroring.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `transform`: Name of the requesting transform, used verbatim in the external-root rejection diagnostic.
-    pub(crate) fn discharge_local_references(
-        self,
-        capture_count: usize,
-        transform: &'static str,
-    ) -> Result<Self, ProgramError> {
-        let discharged = self.discharge_references(capture_count)?;
-        if let Some(state) = discharged.external_states().first() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "{transform} supports only local references, but the program uses external `{}`",
-                    state.source(),
-                ),
-            });
-        }
-        let (program, public_output_count, _) = discharged.into_parts();
-        if public_output_count != program.output_count() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge appended {} hidden output(s) to a program without external state",
-                program.output_count() - public_output_count,
-            )));
-        }
-        Ok(program)
     }
 }
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: CaptureConstant<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     /// Consumes a program whose captures were lifted into its leading inputs while attached regions may still contain
     /// capture-reference constants naming that prefix.
@@ -303,8 +162,8 @@ where
     pub fn discharge_references_with_lifted_captures(
         self,
         capture_count: usize,
-    ) -> Result<DischargedReferenceProgram<V, O>, ProgramError> {
-        let analysis = self.analyze_references_with_lifted_captures(capture_count)?;
+    ) -> Result<ReferenceDischargeResult<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+        let analysis = self.analyze_array_references_with_lifted_captures(capture_count)?;
         validate_discharge_support(&self, &analysis)?;
         discharge_with_analysis(self, analysis)
     }
@@ -314,7 +173,7 @@ impl<Capture, V, O, Input, Output> ClosedProgram<Capture, V, O, Input, Output>
 where
     Capture: Value<Type = ArrayIrType>,
     V: CaptureConstant<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -323,38 +182,13 @@ where
     /// The returned logical metadata continues to identify capture slots separately from public inputs. Concrete
     /// capture values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the
     /// derived program.
-    pub fn discharge_references(&self) -> Result<DischargedReferenceProgram<V, O>, ProgramError> {
+    pub fn discharge_references(
+        &self,
+    ) -> Result<ReferenceDischargeResult<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
         let capture_count = self.captures().len();
         let program = self.to_program_with_lifted_captures()?;
         program.discharge_references_with_lifted_captures(capture_count)
     }
-}
-
-/// Placement of synthesized state inputs and outputs around one source region boundary.
-struct RegionDischargeLayout {
-    /// Insertion position for synthesized state inputs among source inputs.
-    input_insertion: usize,
-
-    /// Synthesized state input roots in canonical order.
-    input_roots: Vec<ReferenceRoot>,
-
-    /// Insertion position for synthesized state outputs among source outputs.
-    output_insertion: usize,
-
-    /// Synthesized state output roots in canonical order.
-    output_roots: Vec<ReferenceRoot>,
-}
-
-/// One discharged region plus the positions corresponding to its source and synthesized outputs.
-struct DischargedRegion<V: Value<Type = ArrayIrType>, O: ReferenceDischargeOperation> {
-    /// Owned reference-free region program.
-    program: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Destination output position for each source output, in source order.
-    source_output_positions: Vec<usize>,
-
-    /// Destination output position for each synthesized root.
-    state_output_positions: HashMap<ReferenceRoot, usize>,
 }
 
 /// Object-safe view of one canonical reference operation used as the validation oracle for a primitive discharge
@@ -383,11 +217,11 @@ impl<O: Operation<Type = ArrayIrType>> PrimitiveReferenceContract for O {
 /// Rejects unsupported stateful operations before destination construction begins.
 fn validate_discharge_support<V, O>(
     program: &Program<V, O, Vec<V>, Vec<V>>,
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
 ) -> Result<(), ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     if analysis.is_reference_free()
         && program.effects().is_pure()
@@ -472,8 +306,10 @@ where
                 };
             let rule_is_valid = match rule {
                 ReferenceDischargeRule::Ordinary => true,
-                ReferenceDischargeRule::NewReference => matches_primitive(&NewReferenceOperation),
-                ReferenceDischargeRule::View => {
+                ReferenceDischargeRule::NewRoot => {
+                    matches_primitive(&NewReferenceOperation::<ArrayType, ArrayIrType>::new())
+                }
+                ReferenceDischargeRule::Alias => {
                     instruction.inputs().len() == 1
                         && instruction.outputs().len() == 1
                         && instruction.regions().is_empty()
@@ -489,10 +325,18 @@ where
                         )
                         && instruction.operation().reference_view_transform().is_some()
                 }
-                ReferenceDischargeRule::Read => matches_primitive(&ReferenceReadOperation),
-                ReferenceDischargeRule::Swap => matches_primitive(&ReferenceSwapOperation),
-                ReferenceDischargeRule::AddUpdate => matches_primitive(&ReferenceAddUpdateOperation),
-                ReferenceDischargeRule::Freeze => matches_primitive(&FreezeReferenceOperation),
+                ReferenceDischargeRule::Read => {
+                    matches_primitive(&ReferenceReadOperation::<ArrayType, ArrayIrType>::new())
+                }
+                ReferenceDischargeRule::Replace => {
+                    matches_primitive(&ReferenceSwapOperation::<ArrayType, ArrayIrType>::new())
+                }
+                ReferenceDischargeRule::Accumulate => {
+                    matches_primitive(&ReferenceAddUpdateOperation::<ArrayType, ArrayIrType>::new())
+                }
+                ReferenceDischargeRule::Consume => {
+                    matches_primitive(&FreezeReferenceOperation::<ArrayType, ArrayIrType>::new())
+                }
                 ReferenceDischargeRule::Condition => {
                     !instruction.inputs().is_empty()
                         && instruction.regions().len() == 2
@@ -560,11 +404,11 @@ where
             }
             let eliminated = matches!(
                 rule,
-                ReferenceDischargeRule::NewReference
+                ReferenceDischargeRule::NewRoot
                     | ReferenceDischargeRule::Read
-                    | ReferenceDischargeRule::Swap
-                    | ReferenceDischargeRule::AddUpdate
-                    | ReferenceDischargeRule::Freeze,
+                    | ReferenceDischargeRule::Replace
+                    | ReferenceDischargeRule::Accumulate
+                    | ReferenceDischargeRule::Consume,
             );
             if eliminated && instruction.operation().effects() != Effects::single(Effect::OrderedState) {
                 return Err(ProgramError::UnsupportedOperation {
@@ -591,77 +435,42 @@ where
 /// Rewrites a program using the analysis artifact produced immediately before this call.
 fn discharge_with_analysis<V, O>(
     program: Program<V, O, Vec<V>, Vec<V>>,
-    analysis: ReferenceAnalysis,
-) -> Result<DischargedReferenceProgram<V, O>, ProgramError>
+    analysis: ArrayReferenceAnalysis,
+) -> Result<ReferenceDischargeResult<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     let public_output_count = program.output_count();
     if analysis.is_reference_free() {
         verify_discharged_program(&program)?;
-        return Ok(DischargedReferenceProgram { program, public_output_count, external_states: Vec::new() });
+        let total_input_count = program.input_count();
+        return ReferenceDischargeResult::new(
+            program,
+            total_input_count,
+            public_output_count,
+            public_output_count,
+            Vec::new(),
+        );
     }
 
-    let entry = program.entry();
-    let mutated_root_set = analysis
-        .region_summary(entry)
-        .into_iter()
-        .flatten()
-        .filter(|access| matches!(access.mode(), ReferenceAccessMode::Write | ReferenceAccessMode::Accumulate))
-        .map(|access| access.root())
-        .collect::<HashSet<_>>();
-    let mutated_roots = analysis
-        .external_roots()
-        .iter()
-        .filter(|external| mutated_root_set.contains(&external.root()))
-        .map(|external| external.root())
-        .collect::<Vec<_>>();
-    let layout = RegionDischargeLayout {
-        input_insertion: 0,
-        input_roots: Vec::new(),
-        output_insertion: public_output_count,
-        output_roots: mutated_roots,
-    };
-    let discharged = discharge_region(program.entry_region_ref(), &analysis, &layout)?;
-
-    let mut external_states = Vec::with_capacity(analysis.external_roots().len());
-    for external in analysis.external_roots() {
-        let ReferenceRoot::RegionInput { region, input_index } = external.root() else {
-            return Err(ProgramError::MalformedProgram(
-                "external reference root is not an entry-region input".to_string(),
-            ));
-        };
-        if region != entry {
-            return Err(ProgramError::MalformedProgram(
-                "external reference root belongs to a non-entry region".to_string(),
-            ));
-        }
-        let mutated = mutated_root_set.contains(&external.root());
-        let final_state_output_index = if mutated {
-            Some(*discharged.state_output_positions.get(&external.root()).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "mutated external reference root `{}` has no discharged final-state output",
-                    external.root(),
-                ))
-            })?)
-        } else {
-            None
-        };
-        external_states.push(DischargedReferenceState {
-            source: external.source(),
-            discharged_input_index: input_index,
-            final_state_output_index,
-        });
-    }
-
-    verify_discharged_program(&discharged.program)?;
-    Ok(DischargedReferenceProgram { program: discharged.program, public_output_count, external_states })
+    let plan = ReferenceDischargePlan::new(&program, analysis.analysis(), O::reference_discharge_rule)?;
+    let discharged = discharge_region(program.entry_region_ref(), &analysis, plan.entry())?;
+    verify_discharged_program(&discharged)?;
+    let total_input_count = discharged.input_count();
+    let total_output_count = discharged.output_count();
+    ReferenceDischargeResult::new(
+        discharged,
+        total_input_count,
+        total_output_count,
+        plan.public_output_count(),
+        plan.external_states().to_vec(),
+    )
 }
 
 /// Staged view carrier that emits the canonical slice, reshape, and update-slice instructions into a program
 /// builder, sharing the single [`ArrayReferenceView`] traversal with the eager value carrier.
-struct StagedViewCarrier<'b, V: Value<Type = ArrayIrType>, O: ReferenceDischargeOperation>(
+struct StagedViewCarrier<'b, V: Value<Type = ArrayIrType>, O: ArrayReferenceDischargeOperation>(
     /// Destination builder receiving the staged view instructions.
     &'b mut ProgramBuilder<V, O>,
 );
@@ -669,7 +478,7 @@ struct StagedViewCarrier<'b, V: Value<Type = ArrayIrType>, O: ReferenceDischarge
 impl<V, O> ViewReadCarrier for StagedViewCarrier<'_, V, O>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     type Value = AtomId;
 
@@ -698,7 +507,7 @@ where
 impl<V, O> ViewWriteCarrier for StagedViewCarrier<'_, V, O>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     fn update_slice(&mut self, target: &AtomId, update: &AtomId, starts: Vec<usize>) -> Result<AtomId, ProgramError> {
         Ok(self.0.add_instruction(
@@ -723,14 +532,14 @@ where
 fn stage_view_access<'a, V, O>(
     builder: &mut ProgramBuilder<V, O>,
     source: RegionRef<'_, V, O>,
-    analysis: &'a ReferenceAnalysis,
+    analysis: &'a ArrayReferenceAnalysis,
     current_states: &HashMap<ReferenceRoot, AtomId>,
     access: &'static str,
     input: AtomId,
 ) -> Result<(ReferenceRoot, &'a ArrayReferenceView, Vec<AtomId>), ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     let root = analyzed_input_root(analysis, source.id(), input)?;
     let state = current_state(current_states, root)?;
@@ -750,7 +559,7 @@ fn stage_reference_view_reconstruction<V, O>(
 ) -> Result<AtomId, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     view.reconstruct_in(&mut StagedViewCarrier(builder), intermediates, replacement)
 }
@@ -758,21 +567,21 @@ where
 /// Discharges one source region with the requested synthesized state boundary.
 fn discharge_region<V, O>(
     source: RegionRef<'_, V, O>,
-    analysis: &ReferenceAnalysis,
-    layout: &RegionDischargeLayout,
-) -> Result<DischargedRegion<V, O>, ProgramError>
+    analysis: &ArrayReferenceAnalysis,
+    plan: &ReferenceRegionDischargePlan,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
-    validate_layout(layout, source.input_ids().len(), source.output_ids().len())?;
+    let layout = plan.layout();
     let mut builder = ProgramBuilder::<V, O>::new();
     let mut mapped_atoms = vec![None; source.atoms().len()];
     let mut current_states = HashMap::new();
 
     for source_index in 0..=source.input_ids().len() {
-        if source_index == layout.input_insertion {
-            for root in &layout.input_roots {
+        if source_index == layout.input_insertion() {
+            for root in layout.input_roots() {
                 let input = builder.add_input(ArrayIrType::Array(root_referent_type(source, *root)?));
                 if current_states.insert(*root, input).is_some() {
                     return Err(ProgramError::MalformedProgram(format!(
@@ -813,7 +622,7 @@ where
     for (instruction_index, instruction) in source.instructions().iter().enumerate() {
         let instruction_id = InstructionId::new(source.id(), instruction_index);
         match instruction.operation().reference_discharge_rule() {
-            ReferenceDischargeRule::NewReference => {
+            ReferenceDischargeRule::NewRoot => {
                 let initializer =
                     mapped_value(source, analysis, &mapped_atoms, &current_states, instruction.inputs()[0])?;
                 let root = analysis.root(ValueId::new(source.id(), instruction.outputs()[0])).ok_or_else(|| {
@@ -821,7 +630,7 @@ where
                 })?;
                 current_states.insert(root, initializer);
             }
-            ReferenceDischargeRule::View => {}
+            ReferenceDischargeRule::Alias => {}
             ReferenceDischargeRule::Read => {
                 let (_, _, intermediates) = stage_view_access(
                     &mut builder,
@@ -833,7 +642,7 @@ where
                 )?;
                 mapped_atoms[instruction.outputs()[0].index()] = Some(*intermediates.last().unwrap());
             }
-            ReferenceDischargeRule::Swap => {
+            ReferenceDischargeRule::Replace => {
                 let replacement =
                     mapped_value(source, analysis, &mapped_atoms, &current_states, instruction.inputs()[1])?;
                 let (root, view, intermediates) = stage_view_access(
@@ -850,7 +659,7 @@ where
                 mapped_atoms[instruction.outputs()[0].index()] = Some(old);
                 current_states.insert(root, updated);
             }
-            ReferenceDischargeRule::AddUpdate => {
+            ReferenceDischargeRule::Accumulate => {
                 let update = mapped_value(source, analysis, &mapped_atoms, &current_states, instruction.inputs()[1])?;
                 let (root, view, intermediates) = stage_view_access(
                     &mut builder,
@@ -870,21 +679,20 @@ where
                     stage_reference_view_reconstruction(&mut builder, view, intermediates.as_slice(), updated_view)?;
                 current_states.insert(root, updated);
             }
-            ReferenceDischargeRule::Freeze => {
+            ReferenceDischargeRule::Consume => {
                 let root = analyzed_input_root(analysis, source.id(), instruction.inputs()[0])?;
                 let state = current_state(&current_states, root)?;
                 current_states.remove(&root);
                 mapped_atoms[instruction.outputs()[0].index()] = Some(state);
             }
-            rule @ (ReferenceDischargeRule::Condition
+            ReferenceDischargeRule::Condition
             | ReferenceDischargeRule::While
             | ReferenceDischargeRule::Scan { .. }
-            | ReferenceDischargeRule::Call) => discharge_higher_order_instruction(
+            | ReferenceDischargeRule::Call => discharge_higher_order_instruction(
                 source,
                 analysis,
-                instruction_id,
                 instruction,
-                rule,
+                plan.instruction(instruction_id).unwrap(),
                 &mut builder,
                 &mut mapped_atoms,
                 &mut current_states,
@@ -917,103 +725,44 @@ where
         }
     }
 
-    let mut output_ids = Vec::with_capacity(source.output_ids().len() + layout.output_roots.len());
-    let mut source_output_positions = Vec::with_capacity(source.output_ids().len());
-    let mut state_output_positions = HashMap::new();
+    let mut output_ids = Vec::with_capacity(source.output_ids().len() + layout.output_roots().len());
     for source_index in 0..=source.output_ids().len() {
-        if source_index == layout.output_insertion {
-            for root in &layout.output_roots {
-                let position = output_ids.len();
+        if source_index == layout.output_insertion() {
+            for root in layout.output_roots() {
                 output_ids.push(current_state(&current_states, *root)?);
-                if state_output_positions.insert(*root, position).is_some() {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "reference root `{root}` occurs more than once in a discharged region output boundary",
-                    )));
-                }
             }
         }
         let Some(source_output) = source.output_ids().get(source_index).copied() else {
             continue;
         };
-        source_output_positions.push(output_ids.len());
         output_ids.push(mapped_value(source, analysis, &mapped_atoms, &current_states, source_output)?);
     }
 
-    let input_count = source.input_ids().len() + layout.input_roots.len();
+    let input_count = source.input_ids().len() + layout.input_roots().len();
     let output_count = output_ids.len();
     let program =
         builder.build::<Vec<V>, Vec<V>>(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
-    Ok(DischargedRegion { program, source_output_positions, state_output_positions })
+    Ok(program)
 }
 
 /// Rewrites one region-bearing operation and widens its attached computation boundaries with immutable state.
 fn discharge_higher_order_instruction<V, O>(
     source: RegionRef<'_, V, O>,
-    analysis: &ReferenceAnalysis,
-    instruction_id: InstructionId,
+    analysis: &ArrayReferenceAnalysis,
     instruction: &Instruction<O>,
-    rule: ReferenceDischargeRule,
+    plan: &ReferenceInstructionDischargePlan,
     builder: &mut ProgramBuilder<V, O>,
     mapped_atoms: &mut [Option<AtomId>],
     current_states: &mut HashMap<ReferenceRoot, AtomId>,
 ) -> Result<(), ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
-    let explicit_input_roots = instruction
-        .inputs()
-        .iter()
-        .copied()
-        .filter(|input| source.atoms()[input.index()].r#type().is_reference())
-        .map(|input| analyzed_input_root(analysis, source.id(), input))
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let represented_output_roots = instruction
-        .outputs()
-        .iter()
-        .copied()
-        .filter(|output| source.atoms()[output.index()].r#type().is_reference())
-        .map(|output| {
-            analysis.root(ValueId::new(source.id(), output)).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "reference output `{output}` of `{}` has no analyzed root during discharge",
-                    instruction.operation().name(),
-                ))
-            })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let state_roots =
-        instruction_state_roots(analysis, instruction_id, instruction, &represented_output_roots, current_states)?;
-    let added_input_roots =
-        state_roots.iter().copied().filter(|root| !explicit_input_roots.contains(root)).collect::<Vec<_>>();
-    // A condition or call closure only needs a synthesized final-state output for roots it can actually mutate: a
-    // read-only root's entering state is unchanged by construction, and the discharged program performs no dead-code
-    // elimination, so widening it would permanently add a dead result. Loop-shaped rules keep input/output symmetry
-    // instead, because every carried state must round-trip positionally through the loop boundary.
-    let mutated_roots = analysis
-        .instruction_summary(instruction_id)
-        .into_iter()
-        .flatten()
-        .filter(|access| matches!(access.mode(), ReferenceAccessMode::Write | ReferenceAccessMode::Accumulate))
-        .map(|access| access.root())
-        .collect::<BTreeSet<_>>();
-    let added_output_roots = state_roots
-        .iter()
-        .copied()
-        .filter(|root| !represented_output_roots.contains(root))
-        .filter(|root| match rule {
-            ReferenceDischargeRule::Condition | ReferenceDischargeRule::Call => mutated_roots.contains(root),
-            _ => true,
-        })
-        .collect::<Vec<_>>();
-
-    let input_insertion = match rule {
-        ReferenceDischargeRule::Scan { carry_count } => carry_count,
-        _ => instruction.inputs().len(),
-    };
+    let rule = plan.rule();
     let operation = match rule {
         ReferenceDischargeRule::Scan { .. } => {
-            instruction.operation().with_added_reference_scan_carries(added_input_roots.len())?
+            instruction.operation().with_added_reference_scan_carries(plan.added_input_roots().len())?
         }
         _ => instruction.operation().clone(),
     };
@@ -1021,8 +770,8 @@ where
         source,
         analysis,
         instruction.inputs(),
-        input_insertion,
-        &added_input_roots,
+        plan.input_insertion(),
+        plan.added_input_roots(),
         mapped_atoms,
         current_states,
     )?;
@@ -1030,50 +779,14 @@ where
     let mut discharged_regions = Vec::with_capacity(instruction.regions().len());
     for (region_index, region) in instruction.regions().iter().copied().enumerate() {
         let attached = source.with_id(region)?;
-        let region_input_roots = added_input_roots
-            .iter()
-            .copied()
-            .map(|root| attached_root(analysis, instruction_id, region_index, root))
-            .collect::<Vec<_>>();
-        // A while condition observes entering state without producing state outputs; every other higher-order region
-        // returns the synthesized state after its source outputs, except scans, which group synthesized carries with
-        // the declared carry prefix on both boundaries.
-        let region_layout = if matches!(rule, ReferenceDischargeRule::While) && region_index == 0 {
-            RegionDischargeLayout {
-                input_insertion: attached.input_ids().len(),
-                input_roots: region_input_roots,
-                output_insertion: attached.output_ids().len(),
-                output_roots: Vec::new(),
-            }
-        } else {
-            let region_output_roots = added_output_roots
-                .iter()
-                .copied()
-                .map(|root| attached_root(analysis, instruction_id, region_index, root))
-                .collect::<Vec<_>>();
-            let (input_insertion, output_insertion) = match rule {
-                ReferenceDischargeRule::Scan { carry_count } => (carry_count, carry_count),
-                _ => (attached.input_ids().len(), attached.output_ids().len()),
-            };
-            RegionDischargeLayout {
-                input_insertion,
-                input_roots: region_input_roots,
-                output_insertion,
-                output_roots: region_output_roots,
-            }
-        };
-        discharged_regions.push(discharge_region(attached, analysis, &region_layout)?);
+        discharged_regions.push(discharge_region(attached, analysis, &plan.regions()[region_index])?);
     }
 
-    let result_region_index = usize::from(matches!(rule, ReferenceDischargeRule::While));
-    let source_output_positions = discharged_regions[result_region_index].source_output_positions.clone();
-    let state_output_positions = discharged_regions[result_region_index].state_output_positions.clone();
-    let attached_ids = discharged_regions
-        .into_iter()
-        .map(|region| builder.import_program(region.program))
-        .collect::<Vec<_>>();
+    let result_region = &plan.regions()[plan.result_region_index()];
+    let attached_ids = discharged_regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>();
     let outputs = builder.add_instruction(operation, attached_ids, inputs)?.to_vec();
-    for (source_output, position) in instruction.outputs().iter().copied().zip(source_output_positions) {
+    for (source_output_index, source_output) in instruction.outputs().iter().copied().enumerate() {
+        let position = result_region.layout().source_output_position(source_output_index);
         let output = *outputs.get(position).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "discharged `{}` output position {position} is out of range",
@@ -1082,12 +795,12 @@ where
         })?;
         map_source_output(source, analysis, source_output, output, mapped_atoms, current_states)?;
     }
-    for root in added_output_roots {
+    for root in plan.added_output_roots() {
         let attached_root = match rule {
-            ReferenceDischargeRule::While => attached_root(analysis, instruction_id, 1, root),
-            _ => attached_root(analysis, instruction_id, 0, root),
+            ReferenceDischargeRule::While => attached_root(analysis, plan.instruction(), 1, *root),
+            _ => attached_root(analysis, plan.instruction(), 0, *root),
         };
-        let position = state_output_positions.get(&attached_root).copied().ok_or_else(|| {
+        let position = result_region.layout().state_output_position(attached_root).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "discharged `{}` region has no final-state output for root `{root}`",
                 instruction.operation().name(),
@@ -1099,28 +812,7 @@ where
                 instruction.operation().name(),
             ))
         })?;
-        current_states.insert(root, output);
-    }
-    Ok(())
-}
-
-/// Validates synthesized boundary insertion positions and uniqueness before constructing a destination region.
-fn validate_layout(
-    layout: &RegionDischargeLayout,
-    source_input_count: usize,
-    source_output_count: usize,
-) -> Result<(), ProgramError> {
-    if layout.input_insertion > source_input_count {
-        return Err(ProgramError::MalformedProgram(format!(
-            "discharged region input insertion position {} exceeds source input count {source_input_count}",
-            layout.input_insertion,
-        )));
-    }
-    if layout.output_insertion > source_output_count {
-        return Err(ProgramError::MalformedProgram(format!(
-            "discharged region output insertion position {} exceeds source output count {source_output_count}",
-            layout.output_insertion,
-        )));
+        current_states.insert(*root, output);
     }
     Ok(())
 }
@@ -1129,7 +821,7 @@ fn validate_layout(
 fn root_referent_type<V, O>(source: RegionRef<'_, V, O>, root: ReferenceRoot) -> Result<ArrayType, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     let r#type = match root {
         ReferenceRoot::RegionInput { region, input_index } => {
@@ -1159,34 +851,9 @@ where
     Ok(reference.referent().clone())
 }
 
-/// Returns the canonical roots whose state crosses one higher-order instruction boundary.
-fn instruction_state_roots<O: ReferenceDischargeOperation>(
-    analysis: &ReferenceAnalysis,
-    instruction_id: InstructionId,
-    instruction: &Instruction<O>,
-    represented_output_roots: &BTreeSet<ReferenceRoot>,
-    current_states: &HashMap<ReferenceRoot, AtomId>,
-) -> Result<Vec<ReferenceRoot>, ProgramError> {
-    let mut roots = represented_output_roots.clone();
-    if let Some(summary) = analysis.instruction_summary(instruction_id) {
-        roots.extend(summary.iter().map(|access| access.root()));
-    }
-    roots
-        .into_iter()
-        .map(|root| {
-            current_states.contains_key(&root).then_some(root).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "higher-order operation `{}` accesses root `{root}` without entering state",
-                    instruction.operation().name(),
-                ))
-            })
-        })
-        .collect()
-}
-
 /// Returns the formal root used by one attached region for a caller root.
 fn attached_root(
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
     instruction: InstructionId,
     region_index: usize,
     source_root: ReferenceRoot,
@@ -1197,7 +864,7 @@ fn attached_root(
 /// Maps an instruction's source operands and inserts synthesized state operands at `insertion`.
 fn discharged_instruction_inputs<V, O>(
     source: RegionRef<'_, V, O>,
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
     source_inputs: &[AtomId],
     insertion: usize,
     added_roots: &[ReferenceRoot],
@@ -1206,7 +873,7 @@ fn discharged_instruction_inputs<V, O>(
 ) -> Result<Vec<AtomId>, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     if insertion > source_inputs.len() {
         return Err(ProgramError::MalformedProgram(format!(
@@ -1231,14 +898,14 @@ where
 /// Returns the discharged immutable value corresponding to one source atom.
 fn mapped_value<V, O>(
     source: RegionRef<'_, V, O>,
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
     mapped_atoms: &[Option<AtomId>],
     current_states: &HashMap<ReferenceRoot, AtomId>,
     atom: AtomId,
 ) -> Result<AtomId, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     if source.atoms()[atom.index()].r#type().is_reference() {
         current_state(current_states, analyzed_input_root(analysis, source.id(), atom)?)
@@ -1252,7 +919,7 @@ where
 /// Maps one source instruction output to its discharged ordinary value or current reference state.
 fn map_source_output<V, O>(
     source: RegionRef<'_, V, O>,
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
     source_output: AtomId,
     output: AtomId,
     mapped_atoms: &mut [Option<AtomId>],
@@ -1260,7 +927,7 @@ fn map_source_output<V, O>(
 ) -> Result<(), ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    O: ReferenceDischargeOperation,
+    O: ArrayReferenceDischargeOperation,
 {
     if source.atoms()[source_output.index()].r#type().is_reference() {
         let root = analysis.root(ValueId::new(source.id(), source_output)).ok_or_else(|| {
@@ -1277,7 +944,7 @@ where
 
 /// Returns the canonical root analyzed for one reference operand.
 fn analyzed_input_root(
-    analysis: &ReferenceAnalysis,
+    analysis: &ArrayReferenceAnalysis,
     region: RegionId,
     input: AtomId,
 ) -> Result<ReferenceRoot, ProgramError> {
@@ -1295,7 +962,7 @@ fn current_state(states: &HashMap<ReferenceRoot, AtomId>, root: ReferenceRoot) -
 }
 
 /// Verifies the successful-discharge structural postcondition over the complete region arena.
-fn verify_discharged_program<V: Value<Type = ArrayIrType>, O: ReferenceDischargeOperation>(
+fn verify_discharged_program<V: Value<Type = ArrayIrType>, O: ArrayReferenceDischargeOperation>(
     program: &Program<V, O, Vec<V>, Vec<V>>,
 ) -> Result<(), ProgramError> {
     for region in program.regions() {
@@ -1334,16 +1001,18 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
-    use crate::arrays::operations::{ArrayIrOperation, ArrayReferenceOperation};
-    use crate::arrays::reference_analysis::ReferenceAnalysisError;
+    use crate::arrays::operations::{
+        ArrayIrOperation, ArrayReferenceOperation, ReferenceIndexOperation, ReferenceSliceOperation,
+    };
     use crate::arrays::reference_views::{ArrayReference, ArrayReferenceViewTransform};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::captures::CaptureReference;
-    use crate::operations::{
-        ConditionOperation, ReferenceIndexOperation, ReferenceSliceOperation, ScanOperation, WhileOperation,
+    use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
+    use crate::programs::{
+        OutputRegionProvenance, ReferenceAccessMode, ReferenceAnalysisError, ReferenceInputAccess, ReferenceSource,
+        ReferenceStateBinding, ReferenceType, RegionInterface, RegionSlot,
     };
-    use crate::programs::{OutputRegionProvenance, ReferenceInputAccess, ReferenceType, RegionInterface, RegionSlot};
 
     use super::*;
 
@@ -1482,11 +1151,11 @@ mod tests {
         }
     }
 
-    impl ReferenceDischargeOperation for MalformedDischargeOperation {
+    impl ArrayReferenceDischargeOperation for MalformedDischargeOperation {
         fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
             match self {
-                Self::NewReference => ReferenceDischargeRule::NewReference,
-                Self::View => ReferenceDischargeRule::View,
+                Self::NewReference => ReferenceDischargeRule::NewRoot,
+                Self::View => ReferenceDischargeRule::Alias,
                 Self::While => ReferenceDischargeRule::While,
                 Self::MixedEffectRead | Self::MismatchedReadTypes => ReferenceDischargeRule::Read,
                 Self::StatefulCondition | Self::MisroutedConditionOutputs => ReferenceDischargeRule::Condition,
@@ -1569,7 +1238,7 @@ mod tests {
         assert_eq!(
             source.discharge_references(0).unwrap_err(),
             ProgramError::MalformedProgram(
-                "operation `malformed_new_reference_discharge` reports an incompatible `new_reference` reference \
+                "operation `malformed_new_reference_discharge` reports an incompatible `new_root` reference \
                  discharge rule"
                     .to_string(),
             ),
@@ -1592,7 +1261,7 @@ mod tests {
         assert_eq!(
             source.discharge_references(0).unwrap_err(),
             ProgramError::MalformedProgram(
-                "operation `malformed_view_discharge` reports an incompatible `view` reference discharge rule"
+                "operation `malformed_view_discharge` reports an incompatible `alias` reference discharge rule"
                     .to_string(),
             ),
         );
@@ -1752,17 +1421,20 @@ mod tests {
         let initial = builder.add_input(scalar_type().into());
         let replacement = builder.add_input(scalar_type().into());
         let update = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
-        let first_snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
-        let swapped_snapshot =
-            builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let first_snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let swapped_snapshot = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
+            .unwrap()[0];
         assert!(
             builder
-                .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
                 .unwrap()
                 .is_empty(),
         );
-        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let final_snapshot =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![first_snapshot, swapped_snapshot, final_snapshot],
@@ -1794,10 +1466,11 @@ mod tests {
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let indexed =
             builder.add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference]).unwrap()[0];
-        let indexed_snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![indexed]).unwrap()[0];
+        let indexed_snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![indexed]).unwrap()[0];
         let outer = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
@@ -1808,9 +1481,14 @@ mod tests {
         let composed = builder
             .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]), Vec::new(), vec![outer])
             .unwrap()[0];
-        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![composed, replacement]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![composed, update]).unwrap();
-        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let old = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![composed, replacement])
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update])
+            .unwrap();
+        let final_snapshot =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![indexed_snapshot, old, final_snapshot],
@@ -1850,11 +1528,13 @@ mod tests {
         let initial = builder.add_input(matrix_type.clone().into());
         let replacement = builder.add_input(row_type.clone().into());
         let update = builder.add_input(row_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let row = builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
-        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![row, replacement]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![row, update]).unwrap();
-        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let old =
+            builder.add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![row, replacement]).unwrap()[0];
+        builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![row, update]).unwrap();
+        let final_snapshot =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![old, final_snapshot],
@@ -1901,7 +1581,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(matrix_type.clone().into());
         let replacement = builder.add_input(row_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let block = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)]),
@@ -1910,8 +1590,10 @@ mod tests {
             )
             .unwrap()[0];
         let row = builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![block]).unwrap()[0];
-        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![row, replacement]).unwrap()[0];
-        let final_snapshot = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let old =
+            builder.add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![row, replacement]).unwrap()[0];
+        let final_snapshot =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![old, final_snapshot],
@@ -1981,7 +1663,8 @@ mod tests {
                 let initial = builder.add_input(scalar_type().into());
                 let replacement = builder.add_input(scalar_type().into());
                 let update = builder.add_input(scalar_type().into());
-                let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+                let reference =
+                    builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
                 let mut outputs = Vec::new();
                 let mut oracle_state = 2.0f32;
                 let mut oracle_outputs = Vec::new();
@@ -1989,15 +1672,20 @@ mod tests {
                     match step {
                         Step::Read => {
                             outputs.push(
-                                builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()
-                                    [0],
+                                builder
+                                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+                                    .unwrap()[0],
                             );
                             oracle_outputs.push(scalar(oracle_state));
                         }
                         Step::Swap => {
                             outputs.push(
                                 builder
-                                    .add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement])
+                                    .add_instruction(
+                                        ReferenceSwapOperation::new(),
+                                        Vec::new(),
+                                        vec![reference, replacement],
+                                    )
                                     .unwrap()[0],
                             );
                             oracle_outputs.push(scalar(oracle_state));
@@ -2005,14 +1693,19 @@ mod tests {
                         }
                         Step::AddUpdate => {
                             builder
-                                .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+                                .add_instruction(
+                                    ReferenceAddUpdateOperation::new(),
+                                    Vec::new(),
+                                    vec![reference, update],
+                                )
                                 .unwrap();
                             oracle_state += 3.0;
                         }
                     }
                 }
-                outputs
-                    .push(builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0]);
+                outputs.push(
+                    builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0],
+                );
                 oracle_outputs.push(scalar(oracle_state));
                 let output_count = outputs.len();
                 let source = builder
@@ -2041,9 +1734,11 @@ mod tests {
         let replacement = builder.add_input(scalar_type().into());
 
         // Access the second root first so metadata order cannot accidentally follow access order.
-        let second_snapshot = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![second]).unwrap()[0];
-        let first_snapshot =
-            builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![first, replacement]).unwrap()[0];
+        let second_snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second]).unwrap()[0];
+        let first_snapshot = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![first, replacement])
+            .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![second_snapshot, first_snapshot],
@@ -2069,16 +1764,8 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                DischargedReferenceState {
-                    source: ReferenceSource::PublicInput { index: 0 },
-                    discharged_input_index: 0,
-                    final_state_output_index: Some(2),
-                },
-                DischargedReferenceState {
-                    source: ReferenceSource::PublicInput { index: 1 },
-                    discharged_input_index: 1,
-                    final_state_output_index: None,
-                },
+                ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(2)),
+                ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 1 }, 1, None),
             ],
         );
         assert_eq!(
@@ -2092,9 +1779,9 @@ mod tests {
         assert_eq!(
             format!("{:?}", discharged.external_states()),
             concat!(
-                "[DischargedReferenceState { source: PublicInput { index: 0 }, ",
+                "[ReferenceStateBinding { source: PublicInput { index: 0 }, ",
                 "discharged_input_index: 0, final_state_output_index: Some(2) }, ",
-                "DischargedReferenceState { source: PublicInput { index: 1 }, ",
+                "ReferenceStateBinding { source: PublicInput { index: 1 }, ",
                 "discharged_input_index: 1, final_state_output_index: None }]",
             ),
         );
@@ -2105,17 +1792,100 @@ mod tests {
     }
 
     #[test]
-    fn test_discharge_local_references() {
+    fn test_array_reference_discharge_matches_generic_plan_layout_and_bindings() {
+        let reference_type = ReferenceType::new(scalar_type());
+        let make_branch = || {
+            let mut builder = ProgramBuilder::<Capture, CaptureOperation>::new();
+            let replacement = builder.add_input(scalar_type().into());
+            let captured = builder.add_constant(Capture::new(0, reference_type.clone().into()));
+            let old = builder
+                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![captured, replacement])
+                .unwrap()[0];
+            builder
+                .build::<Vec<Capture>, Vec<Capture>>(vec![old], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<Capture, CaptureOperation>::new();
+        builder.add_input(reference_type.clone().into());
+        let read_only = builder.add_input(reference_type.clone().into());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let replacement = builder.add_input(scalar_type().into());
+        let branch = builder.import_region(make_branch().entry_region_ref());
+        let old = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<CaptureArray>>::new(),
+                vec![branch, branch],
+                vec![predicate, replacement],
+            )
+            .unwrap()[0];
+        let snapshot = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_only]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Capture>, Vec<Capture>>(vec![old, snapshot], vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+
+        let analysis = program.analyze_array_references_with_lifted_captures(1).unwrap();
+        let plan =
+            ReferenceDischargePlan::new(&program, analysis.analysis(), CaptureOperation::reference_discharge_rule)
+                .unwrap();
+        let captured_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 };
+        let read_only_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 1 };
+        let expected_bindings = [
+            ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(2)),
+            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 1, None),
+        ];
+
+        assert_eq!(plan.public_output_count(), 2);
+        assert_eq!(plan.external_states(), expected_bindings);
+        assert_eq!(plan.entry().layout().input_insertion(), 0);
+        assert_eq!(plan.entry().layout().input_roots(), &[]);
+        assert_eq!(plan.entry().layout().output_insertion(), 2);
+        assert_eq!(plan.entry().layout().output_roots(), &[captured_root]);
+        assert_eq!(plan.entry().layout().source_output_position(0), 0);
+        assert_eq!(plan.entry().layout().source_output_position(1), 1);
+        assert_eq!(plan.entry().layout().state_output_position(captured_root), Some(2));
+        assert_eq!(plan.entry().layout().state_output_position(read_only_root), None);
+        let condition = plan.entry().instruction(InstructionId::new(program.entry(), 0)).unwrap();
+        assert_eq!(condition.rule(), ReferenceDischargeRule::Condition);
+        assert_eq!(condition.input_insertion(), 2);
+        assert_eq!(condition.added_input_roots(), &[captured_root]);
+        assert_eq!(condition.added_output_roots(), &[captured_root]);
+        assert_eq!(condition.regions().len(), 2);
+        for branch in condition.regions() {
+            assert_eq!(branch.layout().input_insertion(), 1);
+            assert_eq!(branch.layout().input_roots(), &[captured_root]);
+            assert_eq!(branch.layout().output_insertion(), 1);
+            assert_eq!(branch.layout().output_roots(), &[captured_root]);
+        }
+
+        let discharged = program.discharge_references_with_lifted_captures(1).unwrap();
+        assert_eq!(discharged.public_output_count(), plan.public_output_count());
+        assert_eq!(discharged.external_states(), plan.external_states());
+        assert_eq!(discharged.external_states(), expected_bindings);
+        assert_eq!(discharged.program().output_count(), 3);
+        let entry = discharged.program().entry_region_ref();
+        let condition = &entry.instructions()[0];
+        assert_eq!(condition.inputs().len(), 3);
+        assert_eq!(condition.outputs().len(), 2);
+        for region in condition.regions() {
+            let branch = entry.with_id(*region).unwrap();
+            assert_eq!(branch.input_ids().len(), 2);
+            assert_eq!(branch.output_ids().len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_array_reference_discharge_local_references() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(scalar_type()).into());
-        let output = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let external = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // Every transform adapter shares this gate, so its rejection names the requesting transform verbatim
-        // together with the caller-owned boundary source the program depends on. Public arguments and captures are
-        // both external: neither boundary can supply the runtime holder that writing final state back would need.
+        // The shared local-only gate names the requesting transform together with the caller-owned boundary source.
+        // Public arguments and captures are both external: neither boundary supplies the runtime holder needed for
+        // final-state write-back.
         assert!(matches!(
             external.clone().discharge_local_references(0, "differentiation"),
             Err(ProgramError::UnsupportedOperation { message })
@@ -2132,9 +1902,11 @@ mod tests {
         // final-state outputs are appended only for external roots. The result is an ordinary pure array program.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, initial]).unwrap();
-        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, initial])
+            .unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let local = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2148,9 +1920,10 @@ mod tests {
     fn test_discharge_rejects_invalid_program_before_producing_an_artifact() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
-        let invalid_read = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let invalid_read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![frozen, invalid_read],
@@ -2179,7 +1952,7 @@ mod tests {
         let reference = true_builder.add_input(reference_type.clone().into());
         let replacement = true_builder.add_input(scalar_type().into());
         let snapshot = true_builder
-            .add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
@@ -2188,7 +1961,8 @@ mod tests {
         let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = false_builder.add_input(reference_type.clone().into());
         false_builder.add_input(scalar_type().into());
-        let snapshot = false_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot =
+            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2253,9 +2027,10 @@ mod tests {
         let second = true_builder.add_input(reference_type.clone().into());
         true_builder.add_input(scalar_type().into());
         let second_replacement = true_builder.add_input(scalar_type().into());
-        let first_snapshot = true_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![first]).unwrap()[0];
+        let first_snapshot =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first]).unwrap()[0];
         let second_snapshot = true_builder
-            .add_instruction(ReferenceSwapOperation, Vec::new(), vec![second, second_replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![second, second_replacement])
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -2271,10 +2046,10 @@ mod tests {
         let first_replacement = false_builder.add_input(scalar_type().into());
         false_builder.add_input(scalar_type().into());
         let first_snapshot = false_builder
-            .add_instruction(ReferenceSwapOperation, Vec::new(), vec![first, first_replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![first, first_replacement])
             .unwrap()[0];
         let second_snapshot =
-            false_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![second]).unwrap()[0];
+            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second]).unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![first_snapshot, second_snapshot],
@@ -2333,7 +2108,9 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type());
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = condition_builder.add_input(reference_type.clone().into());
-        condition_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap();
         let predicate = condition_builder.add_constant(boolean(true));
         let loop_condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -2343,7 +2120,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.into());
         let update = body_builder.add_constant(scalar(1.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
         let loop_body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -2353,11 +2130,13 @@ mod tests {
         let loop_condition = true_builder.import_region(loop_condition.entry_region_ref());
         let loop_body = true_builder.import_region(loop_body.entry_region_ref());
         let initial = true_builder.add_input(scalar_type().into());
-        let reference = true_builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            true_builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
         let reference =
             true_builder.add_instruction(operation, vec![loop_condition, loop_body], vec![reference]).unwrap()[0];
-        let value = true_builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            true_builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2398,7 +2177,9 @@ mod tests {
             let reference_type = ReferenceType::new(scalar_type());
             let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = condition_builder.add_input(reference_type.clone().into());
-            condition_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+            condition_builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+                .unwrap();
             let condition = condition_builder.add_constant(boolean(condition_value));
             let condition = condition_builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition], vec![Placeholder], vec![Placeholder])
@@ -2408,7 +2189,7 @@ mod tests {
             let reference = body_builder.add_input(reference_type.clone().into());
             let update = body_builder.add_constant(scalar(1.0));
             body_builder
-                .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
                 .unwrap();
             let body = body_builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -2420,7 +2201,7 @@ mod tests {
             let reference = builder.add_input(reference_type.into());
             let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(iteration_bound).unwrap();
             let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
-            let value = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+            let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2463,9 +2244,10 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let update = body_builder.add_constant(scalar(1.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
-        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference, value], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -2478,7 +2260,7 @@ mod tests {
         let final_reference = outputs[0];
         let stacked_values = outputs[1];
         let final_value =
-            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![final_reference]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![final_value, stacked_values],
@@ -2531,7 +2313,7 @@ mod tests {
         let element = body_builder.add_input(scalar_type().into());
         let reference = body_builder.add_constant(Capture::new(0, reference_type.into()));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, element])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element])
             .unwrap();
         let next_carry = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element])
@@ -2594,7 +2376,7 @@ mod tests {
             let mut branch_builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = branch_builder.add_input(reference_type.clone().into());
             let snapshot =
-                branch_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+                branch_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
             branch_builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2649,9 +2431,10 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let update = body_builder.add_constant(scalar(1.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
-        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference, value], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -2664,7 +2447,7 @@ mod tests {
         let final_reference = outputs[0];
         let stacked_values = outputs[1];
         let final_value =
-            builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![final_reference]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![final_value, stacked_values],
@@ -2767,7 +2550,7 @@ mod tests {
             }
         }
 
-        impl ReferenceDischargeOperation for CallingOperation {
+        impl ArrayReferenceDischargeOperation for CallingOperation {
             fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
                 match self {
                     Self::Native(operation) => operation.reference_discharge_rule(),
@@ -2812,7 +2595,7 @@ mod tests {
         let replacement = callee_builder.add_input(scalar_type().into());
         let old = callee_builder
             .add_instruction(
-                CallingOperation::Native(ReferenceSwapOperation.into()),
+                CallingOperation::Native(ReferenceSwapOperation::new().into()),
                 Vec::new(),
                 vec![reference, replacement],
             )
@@ -2826,11 +2609,11 @@ mod tests {
         let initial = builder.add_input(scalar_type().into());
         let replacement = builder.add_input(scalar_type().into());
         let root = builder
-            .add_instruction(CallingOperation::Native(NewReferenceOperation.into()), Vec::new(), vec![initial])
+            .add_instruction(CallingOperation::Native(NewReferenceOperation::new().into()), Vec::new(), vec![initial])
             .unwrap()[0];
         let old = builder.add_instruction(CallingOperation::Call, vec![callee], vec![root, replacement]).unwrap()[0];
         let final_snapshot = builder
-            .add_instruction(CallingOperation::Native(FreezeReferenceOperation.into()), Vec::new(), vec![root])
+            .add_instruction(CallingOperation::Native(FreezeReferenceOperation::new().into()), Vec::new(), vec![root])
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -2862,7 +2645,8 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type());
         let mut branch_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = branch_builder.add_constant(Capture::new(0, reference_type.into()));
-        let value = branch_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            branch_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let branch = branch_builder
             .build::<Vec<Capture>, Vec<Capture>>(vec![value], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -2887,11 +2671,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[DischargedReferenceState {
-                source: ReferenceSource::Capture { index: 0 },
-                discharged_input_index: 0,
-                final_state_output_index: None,
-            }],
+            &[ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, None)],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
@@ -2912,7 +2692,8 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let mut leaf_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = leaf_builder.add_constant(Capture::new(0, reference_type.into()));
-        let value = leaf_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            leaf_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let leaf = leaf_builder
             .build::<Vec<Capture>, Vec<Capture>>(vec![value], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -2955,7 +2736,9 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type());
         let mut condition_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = condition_builder.add_constant(Capture::new(0, reference_type.into()));
-        condition_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap();
         let predicate = condition_builder.add_constant(Capture::new(1, ArrayType::scalar(DataType::Boolean).into()));
         let condition = condition_builder
             .build::<Vec<Capture>, Vec<Capture>>(vec![predicate], Vec::new(), vec![Placeholder])
@@ -2991,7 +2774,8 @@ mod tests {
         let concrete_reference = ArrayReference::new(Array::scalar(4.0f32));
         let mut body_builder = ProgramBuilder::<Capture, CaptureOperation>::new();
         let reference = body_builder.add_constant(Capture::new(0, reference_type.into()));
-        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let body = body_builder
             .build::<Vec<Capture>, Vec<Capture>>(vec![value], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -3029,9 +2813,10 @@ mod tests {
         let reference = body_builder.add_constant(Capture::new(0, reference_type.into()));
         let update = body_builder.add_constant(Capture::new(1, scalar_type().into()));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
-        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let body = body_builder
             .build::<Vec<Capture>, Vec<Capture>>(vec![value], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -3078,9 +2863,10 @@ mod tests {
         let reference = true_builder.add_input(reference_type.clone().into());
         let update = true_builder.add_constant(scalar(1.0));
         true_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
-        let snapshot = true_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3089,7 +2875,7 @@ mod tests {
         let reference = false_builder.add_input(reference_type.clone().into());
         let replacement = false_builder.add_constant(scalar(9.0));
         let snapshot = false_builder
-            .add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
             .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
@@ -3100,7 +2886,7 @@ mod tests {
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -3108,7 +2894,7 @@ mod tests {
                 vec![predicate, reference],
             )
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -3135,7 +2921,7 @@ mod tests {
             let view =
                 builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
             let update = builder.add_constant(scalar(1.0));
-            builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![view, update]).unwrap();
+            builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update]).unwrap();
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -3153,7 +2939,7 @@ mod tests {
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(vector_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let reference = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -3161,7 +2947,7 @@ mod tests {
                 vec![predicate, reference],
             )
             .unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -3206,7 +2992,9 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type());
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = condition_builder.add_input(reference_type.clone().into());
-        condition_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap();
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap();
         let predicate = condition_builder.add_constant(boolean(true));
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -3216,7 +3004,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.into());
         let update = body_builder.add_constant(scalar(2.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -3226,10 +3014,10 @@ mod tests {
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
         let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3280,9 +3068,10 @@ mod tests {
         let reference = body_builder.add_input(reference_type.into());
         let update = body_builder.add_constant(scalar(3.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
-        let value = body_builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference, value], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -3290,12 +3079,13 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type().into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let outputs =
             builder.add_instruction(ScanOperation::<TestValue>::new(1, 4), vec![body], vec![reference]).unwrap();
         let final_reference = outputs[0];
         let stacked_values = outputs[1];
-        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![final_reference]).unwrap()[0];
+        let frozen =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![final_reference]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![frozen, stacked_values],
@@ -3323,7 +3113,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.into());
         let update = body_builder.add_constant(scalar(3.0));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
             .unwrap();
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -3333,7 +3123,7 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type().into());
         let runtime_length = builder.add_input(DimensionType::new(length.clone()).into());
-        let reference = builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let scanned = builder
             .add_instruction(
                 ScanOperation::<TestValue>::new(1, Dimension::Dynamic(length.clone())),
@@ -3341,7 +3131,7 @@ mod tests {
                 vec![reference, runtime_length],
             )
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![scanned]).unwrap()[0];
+        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![scanned]).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

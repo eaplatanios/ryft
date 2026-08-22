@@ -21,8 +21,8 @@ use std::fmt::Display;
 use std::num::NonZeroUsize;
 
 use ryft_core::{
-    ArrayIrType, ArrayReferenceView, ArrayType, InstructionId, Operation, OperationFormatter, ProgramError,
-    ReferenceAccessMode, ReferenceAddUpdateOperation, ReferenceAnalysis, ReferenceDischargeOperation,
+    ArrayIrType, ArrayReferenceAnalysis, ArrayReferenceDischargeOperation, ArrayReferenceView, ArrayType,
+    InstructionId, Operation, OperationFormatter, ProgramError, ReferenceAccessMode, ReferenceAddUpdateOperation,
     ReferenceDischargeRule, ReferenceIndexOperation, ReferenceReadOperation, ReferenceRoot, ReferenceSwapOperation,
     ReferenceType, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityRenaming, Typed, Value,
     ValueId,
@@ -516,7 +516,7 @@ impl PreservedReferenceKernelOperation {
     pub fn validate_body<V, O>(&self, body: RegionRef<'_, V, O>) -> Result<PreservedReferenceKernel, ProgramError>
     where
         V: Value<Type = ArrayIrType>,
-        O: ReferenceDischargeOperation,
+        O: ArrayReferenceDischargeOperation,
     {
         if body.input_ids().len() != self.parameters.len() {
             return Err(ProgramError::custom(KernelReferenceError::InputCount {
@@ -577,7 +577,7 @@ impl PreservedReferenceKernelOperation {
             }
         }
 
-        let analysis = body.analyze_references(0)?;
+        let analysis = body.analyze_array_references(0)?;
         let mut bindings = Vec::with_capacity(self.parameters.len());
         // Canonical analysis reports exactly one external root per reference-typed region input, in input order, so
         // the parameter position and the external-root position always coincide here.
@@ -598,14 +598,14 @@ impl PreservedReferenceKernelOperation {
         for (instruction_index, instruction) in body.instructions().iter().enumerate() {
             let instruction_id = InstructionId::new(body.id(), instruction_index);
             let rule = instruction.operation().reference_discharge_rule();
-            if rule == ReferenceDischargeRule::NewReference {
+            if rule == ReferenceDischargeRule::NewRoot {
                 return Err(ProgramError::custom(KernelReferenceError::LocalAllocationUnsupported {
                     instruction: instruction_id,
                 }));
             }
             if matches!(
                 rule,
-                ReferenceDischargeRule::Freeze
+                ReferenceDischargeRule::Consume
                     | ReferenceDischargeRule::Condition
                     | ReferenceDischargeRule::While
                     | ReferenceDischargeRule::Scan { .. }
@@ -649,7 +649,7 @@ impl PreservedReferenceKernelOperation {
                 (inputs, outputs)
             };
             let primitive_contract = match rule {
-                ReferenceDischargeRule::View => Some((
+                ReferenceDischargeRule::Alias => Some((
                     1,
                     1,
                     None,
@@ -668,13 +668,13 @@ impl PreservedReferenceKernelOperation {
                         "exactly one `Read` reference access on input 0",
                         matches_reference_primitive(
                             instruction.operation(),
-                            &ReferenceReadOperation,
+                            &ReferenceReadOperation::new(),
                             input_types.as_slice(),
                             output_types.as_slice(),
                         ),
                     ))
                 }
-                ReferenceDischargeRule::Swap => {
+                ReferenceDischargeRule::Replace => {
                     let (input_types, output_types) = boundary_types();
                     Some((
                         2,
@@ -683,13 +683,13 @@ impl PreservedReferenceKernelOperation {
                         "exactly one `Write` reference access on input 0",
                         matches_reference_primitive(
                             instruction.operation(),
-                            &ReferenceSwapOperation,
+                            &ReferenceSwapOperation::new(),
                             input_types.as_slice(),
                             output_types.as_slice(),
                         ),
                     ))
                 }
-                ReferenceDischargeRule::AddUpdate => {
+                ReferenceDischargeRule::Accumulate => {
                     let (input_types, output_types) = boundary_types();
                     Some((
                         2,
@@ -698,7 +698,7 @@ impl PreservedReferenceKernelOperation {
                         "exactly one `Accumulate` reference access on input 0",
                         matches_reference_primitive(
                             instruction.operation(),
-                            &ReferenceAddUpdateOperation,
+                            &ReferenceAddUpdateOperation::new(),
                             input_types.as_slice(),
                             output_types.as_slice(),
                         ),
@@ -748,7 +748,7 @@ impl PreservedReferenceKernelOperation {
             // Local allocations are rejected above, so every analyzed access names one of the external roots that
             // produced `bindings`.
             let binding = bindings.iter().find(|binding| binding.root == access.root()).unwrap();
-            let old_value_is_live = rule == ReferenceDischargeRule::Swap
+            let old_value_is_live = rule == ReferenceDischargeRule::Replace
                 && instruction.outputs().first().is_some_and(|output| data_liveness[output.index()]);
             let input = instruction.inputs()[access.input_index()];
             let value = ValueId::new(body.id(), input);
@@ -761,20 +761,22 @@ impl PreservedReferenceKernelOperation {
                     root: access.root(),
                     view,
                 }),
-                ReferenceDischargeRule::Swap if old_value_is_live => lowering.push(MockKernelInstruction::Exchange {
+                ReferenceDischargeRule::Replace if old_value_is_live => {
+                    lowering.push(MockKernelInstruction::Exchange {
+                        instruction: instruction_id,
+                        replacement: ValueId::new(body.id(), instruction.inputs()[1]),
+                        output: ValueId::new(body.id(), instruction.outputs()[0]),
+                        root: access.root(),
+                        view,
+                    })
+                }
+                ReferenceDischargeRule::Replace => lowering.push(MockKernelInstruction::Store {
                     instruction: instruction_id,
                     replacement: ValueId::new(body.id(), instruction.inputs()[1]),
-                    output: ValueId::new(body.id(), instruction.outputs()[0]),
                     root: access.root(),
                     view,
                 }),
-                ReferenceDischargeRule::Swap => lowering.push(MockKernelInstruction::Store {
-                    instruction: instruction_id,
-                    replacement: ValueId::new(body.id(), instruction.inputs()[1]),
-                    root: access.root(),
-                    view,
-                }),
-                ReferenceDischargeRule::AddUpdate => lowering.push(MockKernelInstruction::Accumulate {
+                ReferenceDischargeRule::Accumulate => lowering.push(MockKernelInstruction::Accumulate {
                     instruction: instruction_id,
                     update: ValueId::new(body.id(), instruction.inputs()[1]),
                     root: access.root(),
@@ -1072,8 +1074,8 @@ pub enum MockKernelInstruction {
 /// Validated preserved-reference body together with its deterministic mock lowering decisions.
 #[derive(Debug)]
 pub struct PreservedReferenceKernel {
-    /// Canonical core reference analysis.
-    analysis: ReferenceAnalysis,
+    /// Canonical generic reference analysis with its validated array-view overlay.
+    analysis: ArrayReferenceAnalysis,
 
     /// Ordered boundary bindings.
     bindings: Vec<KernelReferenceBinding>,
@@ -1085,7 +1087,7 @@ pub struct PreservedReferenceKernel {
 impl PreservedReferenceKernel {
     /// Returns the canonical root, view, and access analysis reused by this eligibility proof.
     #[inline]
-    pub fn analysis(&self) -> &ReferenceAnalysis {
+    pub fn analysis(&self) -> &ArrayReferenceAnalysis {
         &self.analysis
     }
 
@@ -1179,8 +1181,8 @@ mod tests {
         AddOperation, Array as CpuArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceOperation,
         ArrayReferenceViewTransform, ArraySliceAxis, ConditionOperation, DataType, Dimension, Effects,
         FreezeReferenceOperation, NewReferenceOperation, Placeholder, PrintOperation, Program, ProgramBuilder,
-        ReferenceAnalysisError, ReferenceOperationSemantics, ReferenceSliceOperation, ReshapeOperation, Shape,
-        SliceOperation, UpdateSliceOperation, ValueProjection,
+        ReferenceAnalysisError, ReferenceDischarge, ReferenceOperationSemantics, ReferenceSliceOperation,
+        ReshapeOperation, Shape, SliceOperation, UpdateSliceOperation, ValueProjection,
     };
 
     use crate::experimental::lowering::{LoweringError, lower_mlir_module_for_program};
@@ -1211,11 +1213,11 @@ mod tests {
         }
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-            ReferenceReadOperation.reference_semantics()
+            Cow::Owned(ReferenceReadOperation::<ArrayType, ArrayIrType>::new().reference_semantics().into_owned())
         }
 
         fn effects(&self) -> Effects {
-            ReferenceReadOperation.effects()
+            ReferenceReadOperation::<ArrayType, ArrayIrType>::new().effects()
         }
 
         fn rename_type_identities(
@@ -1275,8 +1277,8 @@ mod tests {
         Native(TestOperation),
         ReferenceIndex(ReferenceIndexOperation),
         OrdinaryReferenceIndex(OrdinaryReferenceIndexOperation),
-        ReferenceRead(ReferenceReadOperation),
-        ReferenceAddUpdate(ReferenceAddUpdateOperation),
+        ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
+        ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
         WrongTypeRead(WrongTypeReadOperation),
     }
 
@@ -1290,12 +1292,12 @@ mod tests {
         }
     }
 
-    impl ReferenceDischargeOperation for MalformedReferenceRuleOperation {
+    impl ArrayReferenceDischargeOperation for MalformedReferenceRuleOperation {
         fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
             match self {
                 Self::ReferenceIndex(_) | Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::Read,
                 Self::OrdinaryReferenceIndex(_) => ReferenceDischargeRule::Ordinary,
-                Self::ReferenceRead(_) => ReferenceDischargeRule::View,
+                Self::ReferenceRead(_) => ReferenceDischargeRule::Alias,
                 Self::WrongTypeRead(_) => ReferenceDischargeRule::Read,
                 Self::Native(operation) => operation.reference_discharge_rule(),
             }
@@ -1340,8 +1342,10 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let source = builder.add_input(reference_type(scalar_type()));
         let destination = builder.add_input(reference_type(scalar_type()));
-        let value = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![source]).unwrap()[0];
-        builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![destination, value]).unwrap();
+        let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![destination, value])
+            .unwrap();
         builder.build(Vec::new(), vec![Placeholder; 2], Vec::<Placeholder>::new()).unwrap()
     }
 
@@ -1483,9 +1487,11 @@ mod tests {
         let first = builder.add_input(reference_type(scalar_type()));
         let second = builder.add_input(reference_type(scalar_type()));
         let source = builder.add_input(reference_type(scalar_type()));
-        let replacement = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![source]).unwrap()[0];
-        let old = builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![first, replacement]).unwrap()[0];
-        builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![second, old]).unwrap();
+        let replacement = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source]).unwrap()[0];
+        let old = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![first, replacement])
+            .unwrap()[0];
+        builder.add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![second, old]).unwrap();
         let live_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 3], Vec::<Placeholder>::new())
             .unwrap();
@@ -1519,8 +1525,9 @@ mod tests {
         let destination = builder.add_input(reference_type(scalar_type()));
         let replacement = builder.add_constant(TestValue::Array(CpuArray::scalar(1.0_f32)));
         let increment = builder.add_constant(TestValue::Array(CpuArray::scalar(2.0_f32)));
-        let old =
-            builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![destination, replacement]).unwrap()[0];
+        let old = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![destination, replacement])
+            .unwrap()[0];
         builder.add_instruction(AddOperation::new(), Vec::new(), vec![old, increment]).unwrap();
         let dead_consumer_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
@@ -1580,7 +1587,7 @@ mod tests {
             )
             .unwrap()[0];
         let replacement = builder.add_constant(TestValue::Array(CpuArray::vector(vec![5.0_f32, 6.0])));
-        builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![view, replacement]).unwrap();
+        builder.add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![view, replacement]).unwrap();
         let partial_write = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1597,8 +1604,10 @@ mod tests {
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
-        let update = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+        let update = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .unwrap();
         let accumulate_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1630,7 +1639,7 @@ mod tests {
         // drop the effect.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
-        let value = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         builder
             .add_instruction(ArrayOperation::Print(PrintOperation::new("kernel")), Vec::new(), vec![value])
             .unwrap();
@@ -1658,9 +1667,11 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
         let increment = builder.add_constant(TestValue::Array(CpuArray::scalar(2.0_f32)));
-        let current = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
+        let current = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
         let updated = builder.add_instruction(AddOperation::new(), Vec::new(), vec![current, increment]).unwrap()[0];
-        builder.add_instruction(ReferenceSwapOperation, Vec::new(), vec![reference, updated]).unwrap();
+        builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, updated])
+            .unwrap();
         let live_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1710,8 +1721,10 @@ mod tests {
         // A read-only parameter cannot accumulate either, even though the preceding read is permitted.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
-        let update = builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![reference]).unwrap()[0];
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+        let update = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .unwrap();
         let read_accumulate_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1731,7 +1744,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
         let update = builder.add_constant(TestValue::Array(CpuArray::scalar(1.0_f32)));
-        builder.add_instruction(ReferenceAddUpdateOperation, Vec::new(), vec![reference, update]).unwrap();
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .unwrap();
         let accumulate_body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1760,7 +1775,7 @@ mod tests {
             .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]), Vec::new(), vec![root])
             .unwrap()[0];
         let index = builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![slice]).unwrap()[0];
-        builder.add_instruction(ReferenceReadOperation, Vec::new(), vec![index]).unwrap();
+        builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![index]).unwrap();
         let body = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1847,7 +1862,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_constant(TestValue::Array(CpuArray::scalar(1.0_f32)));
-        builder.add_instruction(NewReferenceOperation, Vec::new(), vec![initial]).unwrap();
+        builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap();
         let local = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), Vec::<Placeholder>::new(), Vec::<Placeholder>::new())
             .unwrap();
@@ -1919,7 +1934,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(reference_type(scalar_type()));
-        builder.add_instruction(FreezeReferenceOperation, Vec::new(), vec![reference]).unwrap();
+        builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap();
         let consuming = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::<Placeholder>::new())
             .unwrap();
@@ -1944,7 +1959,7 @@ mod tests {
         let update = builder.add_constant(TestValue::Array(CpuArray::scalar(1.0_f32)));
         builder
             .add_instruction(
-                MalformedReferenceRuleOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation),
+                MalformedReferenceRuleOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                 Vec::new(),
                 vec![reference, update],
             )
@@ -2005,7 +2020,7 @@ mod tests {
         let reference = builder.add_input(reference_type(scalar_type()));
         builder
             .add_instruction(
-                MalformedReferenceRuleOperation::ReferenceRead(ReferenceReadOperation),
+                MalformedReferenceRuleOperation::ReferenceRead(ReferenceReadOperation::new()),
                 Vec::new(),
                 vec![reference],
             )
@@ -2022,7 +2037,7 @@ mod tests {
         assert_eq!(
             message,
             format!(
-                "kernel instruction `{}` operation `reference_read` violates the `view` contract: expected 1 inputs, \
+                "kernel instruction `{}` operation `reference_read` violates the `alias` contract: expected 1 inputs, \
                  1 outputs, no reference accesses, and canonical semantics, types, and effects",
                 InstructionId::new(accessing_view.entry(), 0),
             ),
@@ -2154,10 +2169,14 @@ mod tests {
         let source = builder.add_input(reference_type(scalar_type()));
         let destination = builder.add_input(reference_type(scalar_type()));
         let value = builder
-            .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation), Vec::new(), vec![source])
+            .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation::new()), Vec::new(), vec![source])
             .unwrap()[0];
         builder
-            .add_instruction(XlaOperation::ReferenceSwap(ReferenceSwapOperation), Vec::new(), vec![destination, value])
+            .add_instruction(
+                XlaOperation::ReferenceSwap(ReferenceSwapOperation::new()),
+                Vec::new(),
+                vec![destination, value],
+            )
             .unwrap();
         let body: FlatXlaProgram = builder.build(Vec::new(), vec![Placeholder; 2], Vec::<Placeholder>::new()).unwrap();
         PreservedReferenceKernelOperation::new(vec![

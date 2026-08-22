@@ -10,7 +10,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory, RaggedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -127,7 +127,19 @@ impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayBatchingPoli
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination);
-        Ok(vec![ArrayBatch::new(value, inputs[0].batch_axis())?].into())
+        let ragged_axes = inputs[0]
+            .ragged_axes()
+            .iter()
+            .map(|ragged_axis| {
+                RaggedAxis::new(
+                    ragged_axis.axis(),
+                    ragged_axis.extents().transfer_to_memory(self.destination),
+                    ragged_axis.dimension().clone(),
+                    ragged_axis.extent_axes().to_vec(),
+                )
+            })
+            .collect();
+        Ok(vec![ArrayBatch::new(value, inputs[0].batch_axis())?.with_ragged_axes(ragged_axes)?].into())
     }
 }
 
@@ -227,7 +239,9 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
-    use crate::arrays::{Array, ArrayBatch, ArrayOperation, DataType, Dimension, Shape};
+    use crate::arrays::{
+        Array, ArrayBatch, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, RaggedAxis, Shape,
+    };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
@@ -305,6 +319,23 @@ mod tests {
         assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));
         assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
         assert_eq!(outputs[0].value().to_f64s(), vec![1.0; 6]);
+
+        // Memory placement changes neither logical geometry nor the values carrying per-item extents.
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1.0, 3.0]), variable, vec![0])])
+            .unwrap();
+        let ragged_outputs = operation
+            .batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&ragged_input))
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(ragged_outputs[0].ragged_axes()[0].axis(), 1);
+        assert_eq!(ragged_outputs[0].ragged_axes()[0].dimension(), ragged_input.ragged_axes()[0].dimension());
+        assert_eq!(ragged_outputs[0].ragged_axes()[0].extent_axes(), &[0]);
+        assert_eq!(ragged_outputs[0].ragged_axes()[0].extents().r#type().memory(), PINNED_HOST);
+        assert_eq!(ragged_outputs[0].unbatched_type().memory(), PINNED_HOST);
 
         // Batching under a staging parent stages the same transfer on the physical batched value with its batch
         // axis preserved.

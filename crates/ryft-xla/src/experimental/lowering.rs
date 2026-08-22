@@ -24,12 +24,12 @@ use ryft_core::{
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureReference,
     CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
     ConvertElementTypeOperation, CoordinateBasisOperation, CosOperation, DataType, Dimension, DimensionOperation,
-    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
-    DischargedReferenceState, DivOperation, DomainTracingContext, DotOperation, Effect, Effects, ErfOperation,
-    ExpOperation, FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction,
-    IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
-    MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation,
-    Program, ProgramError, ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, RegionId, RegionRef,
+    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation,
+    DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
+    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation,
+    LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation,
+    MulOperation, NegOperation, Operation, PadOperation, Parameterized, PowOperation, Program, ProgramError,
+    ProjectedValue, REMATERIALIZE_OPERATION_NAME, ReductionKind, ReferenceStateBinding, RegionId, RegionRef,
     RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME,
     ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension,
     ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation,
@@ -4307,7 +4307,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Outp
     arg_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
-    reference_states: &[DischargedReferenceState],
+    reference_states: &[ReferenceStateBinding],
 ) -> Result<LoweredXlaModule, LoweringError>
 where
     Input: Parameterized<ArrayType>,
@@ -9122,10 +9122,14 @@ mod tests {
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let reference = builder
-            .add_instruction(XlaOperation::NewReference(NewReferenceOperation), Vec::new(), vec![input])
+            .add_instruction(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), vec![input])
             .unwrap()[0];
         let output = builder
-            .add_instruction(XlaOperation::FreezeReference(FreezeReferenceOperation), Vec::new(), vec![reference])
+            .add_instruction(
+                XlaOperation::FreezeReference(FreezeReferenceOperation::new()),
+                Vec::new(),
+                vec![reference],
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -9172,8 +9176,8 @@ mod tests {
         ];
         let result_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let states = [
-            DischargedReferenceState::new(ReferenceSource::PublicInput { index: 1 }, 1, Some(0)),
-            DischargedReferenceState::new(ReferenceSource::PublicInput { index: 2 }, 2, None),
+            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 1 }, 1, Some(0)),
+            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 2 }, 2, None),
         ];
 
         let lowered = lower_mlir_module_for_program_with_reference_state(
@@ -9212,7 +9216,7 @@ mod tests {
             .replace("@SIGNATURE@", expected_signature),
         );
 
-        let invalid_state = DischargedReferenceState::new(ReferenceSource::PublicInput { index: 0 }, 0, None);
+        let invalid_state = ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None);
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
                 &program,
@@ -9280,7 +9284,7 @@ mod tests {
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
         let program: FlatXlaProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
-        let reference_state = DischargedReferenceState::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(0));
+        let reference_state = ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(0));
 
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
@@ -10059,8 +10063,7 @@ mod tests {
 
     #[test]
     fn test_rematerialize_lowering_inlines_primal_effects_on_the_enclosing_token_chain() {
-        use ryft_core::PrintOperation;
-        use ryft_core::RematerializeOperation;
+        use ryft_core::{PrintOperation, RematerializeOperation};
 
         // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its primal region,
         // so prints immediately before, inside, and after the call must form one ordered-I/O token chain.

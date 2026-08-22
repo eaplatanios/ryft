@@ -756,6 +756,20 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        if let Some((index, ragged_axis)) = inputs
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|ragged_axis| (index, ragged_axis)))
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` does not support bounded ragged dimension `{}` on operand {}",
+                    self.target_name,
+                    ragged_axis.dimension(),
+                    index,
+                ),
+            });
+        }
         let Some((index, mapped)) = inputs.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
             let values = inputs.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
@@ -886,6 +900,20 @@ where
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
         };
         let (arrays, extents) = inputs.split_at(array_input_count);
+        if let Some((index, ragged_axis)) = arrays
+            .iter()
+            .enumerate()
+            .find_map(|(index, input)| input.ragged_axes().first().map(|ragged_axis| (index, ragged_axis)))
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` does not support bounded ragged dimension `{}` on operand {}",
+                    self.target_name,
+                    ragged_axis.dimension(),
+                    index,
+                ),
+            });
+        }
         for extent in extents {
             extent.validate_replicated_dimension()?;
         }
@@ -1055,11 +1083,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension, StridedLayout,
+        Array, ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue,
+        ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+        RaggedAxis, Shape, ShardingDimension, StridedLayout,
     };
     use crate::batching::{
-        BatchAxis, BatchedProgram, BatchingContext, BatchingTracer, ProgramBatchingOutputAxesPolicy,
+        BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingError, BatchingTracer,
+        ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation};
@@ -1340,6 +1370,25 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_custom_call_batch_rejects_ragged_operands_before_binding() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .unwrap();
+        let operation = CustomCallOperation::new("ryft.test.side_effect", vec![vector_type()])
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_side_effect();
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `ryft.test.side_effect` does not support bounded ragged dimension `length` \
+                    on operand 0",
+        ));
     }
 
     /// The mixed universe applies the same all-replicated shortcut, including the trailing first-class output-extent
