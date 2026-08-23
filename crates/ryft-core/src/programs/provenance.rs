@@ -41,8 +41,8 @@ enum ProvenanceNode {
         origin: Provenance,
     },
 
-    /// Several source origins intentionally merged into one generated instruction. Normalized at construction by
-    /// [`Provenance::fused`]: constituents are never unknown, never themselves fused, and never structural
+    /// Several source origins intentionally merged into one generated instruction. This is normalized at construction
+    /// by [`Provenance::fused`]; constituents are never unknown, never themselves fused, and never structural
     /// duplicates, and there are always at least two of them.
     Fused {
         /// Merged source origins, in first-occurrence order.

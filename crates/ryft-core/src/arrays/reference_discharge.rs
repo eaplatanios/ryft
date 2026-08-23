@@ -39,15 +39,14 @@
 //!     -> stateful compilation and execution, or a targeted transform rejection
 //! ```
 //!
-//! Representative supported compositions are shown below. The value-level transform capabilities themselves reject
-//! reference operations outright ("must be discharged before differentiation/batching"). First call
+//! Representative supported compositions are shown below. The transforms themselves reject reference operations
+//! outright ("must be discharged before differentiation/batching"). First call
 //! [`ReferenceDischarge::discharge_local_references`], then use the ordinary transform: [`Program::jvp`] or
 //! [`Program::linearize`] for forward mode, [`Pullback`](crate::Pullback) obtained from the linearization for reverse
-//! mode,
-//! [`Program::batched_with_local_references`](crate::Program::batched_with_local_references) for batching,
+//! mode, [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent) for batching,
 //! [`Program::partially_evaluate`] for partial evaluation, and
 //! [`Program::rematerialize_with_local_references`](crate::Program::rematerialize_with_local_references) for
-//! rematerialization.
+//! rematerialization, which composes the discharge itself.
 //!
 //! ```text
 //! condition(predicate,
@@ -62,7 +61,7 @@
 //! program.linearize()?.pullback()
 //!     -> discharge local state -> differentiate the reference-free program
 //!
-//! program.batched_with_local_references(...)
+//! program.discharge_local_references(capture_count, "batching")?.batched_with_threaded_extent(...)
 //!     -> discharge local state -> batch independent immutable state-passing programs
 //! ```
 //!

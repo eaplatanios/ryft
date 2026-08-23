@@ -128,6 +128,7 @@ pub mod identities;
 pub mod instructions;
 pub mod operations;
 pub mod programs;
+pub mod provenance;
 pub mod references;
 pub mod regions;
 pub mod statistics;
@@ -145,6 +146,7 @@ pub use operations::{
     infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
+pub use provenance::{Provenance, ProvenanceScope};
 pub use references::{
     FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
     NewReference, NewReferenceOperation, PartialReferenceDischargeResult, PreparedReferenceValue,
