@@ -1,0 +1,10 @@
+error[E0616]: field `root` of struct `ReferenceDischargeReference` is private
+  --> tests/reference_discharge/error_reference_handle_private_fields.rs:12:15
+   |
+12 |     reference.root
+   |               ^^^^ private field
+   |
+help: a method `root` also exists, call it with parentheses
+   |
+12 |     reference.root()
+   |                   ++
