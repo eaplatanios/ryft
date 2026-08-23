@@ -118,41 +118,35 @@ impl Display for ProvenanceNode {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Provenance(Option<Arc<ProvenanceNode>>);
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Provenance {
-    /// Returns the [`Provenance`] of an instruction with no recorded origin. This value is allocation-free.
+    /// Returns the [`Provenance`] of an [`Instruction`](crate::Instruction) with no recorded origin.
+    #[inline]
     pub fn unknown() -> Self {
         Self(None)
     }
 
-    /// Returns `true` if this [`Provenance`] records no origin. This gives renderers, lowerers, serialization
-    /// boundaries, and tests a direct way to make that distinction without reconstructing it from traversal results.
-    pub fn is_unknown(&self) -> bool {
-        self.0.is_none()
-    }
-
     /// Creates a new [`Provenance`] that attaches one named scope above the provided origin. No deduplication or
-    /// common-prefix factoring is performed: the stored representation stays purely structural, and visualizers may
+    /// common-prefix factoring is performed. The stored representation stays purely structural, and visualizers may
     /// factor common scope prefixes at display time.
     ///
     /// # Parameters
     ///
     ///   - `scope`: Scope to attach as the new outermost level.
     ///   - `origin`: Origin recorded below the new scope (possibly [`unknown`](Self::unknown)).
+    #[inline]
     pub fn scope(scope: ProvenanceScope, origin: Provenance) -> Self {
         Self(Some(Arc::new(ProvenanceNode::Scope { scope, origin })))
     }
 
-    /// Creates a new [`Provenance`] for a generated instruction with multiple source origins (e.g., several source
-    /// instructions intentionally merged into one by a transform). The provided origins are normalized at
-    /// construction:
+    /// Creates a new [`Provenance`] for a generated [`Instruction`](crate::Instruction) with multiple source origins
+    /// (e.g., several source instructions intentionally merged into one by a transform). The provided origins are
+    /// normalized at construction:
     ///
-    ///   - unknown origins are discarded when another origin is present;
-    ///   - nested fused origins are flattened;
-    ///   - structurally duplicate origins are removed while preserving first-occurrence order; and
+    ///   - unknown origins are discarded when another origin is present,
+    ///   - nested fused origins are flattened,
+    ///   - structurally duplicate origins are removed while preserving first-occurrence order, and
     ///   - zero remaining origins return [`unknown`](Self::unknown) and one remaining origin is returned directly.
-    pub fn fused(origins: impl IntoIterator<Item = Provenance>) -> Self {
+    pub fn fused<O: IntoIterator<Item = Provenance>>(origins: O) -> Self {
         let mut normalized = Vec::<Provenance>::new();
         for origin in origins {
             match origin.0.as_deref() {
@@ -179,6 +173,13 @@ impl Provenance {
             _ => Self(Some(Arc::new(ProvenanceNode::Fused { origins: normalized.into() }))),
         }
     }
+
+    /// Returns `true` if this [`Provenance`] records no origin.
+    pub fn is_unknown(&self) -> bool {
+        self.0.is_none()
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the scope names of this [`Provenance`], from the outermost scope down to the first non-scope node.
     /// Returns an empty path for unknown provenance and for fused roots, whose constituents are reached through
@@ -212,9 +213,9 @@ impl Provenance {
         }
     }
 
-    /// Returns the merged source origins of this [`Provenance`] when it is a fused root, and an empty slice
-    /// otherwise. Fused constituents are normalized at construction: they are never unknown, never themselves fused,
-    /// and never structural duplicates.
+    /// Returns the merged source origins of this [`Provenance`] when it is a fused root, and an empty slice otherwise.
+    /// Fused constituents are normalized at construction; they are never unknown, never themselves fused, and never
+    /// structural duplicates.
     pub fn origins(&self) -> &[Provenance] {
         match self.0.as_deref() {
             Some(ProvenanceNode::Fused { origins }) => origins,
