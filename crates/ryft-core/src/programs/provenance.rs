@@ -2,10 +2,13 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 /// Named provenance scope describing one level of the logical origin of an [`Instruction`](crate::Instruction) (e.g.,
-/// the framework facility or user computation that staged it). Scope names are stable, fully-qualified strings that are
-/// preserved verbatim. Construction is infallible and performs no validation because names have no correctness role.
-/// Names should be non-empty, and the `ryft.` prefix is reserved for framework-owned scopes following the
-/// `ryft.<subsystem>.<concept>` convention. User scopes should use their own namespace. Each scope maps onto
+/// the framework facility or user computation that staged it). Scope names are single path segments preserved verbatim.
+/// Namespacing is expressed structurally by nesting scopes, rendered as `::`-separated paths such as
+/// `ryft::differentiation::coordinate_basis`, rather than by separator characters inside one name. Construction
+/// is infallible and performs no validation because names have no correctness role, but names should be non-empty and
+/// identifier-like (i.e., matching `[A-Za-z_][A-Za-z0-9_]*`) so that they render bare; any other name renders quoted
+/// and escaped as Rust string literals. The root scope name `ryft` is typically reserved for framework-owned scopes,
+/// which nest as `ryft::<subsystem>::<concept>`. User scopes should use their own namespace. Each scope maps onto
 /// one MLIR [`NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) when a program is lowered into MLIR
 /// using Ryft's XLA backend.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -50,6 +53,43 @@ enum ProvenanceNode {
     },
 }
 
+impl Display for ProvenanceNode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Scope { scope, origin } => {
+                // Identifier-like scope names render bare, while all other names render quoted and escaped
+                // deterministically as Rust string literals, so arbitrary name content (i.e., including `::`,
+                // brackets, quotes, and newlines) can never make the rendering ambiguous.
+                let name = scope.name();
+                let mut characters = name.chars();
+                let bare =
+                    characters.next().is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+                        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_');
+                if bare {
+                    write!(formatter, "{name}")?;
+                } else {
+                    write!(formatter, "{name:?}")?;
+                }
+                if let Some(origin) = origin.0.as_deref() {
+                    write!(formatter, "::")?;
+                    origin.fmt(formatter)?;
+                }
+                Ok(())
+            }
+            Self::Fused { origins } => {
+                write!(formatter, "fused[")?;
+                for (index, origin) in origins.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, ", ")?;
+                    }
+                    write!(formatter, "{origin}")?;
+                }
+                write!(formatter, "]")
+            }
+        }
+    }
+}
+
 /// Persistent, hierarchical, non-semantic origin of one [`Instruction`](crate::Instruction). Provenance records _where_
 /// an instruction came from (e.g., the framework facility that staged it, or the source instructions a transform
 /// generated it from) without adding a Single Static Assignment (SSA) value, a data dependency, or any semantic
@@ -70,9 +110,11 @@ enum ProvenanceNode {
 /// [`NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc)s and fused origins become
 /// [`FusedLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc)s.
 ///
-/// The [`Display`] output uses the diagnostic expression grammar with scope names escaped as Rust string literals:
-/// `"outer"("inner")` for a scope chain, `fused["a", "b"]` for fused origins, and `unknown` for unknown provenance
-/// (program renderings omit the provenance of such instructions entirely instead of printing this token).
+/// The [`Display`] output renders scope chains as `::`-separated paths (e.g., `outer::inner`), fused origins as
+/// bracketed lists that only ever terminate a chain (e.g., `top::fused[a, outer::inner]`), and unknown provenance as
+/// `unknown` (program renderings omit the provenance of such instructions entirely instead of printing this token).
+/// Identifier-like scope names render bare, while all other names render quoted and escaped as Rust string literals.
+/// so arbitrary name content can never make the rendering ambiguous.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Provenance(Option<Arc<ProvenanceNode>>);
 
@@ -182,28 +224,11 @@ impl Provenance {
 }
 
 impl Display for Provenance {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0.as_deref() {
             None => write!(formatter, "unknown"),
-            Some(ProvenanceNode::Scope { scope, origin }) => {
-                // Scope names are preserved verbatim in storage and escaped deterministically at render time as Rust
-                // string literals, which handles quotes, newlines, and delimiters unambiguously.
-                write!(formatter, "{:?}", scope.name())?;
-                if !origin.is_unknown() {
-                    write!(formatter, "({origin})")?;
-                }
-                Ok(())
-            }
-            Some(ProvenanceNode::Fused { origins }) => {
-                write!(formatter, "fused[")?;
-                for (index, origin) in origins.iter().enumerate() {
-                    if index > 0 {
-                        write!(formatter, ", ")?;
-                    }
-                    write!(formatter, "{origin}")?;
-                }
-                write!(formatter, "]")
-            }
+            Some(node) => node.fmt(formatter),
         }
     }
 }
@@ -227,8 +252,8 @@ mod tests {
 
     #[test]
     fn test_provenance_scope() {
-        let scope = ProvenanceScope::new("ryft.differentiation.coordinate_basis");
-        assert_eq!(scope.name(), "ryft.differentiation.coordinate_basis");
+        let scope = ProvenanceScope::new("coordinate_basis");
+        assert_eq!(scope.name(), "coordinate_basis");
         let provenance = Provenance::scope(scope.clone(), Provenance::unknown());
         assert!(!provenance.is_unknown());
         assert_eq!(provenance.scope_path(), vec![&scope]);
@@ -331,19 +356,25 @@ mod tests {
 
         let inner = Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown());
         let outer = Provenance::scope(ProvenanceScope::new("outer"), inner.clone());
-        assert_eq!(inner.to_string(), "\"inner\"");
-        assert_eq!(outer.to_string(), "\"outer\"(\"inner\")");
+        assert_eq!(inner.to_string(), "inner");
+        assert_eq!(outer.to_string(), "outer::inner");
 
         let a = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
         let fused = Provenance::fused([a.clone(), outer.clone()]);
-        assert_eq!(fused.to_string(), "fused[\"a\", \"outer\"(\"inner\")]");
-        assert_eq!(
-            Provenance::scope(ProvenanceScope::new("top"), fused).to_string(),
-            "\"top\"(fused[\"a\", \"outer\"(\"inner\")])",
-        );
+        assert_eq!(fused.to_string(), "fused[a, outer::inner]");
+        assert_eq!(Provenance::scope(ProvenanceScope::new("top"), fused).to_string(), "top::fused[a, outer::inner]",);
 
-        // Scope names are escaped deterministically as Rust string literals.
+        // Non-identifier scope names render quoted and escaped deterministically as Rust string literals, so
+        // arbitrary name content can never make the rendering ambiguous.
         let escaped = Provenance::scope(ProvenanceScope::new("quo\"te\nline"), Provenance::unknown());
         assert_eq!(escaped.to_string(), "\"quo\\\"te\\nline\"");
+        let mixed = Provenance::scope(
+            ProvenanceScope::new("layer 3"),
+            Provenance::scope(ProvenanceScope::new("attention"), Provenance::unknown()),
+        );
+        assert_eq!(mixed.to_string(), "\"layer 3\"::attention");
+        assert_eq!(Provenance::scope(ProvenanceScope::new("a::b"), Provenance::unknown()).to_string(), "\"a::b\"");
+        assert_eq!(Provenance::scope(ProvenanceScope::new("0"), Provenance::unknown()).to_string(), "\"0\"");
+        assert_eq!(Provenance::scope(ProvenanceScope::new(""), Provenance::unknown()).to_string(), "\"\"");
     }
 }
