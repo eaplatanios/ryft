@@ -2051,7 +2051,10 @@ time, the eager runtime, discharge):
   survives as the discharge and persistence boundary vocabulary.
 - Replaced the eager replay preflight's whole-closure analysis with an inline entry-input scan in
   `ArrayIrType::validate_eager_replay` that preserves the external-reference rejection and its exact diagnostic; the
-  `EagerReplayValidation` evidence contract is unchanged.
+  `EagerReplayValidation` evidence contract is unchanged. (A follow-up owner-directed vocabulary pass then renamed
+  this mechanism onto the codebase's canonical interpretation vocabulary — `validate_eager_interpretation`,
+  `VALIDATES_EAGER_INTERPRETATION`, `EagerInterpretationValidation`, and "boundary validation" instead of
+  "preflight" in prose — without changing behavior.)
 - The generic discharge boundary tests' shared fixture, previously imported from the analysis test module, was
   rebuilt in `discharge.rs`'s own test module, trimmed to the four operations those tests use.
 - The prevention-ladder documentation in `programs/references/mod.rs` and every doc cross-reference were rewritten;

@@ -89,8 +89,8 @@ use crate::macros::check_builders;
 use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
-    AtomId, BindingRegionDriver, EagerReplayValidation, Operation, OperationProjection, Program, ProgramBuilder,
-    ProgramError, Type, Typed, Value, ValueProjection,
+    AtomId, BindingRegionDriver, EagerInterpretationValidation, Operation, OperationProjection, Program,
+    ProgramBuilder, ProgramError, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -254,7 +254,7 @@ pub trait Context: Domain + Clone {
 }
 
 /// Zero-sized [`Context`] used for a concrete `(type, value, operation)` universe whose operations can be interpreted
-/// directly without backend-owned context state. Values may themselves can carry explicit resources, such as reference
+/// directly without backend-owned context state. Values may themselves carry explicit resources, such as reference
 /// holders, but all state needed to interpret an operation arrives through those values and the attached regions.
 /// [`EagerContext`] makes this direct interpretation mode explicit in generic code that otherwise has no backend-owned
 /// eager context value to pass around.
@@ -322,16 +322,16 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
         let operation = operation.into();
         operation.validate_region_count(driver.region_count())?;
         // A resource-bearing value family requires the complete attached region closure to be validated before its
-        // eager rule runs. A driver carrying evidence was already covered by its root's whole-closure preflight.
-        // Otherwise, this bind is itself a validation boundary. Either way the eager rule receives fresh evidence
-        // so that nested replay does not revalidate the regions it selects.
-        let validation = if V::VALIDATES_EAGER_REPLAY {
-            if driver.eager_replay_validation().is_none() {
+        // eager rule runs. A driver carrying evidence was already covered by its root's boundary validation. Otherwise,
+        // this bind is itself a validation boundary. Either way, the eager rule receives fresh evidence so that nested
+        // replay does not revalidate the regions it selects.
+        let validation = if V::VALIDATES_EAGER_INTERPRETATION {
+            if driver.eager_interpretation_validation().is_none() {
                 for region in driver.regions() {
-                    V::validate_eager_replay(region)?;
+                    V::validate_eager_interpretation(region)?;
                 }
             }
-            Some(EagerReplayValidation::new())
+            Some(EagerInterpretationValidation::new())
         } else {
             None
         };
@@ -503,7 +503,8 @@ where
 /// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
 /// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
 /// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
-/// and [`stage_operation`](StagingContext::stage_operation). Ordinary and nested tracing implement it through
+/// [`stage_nullary_operation`](StagingContext::stage_nullary_operation), and
+/// [`stage_operation`](StagingContext::stage_operation). Ordinary and nested tracing implement it through
 /// [`TracingContext`] and [`NestedTracingContext`](crate::NestedTracingContext), respectively. Transform contexts have
 /// their own flowing value types and delegate rewritten operations to a parent staging context instead of implementing
 /// this trait themselves.
@@ -514,7 +515,11 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;
 
-    /// Creates a constant [`Tracer`] in this context with the provided constant payload.
+    /// Creates a constant [`Tracer`] in this context with the provided constant payload. Note that this is the
+    /// raw staging primitive and deliberately performs no constant-storage validation. It is meant to be used
+    /// by transform infrastructure that stages values it constructed itself. [`Context::lift`] validates
+    /// [`Value::validate_as_constant`] at the trace boundary instead, and [`Region`](crate::Region) sealing
+    /// re-checks every stored constant at [`build`](ProgramBuilder::build) time as the backstop.
     #[inline]
     fn constant(&self, value: Self::Constant) -> Self::Value {
         let r#type = value.r#type().into_owned();
@@ -648,8 +653,8 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 driver.import_into(self.builder(), &region_input_types).map_err(|error| self.error(error))?;
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, region_ids, inputs) {
-                    Ok(outputs) => outputs.to_vec(),
+                match builder.add_staged_instruction(operation, region_ids, inputs) {
+                    Ok(outputs) => outputs,
                     Err(error) => {
                         if builder.error.is_none() {
                             builder.error = Some(error.clone());

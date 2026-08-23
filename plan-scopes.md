@@ -89,7 +89,11 @@ The public API should expose constructors and traversal methods rather than the 
 - `Provenance::scope_path()` supports program renderers and visualizers without exposing storage internals. It returns
   the scope names from the outermost `Scope` node down to the first non-`Scope` node; for `Unknown` and for a `Fused`
   root it returns an empty path, and fused constituents are reached through `Provenance::origins()`.
-- `Provenance::origins()` supports recursive visualization of fused origins.
+- `Provenance::origin()` returns the child origin below the scope chain: for a `Scope` root it is the provenance under
+  the innermost scope named by `scope_path()`, and for `Unknown` or `Fused` roots it is the provenance itself. Together
+  with `scope_path()` and `origins()`, this lets a visualizer traverse the complete tree without a node-view API.
+- `Provenance::origins()` supports recursive visualization of fused origins: it returns the constituents of a `Fused`
+  root and an empty slice otherwise.
 
 Keep scope names as one stable, fully-qualified string in the first version. Do not introduce a parallel display name
 or an open-ended attribute map until a concrete consumer requires it. A visualizer may recognize well-known names and
@@ -127,25 +131,50 @@ The closure form is preferred to exposing manual push/pop calls. Its implementat
 so the previous state is restored on ordinary return, error return, and panic unwinding. The guard must not hold a
 `RefCell` borrow while `function` runs.
 
-Internally, active context state should keep an ordered scope stack separately from its source origin. Entering a scope
-pushes one frame. Entering an origin temporarily combines it with any existing origin through normalized
-`Provenance::fused`, while leaving ambient scopes in place. `current_provenance()` folds the scope stack over that
-combined origin. Thus a top-level replay preserves its source exactly, an explicit scope remains outside generated
-work, and a nested replay can retain both its enclosing and nested source origins without treating operand dependencies
-as origins. For example, entering `outer` and then `inner` produces `Scope(outer, Scope(inner, origin))`, and
-`scope_path()` returns `[outer, inner]`.
+Internally, active context state keeps an ordered scope stack, an optional source origin, and a cached fully composed
+`Provenance`. The cache is recomputed only when entering or leaving a scope or origin; `current_provenance()` and
+instruction staging clone the cached `Arc` and never rebuild nodes. This is what makes the one-allocation-per-scope
+property in step 7 true: without the cache, folding the scope stack on every staged instruction would allocate fresh
+nodes per instruction.
+
+Composition semantics are defined precisely as follows and must be pinned by tests before implementation:
+
+- Entering a scope pushes one frame. Entering an origin records the origin together with the scope-stack depth at
+  entry. The composed provenance folds only the frames pushed *after* the innermost origin entry over that origin;
+  frames that were already active when the origin was entered are the transform's ambient context, not part of the
+  instruction's origin. This makes the 1→1 propagation rule automatic: replaying a source instruction under an
+  ambient scope that its provenance already records preserves the source provenance exactly, with no double wrap,
+  while synthesized scaffolding staged with no origin still receives the ambient transform scope folded over
+  `Unknown`.
+- Entering an origin while another origin is active *fuses* the two through normalized `Provenance::fused` (it does
+  not replace the outer origin), and the recorded depth moves to the inner entry. A nested replay thus retains both
+  its enclosing and nested source origins without treating operand dependencies as origins.
+- `Provenance::scope(scope, origin)` performs no deduplication or common-prefix factoring; normalization exists only
+  in `Provenance::fused`. Visualizers may factor common scope prefixes at display time, but the stored representation
+  stays purely structural.
+- For example, with an origin entered (or seeded) first and scopes `outer` then `inner` entered afterwards, the
+  composed provenance is `Scope(outer, Scope(inner, origin))` and `scope_path()` returns `[outer, inner]`.
 
 All three methods are required `Context` methods without default bodies, mirroring `is_eager`. A defaulted method
 would let a wrapper context silently drop provenance by forgetting to delegate, and the only safety net would be a
 manual audit; required methods make the compiler enumerate every context implementation instead. Terminal eager and
 test-only contexts implement the explicit no-op behavior (`Unknown` plus running the closure directly). Every wrapper
-context delegates to its parent unless it owns a new staging boundary. This includes projected, batching,
-differentiation, partial-evaluation, reference-discharge, and other recursive transform contexts.
+context delegates to its parent unless it owns a staging boundary — that is, unless it owns a `ProgramBuilder` that
+instructions are emitted into. Delegating wrappers include projected, batching, differentiation, reference-discharge,
+and other recursive transform contexts that stage through an inner context.
+
+`PartialEvaluationContext` is a provenance-owning boundary, not a delegating wrapper. It owns the residual
+`ProgramBuilder` and emits residual instructions into it directly, so delegating provenance reads to its known-side
+parent (often a terminal eager context returning `Unknown`) would erase source provenance from every residual
+program. It must own shared active-provenance state exactly like the tracing contexts, `Rc`-shared across clones
+alongside its builder, seeded from the parent context's current provenance at construction.
 
 `TracingContext` and `NestedTracingContext` own active provenance state shared by their clones. Keep this state separate
 from the `RefCell<ProgramBuilder>` so entering a scope does not hold a builder borrow while instructions are staged.
-A newly created nested tracing context should seed its origin from its parent context's current provenance, then own an
-independent scope state for the nested program.
+A newly created nested tracing context should seed its origin from its parent context's current provenance at depth
+zero of its own scope stack, then own an independent scope state for the nested program. Under the depth-based
+composition rule above, later replaying the nested program's instructions into the parent under the same ambient
+scope preserves each instruction's provenance exactly instead of wrapping or fusing the shared scope twice.
 
 ### Backend locations and compilation caches
 
@@ -160,18 +189,20 @@ There is a necessary distinction between semantic cache identity and compiled-ar
 - A cache containing lowered MLIR, HLO, or a compiled executable cannot reuse an artifact carrying different emitted
   provenance without returning stale names to visualizers and profilers.
 
-Characterize the actual caches before designing new machinery. There are currently few relevant boundaries: the eager
+This question is resolved against the current code rather than left open. The relevant boundaries are the eager
 per-operation compile cache, whose single-operation programs are staged outside any user scope and therefore
-effectively always carry `Unknown` provenance, and the jit executable cache, whose identity is documented as deriving
-from the complete lowered computation. The decisive question is whether that key derivation prints MLIR locations,
-because MLIR's default printer omits locations unless debug-info printing is enabled:
+effectively always carry `Unknown` provenance, and the jit executable cache, whose persistent key already embeds the
+complete textual StableHLO module (`XlaPersistentKeyV6::stable_hlo`, built by `xla_compilation_key` in
+`crates/ryft-xla/src/experimental/domains.rs`). However, lowering currently serializes the module with
+`module.to_string()`, and `OperationPrintingFlags::default()` in `crates/ryft-mlir/src/operations/printing.rs` has
+`enable_debug_information: false`, so MLIR locations do not enter the key today.
 
-- If the key already includes locations, provenance participates in cache identity automatically and no extra
-  machinery is needed.
-- If it does not, prefer switching that one key derivation to a location-inclusive rendering over introducing and
-  threading a parallel provenance-only fingerprint through cache keys.
-- Only if neither approach works should a separate, stable, deterministic provenance fingerprint be added to the
-  affected keys.
+The fix is therefore a serialization change, not a parallel fingerprint: serialize scoped modules with
+`enable_debug_information = true` and `pretty_print_debug_information = false` (the pretty debug form is documented
+as unparsable and must not feed cache keys or reloadable artifacts). Enable this only when the program carries
+non-`Unknown` provenance, so ordinary programs keep byte-identical StableHLO text, existing snapshots, and existing
+cache keys. A separate deterministic provenance fingerprint is a fallback to be added only if location-inclusive
+serialization proves unworkable at some cache boundary.
 
 In all cases, do not put provenance into operation rendering or the semantic canonical program representation.
 Document that exact backend provenance can reduce compiled-artifact cache reuse. If this cost later matters, add an
@@ -212,13 +243,21 @@ do not silently return incorrectly labeled cached artifacts.
       default bodies, so every existing implementation must be updated before the crate compiles.
 - [ ] Update `StagingContext::stage_operation` to snapshot `current_provenance()` and attach it to the emitted
       instruction.
+- [ ] Implement the cached-composition active state: recompute the composed provenance only on scope/origin entry and
+      exit, and make `current_provenance()` and staging clone the cached `Arc`.
 - [ ] Implement shared, unwind-safe scope state in `TracingContext` and `NestedTracingContext`; ensure cloned contexts
       observe the same active scope and independent traces do not leak scopes into each other.
+- [ ] Give `PartialEvaluationContext` its own `Rc`-shared active-provenance state seeded from its parent, as described
+      above; residual instructions emitted into its builder must snapshot that state, never the known-side parent's.
 - [ ] Implement the required methods on every `Context` implementation, using the resulting compile errors as the
       enumeration. Transform/projected wrappers delegate; terminal eager and test-only contexts implement and document
       the explicit no-op behavior.
 - [ ] Add tests for nested scope order, clone sharing, restoration after `Result::Err`, restoration during panic
       unwinding, independent tracing contexts, nested tracing, and ordinary eager execution remaining unaffected.
+- [ ] Add tests pinning the composition semantics: nested tracing seeded inside scope `outer` followed by replay
+      inside `outer` produces no double wrap; `with_provenance_origin` nested inside another origin fuses both
+      origins; scopes entered before an origin do not fold over it while scopes entered after it do; and no automatic
+      common-prefix factoring occurs in `Provenance::scope`.
 
 ### 3. Add diagnostic rendering and visualizer-facing traversal
 
@@ -238,15 +277,34 @@ do not silently return incorrectly labeled cached artifacts.
 - [ ] Make `Display` call `Program::render(..., ProgramRenderingMode::Semantic)`, preserving all existing `to_string()`
       output and canonical structural strings byte-for-byte for equivalent programs.
 - [ ] Thread the mode through the private recursive instruction/region rendering helpers and every nested-program
-      rendering path. Because `OperationFormatter::program` can render program-valued operation metadata, extend the
-      existing operation-rendering/formatter contract with the same enum as needed rather than silently reverting
-      nested programs to semantic mode. Update derive-generated operation renderers and downstream implementations in
-      the same change.
+      rendering path. Because `OperationFormatter::program` can render program-valued operation metadata, nested
+      programs must receive the selected mode rather than silently reverting to semantic rendering. Do not change the
+      signature of every `Operation::render` implementation (roughly fifty files define one): add a defaulted
+      `render_with_mode(formatter, indentation, mode)` that delegates to the existing semantic `render`, and override
+      it only in the derive-generated dispatcher and in operations that actually render nested program metadata. The
+      default is semantically safe because an operation that renders no nested program has nothing mode-dependent to
+      emit.
 - [ ] Require every direct caller of `Program::render` and operation rendering to choose a mode explicitly. Canonical
       fingerprints and semantic operation fields use `Semantic`; visualization, provenance assertions, and diagnostic
       dumps use `WithProvenance`.
-- [ ] Render provenance per instruction, not as assumed-contiguous begin/end blocks. The first textual form should use a
-      stable prefix or adjacent comment containing the complete scope path and fused origins.
+- [ ] Render provenance per instruction, not as assumed-contiguous begin/end blocks, using the following exact
+      grammar, modeled on MLIR location syntax and appended to the instruction line:
+
+      ```text
+      suffix     ::= ""                                    // Unknown: no suffix at all.
+                   | " provenance = " expression
+      expression ::= name                                  // Scope over Unknown: innermost `(unknown)` is omitted.
+                   | name "(" expression ")"               // Scope over a non-Unknown origin.
+                   | "fused[" expression ("," " " expression)* "]"
+      name       ::= <scope name rendered as a Rust string literal>
+      ```
+
+      No `unknown` token exists in the grammar: `Unknown` renders as the absence of a suffix, and fused normalization
+      already guarantees `Unknown` never appears as a constituent. Scope names are preserved verbatim in storage and
+      escaped deterministically at render time
+      using Rust string-literal escaping (the `{:?}` / `escape_debug` form), which handles quotes, newlines, and
+      delimiters unambiguously. The format is readable and unambiguous; round-tripping (parsing provenance back from
+      renderings) is an explicit non-goal in the first version, but the grammar must not preclude adding it later.
 - [ ] Expose enough read-only traversal for a future visualizer to group instructions by common scope ancestors while
       retaining non-contiguous membership and fused origins.
 - [ ] Add exact rendering tests proving that canonical output is unchanged, diagnostic output contains nested paths,
@@ -297,6 +355,12 @@ do not silently return incorrectly labeled cached artifacts.
       - deleted instructions: delete their provenance with them.
 - [ ] Do not infer fused provenance by walking input operands. Dataflow dependency is not the same as instruction
       origin; a pass that performs a real many-to-one rewrite must provide the origins explicitly.
+- [ ] Treat reverse-mode cotangent accumulation as an explicit many-to-one merge. The `accumulate` helper in
+      `crates/ryft-core/src/differentiation/reverse.rs` stages an add combining cotangent contributions that
+      originate from transposing *different* source instructions, so wrapping each transpose rule in
+      `with_provenance_origin` is not sufficient to label that add. Track the provenance of each accumulated
+      contribution alongside its atom in the adjoint table, and stage every accumulation add with `Provenance::fused`
+      over the contributing provenances.
 - [ ] Ensure transform-cache reuse cannot return provenance belonging to a different source region. Provenance remains
       excluded from semantic transformation decisions, but identity-rebuild cache adoption must require provenance to
       have been preserved exactly when the cached transformed artifact itself carries provenance.
@@ -330,17 +394,20 @@ do not silently return incorrectly labeled cached artifacts.
 
 ### 7. Audit fingerprints, caches, serialization, and overhead
 
-- [ ] Characterize the actual cache boundaries (the eager per-operation compile cache, the jit executable cache, and
-      any transform, MLIR/module, or persistent compilation cache) and determine for each whether its key derivation
-      already includes MLIR locations.
+- [ ] Confirm the cache-boundary inventory from the design section (the eager per-operation compile cache, the jit
+      executable cache keyed through `XlaPersistentKeyV6::stable_hlo`, and any transform, MLIR/module, or persistent
+      compilation cache added since) and check that no other boundary caches lowered artifacts.
 - [ ] Prove with tests that canonical program rendering and semantic fingerprints remain unchanged by provenance.
-- [ ] Make provenance participate in every cache key whose cached artifact contains lowered provenance, preferring a
-      location-inclusive module rendering in the existing key derivation. Add a separate deterministic provenance
-      fingerprint (never pointer identity or hash-map iteration order) only where a location-inclusive key is not
-      possible. Verify that two semantically equal programs with different scope names cannot receive each other's
-      labeled executable.
-- [ ] Verify that region imports and common scope sharing remain cheap: entering one scope should allocate one shared
-      provenance node, while staging each instruction should ordinarily clone only an `Arc`.
+- [ ] Serialize modules lowered from programs carrying non-`Unknown` provenance with `enable_debug_information = true`
+      and `pretty_print_debug_information = false`, so locations enter `XlaPersistentKeyV6::stable_hlo` and cache
+      identity automatically; keep ordinary programs on the existing location-free serialization so their StableHLO
+      text, snapshots, and cache keys remain byte-identical. Add a separate deterministic provenance fingerprint
+      (never pointer identity or hash-map iteration order) only if location-inclusive serialization proves unworkable
+      at some boundary. Verify that two semantically equal programs with different scope names cannot receive each
+      other's labeled executable, and that a provenance-free program's key is unchanged from before this feature.
+- [ ] Verify that region imports and common scope sharing remain cheap: entering one scope recomputes the cached
+      composed provenance once (one shared node allocation), staging each instruction clones only the cached `Arc`,
+      and no composition work happens per staged instruction.
 - [ ] Add a focused construction benchmark if profiling infrastructure already provides an appropriate home. Do not add
       a new benchmark framework solely for this feature.
 - [ ] Document the cache-reuse tradeoff and the future opt-out design: stripping provenance before lowering may improve
@@ -402,9 +469,12 @@ instructions must remain authoritative even when no subscriber is installed.
 
 - **Accidental provenance loss during rebuilds:** make destructive instruction decomposition include provenance, audit
   all constructors, and add transform-by-transform exact tests.
-- **Incorrect stale labels from cache hits:** separate semantic identity from artifact provenance identity and ensure
-  provenance participates in every lowered-artifact cache key, preferring a location-inclusive key rendering over a
-  parallel provenance fingerprint.
+- **Incorrect stale labels from cache hits:** separate semantic identity from artifact provenance identity; lowered
+  provenance enters cache identity through location-inclusive module serialization (debug information enabled,
+  pretty-printing disabled) feeding the existing `stable_hlo` key field, with a parallel provenance fingerprint only
+  as a fallback.
+- **Provenance erased at the partial-evaluation boundary:** `PartialEvaluationContext` owns its residual builder, so
+  it owns active-provenance state like the tracing contexts instead of delegating reads to its known-side parent.
 - **Scope leakage across traces or errors:** use context-owned shared state plus an unwind-safe RAII restoration guard.
 - **Silently non-delegating context wrappers:** make the three provenance methods required `Context` methods without
   defaults, so the compiler enumerates every implementation.
