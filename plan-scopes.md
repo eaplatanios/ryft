@@ -3,7 +3,8 @@
 ## Status
 
 - [ ] Await review and approval before implementation.
-- [ ] Reconcile this plan with the completed `CoordinateBasisOperation` inlining before changing code.
+- [x] Reconcile this plan with the completed `CoordinateBasisOperation` inlining: the operation is gone from the
+      repository and step 4 now states the completed prerequisite instead of waiting on it.
 
 ## Objective
 
@@ -133,9 +134,12 @@ so the previous state is restored on ordinary return, error return, and panic un
 
 Internally, active context state keeps an ordered scope stack, an optional source origin, and a cached fully composed
 `Provenance`. The cache is recomputed only when entering or leaving a scope or origin; `current_provenance()` and
-instruction staging clone the cached `Arc` and never rebuild nodes. This is what makes the one-allocation-per-scope
-property in step 7 true: without the cache, folding the scope stack on every staged instruction would allocate fresh
-nodes per instruction.
+instruction staging clone the cached `Arc` and never rebuild nodes. Note that because the nodes are immutable and the
+outermost scope sits at the root, recomputing the cache at a scope transition rebuilds the chain above the change
+point, which is O(scope depth) node allocations per transition. That is accepted: scope nesting is shallow in
+practice, and the performance requirement is precisely that *composition occurs only at scope and origin transitions,
+never per staged instruction*. Do not complicate the representation (for example, innermost-first storage with
+reversal at traversal time) to shave transition cost unless profiling ever shows it matters.
 
 Composition semantics are defined precisely as follows and must be pinned by tests before implementation:
 
@@ -146,9 +150,13 @@ Composition semantics are defined precisely as follows and must be pinned by tes
   ambient scope that its provenance already records preserves the source provenance exactly, with no double wrap,
   while synthesized scaffolding staged with no origin still receives the ambient transform scope folded over
   `Unknown`.
-- Entering an origin while another origin is active *fuses* the two through normalized `Provenance::fused` (it does
-  not replace the outer origin), and the recorded depth moves to the inner entry. A nested replay thus retains both
-  its enclosing and nested source origins without treating operand dependencies as origins.
+- Entering an origin while another origin is active *fuses* the new origin with the provenance *composed at that
+  moment* — the outer origin with all frames pushed after it already folded — not with the raw outer origin (it never
+  replaces it). Concretely, after entering origin `A`, then scope `S`, then origin `B`, the composed provenance is
+  `fused[Scope(S, A), B]`; fusing `B` with raw `A` would silently drop `S`. The new entry records the scope-stack
+  depth at `B`'s entry, so only frames pushed after `B` fold over the fused node, and leaving `B` restores the
+  previous origin, depth, and cached composition (here, back to `Scope(S, A)`). A nested replay thus retains both its
+  enclosing and nested source origins without treating operand dependencies as origins.
 - `Provenance::scope(scope, origin)` performs no deduplication or common-prefix factoring; normalization exists only
   in `Provenance::fused`. Visualizers may factor common scope prefixes at display time, but the stored representation
   stays purely structural.
@@ -180,8 +188,10 @@ scope preserves each instruction's provenance exactly instead of wrapping or fus
 
 Extend the existing `Program::render` function with an explicit enum-valued rendering-mode argument. Semantic mode
 must continue to omit provenance, while provenance mode emits it deterministically. `Display` must call semantic mode,
-so existing canonical strings remain unchanged; do not introduce a separate `display_with_provenance` function or
-display-wrapper API.
+so existing canonical strings remain unchanged. Because `Program::render` takes a `std::fmt::Formatter` that callers
+cannot construct directly, the public entry point for provenance rendering is a single mode-parameterized adapter,
+`Program::display(mode)`, returning a small `Display` wrapper over `(program, mode)` that allocates nothing until
+formatted. Do not add mode-specific named functions such as `display_with_provenance` or `to_string_with_mode`.
 
 There is a necessary distinction between semantic cache identity and compiled-artifact identity:
 
@@ -201,7 +211,10 @@ The fix is therefore a serialization change, not a parallel fingerprint: seriali
 `enable_debug_information = true` and `pretty_print_debug_information = false` (the pretty debug form is documented
 as unparsable and must not feed cache keys or reloadable artifacts). Enable this only when the program carries
 non-`Unknown` provenance, so ordinary programs keep byte-identical StableHLO text, existing snapshots, and existing
-cache keys. A separate deterministic provenance fingerprint is a fallback to be added only if location-inclusive
+cache keys. "Carries provenance" must be detected transitively, not by scanning top-level instructions, which would
+miss attached regions, shared callees, and nested program-valued operation metadata: lowering accumulates a
+`has_provenance` flag whenever it constructs an instruction-specific (non-base) location, including in every
+recursive lowering path, and that flag selects the serialization mode after lowering completes. A separate deterministic provenance fingerprint is a fallback to be added only if location-inclusive
 serialization proves unworkable at some cache boundary.
 
 In all cases, do not put provenance into operation rendering or the semantic canonical program representation.
@@ -256,8 +269,9 @@ do not silently return incorrectly labeled cached artifacts.
       unwinding, independent tracing contexts, nested tracing, and ordinary eager execution remaining unaffected.
 - [ ] Add tests pinning the composition semantics: nested tracing seeded inside scope `outer` followed by replay
       inside `outer` produces no double wrap; `with_provenance_origin` nested inside another origin fuses both
-      origins; scopes entered before an origin do not fold over it while scopes entered after it do; and no automatic
-      common-prefix factoring occurs in `Provenance::scope`.
+      origins; the exact `enter A, enter S, enter B` sequence composes `fused[Scope(S, A), B]` and restores
+      `Scope(S, A)` after leaving `B`; scopes entered before an origin do not fold over it while scopes entered after
+      it do; and no automatic common-prefix factoring occurs in `Provenance::scope`.
 
 ### 3. Add diagnostic rendering and visualizer-facing traversal
 
@@ -272,8 +286,11 @@ do not silently return incorrectly labeled cached artifacts.
       ```
 
 - [ ] Change the existing renderer to
-      `Program::render(&self, formatter, indentation, mode: ProgramRenderingMode)`. Do not add a second public render or
-      display-wrapper function.
+      `Program::render(&self, formatter, indentation, mode: ProgramRenderingMode)`. Do not add a second public render
+      function.
+- [ ] Add `Program::display(mode: ProgramRenderingMode)` returning a lightweight `Display` adapter over
+      `(program, mode)`, as the sole public entry point for requesting `WithProvenance` output (callers cannot invoke
+      `Program::render` directly because it takes a `std::fmt::Formatter`).
 - [ ] Make `Display` call `Program::render(..., ProgramRenderingMode::Semantic)`, preserving all existing `to_string()`
       output and canonical structural strings byte-for-byte for equivalent programs.
 - [ ] Thread the mode through the private recursive instruction/region rendering helpers and every nested-program
@@ -283,7 +300,10 @@ do not silently return incorrectly labeled cached artifacts.
       `render_with_mode(formatter, indentation, mode)` that delegates to the existing semantic `render`, and override
       it only in the derive-generated dispatcher and in operations that actually render nested program metadata. The
       default is semantically safe because an operation that renders no nested program has nothing mode-dependent to
-      emit.
+      emit. Forwarding implementations are the exception to "override only where needed": wrappers such as
+      `impl<O: Operation> Operation for Box<O>` in `crates/ryft-core/src/programs/operations.rs` must forward
+      `render_with_mode` to the inner operation, because relying on the default there would silently strip the mode
+      from every boxed operation. Audit all such forwarding/wrapper `Operation` implementations.
 - [ ] Require every direct caller of `Program::render` and operation rendering to choose a mode explicitly. Canonical
       fingerprints and semantic operation fields use `Semantic`; visualization, provenance assertions, and diagnostic
       dumps use `WithProvenance`.
@@ -299,7 +319,10 @@ do not silently return incorrectly labeled cached artifacts.
       name       ::= <scope name rendered as a Rust string literal>
       ```
 
-      No `unknown` token exists in the grammar: `Unknown` renders as the absence of a suffix, and fused normalization
+      The suffix is inserted immediately before the instruction statement's final newline. For instructions whose
+      rendering spans multiple lines (for example, operations with attached regions), that means after the final
+      closing bracket on the statement's last line, never inside the nested body. No `unknown` token exists in the
+      grammar: `Unknown` renders as the absence of a suffix, and fused normalization
       already guarantees `Unknown` never appears as a constituent. Scope names are preserved verbatim in storage and
       escaped deterministically at render time
       using Rust string-literal escaping (the `{:?}` / `escape_debug` form), which handles quotes, newlines, and
@@ -308,13 +331,16 @@ do not silently return incorrectly labeled cached artifacts.
 - [ ] Expose enough read-only traversal for a future visualizer to group instructions by common scope ancestors while
       retaining non-contiguous membership and fused origins.
 - [ ] Add exact rendering tests proving that canonical output is unchanged, diagnostic output contains nested paths,
-      nested program-valued operation metadata receives the selected mode, and fused origins are deterministic.
+      nested program-valued operation metadata receives the selected mode, fused origins are deterministic, name
+      escaping handles quotes and newlines, and one multiline instruction (an operation with an attached region)
+      places the suffix after the final closing bracket.
 
 ### 4. Annotate coordinate-basis construction
 
-- [ ] Wait for the ongoing `CoordinateBasisOperation` inlining to land, then wrap only the ordinary primitive
-      construction in `DenseDifferentiableType::coordinate_basis` with
-      `ryft.differentiation.coordinate_basis`.
+- [ ] Prerequisite complete: the `CoordinateBasisOperation` inlining has landed — the operation no longer exists in
+      the repository, and `DenseDifferentiableType::coordinate_basis`
+      (`crates/ryft-core/src/differentiation/types.rs`) already stages ordinary primitives. Wrap only that primitive
+      construction with `ryft.differentiation.coordinate_basis`.
 - [ ] Do not reintroduce a coordinate-basis operation, marker value, wrapper region, or special backend lowering.
 - [ ] Ensure validation that fails before construction does not emit partially scoped instructions. If some validation
       necessarily stages shape computations, decide explicitly whether those computations belong inside the scope and
@@ -375,9 +401,13 @@ do not silently return incorrectly labeled cached artifacts.
 - [ ] Add a conversion from Ryft `Provenance` plus the caller-provided base `LocationRef` to MLIR locations:
       - `Unknown` uses the base location;
       - `Scope { name, origin }` becomes `NamedLocationRef(name, lower(origin, base))`;
-      - `Fused { origins }` becomes `FusedLocationRef` over the recursively lowered origins, using unit metadata unless
-        a concrete metadata payload is introduced later.
+      - `Fused { origins }` becomes `FusedLocationRef` over the recursively lowered origins, with *no* metadata
+        attribute. Unit metadata is an actual metadata payload and changes the printed location, so it must not be
+        used as a stand-in for "none".
 - [ ] Reuse the existing `ryft-mlir` named/fused/unknown location wrappers; do not create parallel MLIR bindings.
+      `Context::fused_location` currently requires a metadata attribute, so add an optional/no-metadata construction
+      path to the existing wrapper (passing a null attribute handle through `mlirLocationFusedGet`), matching how
+      `fused_metadata` already models absent metadata as `None`.
 - [ ] Change the StableHLO replay loops to derive an instruction-specific location before constructing each plain or
       shard-map lowerer. Composite lowerings already emit all constituent MLIR operations through the lowerer's shared
       location, so every StableHLO operation generated from one Ryft instruction should inherit that instruction's
@@ -401,13 +431,15 @@ do not silently return incorrectly labeled cached artifacts.
 - [ ] Serialize modules lowered from programs carrying non-`Unknown` provenance with `enable_debug_information = true`
       and `pretty_print_debug_information = false`, so locations enter `XlaPersistentKeyV6::stable_hlo` and cache
       identity automatically; keep ordinary programs on the existing location-free serialization so their StableHLO
-      text, snapshots, and cache keys remain byte-identical. Add a separate deterministic provenance fingerprint
+      text, snapshots, and cache keys remain byte-identical. Detect "carries provenance" via the lowering-accumulated
+      `has_provenance` flag described in the design section (set whenever any recursive lowering path constructs an
+      instruction-specific location), never via a top-level instruction scan. Add a separate deterministic provenance fingerprint
       (never pointer identity or hash-map iteration order) only if location-inclusive serialization proves unworkable
       at some boundary. Verify that two semantically equal programs with different scope names cannot receive each
       other's labeled executable, and that a provenance-free program's key is unchanged from before this feature.
-- [ ] Verify that region imports and common scope sharing remain cheap: entering one scope recomputes the cached
-      composed provenance once (one shared node allocation), staging each instruction clones only the cached `Arc`,
-      and no composition work happens per staged instruction.
+- [ ] Verify that region imports and common scope sharing remain cheap: composition work is O(scope depth) and happens
+      only at scope/origin transitions, staging each instruction clones only the cached `Arc`, and no composition work
+      happens per staged instruction.
 - [ ] Add a focused construction benchmark if profiling infrastructure already provides an appropriate home. Do not add
       a new benchmark framework solely for this feature.
 - [ ] Document the cache-reuse tradeoff and the future opt-out design: stripping provenance before lowering may improve

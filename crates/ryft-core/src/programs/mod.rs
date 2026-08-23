@@ -146,15 +146,25 @@ pub use operations::{
 };
 pub use programs::{FlatProgram, Program, ProgramLiveSets};
 pub use references::{
-    PreparedReferenceValue, Reference, ReferenceAccessMode, ReferenceAliasKind, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError,
-    ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics,
-    ReferenceOutputSemantics, ReferenceType, ReferenceTypeRefinements,
+    FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
+    NewReference, NewReferenceOperation, PartialReferenceDischargeResult, PreparedReferenceValue,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
+    RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAliasKind, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceDischarge, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
+    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceError, ReferenceGeneration, ReferenceGuard,
+    ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
+    ReferenceReadOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource,
+    ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerReplayValidation, EmptyRegionDriver,
-    OutputRegionProvenance, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
-    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
+    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,
+    EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
+    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

@@ -527,6 +527,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Domain for TracingContext<V, O, 
 impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O, C> {
     #[inline]
     fn lift(&self, constant: V) -> Result<Tracer<Self>, ProgramError> {
+        // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
+        // the lift that attempts it because region sealing re-checks every stored constant, but only at build time,
+        // when the tracing call that stored the constant is long gone.
+        if let Err(error) = constant.validate_as_constant() {
+            return Err(self.error(error.into()));
+        }
         Ok(self.constant(constant))
     }
 
@@ -716,6 +722,12 @@ impl<C: Context> Domain for NestedTracingContext<C> {
 impl<C: Context> Context for NestedTracingContext<C> {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
+        // A value family that forbids constant storage (most notably a mutable reference holder) must be rejected at
+        // the lift that attempts it because region sealing re-checks every stored constant, but only at build time,
+        // when the tracing call that stored the constant is long gone.
+        if let Err(error) = constant.validate_as_constant() {
+            return Err(self.error(error.into()));
+        }
         Ok(self.constant(constant))
     }
 
@@ -839,8 +851,8 @@ impl<D: Domain> Trace for D {}
 
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
-/// contribute only their abstract [`Type`](crate::Type)s; no runtime computation is performed on them, and they are
-/// not captured by the resulting program. The trace runs in the input value type's statically known
+/// contribute only their abstract [`Type`]s; no runtime computation is performed on them, and they are not
+/// captured by the resulting program. The trace runs in the input value type's statically known
 /// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batch) and the differentiation entry
 /// points, no context instance needs to be recovered from the input leaves and inputs with no leaf values are still
 /// traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for the input types through

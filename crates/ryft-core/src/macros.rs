@@ -1033,6 +1033,75 @@ macro_rules! define_elementwise_capability {
     };
 }
 
+/// Implements the [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) trait
+/// for an [`Operation`](crate::Operation) as a verbatim replay/interpretation, by delegating to
+/// [`discharge_reference_free_operation`](crate::discharge_reference_free_operation). The generated rule replays the
+/// application over its rewritten operands, so an eager context executes it and a staging context records it. That is
+/// the complete implementation for an operation that touches no reference, and a checked rejecting placeholder for one
+/// that does, until that operation gets a discharge implementation of its own.
+///
+/// Note that the precondition this macro states is _reference freedom_ and not effect purity. An operation with ordered
+/// or other effects replays here perfectly well, because replaying it reproduces those effects in the destination
+/// exactly as the source performed them. Only a reference makes the rewrite the operation's own business.
+///
+/// An application that carries regions still replays verbatim when nothing in their closure touches a reference: the
+/// regions are copied into the destination as they stand. The generated implementation is a rejection rather than a
+/// rewrite in the two cases it cannot serve: a region closure that does reach a reference, because how a reference
+/// boundary widens is knowledge that belongs to the operation, and an operand that is a live reference handle, because
+/// a reference-touching operation owns its own rewrite. Both diagnostics name the operation.
+///
+/// The optional leading generic list declares operation-specific type parameters, and an optional `where` clause can
+/// provide any bounds needed to make the operation type well-formed.
+///
+/// # Parameters
+///
+///   - `$generic`: Optional operation-specific type parameters used by `$operation`.
+///   - `$operation`: The operation type for which the implementation is generated.
+///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
+#[macro_export]
+macro_rules! impl_reference_free_dischargeable_operation {
+    // This branch accepts a generic operation with additional well-formedness bounds.
+    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_reference_free_dischargeable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+    };
+
+    // This branch accepts a generic operation whose `Operation` implementation supplies all required bounds.
+    (<$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_reference_free_dischargeable_operation!(@impl [$($generic),+] ($operation) {});
+    };
+
+    // This branch accepts the common non-generic operation form.
+    ($operation:ty $(,)?) => {
+        $crate::impl_reference_free_dischargeable_operation!(@impl [] ($operation) {});
+    };
+
+    // This internal helper emits the shared reference-free replay rule for every public invocation form. The
+    // destination is bounded by `Context` rather than `Domain` because replaying the application binds it.
+    (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+        impl<
+            __C: $crate::Context,
+            __P: $crate::ReferenceDischargePolicy<__C>
+            $(, $generic)*
+        >
+            $crate::ReferenceDischargeableOperation<__C, __P> for $operation
+        where
+            __C::Operation: ::std::convert::From<$operation>,
+            $operation: $crate::Operation<Type = __C::Type>,
+            $($bounds)*
+        {
+            #[inline]
+            fn discharge_references<__D: $crate::ReferenceDischargeDriver<__C, __P>>(
+                &self,
+                context: &$crate::ReferenceDischargeContext<__C, __P>,
+                driver: &__D,
+                inputs: &[$crate::ReferenceDischargeValue<__C, __P>],
+            ) -> Result<Vec<$crate::ReferenceDischargeValue<__C, __P>>, $crate::ProgramError> {
+                $crate::discharge_reference_free_operation(self, context, driver, inputs)
+            }
+        }
+    };
+}
+
 /// Implements complete forward-mode differentiation (i.e., the Jacobian-Vector Product, or JVP, tranform) and primitive
 /// transposition rules for an [`Operation`](crate::Operation). The caller supplies the operation-specific algorithms
 /// while this macro generates the common [`DifferentiableOperation`](crate::DifferentiableOperation) and
@@ -4520,6 +4589,7 @@ pub use crate::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     impl_differentiable_elementwise_operation, impl_differentiable_operation, impl_non_differentiable_operation,
     impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
+    impl_reference_free_dischargeable_operation,
 };
 
 #[cfg(test)]
@@ -4548,13 +4618,15 @@ mod tests {
         ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, Sub,
         SubOperation, TransposeOperation, ZeroOperation,
     };
-    use crate::parameters::Parameter;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
     };
     use crate::programs::{
-        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, Type, TypeError,
-        TypeIdentityRenaming, Typed, ValueProjection,
+        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramBuilder, ProgramError,
+        RecursiveReferenceDischargeDriver, ReferenceDischargeContext, ReferenceDischargePolicy,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Type, TypeError, TypeIdentityRenaming,
+        Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -4731,6 +4803,7 @@ mod tests {
         rule = [@negative, @negative]
     }
 
+    impl_reference_free_dischargeable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);
@@ -5921,6 +5994,94 @@ mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), TEST_BINARY_OPERATION_NAME);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_impl_reference_free_dischargeable_operation() {
+        // The array universe has no reference-typed spelling, so this fixture policy classifies every destination
+        // type as ordinary and serves whole-value reads and replacements. That is all the generated rule needs: it
+        // only ever mints the one live handle whose rejection is under test.
+        #[derive(Copy, Clone, Debug, PartialEq)]
+        struct WholeArray;
+
+        impl Parameter for WholeArray {}
+
+        #[derive(Copy, Clone, Debug)]
+        struct TestArrayReferenceDischarge;
+
+        impl<C: Domain<Type = ArrayType>> ReferenceDischargePolicy<C> for TestArrayReferenceDischarge {
+            type Referent = ArrayType;
+            type Alias = WholeArray;
+
+            fn root_alias(_referent: &ArrayType) -> WholeArray {
+                WholeArray
+            }
+
+            fn lift_reference_type(r#type: ReferenceType<ArrayType>) -> ArrayType {
+                r#type.referent().clone()
+            }
+
+            fn lift_referent_type(referent: ArrayType) -> ArrayType {
+                referent
+            }
+
+            fn project_reference_type(_type: &ArrayType) -> Option<ReferenceType<ArrayType>> {
+                None
+            }
+
+            fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
+                Ok(current.clone())
+            }
+
+            fn replace(
+                _context: &C,
+                current: &C::Value,
+                replacement: C::Value,
+                _alias: &WholeArray,
+            ) -> Result<(C::Value, C::Value), ProgramError> {
+                Ok((current.clone(), replacement))
+            }
+        }
+
+        let operation = TestUnaryOperation::<ArrayType>::new();
+        let context = ReferenceDischargeContext::<
+            EagerContext<Array, TestUnaryOperation<ArrayType>>,
+            TestArrayReferenceDischarge,
+        >::new(EagerContext::new());
+        let inputs = [ReferenceDischargeValue::Ordinary(Array::scalar(2.0f32))];
+
+        // A reference-free, region-free application replays verbatim through the destination, which executes it and
+        // returns its outputs as ordinary carriers.
+        assert_eq!(
+            operation.discharge_references(&context, &EmptyRegionDriver, &inputs),
+            Ok(vec![ReferenceDischargeValue::Ordinary(Array::scalar(-2.0f32))]),
+        );
+
+        // A region-carrying application replays its regions verbatim, so an operation that declares none rejects the
+        // attachment through its own contract rather than through the shared rule.
+        let mut builder = ProgramBuilder::<Array, TestUnaryOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let regions =
+            [builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        assert_eq!(
+            operation.discharge_references(&context, &driver, &inputs),
+            Err(ProgramError::MalformedProgram(
+                "operation `test_unary` declares no region slots but 1 regions were attached".to_string(),
+            )),
+        );
+
+        // An operand that is a live reference handle is rejected too, because a reference-touching operation owns its
+        // own rewrite. The handle's own rendering is spliced into the expected diagnostic because a root environment
+        // identity is minted process-globally and is therefore not stable across runs.
+        let reference =
+            context.allocate_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32));
+        assert_eq!(
+            operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge expected an ordinary operand 0 of `test_unary` but received {reference}",
+            ))),
+        );
     }
 
     #[test]
