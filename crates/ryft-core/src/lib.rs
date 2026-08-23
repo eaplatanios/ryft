@@ -152,7 +152,7 @@ pub use partial::{
 };
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BindingRegionDriver, CalleeRegionDriver, Concretizable,
-    DestinationRegionMapping, EagerReplayValidation, Effect, EffectOccurrence, Effects, EmptyRegionDriver,
+    DestinationRegionMapping, EagerInterpretationValidation, Effect, EffectOccurrence, Effects, EmptyRegionDriver,
     FREEZE_REFERENCE_OPERATION_NAME, FlatProgram, FreezeReference, FreezeReferenceOperation, Instruction,
     InstructionId, MaybeZero, MemberOperation, NEW_REFERENCE_OPERATION_NAME, NewReference, NewReferenceOperation,
     NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance,

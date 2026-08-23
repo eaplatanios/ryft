@@ -441,11 +441,12 @@ mod tests {
     use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, FreezeReferenceOperation, InstructionId, NewReferenceOperation, Operation, OutputRegionProvenance,
-        ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceReadOperation,
-        ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType, RegionInterface, RegionSlot,
-        TypeError, discharge_positional_region_operation, discharge_reference_free_operation,
+        Effects, FreezeReferenceOperation, Instruction, InstructionId, NewReferenceOperation, Operation,
+        OutputRegionProvenance, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext,
+        ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation,
+        ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource, ReferenceStateBinding,
+        ReferenceSwapOperation, ReferenceType, RegionInterface, RegionSlot, TypeError,
+        discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -616,13 +617,20 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_reports_environment_and_boundary_failures() {
-        // Discharge catches at replay time what the authored-program lint catches ahead of it: a root that a
-        // `freeze` already consumed is reported against that exact root.
+        // Discharge catches at replay time what construction-time checking catches ahead of it: a root that a
+        // `freeze` already consumed is reported against that exact root. The checked append rejects this program, so
+        // the stale read is assembled through the unchecked rebuild hatch to prove discharge's own guard.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
         let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root]).unwrap()[0];
-        let stale = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![root]).unwrap()[0];
+        let stale = builder.add_variable(scalar_type().into());
+        builder.add_instruction_unchecked(Instruction::new(
+            ReferenceReadOperation::new().into(),
+            vec![root],
+            vec![stale],
+            Vec::new(),
+        ));
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen, stale], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -634,15 +642,22 @@ mod tests {
         ));
 
         // A `freeze` through a derived view names no consumption at all, because consumption yields the whole root.
-        // Both the eager handles and the standalone analysis reject the same program; discharge runs neither, so it
-        // rejects rather than returning a whole-root value under the view's narrower type.
+        // The eager handles and the checked append both reject the same program; discharge runs neither (the frozen
+        // view is again assembled through the unchecked hatch), so it rejects rather than returning a whole-root
+        // value under the view's narrower type.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
         let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
         let view = builder
             .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]), Vec::new(), vec![root])
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![view]).unwrap()[0];
+        let frozen = builder.add_variable(ArrayType::new_static(DataType::F32, [2]).into());
+        builder.add_instruction_unchecked(Instruction::new(
+            FreezeReferenceOperation::new().into(),
+            vec![view],
+            vec![frozen],
+            Vec::new(),
+        ));
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();

@@ -2,8 +2,7 @@
 //!
 //! [`ArrayOperation`], [`DimensionOperation`], and [`ArrayIrOperation`] are the staged operation families for the
 //! array universe. Most child modules group private mixed array-IR machinery by the semantic families used under
-//! [`crate::operations`]. The public [`references`] module owns array-specific reference views and the array
-//! implementations of generic payloads from [`crate::programs::references::operations`].
+//! [`crate::operations`].
 
 // TODO(eaplatanios): Review this module.
 
@@ -21,9 +20,9 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    CoordinateBasisOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, LinearCallOperation,
-    MemberDifferentiableOperation, ResidualZeroProvider, StopGradient, StopGradientOperation, jvp_projected_operation,
+    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, LinearCallOperation, MemberDifferentiableOperation,
+    ResidualZeroProvider, StopGradient, StopGradientOperation, jvp_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -58,9 +57,9 @@ use crate::operations::{
 };
 use crate::programs::{
     FreezeReference, FreezeReferenceOperation, MaybeZero, NewReference, NewReferenceOperation, Operation,
-    OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceDischargeRule,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueProjection,
+    OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -108,7 +107,6 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     OneLike(OneLikeOperation<ArrayType>),
     Constant(ConstantOperation<Array>),
     Iota(IotaOperation<ArrayType>),
-    CoordinateBasis(CoordinateBasisOperation<ArrayType>),
     Abs(AbsOperation<ArrayType>),
     Neg(NegOperation<ArrayType>),
     Add(AddOperation<ArrayType>),
@@ -273,7 +271,7 @@ where
 {
 }
 
-/// [`Operation`](crate::Operation) family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
+/// [`Operation`] family used for staged [`DimensionValue`] [`Program`](crate::Program)s.
 #[derive(Clone, Debug, Operation)]
 pub enum DimensionOperation<V: Value<Type = DimensionType>> {
     Constant(ConstantOperation<V>),
@@ -341,7 +339,7 @@ where
 {
 }
 
-/// Closed [`Operation`](crate::Operation) family for Ryft's array IR, whose values include ordinary arrays,
+/// Closed [`Operation`] family for Ryft's array IR, whose values include ordinary arrays,
 /// first-class runtime dimensions, and references to arrays. This dispatcher preserves the homogeneous contracts of
 /// [`ArrayOperation`] and [`DimensionOperation`]: it selects the member family, projects the composite type boundary
 /// once, delegates to that family, and lifts the inferred result types back into [`ArrayIrType`]. Reference operations
@@ -352,9 +350,13 @@ where
 /// member family can express such a signature. For example, [`DimensionSizeOperation`] consumes an array and produces
 /// a first-class dimension without changing either homogeneous family.
 #[derive(Clone, Debug, Operation)]
-#[ryft(crate = "crate", type = ArrayIrType, constant = ArrayIrValue<A>)]
-#[ryft(members(ArrayType, structural(DimensionType)))]
-#[ryft(dispatch(batching, differentiation, transposition))]
+#[ryft(
+    crate = "crate",
+    type = ArrayIrType,
+    constant = ArrayIrValue<A>,
+    members(ArrayType, structural(DimensionType)),
+    dispatch(discharge, batching, differentiation, transposition),
+)]
 pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed zero constructor whose stored [`ArrayType`] defines the array result and whose dynamic dimensions are
     /// consumed as explicit first-class dimension operands, one per dynamic axis in axis order. A static stored type
@@ -518,31 +520,26 @@ pub trait ArrayReferenceOperation: Operation<Type = ArrayIrType> {
     }
 }
 
-/// Operation-family capability used by immutable array-reference discharge.
+/// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
 ///
-/// This contract extends [`ArrayReferenceOperation`] with the structural rewrite required to eliminate reference
-/// semantics and widen higher-order state boundaries. Keeping it on each closed operation family lets core Array IR
-/// and backend-owned supersets share one discharge algorithm without matching operation names.
-pub trait ArrayReferenceDischargeOperation: ArrayReferenceOperation + From<AddOperation<ArrayIrType>> + Sized {
-    /// Returns the structural reference-discharge rule for this operation.
-    fn reference_discharge_rule(&self) -> ReferenceDischargeRule;
-
-    /// Wraps a canonical homogeneous array reshape for reference-view discharge.
+/// Mapping between a reference root and one derived handle's coordinates is a sequence of slices, reshapes, and
+/// update-slices, and both consumers of that mapping — the eager handles and the
+/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy — walk the same
+/// [`ArrayReferenceView`](crate::ArrayReferenceView). This contract is what lets the staging consumer put those
+/// operations into a closed operation family it does not otherwise know the shape of, so core array IR and
+/// backend-owned supersets share one traversal without matching operation names.
+///
+/// It is orthogonal to [`ArrayReferenceOperation`], which reports the view transform a member derives rather than
+/// constructing one: a consumer that only stages view accesses states this contract alone.
+pub trait ArrayReferenceViewOperation: Operation<Type = ArrayIrType> + Sized {
+    /// Wraps a canonical homogeneous array reshape for reference-view staging.
     fn from_reference_reshape(operation: ReshapeOperation) -> Self;
 
-    /// Wraps a canonical homogeneous array slice for reference-view discharge.
+    /// Wraps a canonical homogeneous array slice for reference-view staging.
     fn from_reference_slice(operation: SliceOperation) -> Self;
 
-    /// Wraps a canonical homogeneous array update-slice for reference-view discharge.
+    /// Wraps a canonical homogeneous array update-slice for reference-view staging.
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
-
-    /// Returns this scan operation with `additional_carry_count` hidden reference-state carries added after its
-    /// existing carries, preserving its length, direction, unroll factor, and capture payloads.
-    ///
-    /// Calling this method for a non-scan operation is a malformed-transform error. The split between classification
-    /// and reconstruction keeps [`ReferenceDischargeRule`] lifetime-free and makes accidental reconstruction of an
-    /// ordinary operation fail explicitly.
-    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError>;
 }
 
 impl<A: Value<Type = ArrayType>> ArrayReferenceOperation for ArrayIrOperation<A> {
@@ -555,22 +552,7 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceOperation for ArrayIrOperation<A>
     }
 }
 
-impl<A: Value<Type = ArrayType>> ArrayReferenceDischargeOperation for ArrayIrOperation<A> {
-    fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
-        match self {
-            Self::NewReference(_) => ReferenceDischargeRule::NewRoot,
-            Self::ReferenceIndex(_) | Self::ReferenceSlice(_) => ReferenceDischargeRule::Alias,
-            Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
-            Self::ReferenceSwap(_) => ReferenceDischargeRule::Replace,
-            Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::Accumulate,
-            Self::FreezeReference(_) => ReferenceDischargeRule::Consume,
-            Self::Condition(_) => ReferenceDischargeRule::Condition,
-            Self::While(_) => ReferenceDischargeRule::While,
-            Self::Scan(operation) => ReferenceDischargeRule::Scan { carry_count: operation.carry_count() },
-            _ => ReferenceDischargeRule::Ordinary,
-        }
-    }
-
+impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperation<A> {
     fn from_reference_reshape(operation: ReshapeOperation) -> Self {
         Self::Array(ArrayOperation::Reshape(operation))
     }
@@ -581,16 +563,6 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceDischargeOperation for ArrayIrOpe
 
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
         Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn with_added_reference_scan_carries(&self, additional_carry_count: usize) -> Result<Self, ProgramError> {
-        let Self::Scan(operation) = self else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` is not a scan and cannot carry discharged reference state",
-                self.name(),
-            )));
-        };
-        Ok(Self::Scan(operation.with_added_carries(additional_carry_count)?))
     }
 }
 
@@ -1432,89 +1404,6 @@ mod tests {
                     .with_memory(Memory::Host { pinned: true })
                     .into()
             ]),
-        );
-    }
-
-    #[test]
-    fn test_reference_discharge_rules() {
-        // Each reference operation classifies into its own discharge rule, region carriers classify into the
-        // region-aware rules, a scan additionally reports its current carry count, and every other operation family
-        // falls back to `Ordinary`. This mapping is written arm by arm, so a mis-paired arm would still compile.
-        assert_eq!(
-            ArrayIrOperation::<Array>::NewReference(NewReferenceOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::NewRoot,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::ReferenceRead(ReferenceReadOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Read,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::ReferenceSwap(ReferenceSwapOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Replace,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::ReferenceAddUpdate(ReferenceAddUpdateOperation::new())
-                .reference_discharge_rule(),
-            ReferenceDischargeRule::Accumulate,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::FreezeReference(FreezeReferenceOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Consume,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::Condition(ConditionOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Condition,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::While(WhileOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::While,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::Array(ArrayOperation::Add(AddOperation::new())).reference_discharge_rule(),
-            ReferenceDischargeRule::Ordinary,
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::Scan(ScanOperation::new(2, 4)).reference_discharge_rule(),
-            ReferenceDischargeRule::Scan { carry_count: 2 },
-        );
-    }
-
-    #[test]
-    fn test_scan_reference_carry_widening() {
-        // Widening a scan's carry list preserves every other payload field, non-scan operations are rejected instead
-        // of silently accepting discharged state, and an overflowing carry count is reported instead of wrapping.
-        let capture = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
-        let scan = ArrayIrOperation::Scan(
-            ScanOperation::<TestValue>::new(2, 4)
-                .with_reverse(true)
-                .with_unroll(2)
-                .unwrap()
-                .with_captures(vec![capture.clone()]),
-        );
-        let widened = scan.with_added_reference_scan_carries(3).unwrap();
-        let ArrayIrOperation::Scan(widened) = widened else {
-            panic!("expected a widened scan operation");
-        };
-        assert_eq!(widened.carry_count(), 5);
-        assert_eq!(widened.length(), &Dimension::Static(4));
-        assert!(widened.reverse());
-        assert_eq!(widened.unroll(), 2);
-        assert_eq!(widened.captures(), &[capture]);
-
-        let add = ArrayIrOperation::<Array>::Array(ArrayOperation::Add(AddOperation::new()));
-        assert_eq!(
-            add.with_added_reference_scan_carries(1).unwrap_err(),
-            ProgramError::MalformedProgram(
-                "operation `add` is not a scan and cannot carry discharged reference state".to_string(),
-            ),
-        );
-        let overflowing_scan = ArrayIrOperation::<Array>::Scan(ScanOperation::new(usize::MAX, 4));
-        assert_eq!(
-            overflowing_scan.with_added_reference_scan_carries(1).unwrap_err(),
-            ProgramError::MalformedProgram(format!(
-                "`scan` carry count {} overflows when adding 1 discharged reference state carries",
-                usize::MAX,
-            )),
         );
     }
 

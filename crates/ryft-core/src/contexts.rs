@@ -653,8 +653,8 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
                 driver.import_into(self.builder(), &region_input_types).map_err(|error| self.error(error))?;
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_staged_instruction(operation, region_ids, inputs) {
-                    Ok(outputs) => outputs,
+                match builder.add_instruction(operation, region_ids, inputs) {
+                    Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
                             builder.error = Some(error.clone());

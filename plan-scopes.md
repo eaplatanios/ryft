@@ -85,14 +85,17 @@ The public API should expose constructors and traversal methods rather than the 
 
 - `ProvenanceScope::new(name)` creates a named scope.
 - `Provenance::unknown()` represents instructions with no recorded origin.
+- `Provenance::is_unknown()` returns whether the provenance is `Unknown`, giving renderers, lowerers, serialization
+  boundaries, and tests a direct way to make that distinction without reconstructing it from traversal results.
 - `Provenance::scope(scope, origin)` attaches one named scope above an existing origin.
 - `Provenance::fused(origins)` represents a generated instruction with multiple source origins.
 - `Provenance::scope_path()` supports program renderers and visualizers without exposing storage internals. It returns
   the scope names from the outermost `Scope` node down to the first non-`Scope` node; for `Unknown` and for a `Fused`
   root it returns an empty path, and fused constituents are reached through `Provenance::origins()`.
-- `Provenance::origin()` returns the child origin below the scope chain: for a `Scope` root it is the provenance under
-  the innermost scope named by `scope_path()`, and for `Unknown` or `Fused` roots it is the provenance itself. Together
-  with `scope_path()` and `origins()`, this lets a visualizer traverse the complete tree without a node-view API.
+- `Provenance::origin()` returns `Some` containing the child provenance below the innermost scope named by
+  `scope_path()` for a `Scope` root, and `None` for `Unknown` or `Fused` roots. Returning `None` instead of using `self`
+  as a sentinel prevents accidental non-terminating traversal. Together with `is_unknown()`, `scope_path()`, and
+  `origins()`, this lets a visualizer traverse the complete tree without a node-view API.
 - `Provenance::origins()` supports recursive visualization of fused origins: it returns the constituents of a `Fused`
   root and an empty slice otherwise.
 
@@ -151,12 +154,12 @@ Composition semantics are defined precisely as follows and must be pinned by tes
   while synthesized scaffolding staged with no origin still receives the ambient transform scope folded over
   `Unknown`.
 - Entering an origin while another origin is active *fuses* the new origin with the provenance *composed at that
-  moment* — the outer origin with all frames pushed after it already folded — not with the raw outer origin (it never
-  replaces it). Concretely, after entering origin `A`, then scope `S`, then origin `B`, the composed provenance is
+  moment*: the outer origin with all frames pushed after it already folded. It neither uses nor replaces the raw outer
+  origin. Concretely, after entering origin `A`, then scope `S`, then origin `B`, the composition is
   `fused[Scope(S, A), B]`; fusing `B` with raw `A` would silently drop `S`. The new entry records the scope-stack
-  depth at `B`'s entry, so only frames pushed after `B` fold over the fused node, and leaving `B` restores the
-  previous origin, depth, and cached composition (here, back to `Scope(S, A)`). A nested replay thus retains both its
-  enclosing and nested source origins without treating operand dependencies as origins.
+  depth at `B`'s entry, so only frames pushed after `B` fold over the fused node. Leaving `B` restores the previous
+  origin, depth, and cached composition (here, back to `Scope(S, A)`). A nested replay thus retains both its enclosing
+  and nested source origins without treating operand dependencies as origins.
 - `Provenance::scope(scope, origin)` performs no deduplication or common-prefix factoring; normalization exists only
   in `Provenance::fused`. Visualizers may factor common scope prefixes at display time, but the stored representation
   stays purely structural.
@@ -214,13 +217,16 @@ non-`Unknown` provenance, so ordinary programs keep byte-identical StableHLO tex
 cache keys. "Carries provenance" must be detected transitively, not by scanning top-level instructions, which would
 miss attached regions, shared callees, and nested program-valued operation metadata: lowering accumulates a
 `has_provenance` flag whenever it constructs an instruction-specific (non-base) location, including in every
-recursive lowering path, and that flag selects the serialization mode after lowering completes. A separate deterministic provenance fingerprint is a fallback to be added only if location-inclusive
-serialization proves unworkable at some cache boundary.
+recursive lowering path, and that flag selects the serialization mode after lowering completes. A separate
+deterministic provenance fingerprint is a fallback to be added only if location-inclusive serialization proves
+unworkable at some cache boundary.
 
-In all cases, do not put provenance into operation rendering or the semantic canonical program representation.
-Document that exact backend provenance can reduce compiled-artifact cache reuse. If this cost later matters, add an
-explicit compilation option that strips provenance before lowering and consequently removes it from cache identity;
-do not silently return incorrectly labeled cached artifacts.
+In all cases, do not put an instruction's provenance into its operation's semantic `Operation::render` output or the
+semantic canonical program representation. The contextual `Program` renderer owns the instruction-level suffix, while
+`Operation::render_with_mode` only propagates the selected mode into nested program-valued metadata. Document that
+exact backend provenance can reduce compiled-artifact cache reuse. If this cost later matters, add an explicit
+compilation option that strips provenance before lowering and consequently removes it from cache identity; do not
+silently return incorrectly labeled cached artifacts.
 
 ## Implementation Plan
 
@@ -304,9 +310,10 @@ do not silently return incorrectly labeled cached artifacts.
       `impl<O: Operation> Operation for Box<O>` in `crates/ryft-core/src/programs/operations.rs` must forward
       `render_with_mode` to the inner operation, because relying on the default there would silently strip the mode
       from every boxed operation. Audit all such forwarding/wrapper `Operation` implementations.
-- [ ] Require every direct caller of `Program::render` and operation rendering to choose a mode explicitly. Canonical
-      fingerprints and semantic operation fields use `Semantic`; visualization, provenance assertions, and diagnostic
-      dumps use `WithProvenance`.
+- [ ] Require every program-rendering path to choose a mode explicitly through `Program::render` and
+      `Operation::render_with_mode`. Retained standalone calls to `Operation::render` are explicitly semantic-only and
+      do not select a mode. Canonical fingerprints and semantic operation fields use `Semantic`; visualization,
+      provenance assertions, and diagnostic dumps use `WithProvenance`.
 - [ ] Render provenance per instruction, not as assumed-contiguous begin/end blocks, using the following exact
       grammar, modeled on MLIR location syntax and appended to the instruction line:
 
@@ -433,10 +440,11 @@ do not silently return incorrectly labeled cached artifacts.
       identity automatically; keep ordinary programs on the existing location-free serialization so their StableHLO
       text, snapshots, and cache keys remain byte-identical. Detect "carries provenance" via the lowering-accumulated
       `has_provenance` flag described in the design section (set whenever any recursive lowering path constructs an
-      instruction-specific location), never via a top-level instruction scan. Add a separate deterministic provenance fingerprint
-      (never pointer identity or hash-map iteration order) only if location-inclusive serialization proves unworkable
-      at some boundary. Verify that two semantically equal programs with different scope names cannot receive each
-      other's labeled executable, and that a provenance-free program's key is unchanged from before this feature.
+      instruction-specific location), never via a top-level instruction scan. Add a separate deterministic provenance
+      fingerprint (never pointer identity or hash-map iteration order) only if location-inclusive serialization proves
+      unworkable at some boundary. Verify that two semantically equal programs with different scope names cannot
+      receive each other's labeled executable, and that a provenance-free program's key is unchanged from before this
+      feature.
 - [ ] Verify that region imports and common scope sharing remain cheap: composition work is O(scope depth) and happens
       only at scope/origin transitions, staging each instruction clones only the cached `Arc`, and no composition work
       happens per staged instruction.

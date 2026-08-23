@@ -27,8 +27,8 @@
 //! [`Program::interpret_in_context`] first checks the input [`Parameterized`] structure and the complete input type
 //! signature. Refinements are established across the whole signature so repeated dynamic type identities cannot receive
 //! contradictory concrete bindings. Before replay, an eager concrete [`Value`] family may run its
-//! [`Value::validate_eager_replay`] hook. For example, the core array IR uses this boundary to reject invalid or
-//! external reference state before any mutation. Structured inputs are then flattened into an atom-indexed environment.
+//! [`Value::validate_eager_interpretation`] hook. For example, the core array IR uses this boundary to reject external
+//! reference state before any mutation. Structured inputs are then flattened into an atom-indexed environment.
 //! Only live constants are lifted through [`Context::lift`], and every instruction reads its operands and writes its
 //! results in that environment.
 //!
@@ -82,7 +82,7 @@ use crate::contexts::{Context, Domain, EagerContext};
 use crate::macros::check_count;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{
-    Atom, AtomId, EagerReplayValidation, EmptyRegionDriver, Instruction, Operation, Program, ProgramError,
+    Atom, AtomId, EagerInterpretationValidation, EmptyRegionDriver, Instruction, Operation, Program, ProgramError,
     RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeRefinements, Typed, Value,
     ValueProjection,
 };
@@ -151,13 +151,13 @@ pub(crate) struct EagerInterpretationDriver<'r, D> {
 
     /// Evidence that the complete attached region closure was validated before the active application's eager rule
     /// began executing, forwarded to nested replay so that selected regions are not revalidated.
-    validation: Option<EagerReplayValidation>,
+    validation: Option<EagerInterpretationValidation>,
 }
 
 impl<'r, D> EagerInterpretationDriver<'r, D> {
     /// Creates a new [`EagerInterpretationDriver`].
     #[inline]
-    pub(crate) fn new(driver: &'r D, validation: Option<EagerReplayValidation>) -> Self {
+    pub(crate) fn new(driver: &'r D, validation: Option<EagerInterpretationValidation>) -> Self {
         Self { driver, validation }
     }
 }
@@ -376,9 +376,9 @@ impl<
         // Concrete resource-bearing value families need a complete, all-or-nothing legality check before replay can
         // lift constants or execute the first instruction. Transform wrappers use their own value family and therefore
         // retain their operation-level gates even when their innermost execution context is eager.
-        let requires_validation = context.is_eager() && C::Value::VALIDATES_EAGER_REPLAY;
+        let requires_validation = context.is_eager() && C::Value::VALIDATES_EAGER_INTERPRETATION;
         if requires_validation {
-            C::Value::validate_eager_replay(self.entry_region_ref())?;
+            C::Value::validate_eager_interpretation(self.entry_region_ref())?;
         }
 
         // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
@@ -444,8 +444,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// already generic over `V`, carrying the matching `E` keeps each interpreter's error statically typed rather than
     /// erasing it to a runtime downcast.
     ///
-    /// This low-level callback API does not run [`Value::validate_eager_replay`]. A caller whose `interpret_fn` can
-    /// mutate resource-bearing values must validate the complete program and invocation before calling it.
+    /// This low-level callback API does not run [`Value::validate_eager_interpretation`]. A caller whose `interpret_fn`
+    /// can mutate resource-bearing values must validate the complete program and invocation before calling it.
     /// [`Program::interpret_in_context`] is the canonical checked eager entry point.
     ///
     /// # Parameters
@@ -483,18 +483,19 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     ///
     ///   - `context`: [`Context`] that assigns meaning to constant lifting and instruction binding.
     ///   - `inputs`: Flat input values aligned with this region's input atoms.
-    ///   - `validation`: Evidence that a [`Value::validate_eager_replay`] preflight already covered this region as
-    ///     part of an enclosing checked replay root. Pass [`None`] unless you hold evidence obtained from such a root.
-    ///     [`None`] makes this replay its own root boundary, so that an eager context whose value family validates
-    ///     eager replay runs the whole-closure preflight here before anything executes. Ryft's nested replay machinery
-    ///     forwards the evidence minted by its enclosing root instead, both because that root's preflight already
-    ///     covered every nested region and because revalidating a selected child in isolation would misclassify
-    ///     parent-created references forwarded into the child as external roots.
+    ///   - `validation`: Evidence that a [`Value::validate_eager_interpretation`] boundary validation already covered
+    ///     this region as part of an enclosing checked interpretation root. Pass [`None`] unless you hold evidence
+    ///     obtained from such a root. [`None`] makes this interpretation its own root boundary, so that an eager
+    ///     context whose value family validates eager interpretation runs the boundary validation here before
+    ///     anything executes. Ryft's nested replay machinery forwards the evidence minted by its enclosing root
+    ///     instead, both because that root's boundary validation already covered every nested region and because
+    ///     revalidating a selected child in isolation would misclassify parent-created references forwarded into the
+    ///     child as external roots.
     pub fn interpret_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         self,
         context: &C,
         inputs: Vec<C::Value>,
-        validation: Option<&EagerReplayValidation>,
+        validation: Option<&EagerInterpretationValidation>,
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, self.input_ids().len(), ProgramError);
         let input_ids = self.input_ids();
@@ -543,16 +544,16 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
         };
 
         // A replay without validation evidence is a root execution boundary just like `Program::interpret_in_context`.
-        // Nested eager recursion supplies its root's evidence instead, because that root's preflight has already
-        // validated the whole closure in its original context.
+        // Nested eager recursion supplies its root's evidence instead, because that root's boundary validation
+        // already covered the whole closure in its original context.
         let validated = match validation {
             Some(_) => true,
             None => {
-                let requires_preflight = context.is_eager() && C::Value::VALIDATES_EAGER_REPLAY;
-                if requires_preflight {
-                    C::Value::validate_eager_replay(self)?;
+                let requires_boundary_validation = context.is_eager() && C::Value::VALIDATES_EAGER_INTERPRETATION;
+                if requires_boundary_validation {
+                    C::Value::validate_eager_interpretation(self)?;
                 }
-                requires_preflight
+                requires_boundary_validation
             }
         };
 
@@ -596,8 +597,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     /// the region directly from its source arena without first materializing a standalone [`Program`], while preserving
     /// the same flat input, constant-lifting, instruction-dispatch, and output-gathering behavior.
     ///
-    /// This low-level callback API does not run [`Value::validate_eager_replay`]. A caller whose `interpret_fn` can
-    /// mutate resource-bearing values must validate the complete reachable region closure and its invocation before
+    /// This low-level callback API does not run [`Value::validate_eager_interpretation`]. A caller whose `interpret_fn`
+    /// can mutate resource-bearing values must validate the complete reachable region closure and its invocation before
     /// calling it. [`RegionRef::interpret_in_context`] is the canonical checked eager entry point.
     pub fn interpret_with<
         RuntimeValue: Clone,
@@ -849,7 +850,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_marks_replay_validated_only_after_running_the_value_hook() {
-        /// Eager test context that records whether program replay supplied privileged preflight evidence.
+        /// Eager test context that records whether program replay supplied privileged boundary-validation evidence.
         #[derive(Clone)]
         struct ReplayEvidenceContext {
             /// Whether the observed application used an ordinary unvalidated replay driver.
@@ -876,7 +877,7 @@ mod tests {
             ) -> Result<Vec<Array>, ProgramError> {
                 let operation = operation.into();
                 operation.validate_region_count(driver.region_count())?;
-                self.saw_unvalidated_replay.set(driver.eager_replay_validation().is_none());
+                self.saw_unvalidated_replay.set(driver.eager_interpretation_validation().is_none());
                 Ok(inputs.to_vec())
             }
 

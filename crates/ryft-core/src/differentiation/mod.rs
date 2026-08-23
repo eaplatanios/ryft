@@ -504,7 +504,7 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///     values does not make them static specialization arguments. Captures follow the same operational validity rules
 ///     as ordinary values. If a capture is incompatible with the selected context, the operation or execution boundary
 ///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
-///     fail preflight validation.
+///     fail the builder's up-front signature validation.
 ///   - [`with_auxiliary_output`](Self::with_auxiliary_output) declares that the closure being differentiated returns
 ///     `(output, auxiliary)`. `auxiliary` may be any third, independently shaped [`Parameterized`] tree and is
 ///     reconstructed with runtime leaves without being differentiated.
