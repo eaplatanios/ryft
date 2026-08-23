@@ -870,12 +870,11 @@ pub trait DifferentiableOperation<C: Context>: Operation {
 /// values and the projected context's parent `C` itself, allowing the rule to use values from other members of `U`
 /// when constructing the derivative.
 ///
-/// This distinction matters for rules such as dynamically shaped slicing. The primal operation remains an ordinary
-/// [`ArrayType`](crate::ArrayType) operation, but its linearization must retain first-class dimension values in an
-/// [`ArrayIrType`](crate::ArrayIrType) program. Implementing [`DifferentiableOperation<C>`] directly cannot express
-/// that relationship because its [`jvp`](DifferentiableOperation::jvp) method deliberately requires `Self::Type =
-/// C::Type`. This trait preserves that same-universe invariant while making member differentiation in the parent
-/// universe explicit.
+/// This distinction matters whenever the primal operation belongs to one projected member but its linearization must
+/// retain values belonging to another member of the enclosing type universe. Implementing [`DifferentiableOperation`]
+/// directly cannot express that relationship because its [`jvp`](DifferentiableOperation::jvp) function deliberately
+/// requires `Self::Type = C::Type`. This trait preserves that same-universe invariant while making member
+/// differentiation in the parent universe explicit.
 ///
 /// Implementations bound the parent context by the projection vocabulary they actually use (typically
 /// [`ValueProjection<T>`](ValueProjection) for values and constants, [`OperationProjection<T>`](OperationProjection)
@@ -2340,7 +2339,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -2348,13 +2348,18 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
-    use crate::differentiation::operations::{StopGradient, StopGradientOperation};
+    use crate::differentiation::operations::tests::custom_jvp_regions_with_reference_state;
+    use crate::differentiation::operations::{CustomJvpOperation, StopGradient, StopGradientOperation};
     use crate::operations::{
         CollectiveKind, CollectiveOperation, ConditionOperation, CosOperation, Dot, DotDimensionNumbers, MulOperation,
-        Sin, SinOperation,
+        Sin, SinOperation, WhileOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
-    use crate::programs::{Concretizable, Operation, ProgramBuilder, RegionId};
+    use crate::programs::{
+        Concretizable, FreezeReferenceOperation, NewReferenceOperation, Operation, ProgramBuilder,
+        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceType, RegionId,
+    };
+    use crate::tests::test_condition_program;
     use crate::tracing::{NestedTracingContext, Trace};
 
     #[cfg(debug_assertions)]
@@ -2393,6 +2398,20 @@ mod tests {
     }
 
     #[test]
+    fn test_differentiation_context_rejects_state_before_symbolic_zero_fast_path() {
+        let context = DifferentiationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(ArrayIrValue::Array(Array::scalar(1.0_f32))).unwrap(),
+            context.clone(),
+        );
+        assert!(matches!(
+            context.bind(NewReferenceOperation::new(), Vec::new(), &[input]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`new_reference` must be discharged before differentiation",
+        ));
+    }
+
+    #[test]
     fn test_differentiation_context_skips_ruleless_operations_for_symbolic_zero_tangents() {
         // `stop_gradient` severs the collective's tangent input. The differentiation context must therefore bind the
         // primal collective without consulting its absent JVP rule, while preserving the live tangent of the other
@@ -2410,6 +2429,50 @@ mod tests {
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![4.0]);
         assert_eq!(tangent.to_f64s(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_differentiation_context_rejects_unresolved_references_in_custom_derivative_regions() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let regions = custom_jvp_regions_with_reference_state(&scalar_type);
+
+        // A custom derivative cannot hide state in its rule regions when it consumes the active input directly.
+        let result = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().jvp(
+            {
+                let regions = regions.clone();
+                move |input: DifferentiationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>, ()| {
+                    let operation = ArrayIrOperation::CustomJvp(CustomJvpOperation::new());
+                    Ok(input.context().bind(operation, regions.clone(), std::slice::from_ref(&input))?.remove(0))
+                }
+            },
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            (),
+        );
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_jvp` carries unresolved state in an attached region and must be discharged \
+                    before differentiation",
+        ));
+
+        // Replacing the active input with a lifted value does not make the attached stateful rule dormant or valid.
+        let result = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().jvp(
+            move |input: DifferentiationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>, ()| {
+                let lifted = input.context().lift(ArrayIrValue::Array(Array::scalar(1.0_f32)))?;
+                let operation = ArrayIrOperation::CustomJvp(CustomJvpOperation::new());
+                Ok(input.context().bind(operation, regions.clone(), std::slice::from_ref(&lifted))?.remove(0))
+            },
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            (),
+        );
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`custom_jvp` carries unresolved state in an attached region and must be discharged \
+                    before differentiation",
+        ));
     }
 
     #[test]
@@ -2471,6 +2534,61 @@ mod tests {
             ],
             "the fused outputs must be the primal outputs [3 * 2, 2, 3 * 2] followed by the tangents [2 * 1, 0, 0]",
         );
+    }
+
+    #[test]
+    fn test_program_jvp_rejects_unresolved_references() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "program carries unresolved state and must be discharged before differentiation",
+        ));
+    }
+
+    #[test]
+    fn test_program_jvp_rejects_unresolved_references_in_dormant_custom_derivative_regions() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let wrapped = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let regions = custom_jvp_regions_with_reference_state(&scalar_type)
+                .iter()
+                .map(|region| builder.import_region(region.entry_region_ref()))
+                .collect::<Vec<_>>();
+            let input = builder.add_input(scalar_type.clone());
+            let outputs = builder
+                .add_instruction(ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input])
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    outputs,
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+
+        // The entry region is pure, but whole-program validation must inspect the dormant custom rule closure.
+        assert!(wrapped.effects().is_pure());
+        assert!(matches!(
+            wrapped.jvp(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "program carries unresolved state and must be discharged before differentiation",
+        ));
     }
 
     #[test]
@@ -2662,6 +2780,164 @@ mod tests {
         assert!(linearization.primal().output_ids().is_empty());
         assert_eq!(linearization.tangent().input_ids().len(), 1);
         assert!(linearization.tangent().output_ids().is_empty());
+    }
+
+    #[test]
+    fn test_program_linearize_rejects_unresolved_references() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .unwrap();
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.linearize(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "program carries unresolved state and must be discharged before differentiation",
+        ));
+    }
+
+    #[test]
+    fn test_program_jvp_and_linearize_after_local_reference_discharge_across_condition() {
+        let source = test_condition_program();
+
+        // Forward mode, linearization, and transposition all consume the discharged program, so every derived
+        // program must be pure and reference-free even though the source threads state through both branches.
+        let jvp = source.clone().discharge_local_references(0, "differentiation").unwrap().jvp().unwrap();
+        let linearization = source.discharge_local_references(0, "differentiation").unwrap().linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
+            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+            assert!(program.effects().is_pure());
+        }
+
+        // The true branch accumulates the input, so both public outputs remain differentiable.
+        let predicate = ArrayIrValue::Array(Array::scalar(true));
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        assert_eq!(
+            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(5.0_f32)),
+                ArrayIrValue::Array(Array::scalar(5.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+        );
+        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
+        assert_eq!(
+            primal_outputs[..2],
+            [ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(5.0_f32))],
+        );
+        let mut pullback_inputs =
+            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32))]));
+
+        // The false branch replaces the state with a constant, so the frozen output has zero tangent and contributes
+        // no cotangent to the input.
+        let predicate = ArrayIrValue::Array(Array::scalar(false));
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        assert_eq!(
+            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(4.0_f32)),
+                ArrayIrValue::Array(Array::scalar(9.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(0.0_f32)),
+            ]),
+        );
+        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
+        assert_eq!(
+            primal_outputs[..2],
+            [ArrayIrValue::Array(Array::scalar(4.0_f32)), ArrayIrValue::Array(Array::scalar(9.0_f32))],
+        );
+        let mut pullback_inputs =
+            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f32))]));
+    }
+
+    #[test]
+    fn test_program_jvp_and_linearize_after_local_reference_discharge_across_bounded_while() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .unwrap();
+        let predicate = condition_builder.add_constant(ArrayIrValue::Array(Array::scalar(true)));
+        let condition = condition_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![predicate],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
+        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
+        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let source = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The loop's mutated state becomes an ordinary carry, so the derived programs are pure and reference-free
+        // and reverse mode remains available through the bounded loop.
+        let jvp = source.clone().discharge_local_references(0, "differentiation").unwrap().jvp().unwrap();
+        let linearization = source.discharge_local_references(0, "differentiation").unwrap().linearize().unwrap();
+        let pullback = linearization.pullback().unwrap();
+        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
+            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+            assert!(program.effects().is_pure());
+        }
+
+        // Two iterations accumulate the constant `1.0` into the state, so `f(x) = x + 2` and the tangent passes
+        // through unscaled in both directions.
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+        );
+        let primal_outputs =
+            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]).unwrap();
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(5.0_f32)));
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(4.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[1..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(4.0_f32))]));
     }
 
     #[test]

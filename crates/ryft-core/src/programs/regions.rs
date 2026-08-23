@@ -1164,22 +1164,22 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionD
     }
 }
 
-/// Opaque evidence that a [`Value::validate_eager_replay`] preflight already covered a complete region closure. Ryft's
-/// checked replay roots (i.e., [`Program::interpret_in_context`] and [`RegionRef::interpret_in_context`]) run that
-/// preflight once at the root boundary, before anything executes, and then thread this token through their nested
-/// replay drivers so that nested regions are not revalidated. Skipping revalidation is not merely an optimization.
-/// A nested region that receives parent-created references as inputs is valid only in the context of its root, and
-/// revalidating it in isolation would misclassify those references as external roots. Therefore, the token has no
-/// public constructor and is not cloneable. Downstream code can propagate evidence it received from a checked root
-/// but cannot forge it to bypass the preflight.
+/// Opaque evidence that a [`Value::validate_eager_interpretation`] boundary validation already covered a
+/// complete region closure. Ryft's checked interpretation roots (i.e., [`Program::interpret_in_context`] and
+/// [`RegionRef::interpret_in_context`]) run that validation once at the root boundary, before anything executes, and
+/// then thread this token through their nested replay drivers so that nested regions are not revalidated. Skipping
+/// revalidation is not merely an optimization. A nested region that receives parent-created references as inputs is
+/// valid only in the context of its root, and revalidating it in isolation would misclassify those references as
+/// external roots. Therefore, the token has no public constructor and is not cloneable. Downstream code can propagate
+/// evidence it received from a checked root but cannot forge it to bypass the boundary validation.
 #[derive(Debug)]
-pub struct EagerReplayValidation {
+pub struct EagerInterpretationValidation {
     /// Private field preventing downstream construction.
     _private: (),
 }
 
-impl EagerReplayValidation {
-    /// Creates a new [`EagerReplayValidation`].
+impl EagerInterpretationValidation {
+    /// Creates a new [`EagerInterpretationValidation`].
     #[inline]
     pub(crate) const fn new() -> Self {
         Self { _private: () }
@@ -1195,16 +1195,16 @@ impl EagerReplayValidation {
 /// Ordinary owned collections implement this trait when they support both slice-like borrowing and owned iteration.
 /// Consequently, fixed-size arrays and [`Vec`]s remain valid direct binding arguments.
 ///
-/// [`EagerReplayValidation`] is opaque evidence created only by Ryft's checked interpretation entry points. A custom
-/// driver can participate in ordinary binding but cannot forge the evidence that permits eager replay to skip its
-/// value-family preflight.
+/// [`EagerInterpretationValidation`] is opaque evidence created only by Ryft's checked interpretation entry points.
+/// A custom driver can participate in ordinary binding but cannot forge the evidence that permits eager
+/// interpretation to skip its value-family boundary validation.
 pub trait BindingRegionDriver<V: Value, O: Operation<Type = V::Type>>: RegionDriver<V, O> + Sized {
     /// Returns evidence that these attached regions come from a replay whose complete root was already validated before
     /// any operation executed. Ordinary direct-bind drivers return [`None`]. A [`ReplayRegionDriver`] returns evidence
     /// only when interpretation constructed it beneath an already-validated source root through its private validated
     /// constructor. The public [`ReplayRegionDriver::new`] constructor returns an ordinary unvalidated driver.
     #[inline]
-    fn eager_replay_validation(&self) -> Option<&EagerReplayValidation> {
+    fn eager_interpretation_validation(&self) -> Option<&EagerInterpretationValidation> {
         None
     }
 
@@ -1344,8 +1344,9 @@ pub struct ReplayRegionDriver<'r, V: Value, O: Operation<Type = V::Type>> {
     /// is shared across that replay's instruction drivers, but must not be reused for a different source arena.
     mappings: &'r RegionReplayMappings<V, O>,
 
-    /// Evidence that the complete replay root passed its value-family interpretation preflight before execution began.
-    validation: Option<EagerReplayValidation>,
+    /// Evidence that the complete replay root passed its value-family interpretation boundary validation before
+    /// execution began.
+    validation: Option<EagerInterpretationValidation>,
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
@@ -1359,8 +1360,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
         Self::with_validation(source, roots, mappings, false)
     }
 
-    /// Creates a replay driver that carries preflight evidence when `validated` marks a replay beneath a root whose
-    /// complete interpretation preflight has already succeeded.
+    /// Creates a replay driver that carries boundary-validation evidence when `validated` marks a replay beneath
+    /// a root whose interpretation boundary validation has already succeeded.
     pub(crate) fn with_validation(
         source: RegionRef<'r, V, O>,
         roots: &'r [RegionId],
@@ -1370,7 +1371,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
         for root in roots {
             source.with_id(*root)?;
         }
-        Ok(Self { source, roots, mappings, validation: validated.then(EagerReplayValidation::new) })
+        Ok(Self { source, roots, mappings, validation: validated.then(EagerInterpretationValidation::new) })
     }
 }
 
@@ -1387,7 +1388,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for ReplayRegion
 
 impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for ReplayRegionDriver<'_, V, O> {
     #[inline]
-    fn eager_replay_validation(&self) -> Option<&EagerReplayValidation> {
+    fn eager_interpretation_validation(&self) -> Option<&EagerInterpretationValidation> {
         self.validation.as_ref()
     }
 
@@ -2319,9 +2320,9 @@ mod tests {
         let roots = [second_root, first_root, second_root];
         let driver = ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap();
         assert_eq!(driver.regions().map(RegionRef::id).collect::<Vec<_>>(), roots);
-        assert!(driver.eager_replay_validation().is_none());
+        assert!(driver.eager_interpretation_validation().is_none());
         let driver = ReplayRegionDriver::with_validation(program.entry_region_ref(), &roots, &mappings, true).unwrap();
-        assert!(driver.eager_replay_validation().is_some());
+        assert!(driver.eager_interpretation_validation().is_some());
     }
 
     #[test]

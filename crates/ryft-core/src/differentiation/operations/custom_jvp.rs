@@ -1092,4 +1092,22 @@ mod tests {
             )),
         );
     }
+
+    #[test]
+    fn test_custom_jvp_wrapper_executes_zero_space_boundaries() {
+        // Token primals and zero-space tangents carry no payload, so the wrapper must pass them through the traced
+        // rule unchanged instead of demanding dense tangent space.
+        type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let function = custom_jvp(
+            |token: DomainTracer<ArrayContext>| Ok(token),
+            |token: DomainTracer<ArrayContext>, tangent| Ok((token, tangent)),
+        );
+        assert_eq!(
+            ArrayContext::new().jvp(|token, ()| function.call(token), token.clone(), zero.clone(), ()),
+            Ok((token, zero)),
+        );
+    }
 }

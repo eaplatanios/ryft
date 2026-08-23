@@ -2299,8 +2299,8 @@ mod tests {
                 .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)],)
                 .map(|_| ()),
             Err(ProgramError::UnsupportedOperation {
-                // The entry-level closure preflight identifies the intrinsic state operation before carrier-specific
-                // partitioning can stage any known work.
+                // The entry-level up-front closure check identifies the intrinsic state operation before
+                // carrier-specific partitioning can stage any known work.
                 message: "`new_reference` must be discharged before partial evaluation".to_string(),
             }),
         );

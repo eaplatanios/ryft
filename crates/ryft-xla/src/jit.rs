@@ -2871,7 +2871,7 @@ mod tests {
             )
         };
 
-        // Complete preflight failures leave every holder Ready and unchanged.
+        // Failures during pre-execution holder validation leave every holder Ready and unchanged.
         let pre_handoff_first = new_reference(1.0);
         let pre_handoff_second = new_reference(10.0);
         let pre_handoff_read_only = new_reference(20.0);
@@ -2984,7 +2984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_multi_holder_preflight_failure_leaves_ready_peer_unchanged() {
+    fn test_stateful_multi_holder_validation_failure_leaves_ready_peer_unchanged() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);

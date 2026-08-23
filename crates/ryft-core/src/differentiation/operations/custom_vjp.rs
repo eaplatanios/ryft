@@ -1298,4 +1298,22 @@ mod tests {
             vec![Array::vector(vec![10.0, 15.0])],
         );
     }
+
+    #[test]
+    fn test_custom_vjp_wrapper_executes_zero_space_boundaries() {
+        // Token primals, residuals, and zero-space cotangents carry no payload, so the wrapper must pass them
+        // through the traced forward and backward rules unchanged instead of demanding dense cotangent space.
+        type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
+
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let function = custom_vjp(
+            |token: DomainTracer<ArrayContext>| Ok(token),
+            |token: DomainTracer<ArrayContext>| Ok((token.clone(), token)),
+            |_residual: DomainTracer<ArrayContext>, cotangent| Ok(cotangent),
+        );
+        let (value, pullback) = ArrayContext::new().vjp(|token, ()| function.call(token), token.clone(), ()).unwrap();
+        assert_eq!(value, token);
+        assert_eq!(pullback.apply(zero.clone()), Ok(zero));
+    }
 }

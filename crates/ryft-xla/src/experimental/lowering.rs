@@ -500,8 +500,8 @@ where
 ///
 /// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
 /// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back the
-/// compilation preflight and the two direct module-lowering entries; eager binding, dispatch, and staging enforce
-/// their corresponding boundary invariants separately.
+/// pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
+/// enforce their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
 ) -> bool

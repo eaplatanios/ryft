@@ -3190,8 +3190,9 @@ mod tests {
 
     #[test]
     fn test_dynamic_length_scan_discharge_accepts_the_trailing_runtime_length_operand() {
-        // A dynamic-length scan carries one runtime-length operand after the body's inputs, so the discharge
-        // preflight must accept the one-past-body parent arity instead of rejecting the canonical dynamic form.
+        // A dynamic-length scan carries one runtime-length operand after the body's inputs, so the scan discharge
+        // rule's arity validation must accept the one-past-body parent arity instead of rejecting the canonical
+        // dynamic form.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(9)).unwrap());
         let reference_type = ReferenceType::new(scalar_type());
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();

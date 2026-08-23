@@ -20,20 +20,14 @@ pub use stop_gradient::{STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradient
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use pretty_assertions::assert_eq;
-
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue};
     use crate::contexts::EagerContext;
     use crate::differentiation::DifferentiationError;
-    use crate::differentiation::forward::{
-        DifferentiationDriver, DifferentiationDual, ForwardModeDifferentiate, Linearization,
-    };
-    use crate::differentiation::reverse::ReverseModeDifferentiate;
+    use crate::differentiation::forward::{DifferentiationDriver, DifferentiationDual, Linearization};
     use crate::parameters::Placeholder;
     use crate::programs::{
         FlatProgram, NewReferenceOperation, Program, ProgramBuilder, ReferenceReadOperation, RegionDriver, RegionRef,
     };
-    use crate::tracing::DomainTracer;
 
     use super::*;
 
@@ -143,31 +137,5 @@ pub(crate) mod tests {
         ) -> Result<Vec<DifferentiationDual<ArrayIrValue<Array>>>, DifferentiationError> {
             unreachable!("the operation-local state guard must reject before recursive differentiation")
         }
-    }
-
-    // TODO(eaplatanios): Is this really where this belongs?
-    #[test]
-    fn test_custom_derivative_wrappers_use_zero_space_boundaries() {
-        type ArrayContext = EagerContext<Array, ArrayOperation<Array>>;
-        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
-        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-
-        let function = custom_jvp(
-            |token: DomainTracer<ArrayContext>| Ok(token),
-            |token: DomainTracer<ArrayContext>, tangent| Ok((token, tangent)),
-        );
-        assert_eq!(
-            ArrayContext::new().jvp(|token, ()| function.call(token), token.clone(), zero.clone(), ()),
-            Ok((token.clone(), zero.clone())),
-        );
-
-        let function = custom_vjp(
-            |token: DomainTracer<ArrayContext>| Ok(token),
-            |token: DomainTracer<ArrayContext>| Ok((token.clone(), token)),
-            |_residual: DomainTracer<ArrayContext>, cotangent| Ok(cotangent),
-        );
-        let (value, pullback) = ArrayContext::new().vjp(|token, ()| function.call(token), token.clone(), ()).unwrap();
-        assert_eq!(value, token);
-        assert_eq!(pullback.apply(zero.clone()), Ok(zero));
     }
 }

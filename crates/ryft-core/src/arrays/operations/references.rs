@@ -1339,7 +1339,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_reference_program_preflight_rejects_before_external_mutation() {
+    fn test_array_ir_reference_program_boundary_validation_rejects_before_external_mutation() {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let external = builder.add_input(ReferenceType::new(array_type.clone()).into());

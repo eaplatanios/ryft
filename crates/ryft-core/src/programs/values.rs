@@ -66,20 +66,21 @@ impl ValueId {
 /// represented by a compact semantic reference such as [`CaptureReference`], whose displayed table index and type
 /// identify the program-level constant without reading back its runtime payload.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
-    /// Boolean value that represents whether this value family overrides [`Self::validate_eager_replay`], obligating
-    /// every eager replay boundary to invoke that hook before executing anything. The default value (i.e., `false`) is
-    /// correct for value universes that cannot carry concrete mutable resources. A family that overrides
-    /// [`Self::validate_eager_replay`] must set this constant to `true`. That is because an override is not otherwise
-    /// detectable statically, and so this constant is what makes the hook reachable. Specifically, it does two things:
+    /// Boolean value that represents whether this value family overrides [`Self::validate_eager_interpretation`],
+    /// obligating every eager interpretation boundary to invoke that hook before executing anything. The default
+    /// value (i.e., `false`) is correct for value universes that cannot carry concrete mutable resources. A family
+    /// that overrides [`Self::validate_eager_interpretation`] must set this constant to `true`. That is because an
+    /// override is not otherwise detectable statically, and so this constant is what makes the hook reachable.
+    /// Specifically, it does two things:
     ///
-    ///   - It lets eager replay boundaries skip validation entirely for ordinary value families. Because the check is
-    ///     a monomorphization-time constant, the branch compiles away instead of invoking the no-op default for every
-    ///     attached region of every bind.
-    ///   - It gates the creation of [`EagerReplayValidation`](crate::EagerReplayValidation) evidence, which lets nested
-    ///     eager replay skip revalidating regions that an enclosing root's preflight already covered. Only a family
-    ///     whose preflight actually ran may issue that evidence; staging and transform contexts enforce their own
-    ///     structural legality gates and never produce it.
-    const VALIDATES_EAGER_REPLAY: bool = false;
+    ///   - It lets eager interpretation boundaries skip validation entirely for ordinary value families. Because the
+    ///     check is a monomorphization-time constant, the branch compiles away instead of invoking the no-op default
+    ///     for every attached region of every bind.
+    ///   - It gates the creation of [`EagerInterpretationValidation`](crate::EagerInterpretationValidation) evidence,
+    ///     which lets nested eager interpretation skip revalidating regions that an enclosing root's boundary
+    ///     validation already covered. Only a family whose boundary validation actually ran may issue that evidence;
+    ///     staging and transform contexts enforce their own structural legality gates and never produce it.
+    const VALIDATES_EAGER_INTERPRETATION: bool = false;
 
     /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
     /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work
@@ -147,18 +148,18 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
         Ok(())
     }
 
-    /// Validates a complete region closure before eager replay executes any of it. Eager replay of a program whose
-    /// values carry concrete mutable resources performs irreversible mutations, so its legality must be established
-    /// transactionally: this hook inspects the complete region closure up front and either accepts all of it or rejects
-    /// it before any constant is lifted or instruction is executed. Eager program interpretation calls it with the
-    /// program's entry region, and direct eager binding calls it with each attached region that carries no
-    /// [`EagerReplayValidation`](crate::EagerReplayValidation) evidence.
+    /// Validates a region closure at the eager interpretation boundary, before any of it executes. Eager interpretation
+    /// of a program whose values carry concrete mutable resources performs irreversible mutations, so its legality must
+    /// be established transactionally. This hook inspects the closure boundary up front and either accepts the closure
+    /// or rejects it before any constant is lifted or instruction is executed. Eager program interpretation calls it
+    /// with the program's entry region, and direct eager binding calls it with each attached region that carries no
+    /// [`EagerInterpretationValidation`](crate::EagerInterpretationValidation) evidence.
     ///
     /// The default accepts every closure and is correct for value universes that cannot carry concrete mutable
     /// resources. A family that admits such resources (e.g., the core array IR with references) must override this
-    /// function with its replay-boundary legality checks and set [`Self::VALIDATES_EAGER_REPLAY`] to `true` so that
-    /// eager replay boundaries actually invoke the override. Transform boundaries such as partial evaluation do not
-    /// call this hook. Instead, they enforce their own type- and effect-level gates.
+    /// function with its interpretation-boundary legality checks and set [`Self::VALIDATES_EAGER_INTERPRETATION`] to
+    /// `true` so that eager interpretation boundaries actually invoke the override. Transform boundaries such as
+    /// partial evaluation do not call this hook. Instead, they enforce their own type- and effect-level gates.
     ///
     /// This hook is intentionally distinct from [`Self::validate_as_constant`] because constant admissibility is
     /// a local storage property of a value, while this function sees the complete attached-region closure before
@@ -168,7 +169,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ///
     ///   - `region`: Root of the complete region closure that is about to be replayed.
     #[inline]
-    fn validate_eager_replay<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
+    fn validate_eager_interpretation<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
         region: RegionRef<'_, V, O>,
     ) -> Result<(), ProgramError> {
         let _ = region;
