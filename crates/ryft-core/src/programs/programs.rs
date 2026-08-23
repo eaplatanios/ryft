@@ -11,7 +11,7 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
-use crate::programs::operations::Operation;
+use crate::programs::operations::{Operation, ProgramRenderingMode};
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
@@ -519,7 +519,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                     instruction.inputs().to_vec(),
                                     instruction.outputs().to_vec(),
                                     instruction.regions().to_vec(),
-                                ))
+                                )
+                                .with_provenance(instruction.provenance().clone()))
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?,
                     ))
@@ -617,8 +618,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         .instructions
                         .into_iter()
                         .map(|instruction| {
-                            let (operation, inputs, outputs, regions) = instruction.into_parts();
-                            Instruction::new(operation.into(), inputs, outputs, regions)
+                            let (operation, inputs, outputs, regions, provenance) = instruction.into_parts();
+                            Instruction::new(operation.into(), inputs, outputs, regions).with_provenance(provenance)
                         })
                         .collect(),
                 )
@@ -691,12 +692,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                 )
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        new_instructions.push(Instruction::new(
-                            instruction.operation().clone(),
-                            inputs,
-                            Vec::new(),
-                            instruction.regions().to_vec(),
-                        ));
+                        new_instructions.push(
+                            Instruction::new(
+                                instruction.operation().clone(),
+                                inputs,
+                                Vec::new(),
+                                instruction.regions().to_vec(),
+                            )
+                            .with_provenance(instruction.provenance().clone()),
+                        );
                         continue;
                     }
                     for output_id in instruction.outputs().iter().copied() {
@@ -837,12 +841,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                 )
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        new_instructions.push(Instruction::new(
-                            instruction.operation,
-                            inputs,
-                            Vec::new(),
-                            instruction.regions,
-                        ));
+                        new_instructions.push(
+                            Instruction::new(instruction.operation, inputs, Vec::new(), instruction.regions)
+                                .with_provenance(instruction.provenance),
+                        );
                         continue;
                     }
                     for root in outputs {
@@ -965,12 +967,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                new_instructions.push(Instruction::new(
-                    instruction.operation().clone(),
-                    effect_inputs,
-                    Vec::new(),
-                    instruction.regions().to_vec(),
-                ));
+                new_instructions.push(
+                    Instruction::new(
+                        instruction.operation().clone(),
+                        effect_inputs,
+                        Vec::new(),
+                        instruction.regions().to_vec(),
+                    )
+                    .with_provenance(instruction.provenance().clone()),
+                );
             } else {
                 for root in instruction.outputs().iter().copied() {
                     clone_atom_subgraph_into_region(
@@ -1094,12 +1099,10 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                new_instructions.push(Instruction::new(
-                    instruction.operation,
-                    effect_inputs,
-                    Vec::new(),
-                    instruction.regions,
-                ));
+                new_instructions.push(
+                    Instruction::new(instruction.operation, effect_inputs, Vec::new(), instruction.regions)
+                        .with_provenance(instruction.provenance),
+                );
             } else {
                 // Moving one output may consume its producing instruction, so retain the small output-ID list
                 // before mutating the instruction table.
@@ -1285,11 +1288,19 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// implementation, whose [`Value`] contract requires a deterministic and semantically complete representation.
     /// Resultless instructions render in [`Instruction`] order relative to the instructions that do bind atoms, so
     /// programs whose only difference is the presence or ordering of such instructions render differently.
-    pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+    pub fn render(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+        indentation: usize,
+        mode: ProgramRenderingMode,
+    ) -> std::fmt::Result {
         /// Renders one [`Instruction`] as a single statement of the enclosing region's `let` block, recursively
         /// rendering its attached regions according to `reference_counts` and `rendered`. An instruction that binds
         /// no output atom renders without the leading binder. `statement_count` is the number of statements already
-        /// rendered in this block and selects the `let` keyword for the first one.
+        /// rendered in this block and selects the `let` keyword for the first one. Under
+        /// [`ProgramRenderingMode::WithProvenance`], a non-unknown provenance renders as a comment-style ` ; ...`
+        /// suffix immediately before the statement's final newline (i.e., after the final closing bracket for
+        /// multiline instructions), never inside nested bodies.
         #[allow(clippy::too_many_arguments)]
         fn render_instruction<V: Value, O: Operation<Type = V::Type>>(
             regions: &RegionArena<V, O>,
@@ -1300,6 +1311,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             statement_count: usize,
             reference_counts: &[usize],
             rendered: &mut [bool],
+            mode: ProgramRenderingMode,
         ) -> std::fmt::Result {
             let line_indentation = if statement_count == 0 { indentation } else { indentation + 4 };
             write!(formatter, "{:indentation$}", "")?;
@@ -1314,7 +1326,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 })?;
                 write!(formatter, " = ")?;
             }
-            instruction.operation.render(formatter, line_indentation)?;
+            instruction.operation.render_with_mode(formatter, line_indentation, mode)?;
             instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
             if !instruction.regions.is_empty() {
                 let slots = instruction.operation.region_slots();
@@ -1336,7 +1348,15 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         write!(formatter, "{attached}=")?;
                     }
                     writeln!(formatter, "{{")?;
-                    render_region(regions, attached, formatter, line_indentation + 8, reference_counts, rendered)?;
+                    render_region(
+                        regions,
+                        attached,
+                        formatter,
+                        line_indentation + 8,
+                        reference_counts,
+                        rendered,
+                        mode,
+                    )?;
                     writeln!(formatter)?;
                     write!(formatter, "{:width$}", "", width = line_indentation + 4)?;
                     write!(formatter, "}},")?;
@@ -1344,6 +1364,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 writeln!(formatter)?;
                 write!(formatter, "{:width$}", "", width = line_indentation)?;
                 write!(formatter, "]")?;
+            }
+            if mode == ProgramRenderingMode::WithProvenance && !instruction.provenance.is_unknown() {
+                write!(formatter, " ; {}", instruction.provenance)?;
             }
             writeln!(formatter)
         }
@@ -1357,6 +1380,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             indentation: usize,
             reference_counts: &[usize],
             rendered: &mut [bool],
+            mode: ProgramRenderingMode,
         ) -> std::fmt::Result {
             let region = &regions[id.index()];
             write!(formatter, "{:indentation$}", "")?;
@@ -1415,6 +1439,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                         statement_count,
                                         reference_counts,
                                         rendered,
+                                        mode,
                                     )?;
                                     statement_count += 1;
                                 }
@@ -1429,6 +1454,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                                 statement_count,
                                 reference_counts,
                                 rendered,
+                                mode,
                             )?;
                             statement_count += 1;
                         };
@@ -1446,6 +1472,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                         statement_count,
                         reference_counts,
                         rendered,
+                        mode,
                     )?;
                     statement_count += 1;
                 }
@@ -1475,6 +1502,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             indentation,
             reference_counts.as_slice(),
             rendered.as_mut_slice(),
+            mode,
         )
     }
 }
@@ -1497,7 +1525,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
+        self.render(formatter, 0, ProgramRenderingMode::Semantic)
     }
 }
 
@@ -1756,12 +1784,10 @@ fn clone_atom_subgraph_into_region<V: Value, O: Operation<Type = V::Type>>(
                     outputs.push(new_output);
                 }
 
-                new_instructions.push(Instruction::new(
-                    instruction.operation.clone(),
-                    inputs,
-                    outputs,
-                    instruction.regions.clone(),
-                ));
+                new_instructions.push(
+                    Instruction::new(instruction.operation.clone(), inputs, outputs, instruction.regions.clone())
+                        .with_provenance(instruction.provenance.clone()),
+                );
             }
         }
     }
@@ -1881,7 +1907,10 @@ fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
                     outputs.push(new_output);
                 }
 
-                new_instructions.push(Instruction::new(instruction.operation, inputs, outputs, instruction.regions));
+                new_instructions.push(
+                    Instruction::new(instruction.operation, inputs, outputs, instruction.regions)
+                        .with_provenance(instruction.provenance),
+                );
             }
         }
     }
@@ -1986,6 +2015,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::OperationFormatter;
+    use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::tests::{TestOrderedStateOperation, TestRegionOperation};
@@ -2087,6 +2117,52 @@ mod tests {
         fn effects(&self) -> Effects {
             if matches!(self, Self::Effectful) { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
         }
+    }
+
+    /// Builds the provenance-preservation fixture shared by the simplification and filtering tests below. A chain `neg`
+    /// (nested scopes) -> `add` (fused) -> `add` (unknown), plus a dead pure `mul` (whose provenance must drop with it)
+    /// and a dead effectful `print` (which survives on its effect alone and must keep its provenance). Returns the
+    /// program together with its input atom and the intermediate `add` output atom.
+    fn provenance_preservation_fixture()
+    -> (Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>, AtomId, AtomId) {
+        let nested = Provenance::scope(
+            ProvenanceScope::new("outer"),
+            Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+        );
+        let fused = Provenance::fused([
+            Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+            Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+        ]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(2.0f64));
+        let negated = builder
+            .add_instruction_with_provenance(NegOperation::new(), Vec::new(), vec![input], nested)
+            .unwrap()[0];
+        let shifted = builder
+            .add_instruction_with_provenance(AddOperation::new(), Vec::new(), vec![negated, constant], fused)
+            .unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![shifted, shifted]).unwrap()[0];
+        builder
+            .add_instruction_with_provenance(
+                MulOperation::new(),
+                Vec::new(),
+                vec![input, input],
+                Provenance::scope(ProvenanceScope::new("dropped"), Provenance::unknown()),
+            )
+            .unwrap();
+        builder
+            .add_instruction_with_provenance(
+                PrintOperation::new("x"),
+                Vec::new(),
+                vec![input],
+                Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown()),
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        (program, input, shifted)
     }
 
     #[test]
@@ -2949,6 +3025,53 @@ mod tests {
     }
 
     #[test]
+    fn test_program_simplified_preserves_provenance() {
+        // Simplification is a structural rebuild, so every surviving instruction must keep its provenance verbatim,
+        // including the nested-scope, fused, and unknown shapes, while the dead pure multiplication drops together
+        // with its provenance.
+        let expected = vec![
+            ("print", Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown())),
+            (
+                "neg",
+                Provenance::scope(
+                    ProvenanceScope::new("outer"),
+                    Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+                ),
+            ),
+            (
+                "add",
+                Provenance::fused([
+                    Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+                    Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+                ]),
+            ),
+            ("add", Provenance::unknown()),
+        ];
+        assert_eq!(
+            &provenance_preservation_fixture()
+                .0
+                .simplified()
+                .unwrap()
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect(),
+            expected
+        );
+        assert_eq!(
+            &provenance_preservation_fixture()
+                .0
+                .into_simplified()
+                .unwrap()
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect(),
+            expected
+        );
+    }
+
+    #[test]
     fn test_program_into_simplified() {
         #[derive(Debug, Parameter)]
         struct CloneCountingValue {
@@ -3164,6 +3287,39 @@ mod tests {
     }
 
     #[test]
+    fn test_program_filtered_preserves_provenance() {
+        // Projection onto an intermediate atom keeps the provenance of the instructions it retains and, like
+        // simplification, retains the effectful instruction without widening the projection's outputs.
+        let (program, input, shifted) = provenance_preservation_fixture();
+        let (filtered, live) = program.filtered(&[input], &[shifted], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(
+            &filtered
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect(),
+            vec![
+                ("print", Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown())),
+                (
+                    "neg",
+                    Provenance::scope(
+                        ProvenanceScope::new("outer"),
+                        Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+                    ),
+                ),
+                (
+                    "add",
+                    Provenance::fused([
+                        Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+                        Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+                    ]),
+                ),
+            ],
+        );
+    }
+
+    #[test]
     fn test_program_into_filtered() {
         // Build the same program twice, so that the consuming `into_filtered` can be compared
         // against the borrowing `filter`.
@@ -3342,6 +3498,108 @@ mod tests {
         );
         assert_ne!(first, build(2.0).to_string());
         assert_eq!(first, build(1.0).to_string());
+    }
+
+    #[test]
+    fn test_program_render_with_provenance() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let scoped = builder
+            .add_instruction_with_provenance(
+                AddOperation::new(),
+                Vec::new(),
+                vec![input, input],
+                Provenance::scope(
+                    ProvenanceScope::new("outer"),
+                    Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+                ),
+            )
+            .unwrap()[0];
+        let fused = builder
+            .add_instruction_with_provenance(
+                MulOperation::new(),
+                Vec::new(),
+                vec![scoped, scoped],
+                Provenance::fused([
+                    Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+                    Provenance::scope(ProvenanceScope::new("quo\"te"), Provenance::unknown()),
+                ]),
+            )
+            .unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![fused]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // The canonical semantic rendering (and hence `Display` and structural fingerprints) never includes
+        // provenance, and the semantic and diagnostic modes agree on everything else.
+        let semantic = indoc! {"
+            lambda %0:f64[] .
+            let %1:f64[] = add %0 %0
+                %2:f64[] = mul %1 %1
+                %3:f64[] = neg %2
+            in (%3)
+        "}
+        .trim_end();
+        assert_eq!(program.to_string(), semantic);
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::Semantic)).to_string(),
+            semantic,
+        );
+
+        // The diagnostic mode appends nested scope paths and deterministic fused origins (with non-identifier names
+        // escaped as Rust string literals) before each statement's final newline, and instructions with unknown
+        // provenance render without a suffix.
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {r#"
+                lambda %0:f64[] .
+                let %1:f64[] = add %0 %0 ; outer::inner
+                    %2:f64[] = mul %1 %1 ; fused[b, "quo\"te"]
+                    %3:f64[] = neg %2
+                in (%3)
+            "#}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_render_with_provenance_multiline_instruction() {
+        // For an instruction whose rendering spans multiple lines, the provenance suffix lands after the final
+        // closing bracket on the statement's last line, never inside the nested body.
+        let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
+        let region_program = region_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let region = builder.import_region(region_program.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction_with_provenance(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![region],
+                vec![input],
+                Provenance::scope(ProvenanceScope::new("scoped"), Provenance::unknown()),
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            std::fmt::from_fn(|formatter| program.render(formatter, 0, ProgramRenderingMode::WithProvenance))
+                .to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = with_regions %0 [
+                    body={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ] ; scoped
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

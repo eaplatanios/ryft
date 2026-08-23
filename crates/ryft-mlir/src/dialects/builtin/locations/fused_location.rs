@@ -1,5 +1,5 @@
 use ryft_xla_sys::bindings::{
-    MlirLocation, mlirLocationFusedGet, mlirLocationFusedGetLocations, mlirLocationFusedGetMetadata,
+    MlirAttribute, MlirLocation, mlirLocationFusedGet, mlirLocationFusedGetLocations, mlirLocationFusedGetMetadata,
     mlirLocationFusedGetNumLocations, mlirLocationFusedGetTypeID,
 };
 
@@ -61,11 +61,13 @@ impl<'c, 't> FusedLocationRef<'c, 't> {
 mlir_subtype_trait_impls!(FusedLocationRef<'c, 't> as Location, mlir_type = Location, mlir_subtype = Fused);
 
 impl<'t> Context<'t> {
-    /// Creates a new [`FusedLocationRef`] owned by this [`Context`].
+    /// Creates a new [`FusedLocationRef`] owned by this [`Context`]. A [`None`] `attribute` creates a fused location
+    /// with no metadata, which renders as `loc(fused[...])`. Note that this differs from attaching unit metadata,
+    /// which is an actual metadata payload rendering as `loc(fused<unit>[...])`.
     pub fn fused_location<'c, L: Location<'c, 't>, A: Attribute<'c, 't>>(
         &'c self,
         locations: &[L],
-        attribute: A,
+        attribute: Option<A>,
     ) -> FusedLocationRef<'c, 't> {
         // While this operation can mutate the context (in that it might add an entry to its corresponding
         // uniquing table), we use an immutable borrow here as a mutable borrow would make using this
@@ -74,11 +76,13 @@ impl<'t> Context<'t> {
         // should be no possibility for this function to cause problems with an immutable borrow.
         unsafe {
             let locations = locations.iter().map(|location| location.to_c_api()).collect::<Vec<_>>();
+            let attribute =
+                attribute.map_or(MlirAttribute { ptr: std::ptr::null_mut() }, |attribute| attribute.to_c_api());
             let handle = mlirLocationFusedGet(
                 *self.handle.borrow(),
                 locations.len().cast_signed(),
                 locations.as_ptr() as *const _,
-                attribute.to_c_api(),
+                attribute,
             );
             FusedLocationRef { handle, context: self }
         }
@@ -107,7 +111,7 @@ mod tests {
         let location_2 = context.file_location("file2.rs", 20, 10);
         let location_3 = context.file_location("file3.rs", 30, 15);
         let metadata = context.unit_attribute();
-        let location = context.fused_location(&[location_1, location_2, location_3], metadata);
+        let location = context.fused_location(&[location_1, location_2, location_3], Some(metadata));
         assert_eq!(&context, location.context());
         assert_eq!(location.fused_location_count(), 3);
         assert_eq!(
@@ -126,12 +130,12 @@ mod tests {
         let metadata = context.unit_attribute();
 
         // Same locations from the same context must be equal because they are "uniqued".
-        let location_1 = context.fused_location(&[file_location_1, file_location_2], metadata);
-        let location_2 = context.fused_location(&[file_location_1, file_location_2], metadata);
+        let location_1 = context.fused_location(&[file_location_1, file_location_2], Some(metadata));
+        let location_2 = context.fused_location(&[file_location_1, file_location_2], Some(metadata));
         assert_eq!(location_1, location_2);
 
         // Different locations from the same context must not be equal.
-        let location_2 = context.fused_location(&[file_location_1, file_location_3], metadata);
+        let location_2 = context.fused_location(&[file_location_1, file_location_3], Some(metadata));
         assert_ne!(location_1, location_2);
 
         // Same locations from different contexts must not be equal.
@@ -139,8 +143,20 @@ mod tests {
         let file_location_1 = context.file_location("file1.rs", 10, 5);
         let file_location_2 = context.file_location("file2.rs", 20, 10);
         let other_metadata = context.unit_attribute();
-        let location_2 = context.fused_location(&[file_location_1, file_location_2], other_metadata);
+        let location_2 = context.fused_location(&[file_location_1, file_location_2], Some(other_metadata));
         assert_ne!(location_1, location_2);
+    }
+
+    #[test]
+    fn test_fused_location_without_metadata() {
+        let context = Context::new();
+        let location_1 = context.file_location("test1.rs", 10, 5);
+        let location_2 = context.file_location("test2.rs", 20, 10);
+        let location = context.fused_location::<_, AttributeRef>(&[location_1, location_2], None);
+        assert_eq!(location.fused_location_count(), 2);
+        assert!(location.fused_metadata().unwrap().is_none());
+        // No metadata renders without a payload, unlike unit metadata which renders as `fused<unit>`.
+        test_location_display_and_debug(location, "loc(fused[\"test1.rs\":10:5, \"test2.rs\":20:10])");
     }
 
     #[test]
@@ -149,7 +165,7 @@ mod tests {
         let location_1 = context.file_location("test1.rs", 10, 5);
         let location_2 = context.file_location("test2.rs", 20, 10);
         let metadata = context.unit_attribute();
-        let location = context.fused_location(&[location_1, location_2], metadata.as_ref());
+        let location = context.fused_location(&[location_1, location_2], Some(metadata.as_ref()));
         test_location_display_and_debug(location, "loc(fused<unit>[\"test1.rs\":10:5, \"test2.rs\":20:10])");
     }
 
@@ -159,7 +175,7 @@ mod tests {
         let location_1 = context.file_location("file1.rs", 10, 5);
         let location_2 = context.file_location("file2.rs", 20, 10);
         let metadata = context.unit_attribute();
-        let location = context.fused_location(&[location_1, location_2], metadata.as_ref());
+        let location = context.fused_location(&[location_1, location_2], Some(metadata.as_ref()));
         test_location_casting(location);
     }
 }

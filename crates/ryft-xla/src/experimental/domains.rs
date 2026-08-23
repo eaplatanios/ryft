@@ -18,12 +18,12 @@ use ryft_core::{
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, Parameterized, Placeholder, ProgramError, ReductionKind, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceDischargeResult,
-    ReferenceExecution, ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceSource, ReferenceStateBinding,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
-    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult,
+    ReferenceDischargeResult, ReferenceExecution, ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceSource,
+    ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
+    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
+    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -573,6 +573,24 @@ impl<'c> Context for XlaDomain<'c> {
     /// domains recovered from arrays without an attached client) cannot execute operations and stay non-eager.
     fn is_eager(&self) -> bool {
         self.client.is_some()
+    }
+
+    // `XlaDomain` is a terminal execution domain: it dispatches operations to compiled per-operation programs
+    // instead of recording instructions, so there is nothing to attach provenance to and scopes are a deliberate
+    // no-op. Programs traced *over* this domain attach provenance through their own tracing contexts.
+    #[inline]
+    fn current_provenance(&self) -> Provenance {
+        Provenance::unknown()
+    }
+
+    #[inline]
+    fn with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+        function()
+    }
+
+    #[inline]
+    fn with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+        function()
     }
 }
 
@@ -11027,5 +11045,94 @@ mod tests {
         let canonical = |r#type: &ArrayType| canonical_boundary_types(std::slice::from_ref(r#type), &[]);
         assert_eq!(canonical(&shared), canonical(&shared_renamed));
         assert_ne!(canonical(&shared), canonical(&independent));
+    }
+
+    #[test]
+    fn test_xla_lowering_preserves_provenance_locations_end_to_end() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::F64);
+
+        // Builds `-(x * x)` with the multiplication carrying the provided provenance.
+        fn build_program(
+            input_type: &ArrayType,
+            provenance: Provenance,
+        ) -> crate::experimental::ops::XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>> {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let product = builder
+                .add_instruction_with_provenance(MulOperation::new(), Vec::new(), vec![input, input], provenance)
+                .unwrap()[0];
+            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![product]).unwrap()[0];
+            builder.build(vec![negated], vec![Placeholder], vec![Placeholder]).unwrap()
+        }
+
+        let coordinate_basis = Provenance::scope(
+            ProvenanceScope::new("ryft"),
+            Provenance::scope(
+                ProvenanceScope::new("differentiation"),
+                Provenance::scope(ProvenanceScope::new("coordinate_basis"), Provenance::unknown()),
+            ),
+        );
+        let scoped = build_program(&input_type, coordinate_basis);
+        let options = XlaOptions::new(mesh.clone());
+        let lowered = domain.lower_xla_program(&scoped, 0, &options).unwrap();
+
+        // The nested framework scopes survive lowering as a chain of nested name locations that is visible in the
+        // serialized module (and therefore in dumped MLIR/HLO metadata), while the unknown-provenance negation and
+        // the module scaffolding keep the base location.
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <["x"=1]> loc(#loc)
+                  func.func @main(%arg0: tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>} loc(unknown)) -> (tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64> loc(#loc3)
+                    %1 = stablehlo.negate %0 : tensor<f64> loc(#loc)
+                    return %1 : tensor<f64> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc("coordinate_basis")
+                #loc2 = loc("differentiation"(#loc1))
+                #loc3 = loc("ryft"(#loc2))
+            "#},
+        );
+
+        // Provenance does not affect numeric results.
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let value =
+            Array::from_host_buffer(&client, input_type.clone(), mesh.clone(), 3.0_f64.to_ne_bytes().as_slice())
+                .unwrap();
+        let outputs = domain.execute_xla_program(&compiled, vec![value]).unwrap();
+        assert_eq!(read_f64s(&client, &outputs[0]), vec![-9.0]);
+
+        // Two semantically equal programs with different scope names serialize differently and therefore key
+        // differently, so neither can receive the other's labeled executable, while a provenance-free program keeps
+        // the location-free serialization (and hence its pre-provenance cache key) entirely.
+        let relabeled =
+            build_program(&input_type, Provenance::scope(ProvenanceScope::new("other_label"), Provenance::unknown()));
+        let relabeled = domain.lower_xla_program(&relabeled, 0, &options).unwrap();
+        assert_ne!(
+            XlaDomain::xla_compilation_key(&lowered).unwrap(),
+            XlaDomain::xla_compilation_key(&relabeled).unwrap(),
+        );
+        let unlabeled = build_program(&input_type, Provenance::unknown());
+        let unlabeled = domain.lower_xla_program(&unlabeled, 0, &options).unwrap();
+        assert_eq!(
+            unlabeled.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> (tensor<f64> {sdy.sharding = #sdy.sharding<@mesh, []>}) {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<f64>
+                    %1 = stablehlo.negate %0 : tensor<f64>
+                    return %1 : tensor<f64>
+                  }
+                }
+            "#},
+        );
     }
 }

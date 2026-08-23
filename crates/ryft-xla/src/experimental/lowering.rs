@@ -28,22 +28,22 @@ use ryft_core::{
     Effect, Effects, ErfOperation, ExpOperation, FloorOperation, GATHER_OPERATION_NAME, GatherOperation,
     GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation,
     MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, REMATERIALIZE_OPERATION_NAME,
-    ReductionKind, ReferenceStateBinding, RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation,
-    RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterOperation,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation, Type as RyftType, Typed, Value,
-    WHILE_OPERATION_NAME, WhileOperation,
+    PadOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
+    REMATERIALIZE_OPERATION_NAME, ReductionKind, ReferenceStateBinding, RegionId, RegionRef, RemOperation,
+    ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation,
+    ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
+    SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation,
+    Type as RyftType, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
 use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, DictionaryAttributeRef,
-    FloatTypeRef, IntegerTypeRef, Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize,
-    StringRef, SymbolVisibility, TensorTypeRef, Type, TypeAndAttributes, TypeRef, Value as MlirValue,
-    ValueAndAttributes, ValueRef,
+    Attribute, AttributeRef, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef,
+    DictionaryAttributeRef, FloatTypeRef, IntegerTypeRef, Location, LocationRef, Module, Operation as MlirOperation,
+    OperationPrintingFlags, Region, Size as MlirSize, StringRef, SymbolVisibility, TensorTypeRef, Type,
+    TypeAndAttributes, TypeRef, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
 
 use crate::ToMlir;
@@ -3853,6 +3853,12 @@ pub(crate) struct CollectiveLoweringState {
 
     /// Module-owned private decompositions used by named StableHLO composites.
     named_compositions: Option<Rc<NamedCompositionFunctionMap>>,
+
+    /// Module-scoped flag recording whether any recursive lowering path constructed an instruction-specific
+    /// (non-base) location from a non-unknown [`Provenance`]. It selects the module serialization mode after
+    /// lowering completes: only a module that actually carries provenance locations is printed with debug
+    /// information, so provenance-free modules keep their existing byte-identical StableHLO text and cache keys.
+    has_provenance: Rc<Cell<bool>>,
 }
 
 impl CollectiveLoweringState {
@@ -3863,6 +3869,7 @@ impl CollectiveLoweringState {
             manual_shard_map: None,
             target_platform: None,
             named_compositions: None,
+            has_provenance: Rc::new(Cell::new(false)),
         }
     }
 
@@ -3892,6 +3899,7 @@ impl CollectiveLoweringState {
             manual_shard_map: Some(Rc::new(shard_map)),
             target_platform: self.target_platform.clone(),
             named_compositions: self.named_compositions.clone(),
+            has_provenance: self.has_provenance.clone(),
         }
     }
 
@@ -3906,6 +3914,80 @@ impl CollectiveLoweringState {
         self.channel_ids.set(channel_id + 1);
         channel_id
     }
+
+    /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
+    /// module-wide whether any instruction-specific location was constructed. Unknown provenance uses the base
+    /// location unchanged, each scope level becomes one
+    /// [`NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) above its lowered origin, and fused
+    /// provenance becomes one metadata-free
+    /// [`FusedLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc) over its recursively lowered origins. An
+    /// existing file/line base location is thereby preserved as the innermost child of the named scopes rather than
+    /// being replaced.
+    pub(crate) fn instruction_location<'c, 't: 'c>(
+        &self,
+        context: &'c MlirContext<'t>,
+        provenance: &Provenance,
+        base: LocationRef<'c, 't>,
+    ) -> LocationRef<'c, 't> {
+        /// Recursively lowers `provenance` above `base` without touching the module-wide flag.
+        fn lower<'c, 't: 'c>(
+            context: &'c MlirContext<'t>,
+            provenance: &Provenance,
+            base: LocationRef<'c, 't>,
+        ) -> LocationRef<'c, 't> {
+            if let Some((scope, origin)) = provenance.as_scope() {
+                let child = lower(context, origin, base);
+                context.named_location(scope.name(), Some(child)).as_ref()
+            } else if let Some(origins) = provenance.as_fused() {
+                let locations = origins.iter().map(|origin| lower(context, origin, base)).collect::<Vec<_>>();
+                context.fused_location::<_, AttributeRef>(locations.as_slice(), None).as_ref()
+            } else {
+                base
+            }
+        }
+
+        if provenance.is_unknown() {
+            return base;
+        }
+        self.has_provenance.set(true);
+        lower(context, provenance, base)
+    }
+
+    /// Returns `true` if any recursive lowering path constructed an instruction-specific location from a
+    /// non-unknown [`Provenance`].
+    pub(crate) fn has_provenance(&self) -> bool {
+        self.has_provenance.get()
+    }
+}
+
+/// Serializes one lowered module to StableHLO text, printing MLIR debug information (i.e., locations) exactly when
+/// the lowering constructed instruction-specific provenance locations. Provenance-free modules keep the plain
+/// rendering, so their StableHLO text, snapshots, and compilation cache keys remain byte-identical to before
+/// provenance existed, while provenance-carrying modules embed their locations in the text and therefore in the
+/// persistent compilation key derived from it. The pretty debug form is documented as unparsable and never used, and
+/// the elision thresholds are disabled because the plain rendering performs no elision either.
+///
+/// Exact backend provenance can reduce compiled-artifact cache reuse, because two semantically equal modules with
+/// different provenance serialize (and therefore key) differently. If that cost ever matters, the correct extension
+/// is an explicit compilation option that strips provenance before lowering (making this helper fall back to the
+/// plain rendering); silently returning an artifact labeled with another program's provenance is never acceptable.
+fn serialize_lowered_module(
+    module: &Module<'_, '_>,
+    collective_state: &CollectiveLoweringState,
+) -> Result<String, LoweringError> {
+    if !collective_state.has_provenance() {
+        return Ok(module.to_string());
+    }
+    module
+        .as_operation()?
+        .to_string_with_flags(OperationPrintingFlags {
+            elements_attribute_size_threshold: None,
+            resource_string_size_threshold: None,
+            enable_debug_information: true,
+            pretty_print_debug_information: false,
+            ..OperationPrintingFlags::default()
+        })
+        .map_err(|error| ryft_mlir::Error::internal(format!("serialized module is not valid UTF-8: {error}")).into())
 }
 
 /// Lowering helper passed to op-owned traced XLA MLIR lowering hooks.
@@ -4151,6 +4233,8 @@ pub(crate) fn to_mlir_module<
         })
         .collect::<Result<Vec<_>, LoweringError>>()?;
 
+    // Module-scoped collective lowering state: this entry point lowers one whole module.
+    let collective_state = CollectiveLoweringState::new();
     module.body()?.append_operation({
         let function_block = context.block(
             global_input_tensor_types
@@ -4163,7 +4247,6 @@ pub(crate) fn to_mlir_module<
             .map(|index| function_block.argument(index).expect("function block arguments should exist").as_ref())
             .collect::<Vec<_>>();
         let mut function_block_ref = function_block.as_ref();
-        let collective_state = CollectiveLoweringState::new();
         let manual_results = lower_manual_computation(
             &mut function_block_ref,
             outer_inputs.as_slice(),
@@ -4191,7 +4274,7 @@ pub(crate) fn to_mlir_module<
         return Err(LoweringError::MlirVerificationFailure);
     }
 
-    Ok(module.to_string())
+    serialize_lowered_module(&module, &collective_state)
 }
 
 /// Lowers an arbitrary traced XLA program to a textual StableHLO/Shardy MLIR module.
@@ -4649,7 +4732,7 @@ where
     // Preserve the source effect classification explicitly. Persistent cache loads no longer have the core program
     // available, and scanning rendered StableHLO for a target name would be a brittle substitute for typed metadata.
     Ok(LoweredXlaModule {
-        stable_hlo: module.to_string(),
+        stable_hlo: serialize_lowered_module(&module, &collective_state)?,
         signature,
         requires_assertion_handler: program.effects().contains(Effect::OrderedAssertion),
     })
@@ -4791,6 +4874,8 @@ pub(crate) fn to_mlir_module_for_plain_program<
     let context = MlirContext::new();
     let location = context.unknown_location();
     let module = context.module(location)?;
+    // Module-scoped collective lowering state: this entry point lowers one whole module.
+    let collective_state = CollectiveLoweringState::new();
     let mut mesh = None;
     for region in program.regions().iter() {
         for atom in region.atoms() {
@@ -4831,7 +4916,13 @@ pub(crate) fn to_mlir_module_for_plain_program<
         );
         {
             let mut function_block_ref = function_block.as_ref();
-            let outputs = lower_plain_program_outputs(program, &mut function_block_ref, &context, location.as_ref())?;
+            let outputs = lower_plain_program_outputs(
+                program,
+                &mut function_block_ref,
+                &context,
+                location.as_ref(),
+                &collective_state,
+            )?;
             function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
         }
         let mut function_region = context.region();
@@ -4858,7 +4949,7 @@ pub(crate) fn to_mlir_module_for_plain_program<
         return Err(LoweringError::MlirVerificationFailure);
     }
 
-    Ok(module.to_string())
+    serialize_lowered_module(&module, &collective_state)
 }
 
 fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput>(
@@ -6459,6 +6550,9 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c>(
                 .iter()
                 .map(|attached| RegionRef::new(region.arena(), *attached).map(RegionRef::to_program))
                 .collect::<Result<Vec<_>, ProgramError>>()?;
+            // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's
+            // provenance through the lowerer's shared location, with the ambient location as its base.
+            let location = collective_state.instruction_location(context, instruction.provenance(), location);
             let mut lowerer = ShardMapMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
                 .with_nested_functions(nested_functions.cloned())
@@ -6588,6 +6682,7 @@ fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
+    collective_state: &CollectiveLoweringState,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue,
@@ -6600,8 +6695,6 @@ where
         .collect::<Vec<_>>();
     // Function-body-scoped per-class effect chains are created lazily and dropped at the end of the function body.
     let mut effect_tokens = EffectTokens::default();
-    // Module-scoped collective lowering state: this entry point lowers one whole module.
-    let collective_state = CollectiveLoweringState::new();
     replay_program_into_block(
         program,
         input_values,
@@ -6629,6 +6722,7 @@ where
                     ),
                 });
             }
+            let location = collective_state.instruction_location(context, instruction.provenance(), location);
             let mut lowerer = PlainMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
                 .with_effect_tokens(effect_tokens)
@@ -7093,6 +7187,9 @@ where
         .iter()
         .map(|output| program.atoms()[output.index()].r#type().into_owned())
         .collect::<Vec<_>>();
+    // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
+    // through the lowerer's shared location, with the ambient location as its base.
+    let location = collective_state.instruction_location(context, instruction.provenance(), location);
     let mut lowerer = ShardMapMlirLowerer::new(*block, context, location)
         .with_input_types(input_types)
         .with_nested_functions(nested_functions.cloned())
@@ -8345,10 +8442,10 @@ mod tests {
         DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
         DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation,
         DynamicUpdateSliceOperation, EagerContext, Fill, LogicalMesh, MeshAxis, MeshAxisType, OneLike,
-        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, ReduceOperation,
-        ReshapeOperation, ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension,
-        Sin, SliceOperation, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
-        ZeroOperation, i1, i2, i4, u1, u2, u4,
+        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, Provenance,
+        ProvenanceScope, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, SelectOperation,
+        Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError, UpdateSliceOperation,
+        WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -10221,6 +10318,61 @@ mod tests {
                     return %0 : tensor<8xf32>
                   }
                 }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_renders_provenance_locations() {
+        let global_input_type = test_vector_type(8);
+        let mesh = test_manual_mesh("x", 4);
+        let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
+            |x| {
+                let context = x.value().context().clone();
+                // One instruction staged under nested scopes, one under a fused origin, and one with unknown
+                // provenance, covering every provenance shape in one lowered module.
+                let scoped = context.with_provenance_scope(ProvenanceScope::new("outer"), || {
+                    context.with_provenance_scope(ProvenanceScope::new("inner"), || x.clone() + x.clone())
+                });
+                let fused = Provenance::fused([
+                    Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+                    Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+                ]);
+                let product = context.with_provenance_origin(fused, || scoped.clone() * scoped);
+                product + x
+            },
+            global_input_type,
+            mesh.clone(),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap(),
+        )
+        .unwrap();
+
+        // The scoped addition carries the nested name-location chain, the fused multiplication carries a
+        // metadata-free fused location, the unknown-provenance addition keeps the base (unknown) location, and
+        // module/function scaffolding keeps the base location. Locations render because provenance-carrying modules
+        // serialize with debug information enabled (and the non-pretty, parsable form).
+        assert_eq!(
+            lower_traced_module(&traced, "main").unwrap(),
+            indoc! {r#"
+                #loc = loc(unknown)
+                module {
+                  sdy.mesh @mesh = <["x"=4]> loc(#loc)
+                  func.func @main(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>} loc(unknown)) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32> loc(unknown)) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32> loc(#loc4)
+                      %2 = stablehlo.multiply %1, %1 : tensor<2xf32> loc(#loc5)
+                      %3 = stablehlo.add %2, %arg1 : tensor<2xf32> loc(#loc)
+                      sdy.return %3 : tensor<2xf32> loc(#loc)
+                    } : (tensor<8xf32>) -> tensor<8xf32> loc(#loc)
+                    return %0 : tensor<8xf32> loc(#loc)
+                  } loc(#loc)
+                } loc(#loc)
+                #loc1 = loc("inner")
+                #loc2 = loc("a")
+                #loc3 = loc("b")
+                #loc4 = loc("outer"(#loc1))
+                #loc5 = loc(fused[#loc2, #loc3])
             "#}
         );
     }

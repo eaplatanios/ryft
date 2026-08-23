@@ -300,7 +300,10 @@ where
                 })
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        builder.add_instruction_unchecked(Instruction::new(instruction.operation().clone(), inputs, outputs, regions));
+        builder.add_instruction_unchecked(
+            Instruction::new(instruction.operation().clone(), inputs, outputs, regions)
+                .with_provenance(instruction.provenance().clone()),
+        );
     }
 
     let output_ids = output_ids
@@ -434,7 +437,11 @@ where
                 (operation.clone(), region_ids)
             }
         };
-        let new_outputs = builder.add_instruction(operation, region_ids, inputs)?.to_vec();
+        // Both arms rebuild this one source instruction (verbatim or with dead outputs projected away), so its
+        // provenance is preserved verbatim.
+        let new_outputs = builder
+            .add_instruction_with_provenance(operation, region_ids, inputs, instruction.provenance().clone())?
+            .to_vec();
         let mut next_new_output = new_outputs.into_iter();
         for (output, live) in instruction.outputs().iter().copied().zip(live_outputs) {
             if live {
