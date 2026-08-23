@@ -113,7 +113,7 @@ impl Display for ProvenanceNode {
 /// The [`Display`] output renders scope chains as `::`-separated paths (e.g., `outer::inner`), fused origins as
 /// bracketed lists that only ever terminate a chain (e.g., `top::fused[a, outer::inner]`), and unknown provenance as
 /// `unknown` (program renderings omit the provenance of such instructions entirely instead of printing this token).
-/// Identifier-like scope names render bare, while all other names render quoted and escaped as Rust string literals.
+/// Identifier-like scope names render bare, while all other names render quoted and escaped as Rust string literals,
 /// so arbitrary name content can never make the rendering ambiguous.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Provenance(Option<Arc<ProvenanceNode>>);
@@ -175,51 +175,32 @@ impl Provenance {
     }
 
     /// Returns `true` if this [`Provenance`] records no origin.
+    #[inline]
     pub fn is_unknown(&self) -> bool {
         self.0.is_none()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the scope names of this [`Provenance`], from the outermost scope down to the first non-scope node.
-    /// Returns an empty path for unknown provenance and for fused roots, whose constituents are reached through
-    /// [`origins`](Self::origins). The provenance below the innermost returned scope is reached through
-    /// [`origin`](Self::origin).
-    pub fn scope_path(&self) -> Vec<&ProvenanceScope> {
-        let mut path = Vec::new();
-        let mut current = self;
-        while let Some(ProvenanceNode::Scope { scope, origin }) = current.0.as_deref() {
-            path.push(scope);
-            current = origin;
-        }
-        path
-    }
-
-    /// Returns the provenance below the innermost scope named by [`scope_path`](Self::scope_path) when this
-    /// [`Provenance`] is a scope chain, and `None` for unknown provenance and fused roots. Returning `None` instead
-    /// of `self` as a sentinel prevents accidental non-terminating traversal. Together with
-    /// [`is_unknown`](Self::is_unknown), [`scope_path`](Self::scope_path), and [`origins`](Self::origins), this lets
-    /// a visualizer traverse the complete provenance tree.
-    pub fn origin(&self) -> Option<&Provenance> {
+    /// Returns the outermost scope of this [`Provenance`] together with the origin recorded below it when this
+    /// provenance is a scope, and [`None`] if it is unknown or fused. Walking `as_scope` repeatedly recovers the
+    /// complete outermost-first scope path and the provenance below it. Together with [`is_unknown`](Self::is_unknown)
+    /// and [`as_fused`](Self::as_fused), this mirrors the three provenance shapes one-to-one and lets a visualizer
+    /// traverse the complete provenance tree.
+    #[inline]
+    pub fn as_scope(&self) -> Option<(&ProvenanceScope, &Provenance)> {
         match self.0.as_deref() {
-            Some(ProvenanceNode::Scope { origin, .. }) => {
-                let mut current = origin;
-                while let Some(ProvenanceNode::Scope { origin, .. }) = current.0.as_deref() {
-                    current = origin;
-                }
-                Some(current)
-            }
+            Some(ProvenanceNode::Scope { scope, origin }) => Some((scope, origin)),
             _ => None,
         }
     }
 
-    /// Returns the merged source origins of this [`Provenance`] when it is a fused root, and an empty slice otherwise.
+    /// Returns the merged source origins of this [`Provenance`] when it is a fused provenance, and [`None`] otherwise.
     /// Fused constituents are normalized at construction; they are never unknown, never themselves fused, and never
-    /// structural duplicates.
-    pub fn origins(&self) -> &[Provenance] {
+    /// structural duplicates, and there are always at least two of them.
+    #[inline]
+    pub fn as_fused(&self) -> Option<&[Provenance]> {
         match self.0.as_deref() {
-            Some(ProvenanceNode::Fused { origins }) => origins,
-            _ => &[],
+            Some(ProvenanceNode::Fused { origins }) => Some(origins),
+            _ => None,
         }
     }
 }
@@ -246,9 +227,8 @@ mod tests {
     fn test_provenance_unknown() {
         let unknown = Provenance::unknown();
         assert!(unknown.is_unknown());
-        assert_eq!(unknown.scope_path(), Vec::<&ProvenanceScope>::new());
-        assert_eq!(unknown.origin(), None);
-        assert_eq!(unknown.origins(), &[]);
+        assert_eq!(unknown.as_scope(), None);
+        assert_eq!(unknown.as_fused(), None);
     }
 
     #[test]
@@ -257,9 +237,8 @@ mod tests {
         assert_eq!(scope.name(), "coordinate_basis");
         let provenance = Provenance::scope(scope.clone(), Provenance::unknown());
         assert!(!provenance.is_unknown());
-        assert_eq!(provenance.scope_path(), vec![&scope]);
-        assert_eq!(provenance.origin(), Some(&Provenance::unknown()));
-        assert_eq!(provenance.origins(), &[]);
+        assert_eq!(provenance.as_scope(), Some((&scope, &Provenance::unknown())));
+        assert_eq!(provenance.as_fused(), None);
     }
 
     #[test]
@@ -267,22 +246,31 @@ mod tests {
         let outer = ProvenanceScope::new("outer");
         let inner = ProvenanceScope::new("inner");
         let provenance = Provenance::scope(outer.clone(), Provenance::scope(inner.clone(), Provenance::unknown()));
-        assert_eq!(provenance.scope_path(), vec![&outer, &inner]);
-        assert_eq!(provenance.origin(), Some(&Provenance::unknown()));
 
-        // A scope chain above a fused origin stops at the fused node, which is reached through `origin()` and
-        // traversed through `origins()`.
+        // Walking `as_scope` repeatedly recovers the complete outermost-first scope path and the origin below it.
+        let mut path = Vec::new();
+        let mut current = &provenance;
+        while let Some((scope, origin)) = current.as_scope() {
+            path.push(scope);
+            current = origin;
+        }
+        assert_eq!(path, vec![&outer, &inner]);
+        assert!(current.is_unknown());
+
+        // A scope chain above a fused origin stops at the fused node, which is reached through `as_scope()` and
+        // traversed through `as_fused()`.
         let first = Provenance::scope(ProvenanceScope::new("first"), Provenance::unknown());
         let second = Provenance::scope(ProvenanceScope::new("second"), Provenance::unknown());
         let fused = Provenance::fused([first.clone(), second.clone()]);
         let provenance = Provenance::scope(outer.clone(), fused.clone());
-        assert_eq!(provenance.scope_path(), vec![&outer]);
-        assert_eq!(provenance.origin(), Some(&fused));
-        assert_eq!(provenance.origin().unwrap().origins(), &[first, second]);
+        assert_eq!(provenance.as_scope(), Some((&outer, &fused)));
+        assert_eq!(fused.as_fused(), Some([first, second].as_slice()));
 
         // `Provenance::scope` performs no deduplication or common-prefix factoring.
         let repeated = Provenance::scope(outer.clone(), Provenance::scope(outer.clone(), Provenance::unknown()));
-        assert_eq!(repeated.scope_path(), vec![&outer, &outer]);
+        let (first_scope, below) = repeated.as_scope().unwrap();
+        assert_eq!(first_scope, &outer);
+        assert_eq!(below.as_scope(), Some((&outer, &Provenance::unknown())));
     }
 
     #[test]
@@ -311,7 +299,7 @@ mod tests {
 
         // Structurally duplicate origins are removed while preserving first-occurrence order.
         let deduplicated = Provenance::fused([b.clone(), a.clone(), b.clone()]);
-        assert_eq!(deduplicated.origins(), &[b.clone(), a.clone()]);
+        assert_eq!(deduplicated.as_fused(), Some([b.clone(), a.clone()].as_slice()));
         assert_eq!(
             Provenance::fused([Provenance::fused([a.clone(), b.clone()]), b.clone()]),
             Provenance::fused([a.clone(), b.clone()]),

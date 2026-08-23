@@ -9,8 +9,8 @@
 ## Objective
 
 Add persistent, hierarchical, non-semantic provenance to Ryft IR instructions. The first producer will annotate the
-ordinary primitive operations that construct a dense Jacobian coordinate basis with the scope name
-`ryft.differentiation.coordinate_basis`.
+ordinary primitive operations that construct a dense Jacobian coordinate basis with the nested framework scopes
+`ryft::differentiation::coordinate_basis`.
 
 The same mechanism must support future program visualization, readable diagnostic renderings, transform provenance,
 and backend source locations without introducing marker operations, executable regions, or dependencies from compiler
@@ -32,7 +32,7 @@ Provenance must never change:
 
 Compiler behavior must remain correct if all provenance is removed. Code that needs to recognize a coordinate basis for
 correctness or optimization must match the ordinary primitive computation or use a semantic operation; it must not
-inspect `ryft.differentiation.coordinate_basis`.
+inspect the `ryft::differentiation::coordinate_basis` scopes.
 
 A direct consequence worth stating explicitly: `Unknown` is always a correct value. A transform that drops provenance
 produces a worse diagnostic, never a wrong program. Full propagation coverage in step 5 is therefore a quality bar
@@ -89,20 +89,22 @@ The public API should expose constructors and traversal methods rather than the 
   boundaries, and tests a direct way to make that distinction without reconstructing it from traversal results.
 - `Provenance::scope(scope, origin)` attaches one named scope above an existing origin.
 - `Provenance::fused(origins)` represents a generated instruction with multiple source origins.
-- `Provenance::scope_path()` supports program renderers and visualizers without exposing storage internals. It returns
-  the scope names from the outermost `Scope` node down to the first non-`Scope` node; for `Unknown` and for a `Fused`
-  root it returns an empty path, and fused constituents are reached through `Provenance::origins()`.
-- `Provenance::origin()` returns `Some` containing the child provenance below the innermost scope named by
-  `scope_path()` for a `Scope` root, and `None` for `Unknown` or `Fused` roots. Returning `None` instead of using `self`
-  as a sentinel prevents accidental non-terminating traversal. Together with `is_unknown()`, `scope_path()`, and
-  `origins()`, this lets a visualizer traverse the complete tree without a node-view API.
-- `Provenance::origins()` supports recursive visualization of fused origins: it returns the constituents of a `Fused`
-  root and an empty slice otherwise.
+- `Provenance::as_scope()` returns the outermost scope together with the origin recorded below it for a `Scope` root,
+  and `None` for `Unknown` and `Fused` roots. Walking it repeatedly recovers the complete outermost-first scope path
+  and the provenance below the chain, so no separate path or below-chain accessors are needed, and traversal
+  allocates nothing.
+- `Provenance::as_fused()` returns the fused constituents for a `Fused` root and `None` otherwise.
+- Together, `is_unknown()`, `as_scope()`, and `as_fused()` mirror the three provenance shapes one-to-one and let a
+  visualizer traverse the complete tree without a node-view API. Returning `None` from the shape accessors instead of
+  using `self` as a sentinel prevents accidental non-terminating traversal.
 
-Keep scope names as one stable, fully-qualified string in the first version. Do not introduce a parallel display name
-or an open-ended attribute map until a concrete consumer requires it. A visualizer may recognize well-known names and
-render friendly labels, while unknown user-defined names remain directly displayable. This keeps the initial API small
-and maps exactly onto MLIR `NameLoc`.
+Keep scope names as single path segments and express namespacing structurally by nesting scopes: the framework
+annotation is the nested path `ryft::differentiation::coordinate_basis` — three scope levels, not one dotted name.
+This makes the scope tree and the namespace tree one mechanism (visualizers group framework work under `ryft` and
+`differentiation` structurally, with no display-time name parsing), keeps names identifier-like so they render bare,
+and lowers to a chain of nested MLIR `NameLoc`s in the JAX name-stack style. Do not introduce a parallel display name
+or an open-ended attribute map until a concrete consumer requires it. A visualizer may recognize well-known scope
+paths and render friendly labels, while unknown user-defined names remain directly displayable.
 
 Normalize fused provenance at construction:
 
@@ -164,7 +166,8 @@ Composition semantics are defined precisely as follows and must be pinned by tes
   in `Provenance::fused`. Visualizers may factor common scope prefixes at display time, but the stored representation
   stays purely structural.
 - For example, with an origin entered (or seeded) first and scopes `outer` then `inner` entered afterwards, the
-  composed provenance is `Scope(outer, Scope(inner, origin))` and `scope_path()` returns `[outer, inner]`.
+  composed provenance is `Scope(outer, Scope(inner, origin))` and walking `as_scope()` yields `outer` then `inner`
+  before reaching `origin`.
 
 All three methods are required `Context` methods without default bodies, mirroring `is_eager`. A defaulted method
 would let a wrapper context silently drop provenance by forgetting to delegate, and the only safety net would be a
@@ -232,19 +235,18 @@ silently return incorrectly labeled cached artifacts.
 
 ### 1. Add the core `Provenance` model
 
-- [ ] Add a provenance module under `crates/ryft-core/src/programs` and re-export its intended public surface through
+- [x] Add a provenance module under `crates/ryft-core/src/programs` and re-export its intended public surface through
       the normal `programs` facade and downstream crate-root facade.
-- [ ] Implement immutable `Unknown`, `Scope`, and normalized `Fused` provenance as described above, with the
+- [x] Implement immutable `Unknown`, `Scope`, and normalized `Fused` provenance as described above, with the
       allocation-free `Option<Arc<ProvenanceNode>>` representation for `Unknown`.
-- [ ] Add the small `ProvenanceScope` name wrapper. Keep construction infallible and preserve user-provided names
+- [x] Add the small `ProvenanceScope` name wrapper. Keep construction infallible and preserve user-provided names
       verbatim; document that names should be non-empty and that the `ryft.` prefix is reserved for framework-owned
       scopes rather than adding validation machinery that has no correctness role.
-- [ ] Define `COORDINATE_BASIS_PROVENANCE_NAME` as
-      `"ryft.differentiation.coordinate_basis"` in the differentiation-owned module rather than the generic programs
-      module.
-- [ ] Add concise `Display` output suitable for annotated diagnostics, while keeping full recursive inspection
+- [x] Deferred to step 4: the coordinate-basis scope-path definition is not added until its first consumer exists, so
+      no unused global definition lands ahead of the coordinate-basis annotation work.
+- [x] Add concise `Display` output suitable for annotated diagnostics, while keeping full recursive inspection
       available through accessors.
-- [ ] Add exact unit tests for unknown, one scope, nested scopes, fusion normalization, duplicate removal, equality,
+- [x] Add exact unit tests for unknown, one scope, nested scopes, fusion normalization, duplicate removal, equality,
       hashing, and display.
 
 ### 2. Attach provenance during staging
@@ -320,21 +322,24 @@ silently return incorrectly labeled cached artifacts.
       ```text
       suffix     ::= ""                                    // Unknown: no suffix at all.
                    | " provenance = " expression
-      expression ::= name                                  // Scope over Unknown: innermost `(unknown)` is omitted.
-                   | name "(" expression ")"               // Scope over a non-Unknown origin.
+      expression ::= segment ("::" segment)*               // Outermost scope first.
+      segment    ::= name                                  // One scope level.
                    | "fused[" expression ("," " " expression)* "]"
-      name       ::= <scope name rendered as a Rust string literal>
+      name       ::= <bare identifier> | <Rust string literal>
       ```
 
       The suffix is inserted immediately before the instruction statement's final newline. For instructions whose
       rendering spans multiple lines (for example, operations with attached regions), that means after the final
       closing bracket on the statement's last line, never inside the nested body. No `unknown` token exists in the
-      grammar: `Unknown` renders as the absence of a suffix, and fused normalization
-      already guarantees `Unknown` never appears as a constituent. Scope names are preserved verbatim in storage and
-      escaped deterministically at render time
-      using Rust string-literal escaping (the `{:?}` / `escape_debug` form), which handles quotes, newlines, and
-      delimiters unambiguously. The format is readable and unambiguous; round-tripping (parsing provenance back from
-      renderings) is an explicit non-goal in the first version, but the grammar must not preclude adding it later.
+      grammar: `Unknown` renders as the absence of a suffix, and fused normalization already guarantees `Unknown`
+      never appears as a constituent. A `fused[...]` segment only ever terminates a chain, because a scope above a
+      fused origin ends the scope chain. Names render bare when they match `[A-Za-z_][A-Za-z0-9_]*` and otherwise
+      render quoted and escaped deterministically as Rust string literals (the `{:?}` / `escape_debug` form), so
+      arbitrary name content — including `::`, brackets, quotes, and newlines — can never corrupt the grammar, and
+      construction stays infallible with no name validation. A scope literally named `fused` stays unambiguous
+      because the keyword form is always followed by `[`. The format is readable and unambiguous; round-tripping
+      (parsing provenance back from renderings) is an explicit non-goal in the first version, but the grammar must
+      not preclude adding it later.
 - [ ] Expose enough read-only traversal for a future visualizer to group instructions by common scope ancestors while
       retaining non-contiguous membership and fused origins.
 - [ ] Add exact rendering tests proving that canonical output is unchanged, diagnostic output contains nested paths,
@@ -347,7 +352,11 @@ silently return incorrectly labeled cached artifacts.
 - [ ] Prerequisite complete: the `CoordinateBasisOperation` inlining has landed — the operation no longer exists in
       the repository, and `DenseDifferentiableType::coordinate_basis`
       (`crates/ryft-core/src/differentiation/types.rs`) already stages ordinary primitives. Wrap only that primitive
-      construction with `ryft.differentiation.coordinate_basis`.
+      construction with the nested scopes `ryft::differentiation::coordinate_basis`.
+- [ ] Define the differentiation-owned coordinate-basis scope path — the nested `ryft`, `differentiation`, and
+      `coordinate_basis` scopes, e.g., as a small constructor or constants colocated with
+      `DenseDifferentiableType` — rather than in the generic programs module (deferred from step 1 so the
+      definition is not added before its consumer exists).
 - [ ] Do not reintroduce a coordinate-basis operation, marker value, wrapper region, or special backend lowering.
 - [ ] Ensure validation that fails before construction does not emit partially scoped instructions. If some validation
       necessarily stages shape computations, decide explicitly whether those computations belong inside the scope and
@@ -424,8 +433,9 @@ silently return incorrectly labeled cached artifacts.
 - [ ] Preserve an existing file/line base location as the innermost child of named scopes rather than replacing it.
 - [ ] Verify that later MLIR transformations preserve or fuse locations according to MLIR conventions; do not add a
       Ryft-specific StableHLO attribute when standard locations suffice.
-- [ ] Add exact MLIR tests for unknown, single, nested, and fused provenance, including
-      `ryft.differentiation.coordinate_basis` on every StableHLO operation produced by its scoped Ryft primitives.
+- [ ] Add exact MLIR tests for unknown, single, nested, and fused provenance, including the nested
+      `ryft::differentiation::coordinate_basis` `NameLoc` chain on every StableHLO operation produced by its scoped
+      Ryft primitives.
 - [ ] Add end-to-end XLA tests demonstrating that nested batching/differentiation scopes survive compilation and are
       visible in dumped MLIR/HLO metadata without affecting numeric results.
 
@@ -459,8 +469,9 @@ silently return incorrectly labeled cached artifacts.
       MLIR lowering behavior with links to the precise
       [MLIR `NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) and
       [`FusedLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc) documentation.
-- [ ] Document framework namespace ownership: built-in names use `ryft.<subsystem>.<concept>`, beginning with
-      `ryft.differentiation.coordinate_basis`; user scopes should use their own namespace.
+- [ ] Document framework namespace ownership: the root scope name `ryft` is reserved, and built-in scopes nest as
+      `ryft::<subsystem>::<concept>`, beginning with `ryft::differentiation::coordinate_basis`; user scopes should
+      use their own namespace.
 - [ ] Explain that Rust `tracing` integration, if added later, is an optional telemetry bridge and never the persistent
       IR source of truth.
 - [ ] Run targeted provenance, builder, program, tracing, batching, differentiation, partial-evaluation, and lowering
@@ -531,7 +542,22 @@ instructions must remain authoritative even when no subscriber is installed.
 
 Populate this section while implementing the approved plan.
 
-- Step 1: pending.
+- Step 1: done. Added `crates/ryft-core/src/programs/provenance.rs` with `ProvenanceScope` (verbatim single-segment
+  `Arc<str>` name, infallible construction, documented reserved `ryft` root scope) and `Provenance` over the private
+  `Option<Arc<ProvenanceNode>>` representation (allocation-free `unknown()`, `is_unknown()`, structural `scope()`,
+  normalized `fused()` with unknown-discarding/flattening/first-occurrence dedup/zero-and-one collapsing, and the
+  shape-mirroring `as_scope()`/`as_fused()` accessors, which replaced an earlier
+  `scope_path()`/`origin()`/`origins()` trio after review). `Display` renders `::`-separated scope chains with
+  bare-or-quoted names (bare for `[A-Za-z_][A-Za-z0-9_]*`, Rust-string-literal escaping otherwise), terminal
+  `fused[...]` segments, and a standalone `unknown` token; this revised the initially landed MLIR-style
+  `"outer"("inner")` form after review, and namespacing became structural (nested scopes such as
+  `ryft::differentiation::coordinate_basis`) instead of dotted names. Re-exported through the `programs` facade and
+  the crate-root facade (the `ryft` crate glob-re-exports `ryft_core::*`, so no change was needed there). The
+  coordinate-basis scope-path definition was deferred to step 4 so it is not added before its consumer exists.
+  Verified with seven exact unit tests covering unknown, one scope, nested scopes (including scope-over-fused and no
+  prefix factoring), fusion normalization, duplicate removal, equality, hashing, and display (bare, quoted/escaped,
+  `::` chains, and terminal fused segments); `cargo test -p ryft-core --lib` passes and `cargo fmt -p ryft-core` is
+  clean.
 - Step 2: pending.
 - Step 3: pending.
 - Step 4: pending.
