@@ -14,7 +14,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::{ArrayReference, ArrayReferenceViewTransform};
+use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::batching::{
@@ -32,8 +32,10 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation, Operation, OperationFormatter,
     ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
-    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceType, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, RegionInterface, TypeError, Typed,
+    Value, ValueProjection,
 };
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
@@ -263,6 +265,90 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
     }
 }
 
+/// Discharges one root-preserving array reference view by composing `transform` onto the incoming handle's alias.
+///
+/// A view derives a narrower handle onto the same root, so on a discharged root the rewrite is metadata only: it
+/// validates and derives the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid
+/// composition before any handle exists, and then records the composed chain as the derived handle's authoritative
+/// alias. Nothing is bound into the destination, because the coordinates this handle selects are materialized at each
+/// access rather than at the view.
+///
+/// On a root that partial discharge *preserved*, the view is additionally replayed into the destination, and the
+/// reference it produces becomes the derived handle's own destination value, so that later accesses consume that
+/// exact value instead of re-deriving the chain and duplicating the view operations. The composed alias is recorded
+/// either way, which is what keeps one handle's view chain single-sourced whichever state its root is in.
+///
+/// # Parameters
+///
+///   - `operation`: View operation being discharged, replayed verbatim on a preserved root.
+///   - `transform`: Coordinate transform this view operation applies to its operand's view.
+///   - `context`: Active discharge context owning the root environment.
+///   - `inputs`: Carriers supplied as the view operation's operands, in operation-defined order.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand,
+/// [`ProgramError::MalformedProgram`] when that operand is an ordinary value rather than a reference handle, and
+/// [`ProgramError::InvalidOutputCount`] when replaying the view on a preserved root does not produce exactly one
+/// value. Propagates the view algebra's own [`TypeError`] when `transform` does not compose onto the incoming
+/// handle's referent, and the discharge context's own [`ProgramError::MalformedProgram`] when the replayed
+/// reference does not carry the composed type.
+fn discharge_reference_view<C, P, O>(
+    operation: &O,
+    transform: ArrayReferenceViewTransform,
+    context: &ReferenceDischargeContext<C, P>,
+    inputs: &[ReferenceDischargeValue<C, P>],
+) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+where
+    C: Context<Type = ArrayIrType, Operation: From<O>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+    O: Clone + Operation<Type = ArrayIrType>,
+{
+    check_count!("input", inputs, 1, ProgramError);
+    let reference = inputs[0].expect_reference("a reference to view")?;
+    let referent = transform.output_type(reference.r#type().referent())?;
+    let alias = reference.alias().with_transform_unchecked(transform);
+    let preserved = match reference.preserved() {
+        None => None,
+        Some(value) => {
+            let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
+            check_count!("output", outputs, 1, ProgramError);
+            Some(outputs.remove(0))
+        }
+    };
+    Ok(vec![context.derive(reference, alias, ReferenceType::new(referent), preserved)?])
+}
+
+impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation
+where
+    C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_reference_view(self, self.transform(), context, inputs)
+    }
+}
+
+impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceSliceOperation
+where
+    C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_reference_view(self, self.transform(), context, inputs)
+    }
+}
+
 macro_rules! impl_unsupported_reference_view_transforms {
     // Installs the same conservative transform rejections for one unresolved array reference-view operation.
     ($operation:ty) => {
@@ -422,11 +508,9 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation<ArrayType, ArrayIrType>>,
 {
-    fn freeze(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
+    fn freeze(self) -> Result<V, ProgramError> {
+        let domain = self.dispatch_domain();
+        Ok(domain.bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
 }
 
@@ -435,10 +519,9 @@ where
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation<ArrayType, ArrayIrType>>,
 {
-    fn freeze(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
-            .dispatch_domain()
+    fn freeze(self) -> Result<V, ProgramError> {
+        let domain = self.value().dispatch_domain();
+        Ok(domain
             .bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0))
     }
@@ -483,18 +566,18 @@ impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> Reference
 }
 
 impl<A: Value<Type = ArrayType>> FreezeReference for ArrayIrValue<A> {
-    fn freeze(&self) -> Result<Self, ProgramError> {
+    fn freeze(self) -> Result<Self, ProgramError> {
         FreezeReferenceOperation::<ArrayType, ArrayIrType>::new()
             .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
-        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(&self)?;
         Ok(Self::Array(reference.freeze()?))
     }
 }
 
 impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
     fn reference_index(&self, axis: usize, index: usize) -> Result<Self, ProgramError> {
-        let operation = ReferenceIndexOperation::new(axis, index);
-        operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        // Projection rejects ordinary operands and `with_transform` validates the transform against the handle's
+        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Index { axis, index })?))
     }
@@ -502,8 +585,8 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
 
 impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
     fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        let operation = ReferenceSliceOperation::new(axes.to_vec());
-        operation.infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
+        // Projection rejects ordinary operands and `with_transform` validates the transform against the handle's
+        // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Slice { axes: axes.to_vec() })?))
     }
@@ -519,10 +602,11 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::ArrayIrBatching;
     use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::reference_discharge::ArrayReferenceDischarge;
     use crate::arrays::reference_views::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation};
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -530,8 +614,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationContext;
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, InstructionId, ProgramBuilder, REFERENCE_READ_OPERATION_NAME,
-        ReferenceAnalysisError, ReferenceError, ReferenceRoot, TypeError,
+        Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -539,6 +622,7 @@ mod tests {
 
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
+    type TestDestination = EagerContext<TestValue, TestOperation>;
     type TestNew = NewReferenceOperation<ArrayType, ArrayIrType>;
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType>;
     type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
@@ -585,6 +669,112 @@ mod tests {
                 "ArraySliceAxis { start: 0, size: 3, stride: 1 }],\n",
                 "]",
             ),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_view_operation_reference_discharge() {
+        // Both view rules derive a narrower handle onto the same root by composing their transform onto the incoming
+        // alias, and bind nothing: a view's coordinates are materialized at each access instead.
+        let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
+        let root_type = ArrayType::new_static(DataType::F32, [3, 3]);
+        let allocated = context.allocate_discharged(
+            ReferenceType::new(root_type.clone()),
+            TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
+        );
+        let root = allocated.expect_reference("the allocated root").unwrap().clone();
+        let sliced = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)])
+            .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&allocated))
+            .unwrap();
+        assert_eq!(sliced.len(), 1);
+        let sliced = sliced[0].expect_reference("the derived slice").unwrap().clone();
+        assert_eq!(sliced.root(), root.root());
+        assert_eq!(sliced.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 2])));
+        assert_eq!(sliced.preserved(), None);
+
+        // Composition is onto the *incoming* handle's chain, so indexing the slice selects a row of the slice rather
+        // than a row of the root, and the composed alias is what every later access applies.
+        let indexed = ReferenceIndexOperation::new(0, 1)
+            .discharge_references(&context, &EmptyRegionDriver, &[ReferenceDischargeValue::Reference(sliced.clone())])
+            .unwrap();
+        let indexed = indexed[0].expect_reference("the derived index").unwrap().clone();
+        assert_eq!(indexed.root(), root.root());
+        assert_eq!(indexed.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(
+            indexed.alias(),
+            &ArrayReferenceView::root()
+                .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
+                    axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
+                })
+                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }),
+        );
+        assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
+
+        // A composition that does not fit the incoming view is rejected before any handle exists, with the view
+        // algebra's own diagnostic rather than a discharge-specific one.
+        assert_eq!(
+            ReferenceIndexOperation::new(0, 2).discharge_references(
+                &context,
+                &EmptyRegionDriver,
+                &[ReferenceDischargeValue::Reference(sliced)],
+            ),
+            Err(TypeError::invalid("reference index 2 on axis 0 is out of bounds for size 2").into()),
+        );
+
+        // The operand must be a reference handle, and there must be exactly one of them.
+        let pure = ReferenceDischargeValue::Ordinary(TestValue::Array(Array::scalar(1.0_f32)));
+        assert_eq!(
+            ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)]).discharge_references(
+                &context,
+                &EmptyRegionDriver,
+                std::slice::from_ref(&pure),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "reference discharge expected a reference to view but received an ordinary value".to_string(),
+            )),
+        );
+        assert_eq!(
+            ReferenceIndexOperation::new(0, 0).discharge_references(&context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+
+        // A root that partial discharge preserved survives in the destination, so the view is additionally replayed
+        // there and the reference that replay produced becomes the derived handle's own destination value. The
+        // composed alias is recorded exactly as it is for a discharged root, which is what keeps one handle's view
+        // chain single-sourced whichever state its root is in.
+        let preserved = context
+            .bind_preserved(
+                ReferenceType::new(root_type),
+                TestValue::Reference(ArrayReference::new(Array::matrix(
+                    3,
+                    3,
+                    (1..=9).map(|value| value as f32).collect(),
+                ))),
+            )
+            .unwrap();
+        let preserved_root = preserved.expect_reference("the preserved root").unwrap().root();
+        let derived = ReferenceIndexOperation::new(0, 0)
+            .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))
+            .unwrap();
+        assert_eq!(derived.len(), 1);
+        let derived = derived[0].expect_reference("the derived preserved view").unwrap().clone();
+        assert_eq!(derived.root(), preserved_root);
+        assert_eq!(derived.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        assert_eq!(
+            derived.alias(),
+            &ArrayReferenceView::root()
+                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }),
+        );
+        assert_eq!(
+            derived.preserved().map(|value| value.r#type().into_owned()),
+            Some(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])))),
+        );
+
+        // The replayed view denotes the coordinates the source named, which the eager destination proves by reading
+        // through the derived handle: the first row of the preserved root rather than the root itself.
+        assert_eq!(
+            derived.preserved().map(ReferenceRead::read),
+            Some(Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])))),
         );
     }
 
@@ -694,7 +884,7 @@ mod tests {
         );
         assert_eq!(
             root.reference_slice(&[ArraySliceAxis::new(2, 2, 1)]),
-            Err(TypeError::invalid("reference slice on axis 0 with start 2 and size 2 exceeds input size 3",).into()),
+            Err(TypeError::invalid("reference slice on axis 0 with start 2 and size 2 exceeds input size 3").into()),
         );
         assert_eq!(
             root.reference_slice(&[ArraySliceAxis::new(0, 2, 2)]),
@@ -737,7 +927,9 @@ mod tests {
         assert_eq!(views.get(&same_view_handle), Some(&7));
         assert_eq!(views.get(&different_view_handle), None);
         assert_eq!(views.get(&root_handle), None);
-        let error = view.freeze().unwrap_err();
+        // `freeze` consumes the handle it is given, so an alias that must outlive the consumption is cloned first;
+        // the clone shares the holder and is therefore invalidated with the rest of the family.
+        let error = view.clone().freeze().unwrap_err();
         assert_eq!(
             error.downcast_custom::<ArrayReferenceViewError>(),
             Some(&ArrayReferenceViewError::CannotFreezeView)
@@ -856,7 +1048,7 @@ mod tests {
         let old = referent(reference.swap(&ArrayIrValue::Array(replacement)).unwrap());
         assert_eq!(old.r#type().into_owned(), dynamic_type);
         assert_eq!(old.storage_bytes(), initial_bytes.as_slice());
-        let frozen = referent(reference.freeze().unwrap());
+        let frozen = referent(reference.clone().freeze().unwrap());
         assert_eq!(frozen.r#type().into_owned(), dynamic_type);
         assert_eq!(frozen.storage_bytes(), replacement_bytes.as_slice());
         let error = reference.read().unwrap_err();
@@ -983,6 +1175,137 @@ mod tests {
     }
 
     #[test]
+    fn test_traced_reference_misuse_is_rejected_where_it_is_staged() {
+        type TestContext = TracingContext<TestValue, TestOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 2]));
+        let consumed = "`reference_read` reads a reference whose alias family `freeze_reference` already consumed";
+
+        // Every clone of one tracer names the same staged atom, so a handle cloned before the freeze is invalidated
+        // with the rest of the alias family and its next access is reported against the operation that performs it,
+        // not against the freeze and not at discharge.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.new_reference()?;
+                let alias = reference.clone();
+                reference.freeze()?;
+                alias.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Consumption invalidates a derived view exactly as it invalidates the root, because the view is an alias
+        // edge onto the same family rather than an independent resource.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.new_reference()?;
+                let row = reference.reference_index(0, 0)?;
+                reference.freeze()?;
+                row.read()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
+
+        // Freezing a view is rejected in the other direction too: consumption applies to the whole root, which is
+        // what the eager handles enforce with `CannotFreezeView` and what discharge would otherwise discover only
+        // when it compared the root's state type against the handle's.
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let reference = input.new_reference()?;
+                reference.reference_slice(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 2, 1)])?.freeze()
+            },
+            array_type.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::MalformedProgram(
+                "`freeze_reference` consumes a derived reference view, but consumption invalidates the whole alias \
+                 family; consume the root handle instead"
+                    .to_string(),
+            ),
+        );
+
+        // Independent roots stay independent, and a whole-family consumption of one says nothing about the other.
+        let (_, program) = TestContext::trace(
+            |inputs: Vec<TestTracer>| {
+                let first = inputs[0].new_reference()?;
+                let second = inputs[1].new_reference()?;
+                let frozen = first.freeze()?;
+                Ok(vec![frozen, second.read()?])
+            },
+            vec![array_type.clone(), array_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                let %2:ref<f32[2, 2]> = new_reference %0
+                    %3:ref<f32[2, 2]> = new_reference %1
+                    %4:f32[2, 2] = freeze_reference %2
+                    %5:f32[2, 2] = reference_read %3
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_traced_structured_reference_carry_joins_its_operand_alias_family() {
+        type TestContext = TracingContext<TestValue, TestOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        // A `while` declares nothing in its reference semantics; that its carry output denotes the same reference as
+        // its carry input is stated through `reference_output_identity_input` instead. The trace-time liveness state
+        // honors that hook, so the loop's own result belongs to its operand's alias family and an access through it
+        // after the root has been frozen is still reported at the access that performs it.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type.clone()));
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        condition_builder.add_input(reference_type.clone());
+        let predicate = condition_builder
+            .add_constant(TestValue::Array(Array::from_f64s(ArrayType::scalar(DataType::Boolean), vec![0.0])));
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let carry = body_builder.add_input(reference_type);
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![carry], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let error = TestContext::trace(
+            |input: TestTracer| {
+                let context = input.context().clone();
+                let reference = input.new_reference()?;
+                let carried = context
+                    .bind(
+                        WhileOperation::new(),
+                        vec![condition.clone(), body.clone()],
+                        std::slice::from_ref(&reference),
+                    )?
+                    .remove(0);
+                reference.freeze()?;
+                carried.read()
+            },
+            ArrayIrType::Array(scalar_type),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::MalformedProgram(
+                "`reference_read` reads a reference whose alias family `freeze_reference` already consumed".to_string(),
+            ),
+        );
+    }
+
+    #[test]
     fn test_array_ir_reference_program_matches_eager_execution() {
         type TestContext = EagerContext<TestValue, TestOperation>;
 
@@ -1011,7 +1334,6 @@ mod tests {
             TestValue::Array(Array::vector(vec![6.0_f32, 8.0])),
         );
         assert_eq!(eager_outputs, expected);
-        program.analyze_references(0).unwrap();
         assert_eq!(program.interpret(inputs), Ok(expected));
         assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
     }
@@ -1029,19 +1351,14 @@ mod tests {
 
         let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
         let reference = initial.new_reference().unwrap();
-        assert!(matches!(
-            program.interpret(vec![
-                reference.clone(),
-                TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
-            ]),
-            Err(error)
-                if error.downcast_custom::<ReferenceAnalysisError>()
-                    == Some(&ReferenceAnalysisError::ReferenceOutput {
-                        region: program.entry(),
-                        output_index: 0,
-                        root: ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 },
-                    }),
-        ));
+        assert_eq!(
+            program.interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "program replay cannot bind external reference `public input 0`; use a stateful \
+                          compilation domain"
+                    .to_string(),
+            }),
+        );
         assert_eq!(reference.read(), Ok(initial));
     }
 
@@ -1078,7 +1395,6 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        program.analyze_references(0).unwrap();
 
         let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]));
         assert_eq!(
@@ -1119,7 +1435,6 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        program.analyze_references(0).unwrap();
 
         let context = EagerContext::<TestValue, TestOperation>::new();
         let value = TestValue::Array(Array::vector(vec![2.0_f32, 4.0]));
@@ -1137,46 +1452,6 @@ mod tests {
                 Ok(vec![value.clone()]),
             );
         }
-    }
-
-    #[test]
-    fn test_array_ir_reference_program_validates_attached_regions_before_selection() {
-        let array_type = ArrayType::new_static(DataType::F32, [2]);
-        let valid_branch = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(array_type.clone().into());
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let invalid_branch = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let input = builder.add_input(array_type.clone().into());
-            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![input]).unwrap()[0];
-            builder.add_instruction(TestFreeze::new(), Vec::new(), vec![reference]).unwrap();
-            builder.add_instruction(TestRead::new(), Vec::new(), vec![reference]).unwrap();
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let invalid_region = invalid_branch.entry();
-
-        let error = EagerContext::<TestValue, TestOperation>::new()
-            .bind(
-                ConditionOperation::new(),
-                vec![valid_branch, invalid_branch],
-                &[TestValue::Array(Array::scalar(true)), TestValue::Array(Array::vector(vec![1.0_f32, 2.0]))],
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<ReferenceAnalysisError>(),
-            Some(&ReferenceAnalysisError::UseAfterConsume {
-                instruction: InstructionId::new(invalid_region, 2),
-                operation: REFERENCE_READ_OPERATION_NAME.to_string(),
-                input_index: 0,
-                root: ReferenceRoot::Allocation { instruction: InstructionId::new(invalid_region, 0), output_index: 0 },
-            }),
-        );
     }
 
     #[test]
@@ -1220,7 +1495,6 @@ mod tests {
             .unwrap()
             .to_vec();
         let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
-        program.analyze_references(0).unwrap();
         assert_eq!(
             program.interpret(vec![
                 TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
@@ -1257,7 +1531,6 @@ mod tests {
             .to_vec();
         let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
 
-        program.analyze_references(0).unwrap();
         assert_eq!(
             program.interpret(vec![
                 TestValue::Array(Array::scalar(1.0_f32)),

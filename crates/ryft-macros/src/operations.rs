@@ -17,6 +17,7 @@ const TYPE_ATTRIBUTE: Symbol = Symbol::new("type");
 const CONSTANT_ATTRIBUTE: Symbol = Symbol::new("constant");
 const MEMBERS_ATTRIBUTE: Symbol = Symbol::new("members");
 const BATCHING_ATTRIBUTE: Symbol = Symbol::new("batching");
+const DISCHARGE_ATTRIBUTE: Symbol = Symbol::new("discharge");
 const DIFFERENTIATION_ATTRIBUTE: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
 const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
@@ -70,6 +71,9 @@ struct OperationMember {
 struct Dispatchers {
     /// Whether to generate the batching dispatcher.
     batching: bool,
+
+    /// Whether to generate the reference discharge dispatcher.
+    discharge: bool,
 
     /// Whether to generate the differentiation dispatcher.
     differentiation: bool,
@@ -257,14 +261,15 @@ impl OperationParser {
         for dispatcher in dispatchers {
             let selected = match &dispatcher {
                 path if path == &BATCHING_ATTRIBUTE => &mut selected_dispatchers.batching,
+                path if path == &DISCHARGE_ATTRIBUTE => &mut selected_dispatchers.discharge,
                 path if path == &DIFFERENTIATION_ATTRIBUTE => &mut selected_dispatchers.differentiation,
                 path if path == &TRANSPOSITION_ATTRIBUTE => &mut selected_dispatchers.transposition,
                 _ => {
                     return Err(syn::Error::new_spanned(
                         &dispatcher,
                         format_args!(
-                            "invalid '#[ryft(dispatch(...))]' dispatcher: '{}'; only 'batching', 'differentiation', and \
-                         'transposition' are supported here",
+                            "invalid '#[ryft(dispatch(...))]' dispatcher: '{}'; only 'batching', 'discharge', \
+                         'differentiation', and 'transposition' are supported here",
                             dispatcher.to_token_stream().to_string().replace(' ', ""),
                         ),
                     ));
@@ -674,11 +679,15 @@ fn defaulted_member_type<T: ToTokens>(tokens: T, class: &str, members: &[Operati
 impl OperationEnum {
     /// Generates every semantic implementation selected for this operation enum.
     fn generate(&self) -> TokenStream {
+        // Reference discharge is emitted before batching, differentiation, and transposition because it is the
+        // transform those three are defined downstream of: a program that still carries references is rejected by all
+        // of them until discharge has run.
         let operation = self.generate_operation();
+        let discharge = self.dispatchers.discharge.then(|| self.generate_reference_dischargeable_operation());
         let batching = self.dispatchers.batching.then(|| self.generate_batchable_operation());
         let differentiation = self.dispatchers.differentiation.then(|| self.generate_differentiable_operation());
         let transposition = self.dispatchers.transposition.then(|| self.generate_transposable_operation());
-        quote!(#operation #batching #differentiation #transposition)
+        quote!(#operation #discharge #batching #differentiation #transposition)
     }
 
     /// Generates the `Operation` derive output: the [`Operation`] dispatcher, the [`InterpretableOperation`]
@@ -1285,6 +1294,116 @@ impl OperationEnum {
                 > {
                     match self {
                         #(#batching_arms)*
+                    }
+                }
+            }
+        })
+    }
+
+    /// Generates the [`ReferenceDischargeableOperation`](ryft_core::ReferenceDischargeableOperation) dispatcher. The
+    /// reference universe policy stays fully generic for every family, because a policy names the reference universe
+    /// being threaded rather than the element universe the family's values belong to. Composite-native variants
+    /// delegate to their payload's own discharge rule, while member variants and bare generic extension variants
+    /// replay the complete enum through
+    /// [`discharge_reference_free_operation`](ryft_core::discharge_reference_free_operation), which copies any
+    /// attached regions across unchanged and rejects a reference operand or a region closure that reaches a
+    /// reference.
+    fn generate_reference_dischargeable_operation(&self) -> TokenStream {
+        let variants = &self.variants;
+        let ryft = &self.ryft_crate;
+        let primary_type = &self.operation_type;
+        let discharge_self_type = &self.program_self_type;
+        let mut discharge_generics = self.program_generics.clone();
+        discharge_generics.params.push(syn::parse_quote!(__ParentContext));
+        discharge_generics.params.push(syn::parse_quote!(__ReferenceDischargePolicy));
+        let discharge_where_clause = discharge_generics.make_where_clause();
+        // The parent context's constant type is deliberately left free. No rule body and no shared rule helper reads
+        // it, while pinning it to the family's own declared constant type would make the dispatcher inapplicable to a
+        // capture-lifted program, whose constants name the caller's captures instead of carrying the family's values.
+        discharge_where_clause.predicates.push(syn::parse_quote! {
+            __ParentContext: #ryft::Context<Type = #primary_type, Operation = #discharge_self_type>
+        });
+        discharge_where_clause.predicates.push(syn::parse_quote! {
+            #discharge_self_type: #ryft::Operation<Type = #primary_type>
+        });
+        discharge_where_clause.predicates.push(syn::parse_quote! {
+            __ReferenceDischargePolicy: #ryft::ReferenceDischargePolicy<__ParentContext>
+        });
+
+        // Only composite-native payloads name a discharge rule of their own. The verbatim replay the remaining
+        // variants use needs no payload predicate: the impl already pins `__ParentContext::Operation` to this enum,
+        // `From<Self>` is reflexive, and `Clone` and `Operation<Type = T>` are already available on the enum.
+        discharge_where_clause.predicates.extend(
+            variants
+                .iter()
+                .filter(|variant| {
+                    !variant.is_generic_extension && matches!(variant.class, OperationVariantClass::CompositeNative)
+                })
+                .map(|variant| {
+                    let operation_type = &variant.program_payload_type;
+                    let predicate: syn::WherePredicate = syn::parse_quote! {
+                        #operation_type: #ryft::ReferenceDischargeableOperation<
+                            __ParentContext,
+                            __ReferenceDischargePolicy,
+                        >
+                    };
+                    predicate
+                }),
+        );
+        let discharge_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            if variant.is_generic_extension || !matches!(variant.class, OperationVariantClass::CompositeNative) {
+                // The payload is replayed as the enclosing enum rather than on its own, so the arm binds nothing.
+                quote! {
+                    Self::#variant_ident(..) => {
+                        #ryft::discharge_reference_free_operation(self, context, driver, inputs)
+                    },
+                }
+            } else {
+                let operation_type = &variant.program_payload_type;
+                let receiver = variant.receiver();
+                quote! {
+                    Self::#variant_ident(operation) => {
+                        <#operation_type as #ryft::ReferenceDischargeableOperation<
+                            __ParentContext,
+                            __ReferenceDischargePolicy,
+                        >>::discharge_references(#receiver, context, driver, inputs)
+                    },
+                }
+            }
+        });
+        let (discharge_impl_generics, _, discharge_where_clause) = discharge_generics.split_for_impl();
+        const_block(quote! {
+            #[automatically_derived]
+            impl #discharge_impl_generics #ryft::ReferenceDischargeableOperation<
+                __ParentContext,
+                __ReferenceDischargePolicy,
+            > for #discharge_self_type
+            #discharge_where_clause
+            {
+                fn discharge_references<__D: #ryft::ReferenceDischargeDriver<
+                    __ParentContext,
+                    __ReferenceDischargePolicy,
+                >>(
+                    &self,
+                    context: &#ryft::ReferenceDischargeContext<
+                        __ParentContext,
+                        __ReferenceDischargePolicy,
+                    >,
+                    driver: &__D,
+                    inputs: &[#ryft::ReferenceDischargeValue<
+                        __ParentContext,
+                        __ReferenceDischargePolicy,
+                    >],
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<#ryft::ReferenceDischargeValue<
+                        __ParentContext,
+                        __ReferenceDischargePolicy,
+                    >>,
+                    #ryft::ProgramError,
+                > {
+                    match self {
+                        #(#discharge_arms)*
                     }
                 }
             }
@@ -2359,7 +2478,7 @@ mod tests {
     fn test_operation_parser_extract_attributes() {
         let generator = extract_attributes(quote! {
             #[ryft(crate = "wrapped::ryft")]
-            #[ryft(dispatch(batching, differentiation, transposition))]
+            #[ryft(dispatch(discharge, batching, differentiation, transposition))]
             enum Operation<V: Value<Type = DataType>> {
                 Zero(ZeroOperation<DataType>),
             }
@@ -2369,6 +2488,7 @@ mod tests {
         assert_eq!(generator.operation_type.as_ref().unwrap().to_token_stream().to_string(), "DataType");
         let dispatchers = generator.dispatchers.unwrap_or_default();
         assert!(dispatchers.batching);
+        assert!(dispatchers.discharge);
         assert!(dispatchers.differentiation);
         assert!(dispatchers.transposition);
 
@@ -2402,16 +2522,18 @@ mod tests {
         assert!(generator.errors.is_empty());
         let dispatchers = generator.dispatchers.unwrap_or_default();
         assert!(!dispatchers.batching);
+        assert!(!dispatchers.discharge);
         assert!(!dispatchers.differentiation);
         assert!(!dispatchers.transposition);
     }
 
     #[test]
     fn test_operation_parser_extract_dispatchers() {
-        for (dispatcher, batching, differentiation, transposition) in [
-            (quote!(batching), true, false, false),
-            (quote!(differentiation), false, true, false),
-            (quote!(transposition), false, false, true),
+        for (dispatcher, batching, discharge, differentiation, transposition) in [
+            (quote!(batching), true, false, false, false),
+            (quote!(discharge), false, true, false, false),
+            (quote!(differentiation), false, false, true, false),
+            (quote!(transposition), false, false, false, true),
         ] {
             let generator = extract_attributes(quote! {
                 #[ryft(dispatch(#dispatcher))]
@@ -2422,6 +2544,7 @@ mod tests {
             assert!(generator.errors.is_empty());
             let dispatchers = generator.dispatchers.unwrap_or_default();
             assert_eq!(dispatchers.batching, batching);
+            assert_eq!(dispatchers.discharge, discharge);
             assert_eq!(dispatchers.differentiation, differentiation);
             assert_eq!(dispatchers.transposition, transposition);
         }
@@ -2432,7 +2555,11 @@ mod tests {
         let cases = [
             (quote!(#[ryft(crate = "ryft", unknown = "value")]), "invalid '#[ryft(...)]' attribute: 'unknown'"),
             (quote!(#[ryft(dispatch())]), "must select at least one dispatcher"),
-            (quote!(#[ryft(dispatch(lowering))]), "invalid '#[ryft(dispatch(...))]' dispatcher: 'lowering'"),
+            (
+                quote!(#[ryft(dispatch(lowering))]),
+                "invalid '#[ryft(dispatch(...))]' dispatcher: 'lowering'; only 'batching', 'discharge', \
+                 'differentiation', and 'transposition' are supported here",
+            ),
             (quote!(#[ryft(dispatch(batching, batching))]), "duplicate ryft dispatcher 'batching'"),
             (
                 quote!(#[ryft(dispatch(batching))] #[ryft(dispatch(transposition))]),
@@ -2812,7 +2939,7 @@ mod tests {
     fn test_operation_generates_composite_member_dispatchers() {
         let mut input: syn::DeriveInput = syn::parse_quote! {
             #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
-            #[ryft(dispatch(batching, differentiation, transposition))]
+            #[ryft(dispatch(discharge, batching, differentiation, transposition))]
             enum CompositeOperation<A: Value<Type = ArrayType>> {
                 #[ryft(projected(ArrayType))]
                 Array(ArrayOperation<A>),
@@ -2851,6 +2978,22 @@ mod tests {
         assert!(generated.contains("MemberDifferentiableOperation<__DifferentiationContext>>::jvp_in_parent"));
         assert!(generated.contains("transpose_mixed_operation(context,operation,inputs,outputs)"));
         assert!(generated.contains("NativeOperation<ArrayIrType>asryft::Operation>::infer_output_types"));
+
+        // Reference discharge delegates only native payloads. Every member payload, computational or structural,
+        // replays the complete enum through the reference-free replay path instead.
+        assert!(generated.contains(
+            "ReferenceDischargeableOperation<__ParentContext,__ReferenceDischargePolicy,>>::discharge_references\
+             (operation,context,driver,inputs)",
+        ));
+        assert!(
+            generated
+                .contains("Self::Array(..)=>{ryft::discharge_reference_free_operation(self,context,driver,inputs)}",)
+        );
+        assert!(
+            generated.contains(
+                "Self::Collective(..)=>{ryft::discharge_reference_free_operation(self,context,driver,inputs)}",
+            )
+        );
 
         // The structural mixed role keeps the shared mixed base, interpretation, batching, and transposition dispatch
         // while replacing only the forward-mode arm with a generated primal plus member zero tangent over the same

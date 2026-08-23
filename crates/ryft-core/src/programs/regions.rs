@@ -1166,12 +1166,12 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for EmptyRegionD
 
 /// Opaque evidence that a [`Value::validate_eager_replay`] preflight already covered a complete region closure. Ryft's
 /// checked replay roots (i.e., [`Program::interpret_in_context`] and [`RegionRef::interpret_in_context`]) run that
-/// whole-closure preflight once, before anything executes, and then thread this token through their nested replay
-/// drivers so that nested regions are not revalidated. Skipping revalidation is not merely an optimization. A nested
-/// region that receives parent-created references as inputs is valid only in the context of its root, and revalidating
-/// it in isolation would misclassify those references as external roots. Therefore, the token has no public constructor
-/// and is not cloneable. Downstream code can propagate evidence it received from a checked root but cannot forge it to
-/// bypass the preflight.
+/// preflight once at the root boundary, before anything executes, and then thread this token through their nested
+/// replay drivers so that nested regions are not revalidated. Skipping revalidation is not merely an optimization.
+/// A nested region that receives parent-created references as inputs is valid only in the context of its root, and
+/// revalidating it in isolation would misclassify those references as external roots. Therefore, the token has no
+/// public constructor and is not cloneable. Downstream code can propagate evidence it received from a checked root
+/// but cannot forge it to bypass the preflight.
 #[derive(Debug)]
 pub struct EagerReplayValidation {
     /// Private field preventing downstream construction.

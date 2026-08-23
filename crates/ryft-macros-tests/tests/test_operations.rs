@@ -4,7 +4,7 @@
 //! macro tests focused on generated code rather than on the current `ryft-core` implementation details. The fixtures
 //! and tests are grouped and ordered by the traits the derives generate: [`Operation`] together with its
 //! [`InterpretableOperation`] and [`PartiallyEvaluatableOperation`] companions, then [`BatchableOperation`],
-//! [`DifferentiableOperation`], and [`TransposableOperation`].
+//! [`ReferenceDischargeableOperation`], [`DifferentiableOperation`], and [`TransposableOperation`].
 
 #![allow(private_interfaces, dead_code)]
 
@@ -2815,9 +2815,169 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     );
 }
 
+/// Stand-in for `ryft_core::ReferenceDischargePolicy`. The generated dispatcher never inspects a policy's alias
+/// mechanics, so the stand-in keeps only the destination-domain parameter that every discharge signature threads.
+trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + std::fmt::Debug {}
+
+/// Reference universe policy used by the discharge fixtures. These fixtures observe dispatch only, so one policy
+/// serves every destination domain.
+#[derive(Copy, Clone, Debug)]
+struct TestReferenceDischargePolicy;
+
+impl<C: Domain> ReferenceDischargePolicy<C> for TestReferenceDischargePolicy {}
+
+/// Stand-in for `ryft_core::ReferenceDischargeValue`. A label naming the rule that produced a carrier suffices to
+/// observe dispatch. The manual trait implementations avoid bounding the destination context, which is instantiated
+/// at the `Debug`-less stand-in contexts.
+struct ReferenceDischargeValue<C: Domain, P: ReferenceDischargePolicy<C>> {
+    label: &'static str,
+    marker: PhantomData<fn() -> (C, P)>,
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeValue<C, P> {
+    fn labeled(label: &'static str) -> Self {
+        Self { label, marker: PhantomData }
+    }
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> std::fmt::Debug for ReferenceDischargeValue<C, P> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label)
+    }
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> PartialEq for ReferenceDischargeValue<C, P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label
+    }
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> Eq for ReferenceDischargeValue<C, P> {}
+
+/// Stand-in for `ryft_core::ReferenceDischargeContext`. Mirrors the real context's destination-context accessor,
+/// through which every rule binds its rewritten work.
+struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> {
+    parent: C,
+    policy: PhantomData<fn() -> P>,
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> {
+    fn parent(&self) -> &C {
+        &self.parent
+    }
+}
+
+/// Stand-in for `ryft_core::ReferenceDischargeDriver`.
+trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>: RegionDriver<C::Value, C::Operation> {}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> for EmptyRegionDriver {}
+
+/// Stand-in for `ryft_core::ReferenceDischargeableOperation`.
+trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+    where
+        Self: Operation<Type = C::Type>;
+}
+
+/// Replays one reference-free operation verbatim, mirroring the call shape of
+/// `ryft_core::discharge_reference_free_operation` rather than its region handling. The produced carrier is labeled
+/// with the replayed operation's name, which makes a fallback arm distinguishable from a payload rule's own result.
+fn discharge_reference_free_operation<C, P, O, D>(
+    operation: &O,
+    context: &ReferenceDischargeContext<C, P>,
+    driver: &D,
+    inputs: &[ReferenceDischargeValue<C, P>],
+) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+where
+    C: Context<Operation: From<O>>,
+    P: ReferenceDischargePolicy<C>,
+    O: Clone + Operation<Type = C::Type>,
+    D: ReferenceDischargeDriver<C, P>,
+{
+    if driver.region_count() != 0 {
+        return Err(ProgramError);
+    }
+    let _ = (context.parent(), inputs, C::Operation::from(operation.clone()));
+    Ok(vec![ReferenceDischargeValue::labeled(operation.name())])
+}
+
+impl<T: Type, C: Domain<Type = T>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+    for ZeroOperation<T>
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        _context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        _inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        Ok(vec![ReferenceDischargeValue::labeled("zero_rule")])
+    }
+}
+
+impl<T: Type, Constant: Clone, C: Domain<Type = T>, P: ReferenceDischargePolicy<C>>
+    ReferenceDischargeableOperation<C, P> for ConstantOperation<T, Constant>
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        _context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        _inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        Ok(vec![ReferenceDischargeValue::labeled("constant_rule")])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(
+    crate = "crate",
+    type = ProjectedProgramType,
+    constant = ProjectedProgramValue<A>,
+)]
+#[ryft(dispatch(discharge))]
+enum DischargeableProjectedOperation<A: Value<Type = ProjectedMemberType<0>>> {
+    Constant(ConstantOperation<ProjectedProgramType, ProjectedProgramValue<A>>),
+
+    #[ryft(projected(ProjectedMemberType<0>))]
+    First(ProjectedMemberOperation<0>),
+}
+
+#[test]
+fn test_operation_generates_reference_discharge_dispatch() {
+    type Value = ProjectedProgramValue<ProjectedMemberValue<0>>;
+    type Operation = DischargeableProjectedOperation<ProjectedMemberValue<0>>;
+
+    let context = ReferenceDischargeContext::<EagerContext<Value, Operation>, TestReferenceDischargePolicy> {
+        parent: EagerContext { marker: PhantomData },
+        policy: PhantomData,
+    };
+
+    // A composite-native variant delegates to its payload's own discharge rule.
+    let constant = Operation::from(ConstantOperation {
+        value: ProjectedProgramValue::First(ProjectedMemberValue(3)),
+        marker: PhantomData,
+    });
+    assert_eq!(
+        constant.discharge_references(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ReferenceDischargeValue::labeled("constant_rule")],
+    );
+
+    // A member variant has no composite-context discharge rule, so the complete enum replays verbatim through the
+    // reference-free replay fallback, which needs no projected payload rule at all.
+    let first = Operation::from(ProjectedMemberOperation::<0>);
+    assert_eq!(
+        first.discharge_references(&context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ReferenceDischargeValue::labeled("projected")],
+    );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
-#[ryft(dispatch(batching, differentiation, transposition))]
+#[ryft(dispatch(discharge, batching, differentiation, transposition))]
 enum AllDispatcherOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Constant(ConstantOperation<ArrayType, V>),
@@ -2838,6 +2998,15 @@ fn test_operation_generates_all_selected_dispatchers() {
     assert_eq!(
         operation.batch(&batching_context, &EmptyRegionDriver, &[]).unwrap().into_batches(),
         vec![ArrayBatch::labeled("zero")],
+    );
+
+    let discharge_context = ReferenceDischargeContext::<Context, TestReferenceDischargePolicy> {
+        parent: Context { marker: PhantomData },
+        policy: PhantomData,
+    };
+    assert_eq!(
+        operation.discharge_references(&discharge_context, &EmptyRegionDriver, &[]).unwrap(),
+        vec![ReferenceDischargeValue::labeled("zero_rule")],
     );
 
     let differentiated = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();

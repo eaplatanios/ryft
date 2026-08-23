@@ -427,9 +427,11 @@ aliases are unrepresentable rather than merely rejected. There is deliberately n
 as `Write`, matching JAX's `swap_p`) and no `Freeze` mode (`freeze` classifies as `Consume`, a lifetime event that
 also covers a future result-less `free_reference`). View operations attach their ordered coordinate-transform stacks
 to the arrays-owned `ArrayReferenceOperation` contract; the generic `Alias { kind: View }` edge records root
-provenance without making the generic program layer depend on array coordinate descriptors. `ReferenceAnalysis`
-validates and stores the exact composed `ArrayReferenceView` once, and discharge consumes that artifact rather than
-re-resolving view coordinates.
+provenance without making the generic program layer depend on array coordinate descriptors. `ArrayReferenceAnalysis`
+validated and stored the exact composed `ArrayReferenceView` once; the interpreter-style discharge of
+`plan-reference-discharge.md` composes views through its own tracer aliases instead, and the static analysis stack
+(with this plan's preserved-reference kernel mock) was deleted after that rework, to be restored by `plan-pallas.md`
+Phase 6 against the real kernel operation.
 
 The program-level `ReferenceAnalysis` resolves these templates to region-relative canonical roots:
 

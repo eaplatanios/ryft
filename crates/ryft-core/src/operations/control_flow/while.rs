@@ -932,7 +932,9 @@ where
 // merely reads still occupies a carry position, because dropping it would leave the body's boundary disagreeing with
 // the condition's. The one asymmetry is forced by the operation's own contract — the condition returns only a
 // predicate, so it receives the entering state and publishes none, which is also why a mutating condition is rejected
-// rather than widened.
+// rather than widened. A carry that partial reference discharge *preserved* keeps its declared position on every one
+// of those boundaries and widens nothing at all: it enters as the reference the caller already holds, its accesses
+// replay inside the regions as the operations the source performed, and it publishes no successor.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for WhileOperation<T>
 where
     T: Type,
@@ -972,10 +974,9 @@ where
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. This is the same threaded set the shared positional rewrite builds.
-        let threaded =
-            summary.accessed().chain(summary.output_roots().iter().copied().flatten()).collect::<BTreeSet<_>>();
-        context.validate_threaded_roots(threaded.iter().copied(), name)?;
+        // resolve. This is the same threaded set the shared positional rewrite builds, and it excludes the carries
+        // that survive as references: those occupy their declared carry positions as the references they already are.
+        let threaded = context.threaded_state_roots(&summary, name)?;
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
         let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
         let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
@@ -1023,7 +1024,7 @@ where
 
         let mut operands = Vec::with_capacity(inputs.len() + entering.len());
         for input in inputs {
-            operands.push(context.operand_state(input)?);
+            operands.push(context.operand_value(input)?);
         }
         for root in &entering {
             operands.push(context.discharged_state(*root)?);
@@ -1037,15 +1038,18 @@ where
 
         // A symmetric boundary returns a successor state for every carried root, including ones the loop only read,
         // so the merge records a mutation exactly where the summary saw one. Marking a read-only carry as written
-        // would publish a hidden final-state output for a root the program never writes.
+        // would publish a hidden final-state output for a root the program never writes. A carry that survives as a
+        // reference came back out as the same reference and has no state to merge.
         let mut results = Vec::with_capacity(inputs.len());
         for (position, output) in outputs.into_iter().enumerate() {
             match carries.get(position).copied().flatten() {
                 Some(root) => {
-                    context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                    if threaded.contains(&root) {
+                        context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                    }
                     results.push(inputs[position].clone());
                 }
-                None if position < inputs.len() => results.push(ReferenceDischargeValue::Pure(output)),
+                None if position < inputs.len() => results.push(ReferenceDischargeValue::Ordinary(output)),
                 None => {
                     let root = entering[position - inputs.len()];
                     context.merge_discharged_state(root, output, summary.is_mutated(root))?;

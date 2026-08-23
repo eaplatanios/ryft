@@ -105,7 +105,7 @@ impl ArrayReferenceViewTransform {
         match self {
             Self::Index { axis, index } => {
                 let shape = input.static_shape().ok_or_else(|| {
-                    TypeError::invalid(format!("reference indexing requires a static referent type but got `{input}`",))
+                    TypeError::invalid(format!("reference indexing requires a static referent type but got `{input}`"))
                 })?;
                 if *axis >= shape.rank() {
                     return Err(TypeError::invalid(format!(
@@ -135,7 +135,7 @@ impl ArrayReferenceViewTransform {
             }
             Self::Slice { axes } => {
                 let shape = input.static_shape().ok_or_else(|| {
-                    TypeError::invalid(format!("reference slicing requires a static referent type but got `{input}`",))
+                    TypeError::invalid(format!("reference slicing requires a static referent type but got `{input}`"))
                 })?;
                 if axes.len() != shape.rank() {
                     return Err(TypeError::invalid(format!(
@@ -314,9 +314,8 @@ impl ArrayReferenceView {
     where
         A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
     {
-        let intermediates = self.intermediates(root)?;
-        let old = intermediates.last().unwrap().clone();
-        let reconstructed = self.reconstruct(intermediates.as_slice(), replacement)?;
+        let (old, reconstructed) =
+            self.swap_in(&mut EagerViewCarrier(PhantomData), root.clone(), replacement.clone())?;
         Ok((reconstructed, old))
     }
 
@@ -354,20 +353,21 @@ impl ArrayReferenceView {
         Ok(reconstructed)
     }
 
-    /// Materializes each parent-to-child eager snapshot once for update reconstruction.
-    fn intermediates<A>(&self, root: &A) -> Result<Vec<A>, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice,
-    {
-        self.intermediates_in(&mut EagerViewCarrier(PhantomData), root.clone())
-    }
+    /// Replaces this view's selected coordinates through `carrier`, returning their previous snapshot plus the
+    /// reconstructed root, so that the eager swap and the discharge-time replacement share one traversal.
+    pub(crate) fn swap_in<C: ViewWriteCarrier<Value: Clone>>(
+        &self,
+        carrier: &mut C,
+        root: C::Value,
+        replacement: C::Value,
+    ) -> Result<(C::Value, C::Value), ProgramError> {
+        let intermediates = self.intermediates_in(carrier, root)?;
 
-    /// Reconstructs an eager root from precomputed view intermediates and a replacement leaf.
-    fn reconstruct<A>(&self, intermediates: &[A], replacement: &A) -> Result<A, ProgramError>
-    where
-        A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice,
-    {
-        self.reconstruct_in(&mut EagerViewCarrier(PhantomData), intermediates, replacement.clone())
+        // The traversal always pushes the root itself first, so the chain is never empty and its last snapshot is
+        // the value this view selects.
+        let previous = intermediates.last().unwrap().clone();
+        let reconstructed = self.reconstruct_in(carrier, intermediates.as_slice(), replacement)?;
+        Ok((previous, reconstructed))
     }
 }
 
@@ -375,8 +375,8 @@ impl ArrayReferenceView {
 ///
 /// The root-to-view push-forward and the reverse update-slice reconstruction each exist exactly once, on
 /// [`ArrayReferenceView`], generically over this carrier: the eager carrier operates on concrete values with the
-/// array-manipulation capabilities, while reference discharge stages the identical instruction sequence into a
-/// program builder. Keeping one traversal guarantees the staged and eager semantics cannot drift apart.
+/// array-manipulation capabilities, while reference discharge binds the identical operation sequence through its
+/// destination context. Keeping one traversal guarantees the staged and eager semantics cannot drift apart.
 pub(crate) trait ViewReadCarrier {
     /// Value representation carried through the traversal.
     type Value;
@@ -551,15 +551,21 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             return self.root.update_with(|current| current.add(update));
         }
         self.root.update_with(|current| {
-            let intermediates = self.view.intermediates(current)?;
-            let current_view = intermediates.last().unwrap();
-            let updated_view = current_view.add(update)?;
+            let mut carrier = EagerViewCarrier(PhantomData);
+            let intermediates = self.view.intermediates_in(&mut carrier, current.clone())?;
+            let updated_view = intermediates.last().unwrap().add(update)?;
             self.validate_view_referent_type(&updated_view)?;
-            self.view.reconstruct(intermediates.as_slice(), &updated_view)
+            self.view.reconstruct_in(&mut carrier, intermediates.as_slice(), updated_view)
         })
     }
 
-    /// Consumes a root handle, rejecting every derived view without changing shared state.
+    /// Consumes the referenced root, invalidating its complete alias family, and rejects a derived view without
+    /// changing shared state.
+    ///
+    /// This takes the handle by shared borrow while the value-level [`FreezeReference`](crate::FreezeReference)
+    /// capability above it takes one by value. The asymmetry is mechanical rather than semantic: the composite
+    /// implementation reaches this handle through a projection of its owned value, which yields a borrow, and the
+    /// linearity the capability enforces is already enforced one layer up.
     pub fn freeze(&self) -> Result<A, ProgramError> {
         if !self.view.is_root() {
             return Err(ProgramError::custom(ArrayReferenceViewError::CannotFreezeView));

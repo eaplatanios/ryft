@@ -1699,6 +1699,8 @@ where
 // list, in the body's input boundary, and in both output boundaries, and the payload's carry count grows to match.
 // Everything after the prefix is a stacked operand or a per-iteration slice of one and is therefore never a reference.
 // Like `while`, a scan applies no read-only pruning, because a carry position exists in both boundaries or in neither.
+// A carry that partial reference discharge *preserved* stays a declared carry: it keeps its position and its reference
+// type on both boundaries, its accesses replay inside the body, and it publishes no successor.
 impl<Capture, C, P> ReferenceDischargeableOperation<C, P> for ScanOperation<Capture>
 where
     Capture: Value,
@@ -1743,10 +1745,9 @@ where
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. This is the same threaded set the shared positional rewrite builds.
-        let threaded =
-            summary.accessed().chain(summary.output_roots().iter().copied().flatten()).collect::<BTreeSet<_>>();
-        context.validate_threaded_roots(threaded.iter().copied(), name)?;
+        // resolve. This is the same threaded set the shared positional rewrite builds, and it excludes the carries
+        // that survive as references: those occupy their declared carry positions as the references they already are.
+        let threaded = context.threaded_state_roots(&summary, name)?;
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
         let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
         let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
@@ -1787,14 +1788,16 @@ where
 
         let mut operands = Vec::with_capacity(inputs.len() + entering.len());
         for input in carry_operands {
-            operands.push(context.operand_state(input)?);
+            operands.push(context.operand_value(input)?);
         }
         for root in &entering {
             operands.push(context.discharged_state(*root)?);
         }
         for (position, input) in stacked_operands.iter().enumerate() {
             operands.push(
-                input.expect_pure(&format!("an ordinary operand {} of `{name}`", carry_count + position))?.clone(),
+                input
+                    .expect_ordinary(&format!("an ordinary operand {} of `{name}`", carry_count + position))?
+                    .clone(),
             );
         }
         let outputs = context.parent().bind(
@@ -1809,16 +1812,20 @@ where
             if position < carry_count {
                 match carries[position] {
                     Some(root) => {
-                        context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                        // A carry that survives as a reference came back out as the same reference, so there is no
+                        // successor state to merge for it.
+                        if threaded.contains(&root) {
+                            context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                        }
                         results.push(carry_operands[position].clone());
                     }
-                    None => results.push(ReferenceDischargeValue::Pure(output)),
+                    None => results.push(ReferenceDischargeValue::Ordinary(output)),
                 }
             } else if position < carry_count + entering.len() {
                 let root = entering[position - carry_count];
                 context.merge_discharged_state(root, output, summary.is_mutated(root))?;
             } else {
-                results.push(ReferenceDischargeValue::Pure(output));
+                results.push(ReferenceDischargeValue::Ordinary(output));
             }
         }
         Ok(results)

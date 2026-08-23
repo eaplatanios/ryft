@@ -76,9 +76,9 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ///     a monomorphization-time constant, the branch compiles away instead of invoking the no-op default for every
     ///     attached region of every bind.
     ///   - It gates the creation of [`EagerReplayValidation`](crate::EagerReplayValidation) evidence, which lets nested
-    ///     eager replay skip revalidating regions that a whole-closure preflight already covered. Only a family whose
-    ///     preflight actually ran may issue that evidence; staging and transform contexts enforce their own structural
-    ///     legality gates and never produce it.
+    ///     eager replay skip revalidating regions that an enclosing root's preflight already covered. Only a family
+    ///     whose preflight actually ran may issue that evidence; staging and transform contexts enforce their own
+    ///     structural legality gates and never produce it.
     const VALIDATES_EAGER_REPLAY: bool = false;
 
     /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
@@ -156,9 +156,9 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ///
     /// The default accepts every closure and is correct for value universes that cannot carry concrete mutable
     /// resources. A family that admits such resources (e.g., the core array IR with references) must override this
-    /// function with its whole-closure legality checks and set [`Self::VALIDATES_EAGER_REPLAY`] to `true` so that eager
-    /// replay boundaries actually invoke the override. Transform boundaries such as partial evaluation do not call this
-    /// hook. Instead, they enforce their own type- and effect-level gates.
+    /// function with its replay-boundary legality checks and set [`Self::VALIDATES_EAGER_REPLAY`] to `true` so that
+    /// eager replay boundaries actually invoke the override. Transform boundaries such as partial evaluation do not
+    /// call this hook. Instead, they enforce their own type- and effect-level gates.
     ///
     /// This hook is intentionally distinct from [`Self::validate_as_constant`] because constant admissibility is
     /// a local storage property of a value, while this function sees the complete attached-region closure before

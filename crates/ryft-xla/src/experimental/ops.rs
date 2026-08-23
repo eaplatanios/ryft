@@ -15,15 +15,15 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
-    ArrayIrType, ArrayOperation, ArrayReferenceDischargeOperation, ArrayReferenceOperation,
-    ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis,
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CollectiveOperation,
-    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
-    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CustomJvpOperation, CustomVjpOperation,
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    ArrayIrType, ArrayOperation, ArrayReferenceOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform,
+    ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram,
+    BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant,
+    CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
+    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
+    CosOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation,
+    DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
+    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
@@ -34,14 +34,14 @@ use ryft_core::{
     PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
     ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRule, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation,
-    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation,
-    ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation,
-    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
-    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
-    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver,
-    Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation,
-    XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation, ReferenceReadOperation,
+    ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
+    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
+    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
+    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type,
+    TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation,
+    Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -388,30 +388,6 @@ where
 
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
         Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-}
-
-impl<Constant> ArrayReferenceDischargeOperation for XlaOperation<Constant>
-where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    fn reference_discharge_rule(&self) -> ReferenceDischargeRule {
-        // The `Ordinary` fallback is safe for the remaining region-carrying families (`shard_map`, rematerialization,
-        // linear calls, and custom-derivative carriers): discharge rejects any `Ordinary` instruction whose boundary
-        // or attached closure carries reference state before replaying it.
-        match self {
-            Self::NewReference(_) => ReferenceDischargeRule::NewRoot,
-            Self::ReferenceIndex(_) | Self::ReferenceSlice(_) => ReferenceDischargeRule::Alias,
-            Self::ReferenceRead(_) => ReferenceDischargeRule::Read,
-            Self::ReferenceSwap(_) => ReferenceDischargeRule::Replace,
-            Self::ReferenceAddUpdate(_) => ReferenceDischargeRule::Accumulate,
-            Self::FreezeReference(_) => ReferenceDischargeRule::Consume,
-            Self::Condition(_) => ReferenceDischargeRule::Condition,
-            Self::While(_) => ReferenceDischargeRule::While,
-            Self::Scan(operation) => ReferenceDischargeRule::Scan { carry_count: operation.carry_count() },
-            Self::JitCall(_) => ReferenceDischargeRule::Call,
-            _ => ReferenceDischargeRule::Ordinary,
-        }
     }
 }
 
@@ -1362,14 +1338,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceDischargeOperation, ArrayReferenceOperation, ArrayReferenceViewTransform, ArraySliceAxis,
-        ArrayType, AtomId, CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation,
-        CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
-        DynamicBroadcastOperation, Effects, EmptyRegionDriver, FreezeReferenceOperation, InstructionId, LogicalMesh,
-        MaybeZero, MeshAxis, MeshAxisType, MulOperation, NewReferenceOperation, Operation, OutputRegionProvenance,
-        PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceAnalysisError,
-        ReferenceDischarge, ReferenceDischargeRule, ReferenceIndexOperation, ReferenceReadOperation, ReferenceRoot,
+        ArrayReferenceOperation, ArrayReferenceViewTransform, ArraySliceAxis, ArrayType, CaptureReference,
+        CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
+        EmptyRegionDriver, FreezeReferenceOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
+        NewReferenceOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder,
+        ProgramError, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceIndexOperation, ReferenceReadOperation,
         ReferenceSliceOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
         RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
         Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
@@ -1573,64 +1548,6 @@ mod tests {
                 Shape::new(vec![Dimension::Dynamic(target)]),
             ))),
         );
-    }
-
-    #[test]
-    fn test_reference_analysis_rejects_unlifted_reference_capture_metadata() {
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let reference = builder
-            .add_constant(XlaConstant::Captured(CaptureReference::new(3, ArrayIrType::Reference(reference_type))));
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], Vec::new(), vec![Placeholder])
-            .unwrap();
-
-        let error = program.analyze_references(0).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<ReferenceAnalysisError>(),
-            Some(&ReferenceAnalysisError::ReferenceConstant { region: program.entry(), atom: AtomId::new(0) }),
-        );
-    }
-
-    #[test]
-    fn test_reference_analysis_substitutes_nested_jit_call_roots() {
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let reference = callee_builder.add_input(reference_type.clone().into());
-        let value =
-            callee_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
-        let callee = callee_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut middle_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let callee_region = middle_builder.import_region(callee.entry_region_ref());
-        let reference = middle_builder.add_input(reference_type.clone().into());
-        let value = middle_builder
-            .add_instruction(JitCallOperation::new(0), vec![callee_region], vec![reference])
-            .unwrap()[0];
-        let middle = middle_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let middle_region = builder.import_region(middle.entry_region_ref());
-        let reference = builder.add_input(reference_type.into());
-        let value = builder.add_instruction(JitCallOperation::new(0), vec![middle_region], vec![reference]).unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let analysis = program.analyze_references(0).unwrap();
-        let callee_root = ReferenceRoot::RegionInput { region: callee_region, input_index: 0 };
-        let middle_root = ReferenceRoot::RegionInput { region: middle_region, input_index: 0 };
-        let entry_root = ReferenceRoot::RegionInput { region: program.entry(), input_index: 0 };
-        let middle_call = InstructionId::new(middle_region, 0);
-        let entry_call = InstructionId::new(program.entry(), 0);
-        assert_eq!(analysis.region_root_for_source(middle_call, 0, middle_root), Some(callee_root));
-        assert_eq!(analysis.region_root_for_source(entry_call, 0, entry_root), Some(middle_root));
-        assert_eq!(analysis.region_root_for_source(entry_call, 0, middle_root), None);
-        assert_eq!(analysis.accesses()[0].root(), callee_root);
     }
 
     #[test]
@@ -2518,16 +2435,6 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        let analysis = program.analyze_references_with_lifted_captures(0).unwrap();
-        assert_eq!(
-            analysis
-                .instruction_summary(InstructionId::new(program.entry(), 0))
-                .unwrap()
-                .iter()
-                .map(|access| access.root())
-                .collect::<Vec<_>>(),
-            vec![ReferenceRoot::RegionInput { region: program.entry(), input_index: 1 }],
-        );
         let discharged = program.discharge_references_with_lifted_captures(0).unwrap();
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.program().output_count(), 2);
@@ -2573,58 +2480,22 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_rules() {
-        // The `XlaOperation` rule mapping is written arm by arm, so a mis-paired arm would still compile: each
-        // reference operation must classify into its own rule, region carriers must classify into the region-aware
-        // rules, a scan must report its current carry count, a jitted call must classify as a call boundary, and
-        // every other operation family must fall back to `Ordinary`.
-        assert_eq!(
-            XlaOperation::<XlaConstant>::NewReference(NewReferenceOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::NewRoot,
-        );
+    fn test_reference_view_transforms() {
+        // The only reference classification an operation family still declares is which of its members derive a
+        // root-preserving view, and with what coordinates. Everything else the kernel path needs is derived from
+        // `Operation::reference_semantics`, so a family has one declaration to keep honest rather than two.
         let index = XlaOperation::<XlaConstant>::ReferenceIndex(ReferenceIndexOperation::new(0, 1));
-        assert_eq!(index.reference_discharge_rule(), ReferenceDischargeRule::Alias);
-        assert_eq!(index.reference_view_transform(), Some(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }),);
+        assert_eq!(index.reference_view_transform(), Some(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }));
         let axes = vec![ArraySliceAxis::new(1, 2, 1)];
         let slice = XlaOperation::<XlaConstant>::ReferenceSlice(ReferenceSliceOperation::new(axes.clone()));
-        assert_eq!(slice.reference_discharge_rule(), ReferenceDischargeRule::Alias);
-        assert_eq!(slice.reference_view_transform(), Some(ArrayReferenceViewTransform::Slice { axes }),);
+        assert_eq!(slice.reference_view_transform(), Some(ArrayReferenceViewTransform::Slice { axes }));
         assert_eq!(
-            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Read,
+            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation::new()).reference_view_transform(),
+            None,
         );
         assert_eq!(
-            XlaOperation::<XlaConstant>::ReferenceSwap(ReferenceSwapOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Replace,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::ReferenceAddUpdate(ReferenceAddUpdateOperation::new())
-                .reference_discharge_rule(),
-            ReferenceDischargeRule::Accumulate,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::FreezeReference(FreezeReferenceOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Consume,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::Condition(ConditionOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::Condition,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::While(WhileOperation::new()).reference_discharge_rule(),
-            ReferenceDischargeRule::While,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::Scan(ScanOperation::new(2, 4)).reference_discharge_rule(),
-            ReferenceDischargeRule::Scan { carry_count: 2 },
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::JitCall(JitCallOperation::new(0)).reference_discharge_rule(),
-            ReferenceDischargeRule::Call,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::Array(ArrayOperation::Add(AddOperation::new())).reference_discharge_rule(),
-            ReferenceDischargeRule::Ordinary,
+            XlaOperation::<XlaConstant>::NewReference(NewReferenceOperation::new()).reference_view_transform(),
+            None,
         );
     }
 

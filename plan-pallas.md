@@ -6,7 +6,7 @@ kernel language. No phase in this document is implemented merely because a lower
 already exists.
 
 This is a source-sensitive plan. Mosaic and cuTile are evolving, experimental systems, so Phase 0 refreshes the
-non-TPU upstream inventory against the selected OpenXLA, JAX, CUDA, and cuTile revisions; Phase 20 refreshes the TPU
+non-TPU upstream inventory against the selected OpenXLA, JAX, CUDA, and cuTile revisions; Phase 21 refreshes the TPU
 inventory immediately before TPU implementation. Links describe the design snapshot, not an upstream stability
 promise.
 
@@ -17,7 +17,7 @@ promise.
 2. **Finish the non-TPU lower layers first.** Phases 0-5 complete and prove the missing GPU/cuTile
    `ryft-xla-sys`, `ryft-mlir`, and `ryft-pjrt` foundations. No production change in `ryft-core` or `ryft-xla` may
    begin before the Phase 5 gate passes. Every TPU-specific inventory, wrapper, runtime, lowering, test, and
-   qualification task is consolidated in final Phase 20 so Phases 0-19 never require libtpu or TPU hardware.
+   qualification task is consolidated in final Phase 21 so Phases 0-20 never require libtpu or TPU hardware.
 3. **Extend what exists.** `ryft-xla-sys` already links the JAX Mosaic dialects, `ryft-mlir` already wraps substantial
    Mosaic GPU and TPU surfaces, and `ryft-pjrt` already compiles, executes, serializes, and reloads generic MLIR
    programs. The missing work is primarily pinned-surface parity, pass/compiler bridges, target capabilities, artifact
@@ -109,7 +109,7 @@ Target extensions branch after verification of the shared boundary. Mosaic opera
 operation family, and cuTile syntax does not become the common kernel IR.
 
 The core IR is parameterized as `KernelOperation<Extension>`. Portable operations are concrete core variants.
-`ryft-xla` owns the sealed, typed experimental extension enum: Phase 12 introduces its GPU-capable form and Phase 20
+`ryft-xla` owns the sealed, typed experimental extension enum: Phase 13 introduces its GPU-capable form and Phase 21
 adds TPU variants. Every extension operation must provide its complete type, effect, resource, liveness, race,
 transform, and capability contract to the core verifier. Opaque names, strings, or byte payloads are artifact metadata
 only and can never enter a verified kernel body or bypass semantic analysis.
@@ -134,9 +134,13 @@ only and can never enter a verified kernel body or bypass semantic analysis.
 - [`crates/ryft-pjrt`](crates/ryft-pjrt) already supplies generic MLIR/HLO program formats, compile/load/execute,
   asynchronous fences, serialization, topology, memory, stream, FFI, GPU custom-call, Triton, profiling, and
   executable-metadata wrappers.
-- [`crates/ryft-xla/src/experimental/reference_kernels.rs`](crates/ryft-xla/src/experimental/reference_kernels.rs)
-  proves that the roots, views, accesses, liveness, and operation-local aliases from `plan-references.md` can survive
-  inside an explicitly validated kernel boundary.
+- The reference architecture of `plan-references.md` proved that roots, views, accesses, liveness, and operation-local
+  aliases can survive inside an explicitly validated kernel boundary, through a preserved-reference kernel mock
+  (`crates/ryft-xla/src/experimental/reference_kernels.rs`) backed by a whole-closure static `ReferenceAnalysis`.
+  After the interpreter-style discharge rework of `plan-reference-discharge.md`, that analysis stack and the mock were
+  deliberately deleted (they were working-tree-only and were never committed), because discharge validates programs
+  itself and their only remaining consumer was this plan. The restoration phase below rebuilds them against the real
+  kernel operation instead of the mock.
 - `ryft-core` already models `F4E2M1FN`, and `ryft-xla` already lowers and executes a portable block-scaled-dot path.
   That is useful groundwork, but it is not by itself an NVFP4 tensor-core kernel contract.
 - [`crates/experimental/src/jax/gpu_runtime.rs`](crates/experimental/src/jax/gpu_runtime.rs) already prototypes dynamic
@@ -159,7 +163,7 @@ only and can never enter a verified kernel body or bypass semantic analysis.
 - CUDA-plugin linkage and retention for JAX's Mosaic GPU custom-call/runtime registration. Dialect wrappers alone do
   not prove that the `mosaic_gpu_v2` execution target is present in the shipped PJRT plugin.
 - A proven path from hand-authored Mosaic GPU MLIR through the pinned compiler and PJRT plugin to execution, followed
-  by the equivalent TPU proof only in Phase 20.
+  by the equivalent TPU proof only in Phase 21.
 - Architecture and compiler capability discovery with exact prelaunch diagnostics.
 - A versioned generic CUDA kernel artifact/calling-convention contract that can be cached and reloaded through
   existing PJRT/XLA
@@ -173,7 +177,7 @@ only and can never enter a verified kernel body or bypass semantic analysis.
   debugging, profiling, autotuning, examples, and release qualification.
 
 Phase 0 produces a machine-checkable non-TPU manifest that classifies every item as **existing**, **partial**,
-**missing**, or **intentionally unsupported**. Phase 20 produces the separate TPU manifest. No phase may call its
+**missing**, or **intentionally unsupported**. Phase 21 produces the separate TPU manifest. No phase may call its
 owned surface complete without updating the relevant manifest.
 
 ## 5. Semantic model
@@ -402,21 +406,22 @@ built-in plugin, or dynamic launcher route; alternatives are never summed.
 | 3 | `ryft-mlir` compiler dialects, binary IR, and Mosaic GPU | 9,000-15,000 | 4,500-8,000 | 1,500-3,000 |
 | 4 | `ryft-pjrt` Mosaic/cuTile kernel prerequisites | 1,800-3,000 | 1,800-3,000 | 350-600 |
 | 5 | GPU/cuTile lower-layer vertical-slice gate | 0-250 | 1,800-3,000 | 350-600 |
-| 6 | Core kernel types and semantic IR | 1,400-2,200 | 1,200-1,800 | 350-550 |
-| 7 | Grids, block mappings, and bounds | 1,200-1,900 | 1,100-1,700 | 300-500 |
-| 8 | References, scratch, atomics, and sync | 1,600-2,600 | 1,500-2,400 | 400-650 |
-| 9 | Staging, builder, and kernel call | 1,600-2,500 | 1,300-2,100 | 400-650 |
-| 10 | Interpreter, diagnostics, and debugging | 1,100-1,800 | 1,600-2,400 | 350-550 |
-| 11 | Portable primitives and scheduling | 1,500-2,400 | 1,300-2,100 | 350-600 |
-| 12 | XLA dispatch, ABI, cache, and runtime | 1,500-2,400 | 1,200-1,900 | 350-550 |
-| 13 | Mosaic GPU baseline | 1,800-2,900 | 1,500-2,400 | 400-700 |
-| 14 | Hopper/Blackwell Mosaic GPU | 2,300-3,800 | 2,000-3,300 | 500-850 |
-| 15 | cuTile backend | 1,800-3,000 | 1,500-2,500 | 450-750 |
-| 16 | Transforms and composition | 1,400-2,300 | 1,600-2,600 | 400-650 |
-| 17 | Profiling, autotuning, persistence, AOT | 1,500-2,500 | 1,400-2,300 | 400-650 |
-| 18 | Distributed and asynchronous kernels | 1,200-2,000 | 1,200-2,100 | 350-600 |
-| 19 | Non-TPU stabilization and production hardening | 900-1,500 | 2,000-3,200 | 1,200-1,900 |
-| 20 | Consolidated Mosaic TPU support and qualification | 5,300-9,200 | 5,200-8,800 | 1,750-3,000 |
+| 6 | Restore reference analysis and kernel validation | 2,400-3,400 | 3,000-4,500 | 450-700 |
+| 7 | Core kernel types and semantic IR | 1,400-2,200 | 1,200-1,800 | 350-550 |
+| 8 | Grids, block mappings, and bounds | 1,200-1,900 | 1,100-1,700 | 300-500 |
+| 9 | References, scratch, atomics, and sync | 1,600-2,600 | 1,500-2,400 | 400-650 |
+| 10 | Staging, builder, and kernel call | 1,600-2,500 | 1,300-2,100 | 400-650 |
+| 11 | Interpreter, diagnostics, and debugging | 1,100-1,800 | 1,600-2,400 | 350-550 |
+| 12 | Portable primitives and scheduling | 1,500-2,400 | 1,300-2,100 | 350-600 |
+| 13 | XLA dispatch, ABI, cache, and runtime | 1,500-2,400 | 1,200-1,900 | 350-550 |
+| 14 | Mosaic GPU baseline | 1,800-2,900 | 1,500-2,400 | 400-700 |
+| 15 | Hopper/Blackwell Mosaic GPU | 2,300-3,800 | 2,000-3,300 | 500-850 |
+| 16 | cuTile backend | 1,800-3,000 | 1,500-2,500 | 450-750 |
+| 17 | Transforms and composition | 1,400-2,300 | 1,600-2,600 | 400-650 |
+| 18 | Profiling, autotuning, persistence, AOT | 1,500-2,500 | 1,400-2,300 | 400-650 |
+| 19 | Distributed and asynchronous kernels | 1,200-2,000 | 1,200-2,100 | 350-600 |
+| 20 | Non-TPU stabilization and production hardening | 900-1,500 | 2,000-3,200 | 1,200-1,900 |
+| 21 | Consolidated Mosaic TPU support and qualification | 5,300-9,200 | 5,200-8,800 | 1,750-3,000 |
 
 The arithmetic totals and crate split are recorded in §13 after the detailed phases.
 
@@ -430,7 +435,7 @@ The arithmetic totals and crate split are recorded in §13 after the detailed ph
 production edits.
 
 - [ ] Diff the pinned JAX Mosaic GPU TableGen, C API, pass, compiler, serde, and custom-call sources against all local
-      C++, Rust FFI, and typed MLIR wrappers. Defer the equivalent TPU inventory to final Phase 20.
+      C++, Rust FFI, and typed MLIR wrappers. Defer the equivalent TPU inventory to final Phase 21.
 - [ ] Inventory the standard Vector, Math, Complex, UB, Bufferization, Arith, MemRef, SCF, GPU, NVGPU, NVVM, LLVM,
       and conversion surfaces actually traversed by the pinned Mosaic pipelines; distinguish missing dialect coverage
       from operations already wrapped elsewhere.
@@ -504,7 +509,7 @@ existing MLIR C API and `ryft-mlir`.
       pinned source. Keep generic pass construction and diagnostics in `ryft-mlir`.
 - [ ] Expose a standalone target/lowering compiler bridge only if the pinned upstream provides a supported callable
       interface. Otherwise expose and document only the serialized Mosaic-module contract consumed by
-      `mosaic_gpu_v2`; Phase 13 owns StableHLO custom-call construction and backend-configuration policy.
+      `mosaic_gpu_v2`; Phase 14 owns StableHLO custom-call construction and backend-configuration policy.
 - [ ] Return compiled object/PTX/cubin data, entry symbol, launch metadata, required shared/TMEM resources, and compiler
       diagnostics through an owned artifact where the pinned native interface exposes those stages. Otherwise return
       the verified serialized Mosaic module consumed by the linked runtime. Wrap a configuration producer only if
@@ -515,7 +520,7 @@ existing MLIR C API and `ryft-mlir`.
 - [ ] If Phase 0 selects a built-in plugin launcher, add the generic cubin/PTX handler here. If Phase 0 selects the
       dynamic Rust launcher, expose only the minimal stream/context contract it needs and leave promotion to Phase 4.
 - [ ] Keep native/compiler target representations open-ended and ensure CUDA plugin builds do not cap the newest known
-      SM version. PJRT exposes raw device architecture; Phase 12 normalizes Hopper/Blackwell capabilities.
+      SM version. PJRT exposes raw device architecture; Phase 13 normalizes Hopper/Blackwell capabilities.
 - [ ] Preserve the JAX visibility patch only if the pinned source still requires it; delete it when upstream exports
       the necessary targets.
 
@@ -578,7 +583,7 @@ proceed in parallel with typed MLIR completion.
 **Owners:** existing PJRT program, stream, FFI, GPU custom-call, executable-metadata, topology, and profiling modules.
 
 - [ ] Add only raw plugin/device/topology/extension/version and metadata accessors proven missing by the vertical
-      slices. Normalized Mosaic and kernel semantic capabilities belong to `ryft-xla` Phase 12.
+      slices. Normalized Mosaic and kernel semantic capabilities belong to `ryft-xla` Phase 13.
 - [ ] Wrap Pallas-relevant upstream extensions still missing at the selected pin, such as raw-buffer or phase-compile
       support, only when Phase 0 demonstrates that the chosen runtime path needs them.
 - [ ] Extend generic `Program` formats only when Mosaic ingestion requires a format not representable as current MLIR
@@ -590,7 +595,7 @@ proceed in parallel with typed MLIR completion.
 - [ ] If a generic launcher needs an owned descriptor, define only a backend-neutral `CudaKernelArtifact` containing
       cubin/PTX bytes, symbol, target architecture, launch dimensions, immutable parameter/ABI descriptors, resource
       requirements, and ABI schema/version. Per-execution buffers, scalars, and pointers belong to a separate launch
-      call frame. cuTile constraints, versions, tuple flattening, and `cutile_python_v2` translation stay in Phase 15.
+      call frame. cuTile constraints, versions, tuple flattening, and `cutile_python_v2` translation stay in Phase 16.
 - [ ] If the built-in plugin launcher was selected in Phase 2, wrap that one implementation instead and delete the
       experimental dynamic launcher when its tests have migrated.
 - [ ] Preserve event/fence ownership, callback, error, and dropped-handle behavior. Add cancellation or timeouts only
@@ -644,25 +649,66 @@ inspection tooling.
 inspection or qualification tools; fixtures remain test code.
 
 **Exit criterion:** GPU and cuTile lower-layer paths are real, inspectable, repeatable, and safe. If either path fails,
-revise its seam before designing the language around it. TPU remains entirely deferred to Phase 20.
+revise its seam before designing the language around it. TPU remains entirely deferred to Phase 21.
 
-### Phase 6: Add backend-neutral kernel types and semantic IR
+### Phase 6: Restore reference program analysis and kernel validation foundations
 
-**Prerequisites:** Phase 5.
+**Prerequisites:** none within this plan; requires only the completed `plan-reference-discharge.md` architecture
+already in the repository, so it may proceed in parallel with Phases 0-5.
+
+**Owners:** `ryft-core` reference analysis; `ryft-xla` experimental kernel validation.
+
+The interpreter-style discharge rework deleted the static reference-analysis stack — the generic whole-closure
+`ReferenceAnalysis` (`crates/ryft-core/src/programs/references/analysis.rs`), the array-view overlay
+`ArrayReferenceAnalysis` (`crates/ryft-core/src/arrays/reference_analysis.rs`), and the preserved-reference kernel
+validator mock (`crates/ryft-xla/src/experimental/reference_kernels.rs`) — because after that rework its only live
+production consumer was an entry-boundary fact (now an inline scan in the eager replay preflight) and its remaining
+purpose was this plan's kernel work. The deleted files were never committed, so restoration re-implements against the
+contracts recorded in `plan-references.md` (and approximate transcript-recovered copies archived at deletion time)
+rather than reverting a commit.
+
+- [ ] Rebuild the generic `ReferenceAnalysis`: root/alias/access resolution, capture scopes, region-input bindings,
+      region-output forwarding, transitive instruction summaries, and lifetime/second-class boundary validation over
+      complete region closures (condition, while, scan, and call-like operations).
+- [ ] Rebuild the array-view overlay (`ArrayReferenceAnalysis`) deriving each validated root-relative
+      `ArrayReferenceView` from the generic alias edges exactly once.
+- [ ] Rebuild kernel-body validation on that analysis — second-class boundaries, declared access modes, liveness, and
+      per-root alias/view maps for lowering — targeting the real kernel operation of the phases below rather than the
+      deleted mock.
+- [ ] Keep the three-rung prevention ladder (trace time, eager runtime, discharge) as the default for non-kernel
+      paths; reconnect the eager replay preflight to whole-closure validation only if kernel work demonstrates the
+      entry-boundary scan is insufficient.
+
+**Tests/docs:** restore the analysis test corpus (roots/aliases/accesses, capture scopes, nested-region root
+substitution, and error diagnostics) and the kernel-boundary validation suites; document the analysis as kernel-owned
+validation infrastructure rather than a standing whole-program lint.
+
+**Excludes:** kernel types themselves (next phase) and any change to discharge, which remains the authority for
+staged reference rewriting.
+
+**Estimate:** production 2,400-3,400; tests 3,000-4,500; docs 450-700.
+
+**Exit criterion:** a region closure containing references can again be statically analyzed for roots, aliases,
+accesses, and lifetimes, with the kernel validator consuming that analysis, and no mandatory lint reintroduced into
+any non-kernel path.
+
+### Phase 7: Add backend-neutral kernel types and semantic IR
+
+**Prerequisites:** Phases 5-6.
 
 **Owners:** new or existing kernel-owned modules in `ryft-core`; no target dialect dependency.
 
 - [ ] Promote the proven experimental boundary into a backend-neutral higher-order `KernelCallOperation` and region.
 - [ ] Define grid, parameter, static-argument, access, alias, scratch, source-location, capability-requirement, and
       compiler-policy types without backend-specific fields.
-- [ ] Reuse `ArrayType`, `ReferenceType`, `ArrayReferenceView`, `ReferenceAnalysis`, effects, identities, and parameter
-      structures rather than copying them.
+- [ ] Reuse `ArrayType`, `ReferenceType`, `ArrayReferenceView`, the Phase 6 restored `ReferenceAnalysis`, effects,
+      identities, and parameter structures rather than copying them.
 - [ ] Define kernel-specific effect/resource classes for memory, async operations, barriers, and atomics while keeping
       ordinary program effect semantics intact.
 - [ ] Specify deterministic display, hashing, equality, identity renaming, refinement, serialization eligibility, and
       source schema version.
 - [ ] Parameterize the kernel operation family over a typed extension contract. The initial portable API uses no
-      extensions; Phase 12 supplies a sealed experimental `ryft-xla` enum whose variants declare full type, effect,
+      extensions; Phase 13 supplies a sealed experimental `ryft-xla` enum whose variants declare full type, effect,
       resource, liveness, race, transform, capability, and deterministic target-simulation semantics. Reject opaque
       extension payloads in verified bodies.
 
@@ -676,9 +722,9 @@ root/view/access reuse, no target enum leakage, and compile-fail examples for es
 **Exit criterion:** a kernel is a first-class staged operation with a stable semantic identity but no backend or
 runtime assumptions in its core types.
 
-### Phase 7: Add grids, block mappings, indexing, and bounds
+### Phase 8: Add grids, block mappings, indexing, and bounds
 
-**Prerequisites:** Phase 6.
+**Prerequisites:** Phase 7.
 
 **Owners:** `ryft-core` kernel modules and array indexing utilities.
 
@@ -701,12 +747,11 @@ specialization keys.
 **Exit criterion:** every operand window and boundary behavior is statically described or explicitly masked before a
 kernel body executes.
 
-### Phase 8: Complete references, scratch, atomics, and synchronization
+### Phase 9: Complete references, scratch, atomics, and synchronization
 
-**Prerequisites:** Phases 6-7.
+**Prerequisites:** Phases 7-8.
 
-**Owners:** `ryft-core` kernel verifier and operations; removal of the superseded
-`crates/ryft-xla/src/experimental/reference_kernels.rs` mock is coordinated with Phase 12.
+**Owners:** `ryft-core` kernel verifier and operations.
 
 - [ ] Add scoped uninitialized/initialized scratch allocation with memory-space, shape, layout eligibility, alignment,
       lifetime, and non-escape validation.
@@ -719,8 +764,9 @@ kernel body executes.
 - [ ] Add root/view overlap and race analysis for common affine block mappings.
 - [ ] Preserve dead swap-result store optimization only when old contents and untouched root elements are provably
       unnecessary.
-- [ ] Mark the Phase 12 work in `plan-references.md` as superseded by this production contract; delete its mock-only
-      eligibility scaffolding in Phase 12 after all in-repo users move atomically.
+- [ ] Mark the preserved-reference boundary work in `plan-references.md` as superseded by this production contract.
+      Its `reference_kernels.rs` mock was already deleted when the interpreter-style discharge landed, so no
+      mock-removal coordination remains.
 
 **Tests/docs:** all access modes; write-only full-output initialization and publication; ordered repeated stores;
 empty-grid/nonempty-output rejection; uninitialized reads; partial writes; escape/use-after-scope; sibling views;
@@ -732,11 +778,11 @@ masked accesses; atomic contract tests; token linearity; statically provable asy
 
 **Exit criterion:** the verifier defines and enforces the decidable static memory, initialization, atomic, resource,
 and synchronization contract, and rejects programs outside its proof subset. Dynamic interleaving, deadlock, and
-execution conformance become executable acceptance criteria in Phase 10.
+execution conformance become executable acceptance criteria in Phase 11.
 
-### Phase 9: Add staging, builders, and the public kernel-call surface
+### Phase 10: Add staging, builders, and the public kernel-call surface
 
-**Prerequisites:** Phases 6-8.
+**Prerequisites:** Phases 7-9.
 
 **Owners:** `ryft-core` compilation/tracing/operations plus the `ryft` facade after stabilization.
 
@@ -745,7 +791,7 @@ execution conformance become executable acceptance criteria in Phase 10.
 - [ ] Infer parameter trees, result trees, aliases, source locations, and static specialization constraints.
 - [ ] Add user-facing load/store/indexing sugar only over the canonical operations; no second semantic path.
 - [ ] Seal regions atomically after validation and preserve exact diagnostics through nested helper calls.
-- [ ] Keep the surface experimental and out of broad crate-root exports until Phase 19.
+- [ ] Keep the surface experimental and out of broad crate-root exports until Phase 20.
 
 **Tests/docs:** parameter structures, closures/captures, static arguments, malformed return trees, alias inference,
 source spans, staged/eager parity, compile-fail restrictions, and concise kernel examples.
@@ -756,9 +802,9 @@ source spans, staged/eager parity, compile-fail restrictions, and concise kernel
 
 **Exit criterion:** users can express and stage the supported language with typed, deterministic IR and diagnostics.
 
-### Phase 10: Build the semantic interpreter and debugging model
+### Phase 11: Build the semantic interpreter and debugging model
 
-**Prerequisites:** Phases 6-9.
+**Prerequisites:** Phases 7-10.
 
 **Owners:** `ryft-core` interpreter and test utilities; thin `ryft-xla` debug integration later.
 
@@ -780,9 +826,9 @@ and tutorial debugging workflows. Target barrier/deadlock simulation belongs to 
 **Exit criterion:** every portable kernel has an accelerator-independent executable specification suitable for
 backend conformance testing.
 
-### Phase 11: Complete portable value operations and scheduling contracts
+### Phase 12: Complete portable value operations and scheduling contracts
 
-**Prerequisites:** Phases 6-10.
+**Prerequisites:** Phases 7-11.
 
 **Owners:** `ryft-core` portable kernel operations and schedule metadata.
 
@@ -794,7 +840,7 @@ backend conformance testing.
 - [ ] Canonicalize and DCE pure work while retaining effects and all live target resources.
 - [ ] Validate operation-specific precision, rounding, saturation, and accumulator behavior.
 - [ ] Establish a backend-lowering trait only after the GPU and cuTile prototypes demonstrate its minimal common
-      needs. Phase 20 must extend that contract only for concrete TPU requirements, not speculative universality.
+      needs. Phase 21 must extend that contract only for concrete TPU requirements, not speculative universality.
 
 **Tests/docs:** exact inference, folding, liveness, schedule validation, numerical edge cases, block scaling, and
 interpreter equivalence for representative kernels.
@@ -806,9 +852,9 @@ interpreter equivalence for representative kernels.
 **Exit criterion:** the portable subset can describe useful kernels and all result-preserving schedule hints can be
 erased without changing results; target execution-agent and synchronization contracts remain intact.
 
-### Phase 12: Integrate kernel dispatch, ABI, caching, and execution in `ryft-xla`
+### Phase 13: Integrate kernel dispatch, ABI, caching, and execution in `ryft-xla`
 
-**Prerequisites:** Phases 5-11.
+**Prerequisites:** Phases 5-12.
 
 **Owners:** `ryft-xla` experimental operation family, lowering, compilation domains, JIT facade, persistence.
 
@@ -835,11 +881,11 @@ corruption, dropped execution, replacement mismatch, and reference-kernel intera
 
 **Exit criterion:** a verified kernel has deterministic ABI/configuration serialization, backend dispatch, cache
 identity, persistence validation, and host-asynchronous fence plumbing, demonstrated with a mock or hand-authored
-lower-layer artifact. Production lowering and device execution begin in Phase 13.
+lower-layer artifact. Production lowering and device execution begin in Phase 14.
 
-### Phase 13: Implement the Mosaic GPU baseline
+### Phase 14: Implement the Mosaic GPU baseline
 
-**Prerequisites:** Phases 5-12.
+**Prerequisites:** Phases 5-13.
 
 **Owners:** `ryft-xla` Mosaic GPU lowerer using `ryft-mlir` typed APIs.
 
@@ -864,9 +910,9 @@ errors, and vector/reduction/matmul examples.
 **Exit criterion:** representative portable kernels execute correctly through Mosaic GPU on the baseline supported
 architecture with inspectable code generation.
 
-### Phase 14: Add advanced Hopper and Blackwell Mosaic GPU support
+### Phase 15: Add advanced Hopper and Blackwell Mosaic GPU support
 
-**Prerequisites:** Phase 13.
+**Prerequisites:** Phase 14.
 
 **Owners:** `ryft-xla` Mosaic GPU target extensions, schedules, capability tables, qualification tests.
 
@@ -894,9 +940,9 @@ the baseline backend.
 **Exit criterion:** portable and explicit advanced GPU kernels use the intended hardware instructions with correct
 ordering and numerics, and fail exactly elsewhere.
 
-### Phase 15: Implement the optional Ryft-to-cuTile compiler backend
+### Phase 16: Implement the optional Ryft-to-cuTile compiler backend
 
-**Prerequisites:** Phases 4-5, Phase 11, Phase 12, and a still-supported Phase 0 seam.
+**Prerequisites:** Phases 4-5, Phase 12, Phase 13, and a still-supported Phase 0 seam.
 
 **Owners:** isolated `ryft-xla` cuTile backend/tool driver plus existing PJRT/XLA custom-call launch path.
 
@@ -906,7 +952,7 @@ ordering and numerics, and fail exactly elsewhere.
       arbitrary target-specific Mosaic operations.
 - [ ] Compile in an isolated, cancellable, time-limited build-time process and export a `cutile_python_v2` cubin and
       manifest for the exact target GPU.
-- [ ] Emit and validate a cuTile-owned manifest translated into the generic Phase 12 artifact schema:
+- [ ] Emit and validate a cuTile-owned manifest translated into the generic Phase 13 artifact schema:
       pointer/shape/stride argument expansion, static-shape
       constraints, constants, tuples, symbol mangling, alignment, no-alias requirements, grid, and compiler hints.
 - [ ] Execute through the one Phase 4 stream/custom-call launcher, retain compiler logs, and keep the runtime
@@ -927,10 +973,10 @@ uncertainty.
 **Exit criterion:** supported portable kernels compile ahead of time and execute through cuTile with a versioned,
 auditable, Python-free runtime artifact; unsupported kernels fail before tool invocation.
 
-### Phase 16: Add transforms, composition, and sharding
+### Phase 17: Add transforms, composition, and sharding
 
-**Prerequisites:** Phase 12 plus the selected non-TPU backend: Phase 13 for Mosaic GPU or Phase 15 for cuTile. Phase 14
-is required only for transforms over advanced GPU target extensions. TPU transform work remains in Phase 20.
+**Prerequisites:** Phase 13 plus the selected non-TPU backend: Phase 14 for Mosaic GPU or Phase 16 for cuTile. Phase 15
+is required only for transforms over advanced GPU target extensions. TPU transform work remains in Phase 21.
 
 **Owners:** `ryft-core` transform rules and `ryft-xla` backend legality.
 
@@ -953,10 +999,10 @@ partial specialization, control-flow sequencing, shard-map execution, and exact 
 **Exit criterion:** every public transform and higher-order composition has one proven rule or one early exact
 rejection, with no accidental effect duplication.
 
-### Phase 17: Add profiling, autotuning, persistence, and AOT workflows
+### Phase 18: Add profiling, autotuning, persistence, and AOT workflows
 
-**Prerequisites:** Phase 12 plus the participating non-TPU backend: Phase 13 for Mosaic GPU or Phase 15 for cuTile.
-Phase 14 metadata is required only when profiling or persisting advanced GPU extensions; TPU work stays in Phase 20.
+**Prerequisites:** Phase 13 plus the participating non-TPU backend: Phase 14 for Mosaic GPU or Phase 16 for cuTile.
+Phase 15 metadata is required only when profiling or persisting advanced GPU extensions; TPU work stays in Phase 21.
 
 **Owners:** `ryft-xla` compilation/persistence, `ryft-pjrt` profiling only where a demonstrated gap remains.
 
@@ -981,9 +1027,9 @@ validation.
 **Exit criterion:** developers can inspect, tune, persist, and deploy kernels reproducibly without weakening semantic
 or compatibility checks.
 
-### Phase 18: Add distributed coordination and asynchronous cross-host transfers
+### Phase 19: Add distributed coordination and asynchronous cross-host transfers
 
-**Prerequisites:** Phases 16-17 plus the relevant Phase 13/14 GPU contract. TPU distributed work stays in Phase 20.
+**Prerequisites:** Phases 17-18 plus the relevant Phase 14/15 GPU contract. TPU distributed work stays in Phase 21.
 
 **Owners:** `ryft-core` launch semantics, `ryft-xla` runtime, existing `ryft-pjrt` distributed/transfer APIs.
 
@@ -1009,9 +1055,9 @@ partial host failure, collective failure, remote-buffer lifetime, and supported 
 plus atomic publication or an explicit no-external-alias restriction; unsupported coordination is rejected before
 submission.
 
-### Phase 19: Stabilize non-TPU APIs, documentation, CI, and production quality
+### Phase 20: Stabilize non-TPU APIs, documentation, CI, and production quality
 
-**Prerequisites:** Phases 13-18 for the selected non-TPU backends; Phase 18 may remain experimental if it is not
+**Prerequisites:** Phases 14-19 for the selected non-TPU backends; Phase 19 may remain experimental if it is not
 release-ready.
 
 **Owners:** all touched crates and the `ryft` facade.
@@ -1021,11 +1067,11 @@ release-ready.
 - [ ] Remove mock boundaries, temporary bridges, parallel metadata, deprecated names, and compatibility shims; update
       all in-repo users directly.
 - [ ] Publish a support matrix by backend, architecture, dtype, operation, memory space, transform, distribution, and
-      toolchain version for the non-TPU release. Phase 20 adds TPU rows without rewriting existing contracts.
+      toolchain version for the non-TPU release. Phase 21 adds TPU rows without rewriting existing contracts.
 - [ ] Add end-to-end examples: elementwise, reduction, matmul, attention, masked partial tiles, scratch pipeline,
       Hopper WGMMA, Blackwell NVFP4 `tcgen05`, cuTile, custom AD, batching, sharding, AOT, and debugging.
 - [ ] Establish upgrade tooling that diffs pinned Mosaic GPU surfaces and forces an explicit decision for every
-      addition, removal, or semantic change. Phase 20 adds the isolated TPU manifest workflow.
+      addition, removal, or semantic change. Phase 21 adds the isolated TPU manifest workflow.
 - [ ] Run compiler fuzzing, malformed artifact tests, sanitizers, concurrency stress, long-run leak tests, and hardware
       qualification.
 - [ ] Set compile-time, binary-size, runtime, numerical, and benchmark regression budgets.
@@ -1041,9 +1087,9 @@ troubleshooting guides, and exact verification record.
 **Exit criterion:** the supported contract is understandable without implementation knowledge, reproducibly qualified,
 and contains no temporary or redundant architecture.
 
-### Phase 20: Add and qualify complete Mosaic TPU support
+### Phase 21: Add and qualify complete Mosaic TPU support
 
-**Prerequisites:** Phase 19. No earlier phase, milestone, CI tier, or release gate may require libtpu, TPU compiler
+**Prerequisites:** Phase 20. No earlier phase, milestone, CI tier, or release gate may require libtpu, TPU compiler
 metadata, a TPU PJRT plugin, or TPU hardware.
 
 **Owners:** TPU-specific work across `ryft-xla-sys`, `ryft-mlir`, `ryft-pjrt`, and `ryft-xla`, plus TPU fixtures,
@@ -1108,7 +1154,7 @@ without any TPU dependency.
 
 - Mosaic common/GPU/TPU C++ bridges and Rust FFI modules.
 - Bazel dependencies, visibility patches, exported symbols, source archive manifests, and build feature gates.
-- Compiler/pass/serde/artifact/version APIs proven by Phase 0 for GPU and Phase 20 for TPU.
+- Compiler/pass/serde/artifact/version APIs proven by Phase 0 for GPU and Phase 21 for TPU.
 - Possibly CUDA/XLA FFI stream or custom-kernel declarations required by the selected cubin launch seam.
 
 ### `ryft-mlir`
@@ -1133,12 +1179,12 @@ without any TPU dependency.
 
 - Experimental kernel operation integration, lowering, backend selection, Mosaic GPU, Mosaic TPU, cuTile tool driver,
   dispatch/runtime, capability normalization, persistence, profiling, and public experimental facades.
-- The Phase 12 `plan-references.md` mock in `reference_kernels.rs` is removed or reduced to test fixtures once the
-  production boundary supersedes it.
+- The `plan-references.md` kernel mock (`reference_kernels.rs`) has already been removed; the production kernel
+  boundary is built fresh here.
 
 ### `ryft`
 
-- Stable portable re-exports and examples only in Phase 19; TPU-specific facade additions remain in Phase 20.
+- Stable portable re-exports and examples only in Phase 20; TPU-specific facade additions remain in Phase 21.
 
 ## 10. Test matrix
 
@@ -1191,7 +1237,7 @@ TMEM/`tcgen05` path; matching FP32 output after widening is not sufficient.
 - Native ABI/symbol/layout and archive-content tests.
 - MLIR parse/print/verifier/pass snapshots.
 - Kernel interpreter, property, transform, cache, malformed artifact, and diagnostics tests.
-- GPU/PTX compiler tests that do not require hardware. TPU compiler-only coverage begins in Phase 20.
+- GPU/PTX compiler tests that do not require hardware. TPU compiler-only coverage begins in Phase 21.
 - Rustdoc with warnings reviewed, doctests, examples that have a CPU/interpreter route.
 - `git diff --check`, 120-column added-line audit, generated manifest parity, and no stale scaffolding.
 
@@ -1215,7 +1261,7 @@ TMEM/`tcgen05` path; matching FP32 output after widening is not sufficient.
 
 ### Tier E: final TPU qualification
 
-- Run only in Phase 20 after the non-TPU release matrix is already clean.
+- Run only in Phase 21 after the non-TPU release matrix is already clean.
 - Cover compiler-only TPU parity/configuration tests without hardware, then supported TPU generations with
   VMEM/SMEM, DMA/semaphores, MXU, pipelines, transforms, persistence, multi-core, and distribution.
 - Repeat the full affected crate/facade/docs matrix with TPU features enabled and record exact libtpu/plugin versions.
@@ -1236,42 +1282,44 @@ Phases 0-5. This is a hard non-TPU gate, not preparatory work that can be papere
 
 ### Milestone B: portable language and semantic oracle
 
-Phases 6-11: core types, grids, references, memory/synchronization safety, staging, interpreter, operations, and manual
+Phases 6-12: restored reference analysis, core types, grids, references, memory/synchronization safety, staging,
+interpreter, operations, and manual
 schedules.
 
 ### Milestone C: shared XLA runtime and Mosaic GPU baseline
 
-Phases 12-13: one dispatch/cache/ABI plus production baseline Mosaic GPU.
+Phases 13-14: one dispatch/cache/ABI plus production baseline Mosaic GPU.
 
 ### Milestone D: latest hardware and optional backend breadth
 
-Phases 14-15: Hopper/Blackwell and cuTile.
+Phases 15-16: Hopper/Blackwell and cuTile.
 
 ### Milestone E: composition and production operations
 
-Phases 16-19: transforms, profiling/autotuning/AOT, GPU distributed/asynchronous execution, stabilization, and the
+Phases 17-20: transforms, profiling/autotuning/AOT, GPU distributed/asynchronous execution, stabilization, and the
 non-TPU release.
 
 ### Milestone F: consolidated TPU support
 
-Phase 20 alone owns every TPU-specific native, typed-IR, runtime, lowering, transform, distribution, documentation,
+Phase 21 alone owns every TPU-specific native, typed-IR, runtime, lowering, transform, distribution, documentation,
 and qualification task. It begins only after Milestones A-E are independently complete.
 
 Safe parallelism after Phase 5:
 
-- Phases 6-8 may divide by semantic owner but must merge before staging/interpreter work completes.
+- Phase 6 requires nothing from Phases 0-5 and may start immediately.
+- Phases 7-9 may divide by semantic owner but must merge before staging/interpreter work completes.
 - cuTile may proceed beside Mosaic backends after its Phase 0 seam and portable subset are fixed.
 - Transform and profiling work should consume at least two working backends to avoid single-backend abstractions.
-- TPU work never proceeds in parallel with Phases 0-19; that isolation is the purpose of final Phase 20.
+- TPU work never proceeds in parallel with Phases 0-20; that isolation is the purpose of final Phase 21.
 
 ## 13. Aggregate estimates
 
 Summing the phase ranges in §7 gives approximately:
 
-- **Production:** 37,800-63,250 logical lines.
-- **Tests:** 35,000-58,050 logical lines.
-- **Docs/examples:** 10,730-18,350 logical lines.
-- **Total:** 83,530-139,650 logical lines, excluding generated/vendored code.
+- **Production:** 40,200-66,650 logical lines.
+- **Tests:** 38,000-62,550 logical lines.
+- **Docs/examples:** 11,180-19,050 logical lines.
+- **Total:** 89,380-148,250 logical lines, excluding generated/vendored code.
 
 Expected production ownership:
 
@@ -1284,7 +1332,7 @@ Expected production ownership:
 | `ryft-xla` | 38% | ABI, dispatch, three backends, caching, tuning, runtime |
 | facade/examples/tooling | 2% | stable exports, examples, manifests, qualification tools |
 
-These are planning ranges, not commitments. Phase 0 replaces non-TPU estimates using its pinned manifest, and Phase 20
+These are planning ranges, not commitments. Phase 0 replaces non-TPU estimates using its pinned manifest, and Phase 21
 does the same for TPU before implementation. Each phase records actual logical lines and explains a variance above 30%
 before the next phase begins.
 
@@ -1397,8 +1445,8 @@ This plan is complete only when:
 - all selected phases and their exit criteria are checked;
 - the GPU/cuTile lower-layer gate preceded all core/XLA production implementation;
 - portable semantics have an interpreter and immutable oracle;
-- Mosaic GPU and cuTile execute before Phase 20 without TPU dependencies, and the final Mosaic TPU stack executes on
-  supported TPU hardware only in Phase 20;
+- Mosaic GPU and cuTile execute before Phase 21 without TPU dependencies, and the final Mosaic TPU stack executes on
+  supported TPU hardware only in Phase 21;
 - Hopper/Blackwell and NVFP4 tests prove exact target instructions and ordering;
 - cuTile support uses an official versioned AOT seam with no Python runtime dependency, while installation remains
   optional;
@@ -1412,7 +1460,7 @@ This plan is complete only when:
 
 ## 17. Primary external references
 
-Revalidate the GPU, cuTile, XLA, and PJRT sources in Phase 0. Revalidate the two Mosaic TPU sources only when Phase 20
+Revalidate the GPU, cuTile, XLA, and PJRT sources in Phase 0. Revalidate the two Mosaic TPU sources only when Phase 21
 begins:
 
 - [JAX Pallas overview](https://docs.jax.dev/en/latest/pallas/): language status and guide index.
@@ -1460,6 +1508,10 @@ begins:
 - [x] Added phase-specific production, test, and documentation ranges with explicit methodology.
 - [x] Reconciled arithmetic totals, path/link checks, and independent foundation, architecture, and conventions audits;
       all three original-plan auditors reported zero findings.
-- [x] Consolidated every TPU-specific implementation and verification deliverable into final Phase 20, renumbered all
+- [x] Consolidated every TPU-specific implementation and verification deliverable into final Phase 21, renumbered all
       prior phases, and revalidated 21 complete phase templates, dependencies, estimates, paths, line widths, and diff
       hygiene without changing a changelog.
+- [x] Added restoration Phase 6 after the interpreter-style discharge rework deleted the static reference-analysis
+      stack and the `reference_kernels.rs` mock this plan previously named as retained pieces; renumbered later
+      phases, reconciled the estimate table, aggregate totals, milestones, and every cross-reference, and rewrote the
+      retained-pieces inventory to record the deletion.
