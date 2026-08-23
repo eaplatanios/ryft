@@ -166,7 +166,7 @@ define_dimension_arithmetic!(
     dimension_max => DimensionMaxOperation,
 );
 
-/// Shared identity-bearing inference and effect metadata stored by every binary dimension arithmetic operation.
+/// Shared type-identity inference and effect metadata stored by every binary dimension arithmetic operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
 pub(crate) struct ArithmeticDimensionOperationMetadata {
     /// Expected left operand type.

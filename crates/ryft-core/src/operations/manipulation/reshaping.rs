@@ -1548,8 +1548,8 @@ mod tests {
     #[test]
     fn test_array_type_reshape() {
         // Dynamic dimensions can only be reshaped without explicit dimension operands when equality follows directly
-        // from identical identity-bearing shapes. Other runtime relationships require the mixed reshape operation and
-        // its explicit result-dimension operands.
+        // from identical shapes carrying the same symbolic identities. Other runtime relationships require the mixed
+        // reshape operation and its explicit result-dimension operands.
         let static_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]));
         let dynamic_shape = Shape::new(vec![
             Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded())),

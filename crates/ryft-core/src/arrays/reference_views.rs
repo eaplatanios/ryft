@@ -251,7 +251,7 @@ impl ArrayReferenceViewTransform {
 /// another mutable resource.
 ///
 /// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
-/// or synchronization state. [`ArrayReference`] pairs it with the identity-bearing shared holder. The view determines
+/// or synchronization state. [`ArrayReference`] pairs it with the shared holder. The view determines
 /// that handle's referent type and selected coordinates; mutations reconstruct the root by applying the inverse update
 /// of each transform in reverse order. Consequently, overlapping handles may select the same root coordinates and
 /// observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
@@ -434,7 +434,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrie
 
 /// Eager array-reference handle pairing one shared root holder with handle-local view metadata.
 pub struct ArrayReference<A: Value<Type = ArrayType>> {
-    /// Shared identity-bearing root holder.
+    /// Shared root holder.
     root: Reference<A>,
 
     /// Ordered mapping from the shared root to this handle's referent.

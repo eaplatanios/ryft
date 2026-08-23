@@ -691,9 +691,9 @@ pub trait Operation: Clone {
 
     /// Returns this [`Operation`] after simultaneously renaming any [`TypeIdentity`](crate::TypeIdentity)s stored
     /// in its payload, as specified by the provided [`TypeIdentityRenaming`]. Operations whose payload contains no
-    /// identity-bearing type metadata return `self.clone()`. An operation that stores shapes, output types, or nested
-    /// signature metadata must apply the same renaming as its surrounding program so the payload and atom types remain
-    /// consistent.
+    /// type-identity metadata return `self.clone()`. An operation that stores shapes, output types, or nested
+    /// signature metadata must apply the same renaming as its surrounding program so the payload and atom types
+    /// remain consistent.
     #[inline]
     fn rename_type_identities(
         &self,

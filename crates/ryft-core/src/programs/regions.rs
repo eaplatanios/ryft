@@ -456,8 +456,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
         // Constants must be storable per the `Value` rendering contract (i.e., deterministic, semantically complete
         // renderings), because program renderings double as structural fingerprints. Sealing is the one boundary that
         // every region construction path crosses (i.e., program builders, `Program::new`, and region imports alike),
-        // so identity-bearing values such as mutable reference holders are rejected here for every region, nested ones
-        // included.
+        // so values with process-local identity, such as mutable reference holders, are rejected for every region,
+        // including nested ones.
         for atom in region.atoms.iter() {
             if let Atom::Constant(value) = atom {
                 value.validate_as_constant()?;

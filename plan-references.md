@@ -121,7 +121,7 @@ where its contracts must live.
 | Capability | Current ownership | Consequence for references |
 |---|---|---|
 | Mixed array IR type universe | `crates/ryft-core/src/arrays/types/ir.rs` | Add `Reference`; do not create `AtomType<T>`. |
-| Mixed runtime value universe | `crates/ryft-core/src/arrays/ir.rs` | Add an identity-bearing `ArrayReference<A>`. |
+| Mixed runtime values | `crates/ryft-core/src/arrays/ir.rs` | Add `ArrayReference<A>` with a shared runtime holder. |
 | Checked member projection | `ValueProjection` and tracer projections | Keep ordinary array operations narrow and reject references unless explicitly read. |
 | Composite operation family | `ArrayIrOperation` | Add cross-member reference operations as native mixed variants. |
 | Composite XLA domain | `XlaDomain` and `XlaOperation` | Trace references without changing the public array-only facade initially. |
@@ -946,8 +946,8 @@ A future `List` can also become an `ArrayIrType`/`ArrayIrValue` member. Referenc
 - transform legality gates;
 - backend-specific physicalization.
 
-They do not share semantics. A reference is an identity-bearing effect capability over array storage with one invariant
-declared type; a List is a persistent variable-cardinality computational value. Do not model a logical List as
+They do not share semantics. A reference is a mutable effect capability over a shared array-storage holder with one
+invariant declared type; a List is a persistent variable-cardinality computational value. Do not model a logical List as
 `Reference<List<T>>` or make List operations stateful.
 
 The List design should continue to reuse `Size` for logical length and derive packed capacity only during lowering;
@@ -2102,7 +2102,7 @@ At each checkpoint, ask:
       contract with reference-free identity output; assigned lifecycle, analysis, transform, and backend error
       ownership; and completed independent core and XLA simplification reviews.
 - [x] 2026-08-16 Phase 1 implementation/review pass 6: completed the generic `ReferenceType<T>` refinement and
-      whole-signature identity-renaming contract; completed holder-free structural type identity and identity-bearing
+      whole-signature identity-renaming contract; completed holder-free structural type identity and shared-holder
       `Reference<V>` semantics; integrated the third `ArrayIrType`/`ArrayIrValue` member across projections,
       classification, diagnostics, captures, control-flow boundaries, and documentation; supported reference-typed
       `XlaConstant` capture metadata without admitting concrete holder literals; made member batching projection

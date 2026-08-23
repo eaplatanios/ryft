@@ -103,8 +103,8 @@ impl<F: Value<Type: ConditionTypeSemantics>> Display for ConditionOperation<F> {
 ///
 /// Conditions always branch on ordinary Boolean data. [`ArrayType`] accepts rank-zero Boolean predicates, while a
 /// composite [`ArrayIrType`] accepts only its rank-zero Boolean array member. A first-class dimension describes an
-/// array extent rather than Boolean data, even though its runtime representation is scalar, and a reference is an
-/// identity-bearing state handle rather than a predicate value.
+/// array extent rather than Boolean data, even though its runtime representation is scalar, and a reference is a
+/// mutable state handle rather than a predicate value.
 pub trait ConditionTypeSemantics: Type {
     /// Returns whether this type is a valid condition predicate.
     fn is_condition_predicate(&self) -> bool;

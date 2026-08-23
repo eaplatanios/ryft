@@ -1250,8 +1250,8 @@ mod tests {
             ConditionOperation::<ArrayIrValue<Array>>::new().output_region_provenance(0),
         );
 
-        // Canonical lifts keep identity-free zeros homogeneous, while explicit static mixed constructors are also
-        // valid and identity-bearing zeros require the mixed encoding with ordinary identity renaming.
+        // Canonical lifts keep identity-free zeros homogeneous, explicit static mixed constructors are also valid,
+        // and zeros whose types carry identities require the mixed encoding with ordinary identity renaming.
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
@@ -1269,8 +1269,8 @@ mod tests {
         let mixed_static_zero = ArrayIrOperation::<Array>::Zero(ZeroOperation::new(static_zero_type.clone()));
         assert_eq!(mixed_static_zero.infer_output_types(&[], &[]), Ok(vec![static_zero_type.clone().into()]));
 
-        // Canonical lifts keep identity-free ones homogeneous, while explicit static mixed constructors are also
-        // valid and identity-bearing ones require the mixed encoding.
+        // Canonical lifts keep identity-free ones homogeneous, explicit static mixed constructors are also valid,
+        // and ones whose types carry identities require the mixed encoding.
         let static_one = ArrayIrOperation::<Array>::from(OneOperation::new(static_zero_type.clone()));
         assert!(matches!(static_one, ArrayIrOperation::Array(ArrayOperation::One(_))));
         let mixed_static_one = ArrayIrOperation::<Array>::DynamicOne(OneOperation::new(static_zero_type.clone()));

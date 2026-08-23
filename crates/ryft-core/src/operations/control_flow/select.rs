@@ -256,7 +256,7 @@ impl_select_differentiation! {
                         .clone();
                     let cotangent_type = cotangent.r#type().into_owned();
                     let zero = if cotangent_type.identities().next().is_some() {
-                        // An identity-bearing type does not contain concrete runtime extents, so use the live
+                        // A type with symbolic extents does not contain concrete runtime extents, so use the live
                         // cotangent as the shape exemplar. Identity-free types retain the canonical nullary zero,
                         // whose zero-producing marker keeps higher-order partial evaluation structural.
                         let mut zero = context.stage_operation(

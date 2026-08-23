@@ -116,7 +116,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
     fn execution_domain(&self) -> Self::ExecutionDomain;
 
-    /// Returns an equivalent value whose identity-bearing type metadata has been simultaneously renamed according to
+    /// Returns an equivalent value whose type-identity metadata has been simultaneously renamed according to
     /// `renaming`. [`Value`] represents every kind of leaf that can participate in a [`Program`](crate::Program), not
     /// only concrete runtime payloads. Some values, such as metadata-only values and captured-value references, store
     /// their [`Type`](Typed::Type) or other type metadata directly. When a program or region is instantiated under
@@ -126,7 +126,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// This compiler-managed operation must preserve the represented runtime data, Single Static Assignment (SSA)
     /// identity, and execution semantics; it may only reconstruct metadata that depends on the value's type. The
     /// default implementation clones values whose type is unchanged by [`Type::rename_identities`] and rejects
-    /// identity-bearing changes. Value types that can safely reconstruct their stored type metadata must override
+    /// changes to that metadata. Value types that can safely reconstruct their stored type metadata must override
     /// this method.
     fn rename_type_identities(
         &self,
@@ -136,13 +136,13 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     }
 
     /// Validates that this value can be used as a program constant (i.e., [`Atom::Constant`](crate::Atom::Constant)).
-    /// Such values must satisfy the followwing rendering contract: their [`Display`] output must be deterministic and
+    /// Such values must satisfy the following rendering contract: their [`Display`] output must be deterministic and
     /// semantically complete, because program renderings double as structural fingerprints. Values that cannot satisfy
-    /// it (most notably identity-bearing mutable reference holders, whose runtime identity is process-local and
-    /// deliberately absent from their deterministic rendering) must reject constant storage here and enter programs
-    /// through inputs or captures instead. [`Region`](crate::Region) sealing enforces this for every stored constant
-    /// in every region, so all construction paths (i.e., program builders, [`Program::new`](crate::Program::new), and
-    /// region imports alike) are covered. The default implementation accepts all values.
+    /// it (most notably mutable reference holders, whose runtime identity is process-local and deliberately absent from
+    /// their deterministic rendering) must reject constant storage here and enter programs through inputs or captures
+    /// instead. [`Region`](crate::Region) sealing enforces this for every stored constant in every region, so all
+    /// construction paths (i.e., program builders, [`Program::new`](crate::Program::new), and region imports alike)
+    /// are covered. The default implementation accepts all values.
     #[inline]
     fn validate_as_constant(&self) -> Result<(), TypeError> {
         Ok(())
@@ -445,7 +445,7 @@ impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> 
 }
 
 /// Renames a value's type-identity metadata by _rejection_ meaning that identity renamings and renamings that leave
-/// the value's [`Type`] unchanged clone the value, while identity-bearing changes fail because the value has no
+/// the value's [`Type`] unchanged clone the value, while identity-changing renamings fail because the value has no
 /// value-specific reconstruction. This one helper backs the [`Value::rename_type_identities`] default implementation
 /// and composite member arms that deliberately keep the same semantics (e.g., eager reference holders, whose shared
 /// state must not be renamed through one alias), so the rejection policy and diagnostic have exactly one home.

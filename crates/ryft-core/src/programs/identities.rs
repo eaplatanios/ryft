@@ -13,7 +13,7 @@ pub trait TypeIdentity: Clone + Debug + Display + PartialEq + Eq {
     fn fresh(&self) -> Self;
 }
 
-/// [`TypeIdentity`] used by [`Type`](crate::Type) families that carry no identity-bearing metadata.
+/// [`TypeIdentity`] used by [`Type`](crate::Type) families that carry no type-identity metadata.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NoIdentity {}
 

@@ -319,7 +319,7 @@ impl<
 
 /// Materializes one array operand's forward-mode tangent as a concrete projected array value, reading whatever runtime
 /// geometry the tangent type omits from the operand's primal. A mixed array rule that has to hand a concrete tangent to
-/// a staged operation cannot always materialize a structural zero from its type (an identity-bearing [`ArrayType`]
+/// a staged operation cannot always materialize a structural zero from its type (an [`ArrayType`] with symbolic extents
 /// names its dynamic extents by [`DimensionVariable`] rather than pinning them, so the type-only nullary
 /// [`ZeroOperation`](crate::ZeroOperation) is unconstructible for it). The primal names every one of those extents,
 /// because the tangent type derivation preserves geometry exactly and rewrites only element representation, layout,

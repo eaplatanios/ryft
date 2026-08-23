@@ -431,7 +431,7 @@ pub(crate) fn jacobian_reverse_in_context<
     let primals = I::from_parameters(input_structure, input_values)?;
 
     // Validate the input coordinate spaces before deriving the pullback, so a non-finite input coordinate space
-    // reports its input role instead of the identity-bearing nullary-constructor error that materializing a zero
+    // reports its input role instead of the type-identity-dependent nullary-constructor error that materializing a zero
     // input cotangent during the pullback trace would otherwise raise first. This pre-validation remains necessary
     // while pullback tracing can materialize a dynamic nullary cotangent before reporting that the corresponding
     // coordinate space is non-finite. A future operand-relative zero operation may make it redundant.

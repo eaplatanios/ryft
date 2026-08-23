@@ -1558,7 +1558,7 @@ where
                 continue;
             };
 
-            // A residual partition may expose the same identity-bearing value through multiple feeder edges. Restore
+            // A residual partition may expose the same identity-defining value through multiple feeder edges. Restore
             // that value once so the generated region forwards one SSA definition instead of redefining the nominal
             // identity for every use.
             let defines_identity =

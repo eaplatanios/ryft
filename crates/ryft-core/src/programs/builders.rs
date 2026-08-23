@@ -12,6 +12,7 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::references::ReferenceLifetimes;
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -50,6 +51,17 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
 
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
+
+    /// Reference alias topology and consumption state of the region under construction, consulted and maintained by
+    /// [`add_instruction`](Self::add_instruction) alone. The legality of one instruction "append" depends on what
+    /// every earlier "append" did and this builder is the only object that spans every "append" of the region (i.e.,
+    /// hand-built programs, capture lifting, and [`splice_program`](Self::splice_program) never involve a staging
+    /// context), so the fold lives here rather than being recomputed from [`Self::instructions`] on every "append".
+    /// One builder constructs exactly one region, so this state needs no region key, and its lifecycle is the region's
+    /// own. It stays empty (and its checks stay one emptiness test each) for reference-free programs, and it
+    /// deliberately excludes [`add_instruction_unchecked`](Self::add_instruction_unchecked) appends. Refer to the
+    /// documentation of [`ReferenceLifetimes`] for the "checked-appends-only" contract.
+    pub(crate) references: ReferenceLifetimes,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
@@ -64,6 +76,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             callees: Vec::new(),
             callee_instantiations: Vec::new(),
             error: None,
+            references: ReferenceLifetimes::default(),
         }
     }
 
@@ -98,7 +111,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             .map_err(|_| ProgramError::MalformedProgram(format!("region {id} is not part of this builder")))
     }
 
-    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
+    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_input(&mut self, r#type: V::Type) -> AtomId {
         let id = self.add_variable(r#type);
@@ -114,7 +127,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         id
     }
 
-    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
+    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
     pub fn add_variable(&mut self, r#type: V::Type) -> AtomId {
         let id = AtomId::new(self.atoms.len());
@@ -128,6 +141,16 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// attached regions must match the operation's declared [`Operation::region_slots`] count. Output types are
     /// inferred through [`Operation::infer_output_types`], with the attached regions' [`RegionInterface`]s derived
     /// from this builder's sealed arena on the spot (i.e., [`RegionInterface`]s are never stored).
+    ///
+    /// This checked "append" also enforces reference lifetimes across the region under construction. An application
+    /// that accesses a reference whose alias family an earlier instruction consumed, or that consumes a derived view
+    /// rather than a whole root, is rejected at the "append" that performs it. Construction is the earliest point at
+    /// which such a misuse can be reported against the call that caused it (the eager runtime invalidates a frozen
+    /// holder's complete alias family and discharge reports what its own environment observes, but a program under
+    /// construction could otherwise record the misuse and surface it only much later). Replay and rebuild paths that
+    /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
+    /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation
+    /// checks.
     pub fn add_instruction<P: Into<O>>(
         &mut self,
         operation: P,
@@ -135,6 +158,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         inputs: Vec<AtomId>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
+        self.references.validate(&operation, inputs.as_slice())?;
         operation.validate_region_count(regions.len())?;
         for region in regions.iter().copied() {
             if region.index() >= self.regions.len() {
@@ -170,6 +194,27 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(Instruction::new(operation, inputs, outputs, regions));
+
+        // The accepted application is read back off the instruction just appended, which borrows a different field of
+        // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
+        // operand list. It runs for an application that declares reference semantics and for one that merely names a
+        // reference-typed value, because a region-carrying operation carrying a reference through its boundary
+        // declares nothing and is recognized only by its identity-forwarding hook.
+        let instruction = self.instructions.last().unwrap();
+        let contains_references = !instruction.operation().reference_semantics().is_empty()
+            || instruction
+                .inputs
+                .iter()
+                .chain(instruction.outputs.iter())
+                .any(|atom| self.atoms[atom.index()].r#type().is_reference());
+        if contains_references {
+            self.references.record(
+                instruction.operation(),
+                instruction.inputs.as_slice(),
+                instruction.outputs.as_slice(),
+            );
+        }
+
         Ok(self.instructions.last().unwrap().outputs.as_slice())
     }
 
@@ -177,7 +222,9 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// [`add_instruction`](Self::add_instruction) for ordinary staging. This function is for callers that are
     /// rebuilding an existing [`Program`] and have already allocated the instruction outputs in this builder.
     /// The caller is responsible for ensuring that the instruction input and output IDs are bound in this builder
-    /// and that the output atom types match the operation's inferred outputs.
+    /// and that the output atom types match the operation's inferred outputs. It also bypasses the reference-lifetime
+    /// check that [`add_instruction`](Self::add_instruction) performs, which is what lets rebuilds replay already
+    /// accepted programs and lets tests construct deliberately malformed programs for testing validation checks.
     #[inline]
     pub fn add_instruction_unchecked(&mut self, instruction: Instruction<O>) {
         self.instructions.push(instruction);
