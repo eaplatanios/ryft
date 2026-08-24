@@ -79,8 +79,8 @@ use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Type, TypeError,
-    Typed, Value, ValueProjection,
+    AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
+    ProvenanceScope, ProvenanceState, Type, TypeError, Typed, Value, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -273,12 +273,12 @@ where
     }
 }
 
-/// Ordinary active tracing [`Context`] over a [`Type`](crate::Type)/[`Value`]/[`Operation`] universe.
-/// [`TracingContext`] pairs the staged-constant and operation representations `(V, O)` of a program with the
-/// [`ProgramBuilder`] used for one tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is
-/// [`Tracer<Self>`](Tracer) and whose [`Domain::Constant`] is `V`. Its default [`StagingContext::stage_operation`]
-/// behavior records each primitive bind as a program instruction. Transform contexts wrap or replace this context when
-/// they need different binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
+/// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs
+/// the staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one
+/// tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
+/// [`Domain::Constant`] is `V`. Its default [`StagingContext::stage_operation`] behavior records each primitive bind
+/// as a program instruction. Transform contexts wrap or replace this context when they need different binding behavior,
+/// but they still share the same [`Context`] protocol used by [`Tracer`] values.
 ///
 /// The optional capture parameter `C` names the concrete runtime value type stored in the capture table while tracing
 /// a captured [`Program`]. It is deliberately distinct from the staged-constant type `V`.
@@ -349,6 +349,12 @@ pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
     /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
     /// cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
+
+    /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
+    /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] (separately from [`Self::builder`]
+    /// so that [`ProvenanceScope`] transitions never hold a builder borrow) so that every cloned context observes the
+    /// same active scopes, while independent traces own independent states.
+    provenance: Rc<ProvenanceState>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
@@ -364,6 +370,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
             builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
             named_axes: Rc::new(Vec::new()),
+            provenance: Rc::new(ProvenanceState::new()),
         }
     }
 
@@ -472,8 +479,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
         let input_structure = input_type.parameter_structure();
 
         let (output_types, outputs, output_structure) = {
-            let context =
-                Self { builder: builder.clone(), captures: captures.clone(), named_axes: Rc::new(named_axes) };
+            let context = Self {
+                builder: builder.clone(),
+                captures: captures.clone(),
+                named_axes: Rc::new(named_axes),
+                provenance: Rc::new(ProvenanceState::new()),
+            };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
 
@@ -499,7 +510,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
 impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
+        Self {
+            builder: self.builder.clone(),
+            captures: self.captures.clone(),
+            named_axes: self.named_axes.clone(),
+            provenance: self.provenance.clone(),
+        }
     }
 }
 
@@ -553,6 +569,23 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O,
     }
 
     #[inline]
+    fn provenance(&self) -> Provenance {
+        // A `TracingContext` is a staging boundary. It owns the builder that instructions are emitted into, and so it
+        // also owns the shared provenance state those instructions snapshot.
+        self.provenance.current()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
+    }
+
+    #[inline]
     fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<V> {
         if !Rc::ptr_eq(self.builder(), value.context().builder()) {
             return ValueResolution::Opaque;
@@ -595,12 +628,24 @@ pub struct NestedTracingContext<C: Context> {
     /// in which case every lookup delegates to the parent. The list is immutable for the [`NestedTracingContext`]'s
     /// lifetime and shared across cloned contexts.
     named_axes: Rc<Vec<(String, NamedAxis)>>,
+
+    /// Active [`ProvenanceState`] for the nested program, shared across cloned contexts and independent of the
+    /// parent's state. It is seeded with the parent context's current provenance at depth zero, so that instructions
+    /// staged in the nested program record where the nested program itself came from, while later replaying them
+    /// under the same ambient scopes preserves each instruction's provenance exactly.
+    provenance: Rc<ProvenanceState>,
 }
 
 impl<C: Context> NestedTracingContext<C> {
     /// Creates a new [`NestedTracingContext`] that owns a fresh [`ProgramBuilder`] and traces on behalf of `parent`.
     pub fn new(parent: C) -> Self {
-        Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())), named_axes: Rc::new(Vec::new()) }
+        let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
+        Self {
+            parent,
+            builder: Rc::new(RefCell::new(ProgramBuilder::new())),
+            named_axes: Rc::new(Vec::new()),
+            provenance,
+        }
     }
 
     /// Returns the [`Context`] that this [`NestedTracingContext`] is nested into.
@@ -664,7 +709,8 @@ impl<C: Context> NestedTracingContext<C> {
         let input_count = input_types.len();
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let named_axes = Rc::new(named_axes);
-        let context = Self { parent, builder, named_axes };
+        let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
+        let context = Self { parent, builder, named_axes, provenance };
 
         let (output_structure, output_atoms) = {
             let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
@@ -701,7 +747,12 @@ impl<C: Context> NestedTracingContext<C> {
 impl<C: Context> Clone for NestedTracingContext<C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { parent: self.parent.clone(), builder: self.builder.clone(), named_axes: self.named_axes.clone() }
+        Self {
+            parent: self.parent.clone(),
+            builder: self.builder.clone(),
+            named_axes: self.named_axes.clone(),
+            provenance: self.provenance.clone(),
+        }
     }
 }
 
@@ -745,6 +796,23 @@ impl<C: Context> Context for NestedTracingContext<C> {
     fn is_eager(&self) -> bool {
         // `NestedTracingContext`s stage values as `Tracer`s rather than computing them and so they are never eager.
         false
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // A `NestedTracingContext` is a staging boundary for the nested program. It owns an independent provenance
+        // state seeded from its parent and not a delegation to the parent's state.
+        self.provenance.current()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
     }
 
     #[inline]
@@ -1654,5 +1722,86 @@ mod tests {
             error.to_string(),
             format!("specialized input type {unrelated_type} does not refine declared input type {dynamic_type}"),
         );
+    }
+
+    #[test]
+    fn test_tracing_provenance_snapshot_and_clone_sharing() {
+        let scope = ProvenanceScope::new("labeled");
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let context = x.context().clone();
+                let scoped = context.invoke_with_provenance_scope(scope.clone(), || {
+                    // A clone of the context observes the same active scope state.
+                    assert_eq!(context.clone().provenance(), Provenance::scope(scope.clone(), Provenance::unknown()),);
+                    x.clone() * x.clone()
+                });
+                Ok(scoped + x)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+
+        // Each staged instruction snapshots the provenance that was active when it was staged: the multiplication
+        // carries the scope while the addition staged outside it stays unknown.
+        let provenances = program
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.provenance().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(provenances, vec![Provenance::scope(scope, Provenance::unknown()), Provenance::unknown()]);
+    }
+
+    #[test]
+    fn test_tracing_provenance_independent_traces() {
+        let scope = ProvenanceScope::new("scope");
+        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
+        first.invoke_with_provenance_scope(scope.clone(), || {
+            assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
+            // Independent traces own independent states, so scopes never leak across traces.
+            assert!(second.provenance().is_unknown());
+        });
+        assert!(first.provenance().is_unknown());
+    }
+
+    #[test]
+    fn test_eager_provenance_is_a_no_op() {
+        // Terminal eager contexts run scope closures directly, record no provenance, and execute unaffected.
+        let eager = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let sum = eager
+            .invoke_with_provenance_scope(ProvenanceScope::new("scope"), || {
+                assert!(eager.provenance().is_unknown());
+                eager.bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)])
+            })
+            .unwrap();
+        assert_eq!(sum, vec![Array::scalar(3.0)]);
+    }
+
+    #[test]
+    fn test_nested_tracing_provenance_seeding() {
+        let outer_scope = ProvenanceScope::new("outer");
+        let nested_scope = ProvenanceScope::new("nested");
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        parent.invoke_with_provenance_scope(outer_scope.clone(), || {
+            let seed = parent.provenance();
+
+            // A nested tracing context seeds its origin from the parent's current provenance at depth zero of its
+            // own scope stack, and owns independent scope state for the nested program.
+            let nested = NestedTracingContext::new(parent.clone());
+            assert_eq!(nested.provenance(), seed);
+            nested.invoke_with_provenance_scope(nested_scope.clone(), || {
+                assert_eq!(nested.provenance(), Provenance::scope(nested_scope.clone(), seed.clone()));
+                assert_eq!(parent.provenance(), seed);
+            });
+
+            // Instructions staged in a nested trace record the seeded origin.
+            let (_, nested_program) = NestedTracingContext::trace(
+                parent.clone(),
+                |inputs| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
+                vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+            )
+            .unwrap();
+            assert_eq!(nested_program.instructions()[0].provenance(), &seed);
+        });
     }
 }
