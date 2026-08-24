@@ -90,7 +90,7 @@ use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
     AtomId, BindingRegionDriver, EagerInterpretationValidation, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, Type, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -191,6 +191,47 @@ pub trait Context: Domain + Clone {
     /// wrap other contexts (e.g., batching and forward-mode differentiation) delegate to the wrapped context, so that
     /// the answer reflects the innermost context that actually executes the bound operations.
     fn is_eager(&self) -> bool;
+
+    /// Returns the currently composed non-semantic [`Provenance`] that [`Instruction`](crate::Instruction)s
+    /// staged through this [`Context`] record. Staging boundaries (i.e., contexts that own the [`ProgramBuilder`]
+    /// instructions are emitted into, such as tracing and partial evaluation contexts) answer from their shared
+    /// [`ProvenanceState`](crate::ProvenanceState), transform wrappers delegate to the context they stage through,
+    /// and terminal eager contexts return [`Provenance::unknown`] because they record no instructions.
+    fn provenance(&self) -> Provenance;
+
+    /// Invokes `function` with the provided [`Provenance`] entered as the active source _origin_, so that
+    /// [`Instruction`](crate::Instruction)s staged inside it record that they were _generated from_ an existing
+    /// instruction. An origin is where staged work **comes from**, while a scope (i.e., used by the corresponding
+    /// [`with_provenance_scope`](Self::invoke_with_provenance_scope) function) is a fresh label for what that work
+    /// **is**: origins carry already-recorded history forward through transforms, while scopes add new history.
+    ///
+    /// This is the interpretation/replay/transform-facing entry point. A transform replaying one source instruction
+    /// wraps its rule invocation in this call with the source instruction's recorded provenance, and every instruction
+    /// the rule stages then records that source's provenance (verbatim for a one-to-one rewrite, and attached to each
+    /// generated instruction for a one-to-many rewrite). To make that inheritance exact, entering an origin _replaces_
+    /// the active provenance rather than adding to it: scopes entered before this call stop contributing (they describe
+    /// the transform doing the replaying, not the replayed instruction, and return when the closure does), and only
+    /// scopes entered inside the closure fold over the origin. Entering an origin while another origin is already
+    /// active fuses the two, so nested replays record every source involved. Refer to the documentation of
+    /// [`ProvenanceState`](crate::ProvenanceState) for the precise composition semantics. The previous
+    /// state is restored on ordinary return, error return, and panic unwinding.
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R;
+
+    /// Invokes `function` with the provided named [`ProvenanceScope`] entered as the innermost active scope, so that
+    /// [`Instruction`](crate::Instruction)s staged inside it record the scope in their [`Provenance`]. A scope is a
+    /// fresh label for what staged work **is** (i.e., the facility or computation performing the staging), while an
+    /// origin (i.e., used by the corresponding [`with_provenance_origin`](Self::invoke_with_provenance_origin)
+    /// function) is where replayed work **comes from**: scopes add new history, while origins carry already-recorded
+    /// history forward.
+    ///
+    /// This is the producer-facing entry point for code that stages _new_ instructions and wants them labeled (e.g.,
+    /// the differentiation coordinate-basis constructor may enter its `ryft::differentiation::coordinate_basis` scope
+    /// around the primitives it stages). Unlike entering an origin, entering a scope _adds_ one level: it folds over
+    /// whatever provenance is currently active, nesting under enclosing scopes to form `::`-separated paths. The
+    /// previous state is restored on ordinary return, error return, and panic unwinding. Terminal eager contexts run
+    /// the closure directly because they record no instructions; transform wrappers delegate to the context they stage
+    /// through.
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R;
 
     /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
     /// [`ValueResolution`]s and their semantics.
@@ -344,6 +385,23 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
     }
 
     #[inline]
+    fn provenance(&self) -> Provenance {
+        // Terminal eager execution records no instructions, so there is nothing to attach provenance to.
+        // The current provenance is always unknown and entering scopes or origins is a deliberate no-op.
+        Provenance::unknown()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+        function()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+        function()
+    }
+
+    #[inline]
     fn resolve(&self, value: &V) -> ValueResolution<V> {
         ValueResolution::Constant(value.clone())
     }
@@ -481,6 +539,23 @@ where
     #[inline]
     fn is_eager(&self) -> bool {
         self.parent.is_eager()
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // Projection changes the value vocabulary, not the staging boundary, so provenance state lives with the
+        // composite parent that actually records instructions.
+        self.parent.provenance()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.invoke_with_provenance_scope(scope, function)
     }
 
     #[inline]
@@ -651,9 +726,13 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             };
             let region_ids =
                 driver.import_into(self.builder(), &region_input_types).map_err(|error| self.error(error))?;
+
+            // Snapshot the active provenance and attach it to the recorded instruction. Provenance state lives in
+            // its own cell, separate from the builder, so scope transitions never contend with builder borrows.
+            let provenance = self.provenance();
             let outputs = {
                 let mut builder = self.builder().borrow_mut();
-                match builder.add_instruction(operation, region_ids, inputs) {
+                match builder.add_instruction(operation, region_ids, inputs, Some(provenance)) {
                     Ok(outputs) => outputs.to_vec(),
                     Err(error) => {
                         if builder.error.is_none() {
@@ -1193,7 +1272,12 @@ pub(crate) mod tests {
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
             let eight = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![carry, eight])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![carry, eight],
+                    None,
+                )
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
@@ -1202,7 +1286,8 @@ pub(crate) mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
-            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry]).unwrap()[0];
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, carry], None).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
                 .unwrap()

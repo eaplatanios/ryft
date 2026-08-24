@@ -592,7 +592,12 @@ impl<
                 instruction.inputs(),
             )?;
             let outputs = builder
-                .add_instruction(instruction.operation().clone(), instruction.regions().to_vec(), inputs)?
+                .add_instruction(
+                    instruction.operation().clone(),
+                    instruction.regions().to_vec(),
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
                 .to_vec();
             check_count!("output", outputs, instruction.outputs().len(), ProgramError);
             for (source_output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
@@ -784,7 +789,7 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let capture = builder.add_constant(CaptureReference::new(1, ArrayType::scalar(DataType::F64)));
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
@@ -852,7 +857,8 @@ mod tests {
             let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let capture = builder.add_constant(CaptureReference::new(used_capture, ArrayType::scalar(DataType::F64)));
-            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
             let program = builder
                 .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                     vec![output],
@@ -917,6 +923,7 @@ mod tests {
                 ),
                 vec![unchanged_region, renumbered_region],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -968,6 +975,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![entry_capture],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1003,8 +1011,8 @@ mod tests {
         let mut builder = ProgramBuilder::<CaptureReference<ArrayType>, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let capture = builder.add_constant(CaptureReference::new(0, ArrayType::scalar(DataType::F64)));
-        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, capture]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, capture], None).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<ArrayType>>, Vec<CaptureReference<ArrayType>>>(
                 vec![output],
@@ -1139,8 +1147,8 @@ mod tests {
         let input = builder.add_input(scalar_type.clone());
         let capture = builder.add_constant(TestConstant::Captured(CaptureReference::new(1, scalar_type.clone())));
         let immediate = builder.add_constant(TestConstant::Immediate(Array::scalar(5.0)));
-        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, immediate]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sum, immediate], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestConstant>, Vec<TestConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1216,6 +1224,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![entry_capture],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1250,6 +1259,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![entry_input],
+                None,
             )
             .unwrap()[0];
         let program = builder

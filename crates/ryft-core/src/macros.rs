@@ -3579,7 +3579,7 @@ macro_rules! check_operation_partial_evaluation {
             .collect::<Vec<_>>();
         let operation: $crate::ArrayOperation<$crate::Array> =
             ::core::convert::Into::into(operation);
-        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
         assert_eq!(output_ids.len(), 1);
         let program = builder
             .build::<
@@ -3683,7 +3683,7 @@ macro_rules! check_operation_partial_evaluation {
                 })
                 .collect::<Vec<_>>();
             let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
             let output_count = output_ids.len();
             let program = builder
                 .build::<Vec<$value>, Vec<$value>>(
@@ -4061,7 +4061,7 @@ macro_rules! check_operation_differentiation {
                 .map(|input| builder.add_input($crate::programs::types::Typed::r#type(input).into_owned()))
                 .collect::<Vec<_>>();
             let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
             assert_eq!(output_ids.len(), expected_primals.len(), "declared output count is incorrect");
             let output_count = output_ids.len();
             let program = builder
@@ -4258,7 +4258,7 @@ macro_rules! check_operation_transposition {
                 .map(|(r#type, _, _)| builder.add_input(r#type.clone()))
                 .collect::<Vec<_>>();
             let operation: $operation_family = ::core::convert::Into::into(operation.clone());
-            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+            let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
             let output_count = output_ids.len();
             let program = builder
                 .build::<Vec<$value>, Vec<$value>>(
@@ -4321,7 +4321,7 @@ macro_rules! check_operation_transposition {
             .into_iter()
             .map(|input_type| builder.add_input(input_type))
             .collect::<Vec<_>>();
-        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids).unwrap().to_vec();
+        let output_ids = builder.add_instruction(operation, Vec::new(), input_ids, None).unwrap().to_vec();
         let output_count = output_ids.len();
         let program = builder
             .build::<Vec<$value>, Vec<$value>>(

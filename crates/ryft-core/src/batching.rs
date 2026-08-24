@@ -94,8 +94,8 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
-    BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, RegionDriver,
-    RegionRef, Type, TypeError, Typed, Value, ValueProjection,
+    BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
+    ProvenanceScope, RegionDriver, RegionRef, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1503,6 +1503,22 @@ impl<C: Context<Operation: BatchableOperation<C, P>>, P: RecursiveBatchingPolicy
     #[inline]
     fn is_eager(&self) -> bool {
         self.parent().is_eager()
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // Batching stages rewritten primitive work through its parent, so provenance state lives with the parent.
+        self.parent().provenance()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent().invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent().invoke_with_provenance_scope(scope, function)
     }
 
     #[inline]

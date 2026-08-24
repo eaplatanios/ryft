@@ -396,7 +396,13 @@ impl<
                     &region_mappings,
                     requires_validation,
                 )?;
-                context.bind(instruction.operation().clone(), driver, inputs)
+                // Every replayed instruction binds inside its own recorded origin, so a one-to-one rewrite preserves
+                // the source provenance exactly, and a one-to-many rewrite attaches it to every generated instruction.
+                // This also holds for unknown source provenance: preserving it exactly means the replay must not absorb
+                // ambient transform scopes.
+                context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    context.bind(instruction.operation().clone(), driver, inputs)
+                })
             },
         )?;
 
@@ -566,7 +572,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
             |instruction, inputs| {
                 let driver =
                     ReplayRegionDriver::with_validation(self, instruction.regions(), &region_mappings, validated)?;
-                context.bind(instruction.operation().clone(), driver, inputs)
+                // Refer to the matching comment in `Program::interpret_in_context`. Binding inside the source
+                // instruction's recorded origin makes one-to-one and one-to-many propagation automatic.
+                context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    context.bind(instruction.operation().clone(), driver, inputs)
+                })
             },
         )?;
 
@@ -774,7 +784,10 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{AddOperation, BroadcastOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
-    use crate::programs::{AtomId, BindingRegionDriver, ProgramBuilder, ProgramError, RegionInterface, TypeError};
+    use crate::programs::{
+        AtomId, BindingRegionDriver, ProgramBuilder, ProgramError, Provenance, ProvenanceScope, RegionInterface,
+        TypeError,
+    };
     use crate::tests::TestRegionOperation;
     use crate::tracing::TracingContext;
 
@@ -799,7 +812,7 @@ mod tests {
         // A program whose two outputs are the same atom materializes that value into both output positions.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder
             .build::<Array, (Array, Array)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -821,6 +834,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![source_input],
+                None,
             )
             .unwrap()[0];
         let second = source_builder
@@ -828,6 +842,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![first],
+                None,
             )
             .unwrap()[0];
         let source = source_builder
@@ -846,6 +861,76 @@ mod tests {
         assert_eq!(destination.instructions().len(), 2);
         assert_eq!(destination.instructions()[0].regions(), destination.instructions()[1].regions());
         assert_eq!(destination.instructions()[0].regions(), &[crate::RegionId::new(0)]);
+    }
+
+    #[test]
+    fn test_program_interpret_in_context_preserves_instruction_provenance() {
+        // A replay binds each instruction inside its own recorded origin, so a one-to-one rewrite must preserve the
+        // source provenance exactly, for nested scope, fused, and unknown source provenance alike.
+        let nested = Provenance::scope(
+            ProvenanceScope::new("outer"),
+            Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+        );
+        let fused = Provenance::fused([
+            Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+            Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+        ]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let source_input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated = builder
+            .add_instruction(NegOperation::new(), Vec::new(), vec![source_input], Some(nested.clone()))
+            .unwrap()[0];
+        let summed = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![negated, source_input], Some(fused.clone()))
+            .unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![summed, summed], None).unwrap()[0];
+        let source =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Replays the source program into a fresh trace, either directly or with `outer` entered as an ambient scope,
+        // and additionally stages one instruction that is not a replay of any source instruction.
+        let replay = |ambient_scope: bool| {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let input = context.input(ArrayType::scalar(DataType::F64));
+            let stage = || {
+                let outputs = source.interpret_in_context(&context, vec![input]).unwrap();
+                context.bind(NegOperation::new(), Vec::new(), &[outputs[0].clone()]).unwrap();
+            };
+            match ambient_scope {
+                true => context.invoke_with_provenance_scope(ProvenanceScope::new("outer"), stage),
+                false => stage(),
+            }
+            context
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            replay(false),
+            vec![
+                ("neg", nested.clone()),
+                ("add", fused.clone()),
+                ("add", Provenance::unknown()),
+                ("neg", Provenance::unknown()),
+            ],
+        );
+
+        // Entering the same scope as the first source instruction records around the replay changes nothing about the
+        // replayed provenance, because scopes entered before an origin are the enclosing transform's ambient context
+        // and never fold over it. Only the directly staged instruction, which replays nothing, receives that scope.
+        assert_eq!(
+            replay(true),
+            vec![
+                ("neg", nested),
+                ("add", fused),
+                ("add", Provenance::unknown()),
+                ("neg", Provenance::scope(ProvenanceScope::new("outer"), Provenance::unknown())),
+            ],
+        );
     }
 
     #[test]
@@ -884,6 +969,19 @@ mod tests {
             fn is_eager(&self) -> bool {
                 true
             }
+
+            fn provenance(&self) -> Provenance {
+                // This test context executes eagerly and records no instructions, so provenance is a no-op.
+                Provenance::unknown()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+                function()
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+                function()
+            }
         }
 
         let mut nested_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
@@ -899,6 +997,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![nested],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -923,7 +1022,7 @@ mod tests {
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(7.0f64));
         let c1 = builder.add_constant(Array::scalar(3.0f64));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         let mut lifted_constants = Vec::new();
         assert_eq!(
@@ -966,7 +1065,7 @@ mod tests {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
         let mut builder = ProgramBuilder::<Array, AddOperation<ArrayType>>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
@@ -982,7 +1081,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("dynamic", DimensionBounds::unbounded()))]),
         ));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0, 3.0])).unwrap().to_f64s(), vec![2.0, 4.0, 6.0]);
@@ -1001,7 +1100,7 @@ mod tests {
                 DimensionBounds::non_negative(Some(3)).unwrap(),
             ))]),
         ));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.interpret(Array::vector(vec![1.0, 2.0])).unwrap().to_f64s(), vec![2.0, 4.0]);
         assert!(matches!(
@@ -1081,7 +1180,7 @@ mod tests {
         // identity relationship is rejected even though its output independently refines the dynamic array type.
         let mut builder = ProgramBuilder::<Array, WrongShapeOperation>::new();
         let input = builder.add_input(dynamic_type);
-        let output = builder.add_instruction(WrongShapeOperation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(WrongShapeOperation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret(Array::vector(vec![1.0, 2.0])),
@@ -1122,7 +1221,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
         let input = builder.add_input(input_type);
         let output = builder
-            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input])
+            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -1164,6 +1263,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -1197,7 +1297,7 @@ mod tests {
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let o0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
