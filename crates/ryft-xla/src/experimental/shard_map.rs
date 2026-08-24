@@ -440,7 +440,7 @@ where
         // Both arms rebuild this one source instruction (verbatim or with dead outputs projected away), so its
         // provenance is preserved verbatim.
         let new_outputs = builder
-            .add_instruction_with_provenance(operation, region_ids, inputs, instruction.provenance().clone())?
+            .add_instruction(operation, region_ids, inputs, Some(instruction.provenance().clone()))?
             .to_vec();
         let mut next_new_output = new_outputs.into_iter();
         for (output, live) in instruction.outputs().iter().copied().zip(live_outputs) {
@@ -3765,6 +3765,7 @@ mod tests {
                                         CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
                                         Vec::new(),
                                         vec![input],
+                                        None,
                                     )
                                     .unwrap()[0];
                                 builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()

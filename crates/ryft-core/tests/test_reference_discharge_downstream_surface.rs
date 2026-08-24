@@ -371,10 +371,11 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial]).unwrap()[0];
-    let replaced = builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement]).unwrap()[0];
-    let snapshot = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![root]).unwrap()[0];
-    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root]).unwrap()[0];
+    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+    let replaced =
+        builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
+    let snapshot = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![root], None).unwrap()[0];
+    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
     let program = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
             vec![replaced, snapshot, frozen],
@@ -408,10 +409,11 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial]).unwrap()[0];
-    let replaced = builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement]).unwrap()[0];
-    let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![replaced]).unwrap()[0];
-    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root]).unwrap()[0];
+    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+    let replaced =
+        builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
+    let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![replaced], None).unwrap()[0];
+    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
             vec![negated, frozen],
@@ -459,9 +461,11 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     let counter = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let other = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let observed = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![other]).unwrap()[0];
-    let replaced = builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![counter, replacement]).unwrap()[0];
-    let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![observed]).unwrap()[0];
+    let observed = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![other], None).unwrap()[0];
+    let replaced = builder
+        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![counter, replacement], None)
+        .unwrap()[0];
+    let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![observed], None).unwrap()[0];
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
             vec![replaced, negated],
@@ -493,7 +497,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     // A caller-owned root's holder belongs to the caller, so a program that consumes one is rejected by name.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let external = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![external]).unwrap()[0];
+    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
         .unwrap();
@@ -514,9 +518,12 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
     let counter = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let buffer = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let observed = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![buffer]).unwrap()[0];
-    let replaced = builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![counter, observed]).unwrap()[0];
-    builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![buffer, replacement]).unwrap();
+    let observed = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![buffer], None).unwrap()[0];
+    let replaced =
+        builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![counter, observed], None).unwrap()[0];
+    builder
+        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![buffer, replacement], None)
+        .unwrap();
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![replaced], vec![Placeholder; 3], vec![Placeholder])
         .unwrap();

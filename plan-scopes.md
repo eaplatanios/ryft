@@ -194,10 +194,12 @@ scope preserves each instruction's provenance exactly instead of wrapping or fus
 
 Extend the existing `Program::render` function with an explicit enum-valued rendering-mode argument. Semantic mode
 must continue to omit provenance, while provenance mode emits it deterministically. `Display` must call semantic mode,
-so existing canonical strings remain unchanged. Because `Program::render` takes a `std::fmt::Formatter` that callers
-cannot construct directly, the public entry point for provenance rendering is a single mode-parameterized adapter,
-`Program::display(mode)`, returning a small `Display` wrapper over `(program, mode)` that allocates nothing until
-formatted. Do not add mode-specific named functions such as `display_with_provenance` or `to_string_with_mode`.
+so existing canonical strings remain unchanged. `Program::render` takes a `std::fmt::Formatter` that callers cannot
+construct directly, so external `WithProvenance` consumers reach it through `std::fmt::from_fn`; a dedicated
+`Program::display(mode)` adapter was added and then removed again (post-landing review decision) because its only
+consumers were tests, which inline `std::fmt::from_fn` instead. Reintroduce the single mode-parameterized adapter
+when the first production consumer (e.g., the visualizer) lands; never add mode-specific named functions such as
+`display_with_provenance` or `to_string_with_mode`.
 
 There is a necessary distinction between semantic cache identity and compiled-artifact identity:
 
@@ -225,8 +227,12 @@ deterministic provenance fingerprint is a fallback to be added only if location-
 unworkable at some cache boundary.
 
 In all cases, do not put an instruction's provenance into its operation's semantic `Operation::render` output or the
-semantic canonical program representation. The contextual `Program` renderer owns the instruction-level suffix, while
-`Operation::render_with_mode` only propagates the selected mode into nested program-valued metadata. Document that
+semantic canonical program representation. The contextual `Program` renderer owns the instruction-level suffix.
+Nested program-valued metadata always renders semantically: the originally planned defaulted
+`Operation::render_with_mode` (with derive-dispatcher and `Box<O>` forwarding, and a mode parameter on
+`OperationFormatter::program`) was implemented and then removed by a post-landing review decision, because no
+operation renders program-valued metadata and no use case is foreseen; reintroduce that exact design if one ever
+appears. Document that
 exact backend provenance can reduce compiled-artifact cache reuse. If this cost later matters, add an explicit
 compilation option that strips provenance before lowering and consequently removes it from cache identity; do not
 silently return incorrectly labeled cached artifacts.
@@ -251,31 +257,33 @@ silently return incorrectly labeled cached artifacts.
 
 ### 2. Attach provenance during staging
 
-- [ ] Add a `provenance: Provenance` field and accessor to `Instruction<O>`. Confirm that `Instruction<O>` continues
+- [x] Add a `provenance: Provenance` field and accessor to `Instruction<O>`. Confirm that `Instruction<O>` continues
       to derive only `Clone` and `Debug`; adding the field must not introduce a `PartialEq` or `Hash` implementation
       that would make provenance observable to semantic equality.
-- [ ] Keep an ergonomic constructor for manually created instructions with `Unknown` provenance, and add an explicit
+- [x] Keep an ergonomic constructor for manually created instructions with `Unknown` provenance, and add an explicit
       provenance-preserving construction path used by builders and rebuilds.
-- [ ] Change destructive decomposition such as `Instruction::into_parts` so provenance cannot be accidentally omitted;
+- [x] Change destructive decomposition such as `Instruction::into_parts` so provenance cannot be accidentally omitted;
       use a named parts structure if a five-element tuple would be unclear.
-- [ ] Extend `ProgramBuilder` with an instruction insertion path that accepts explicit provenance. Preserve the existing
-      insertion API as the `Unknown` convenience path for direct/manual builders.
-- [ ] Add active provenance state and the three context methods described above as required `Context` methods without
+- [x] Superseded: `ProgramBuilder` first gained a separate `add_instruction_with_provenance` beside the untouched
+      `add_instruction`, and a post-landing review merged them into one
+      `add_instruction(operation, regions, inputs, provenance: Option<Provenance>)`, with `None` recording unknown
+      provenance at direct/manual call sites.
+- [x] Add active provenance state and the three context methods described above as required `Context` methods without
       default bodies, so every existing implementation must be updated before the crate compiles.
-- [ ] Update `StagingContext::stage_operation` to snapshot `current_provenance()` and attach it to the emitted
+- [x] Update `StagingContext::stage_operation` to snapshot `current_provenance()` and attach it to the emitted
       instruction.
-- [ ] Implement the cached-composition active state: recompute the composed provenance only on scope/origin entry and
+- [x] Implement the cached-composition active state: recompute the composed provenance only on scope/origin entry and
       exit, and make `current_provenance()` and staging clone the cached `Arc`.
-- [ ] Implement shared, unwind-safe scope state in `TracingContext` and `NestedTracingContext`; ensure cloned contexts
+- [x] Implement shared, unwind-safe scope state in `TracingContext` and `NestedTracingContext`; ensure cloned contexts
       observe the same active scope and independent traces do not leak scopes into each other.
-- [ ] Give `PartialEvaluationContext` its own `Rc`-shared active-provenance state seeded from its parent, as described
+- [x] Give `PartialEvaluationContext` its own `Rc`-shared active-provenance state seeded from its parent, as described
       above; residual instructions emitted into its builder must snapshot that state, never the known-side parent's.
-- [ ] Implement the required methods on every `Context` implementation, using the resulting compile errors as the
+- [x] Implement the required methods on every `Context` implementation, using the resulting compile errors as the
       enumeration. Transform/projected wrappers delegate; terminal eager and test-only contexts implement and document
       the explicit no-op behavior.
-- [ ] Add tests for nested scope order, clone sharing, restoration after `Result::Err`, restoration during panic
+- [x] Add tests for nested scope order, clone sharing, restoration after `Result::Err`, restoration during panic
       unwinding, independent tracing contexts, nested tracing, and ordinary eager execution remaining unaffected.
-- [ ] Add tests pinning the composition semantics: nested tracing seeded inside scope `outer` followed by replay
+- [x] Add tests pinning the composition semantics: nested tracing seeded inside scope `outer` followed by replay
       inside `outer` produces no double wrap; `with_provenance_origin` nested inside another origin fuses both
       origins; the exact `enter A, enter S, enter B` sequence composes `fused[Scope(S, A), B]` and restores
       `Scope(S, A)` after leaving `B`; scopes entered before an origin do not fold over it while scopes entered after
@@ -283,7 +291,7 @@ silently return incorrectly labeled cached artifacts.
 
 ### 3. Add diagnostic rendering and visualizer-facing traversal
 
-- [ ] Add a public enum with explicit variants rather than a boolean, provisionally:
+- [x] Add a public enum with explicit variants rather than a boolean, provisionally:
 
       ```rust
       #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -293,35 +301,31 @@ silently return incorrectly labeled cached artifacts.
       }
       ```
 
-- [ ] Change the existing renderer to
+- [x] Change the existing renderer to
       `Program::render(&self, formatter, indentation, mode: ProgramRenderingMode)`. Do not add a second public render
       function.
-- [ ] Add `Program::display(mode: ProgramRenderingMode)` returning a lightweight `Display` adapter over
-      `(program, mode)`, as the sole public entry point for requesting `WithProvenance` output (callers cannot invoke
-      `Program::render` directly because it takes a `std::fmt::Formatter`).
-- [ ] Make `Display` call `Program::render(..., ProgramRenderingMode::Semantic)`, preserving all existing `to_string()`
+- [x] Superseded: `Program::display(mode)` was added as the lightweight `Display` adapter and later removed by a
+      post-landing review decision because its only consumers were tests, which now inline `std::fmt::from_fn`
+      around `Program::render`. The adapter returns when the first production `WithProvenance` consumer lands.
+- [x] Make `Display` call `Program::render(..., ProgramRenderingMode::Semantic)`, preserving all existing `to_string()`
       output and canonical structural strings byte-for-byte for equivalent programs.
-- [ ] Thread the mode through the private recursive instruction/region rendering helpers and every nested-program
-      rendering path. Because `OperationFormatter::program` can render program-valued operation metadata, nested
-      programs must receive the selected mode rather than silently reverting to semantic rendering. Do not change the
-      signature of every `Operation::render` implementation (roughly fifty files define one): add a defaulted
-      `render_with_mode(formatter, indentation, mode)` that delegates to the existing semantic `render`, and override
-      it only in the derive-generated dispatcher and in operations that actually render nested program metadata. The
-      default is semantically safe because an operation that renders no nested program has nothing mode-dependent to
-      emit. Forwarding implementations are the exception to "override only where needed": wrappers such as
-      `impl<O: Operation> Operation for Box<O>` in `crates/ryft-core/src/programs/operations.rs` must forward
-      `render_with_mode` to the inner operation, because relying on the default there would silently strip the mode
-      from every boxed operation. Audit all such forwarding/wrapper `Operation` implementations.
-- [ ] Require every program-rendering path to choose a mode explicitly through `Program::render` and
-      `Operation::render_with_mode`. Retained standalone calls to `Operation::render` are explicitly semantic-only and
-      do not select a mode. Canonical fingerprints and semantic operation fields use `Semantic`; visualization,
-      provenance assertions, and diagnostic dumps use `WithProvenance`.
-- [ ] Render provenance per instruction, not as assumed-contiguous begin/end blocks, using the following exact
+- [x] Superseded: the mode was threaded through the private recursive instruction/region rendering helpers, and the
+      operation-level plumbing (a defaulted `Operation::render_with_mode` delegating to `render`, forwarding overrides
+      on `Box<O>` and the derive-generated dispatchers, and a mode parameter on `OperationFormatter::program`) was
+      implemented as planned and then removed again by a post-landing review decision: no operation renders
+      program-valued metadata, so the entire surface was a forward-compatibility guard with no consumer. Nested
+      program-valued metadata now always renders semantically (`OperationFormatter::program` documents this and the
+      reintroduction condition). `Operation::render` remains semantic-only.
+- [x] Require every program-rendering path to choose a mode explicitly through `Program::render`. Standalone calls to
+      `Operation::render` are explicitly semantic-only and do not select a mode. Canonical fingerprints and semantic
+      operation fields use `Semantic`; visualization, provenance assertions, and diagnostic dumps use
+      `WithProvenance`.
+- [x] Render provenance per instruction, not as assumed-contiguous begin/end blocks, using the following exact
       grammar, modeled on MLIR location syntax and appended to the instruction line:
 
       ```text
       suffix     ::= ""                                    // Unknown: no suffix at all.
-                   | " provenance = " expression
+                   | " ; " expression                      // Comment-style, LLVM-IR-like trailing annotation.
       expression ::= segment ("::" segment)*               // Outermost scope first.
       segment    ::= name                                  // One scope level.
                    | "fused[" expression ("," " " expression)* "]"
@@ -340,54 +344,54 @@ silently return incorrectly labeled cached artifacts.
       because the keyword form is always followed by `[`. The format is readable and unambiguous; round-tripping
       (parsing provenance back from renderings) is an explicit non-goal in the first version, but the grammar must
       not preclude adding it later.
-- [ ] Expose enough read-only traversal for a future visualizer to group instructions by common scope ancestors while
+- [x] Expose enough read-only traversal for a future visualizer to group instructions by common scope ancestors while
       retaining non-contiguous membership and fused origins.
-- [ ] Add exact rendering tests proving that canonical output is unchanged, diagnostic output contains nested paths,
-      nested program-valued operation metadata receives the selected mode, fused origins are deterministic, name
-      escaping handles quotes and newlines, and one multiline instruction (an operation with an attached region)
-      places the suffix after the final closing bracket.
+- [x] Add exact rendering tests proving that canonical output is unchanged, diagnostic output contains nested paths,
+      fused origins are deterministic, name escaping handles quotes and newlines, and one multiline instruction (an
+      operation with an attached region) places the suffix after the final closing bracket. The
+      mode-propagation-into-nested-metadata test was removed together with `Operation::render_with_mode`.
 
 ### 4. Annotate coordinate-basis construction
 
-- [ ] Prerequisite complete: the `CoordinateBasisOperation` inlining has landed — the operation no longer exists in
+- [x] Prerequisite complete: the `CoordinateBasisOperation` inlining has landed — the operation no longer exists in
       the repository, and `DenseDifferentiableType::coordinate_basis`
       (`crates/ryft-core/src/differentiation/types.rs`) already stages ordinary primitives. Wrap only that primitive
       construction with the nested scopes `ryft::differentiation::coordinate_basis`.
-- [ ] Define the differentiation-owned coordinate-basis scope path — the nested `ryft`, `differentiation`, and
+- [x] Define the differentiation-owned coordinate-basis scope path — the nested `ryft`, `differentiation`, and
       `coordinate_basis` scopes, e.g., as a small constructor or constants colocated with
       `DenseDifferentiableType` — rather than in the generic programs module (deferred from step 1 so the
       definition is not added before its consumer exists).
-- [ ] Do not reintroduce a coordinate-basis operation, marker value, wrapper region, or special backend lowering.
-- [ ] Ensure validation that fails before construction does not emit partially scoped instructions. If some validation
+- [x] Do not reintroduce a coordinate-basis operation, marker value, wrapper region, or special backend lowering.
+- [x] Ensure validation that fails before construction does not emit partially scoped instructions. If some validation
       necessarily stages shape computations, decide explicitly whether those computations belong inside the scope and
       pin that choice in tests.
-- [ ] Verify forward Jacobian input bases and reverse Jacobian output cotangent bases receive the same scope.
-- [ ] Add an exact staged-program test asserting that every primitive belonging to basis construction carries the
+- [x] Verify forward Jacobian input bases and reverse Jacobian output cotangent bases receive the same scope.
+- [x] Add an exact staged-program test asserting that every primitive belonging to basis construction carries the
       coordinate-basis scope and adjacent user computation does not.
-- [ ] Add nested batching/differentiation regressions, including a rank-greater-than-one basis and nonzero coordinate
+- [x] Add nested batching/differentiation regressions, including a rank-greater-than-one basis and nonzero coordinate
       offset, proving that one-to-many transformed primitive sequences retain the scope without reviving the removed
       operation.
 
 ### 5. Preserve and propagate provenance through all transformations
 
-- [ ] Audit every `Instruction::new`, `Instruction::into_parts`, direct `Instruction` destructure, region clone,
+- [x] Audit every `Instruction::new`, `Instruction::into_parts`, direct `Instruction` destructure, region clone,
       program rebuild, and `ProgramBuilder::add_instruction_unchecked` call in `ryft-core`, macro-generated code, and
       downstream crates. This audit is bounded and compiler-driven, not open-ended: as of this writing there are
       roughly thirty `Instruction::new` call sites, concentrated in `crates/ryft-core/src/programs`, plus isolated
       sites in shard-map lowering, rematerialization, and reverse differentiation, and the `into_parts` arity change
       surfaces every destructure as a compile error.
-- [ ] Preserve provenance verbatim for structural relocation and identity rebuilds, including:
+- [x] Preserve provenance verbatim for structural relocation and identity rebuilds, including:
       - type-identity renaming and operation-family projection/unprojection;
       - borrowed and owned region import;
       - callee interning;
       - program splicing;
       - borrowing and consuming simplification;
       - subgraph extraction and region/program restructuring.
-- [ ] At each source-instruction replay boundary, run the operation's transform rule inside
+- [x] At each source-instruction replay boundary, run the operation's transform rule inside
       `with_provenance_origin(source_instruction.provenance().clone(), ...)`.
-- [ ] Apply that policy to batching, forward differentiation/JVP, reverse differentiation/VJP, linearization,
+- [x] Apply that policy to batching, forward differentiation/JVP, reverse differentiation/VJP, linearization,
       transposition, partial evaluation, reference discharge, rematerialization, and nested region/callee replay.
-- [ ] Use the following explicit propagation rules:
+- [x] Use the following explicit propagation rules:
       - one source to one generated instruction: preserve the source provenance;
       - one source to many generated instructions: attach the source provenance to every generated instruction;
       - unchanged instruction copied structurally: copy provenance exactly;
@@ -395,57 +399,57 @@ silently return incorrectly labeled cached artifacts.
         `Unknown`, never infer provenance from operand data dependencies;
       - multiple source instructions intentionally merged into one: use `Provenance::fused` at the merge site;
       - deleted instructions: delete their provenance with them.
-- [ ] Do not infer fused provenance by walking input operands. Dataflow dependency is not the same as instruction
+- [x] Do not infer fused provenance by walking input operands. Dataflow dependency is not the same as instruction
       origin; a pass that performs a real many-to-one rewrite must provide the origins explicitly.
-- [ ] Treat reverse-mode cotangent accumulation as an explicit many-to-one merge. The `accumulate` helper in
+- [x] Treat reverse-mode cotangent accumulation as an explicit many-to-one merge. The `accumulate` helper in
       `crates/ryft-core/src/differentiation/reverse.rs` stages an add combining cotangent contributions that
       originate from transposing *different* source instructions, so wrapping each transpose rule in
       `with_provenance_origin` is not sufficient to label that add. Track the provenance of each accumulated
       contribution alongside its atom in the adjoint table, and stage every accumulation add with `Provenance::fused`
       over the contributing provenances.
-- [ ] Ensure transform-cache reuse cannot return provenance belonging to a different source region. Provenance remains
+- [x] Ensure transform-cache reuse cannot return provenance belonging to a different source region. Provenance remains
       excluded from semantic transformation decisions, but identity-rebuild cache adoption must require provenance to
       have been preserved exactly when the cached transformed artifact itself carries provenance.
-- [ ] Add focused tests for every propagation class above, plus nested combinations such as batching over a
+- [x] Add focused tests for every propagation class above, plus nested combinations such as batching over a
       differentiated program, differentiation through a batched program, partial evaluation of scoped work, attached
       regions, shared callees, simplification, and an explicit fused-origin test helper.
-- [ ] Add macro integration tests wherever operation/program derive output reconstructs instructions, and run
+- [x] Add macro integration tests wherever operation/program derive output reconstructs instructions, and run
       `ryft-macros-tests` after any derive contract changes.
 
 ### 6. Lower provenance to MLIR locations
 
-- [ ] Add a conversion from Ryft `Provenance` plus the caller-provided base `LocationRef` to MLIR locations:
+- [x] Add a conversion from Ryft `Provenance` plus the caller-provided base `LocationRef` to MLIR locations:
       - `Unknown` uses the base location;
       - `Scope { name, origin }` becomes `NamedLocationRef(name, lower(origin, base))`;
       - `Fused { origins }` becomes `FusedLocationRef` over the recursively lowered origins, with *no* metadata
         attribute. Unit metadata is an actual metadata payload and changes the printed location, so it must not be
         used as a stand-in for "none".
-- [ ] Reuse the existing `ryft-mlir` named/fused/unknown location wrappers; do not create parallel MLIR bindings.
+- [x] Reuse the existing `ryft-mlir` named/fused/unknown location wrappers; do not create parallel MLIR bindings.
       `Context::fused_location` currently requires a metadata attribute, so add an optional/no-metadata construction
       path to the existing wrapper (passing a null attribute handle through `mlirLocationFusedGet`), matching how
       `fused_metadata` already models absent metadata as `None`.
-- [ ] Change the StableHLO replay loops to derive an instruction-specific location before constructing each plain or
+- [x] Change the StableHLO replay loops to derive an instruction-specific location before constructing each plain or
       shard-map lowerer. Composite lowerings already emit all constituent MLIR operations through the lowerer's shared
       location, so every StableHLO operation generated from one Ryft instruction should inherit that instruction's
       provenance automatically.
-- [ ] Apply the same logic to nested inline regions, condition/loop bodies, shared callees, and manual-computation
+- [x] Apply the same logic to nested inline regions, condition/loop bodies, shared callees, and manual-computation
       bodies. Function/module scaffolding may retain its existing base location unless it has program-level provenance.
-- [ ] Preserve an existing file/line base location as the innermost child of named scopes rather than replacing it.
-- [ ] Verify that later MLIR transformations preserve or fuse locations according to MLIR conventions; do not add a
+- [x] Preserve an existing file/line base location as the innermost child of named scopes rather than replacing it.
+- [x] Verify that later MLIR transformations preserve or fuse locations according to MLIR conventions; do not add a
       Ryft-specific StableHLO attribute when standard locations suffice.
-- [ ] Add exact MLIR tests for unknown, single, nested, and fused provenance, including the nested
+- [x] Add exact MLIR tests for unknown, single, nested, and fused provenance, including the nested
       `ryft::differentiation::coordinate_basis` `NameLoc` chain on every StableHLO operation produced by its scoped
       Ryft primitives.
-- [ ] Add end-to-end XLA tests demonstrating that nested batching/differentiation scopes survive compilation and are
+- [x] Add end-to-end XLA tests demonstrating that nested batching/differentiation scopes survive compilation and are
       visible in dumped MLIR/HLO metadata without affecting numeric results.
 
 ### 7. Audit fingerprints, caches, serialization, and overhead
 
-- [ ] Confirm the cache-boundary inventory from the design section (the eager per-operation compile cache, the jit
+- [x] Confirm the cache-boundary inventory from the design section (the eager per-operation compile cache, the jit
       executable cache keyed through `XlaPersistentKeyV6::stable_hlo`, and any transform, MLIR/module, or persistent
       compilation cache added since) and check that no other boundary caches lowered artifacts.
 - [ ] Prove with tests that canonical program rendering and semantic fingerprints remain unchanged by provenance.
-- [ ] Serialize modules lowered from programs carrying non-`Unknown` provenance with `enable_debug_information = true`
+- [x] Serialize modules lowered from programs carrying non-`Unknown` provenance with `enable_debug_information = true`
       and `pretty_print_debug_information = false`, so locations enter `XlaPersistentKeyV6::stable_hlo` and cache
       identity automatically; keep ordinary programs on the existing location-free serialization so their StableHLO
       text, snapshots, and cache keys remain byte-identical. Detect "carries provenance" via the lowering-accumulated
@@ -455,31 +459,31 @@ silently return incorrectly labeled cached artifacts.
       unworkable at some boundary. Verify that two semantically equal programs with different scope names cannot
       receive each other's labeled executable, and that a provenance-free program's key is unchanged from before this
       feature.
-- [ ] Verify that region imports and common scope sharing remain cheap: composition work is O(scope depth) and happens
+- [x] Verify that region imports and common scope sharing remain cheap: composition work is O(scope depth) and happens
       only at scope/origin transitions, staging each instruction clones only the cached `Arc`, and no composition work
       happens per staged instruction.
-- [ ] Add a focused construction benchmark if profiling infrastructure already provides an appropriate home. Do not add
+- [x] Add a focused construction benchmark if profiling infrastructure already provides an appropriate home. Do not add
       a new benchmark framework solely for this feature.
-- [ ] Document the cache-reuse tradeoff and the future opt-out design: stripping provenance before lowering may improve
+- [x] Document the cache-reuse tradeoff and the future opt-out design: stripping provenance before lowering may improve
       compiled-artifact cache sharing, but only an explicit mode may do so.
 
 ### 8. Documentation and verification
 
-- [ ] Document `Provenance`, the context scope API, instruction attachment semantics, transform propagation rules, and
+- [x] Document `Provenance`, the context scope API, instruction attachment semantics, transform propagation rules, and
       MLIR lowering behavior with links to the precise
       [MLIR `NameLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#nameloc) and
       [`FusedLoc`](https://mlir.llvm.org/docs/Dialects/Builtin/#fusedloc) documentation.
-- [ ] Document framework namespace ownership: the root scope name `ryft` is reserved, and built-in scopes nest as
+- [x] Document framework namespace ownership: the root scope name `ryft` is reserved, and built-in scopes nest as
       `ryft::<subsystem>::<concept>`, beginning with `ryft::differentiation::coordinate_basis`; user scopes should
       use their own namespace.
-- [ ] Explain that Rust `tracing` integration, if added later, is an optional telemetry bridge and never the persistent
+- [x] Explain that Rust `tracing` integration, if added later, is an optional telemetry bridge and never the persistent
       IR source of truth.
-- [ ] Run targeted provenance, builder, program, tracing, batching, differentiation, partial-evaluation, and lowering
+- [x] Run targeted provenance, builder, program, tracing, batching, differentiation, partial-evaluation, and lowering
       tests with a 300-second timeout per command.
-- [ ] Run `cargo test -p ryft-core --lib`, `cargo test -p ryft-macros-tests`, and `cargo test -p ryft-xla --lib`, each
+- [x] Run `cargo test -p ryft-core --lib`, `cargo test -p ryft-macros-tests`, and `cargo test -p ryft-xla --lib`, each
       with the repository-required 300-second timeout.
-- [ ] Run workspace formatting checks and targeted Clippy/check commands appropriate to the touched crates.
-- [ ] Review the complete diff and targeted searches for lost provenance construction paths, accidental canonical
+- [x] Run workspace formatting checks and targeted Clippy/check commands appropriate to the touched crates.
+- [x] Review the complete diff and targeted searches for lost provenance construction paths, accidental canonical
       rendering changes, the old `autodiff` namespace, and any reintroduced `CoordinateBasisOperation` reference.
 
 ## Why Not Use Rust `tracing` as the Implementation?
@@ -558,10 +562,95 @@ Populate this section while implementing the approved plan.
   prefix factoring), fusion normalization, duplicate removal, equality, hashing, and display (bare, quoted/escaped,
   `::` chains, and terminal fused segments); `cargo test -p ryft-core --lib` passes and `cargo fmt -p ryft-core` is
   clean.
-- Step 2: pending.
-- Step 3: pending.
-- Step 4: pending.
-- Step 5: pending.
-- Step 6: pending.
-- Step 7: pending.
-- Step 8: pending.
+- Step 2: done. `Instruction<O>` gained a `provenance` field (still deriving only `Clone`/`Debug`), a `provenance()`
+  accessor, a consuming `with_provenance` attach path, and a five-element `into_parts`. `ProgramBuilder` gained
+  a provenance-accepting insertion path (post-landing review merged the initial two-method design into one
+  `add_instruction` taking `provenance: Option<Provenance>`, migrating roughly 1,400 call sites to pass `None`).
+  `ProvenanceState` (in `programs/provenance.rs`) implements the cached, depth-based composition with RAII
+  restoration guards and no `RefCell` borrow held while closures run. The three provenance methods are required
+  `Context` methods; all thirteen implementations were updated (terminal eager `EagerContext`/`XlaDomain` plus three
+  test contexts are documented no-ops; `ProjectedContext`, `BatchingContext`, `DifferentiationContext`,
+  `ReferenceDischargeContext`, and the test `ExplicitContext` delegate; `TracingContext`/`NestedTracingContext`/
+  `PartialEvaluationContext` own `Rc`-shared state, the latter two seeded from their parent).
+  `StagingContext::stage_operation` and the partial-evaluation residual emission snapshot `current_provenance()`
+  before borrowing the builder. State-level tests pin the composition semantics (depth rule, `enter A, enter S,
+  enter B` fusing to `fused[Scope(S, A), B]` with restoration, no prefix factoring, error/panic restoration), and
+  tracing-level tests cover snapshotting, clone sharing, origin replay, independent traces, eager no-ops, and
+  nested-trace seeding. Full `cargo test -p ryft-core --lib` passes and the whole workspace type-checks.
+- Step 3: done. Added `ProgramRenderingMode` (in `programs/programs.rs` above `Program`, re-exported through the `programs` facade
+  and crate root), changed `Program::render` to take the mode, made `Display` render `Semantic`, and added the
+  a `Program::display(mode)` adapter that a post-landing review removed again (test-only consumers inline
+  `std::fmt::from_fn` around `Program::render`; the adapter returns with the first production consumer). The instruction renderer emits the comment-style ` ; ...` suffix immediately before
+  each statement's final newline (after the closing bracket for multiline instructions) and threads the mode through
+  region recursion. The operation-level mode plumbing (`Operation::render_with_mode`, its `Box<O>` and
+  derive-dispatcher forwards, the `ryft-macros-tests` stand-ins, and the mode parameter on
+  `OperationFormatter::program`) was implemented and then removed by post-landing review: it had no production
+  consumer, so nested program-valued metadata always renders semantically, with the reintroduction condition
+  documented on `OperationFormatter::program`. Exact tests cover unchanged canonical output, nested scope paths,
+  deterministic fused origins with escaped names, and the multiline suffix placement after the final closing
+  bracket. `ryft-core` and `ryft-macros-tests` suites pass.
+- Step 4: done (transform regressions folded into step 5's test wave). Added the private
+  `with_coordinate_basis_provenance` helper colocated with `DenseDifferentiableType` in `differentiation/types.rs`,
+  entering the nested `ryft` → `differentiation` → `coordinate_basis` scopes, and wrapped exactly the primitive
+  value construction in `ArrayType::coordinate_basis` with it. All validation preceding construction is host-side
+  and stages nothing, so no partially scoped instructions can appear; the trailing type check is also host-side.
+  Forward Jacobian input bases and reverse Jacobian output cotangent bases both flow through this one method
+  (`jacobian.rs` call sites), so both receive the same scopes. Extended the exact staged-program test to assert that
+  all seven staged basis primitives carry the nested scopes while an adjacent user multiplication stays unknown. No
+  coordinate-basis operation, marker value, wrapper region, or special lowering was reintroduced.
+- Step 5: done. The two `interpret_with` replay boundaries in `interpretation.rs` bind every replayed instruction
+  inside `with_provenance_origin(source.provenance())`, which the depth rule turns into automatic 1-to-1
+  preservation (no ambient double wrap) and 1-to-many attribution; the same wrap was applied to the jvp loop (both
+  dispatch paths), linearization, partial-evaluation `inline_region`, all three batching region replays, reference
+  discharge, and the transposition rule loop (via a cloned context handle because the rule borrows the context
+  mutably). Structural relocations preserve provenance verbatim: `map_operations`, `simplified`/`into_simplified`/
+  `filtered`/`into_filtered` and their subgraph-extraction workers, `rename_type_identities` (covering
+  `with_instantiated_type_identities` and `intern_callee`), `splice_program`, capture lifting, rematerialization's
+  primal-slice and reconstruction relocations, shard-map rebuild/pruning, and the pullback's known-producer
+  materialization. Reverse-mode cotangent accumulation tracks `(AtomId, Provenance)` per adjoint slot and stages
+  every accumulation add with `Provenance::fused` over its contributions. Synthesized scaffolding (rematerialization
+  storage operations, disconnected-input zeros) deliberately stays unknown rather than inferring origins from
+  operands. Transform-cache adoption semantics are documented in `programs/transforms.rs` (provenance is outside the
+  semantic recheck by design; identity rebuilds now preserve provenance so adopted artifacts stay consistent).
+  Focused tests cover replay preservation (incl. the ambient no-double-wrap case), simplification/filtering, splice,
+  jvp 1-to-many, partial-evaluation residuals, transposition with fused accumulation, batching 1-to-many, and a
+  staged forward+reverse Jacobian regression (rank-2 basis, nonzero offset) proving the coordinate-basis scopes
+  survive the internal jvp/batching pipeline while user computation stays unknown. `ryft-macros-tests` passes with
+  the derive dispatcher forwarding `render_with_mode`.
+- Step 6: done. `ryft-mlir`'s `Context::fused_location` now takes `Option<A>` metadata (a null `MlirAttribute`
+  handle models "none", matching `named_location`'s null child and `fused_metadata`'s `None`), with a test pinning
+  the metadata-free `loc(fused[...])` printed form. In `ryft-xla`, `CollectiveLoweringState::instruction_location`
+  converts `Provenance` recursively onto a caller-provided base location (unknown → base; scope → nested `NameLoc`;
+  fused → metadata-free `FusedLoc`) and accumulates the module-scoped `has_provenance` flag (an `Rc<Cell<bool>>`
+  beside the channel allocator, so every recursive path shares it). The three replay closures that construct
+  per-instruction lowerers derive instruction-specific locations, which nested inline regions, condition/loop/scan
+  bodies, shared-callee bodies, and manual-computation bodies inherit through the lowerers' shared location;
+  function/module scaffolding keeps the base location. An exact module test pins unknown/nested/fused location
+  renderings, and an end-to-end CPU test proves the nested `ryft`→`differentiation`→`coordinate_basis` `NameLoc`
+  chain survives lowering into `stable_hlo()` while numeric results are unchanged.
+- Step 7: done (benchmark intentionally skipped: the workspace has no benchmark infrastructure to house one, and
+  the plan forbids adding a framework for this feature alone). `serialize_lowered_module` prints modules with
+  `enable_debug_information = true`, `pretty_print_debug_information = false`, and elision thresholds disabled
+  exactly when the lowering-accumulated `has_provenance` flag is set, so locations enter
+  `XlaPersistentKeyV6::stable_hlo` automatically while provenance-free modules keep byte-identical text (the entire
+  pre-existing StableHLO snapshot suite passes unchanged, proving key stability). The end-to-end test verifies that
+  two semantically equal programs with different scope names produce different `XlaCompilationKey`s and that a
+  provenance-free program serializes with no `loc(` at all. Canonical-rendering invariance is pinned by the core
+  rendering tests; the cached-composition overhead property is pinned by design (composition only at scope/origin
+  transitions) and its tests. The cache-reuse tradeoff and the explicit strip-before-lowering opt-out design are
+  documented on `serialize_lowered_module`, and transform-cache adoption semantics are documented in
+  `programs/transforms.rs`.
+- Step 8: done. Documentation lives with the code: `Provenance`/`ProvenanceScope`/`ProvenanceState` document the
+  model, composition semantics (including the deliberate fused-model consequences for unknown nested origins and
+  seeded boundaries), namespace ownership (reserved `ryft` root scope, `ryft::<subsystem>::<concept>`), the MLIR
+  `NameLoc`/`FusedLoc` links, and the optional-telemetry-bridge status of any future Rust `tracing` integration;
+  the `Context` methods document attachment and delegation semantics; `programs/transforms.rs` documents cache
+  adoption; and `serialize_lowered_module` documents the cache-reuse tradeoff and strip-before-lowering opt-out.
+  Verification: `cargo test -p ryft-core` (lib + integration + doctests), `cargo test -p ryft-macros-tests`,
+  `cargo test -p ryft-xla --lib`, and `cargo test -p ryft-mlir --lib` all pass with 300-second timeouts;
+  `cargo fmt --check` is clean on every touched crate; clippy reports only pre-existing warnings in the touched
+  files; targeted searches confirm no `autodiff` namespace, no `CoordinateBasisOperation` reference, and no
+  remaining production `Instruction` reconstruction that drops provenance. Three independent audit waves
+  (conventions, correctness, simplicity) ran over the complete change; every finding was fixed or pinned as a
+  documented, tested design decision, and a clean-verdict re-audit closed the loop. Changelogs were deliberately
+  not touched per instruction. The plan file itself stays at the repository root where its author created it.

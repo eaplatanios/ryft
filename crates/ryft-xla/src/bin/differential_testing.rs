@@ -389,17 +389,20 @@ fn data_dependent_prefix_program() -> Result<
         ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64))),
         Vec::new(),
         vec![mask],
+        None,
     )?[0];
     let count = builder.add_instruction(
         ArrayIrOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
         Vec::new(),
         vec![mask],
+        None,
     )?[0];
     let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5))?);
-    let count = builder.add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count])?[0];
+    let count =
+        builder.add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)?[0];
     let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
     let output =
-        builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])?[0];
+        builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count], None)?[0];
     builder.build::<Vec<ArrayIrValue<CpuArray>>, Vec<ArrayIrValue<CpuArray>>>(
         vec![output],
         vec![Placeholder, Placeholder],

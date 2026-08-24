@@ -815,14 +815,15 @@ impl<'c> XlaDomain<'c> {
                     }
                     ArrayIrValue::Dimension(dimension) => {
                         let operation = DimensionOperation::Constant(ConstantOperation::new(dimension.clone()));
-                        Ok(builder.add_instruction(XlaOperation::Dimension(operation), Vec::new(), Vec::new())?[0])
+                        Ok(builder.add_instruction(XlaOperation::Dimension(operation), Vec::new(), Vec::new(), None)?
+                            [0])
                     }
                     ArrayIrValue::Reference(_) => {
                         unreachable!("reference inputs are rejected at the `eager_bind` entry guard")
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            builder.add_instruction(operation, region_ids, input_atoms)?.to_vec()
+            builder.add_instruction(operation, region_ids, input_atoms, None)?.to_vec()
         };
         self.validate_eager_placement(client, array_inputs.as_slice())?;
         let output_count = output_atoms.len();
@@ -5352,7 +5353,8 @@ mod tests {
     fn external_reference_read_program(referent_type: ArrayType) -> FlatXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(referent_type)));
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
@@ -5510,58 +5512,66 @@ mod tests {
         // sort. The boolean reductions cover their own false/true identities, and dot covers zero-padded contraction.
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let iota = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let indices = builder
-            .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .add_instruction(IotaOperation::new(index_type, 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
-        let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![iota]).unwrap()[0];
+        let negative = builder.add_instruction(NegOperation::new(), Vec::new(), vec![iota], None).unwrap()[0];
         let sorted_ascending = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative])
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative], None)
             .unwrap()[0];
         let sorted_descending = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota])
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota], None)
             .unwrap()[0];
         let argmin_indices = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative, indices])
+            .add_instruction(SortOperation::new(0, SortDirection::Ascending), Vec::new(), vec![negative, indices], None)
             .unwrap()[1];
         let argmax_indices = builder
-            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota, indices])
+            .add_instruction(SortOperation::new(0, SortDirection::Descending), Vec::new(), vec![iota, indices], None)
             .unwrap()[1];
         let sum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![iota], None)
             .unwrap()[0];
         let maximum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Max), Vec::new(), vec![iota], None)
             .unwrap()[0];
         let minimum = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Min), Vec::new(), vec![negative])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Min), Vec::new(), vec![negative], None)
             .unwrap()[0];
         let any_input = builder
             .add_instruction(
                 ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan)),
                 Vec::new(),
                 vec![negative, iota],
+                None,
             )
             .unwrap()[0];
         let any = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Any), Vec::new(), vec![any_input])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Any), Vec::new(), vec![any_input], None)
             .unwrap()[0];
         let all_input = builder
             .add_instruction(
                 ArrayOperation::Compare(CompareOperation::<ArrayType>::new(ComparisonDirection::GreaterThanOrEqual)),
                 Vec::new(),
                 vec![iota, negative],
+                None,
             )
             .unwrap()[0];
         let all = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::All), Vec::new(), vec![all_input])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::All), Vec::new(), vec![all_input], None)
             .unwrap()[0];
         let dot = builder
-            .add_instruction(DotOperation::new(DotDimensionNumbers::inner_product()), Vec::new(), vec![iota, iota])
+            .add_instruction(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                Vec::new(),
+                vec![iota, iota],
+                None,
+            )
             .unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -5633,23 +5643,26 @@ mod tests {
 
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let batch_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(attention_batch), Vec::new(), vec![size])
+            .add_instruction(DimensionFromScalarOperation::new(attention_batch), Vec::new(), vec![size], None)
             .unwrap()[0];
 
         // `scaled_dot`: the runtime row extent is non-contracting. Both dynamic element/scale operands share it,
         // while the static right operand fixes one output column and the static block geometry fixes `k = 16`.
-        let scaled_lhs =
-            builder.add_instruction(OneOperation::new(scaled_lhs_type), Vec::new(), vec![dimension]).unwrap()[0];
+        let scaled_lhs = builder
+            .add_instruction(OneOperation::new(scaled_lhs_type), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
         let scaled_lhs_scales = builder
-            .add_instruction(OneOperation::new(scaled_lhs_scale_type), Vec::new(), vec![dimension])
+            .add_instruction(OneOperation::new(scaled_lhs_scale_type), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let scaled_rhs =
-            builder.add_instruction(OneOperation::new(scaled_rhs_type), Vec::new(), Vec::new()).unwrap()[0];
-        let scaled_rhs_scales =
-            builder.add_instruction(OneOperation::new(scaled_rhs_scale_type), Vec::new(), Vec::new()).unwrap()[0];
+            builder.add_instruction(OneOperation::new(scaled_rhs_type), Vec::new(), Vec::new(), None).unwrap()[0];
+        let scaled_rhs_scales = builder
+            .add_instruction(OneOperation::new(scaled_rhs_scale_type), Vec::new(), Vec::new(), None)
+            .unwrap()[0];
         let scaled_dot = builder
             .add_instruction(
                 ScaledDotOperation::new(
@@ -5660,6 +5673,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![scaled_lhs, scaled_rhs, scaled_lhs_scales, scaled_rhs_scales],
+                None,
             )
             .unwrap()[0];
 
@@ -5668,37 +5682,55 @@ mod tests {
         // return the mean `(extent - 2) / 2`, while the final logical row and all physical suffix lanes stay zero.
         // Backward has exact `dQ = 0`, `dK[j] = 8 * (j - mean)`, and `dV = 1` on visible rows and zeros elsewhere.
         let query = builder
-            .add_instruction(OneOperation::new(attention_type.clone()), Vec::new(), vec![batch_dimension, dimension])
+            .add_instruction(
+                OneOperation::new(attention_type.clone()),
+                Vec::new(),
+                vec![batch_dimension, dimension],
+                None,
+            )
             .unwrap()[0];
         let key = builder
-            .add_instruction(OneOperation::new(attention_type.clone()), Vec::new(), vec![batch_dimension, dimension])
+            .add_instruction(
+                OneOperation::new(attention_type.clone()),
+                Vec::new(),
+                vec![batch_dimension, dimension],
+                None,
+            )
             .unwrap()[0];
         let value = builder
             .add_instruction(
                 IotaOperation::new(attention_type.clone(), 1).unwrap(),
                 Vec::new(),
                 vec![batch_dimension, dimension],
+                None,
             )
             .unwrap()[0];
         let output_cotangent = builder
-            .add_instruction(OneOperation::new(attention_type), Vec::new(), vec![batch_dimension, dimension])
+            .add_instruction(OneOperation::new(attention_type), Vec::new(), vec![batch_dimension, dimension], None)
             .unwrap()[0];
         let logical_length =
-            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension]).unwrap()[0];
+            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let logical_length = builder
-            .add_instruction(ConvertElementTypeOperation::new(DataType::I32), Vec::new(), vec![logical_length])
+            .add_instruction(ConvertElementTypeOperation::new(DataType::I32), Vec::new(), vec![logical_length], None)
             .unwrap()[0];
         let one = CpuArray::from_elements(ArrayType::scalar(DataType::I32), &[1_i32]).unwrap();
-        let one = builder.add_instruction(ConstantOperation::new(one), Vec::new(), Vec::new()).unwrap()[0];
-        let length = builder.add_instruction(SubOperation::new(), Vec::new(), vec![logical_length, one]).unwrap()[0];
+        let one = builder.add_instruction(ConstantOperation::new(one), Vec::new(), Vec::new(), None).unwrap()[0];
+        let length =
+            builder.add_instruction(SubOperation::new(), Vec::new(), vec![logical_length, one], None).unwrap()[0];
         let lengths = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![length, batch_dimension])
+            .add_instruction(
+                DynamicBroadcastOperation::new(Vec::new()),
+                Vec::new(),
+                vec![length, batch_dimension],
+                None,
+            )
             .unwrap()[0];
         let forward = builder
             .add_instruction(
                 attention_operation(1.0, false, true, None, AttentionOperandSignature::new(false, false, true, true)),
                 Vec::new(),
                 vec![query, key, value, lengths, lengths],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -5712,6 +5744,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![query, key, value, lengths, lengths, forward[0], forward[1], output_cotangent],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -6016,9 +6049,10 @@ mod tests {
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -6070,6 +6104,7 @@ mod tests {
                 DimensionFromScalarOperation::new(first_type.variable().clone()),
                 Vec::new(),
                 vec![first_input],
+                None,
             )
             .unwrap()[0];
         let second = builder
@@ -6077,6 +6112,7 @@ mod tests {
                 DimensionFromScalarOperation::new(second_type.variable().clone()),
                 Vec::new(),
                 vec![second_input],
+                None,
             )
             .unwrap()[0];
         let third = builder
@@ -6084,6 +6120,7 @@ mod tests {
                 DimensionFromScalarOperation::new(third_type.variable().clone()),
                 Vec::new(),
                 vec![third_input],
+                None,
             )
             .unwrap()[0];
         builder
@@ -6091,6 +6128,7 @@ mod tests {
                 DimensionRequirementOperation::less_than_or_equal(&first_type, &second_type),
                 Vec::new(),
                 vec![first, second],
+                None,
             )
             .unwrap();
         builder
@@ -6098,9 +6136,10 @@ mod tests {
                 DimensionRequirementOperation::less_than_or_equal(&second_type, &third_type),
                 Vec::new(),
                 vec![second, third],
+                None,
             )
             .unwrap();
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![third]).unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![third], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![output],
@@ -6144,6 +6183,7 @@ mod tests {
                     DimensionFromScalarOperation::new(left_type.variable().clone()),
                     Vec::new(),
                     vec![left_input],
+                    None,
                 )
                 .unwrap()[0];
             let right = builder
@@ -6151,10 +6191,11 @@ mod tests {
                     DimensionFromScalarOperation::new(right_type.variable().clone()),
                     Vec::new(),
                     vec![right_input],
+                    None,
                 )
                 .unwrap()[0];
-            builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap();
-            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![right]).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap();
+            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![right], None).unwrap()[0];
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -6216,6 +6257,7 @@ mod tests {
                     DimensionFromScalarOperation::new(left_type.variable().clone()),
                     Vec::new(),
                     vec![left_input],
+                    None,
                 )
                 .unwrap()[0];
             let right = builder
@@ -6223,10 +6265,12 @@ mod tests {
                     DimensionFromScalarOperation::new(right_type.variable().clone()),
                     Vec::new(),
                     vec![right_input],
+                    None,
                 )
                 .unwrap()[0];
-            let result = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
-            let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![result]).unwrap()[0];
+            let result = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![result], None).unwrap()[0];
             let program = builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output],
@@ -6292,12 +6336,13 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let left_input = builder.add_input(input_type.clone().into());
         let right_input = builder.add_input(input_type.clone().into());
-        builder.add_instruction(PrintOperation::new("left"), Vec::new(), vec![left_input]).unwrap();
+        builder.add_instruction(PrintOperation::new("left"), Vec::new(), vec![left_input], None).unwrap();
         let left = builder
             .add_instruction(
                 DimensionFromScalarOperation::new(left_type.variable().clone()),
                 Vec::new(),
                 vec![left_input],
+                None,
             )
             .unwrap()[0];
         let right = builder
@@ -6305,6 +6350,7 @@ mod tests {
                 DimensionFromScalarOperation::new(right_type.variable().clone()),
                 Vec::new(),
                 vec![right_input],
+                None,
             )
             .unwrap()[0];
         builder
@@ -6312,9 +6358,11 @@ mod tests {
                 DimensionRequirementOperation::less_than_or_equal(&left_type, &right_type),
                 Vec::new(),
                 vec![left, right],
+                None,
             )
             .unwrap();
-        let output = builder.add_instruction(PrintOperation::new("right"), Vec::new(), vec![right_input]).unwrap()[0];
+        let output =
+            builder.add_instruction(PrintOperation::new("right"), Vec::new(), vec![right_input], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![output],
@@ -6419,7 +6467,7 @@ mod tests {
             let vector = builder.add_input(vector_type.clone().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let size_operation = DimensionSizeOperation::new(vector_type, 0).unwrap();
-            let size = builder.add_instruction(size_operation.clone(), Vec::new(), vec![vector]).unwrap()[0];
+            let size = builder.add_instruction(size_operation.clone(), Vec::new(), vec![vector], None).unwrap()[0];
             let increment_value = DimensionValue::constant(increment).unwrap();
             let increment = builder
                 .add_instruction(
@@ -6428,6 +6476,7 @@ mod tests {
                     ))),
                     Vec::new(),
                     Vec::new(),
+                    None,
                 )
                 .unwrap()[0];
             let add =
@@ -6437,13 +6486,19 @@ mod tests {
                     XlaOperation::Dimension(DimensionOperation::Add(add)),
                     Vec::new(),
                     vec![size, increment],
+                    None,
                 )
                 .unwrap()[0];
             let broadcast = builder
-                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, output_extent])
+                .add_instruction(
+                    DynamicBroadcastOperation::new(Vec::new()),
+                    Vec::new(),
+                    vec![scalar, output_extent],
+                    None,
+                )
                 .unwrap()[0];
             let reshaped = builder
-                .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![broadcast, output_extent])
+                .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![broadcast, output_extent], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -6627,6 +6682,7 @@ mod tests {
                 ))),
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap()[0];
         let size = builder
@@ -6636,6 +6692,7 @@ mod tests {
                 ))),
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap()[0];
         let output = builder
@@ -6643,6 +6700,7 @@ mod tests {
                 XlaOperation::DynamicShapeSlice(DynamicShapeSliceOperation::new(1).with_strides(vec![2]).unwrap()),
                 Vec::new(),
                 vec![input, start, size],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -7303,13 +7361,14 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let broadcast = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
             .unwrap()[0];
         let output = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![broadcast])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![broadcast], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -7854,6 +7913,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![query, key, value],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -7919,17 +7979,17 @@ mod tests {
         let mask = builder.add_input(mask_type.into());
         let values = builder.add_input(values_type.into());
         let mask = builder
-            .add_instruction(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64), Vec::new(), vec![mask])
+            .add_instruction(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64), Vec::new(), vec![mask], None)
             .unwrap()[0];
         let count = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
             .unwrap()[0];
         let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count])
+            .add_instruction(DimensionFromScalarOperation::new(count_variable), Vec::new(), vec![count], None)
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
-            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])
+            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -7973,17 +8033,17 @@ mod tests {
         let result_size = builder.add_input(size_type.clone().into());
         let value = builder.add_input(value_type.clone().into());
         let input_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(input_extent), Vec::new(), vec![input_size])
+            .add_instruction(DimensionFromScalarOperation::new(input_extent), Vec::new(), vec![input_size], None)
             .unwrap()[0];
         let result_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(result_extent), Vec::new(), vec![result_size])
+            .add_instruction(DimensionFromScalarOperation::new(result_extent), Vec::new(), vec![result_size], None)
             .unwrap()[0];
         let input = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, input_dimension])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, input_dimension], None)
             .unwrap()[0];
         let start = builder.add_constant(XlaConstant::Dimension(DimensionValue::constant(0).unwrap()));
         let output = builder
-            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, result_dimension])
+            .add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, result_dimension], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -8031,9 +8091,10 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let extent = DimensionVariable::new("unbounded", DimensionBounds::unbounded());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -8048,16 +8109,18 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension])
+            .add_instruction(IotaOperation::new(dynamic_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
                 CustomCallOperation::new("ryft.test.opaque_dynamic", vec![dynamic_type]),
                 Vec::new(),
                 vec![input, dimension],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -8074,13 +8137,14 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let output = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Mean), Vec::new(), vec![input], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -8098,13 +8162,15 @@ mod tests {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
-        let input = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
             .unwrap()[0];
-        let output =
-            builder.add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input]).unwrap()[0];
+        let input = builder
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(PrintOperation::<ArrayType>::new("value"), Vec::new(), vec![input], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -8122,13 +8188,15 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let size = builder.add_input(size_type.clone().into());
         let state = builder.add_input(RandomAlgorithm::ThreeFry.state_type().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let output = builder
             .add_instruction(
                 RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type),
                 Vec::new(),
                 vec![state, dimension],
+                None,
             )
             .unwrap()[1];
         let program = builder
@@ -8156,10 +8224,11 @@ mod tests {
         let size = builder.add_input(size_type.into());
         let indices = builder.add_input(indices_type.into());
         let updates = builder.add_input(updates_type.into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let operand = builder
-            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension])
+            .add_instruction(IotaOperation::new(dynamic_type, 0).unwrap(), Vec::new(), vec![dimension], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
@@ -8169,6 +8238,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![operand, indices, updates],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -8379,7 +8449,8 @@ mod tests {
         // beside it. Here the gateway makes the program bounded-dynamic while the `shard_map` stays fully static.
         let mut body_builder = XlaProgramBuilder::new();
         let local = body_builder.add_input(local_type.into());
-        let doubled = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![local, local]).unwrap()[0];
+        let doubled =
+            body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![local, local], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -8392,10 +8463,11 @@ mod tests {
         let size = builder.add_input(size_type.into());
         let value = builder.add_input(value_type.into());
         let global = builder.add_input(global_type.clone().into());
-        let dimension =
-            builder.add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size]).unwrap()[0];
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent), Vec::new(), vec![size], None)
+            .unwrap()[0];
         let dynamic = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
             .unwrap()[0];
         let mapped = builder
             .add_instruction(
@@ -8406,6 +8478,7 @@ mod tests {
                 ))),
                 vec![body_region],
                 vec![global],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -8950,7 +9023,7 @@ mod tests {
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let predicate = builder
-                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::Boolean)), Vec::new(), Vec::new())
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::Boolean)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], Vec::new(), vec![Placeholder])
@@ -8959,10 +9032,11 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder
-                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), Vec::new())
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
-            let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap();
+            let reference =
+                builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new()).unwrap()
         };
         assert_eq!(
@@ -8986,9 +9060,10 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-            let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let reference =
+                builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let output =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![output, state_tangent],
@@ -9226,13 +9301,15 @@ mod tests {
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone().into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let snapshot = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
         let final_value =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![snapshot, final_value],
@@ -9285,29 +9362,37 @@ mod tests {
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
-        let indexed =
-            builder.add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let indexed = builder
+            .add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let indexed_snapshot =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![indexed]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![indexed], None).unwrap()[0];
         let outer = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
                 Vec::new(),
                 vec![reference],
+                None,
             )
             .unwrap()[0];
         let composed = builder
-            .add_instruction(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]), Vec::new(), vec![outer])
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
+                Vec::new(),
+                vec![outer],
+                None,
+            )
             .unwrap()[0];
         let old = builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![composed, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![composed, replacement], None)
             .unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![indexed_snapshot, old, final_snapshot],
@@ -9391,17 +9476,19 @@ mod tests {
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
-        let indexed =
-            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let indexed = builder
+            .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let old = builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![indexed, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![indexed, replacement], None)
             .unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![indexed, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![indexed, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![old, final_snapshot],
@@ -9489,7 +9576,7 @@ mod tests {
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let output = builder
-            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate])
+            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -9537,7 +9624,7 @@ mod tests {
             let reference = builder.add_input(reference_type.clone().into());
             let replacement = builder.add_input(scalar_type.clone().into());
             let snapshot = builder
-                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
+                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
@@ -9548,7 +9635,7 @@ mod tests {
             let reference = builder.add_input(reference_type.into());
             builder.add_input(scalar_type.clone().into());
             let snapshot =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -9560,16 +9647,18 @@ mod tests {
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let initial = builder.add_input(scalar_type.clone().into());
         let replacement = builder.add_input(scalar_type.clone().into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::<XlaConstant>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference, replacement],
+                None,
             )
             .unwrap()[0];
         let final_value =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![snapshot, final_value],
@@ -9643,10 +9732,14 @@ mod tests {
         let true_branch = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone().into());
-            let view =
-                builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference]).unwrap()[0];
-            let update = builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new()).unwrap()[0];
-            builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update]).unwrap();
+            let view = builder
+                .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
+                .unwrap()[0];
+            let update =
+                builder.add_instruction(OneOperation::new(scalar_type), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update], None)
+                .unwrap();
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -9664,15 +9757,18 @@ mod tests {
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let initial = builder.add_input(vector_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
                 ConditionOperation::<XlaConstant>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference],
+                None,
             )
             .unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -9736,10 +9832,10 @@ mod tests {
         let condition = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.clone().into());
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap();
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
             let predicate = CpuArray::from_elements(replicated_scalar_type(&mesh, DataType::Boolean), &[true]).unwrap();
             let predicate =
-                builder.add_instruction(ConstantOperation::new(predicate), Vec::new(), Vec::new()).unwrap()[0];
+                builder.add_instruction(ConstantOperation::new(predicate), Vec::new(), Vec::new(), None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![predicate], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -9747,10 +9843,11 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.into());
-            let update =
-                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -9761,10 +9858,12 @@ mod tests {
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
-        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9790,12 +9889,14 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.into());
-            let update =
-                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
-            let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![reference, value],
@@ -9808,13 +9909,15 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scan_outputs = builder
-            .add_instruction(ScanOperation::<XlaConstant>::new(1, 3), vec![body], vec![reference])
+            .add_instruction(ScanOperation::<XlaConstant>::new(1, 3), vec![body], vec![reference], None)
             .unwrap()
             .to_vec();
-        let final_value =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![scan_outputs[0]]).unwrap()[0];
+        let final_value = builder
+            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![scan_outputs[0]], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![final_value, scan_outputs[1]],
@@ -9848,10 +9951,11 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let reference = builder.add_input(reference_type.into());
-            let update =
-                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new()).unwrap()[0];
+            let update = builder
+                .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
@@ -9861,16 +9965,19 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let runtime_length = builder.add_constant(XlaConstant::Dimension(length.clone()));
         let reference = builder
             .add_instruction(
                 ScanOperation::<XlaConstant>::new(1, Dimension::Dynamic(length_variable.clone())),
                 vec![body],
                 vec![reference, runtime_length],
+                None,
             )
             .unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9910,7 +10017,7 @@ mod tests {
             let reference = builder.add_input(reference_type.into());
             let update = builder.add_input(scalar_type.clone().into());
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
@@ -9921,11 +10028,18 @@ mod tests {
         let callee = builder.import_region(callee.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update])
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![reference, update],
+                None,
+            )
             .unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -9954,7 +10068,7 @@ mod tests {
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -9978,12 +10092,15 @@ mod tests {
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
         let read_only = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type)));
         let read_only_output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_only]).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_only], None).unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, read_only_output])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, read_only_output], None)
             .unwrap();
-        let left = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![left, read_only_output]).unwrap()[0];
+        let left =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![left, read_only_output], None)
+            .unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -10235,9 +10352,10 @@ mod tests {
         let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(state_type.clone())));
         let update = builder.add_input(ArrayIrType::Array(state_type.clone()));
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -10427,7 +10545,7 @@ mod tests {
         let doubled = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -10435,7 +10553,7 @@ mod tests {
         let squared = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -10477,12 +10595,12 @@ mod tests {
             let extent = builder.add_input(extent.r#type().into_owned().into());
             let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
-                builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar]).unwrap()[0]
+                builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0]
             } else {
                 scalar
             };
             let output = builder
-                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -10537,12 +10655,13 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
             let literal = CpuArray::from_elements(scalar_type.clone(), &[3.0f32]).unwrap();
-            let limit = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), vec![]).unwrap()[0];
+            let limit = builder.add_instruction(ConstantOperation::new(literal), Vec::new(), vec![], None).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan))),
                     Vec::new(),
                     vec![state, limit],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -10556,8 +10675,9 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let state = builder.add_input(scalar_type.clone().into());
-            let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+            let one =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -10624,8 +10744,9 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
-            let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
+            let one =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![next, next],
@@ -10663,8 +10784,9 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
-            let one = builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![]).unwrap()[0];
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one]).unwrap()[0];
+            let one =
+                builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -10700,7 +10822,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -10735,7 +10857,7 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
-            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x]).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -10779,7 +10901,7 @@ mod tests {
         let callee = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -10825,7 +10947,7 @@ mod tests {
         let body_program = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(local_type.clone().into());
-            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
                 .unwrap()
@@ -11063,9 +11185,9 @@ mod tests {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(input_type.clone().into());
             let product = builder
-                .add_instruction_with_provenance(MulOperation::new(), Vec::new(), vec![input, input], provenance)
+                .add_instruction(MulOperation::new(), Vec::new(), vec![input, input], Some(provenance))
                 .unwrap()[0];
-            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![product]).unwrap()[0];
+            let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
             builder.build(vec![negated], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 

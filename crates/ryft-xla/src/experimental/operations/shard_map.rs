@@ -1247,7 +1247,7 @@ mod tests {
         let input = builder.add_input(array_type);
         let body_region = builder.import_program(body);
         let output = builder
-            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![input])
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![input], None)
             .unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1423,7 +1423,7 @@ mod tests {
         let body = {
             let mut builder = XlaProgramBuilder::new();
             let input = builder.add_input(boundary_type.clone());
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -1441,7 +1441,7 @@ mod tests {
         let input = builder.add_input(ambient_input_type);
         let body_region = builder.import_program(body);
         let output = builder
-            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![input])
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body_region], vec![input], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -1706,12 +1706,15 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let known_input = builder.add_input(array_type.clone());
         let runtime_input = builder.add_input(array_type.clone());
-        let doubled =
-            builder.add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input]).unwrap()[0];
-        let product =
-            builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input]).unwrap()[0];
-        let sum =
-            builder.add_instruction(AddOperation::new(), Vec::new(), vec![runtime_input, known_input]).unwrap()[0];
+        let doubled = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input], None)
+            .unwrap()[0];
+        let product = builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input], None)
+            .unwrap()[0];
+        let sum = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![runtime_input, known_input], None)
+            .unwrap()[0];
         FlatTracedShardMap::from_parts(
             shard_map,
             vec![array_type.clone(), array_type.clone()],
@@ -1774,6 +1777,7 @@ mod tests {
                 XlaOperation::ShardMap(Box::new(operation)),
                 vec![body_region],
                 vec![known_input, runtime_input],
+                None,
             )
             .unwrap()
             .to_vec();
