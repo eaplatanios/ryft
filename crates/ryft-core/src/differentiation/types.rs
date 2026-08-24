@@ -11,7 +11,7 @@ use crate::operations::{
     Slice, Transpose, TransposeOperation, Zero,
 };
 use crate::parameters::ParameterPath;
-use crate::programs::{ProgramError, RegionRef, Type, TypeError, Typed, Value};
+use crate::programs::{ProgramError, ProvenanceScope, RegionRef, Type, TypeError, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
@@ -450,86 +450,120 @@ where
             .into());
         }
 
-        // TODO(eaplatanios): Review this portion.
+        // The validation above is host-side and stages nothing, so the provenance scopes entered below cover exactly
+        // the primitive instructions that construct the basis value.
         let expected_type = value_type.with_inserted_dimension(0, Dimension::Static(coordinate_count))?;
-        let value = if value_coordinate_count == 0 {
-            context.zero(&expected_type)?
-        } else {
-            // Prefer a rank-independent rectangular identity fragment. Plan both reshapes before emitting values so
-            // this path is used only when flattening preserves the exact output placement and layout type.
-            let rectangular_shape =
-                Shape::new(vec![Dimension::Static(coordinate_count), Dimension::Static(value_coordinate_count)]);
-            let rectangular_type = if expected_type.layout().is_none() {
-                match expected_type.reshape(rectangular_shape) {
-                    Ok(rectangular_type) => Some(rectangular_type),
-                    Err(_reshape_error) => None,
-                }
-            } else {
-                None
-            };
-            let rectangular_plan = rectangular_type.and_then(|rectangular_type| {
-                let output_reshape_parameters =
-                    if expected_type.sharding().is_some_and(|sharding| sharding.references_auto_axis()) {
-                        ReshapeParameters::new(expected_type.shape().clone())
-                    } else {
-                        ReshapeParameters::new(expected_type.shape().clone())
-                            .with_output_sharding(expected_type.sharding().cloned())
-                    };
-                rectangular_type
-                    .reshape(output_reshape_parameters.clone())
-                    .is_ok_and(|restored_type| restored_type == expected_type)
-                    .then_some((rectangular_type, output_reshape_parameters))
-            });
-            if let Some((rectangular_type, output_reshape)) = rectangular_plan {
-                let index_type = rectangular_type.clone().with_data_type(DataType::U64);
-                let direction_index = context.iota(&index_type, 0)?;
-                let mut value_coordinate_index = context.iota(&index_type, 1)?;
-                if coordinate_offset != 0 {
-                    let offset = u64::try_from(coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
-                        message: format!("coordinate offset {coordinate_offset} does not fit in u64"),
-                    })?;
-                    value_coordinate_index = value_coordinate_index + context.fill(&index_type, offset)?;
-                }
-                let selected = direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
-                let zero = context.zero(&rectangular_type)?;
-                let one = context.one(&rectangular_type)?;
-                C::Value::select(&selected, &one, &zero)?.reshape(output_reshape)?
-            } else {
-                // Flattening is not a placement-preserving reshape for every explicit layout or non-contiguous and
-                // unconstrained sharding. Construct the same row-major coordinates directly in the output shape.
-                let index_type = expected_type.clone().with_data_type(DataType::U64);
-                let direction_index = context.iota(&index_type, 0)?;
-                let mut flat_coordinate = None;
-                let mut stride = 1u64;
-                for (value_axis, dimension_size) in value_dimensions.dimensions().iter().copied().enumerate().rev() {
-                    let coordinate = context.iota(&index_type, value_axis + 1)?;
-                    let coordinate =
-                        if stride == 1 { coordinate } else { coordinate * context.fill(&index_type, stride)? };
-                    flat_coordinate = Some(match flat_coordinate {
-                        Some(accumulated) => accumulated + coordinate,
-                        None => coordinate,
-                    });
-                    stride = stride
-                        .checked_mul(u64::try_from(dimension_size).map_err(|_| ProgramError::InvalidArgument {
-                            message: format!("value dimension {dimension_size} does not fit in u64"),
-                        })?)
-                        .ok_or_else(|| ProgramError::InvalidArgument {
-                            message: format!("coordinate count overflows u64 for value type {value_type}"),
-                        })?;
-                }
-                let mut flat_coordinate = flat_coordinate.map_or_else(|| context.fill(&index_type, 0u64), Ok)?;
-                if coordinate_offset != 0 {
-                    let offset = u64::try_from(coordinate_offset).map_err(|_| ProgramError::InvalidArgument {
-                        message: format!("coordinate offset {coordinate_offset} does not fit in u64"),
-                    })?;
-                    flat_coordinate = flat_coordinate + context.fill(&index_type, offset)?;
-                }
-                let selected = direction_index.compare(&flat_coordinate, ComparisonDirection::Equal)?;
-                let one = context.one(&expected_type)?;
-                let zero = context.zero(&expected_type)?;
-                C::Value::select(&selected, &one, &zero)?
-            }
-        };
+        let value = context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+            context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
+                context.invoke_with_provenance_scope(
+                    ProvenanceScope::new("coordinate_basis"),
+                    || -> Result<C::Value, DifferentiationError> {
+                        if value_coordinate_count == 0 {
+                            Ok(context.zero(&expected_type)?)
+                        } else {
+                            // Prefer a rank-independent rectangular identity fragment. Plan both reshapes before
+                            // emitting values so this path is used only when flattening preserves the exact output
+                            // placement and layout type.
+                            let rectangular_shape = Shape::new(vec![
+                                Dimension::Static(coordinate_count),
+                                Dimension::Static(value_coordinate_count),
+                            ]);
+                            let rectangular_type = if expected_type.layout().is_none() {
+                                expected_type.reshape(rectangular_shape).ok()
+                            } else {
+                                None
+                            };
+                            let rectangular_plan = rectangular_type.and_then(|rectangular_type| {
+                                let output_reshape_parameters =
+                                    if expected_type.sharding().is_some_and(|sharding| sharding.references_auto_axis())
+                                    {
+                                        ReshapeParameters::new(expected_type.shape().clone())
+                                    } else {
+                                        ReshapeParameters::new(expected_type.shape().clone())
+                                            .with_output_sharding(expected_type.sharding().cloned())
+                                    };
+                                rectangular_type
+                                    .reshape(output_reshape_parameters.clone())
+                                    .is_ok_and(|restored_type| restored_type == expected_type)
+                                    .then_some((rectangular_type, output_reshape_parameters))
+                            });
+                            if let Some((rectangular_type, output_reshape)) = rectangular_plan {
+                                let index_type = rectangular_type.clone().with_data_type(DataType::U64);
+                                let direction_index = context.iota(&index_type, 0)?;
+                                let mut value_coordinate_index = context.iota(&index_type, 1)?;
+                                if coordinate_offset != 0 {
+                                    let offset = u64::try_from(coordinate_offset).map_err(|_| {
+                                        ProgramError::InvalidArgument {
+                                            message: format!(
+                                                "coordinate offset {coordinate_offset} does not fit in u64",
+                                            ),
+                                        }
+                                    })?;
+                                    value_coordinate_index =
+                                        value_coordinate_index + context.fill(&index_type, offset)?;
+                                }
+                                let selected =
+                                    direction_index.compare(&value_coordinate_index, ComparisonDirection::Equal)?;
+                                let zero = context.zero(&rectangular_type)?;
+                                let one = context.one(&rectangular_type)?;
+                                Ok(C::Value::select(&selected, &one, &zero)?.reshape(output_reshape)?)
+                            } else {
+                                // Flattening is not a placement-preserving reshape for every explicit layout or
+                                // non-contiguous and unconstrained sharding. Construct the same row-major coordinates
+                                // directly in the output shape.
+                                let index_type = expected_type.clone().with_data_type(DataType::U64);
+                                let direction_index = context.iota(&index_type, 0)?;
+                                let mut flat_coordinate = None;
+                                let mut stride = 1u64;
+                                for (value_axis, dimension_size) in
+                                    value_dimensions.dimensions().iter().copied().enumerate().rev()
+                                {
+                                    let coordinate = context.iota(&index_type, value_axis + 1)?;
+                                    let coordinate = if stride == 1 {
+                                        coordinate
+                                    } else {
+                                        coordinate * context.fill(&index_type, stride)?
+                                    };
+                                    flat_coordinate = Some(match flat_coordinate {
+                                        Some(accumulated) => accumulated + coordinate,
+                                        None => coordinate,
+                                    });
+                                    stride = stride
+                                        .checked_mul(u64::try_from(dimension_size).map_err(|_| {
+                                            ProgramError::InvalidArgument {
+                                                message: format!(
+                                                    "value dimension {dimension_size} does not fit in u64",
+                                                ),
+                                            }
+                                        })?)
+                                        .ok_or_else(|| ProgramError::InvalidArgument {
+                                            message: format!(
+                                                "coordinate count overflows u64 for value type {value_type}",
+                                            ),
+                                        })?;
+                                }
+                                let mut flat_coordinate =
+                                    flat_coordinate.map_or_else(|| context.fill(&index_type, 0u64), Ok)?;
+                                if coordinate_offset != 0 {
+                                    let offset = u64::try_from(coordinate_offset).map_err(|_| {
+                                        ProgramError::InvalidArgument {
+                                            message: format!(
+                                                "coordinate offset {coordinate_offset} does not fit in u64",
+                                            ),
+                                        }
+                                    })?;
+                                    flat_coordinate = flat_coordinate + context.fill(&index_type, offset)?;
+                                }
+                                let selected = direction_index.compare(&flat_coordinate, ComparisonDirection::Equal)?;
+                                let one = context.one(&expected_type)?;
+                                let zero = context.zero(&expected_type)?;
+                                Ok(C::Value::select(&selected, &one, &zero)?)
+                            }
+                        }
+                    },
+                )
+            })
+        })?;
 
         if value.r#type().as_ref() != &expected_type {
             return Err(TypeError::invalid(format!(
@@ -802,7 +836,7 @@ mod tests {
     };
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
-    use crate::programs::{Operation, ReferenceType};
+    use crate::programs::{Operation, Provenance, ReferenceType};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -1144,9 +1178,17 @@ mod tests {
         let (_, program) = ArrayTracingContext::trace(
             |input| {
                 let context = input.context().clone();
-                <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&context, &value_type, &value_type, 0, 6)
-                    .map(ArrayBatch::into_value)
-                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))
+                let user = input.clone() * input;
+                let basis = <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(
+                    &context,
+                    &value_type,
+                    &value_type,
+                    0,
+                    6,
+                )
+                .map(ArrayBatch::into_value)
+                .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                Ok((user, basis))
             },
             ArrayType::scalar(F32),
         )
@@ -1154,8 +1196,26 @@ mod tests {
 
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
-            vec!["iota", "iota", "compare", "zero", "one", "select", "reshape"],
+            vec!["mul", "iota", "iota", "compare", "zero", "one", "select", "reshape"],
         );
+
+        // Every primitive belonging to basis construction carries the nested framework scopes, while the adjacent
+        // user computation staged outside them stays unknown. The validation preceding construction stages nothing,
+        // so no partially scoped instructions can appear.
+        let coordinate_basis_provenance = Provenance::scope(
+            ProvenanceScope::new("ryft"),
+            Provenance::scope(
+                ProvenanceScope::new("differentiation"),
+                Provenance::scope(ProvenanceScope::new("coordinate_basis"), Provenance::unknown()),
+            ),
+        );
+        let provenances = program
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.provenance().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(provenances[0], Provenance::unknown());
+        assert_eq!(provenances[1..], vec![coordinate_basis_provenance; 7]);
     }
 
     #[test]
