@@ -1109,6 +1109,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![leaf],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -1121,8 +1122,8 @@ mod tests {
 
     #[test]
     fn test_region_ref_transform_supports_generic_value_and_operation_families() {
-        fn transform_generic_universe<'r, V: Value, O: Operation<Type = V::Type>>(
-            region: RegionRef<'r, V, O>,
+        fn transform_generic_universe<V: Value, O: Operation<Type = V::Type>>(
+            region: RegionRef<V, O>,
         ) -> TransformArtifact<V, O, ()> {
             region
                 .transform::<IdentityTransform, _, Infallible>((), |region, _| {

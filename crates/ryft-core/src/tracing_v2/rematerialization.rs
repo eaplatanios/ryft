@@ -1564,7 +1564,7 @@ fn stage_storage_operation<V: Value, O: Operation<Type = V::Type>>(
     let input_type = builder.atoms()[input.index()].r#type().into_owned();
     validate_storage_operation(&operation, &input_type)?;
     let operation_name = operation.name();
-    let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).map_err(|error| {
+    let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).map_err(|error| {
         RematerializationError::InvalidStorageOperation {
             message: format!("storage operation `{operation_name}` could not be staged: {error}"),
         }
@@ -1748,7 +1748,14 @@ impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
                         .import_region_with_remapping(self.primal.region_ref(*region)?, &mut self.region_remapping))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = builder.add_instruction(instruction.operation().clone(), regions, inputs)?.to_vec();
+            let outputs = builder
+                .add_instruction(
+                    instruction.operation().clone(),
+                    regions,
+                    inputs,
+                    Some(instruction.provenance().clone()),
+                )?
+                .to_vec();
             for (source_output, destination_output) in instruction.outputs().iter().zip(outputs) {
                 // The replayed sibling of a saved output is recorded here, but `cuts` win at resolution, so
                 // dependencies on the saved output keep resolving to the restored saved input.
@@ -1863,7 +1870,9 @@ where
                 })
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        let outputs = builder.add_instruction(instruction.operation().clone(), regions, inputs)?.to_vec();
+        let outputs = builder
+            .add_instruction(instruction.operation().clone(), regions, inputs, Some(instruction.provenance().clone()))?
+            .to_vec();
         for (source_output, destination_output) in instruction.outputs().iter().zip(outputs) {
             relocation[source_output.index()] = Some(destination_output);
         }
@@ -2474,10 +2483,11 @@ mod tests {
                     crate::operations::dot::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
+                    None,
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot])
+                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
@@ -2541,11 +2551,12 @@ mod tests {
                     ArrayOperation::Dot(DotOperation::new(DotDimensionNumbers::inner_product())),
                     Vec::new(),
                     vec![lhs, rhs],
+                    None,
                 )
                 .unwrap()[0];
             let output = if tag_output {
                 builder
-                    .add_instruction(crate::operations::tag::TagOperation::new("false"), Vec::new(), vec![dot])
+                    .add_instruction(crate::operations::tag::TagOperation::new("false"), Vec::new(), vec![dot], None)
                     .unwrap()[0]
             } else {
                 dot
@@ -2565,7 +2576,7 @@ mod tests {
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
         let output = builder
-            .add_instruction(ArrayOperation::Condition(condition), regions, vec![predicate, lhs, rhs])
+            .add_instruction(ArrayOperation::Condition(condition), regions, vec![predicate, lhs, rhs], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
@@ -2618,6 +2629,7 @@ mod tests {
                 ArrayOperation::Condition(ConditionOperation::new()),
                 vec![shared_region, shared_region],
                 vec![shared_predicate, shared_lhs, shared_rhs],
+                None,
             )
             .unwrap()[0];
         let shared_program = shared_builder
@@ -2654,6 +2666,7 @@ mod tests {
                 ArrayOperation::Condition(ConditionOperation::new()),
                 vec![dot_region, constant_region],
                 vec![mixed_predicate, mixed_lhs, mixed_rhs],
+                None,
             )
             .unwrap()[0];
         let mixed_program = mixed_builder
@@ -2685,14 +2698,16 @@ mod tests {
                     DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![input, input],
+                    None,
                 )
                 .unwrap()[0];
             let trigonometric = if cosine {
-                builder.add_instruction(CosOperation::new(), Vec::new(), vec![dot]).unwrap()[0]
+                builder.add_instruction(CosOperation::new(), Vec::new(), vec![dot], None).unwrap()[0]
             } else {
-                builder.add_instruction(SinOperation::new(), Vec::new(), vec![dot]).unwrap()[0]
+                builder.add_instruction(SinOperation::new(), Vec::new(), vec![dot], None).unwrap()[0]
             };
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![dot, trigonometric]).unwrap()[0];
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![dot, trigonometric], None).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 
@@ -3710,10 +3725,11 @@ mod tests {
                     crate::operations::dot::DotOperation::new(DotDimensionNumbers::inner_product()),
                     Vec::new(),
                     vec![row, row],
+                    None,
                 )
                 .unwrap()[0];
             let next = builder
-                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot])
+                .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -3728,7 +3744,7 @@ mod tests {
         let scan = ScanOperation::new(1, 3);
         let body_region = builder.import_region(body.entry_region_ref());
         let scan_outputs = builder
-            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![carry, rows])
+            .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![carry, rows], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -3786,7 +3802,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, SplitOperation>::new();
         let input = builder.add_input(scalar_type.clone());
-        let split_outputs = builder.add_instruction(SplitOperation, Vec::new(), vec![input]).unwrap().to_vec();
+        let split_outputs = builder.add_instruction(SplitOperation, Vec::new(), vec![input], None).unwrap().to_vec();
         let primal = builder
             .build::<Vec<Array>, Vec<Array>>(split_outputs.clone(), vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -3877,6 +3893,7 @@ mod tests {
                 },
                 vec![body_region],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -3898,6 +3915,7 @@ mod tests {
                 },
                 vec![body_region],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -3964,7 +3982,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, PassThroughOriginOperation>::new();
         let body_region = builder.import_region(body.entry_region_ref());
         let input = builder.add_input(scalar_type.clone());
-        let output = builder.add_instruction(PassThroughOriginOperation, vec![body_region], vec![input]).unwrap()[0];
+        let output =
+            builder.add_instruction(PassThroughOriginOperation, vec![body_region], vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -4136,8 +4155,10 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let input = builder.add_input(scalar_type.clone());
-        let state = builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![state]).unwrap()[0];
+        let state =
+            builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![state], None).unwrap()[0];
         let primal =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -4174,11 +4195,13 @@ mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let input = builder.add_input(scalar_type);
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![output],
@@ -4274,7 +4297,8 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let reference = builder.add_input(reference_type);
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let external = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![output],
@@ -4369,7 +4393,12 @@ mod tests {
             let state = builder.add_input(scalar_type.clone());
             let bound = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, bound])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![state, bound],
+                    None,
+                )
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
         }
@@ -4377,7 +4406,8 @@ mod tests {
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
-            let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+            let doubled =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
         }
         .unwrap();
@@ -4455,7 +4485,12 @@ mod tests {
             builder.add_input(scalar_type.clone());
             let bound = builder.add_constant(Array::scalar(8.0));
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, bound])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![state, bound],
+                    None,
+                )
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
         }
@@ -4464,7 +4499,8 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(scalar_type.clone());
             let invariant = builder.add_input(scalar_type.clone());
-            let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+            let doubled =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(
                 vec![doubled, invariant],
                 vec![Placeholder; 2],
@@ -4482,6 +4518,7 @@ mod tests {
                 ArrayOperation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![state, invariant],
+                None,
             )
             .unwrap()
             .to_vec();

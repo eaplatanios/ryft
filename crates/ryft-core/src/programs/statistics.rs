@@ -355,7 +355,8 @@ mod tests {
     #[test]
     fn test_statistics_zero_input_instruction_output_has_depth_one() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let produced = builder.add_instruction(ConstantOperation::new(Array::scalar(1.0)), vec![], vec![]).unwrap()[0];
+        let produced =
+            builder.add_instruction(ConstantOperation::new(Array::scalar(1.0)), vec![], vec![], None).unwrap()[0];
         let program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> =
             builder.build(vec![produced], vec![], vec![Placeholder]).unwrap();
         let statistics = program.statistics();
@@ -368,7 +369,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), vec![], vec![input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), vec![], vec![input], None)
             .unwrap();
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![], vec![Placeholder], vec![]).unwrap();
@@ -382,9 +383,9 @@ mod tests {
     fn test_statistics_dead_work_is_excluded_from_depth_but_counted() {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let live = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, input]).unwrap()[0];
-        let dead = builder.add_instruction(TestRegionOperation::Add, vec![], vec![live, live]).unwrap()[0];
-        builder.add_instruction(TestRegionOperation::Add, vec![], vec![dead, dead]).unwrap();
+        let live = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, input], None).unwrap()[0];
+        let dead = builder.add_instruction(TestRegionOperation::Add, vec![], vec![live, live], None).unwrap()[0];
+        builder.add_instruction(TestRegionOperation::Add, vec![], vec![dead, dead], None).unwrap();
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![live], vec![Placeholder], vec![Placeholder]).unwrap();
         let statistics = program.statistics();
@@ -429,6 +430,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![body],
                 vec![input],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -451,6 +453,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![nested],
                 vec![middle_input],
+                None,
             )
             .unwrap()[0];
         let middle: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
@@ -463,6 +466,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::rule("rule")] }),
                 vec![imported],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
@@ -509,6 +513,7 @@ mod tests {
                 ),
                 vec![shared, shared],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
@@ -546,7 +551,7 @@ mod tests {
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_constant = region_builder.add_constant(Array::scalar(1.0));
         let region_output = region_builder
-            .add_instruction(TestRegionOperation::Add, vec![], vec![region_input, region_constant])
+            .add_instruction(TestRegionOperation::Add, vec![], vec![region_input, region_constant], None)
             .unwrap()[0];
         let region_program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             region_builder.build(vec![region_output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -559,6 +564,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let second = builder
@@ -566,9 +572,10 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![shared],
                 vec![first],
+                None,
             )
             .unwrap()[0];
-        let output = builder.add_instruction(TestRegionOperation::Add, vec![], vec![first, second]).unwrap()[0];
+        let output = builder.add_instruction(TestRegionOperation::Add, vec![], vec![first, second], None).unwrap()[0];
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -590,12 +597,13 @@ mod tests {
         let body = builder.import_region(leaf.entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(1.0));
-        let added = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, constant]).unwrap()[0];
+        let added = builder.add_instruction(TestRegionOperation::Add, vec![], vec![input, constant], None).unwrap()[0];
         let output = builder
             .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![body],
                 vec![added],
+                None,
             )
             .unwrap()[0];
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =

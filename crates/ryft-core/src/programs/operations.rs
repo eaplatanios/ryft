@@ -4,7 +4,7 @@ use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::effects::Effects;
 use crate::programs::identities::TypeIdentityRenaming;
-use crate::programs::programs::Program;
+use crate::programs::programs::{Program, ProgramRenderingMode};
 use crate::programs::references::{ReferenceAccessMode, ReferenceOperationSemantics};
 use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
 use crate::programs::types::{Type, TypeError};
@@ -60,7 +60,11 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
     }
 
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued metadata
-    /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead.
+    /// fields; attached [`Region`](crate::Region)s render through the contextual program renderer instead. Nested
+    /// program metadata always renders semantically: [`Operation::render`] carries no [`ProgramRenderingMode`], and
+    /// the instruction-level provenance suffix is owned by the contextual [`Program`] renderer. If a metadata
+    /// program's own provenance ever needs to render, reintroduce a mode-carrying operation rendering path instead
+    /// of changing this canonical output.
     #[inline]
     pub fn program<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
@@ -74,7 +78,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
         writeln!(self.formatter)?;
         write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
         writeln!(self.formatter, "{name}={{")?;
-        program.render(self.formatter, self.indentation + 8)?;
+        program.render(self.formatter, self.indentation + 8, ProgramRenderingMode::Semantic)?;
         writeln!(self.formatter)?;
         write!(self.formatter, "{:indentation$}", "", indentation = self.indentation + 4)?;
         write!(self.formatter, "}},")
@@ -1182,7 +1186,7 @@ mod tests {
         // Check that program fields are rendered over multiple lines.
         let mut builder = ProgramBuilder::<Array, StopGradientOperation<ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             std::fmt::from_fn(|formatter| {

@@ -183,7 +183,8 @@ impl<V: Typed + Parameter, O> Region<V, O> {
                     instruction.inputs().to_vec(),
                     instruction.outputs().to_vec(),
                     instruction.regions().to_vec(),
-                ))
+                )
+                .with_provenance(instruction.provenance().clone()))
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         Ok(Self::new(atoms, self.input_ids.clone(), self.output_ids.clone(), instructions))
@@ -1516,7 +1517,9 @@ pub struct InstantiatedRegionMapping<T: Type> {
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
 /// [`Operation`] application: [`region_index`](Self::region_index) selects an entry from [`Instruction::regions`],
 /// and [`output_index`](Self::output_index) selects an output of that attached region. Refer to
-/// [`Operation::output_region_provenance`] for how operations provide this kind of provenance information.
+/// [`Operation::output_region_provenance`] for how operations provide this kind of provenance information. Despite
+/// the related name, this is unrelated to the non-semantic diagnostic [`Provenance`](crate::Provenance) recorded on
+/// instructions; this type instead describes real dataflow that transforms rely on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OutputRegionProvenance {
     /// Index of the attached [`Region`] in the [`Operation`]-defined region order.
@@ -1790,6 +1793,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![region],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let second = builder
@@ -1797,6 +1801,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![region],
                 vec![first],
+                None,
             )
             .unwrap()[0];
         builder.build(vec![second], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -1812,6 +1817,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("nested")] }),
                 vec![descendant],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let root_program: TestProgram = root_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -1833,6 +1839,7 @@ mod tests {
                 ),
                 vec![first_root, second_root],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -2146,7 +2153,7 @@ mod tests {
         let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let body_output = body_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
@@ -2160,6 +2167,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
                 vec![body],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =

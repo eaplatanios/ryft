@@ -11,11 +11,27 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::effects::Effects;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
-use crate::programs::operations::{Operation, ProgramRenderingMode};
+use crate::programs::operations::Operation;
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId, ValueProjection};
+
+/// Mode selecting what a [`Program`] rendering includes. The semantic rendering is the canonical structural fingerprint
+/// and must never change because of diagnostic annotations, so provenance output is a separate, explicitly requested
+/// mode rather than a boolean flag on the semantic renderer.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ProgramRenderingMode {
+    /// Renders only the canonical semantic program text. This is what [`Display`] produces for [`Program`]s and what
+    /// structural equivalence fingerprints compare.
+    Semantic,
+
+    /// Renders the semantic program text with a non-semantic, comment-style ` ; ...` provenance suffix appended to
+    /// every instruction whose [`Provenance`](crate::Provenance) is not unknown. The suffix is inserted immediately
+    /// before each instruction statement's final newline (i.e., after the final closing bracket for instructions whose
+    /// rendering spans multiple lines) and never inside nested bodies.
+    WithProvenance,
+}
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
@@ -1326,7 +1342,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 })?;
                 write!(formatter, " = ")?;
             }
-            instruction.operation.render_with_mode(formatter, line_indentation, mode)?;
+            instruction.operation.render(formatter, line_indentation)?;
             instruction.inputs.iter().try_for_each(|input| write!(formatter, " {input}"))?;
             if !instruction.regions.is_empty() {
                 let slots = instruction.operation.region_slots();
@@ -2136,27 +2152,26 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(2.0f64));
-        let negated = builder
-            .add_instruction_with_provenance(NegOperation::new(), Vec::new(), vec![input], nested)
-            .unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(nested)).unwrap()[0];
         let shifted = builder
-            .add_instruction_with_provenance(AddOperation::new(), Vec::new(), vec![negated, constant], fused)
+            .add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant], Some(fused))
             .unwrap()[0];
-        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![shifted, shifted]).unwrap()[0];
+        let doubled =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![shifted, shifted], None).unwrap()[0];
         builder
-            .add_instruction_with_provenance(
+            .add_instruction(
                 MulOperation::new(),
                 Vec::new(),
                 vec![input, input],
-                Provenance::scope(ProvenanceScope::new("dropped"), Provenance::unknown()),
+                Some(Provenance::scope(ProvenanceScope::new("dropped"), Provenance::unknown())),
             )
             .unwrap();
         builder
-            .add_instruction_with_provenance(
+            .add_instruction(
                 PrintOperation::new("x"),
                 Vec::new(),
                 vec![input],
-                Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown()),
+                Some(Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown())),
             )
             .unwrap();
         let program = builder
@@ -2171,7 +2186,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(3.0f64));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![ArrayType::scalar(DataType::F64)]);
         assert_eq!(program.output_types(), vec![ArrayType::scalar(DataType::F64)]);
@@ -2194,8 +2209,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1], None).unwrap()[0];
         let program =
             builder.build::<(Array, Array), Array>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
         assert_eq!(program.input_types(), vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],);
@@ -2220,7 +2235,7 @@ mod tests {
         // Test a program that contains an operation with long metadata that should be rendered on multiple lines.
         let mut builder = ProgramBuilder::<Array, LongMetadataOperation>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let o0 = builder.add_instruction(LongMetadataOperation, Vec::new(), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(LongMetadataOperation, Vec::new(), vec![i0], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder).unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
@@ -2244,7 +2259,7 @@ mod tests {
         // Test a program with two outputs that are copies of the same value.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F32));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, i0], None).unwrap()[0];
         let program = builder
             .build::<Array, (Array, Array)>(vec![o0, o0], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -2276,7 +2291,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let v0 = builder.add_variable(ArrayType::scalar(DataType::F64));
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, v0]).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, v0], None).unwrap()[0];
         assert!(matches!(
             builder.build::<Array, Array>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
@@ -2335,9 +2350,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(3.0f64));
-        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, constant], None).unwrap()[0];
+        let dead_output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
@@ -2360,10 +2375,12 @@ mod tests {
         let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let live_constant = builder.add_constant(Array::scalar(3.0f64));
         let dead_constant = builder.add_constant(Array::scalar(5.0f64));
-        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![live_input]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, live_constant]).unwrap()[0];
-        let dead_output =
-            builder.add_instruction(AddOperation::new(), Vec::new(), vec![dead_input, dead_constant]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation::new(), Vec::new(), vec![live_input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, live_constant], None).unwrap()[0];
+        let dead_output = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![dead_input, dead_constant], None)
+            .unwrap()[0];
         let program = builder
             .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2472,10 +2489,16 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(3.0f64));
-        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let combined = builder.add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant]).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let combined =
+            builder.add_instruction(AddOperation::new(), Vec::new(), vec![negated, constant], None).unwrap()[0];
         let output = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![combined, constant])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![combined, constant],
+                None,
+            )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
 
@@ -2533,8 +2556,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
-        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+        let o0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1], None).unwrap()[0];
         let program =
             builder.build::<(Array, Array), Array>(vec![o0], (Placeholder, Placeholder), Placeholder).unwrap();
 
@@ -2626,6 +2649,7 @@ mod tests {
                 WhileOperation::new().with_iteration_bound(1).unwrap(),
                 vec![while_condition_region, while_body_region],
                 vec![scan_carry],
+                None,
             )
             .unwrap()[0];
         let scan_body = scan_body_builder
@@ -2641,7 +2665,7 @@ mod tests {
         let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let branch_input = branch_builder.add_input(array_type.clone());
         let branch_output =
-            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input]).unwrap()[0];
+            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input], None).unwrap()[0];
         let scan_carry = branch_builder.add_constant(Array::scalar(1.0_f64));
         let scan_stack = branch_builder.add_constant(Array::vector(vec![2.0_f64, 3.0]));
         let scan_capture = Array::vector(vec![5.0_f64, 6.0]);
@@ -2655,6 +2679,7 @@ mod tests {
                     .with_captures(vec![scan_capture.clone()]),
                 vec![scan_body_region],
                 vec![scan_carry, scan_stack],
+                None,
             )
             .unwrap();
         let branch = branch_builder
@@ -2671,6 +2696,7 @@ mod tests {
                 ConditionOperation::<Array>::new(),
                 vec![shared_branch, shared_branch],
                 vec![predicate, operand],
+                None,
             )
             .unwrap()[0];
         let source = builder
@@ -2775,8 +2801,8 @@ mod tests {
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(2.0f64));
         let c1 = builder.add_constant(Array::scalar(3.0f64));
-        let _ = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
+        let _ = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1], None).unwrap()[0];
         let program = builder
             .build::<Array, (Array, Array)>(vec![v1, v1], Placeholder, (Placeholder, Placeholder))
             .unwrap();
@@ -2814,8 +2840,9 @@ mod tests {
         let build = || {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input]).unwrap()[0];
-            let _printed = builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap()[0];
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            let _printed = builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input], None).unwrap()[0];
             builder.build::<Array, Array>(vec![doubled], Placeholder, Placeholder).unwrap()
         };
         let effectful = build();
@@ -2835,7 +2862,12 @@ mod tests {
         let build_zero_output_effect = || {
             let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            assert!(builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap().is_empty());
+            assert!(
+                builder
+                    .add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input], None)
+                    .unwrap()
+                    .is_empty()
+            );
             builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap()
         };
         let zero_output_effect = build_zero_output_effect();
@@ -2858,9 +2890,9 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let first =
-                builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input]).unwrap()[0];
-            builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![first]).unwrap();
-            builder.add_instruction(TestOrderedStateOperation::State(1), Vec::new(), vec![input]).unwrap();
+                builder.add_instruction(TestOrderedStateOperation::State(0), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![first], None).unwrap();
+            builder.add_instruction(TestOrderedStateOperation::State(1), Vec::new(), vec![input], None).unwrap();
             builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap()
         };
 
@@ -2905,7 +2937,7 @@ mod tests {
         let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
         let effectful_output = effectful_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![effectful_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![effectful_input], None)
             .unwrap()[0];
         let effectful_program = effectful_builder
             .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
@@ -2917,6 +2949,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![pure_region],
                 vec![input],
+                None,
             )
             .unwrap();
         builder
@@ -2924,9 +2957,11 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![effectful_region],
                 vec![input],
+                None,
             )
             .unwrap();
-        let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
+        let output =
+            builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.regions().len(), 3);
@@ -2954,8 +2989,8 @@ mod tests {
         let mut branch_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let branch_input = branch_builder.add_input(ArrayType::scalar(DataType::F64));
         let branch_output =
-            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input]).unwrap()[0];
-        branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_output]).unwrap();
+            branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_input], None).unwrap()[0];
+        branch_builder.add_instruction(NegOperation::new(), Vec::new(), vec![branch_output], None).unwrap();
         let branch = branch_builder
             .build::<Vec<Array>, Vec<Array>>(vec![branch_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2969,6 +3004,7 @@ mod tests {
                 ConditionOperation::<Array>::new(),
                 vec![branch_region, branch_region],
                 vec![predicate, operand],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -3048,26 +3084,26 @@ mod tests {
             ("add", Provenance::unknown()),
         ];
         assert_eq!(
-            &provenance_preservation_fixture()
+            provenance_preservation_fixture()
                 .0
                 .simplified()
                 .unwrap()
                 .instructions()
                 .iter()
                 .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
-                .collect(),
-            expected
+                .collect::<Vec<_>>(),
+            expected,
         );
         assert_eq!(
-            &provenance_preservation_fixture()
+            provenance_preservation_fixture()
                 .0
                 .into_simplified()
                 .unwrap()
                 .instructions()
                 .iter()
                 .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
-                .collect(),
-            expected
+                .collect::<Vec<_>>(),
+            expected,
         );
     }
 
@@ -3124,8 +3160,8 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
-        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1]).unwrap()[0];
+        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c0], None).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![i0, c1], None).unwrap()[0];
         let program = builder
             .build::<CloneCountingValue, (CloneCountingValue, CloneCountingValue)>(
                 vec![v1, v1],
@@ -3177,7 +3213,7 @@ mod tests {
         // standard pipeline builds a program and immediately consumes it with `into_simplified`.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -3217,8 +3253,8 @@ mod tests {
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(2.0f64));
-        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0], None).unwrap()[0];
         let program =
             builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
 
@@ -3268,8 +3304,8 @@ mod tests {
         // kept alive.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input]).unwrap();
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input], None).unwrap();
         let effectful = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
@@ -3279,7 +3315,7 @@ mod tests {
         // Zero-output effects are preserved explicitly because they have no result atom that can serve as a root.
         let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
+        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input], None).unwrap();
         let effectful = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
         let (filtered, live) = effectful.filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
@@ -3294,11 +3330,11 @@ mod tests {
         let (filtered, live) = program.filtered(&[input], &[shifted], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(
-            &filtered
+            filtered
                 .instructions()
                 .iter()
                 .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
-                .collect(),
+                .collect::<Vec<_>>(),
             vec![
                 ("print", Provenance::scope(ProvenanceScope::new("effectful"), Provenance::unknown())),
                 (
@@ -3328,8 +3364,8 @@ mod tests {
             let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
             let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
             let c0 = builder.add_constant(Array::scalar(2.0f64));
-            let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-            let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0]).unwrap()[0];
+            let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+            let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, c0], None).unwrap()[0];
             let program =
                 builder.build::<(Array, Array), Array>(vec![v1], (Placeholder, Placeholder), Placeholder).unwrap();
             (program, i0, i1, v0, v1)
@@ -3358,7 +3394,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input]).unwrap();
+        builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input], None).unwrap();
         let effectful = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
@@ -3377,7 +3413,7 @@ mod tests {
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let mut value = input;
             for _ in 0..CHAIN_LENGTH {
-                value = builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, input]).unwrap()[0];
+                value = builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, input], None).unwrap()[0];
             }
             let program = builder.build::<Array, Array>(vec![value], Placeholder, Placeholder).unwrap();
             (program, input, value)
@@ -3421,6 +3457,7 @@ mod tests {
                 ),
                 vec![shared, shared],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let second = builder
@@ -3428,6 +3465,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![inline],
                 vec![first],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -3473,6 +3511,7 @@ mod tests {
                     TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                     vec![region],
                     vec![input],
+                    None,
                 )
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -3505,28 +3544,28 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let scoped = builder
-            .add_instruction_with_provenance(
+            .add_instruction(
                 AddOperation::new(),
                 Vec::new(),
                 vec![input, input],
-                Provenance::scope(
+                Some(Provenance::scope(
                     ProvenanceScope::new("outer"),
                     Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
-                ),
+                )),
             )
             .unwrap()[0];
         let fused = builder
-            .add_instruction_with_provenance(
+            .add_instruction(
                 MulOperation::new(),
                 Vec::new(),
                 vec![scoped, scoped],
-                Provenance::fused([
+                Some(Provenance::fused([
                     Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
                     Provenance::scope(ProvenanceScope::new("quo\"te"), Provenance::unknown()),
-                ]),
+                ])),
             )
             .unwrap()[0];
-        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![fused]).unwrap()[0];
+        let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![fused], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -3576,11 +3615,11 @@ mod tests {
         let region = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
-            .add_instruction_with_provenance(
+            .add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![region],
                 vec![input],
-                Provenance::scope(ProvenanceScope::new("scoped"), Provenance::unknown()),
+                Some(Provenance::scope(ProvenanceScope::new("scoped"), Provenance::unknown())),
             )
             .unwrap()[0];
         let program =
@@ -3611,7 +3650,7 @@ mod tests {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![region_input])
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![region_input], None)
             .unwrap()[0];
         let region_program = region_builder
             .build::<Vec<Array>, Vec<Array>>(vec![region_output], vec![Placeholder], vec![Placeholder])
@@ -3623,9 +3662,12 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
-        let output = builder.add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, with_regions]).unwrap();
+        let output = builder
+            .add_instruction(TestRegionOperation::Add, Vec::new(), vec![input, with_regions], None)
+            .unwrap();
         let output = output[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -3642,13 +3684,14 @@ mod tests {
         let mut rule_builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
         let rule_input = rule_builder.add_input(ArrayType::scalar(DataType::F64));
         let rule_output = rule_builder
-            .add_instruction(DormantRegionOperation::Effectful, Vec::new(), vec![rule_input])
+            .add_instruction(DormantRegionOperation::Effectful, Vec::new(), vec![rule_input], None)
             .unwrap()[0];
         let rule_program = rule_builder.build::<Array, Array>(vec![rule_output], Placeholder, Placeholder).unwrap();
         let mut builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
         let dormant = builder.import_region(rule_program.entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input]).unwrap()[0];
+        let output =
+            builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(), Effects::PURE);
         assert_eq!(program.effects(), Effects::PURE);
