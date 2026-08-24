@@ -10365,14 +10365,14 @@ mod tests {
                 let context = x.value().context().clone();
                 // One instruction staged under nested scopes, one under a fused origin, and one with unknown
                 // provenance, covering every provenance shape in one lowered module.
-                let scoped = context.with_provenance_scope(ProvenanceScope::new("outer"), || {
-                    context.with_provenance_scope(ProvenanceScope::new("inner"), || x.clone() + x.clone())
+                let scoped = context.invoke_with_provenance_scope(ProvenanceScope::new("outer"), || {
+                    context.invoke_with_provenance_scope(ProvenanceScope::new("inner"), || x.clone() + x.clone())
                 });
                 let fused = Provenance::fused([
                     Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
                     Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
                 ]);
-                let product = context.with_provenance_origin(fused, || scoped.clone() * scoped);
+                let product = context.invoke_with_provenance_origin(fused, || scoped.clone() * scoped);
                 product + x
             },
             global_input_type,

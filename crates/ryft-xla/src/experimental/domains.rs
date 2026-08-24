@@ -579,17 +579,17 @@ impl<'c> Context for XlaDomain<'c> {
     // instead of recording instructions, so there is nothing to attach provenance to and scopes are a deliberate
     // no-op. Programs traced *over* this domain attach provenance through their own tracing contexts.
     #[inline]
-    fn current_provenance(&self) -> Provenance {
+    fn provenance(&self) -> Provenance {
         Provenance::unknown()
     }
 
     #[inline]
-    fn with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
         function()
     }
 
     #[inline]
-    fn with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
         function()
     }
 }
