@@ -26,6 +26,27 @@ Reference semantics (verified against `jax/_src/lax/parallel.py` and the JAX doc
 - Lowering is `stablehlo.custom_call @ragged_all_to_all` with `api_version = 4` (typed FFI) and a dictionary
   `backend_config` carrying `replica_groups` (equally sized groups required) plus `channel_id` under SPMD.
 
+## Provenance integration (cross-cutting)
+
+`ryft-core` now attaches a [`Provenance`](crates/ryft-core/src/programs/provenance.rs) to every instruction, with
+contexts exposing `invoke_with_provenance_scope` / `invoke_with_provenance_origin` and transform replay threading
+each source instruction's origin into its rule automatically. Two consequences for this plan:
+
+- Every framework-owned *multi-instruction* expansion staged by this plan enters nested
+  `ryft::<subsystem>::<concept>` provenance scopes around exactly the staged primitives, mirroring the
+  `ryft::differentiation::coordinate_basis` idiom (`differentiation/types.rs:460`), and documents that the scopes
+  are purely diagnostic — nothing may match on them for correctness. Concretely: the Phase 1A generalized identity
+  masking (`ryft::batching::ragged_identity_mask`), the Phase 1B associative-scan JVP decomposition
+  (`ryft::differentiation::associative_scan`), the Phase 5 transpose's metadata permutation and marker-mask
+  construction (`ryft::differentiation::ragged_all_to_all_transpose`), and the Phase 6 merged vmap rule's
+  reshape/offset-rebasing arithmetic (`ryft::batching::ragged_all_to_all`). Single-instruction staging (the Phase 4
+  mesh-staged operation, Phase 8 discharge) needs no explicit scopes — ambient origin threading covers it.
+- Tests and snapshots are unaffected by default: provenance renders only under
+  `ProgramRenderingMode::WithProvenance` (comment-style ` ; ...` suffixes), and provenance-free modules keep
+  byte-identical StableHLO text at lowering (`ryft-xla` `lowering.rs:3859`). Where a phase introduces a scope, add
+  one `WithProvenance` rendering assertion pinning the scope path; Phase 7 lowering snapshots of
+  provenance-carrying transformed programs print debug information, so pin those snapshots with locations in mind.
+
 ## Phase 1: Cumulative operations and logarithmic math primitives
 
 Scheduled first because it is independent of the collectives work, and split into two independently completable
@@ -53,7 +74,7 @@ full operation names.
   the combine function (reversed iteration when `reverse`; zero-length scan axis returns the input unchanged).
 - [ ] Generalized ragged identity masking: the existing machinery cannot serve the cumulative family —
   `DynamicArrayBatchingPolicy::mask_reduction_input` zero-masks and rejects every kind but `Sum`
-  (`batching.rs:2893`), and `ReductionKind` has no product or log-add-exp variant. Add a masking capability that
+  (`batching.rs:2933`), and `ReductionKind` has no product or log-add-exp variant. Add a masking capability that
   accepts a staged identity *value* (rather than widening `ReductionKind`), used by cumulative operations to mask
   padding on the scanned axis with the member's own identity. Because cumulative operations do not consume the
   axis, the input `RaggedAxis` is preserved unchanged on the output; ragged axes on other axes pass through
@@ -406,7 +427,7 @@ Demand-driven, one operation at a time, never a generic "collectives preserve ra
 
 - [ ] `parallel_sum`/`parallel_max`: mask padding with the reduction identity via Phase 1A's generalized
   identity-masking capability (the existing `mask_reduction_input` zero-masks and rejects every kind but `Sum`,
-  `batching.rs:2893`); result extents are the elementwise `parallel_max` of
+  `batching.rs:2933`); result extents are the elementwise `parallel_max` of
   the participating extents (costs one extra collective on the extents; document the partial-participation
   semantics).
 - [ ] `parallel_mean` stays explicitly unsupported for ragged inputs unless its denominator is defined first
