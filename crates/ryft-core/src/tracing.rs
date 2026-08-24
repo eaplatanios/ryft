@@ -1598,6 +1598,41 @@ mod tests {
     }
 
     #[test]
+    fn test_tracing_context_provenance() {
+        // Staged instructions snapshot the provenance that is active when they are staged, and cloned contexts observe
+        // the same shared scope state: the multiplication staged inside the scope carries it, while the addition staged
+        // outside it stays unknown.
+        let scope = ProvenanceScope::new("labeled");
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let context = x.context().clone();
+                let scoped = context.invoke_with_provenance_scope(scope.clone(), || {
+                    assert_eq!(context.clone().provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
+                    x.clone() * x.clone()
+                });
+                Ok(scoped + x)
+            },
+            ArrayType::scalar(DataType::F64),
+        )
+        .unwrap();
+        let provenances = program
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.provenance().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(provenances, vec![Provenance::scope(scope.clone(), Provenance::unknown()), Provenance::unknown()]);
+
+        // Independent traces own independent states, so scopes never leak across traces or leave residue behind.
+        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
+        first.invoke_with_provenance_scope(scope.clone(), || {
+            assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
+            assert_eq!(second.provenance(), Provenance::unknown());
+        });
+        assert_eq!(first.provenance(), Provenance::unknown());
+    }
+
+    #[test]
     fn test_nested_tracing_context() {
         // A nested trace over an eager `EagerContext<Array, ArrayOperation<Array>>` parent stages its own independent
         // primal program and, like the root `TracingContext`, shares that program's builder across cloned contexts.
@@ -1698,6 +1733,33 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_tracing_context_provenance() {
+        // A nested tracing context seeds its origin from the parent context's provenance and owns independent scope
+        // state for the nested program, so nested scopes fold over the seed without affecting the parent.
+        let outer_scope = ProvenanceScope::new("outer");
+        let nested_scope = ProvenanceScope::new("nested");
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        parent.invoke_with_provenance_scope(outer_scope.clone(), || {
+            let seed = parent.provenance();
+            let nested = NestedTracingContext::new(parent.clone());
+            assert_eq!(nested.provenance(), seed);
+            nested.invoke_with_provenance_scope(nested_scope.clone(), || {
+                assert_eq!(nested.provenance(), Provenance::scope(nested_scope.clone(), seed.clone()));
+                assert_eq!(parent.provenance(), seed);
+            });
+
+            // Instructions staged in a nested trace record the seeded origin.
+            let (_, nested_program) = NestedTracingContext::trace(
+                parent.clone(),
+                |inputs| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
+                vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+            )
+            .unwrap();
+            assert_eq!(nested_program.instructions()[0].provenance(), &seed);
+        });
+    }
+
+    #[test]
     fn test_program_specialize() {
         let variable = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable)]));
@@ -1722,86 +1784,5 @@ mod tests {
             error.to_string(),
             format!("specialized input type {unrelated_type} does not refine declared input type {dynamic_type}"),
         );
-    }
-
-    #[test]
-    fn test_tracing_provenance_snapshot_and_clone_sharing() {
-        let scope = ProvenanceScope::new("labeled");
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| {
-                let context = x.context().clone();
-                let scoped = context.invoke_with_provenance_scope(scope.clone(), || {
-                    // A clone of the context observes the same active scope state.
-                    assert_eq!(context.clone().provenance(), Provenance::scope(scope.clone(), Provenance::unknown()),);
-                    x.clone() * x.clone()
-                });
-                Ok(scoped + x)
-            },
-            ArrayType::scalar(DataType::F64),
-        )
-        .unwrap();
-
-        // Each staged instruction snapshots the provenance that was active when it was staged: the multiplication
-        // carries the scope while the addition staged outside it stays unknown.
-        let provenances = program
-            .instructions()
-            .iter()
-            .map(|instruction| instruction.provenance().clone())
-            .collect::<Vec<_>>();
-        assert_eq!(provenances, vec![Provenance::scope(scope, Provenance::unknown()), Provenance::unknown()]);
-    }
-
-    #[test]
-    fn test_tracing_provenance_independent_traces() {
-        let scope = ProvenanceScope::new("scope");
-        let first = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let second = TracingContext::<Array, ArrayOperation<Array>>::new();
-        first.invoke_with_provenance_scope(scope.clone(), || {
-            assert_eq!(first.provenance(), Provenance::scope(scope.clone(), Provenance::unknown()));
-            // Independent traces own independent states, so scopes never leak across traces.
-            assert!(second.provenance().is_unknown());
-        });
-        assert!(first.provenance().is_unknown());
-    }
-
-    #[test]
-    fn test_eager_provenance_is_a_no_op() {
-        // Terminal eager contexts run scope closures directly, record no provenance, and execute unaffected.
-        let eager = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let sum = eager
-            .invoke_with_provenance_scope(ProvenanceScope::new("scope"), || {
-                assert!(eager.provenance().is_unknown());
-                eager.bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)])
-            })
-            .unwrap();
-        assert_eq!(sum, vec![Array::scalar(3.0)]);
-    }
-
-    #[test]
-    fn test_nested_tracing_provenance_seeding() {
-        let outer_scope = ProvenanceScope::new("outer");
-        let nested_scope = ProvenanceScope::new("nested");
-        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
-        parent.invoke_with_provenance_scope(outer_scope.clone(), || {
-            let seed = parent.provenance();
-
-            // A nested tracing context seeds its origin from the parent's current provenance at depth zero of its
-            // own scope stack, and owns independent scope state for the nested program.
-            let nested = NestedTracingContext::new(parent.clone());
-            assert_eq!(nested.provenance(), seed);
-            nested.invoke_with_provenance_scope(nested_scope.clone(), || {
-                assert_eq!(nested.provenance(), Provenance::scope(nested_scope.clone(), seed.clone()));
-                assert_eq!(parent.provenance(), seed);
-            });
-
-            // Instructions staged in a nested trace record the seeded origin.
-            let (_, nested_program) = NestedTracingContext::trace(
-                parent.clone(),
-                |inputs| Ok(vec![inputs[0].clone() + inputs[1].clone()]),
-                vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-            )
-            .unwrap();
-            assert_eq!(nested_program.instructions()[0].provenance(), &seed);
-        });
     }
 }

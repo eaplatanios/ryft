@@ -2567,7 +2567,7 @@ mod tests {
     use crate::operations::complex::{Complex, Real};
     use crate::operations::{One, Reduce, ReductionKind};
     use crate::parameters::Parameter;
-    use crate::programs::BindingRegionDriver;
+    use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope};
     use crate::tracing::DomainTracingContext;
 
     use super::*;
@@ -2943,6 +2943,18 @@ mod tests {
 
             fn is_eager(&self) -> bool {
                 self.0.is_eager()
+            }
+
+            fn provenance(&self) -> Provenance {
+                self.0.provenance()
+            }
+
+            fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+                self.0.invoke_with_provenance_origin(origin, function)
+            }
+
+            fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+                self.0.invoke_with_provenance_scope(scope, function)
             }
 
             fn resolve(&self, value: &Array) -> ValueResolution<Array> {

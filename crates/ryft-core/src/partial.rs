@@ -104,8 +104,8 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, FlatProgram, Operation, Program, ProgramBuilder,
-    ProgramError, ProjectedValue, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueProjection,
+    ProgramError, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState, RegionDriver, RegionRef,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
 
@@ -823,6 +823,14 @@ pub struct PartialEvaluationContext<C: Context> {
     /// rather than [`Staged`](ValueResolution::Staged), and so nothing is ever recorded in that case, and inline
     /// constants are excluded because they carry no staged identity.
     staged_feeders: Rc<RefCell<HashMap<AtomId, AtomId>>>,
+
+    /// Active [`ProvenanceState`] that residual [`Instruction`](crate::Instruction)s snapshot.
+    /// [`PartialEvaluationContext`]s are staging boundaries (i.e., they own the residual [`ProgramBuilder`] and emit
+    /// into it directly), and so they own provenance state exactly like tracing contexts instead of delegating reads
+    /// to their known-side parents, which are often terminal eager contexts that would erase source provenance from
+    /// every residual program. The state is seeded from the parent context's current provenance at construction and
+    /// shared across clones.
+    provenance: Rc<ProvenanceState>,
 }
 
 impl<C: Context> PartialEvaluationContext<C> {
@@ -830,11 +838,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// residual work in a new residual [`ProgramBuilder`].
     #[inline]
     pub fn new(parent: C) -> Self {
+        let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
         Self {
             parent,
             builder: Rc::new(RefCell::new(ProgramBuilder::new())),
             inputs: Rc::new(RefCell::new(Vec::new())),
             staged_feeders: Rc::new(RefCell::new(HashMap::new())),
+            provenance,
         }
     }
 
@@ -1056,7 +1066,11 @@ impl<C: Context> PartialEvaluationContext<C> {
             let mut builder = self.builder.borrow_mut();
             regions.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
         };
-        let output_atoms = self.builder.borrow_mut().add_instruction(operation, region_ids, input_atoms)?.to_vec();
+        let output_atoms = self
+            .builder
+            .borrow_mut()
+            .add_instruction(operation, region_ids, input_atoms, Some(self.provenance.current()))?
+            .to_vec();
 
         let builder = self.builder.borrow();
         Ok(output_atoms
@@ -1140,9 +1154,13 @@ impl<C: Context> PartialEvaluationContext<C> {
             inputs,
             |_, constant| Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant.clone())?)),
             |instruction, inputs| {
+                // Evaluate inside the source instruction's recorded origin so residualized instructions record
+                // where they came from.
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
                 let driver = RecursivePartialEvaluationDriver { driver: &regions };
-                instruction.operation().partially_evaluate(self, &driver, inputs)
+                self.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    instruction.operation().partially_evaluate(self, &driver, inputs)
+                })
             },
         )
     }
@@ -1426,6 +1444,7 @@ impl<C: Context> Clone for PartialEvaluationContext<C> {
             builder: self.builder.clone(),
             inputs: self.inputs.clone(),
             staged_feeders: self.staged_feeders.clone(),
+            provenance: self.provenance.clone(),
         }
     }
 }
@@ -1503,6 +1522,23 @@ where
         // concrete, so concretizing extractions (e.g., branching on a known predicate) succeed on the known side,
         // while unknown (residual) values never concretize regardless of the inner context.
         self.parent.is_eager()
+    }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // A `PartialEvaluationContext` is a staging boundary for the residual program. It owns provenance state seeded
+        // from its parent instead of delegating reads to the (often terminal eager context) known side.
+        self.provenance.current()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
     }
 
     #[inline]
@@ -1946,8 +1982,8 @@ mod tests {
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let r = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(3.0));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, r]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, r], None).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let evaluation = PartialEvaluation::<EagerContext<Array, ArrayOperation<Array>>> {
@@ -2082,8 +2118,8 @@ mod tests {
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
         let outputs = context
@@ -2114,8 +2150,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2136,7 +2172,7 @@ mod tests {
         // reassembled outputs are known values even though the (empty) residual operation is still emitted.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
         let partition = program.partition(&[true]).unwrap();
@@ -2266,7 +2302,7 @@ mod tests {
         let mut state_builder = ProgramBuilder::<Array, HigherOrderStateOperation>::new();
         let state_input = state_builder.add_input(scalar_type.clone());
         let state_output = state_builder
-            .add_instruction(HigherOrderStateOperation::State, Vec::new(), vec![state_input])
+            .add_instruction(HigherOrderStateOperation::State, Vec::new(), vec![state_input], None)
             .unwrap()[0];
         let state = state_builder
             .build::<Vec<Array>, Vec<Array>>(vec![state_output], vec![Placeholder], vec![Placeholder])
@@ -2275,7 +2311,7 @@ mod tests {
         let state_region = body_builder.import_region(state.entry_region_ref());
         let body_input = body_builder.add_input(scalar_type.clone());
         let body_output = body_builder
-            .add_instruction(HigherOrderStateOperation::RuleCarrier, vec![state_region], vec![body_input])
+            .add_instruction(HigherOrderStateOperation::RuleCarrier, vec![state_region], vec![body_input], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
@@ -2629,10 +2665,10 @@ mod tests {
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0));
-        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c]).unwrap()[0];
-        let offset = builder.add_instruction(AddOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
+        let offset = builder.add_instruction(AddOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared, shifted, offset], vec![Placeholder; 2], vec![Placeholder; 3])
             .unwrap();
@@ -2729,9 +2765,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let printed = builder.add_instruction(PrintOperation::new("known"), Vec::new(), vec![a]).unwrap()[0];
-        builder.add_instruction(PrintOperation::new("dead"), Vec::new(), vec![x]).unwrap();
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, x]).unwrap()[0];
+        let printed = builder.add_instruction(PrintOperation::new("known"), Vec::new(), vec![a], None).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("dead"), Vec::new(), vec![x], None).unwrap();
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, x], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2764,6 +2800,49 @@ mod tests {
     }
 
     #[test]
+    fn test_program_partially_evaluate_preserves_residual_provenance() {
+        // `f(a, x) = (a * a * x + 1, print(x))` with `a` known and `x` unknown. Every residual instruction is a
+        // deferred rewrite of one source instruction, so it must carry that instruction's provenance. The folded
+        // known-side `a * a` contributes no residual instruction and so its scope must not appear.
+        let scoped = |name: &str| Provenance::scope(ProvenanceScope::new(name), Provenance::unknown());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let one = builder.add_constant(Array::scalar(1.0));
+        let squared =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], Some(scoped("known"))).unwrap()[0];
+        let scaled = builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], Some(scoped("scaled")))
+            .unwrap()[0];
+        let shifted = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![scaled, one], Some(scoped("shifted")))
+            .unwrap()[0];
+        let printed = builder
+            .add_instruction(PrintOperation::new("x"), Vec::new(), vec![x], Some(scoped("printed")))
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![shifted, printed], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(Array::scalar(3.0)),
+                PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation
+                .program
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            // The effectful `print` residualizes ahead of the pure chain, which is a placement property of partial
+            // evaluation; what matters here is that each residual instruction carries its own source provenance.
+            vec![("print", scoped("printed")), ("mul", scoped("scaled")), ("add", scoped("shifted"))],
+        );
+    }
+
+    #[test]
     fn test_program_partially_evaluate_rejects_unresolved_references() {
         let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let (_, source) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
@@ -2791,7 +2870,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
         let body = body_builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2803,12 +2882,14 @@ mod tests {
 
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(array_type.clone().into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let body = builder.import_region(body.entry_region_ref());
         let reference = builder
-            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference])
+            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference], None)
             .unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2841,9 +2922,9 @@ mod tests {
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let c = builder.add_constant(Array::scalar(1.0));
-        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x]).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2907,9 +2988,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let a = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a]).unwrap()[0];
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x]).unwrap()[0];
+        let doubled = builder.add_instruction(AddOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![doubled, product], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();

@@ -16,8 +16,8 @@ use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatabl
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, Provenance, Region, RegionDriver, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -549,19 +549,25 @@ impl<
 
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
-        /// transpose builder.
+        /// transpose builder. Each accumulation is an intentional many-to-one merge of contributions that originate
+        /// from transposing _different_ source instructions, so the table tracks each accumulated contribution's
+        /// [`Provenance`] alongside its atom and every staged add carries the [`Provenance::fused`] combination of
+        /// its contributions.
         ///
         /// # Parameters
         ///
         ///   - `builder`: Destination builder for the transposed program.
-        ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
+        ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom and the provenance
+        ///     of its contributions, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
+        ///   - `provenance`: [`Provenance`] of the source instruction whose transposition produced `contribution`.
         fn accumulate<V: Value, O: Operation<Type = V::Type> + From<AddOperation<V::Type>>>(
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
-            adjoints: &mut [Option<AtomId>],
+            adjoints: &mut [Option<(AtomId, Provenance)>],
             atom: AtomId,
             contribution: AtomId,
+            provenance: Provenance,
         ) -> Result<(), ProgramError> {
             // Contributions must already be atoms in the transpose builder. Otherwise the `AtomId` could alias an
             // unrelated atom index and corrupt the pullback graph.
@@ -573,19 +579,26 @@ impl<
             let adjoint = adjoints.get_mut(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })?;
 
             // If this atom already has a cotangent, stage an add so both contributions flow into one accumulated
-            // adjoint. Otherwise, keep the first contribution directly and avoid emitting an unnecessary add.
-            *adjoint = Some(match *adjoint {
-                Some(existing) => {
+            // adjoint, labeled with the fused provenance of all contributions merged so far. Otherwise, keep the first
+            // contribution directly and avoid emitting an unnecessary add invocation. Re-fusing per contribution costs
+            // normalization work quadratic in the accumulated constituent count at each merge, so a fan-in of many
+            // _distinct_ provenances is cubic overall (that is accepted because contributions from unlabeled or
+            // same-scope sources collapse to one constituent, and the cost is confined to transposition, never to
+            // per-instruction staging).
+            *adjoint = Some(match adjoint.take() {
+                Some((existing, existing_provenance)) => {
+                    let fused = Provenance::fused([existing_provenance, provenance]);
                     let mut builder_borrow = builder.borrow_mut();
                     let outputs = builder_borrow.add_instruction(
                         AddOperation::<V::Type>::new(),
                         Vec::new(),
                         vec![existing, contribution],
+                        Some(fused.clone()),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
-                    outputs[0]
+                    (outputs[0], fused)
                 }
-                None => contribution,
+                None => (contribution, provenance),
             });
             Ok(())
         }
@@ -713,9 +726,16 @@ impl<
                         let driver = ReplayRegionDriver::new(program, instruction.regions(), region_mappings)?;
                         let region_input_types = vec![None; instruction.regions().len()];
                         let regions = driver.import_into(builder, &region_input_types)?;
+                        // Replaying an unchanged known producer into the pullback is a structural copy,
+                        // so that its provenance is preserved verbatim.
                         let outputs = builder
                             .borrow_mut()
-                            .add_instruction(instruction.operation().clone(), regions, inputs)?
+                            .add_instruction(
+                                instruction.operation().clone(),
+                                regions,
+                                inputs,
+                                Some(instruction.provenance().clone()),
+                            )?
                             .to_vec();
                         check_count!("output", outputs, instruction.outputs().len(), ProgramError);
                         for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
@@ -781,7 +801,7 @@ impl<
         // axes for arrays). A non-differentiable output, such as a Boolean, integer, or token, uses the first-class
         // zero-space type. The adjoint table is indexed by atoms from the original program, and each slot stores
         // the staged pullback atom that currently represents the accumulated cotangent for that primal atom.
-        let mut adjoints = vec![None; self.atoms().len()];
+        let mut adjoints: Vec<Option<(AtomId, Provenance)>> = vec![None; self.atoms().len()];
         for output in self.output_ids().iter().copied() {
             let output_atom = self.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
             let output_type = output_atom.r#type();
@@ -789,7 +809,7 @@ impl<
             let has_cotangent = !cotangent_type.is_zero_space();
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
             if has_cotangent && *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
-                accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
+                accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input, Provenance::unknown())?;
             }
         }
 
@@ -875,7 +895,7 @@ impl<
             for output in instruction.outputs().iter().copied() {
                 let cotangent = adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
                 instruction_output_cotangents.push(match cotangent {
-                    Some(atom) => MaybeZero::Value(context.tracer(*atom, None)),
+                    Some((atom, _)) => MaybeZero::Value(context.tracer(*atom, None)),
                     None => {
                         let output_type = self
                             .atoms()
@@ -924,12 +944,19 @@ impl<
             let transposition_driver = RecursiveTranspositionDriver {
                 regions: instruction.regions().iter().map(|id| self.with_id(*id)).collect::<Result<Vec<_>, _>>()?,
             };
-            let input_cotangents = instruction.operation().transpose(
-                &mut context,
-                &transposition_driver,
-                inputs.as_slice(),
-                instruction_output_cotangents.as_slice(),
-            )?;
+
+            // Run the transpose rule inside the source instruction's recorded origin so every staged instruction
+            // records that it originated from this instruction. The origin is entered through a cloned handle because
+            // the rule borrows the context mutably, while the provenance state is shared across clones.
+            let input_cotangents =
+                context.clone().invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    instruction.operation().transpose(
+                        &mut context,
+                        &transposition_driver,
+                        inputs.as_slice(),
+                        instruction_output_cotangents.as_slice(),
+                    )
+                })?;
             check_count!("input", input_cotangents, instruction.inputs().len(), ProgramError);
             for (input, contribution) in instruction.inputs().iter().copied().zip(input_cotangents) {
                 if !*linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? {
@@ -938,7 +965,13 @@ impl<
                 if let Some(contribution) = contribution.as_value() {
                     // Staged contributions must belong to this builder before their atom IDs can be accumulated.
                     check_builders!(&builder, contribution.builder())?;
-                    accumulate::<V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
+                    accumulate::<V, O>(
+                        &builder,
+                        adjoints.as_mut_slice(),
+                        input,
+                        contribution.atom_id()?,
+                        instruction.provenance().clone(),
+                    )?;
                 }
             }
         }
@@ -953,8 +986,8 @@ impl<
             .enumerate()
             .map(|(output_index, &index)| {
                 let input = self.input_ids()[index];
-                match adjoints.get(input.index()).copied().ok_or(ProgramError::UnboundAtomId { id: input })? {
-                    Some(adjoint) => Ok::<AtomId, ProgramError>(adjoint),
+                match adjoints.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?.as_ref() {
+                    Some((adjoint, _)) => Ok::<AtomId, ProgramError>(*adjoint),
                     None => {
                         let input_atom =
                             self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
@@ -987,7 +1020,7 @@ impl<
                             .collect::<Result<Vec<_>, _>>()?;
                         let (operation, operands) =
                             O::zero_operation_with_residuals(cotangent_type, residuals.as_slice())?;
-                        Ok(builder_borrow.add_instruction(operation, Vec::new(), operands)?[0])
+                        Ok(builder_borrow.add_instruction(operation, Vec::new(), operands, None)?[0])
                     }
                 }
             })
@@ -1638,7 +1671,7 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         Atom, AtomId, Concretizable, Effect, Effects, Instruction, MaybeZero, Operation, Program, ProgramBuilder,
-        ProgramError, Region, RegionId, RegionInterface, RegionSlot, TypeError, Typed, Value,
+        ProgramError, ProvenanceScope, Region, RegionId, RegionInterface, RegionSlot, TypeError, Typed, Value,
     };
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
@@ -1827,6 +1860,7 @@ mod tests {
                             Self::Zero(ZeroOperation::new(ArrayType::scalar(DataType::F64))),
                             Vec::new(),
                             Vec::new(),
+                            None,
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
                         outputs[0]
@@ -1865,7 +1899,7 @@ mod tests {
         // Test that transposing an identity instruction forwards the output cotangent straight to the input.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
@@ -1884,7 +1918,7 @@ mod tests {
         // negative values, so both pullback boundaries use F32 while the source program remains E8M0-typed.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_types(), vec![ArrayType::scalar(DataType::F32)]);
@@ -1909,7 +1943,8 @@ mod tests {
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![input, input]).unwrap()[0];
+        let output =
+            builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![input, input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.input_ids(), &[AtomId::new(0)]);
@@ -1932,8 +1967,10 @@ mod tests {
         // `TwoOutputs` rule asserts that its second output cotangent is a structural zero).
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let outputs =
-            builder.add_instruction(TestLinearOperation::TwoOutputs, Vec::new(), vec![input]).unwrap().to_vec();
+        let outputs = builder
+            .add_instruction(TestLinearOperation::TwoOutputs, Vec::new(), vec![input], None)
+            .unwrap()
+            .to_vec();
         let program = builder.build::<Array, Array>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
         let transposed = program.transpose().unwrap();
         assert_eq!(outputs, &[AtomId::new(1), AtomId::new(2)]);
@@ -1980,8 +2017,9 @@ mod tests {
         let dead_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let live_input = builder.add_input(ArrayType::scalar(DataType::F64));
         let dead_output =
-            builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![dead_input]).unwrap()[0];
-        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![live_input]).unwrap()[0];
+            builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![dead_input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![live_input], None).unwrap()[0];
         let program = builder
             .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2051,7 +2089,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
-            .add_instruction(TestLinearOperation::StagedZeroContribution, Vec::new(), vec![input])
+            .add_instruction(TestLinearOperation::StagedZeroContribution, Vec::new(), vec![input], None)
             .unwrap()[0];
         let program =
             builder.build::<TestTracingValue, TestTracingValue>(vec![output], Placeholder, Placeholder).unwrap();
@@ -2081,7 +2119,7 @@ mod tests {
         // of silently dropping cotangents.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::BadArity, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
@@ -2092,8 +2130,9 @@ mod tests {
         // unrelated atom in the destination pullback.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output =
-            builder.add_instruction(TestLinearOperation::ForeignContribution, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(TestLinearOperation::ForeignContribution, Vec::new(), vec![input], None)
+            .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose(),
@@ -2138,7 +2177,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
             .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -2174,8 +2213,10 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let known = builder.add_input(ArrayType::scalar(DataType::F64));
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
-        let known_square = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_square, linear]).unwrap()[0];
+        let known_square =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![known, known], None).unwrap()[0];
+        let product =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![known_square, linear], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
                 vec![known_square, product],
@@ -2195,12 +2236,12 @@ mod tests {
         let first_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let second_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let known_intermediate =
-            builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known]).unwrap()[0];
+            builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known], None).unwrap()[0];
         let first_output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, first_linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, first_linear], None)
             .unwrap()[0];
         let second_output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, second_linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, second_linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
@@ -2236,16 +2277,16 @@ mod tests {
         let first_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let second_linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let first_known = builder
-            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known])
+            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known], None)
             .unwrap()[0];
         let second_known = builder
-            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known])
+            .add_instruction(TestLinearOperation::RegionIdentity, vec![shared_region], vec![known], None)
             .unwrap()[0];
         let first_output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![first_known, first_linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![first_known, first_linear], None)
             .unwrap()[0];
         let second_output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![second_known, second_linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![second_known, second_linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(
@@ -2271,10 +2312,11 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let known = builder.add_input(ArrayType::scalar(DataType::F64));
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
-        let known_intermediate =
-            builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![known]).unwrap()[0];
+        let known_intermediate = builder
+            .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![known], None)
+            .unwrap()[0];
         let output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
@@ -2290,8 +2332,9 @@ mod tests {
         // in the reversed program.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
-        let effectful =
-            builder.add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![linear]).unwrap()[0];
+        let effectful = builder
+            .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![linear], None)
+            .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![effectful], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.transpose_with_respect_to(&[0]),
@@ -2306,17 +2349,18 @@ mod tests {
         let mut region_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
-            .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![region_input])
+            .add_instruction(TestLinearOperation::EffectfulIdentity, Vec::new(), vec![region_input], None)
             .unwrap()[0];
         let region = region_builder.build::<Array, Array>(vec![region_output], Placeholder, Placeholder).unwrap();
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let region = builder.import_region(region.entry_region_ref());
         let known = builder.add_input(ArrayType::scalar(DataType::F64));
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
-        let known_intermediate =
-            builder.add_instruction(TestLinearOperation::RegionIdentity, vec![region], vec![known]).unwrap()[0];
+        let known_intermediate = builder
+            .add_instruction(TestLinearOperation::RegionIdentity, vec![region], vec![known], None)
+            .unwrap()[0];
         let output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
@@ -2326,6 +2370,49 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message.contains("cannot replay effectful known intermediate producer `region_identity`"),
         ));
+    }
+
+    #[test]
+    fn test_program_transpose_preserves_and_fuses_source_provenance() {
+        // `f(x) = x * 2 + x * 3` is linear in `x` and uses it twice, so transposing it stages one pullback `mul` per
+        // source `mul` plus one accumulating `add`. Each staged `mul` records the source instruction it transposes,
+        // while the accumulation intentionally merges contributions from two *different* source instructions and
+        // therefore records the fused provenance of both.
+        let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
+        let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let two = builder.add_constant(Array::scalar(2.0));
+        let three = builder.add_constant(Array::scalar(3.0));
+        let doubled =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, two], Some(first.clone())).unwrap()[0];
+        let tripled = builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![x, three], Some(second.clone()))
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                AddOperation::new(),
+                Vec::new(),
+                vec![doubled, tripled],
+                Some(Provenance::scope(ProvenanceScope::new("c"), Provenance::unknown())),
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // The reverse walk visits the source instructions in reverse program order, so the second `mul`'s contribution
+        // is accumulated first and leads the fused origin list. The `add` transposes into pure cotangent routing and
+        // therefore contributes no instruction of its own.
+        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            pullback
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![("mul", second.clone()), ("mul", first.clone()), ("add", Provenance::fused([second, first])),],
+        );
+        assert_eq!(pullback.interpret(vec![Array::scalar(1.0)]), Ok(vec![Array::scalar(5.0)]));
     }
 
     #[test]
@@ -2342,11 +2429,11 @@ mod tests {
         let mut known_intermediate = known;
         for _ in 0..CHAIN_LENGTH {
             known_intermediate = builder
-                .add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known_intermediate])
+                .add_instruction(TestLinearOperation::Identity, Vec::new(), vec![known_intermediate], None)
                 .unwrap()[0];
         }
         let output = builder
-            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear])
+            .add_instruction(TestLinearOperation::Add, Vec::new(), vec![known_intermediate, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(vec![output], vec![Placeholder, Placeholder], Placeholder)
@@ -2369,7 +2456,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right], None).unwrap()[0];
         let callee = Arc::new(
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -2406,7 +2493,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2416,7 +2503,7 @@ mod tests {
         // not stage.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Identity, Vec::new(), vec![input], None).unwrap()[0];
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );

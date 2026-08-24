@@ -810,7 +810,7 @@ pub(crate) mod tests {
     use crate::partial::{PartialTracer, PartialValue};
     use crate::programs::{
         Atom, AtomId, CalleeRegionDriver, MaybeZero, NoIdentity, OperationProjection, ProgramBuilder, ProgramError,
-        ProjectedValue, RegionInterface, Type, TypeError, Typed, ValueProjection,
+        ProjectedValue, Provenance, ProvenanceScope, RegionInterface, Type, TypeError, Typed, ValueProjection,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracerState, TracingContext};
 
@@ -1330,6 +1330,20 @@ pub(crate) mod tests {
             ),
             Ok(vec![Array::scalar(8.0)]),
         );
+    }
+
+    #[test]
+    fn test_eager_context_provenance_is_a_no_op() {
+        // Terminal eager contexts record no instructions, so there is nothing to attach provenance to. Entering a
+        // scope runs the closure directly, the provenance stays unknown, and execution is unaffected.
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let sum = context
+            .invoke_with_provenance_scope(ProvenanceScope::new("scope"), || {
+                assert_eq!(context.provenance(), Provenance::unknown());
+                context.bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)])
+            })
+            .unwrap();
+        assert_eq!(sum, vec![Array::scalar(3.0)]);
     }
 
     #[test]
