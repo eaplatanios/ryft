@@ -157,24 +157,24 @@ pub use programs::{
     InstructionId, MaybeZero, MemberOperation, NEW_REFERENCE_OPERATION_NAME, NewReference, NewReferenceOperation,
     NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance,
     ParameterProjection, PartialReferenceDischargeResult, PreparedReferenceValue, Program, ProgramBuilder,
-    ProgramError, ProgramLiveSets, ProgramStatistics, ProjectedValue, Provenance, ProvenanceScope,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
-    RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAliasKind, ReferenceCompletion, ReferenceCompletionBackend,
-    ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceDischarge, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceError, ReferenceGeneration, ReferenceGuard,
-    ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
-    ReferenceReadOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource,
-    ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements, Region,
-    RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, Transform, TransformArtifact,
-    TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature,
-    TypeRefinements, Typed, Value, ValueId, ValueProjection, discharge_positional_region_operation,
-    discharge_preserved_access, discharge_reference_free_operation, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance,
+    ProvenanceScope, ProvenanceState, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
+    REFERENCE_SWAP_OPERATION_NAME, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode,
+    ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult,
+    ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeReference, ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite,
+    ReferenceDischargeTracer, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceError,
+    ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics,
+    ReferenceOutputSemantics, ReferenceRead, ReferenceReadOperation, ReferenceRegionDischargeBoundary,
+    ReferenceRegionDischargeFork, ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle,
+    ReferenceRootState, ReferenceSource, ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
+    ReferenceTypeRefinements, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
+    Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId, ValueProjection,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -502,10 +502,11 @@ pub(crate) mod tests {
         let reference = true_builder.add_input(reference_type.clone().into());
         let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
         true_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
-        let snapshot =
-            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -514,7 +515,7 @@ pub(crate) mod tests {
         let reference = false_builder.add_input(reference_type.into());
         let replacement = false_builder.add_constant(TestValue::Array(Array::scalar(9.0_f32)));
         let snapshot = false_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
@@ -525,11 +526,18 @@ pub(crate) mod tests {
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let initial = builder.add_input(ArrayIrType::Array(scalar_type));
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
-            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![predicate, reference])
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let frozen =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap()

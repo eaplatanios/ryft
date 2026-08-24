@@ -28,6 +28,7 @@ use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::provenance::{Provenance, ProvenanceScope};
 use crate::programs::regions::{
     BindingRegionDriver, EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
@@ -2364,6 +2365,23 @@ where
         self.parent.is_eager()
     }
 
+    // Reference discharge stages rewritten primitive work through its destination parent, so provenance state lives
+    // with the parent.
+    #[inline]
+    fn current_provenance(&self) -> Provenance {
+        self.parent.current_provenance()
+    }
+
+    #[inline]
+    fn with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.with_provenance_scope(scope, function)
+    }
+
+    #[inline]
+    fn with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.with_provenance_origin(origin, function)
+    }
+
     #[inline]
     fn resolve(&self, value: &ReferenceDischargeTracer<C, P>) -> ValueResolution<C::Constant> {
         match value.value() {
@@ -2961,7 +2979,11 @@ where
             let position = InstructionId::new(region.id(), instruction_index);
             instruction_index += 1;
             let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
-            instruction.operation().discharge_references(context, &driver, instruction_inputs)
+            // Run the discharge rule inside the source instruction's recorded origin so every staged instruction
+            // records where it came from.
+            context.with_provenance_origin(instruction.provenance().clone(), || {
+                instruction.operation().discharge_references(context, &driver, instruction_inputs)
+            })
         },
     )
 }
@@ -4956,7 +4978,7 @@ mod tests {
             let mut builder = ProgramBuilder::<TestValue, ProofOperation>::new();
             let mut value = builder.add_input(input_type);
             for operation in operations {
-                value = builder.add_instruction(*operation, Vec::new(), vec![value]).unwrap()[0];
+                value = builder.add_instruction(*operation, Vec::new(), vec![value], None).unwrap()[0];
             }
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
@@ -4999,8 +5021,8 @@ mod tests {
         // attached region closure rather than the entry region alone.
         let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = callee_builder.add_input(TestType::Value(0));
-        let root = callee_builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial]).unwrap()[0];
-        let frozen = callee_builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root]).unwrap()[0];
+        let root = callee_builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
+        let frozen = callee_builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root], None).unwrap()[0];
         let callee = callee_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5010,15 +5032,15 @@ mod tests {
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
         let callee = builder.import_program(callee);
-        let local = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial]).unwrap()[0];
-        builder.add_instruction(TestOperation::Read, Vec::new(), vec![captured]).unwrap();
-        builder.add_instruction(TestOperation::Read, Vec::new(), vec![public]).unwrap();
-        let called = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial]).unwrap()[0];
+        let local = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
+        builder.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap();
+        builder.add_instruction(TestOperation::Read, Vec::new(), vec![public], None).unwrap();
+        let called = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial], None).unwrap()[0];
 
         // The same callee region is attached twice, so its interior allocation must be enumerated once rather than
         // once per invocation.
-        let repeated = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial]).unwrap()[0];
-        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![local]).unwrap()[0];
+        let repeated = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial], None).unwrap()[0];
+        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![local], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![called, repeated, frozen],
@@ -5069,9 +5091,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
-        let root = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial]).unwrap()[0];
-        let read = builder.add_instruction(TestOperation::Read, Vec::new(), vec![public]).unwrap()[0];
-        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root]).unwrap()[0];
+        let root = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
+        let read = builder.add_instruction(TestOperation::Read, Vec::new(), vec![public], None).unwrap()[0];
+        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![read, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -5297,7 +5319,7 @@ mod tests {
         // isolated environment.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured]).unwrap()[0];
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -5355,7 +5377,7 @@ mod tests {
         // the operation's own contract rejects the attachment, because `list.add` declares no region slots at all.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let input = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 1 })));
-        let read = builder.add_instruction(ListOperation::Read, Vec::new(), vec![input]).unwrap()[0];
+        let read = builder.add_instruction(ListOperation::Read, Vec::new(), vec![input], None).unwrap()[0];
         let stateful = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![read], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5386,8 +5408,9 @@ mod tests {
         // the whole rewrite for a region-carrying operation whose closure holds no state to thread.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let callee_input = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let doubled =
-            builder.add_instruction(ListOperation::Add, Vec::new(), vec![callee_input, callee_input]).unwrap()[0];
+        let doubled = builder
+            .add_instruction(ListOperation::Add, Vec::new(), vec![callee_input, callee_input], None)
+            .unwrap()[0];
         let callee = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5665,17 +5688,18 @@ mod tests {
         // it, adds the replaced and current selections, and finally freezes the whole root.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial]).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root])
+            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
             .unwrap()[0];
         let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update]).unwrap();
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
         let replacement = builder.add_constant(ListIrValue::List(vec![7, 8]));
-        let replaced = builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement]).unwrap()[0];
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view]).unwrap()[0];
-        let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot]).unwrap()[0];
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root]).unwrap()[0];
+        let replaced =
+            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![total, frozen], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -5711,7 +5735,7 @@ mod tests {
             callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
         let previous = callee_builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, replacement])
+            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, replacement], None)
             .unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
@@ -5723,11 +5747,12 @@ mod tests {
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference]).unwrap()[0];
-        let local = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![snapshot]).unwrap()[0];
-        let local_snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![local]).unwrap()[0];
-        let previous =
-            builder.add_instruction(ListOperation::Call, vec![callee], vec![reference, replacement]).unwrap()[0];
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let local = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![snapshot], None).unwrap()[0];
+        let local_snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![local], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(ListOperation::Call, vec![callee], vec![reference, replacement], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![reference, local, snapshot, local_snapshot, previous],
@@ -5758,7 +5783,7 @@ mod tests {
     fn test_reference_region_summary_rejects_a_closure_that_consumes_a_caller_root() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference]).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5795,7 +5820,8 @@ mod tests {
         let callee = builder.import_program(callee);
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
         let value = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let forwarded = builder.add_instruction(ListOperation::Call, vec![callee], vec![captured, value]).unwrap()[0];
+        let forwarded =
+            builder.add_instruction(ListOperation::Call, vec![callee], vec![captured, value], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![forwarded], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5849,7 +5875,8 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let previous = builder.add_instruction(ListOperation::Swap, Vec::new(), vec![reference, update]).unwrap()[0];
+        let previous =
+            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![reference, update], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![previous, reference],
@@ -5908,7 +5935,9 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_constant(ListIrValue::List(vec![10, 10]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update]).unwrap();
+        builder
+            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .unwrap();
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -5953,7 +5982,7 @@ mod tests {
         // construction, so the failing program is assembled through the unchecked rebuild hatch.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference]).unwrap();
+        builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap();
         let failing = builder.add_variable(ListIrType::List(ListType { length: 2 }));
         builder.add_instruction_unchecked(Instruction::new(
             ListOperation::Read,
@@ -5984,8 +6013,10 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update]).unwrap();
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference]).unwrap()[0];
+        builder
+            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -6044,7 +6075,7 @@ mod tests {
             callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
         let previous = callee_builder
-            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, update])
+            .add_instruction(ListOperation::Swap, Vec::new(), vec![callee_reference, update], None)
             .unwrap()[0];
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
@@ -6054,9 +6085,9 @@ mod tests {
         let initial = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial]).unwrap()[0];
-        let previous = builder.add_instruction(ListOperation::Call, vec![callee], vec![root, update]).unwrap()[0];
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root]).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+        let previous = builder.add_instruction(ListOperation::Call, vec![callee], vec![root, update], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![previous, frozen],
@@ -6097,9 +6128,9 @@ mod tests {
         let pipeline = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let kernel = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![kernel]).unwrap()[0];
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![pipeline, update]).unwrap();
-        builder.add_instruction(ListOperation::Swap, Vec::new(), vec![kernel, observed]).unwrap();
+        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![kernel], None).unwrap()[0];
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![pipeline, update], None).unwrap();
+        builder.add_instruction(ListOperation::Swap, Vec::new(), vec![kernel, observed], None).unwrap();
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
@@ -6153,12 +6184,12 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial]).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root])
+            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
             .unwrap()[0];
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update]).unwrap();
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root]).unwrap()[0];
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -6207,7 +6238,7 @@ mod tests {
         // discharge accepts what full discharge cannot express.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external]).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -6233,7 +6264,7 @@ mod tests {
         // that names it rather than published as a stale reference.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external]).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![frozen, external],
@@ -6260,9 +6291,10 @@ mod tests {
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let callee_state = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let callee_kernel = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let observed = callee_builder.add_instruction(ListOperation::Read, Vec::new(), vec![callee_kernel]).unwrap()[0];
+        let observed =
+            callee_builder.add_instruction(ListOperation::Read, Vec::new(), vec![callee_kernel], None).unwrap()[0];
         callee_builder
-            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![callee_state, observed])
+            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![callee_state, observed], None)
             .unwrap();
         let callee = callee_builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
@@ -6272,7 +6304,8 @@ mod tests {
         let pipeline = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let kernel = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let callee = builder.import_program(callee);
-        let observed = builder.add_instruction(ListOperation::Call, vec![callee], vec![pipeline, kernel]).unwrap()[0];
+        let observed =
+            builder.add_instruction(ListOperation::Call, vec![callee], vec![pipeline, kernel], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -6313,7 +6346,7 @@ mod tests {
         // against the program rather than surfacing later as a root that never appeared.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
-        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![external]).unwrap()[0];
+        let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![external], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder], vec![Placeholder])
             .unwrap();

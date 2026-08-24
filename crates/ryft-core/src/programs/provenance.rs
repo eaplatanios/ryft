@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -90,13 +91,15 @@ impl Display for ProvenanceNode {
     }
 }
 
-/// Persistent, hierarchical, non-semantic origin of one [`Instruction`](crate::Instruction). Provenance records _where_
-/// an instruction came from (e.g., the framework facility that staged it, or the source instructions a transform
-/// generated it from) without adding a Single Static Assignment (SSA) value, a data dependency, or any semantic
-/// behavior. It is purely diagnostic (i.e., type inference, effects, differentiation, batching, interpretation,
-/// optimization legality, and the canonical semantic [`Program`](crate::Program) rendering must never depend on it),
-/// and behavior must remain correct if all provenance is removed. Consequently, [`unknown`](Self::unknown) is always a
-/// correct value as dropping provenance degrades diagnostics and should not change program behavior.
+/// Persistent, hierarchical, non-semantic origin of one [`Instruction`](crate::Instruction). Despite the related
+/// name, this is unrelated to [`OutputRegionProvenance`](crate::OutputRegionProvenance), which describes the _semantic_
+/// dataflow origin of an operation output. Provenance records _where_ an instruction came from (e.g., the framework
+/// facility that staged it, or the source instructions a transform generated it from) without adding a Single Static
+/// Assignment (SSA) value, a data dependency, or any semantic behavior. It is purely diagnostic (i.e., type inference,
+/// effects, differentiation, batching, interpretation, optimization legality, and the canonical semantic
+/// [`Program`](crate::Program) rendering must never depend on it), and behavior must remain correct if all provenance
+/// is removed. Consequently, [`unknown`](Self::unknown) is always a correct value as dropping provenance degrades
+/// diagnostics and should not change program behavior.
 ///
 /// A provenance value is an immutable tree over three shapes:
 ///
@@ -205,6 +208,13 @@ impl Provenance {
     }
 }
 
+impl Default for Provenance {
+    #[inline]
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
 impl Display for Provenance {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -212,6 +222,165 @@ impl Display for Provenance {
             None => write!(formatter, "unknown"),
             Some(node) => node.fmt(formatter),
         }
+    }
+}
+
+/// Active provenance state owned by a [`Context`](crate::Context) that is a staging boundary (i.e., one that owns the
+/// [`ProgramBuilder`](crate::ProgramBuilder) instructions are emitted into, such as a tracing or partial evaluation
+/// context). The state is shared across clones of the owning context (typically behind an [`Rc`](std::rc::Rc)) so
+/// that every clone observes the same active scopes, while independent traces own independent states and cannot leak
+/// scopes into each other.
+///
+/// The state keeps the innermost active origin, the scope frames entered after it (outermost first), and a cached
+/// fully composed [`Provenance`] that folds those frames over that origin:
+///
+///   - Entering a scope pushes one frame. Entering an origin replaces the active origin and clears the frame list,
+///     so frames that were already active at that entry are the enclosing transform's ambient context, not part of
+///     the instruction's origin (they are restored when the origin is left). Replaying a source instruction under an
+///     ambient scope that its provenance already records therefore preserves the source provenance exactly, with no
+///     double wrap, while newly synthesized work staged with no origin still receives the ambient scopes folded over
+///     unknown provenance.
+///   - Entering an origin while another origin is active fuses the new origin with the provenance _composed at that
+///     moment_ (i.e., the outer origin with all frames entered after it already folded). Two consequences of this fused
+///     model are deliberate: (i) entering an _unknown_ origin inside an active origin keeps the enclosing composition
+///     (fused normalization discards unknown constituents), so a nested replay of an unlabeled instruction attributes
+///     its rewrite to the enclosing source, exactly like an inlined operation inheriting its call site's location, and
+///     (ii) a [`seeded`](Self::seeded) boundary fuses replayed source origins with its seed, so residual and nested
+///     trace instructions record both where the boundary came from and where each instruction came from.
+///
+/// The cache is recomputed only when entering a scope or origin, while leaving one restores the entry snapshot and
+/// performs no recomposition. [`current`](Self::current) and instruction staging clone the cached value and never
+/// rebuild nodes. Entry side recomposition rebuilds the chain above the change point, which requires `O(scope depth)`
+/// node allocations per entry. That is accepted because scope nesting is shallow in practice, and the requirement is
+/// precisely that composition happens only at scope and origin transitions, never per staged instruction.
+///
+/// Both [`with_scope`](Self::invoke_with_scope) and [`with_origin`](Self::invoke_with_origin) restore the previous state on ordinary
+/// return, error return, and panic unwinding through internal Resource Acquisition Is Initialization (RAII) guards, and
+/// no [`RefCell`] borrow is held while the provided closure runs.
+#[derive(Debug)]
+pub struct ProvenanceState {
+    /// Interior-mutable state. [`ProvenanceState`] is shared by reference across context clones, so all mutation
+    /// happens through short-lived borrows that are never held while user closures run.
+    inner: RefCell<ProvenanceStateInner>,
+}
+
+impl ProvenanceState {
+    /// Creates a new empty [`ProvenanceState`] with no active scopes or origins and unknown composed [`Provenance`].
+    #[inline]
+    pub fn new() -> Self {
+        Self::seeded(Provenance::unknown())
+    }
+
+    /// Creates a new [`ProvenanceState`] seeded with the provided origin and no scope frames. A nested staging
+    /// boundary (e.g., a nested tracing context) seeds its state from its parent context's current provenance, so that
+    /// instructions staged in the nested program record where the nested program itself came from, while later
+    /// replaying those instructions under the same ambient scopes preserves each instruction's provenance exactly
+    /// instead of wrapping or fusing the shared scopes twice.
+    #[inline]
+    pub fn seeded(origin: Provenance) -> Self {
+        // With no scopes entered yet, the composed provenance is the seed itself.
+        Self {
+            inner: RefCell::new(ProvenanceStateInner {
+                origin: if origin.is_unknown() { None } else { Some(origin.clone()) },
+                scopes: Vec::new(),
+                composed: origin,
+            }),
+        }
+    }
+
+    /// Returns the currently composed [`Provenance`]. This clones the cached composition and performs no node
+    /// construction, so it is cheap enough to call once per staged instruction.
+    #[inline]
+    pub fn current(&self) -> Provenance {
+        self.inner.borrow().composed.clone()
+    }
+
+    /// Invokes `function` with the provided origin [`Provenance`] entered as the active origin, restoring the previous
+    /// state afterwards (including on error returns and panic unwinding). When another origin is already active, the
+    /// new origin is fused with the provenance composed at this moment. Either way the frame list is cleared, so only
+    /// scopes entered after this call fold over the new origin.
+    pub fn invoke_with_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        let _guard = self.enter(|inner| {
+            inner.origin =
+                Some(if inner.origin.is_some() { Provenance::fused([inner.composed.clone(), origin]) } else { origin });
+            inner.scopes.clear();
+        });
+        function()
+    }
+
+    /// Invokes `function` with the provided [`ProvenanceScope`] entered as the innermost active scope frame, restoring
+    /// the previous state afterwards (including on error returns and panic unwinding).
+    #[inline]
+    pub fn invoke_with_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        let _guard = self.enter(|inner| inner.scopes.push(scope));
+        function()
+    }
+
+    /// Snapshots the current state into a [`ProvenanceRestorationGuard`], applies `enter` to record one scope or origin
+    /// entry, and recomputes the cached composition, all under one short-lived borrow that ends before the guard is
+    /// returned. Restoring the snapshot on drop is definitionally identical to undoing the entry and recomposing,
+    /// because the composition is a pure function of the origin and frames, so leaving performs no recomposition.
+    fn enter<F: FnOnce(&mut ProvenanceStateInner)>(&self, enter: F) -> ProvenanceRestorationGuard<'_> {
+        let mut inner = self.inner.borrow_mut();
+        let snapshot = inner.clone();
+        enter(&mut inner);
+        inner.recompute_composed_provenance();
+        // The guard exists only after the borrow ends, so even a panic inside `enter` or `recompose` can never make
+        // its `Drop` re-borrow the state while this borrow is still live.
+        drop(inner);
+        ProvenanceRestorationGuard { state: self, snapshot }
+    }
+}
+
+impl Default for ProvenanceState {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Interior state of a [`ProvenanceState`].
+#[derive(Clone, Debug, Default)]
+struct ProvenanceStateInner {
+    /// Innermost effective origin [`Provenance`]. This is the entered origin provenance, fused with the provenance
+    /// composed at entry time when another origin was already active, or [`None`] when no origin is active. Note that
+    /// an active _unknown_ origin is distinct from [`None`] in that it still suppresses the ambient frames cleared at
+    /// its entry.
+    origin: Option<Provenance>,
+
+    /// [`ProvenanceScope`] frames entered after the active origin [`Provenance`], outermost first. Entering an origin
+    /// provenance clears this list, which is what keeps ambient frames out of replayed instructions' provenance.
+    scopes: Vec<ProvenanceScope>,
+
+    /// Cached fully composed [`Provenance`], recomputed only at scope/origin transitions.
+    composed: Provenance,
+}
+
+impl ProvenanceStateInner {
+    /// Recomputes the cached fully composed [`Provenance`] by folding the [`ProvenanceScope`] frames outermost-first
+    /// over the active origin provenance or over unknown provenance when no origin is active.
+    #[inline]
+    fn recompute_composed_provenance(&mut self) {
+        let base = self.origin.clone().unwrap_or_else(Provenance::unknown);
+        self.composed = self.scopes.iter().rev().fold(base, |origin, scope| Provenance::scope(scope.clone(), origin));
+    }
+}
+
+/// Resource Acquisition Is Initialization (RAII) guard that restores the [`ProvenanceState`] snapshot taken when its
+/// entry was recorded, on ordinary return, error return, and panic unwinding alike. The guard holds no [`RefCell`]
+/// borrow while the user closure runs. It re-borrows only inside [`Drop`].
+struct ProvenanceRestorationGuard<'s> {
+    /// [`ProvenanceState`] to restore.
+    state: &'s ProvenanceState,
+
+    /// Complete [`ProvenanceStateInner`] snapshot at entry.
+    snapshot: ProvenanceStateInner,
+}
+
+impl Drop for ProvenanceRestorationGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        *self.state.inner.borrow_mut() = std::mem::take(&mut self.snapshot);
     }
 }
 
@@ -365,5 +534,146 @@ mod tests {
         assert_eq!(Provenance::scope(ProvenanceScope::new("a::b"), Provenance::unknown()).to_string(), "\"a::b\"");
         assert_eq!(Provenance::scope(ProvenanceScope::new("0"), Provenance::unknown()).to_string(), "\"0\"");
         assert_eq!(Provenance::scope(ProvenanceScope::new(""), Provenance::unknown()).to_string(), "\"\"");
+    }
+
+    #[test]
+    fn test_provenance_state_scopes() {
+        let outer = ProvenanceScope::new("outer");
+        let inner = ProvenanceScope::new("inner");
+        let state = ProvenanceState::new();
+        assert!(state.current().is_unknown());
+        state.invoke_with_scope(outer.clone(), || {
+            assert_eq!(state.current(), Provenance::scope(outer.clone(), Provenance::unknown()));
+            state.invoke_with_scope(inner.clone(), || {
+                // The earlier-entered scope is the outermost node.
+                assert_eq!(
+                    state.current(),
+                    Provenance::scope(outer.clone(), Provenance::scope(inner.clone(), Provenance::unknown())),
+                );
+            });
+            assert_eq!(state.current(), Provenance::scope(outer.clone(), Provenance::unknown()));
+        });
+        assert!(state.current().is_unknown());
+    }
+
+    #[test]
+    fn test_provenance_state_origin_scope_boundary() {
+        let ambient = ProvenanceScope::new("ambient");
+        let transform = ProvenanceScope::new("transform");
+        let nested_transform = ProvenanceScope::new("nested_transform");
+        let origin = Provenance::scope(ProvenanceScope::new("source"), Provenance::unknown());
+        let state = ProvenanceState::new();
+        state.invoke_with_scope(ambient.clone(), || {
+            state.invoke_with_origin(origin.clone(), || {
+                // Scopes entered before the origin do not fold over it, so a 1-to-1 replay under an ambient scope
+                // preserves the source provenance exactly.
+                assert_eq!(state.current(), origin);
+                state.invoke_with_scope(transform.clone(), || {
+                    // Scopes entered after the origin do fold over it.
+                    assert_eq!(state.current(), Provenance::scope(transform.clone(), origin.clone()));
+                    state.invoke_with_scope(nested_transform.clone(), || {
+                        // Active scopes remain outside the source provenance's own scope chain and preserve their
+                        // entry order.
+                        assert_eq!(
+                            state.current(),
+                            Provenance::scope(
+                                transform.clone(),
+                                Provenance::scope(nested_transform.clone(), origin.clone()),
+                            ),
+                        );
+                    });
+                });
+            });
+            // Work staged with no origin still receives the ambient scope folded over unknown provenance.
+            assert_eq!(state.current(), Provenance::scope(ambient.clone(), Provenance::unknown()));
+        });
+    }
+
+    #[test]
+    fn test_provenance_state_nested_origins_fuse() {
+        let a = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
+        let b = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
+        let intermediate = ProvenanceScope::new("s");
+        let state = ProvenanceState::new();
+        state.invoke_with_origin(a.clone(), || {
+            state.invoke_with_scope(intermediate.clone(), || {
+                let composed = Provenance::scope(intermediate.clone(), a.clone());
+                assert_eq!(state.current(), composed);
+                state.invoke_with_origin(b.clone(), || {
+                    // The nested origin fuses with the provenance composed at entry, not with the raw outer origin,
+                    // so the intermediate scope `s` is retained.
+                    assert_eq!(state.current(), Provenance::fused([composed.clone(), b.clone()]));
+                });
+                // Leaving the nested origin restores the previous composition.
+                assert_eq!(state.current(), composed);
+            });
+            assert_eq!(state.current(), a);
+        });
+        assert!(state.current().is_unknown());
+    }
+
+    #[test]
+    fn test_provenance_state_unknown_origin_inside_active_origin() {
+        // Entering an unknown origin inside an active origin keeps the enclosing composition, because fused
+        // normalization discards unknown constituents: a nested replay of an unlabeled instruction attributes
+        // its rewrite to the enclosing source instruction.
+        let a = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
+        let state = ProvenanceState::new();
+        state.invoke_with_origin(a.clone(), || {
+            state.invoke_with_origin(Provenance::unknown(), || {
+                assert_eq!(state.current(), a);
+            });
+        });
+
+        // Without an enclosing origin, an unknown origin composes to unknown, so replaying an unlabeled instruction
+        // under ambient scopes preserves its unknown provenance exactly.
+        let ambient = ProvenanceScope::new("ambient");
+        state.invoke_with_scope(ambient.clone(), || {
+            state.invoke_with_origin(Provenance::unknown(), || {
+                assert!(state.current().is_unknown());
+            });
+        });
+    }
+
+    #[test]
+    fn test_provenance_state_seeded() {
+        let seed = Provenance::scope(ProvenanceScope::new("seed"), Provenance::unknown());
+        let nested = ProvenanceScope::new("nested");
+        let state = ProvenanceState::seeded(seed.clone());
+        assert_eq!(state.current(), seed);
+        state.invoke_with_scope(nested.clone(), || {
+            assert_eq!(state.current(), Provenance::scope(nested.clone(), seed.clone()));
+        });
+        assert_eq!(state.current(), seed);
+        assert!(ProvenanceState::seeded(Provenance::unknown()).current().is_unknown());
+
+        // A seeded boundary fuses replayed source origins with its seed, recording both where the boundary came from
+        // and where each replayed instruction came from.
+        let source = Provenance::scope(ProvenanceScope::new("source"), Provenance::unknown());
+        state.invoke_with_origin(source.clone(), || {
+            assert_eq!(state.current(), Provenance::fused([seed.clone(), source.clone()]));
+        });
+    }
+
+    #[test]
+    fn test_provenance_state_restores_after_error_and_panic() {
+        let scope = ProvenanceScope::new("scope");
+        let origin = Provenance::scope(ProvenanceScope::new("origin"), Provenance::unknown());
+        let state = ProvenanceState::new();
+
+        // Restoration after an ordinary error return.
+        let result: Result<(), &str> = state.invoke_with_scope(scope.clone(), || Err("failure"));
+        assert_eq!(result, Err("failure"));
+        assert!(state.current().is_unknown());
+
+        // Restoration after panic unwinding, for both scope and origin frames.
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.invoke_with_scope(scope.clone(), || state.invoke_with_origin(origin.clone(), || panic!("unwind")))
+        }));
+        assert!(panic.is_err());
+        assert!(state.current().is_unknown());
+        state.invoke_with_scope(scope.clone(), || {
+            assert_eq!(state.current(), Provenance::scope(scope.clone(), Provenance::unknown()));
+        });
     }
 }

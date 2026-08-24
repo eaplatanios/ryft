@@ -1889,11 +1889,12 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(TestType::Value(REFERENT));
         let update = builder.add_input(TestType::Value(REFERENT));
-        let root = builder.add_instruction(TestOperation::New(New::new()), Vec::new(), vec![initial]).unwrap()[0];
+        let root = builder.add_instruction(TestOperation::New(New::new()), Vec::new(), vec![initial], None).unwrap()[0];
         builder
-            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![root, update])
+            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![root, update], None)
             .unwrap();
-        let frozen = builder.add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![root]).unwrap()[0];
+        let frozen =
+            builder.add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

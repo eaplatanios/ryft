@@ -12,6 +12,7 @@ use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::provenance::Provenance;
 use crate::programs::references::ReferenceLifetimes;
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::types::{Type, Typed};
@@ -151,11 +152,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
     /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation
     /// checks.
+    ///
+    /// The recorded [`Instruction`] carries the provided non-semantic [`Provenance`], with [`None`] recording
+    /// unknown provenance.
     pub fn add_instruction<P: Into<O>>(
         &mut self,
         operation: P,
         regions: Vec<RegionId>,
         inputs: Vec<AtomId>,
+        provenance: Option<Provenance>,
     ) -> Result<&[AtomId], ProgramError> {
         let operation = operation.into();
         self.references.validate(&operation, inputs.as_slice())?;
@@ -193,7 +198,10 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
         };
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction::new(operation, inputs, outputs, regions));
+        self.instructions.push(
+            Instruction::new(operation, inputs, outputs, regions)
+                .with_provenance(provenance.unwrap_or_else(Provenance::unknown)),
+        );
 
         // The accepted application is read back off the instruction just appended, which borrows a different field of
         // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
@@ -318,7 +326,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 let operation = instruction.operation().clone();
-                Ok(builder.borrow_mut().add_instruction(operation, regions, inputs.to_vec())?.to_vec())
+                let provenance = instruction.provenance().clone();
+                Ok(builder
+                    .borrow_mut()
+                    .add_instruction(operation, regions, inputs.to_vec(), Some(provenance))?
+                    .to_vec())
             },
         )
     }
@@ -535,6 +547,7 @@ mod tests {
     use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::instructions::InstructionId;
+    use crate::programs::provenance::ProvenanceScope;
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
@@ -548,8 +561,8 @@ mod tests {
         let i0 = builder.add_input(ArrayType::scalar(DataType::F64));
         let i1 = builder.add_input(ArrayType::scalar(DataType::F64));
         let c0 = builder.add_constant(Array::scalar(2.0f64));
-        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0]).unwrap()[0];
-        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation::new(), Vec::new(), vec![i0], None).unwrap()[0];
+        let v1 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![v0, i1], None).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
             builder.atoms.get(i0.index()),
@@ -604,7 +617,7 @@ mod tests {
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)]);
+        let v0 = builder.add_instruction(AddOperation::new(), Vec::new(), vec![AtomId::new(42), AtomId::new(99)], None);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId::new(42)));
     }
 
@@ -712,6 +725,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let source = source_builder
@@ -810,7 +824,7 @@ mod tests {
             .cloned()
             .map(|input_type| destination.add_input(input_type))
             .collect::<Vec<_>>();
-        let outputs = destination.add_instruction(ArrayIdentityOperation, vec![second], inputs).unwrap().to_vec();
+        let outputs = destination.add_instruction(ArrayIdentityOperation, vec![second], inputs, None).unwrap().to_vec();
         assert_eq!(
             outputs
                 .iter()
@@ -839,7 +853,7 @@ mod tests {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = region_builder
-            .add_instruction(TestRegionOperation::Add, Vec::new(), vec![region_input, region_input])
+            .add_instruction(TestRegionOperation::Add, Vec::new(), vec![region_input, region_input], None)
             .unwrap()[0];
         let region_program = region_builder
             .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
@@ -853,6 +867,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -931,6 +946,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let second = source_builder
@@ -938,6 +954,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![first],
+                None,
             )
             .unwrap()[0];
         let source = source_builder
@@ -967,6 +984,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![nested],
                 vec![root_input],
+                None,
             )
             .unwrap()[0];
         let root = root_builder
@@ -988,6 +1006,7 @@ mod tests {
                 ),
                 vec![first_root, second_root],
                 vec![source_input],
+                None,
             )
             .unwrap()[0];
         let source = source_builder
@@ -1044,6 +1063,7 @@ mod tests {
                 ),
                 vec![sealed, sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let second = builder
@@ -1051,6 +1071,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![first],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -1078,6 +1099,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![sealed],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         assert_eq!(builder.atoms()[output.index()].r#type().into_owned(), ArrayType::scalar(DataType::I64));
@@ -1099,6 +1121,7 @@ mod tests {
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![nested],
                 vec![root_input],
+                None,
             )
             .unwrap()[0];
         let root = root_builder
@@ -1121,6 +1144,7 @@ mod tests {
                 ),
                 vec![first_root, second_root],
                 vec![source_input],
+                None,
             )
             .unwrap()[0];
         let source_output = source_builder
@@ -1130,6 +1154,7 @@ mod tests {
                 ),
                 vec![first_root, second_root],
                 vec![first_output],
+                None,
             )
             .unwrap()[0];
         let source = source_builder
@@ -1155,6 +1180,44 @@ mod tests {
     }
 
     #[test]
+    fn test_program_builder_splice_program_preserves_provenance() {
+        // Splicing is a structural relocation, so every relocated instruction keeps its provenance verbatim, including
+        // nested-scope, fused, and unknown shapes, and the destination builder attaches nothing of its own.
+        let nested = Provenance::scope(
+            ProvenanceScope::new("outer"),
+            Provenance::scope(ProvenanceScope::new("inner"), Provenance::unknown()),
+        );
+        let fused = Provenance::fused([
+            Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown()),
+            Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown()),
+        ]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let negated =
+            builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], Some(nested.clone())).unwrap()[0];
+        let summed = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![negated, input], Some(fused.clone()))
+            .unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![summed, summed], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let mut destination = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let destination_input = destination.add_input(ArrayType::scalar(DataType::F64));
+        let outputs = destination.splice_program(&program, &[destination_input]).unwrap();
+        let relocated =
+            destination.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            relocated
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![("neg", nested), ("add", fused), ("add", Provenance::unknown())],
+        );
+    }
+
+    #[test]
     fn test_program_builder_build_rejects_malformed_regions() {
         // Instruction regions must reference previously sealed regions (which keeps the graph acyclic by
         // construction). The checked instruction path rejects at insertion time and the unchecked path at build time.
@@ -1164,8 +1227,7 @@ mod tests {
             builder.add_instruction(
                 TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
                 vec![RegionId::new(3)],
-                vec![input],
-            ),
+                vec![input], None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "instruction references region ^3 which has not been sealed yet",
         ));
@@ -1193,7 +1255,7 @@ mod tests {
         let sealed = builder.import_region(region_program.entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
-            builder.add_instruction(TestRegionOperation::Add, vec![sealed], vec![input, input]),
+            builder.add_instruction(TestRegionOperation::Add, vec![sealed], vec![input, input], None),
             Err(ProgramError::MalformedProgram(message))
                 if message == "operation `add` declares no region slots but 1 regions were attached",
         ));

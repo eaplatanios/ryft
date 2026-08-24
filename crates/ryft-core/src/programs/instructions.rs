@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use crate::programs::atoms::AtomId;
+use crate::programs::provenance::Provenance;
 use crate::programs::regions::RegionId;
 
 /// Location of one [`Instruction`] in a multi-region [`Program`](crate::Program), identified by its containing
@@ -71,13 +72,26 @@ pub struct Instruction<O> {
 
     /// [`RegionId`]s of the nested computations attached to this [`Instruction`], in the operation-defined order.
     pub(crate) regions: Vec<RegionId>,
+
+    /// [`Provenance`] recording where this [`Instruction`] came from. Note that this field is intended to serve
+    /// diagnostic purposes only. It does not affect type inference, effects, interpretation, transformation legality,
+    /// or the canonical semantic program rendering.
+    pub(crate) provenance: Provenance,
 }
 
 impl<O> Instruction<O> {
-    /// Creates a new [`Instruction`].
+    /// Creates a new [`Instruction`] with unknown [`Provenance`]. Builders and rebuilds that carry a recorded origin
+    /// attach it through [`with_provenance`](Self::with_provenance).
     #[inline]
     pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>, regions: Vec<RegionId>) -> Self {
-        Self { operation, inputs, outputs, regions }
+        Self { operation, inputs, outputs, regions, provenance: Provenance::unknown() }
+    }
+
+    /// Returns this [`Instruction`] with its [`Provenance`] replaced by the provided one.
+    #[inline]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = provenance;
+        self
     }
 
     /// Returns the [`Operation`](crate::Operation) applied by this [`Instruction`].
@@ -105,11 +119,21 @@ impl<O> Instruction<O> {
         &self.regions
     }
 
-    /// Consumes this [`Instruction`] and returns its [`Operation`](crate::Operation), input [`AtomId`]s,
-    /// output [`AtomId`]s, and attached region [`RegionId`]s.
+    /// Returns the [`Provenance`] recording where this [`Instruction`] came from. Note that this information is
+    /// intended to serve diagnostic purposes only. It does not affect type inference, effects, interpretation,
+    /// transformation legality, or the canonical semantic program rendering.
     #[inline]
-    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>) {
-        (self.operation, self.inputs, self.outputs, self.regions)
+    pub fn provenance(&self) -> &Provenance {
+        &self.provenance
+    }
+
+    /// Consumes this [`Instruction`] and returns its [`Operation`](crate::Operation), input [`AtomId`]s,
+    /// output [`AtomId`]s, attached region [`RegionId`]s, and [`Provenance`], in that order. Rebuilds that
+    /// destructure an instruction this way must reattach the returned provenance through [`Self::with_provenance`]
+    /// instead of silently dropping it.
+    #[inline]
+    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>, Provenance) {
+        (self.operation, self.inputs, self.outputs, self.regions, self.provenance)
     }
 }
 

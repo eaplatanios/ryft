@@ -145,8 +145,8 @@ pub use operations::{
     MemberOperation, Operation, OperationFormatter, OperationProjection, OperationProvider,
     infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
-pub use programs::{FlatProgram, Program, ProgramLiveSets};
-pub use provenance::{Provenance, ProvenanceScope};
+pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};
+pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};
 pub use references::{
     FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
     NewReference, NewReferenceOperation, PartialReferenceDischargeResult, PreparedReferenceValue,
