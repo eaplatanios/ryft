@@ -813,7 +813,7 @@ where
                     operands[index] = Some(builder.add_input(aligned[index].unbatched_type()));
                 }
                 let operands = operands.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands)?.to_vec();
+                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -966,7 +966,7 @@ where
                     .map(Option::unwrap)
                     .chain(carry_inputs[..extents.len()].iter().copied())
                     .collect::<Vec<_>>();
-                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands)?.to_vec();
+                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -1314,7 +1314,7 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(vector_type());
-        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -1446,7 +1446,7 @@ mod tests {
         ));
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(vector_type().into());
-        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],

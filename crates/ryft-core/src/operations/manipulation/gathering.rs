@@ -1348,7 +1348,7 @@ mod tests {
         let operand = builder.add_input(dynamic_type);
         let indices = builder.add_constant(Array::from_f64s(indices_type(vec![2, 1]), vec![0.0, 2.0]));
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-        let output = builder.add_instruction(operation, Vec::new(), vec![operand, indices]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![operand, indices], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(

@@ -1297,10 +1297,17 @@ where
             inputs,
             |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
             |instruction, instruction_inputs| {
+                // Run the batching rule inside the source instruction's recorded origin so that every staged
+                // instruction records where it came from.
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = instruction
-                    .operation()
-                    .batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
+                let (outputs, evidence) = context
+                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        instruction.operation().batch(
+                            context,
+                            &RecursiveBatchingDriver::new(&regions),
+                            instruction_inputs,
+                        )
+                    })?
                     .into_parts();
                 <Self as BatchingPolicy<C>>::validate_operation_outputs(
                     instruction.operation().name(),
@@ -1795,10 +1802,17 @@ impl<
                         inputs,
                         |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
                         |instruction, instruction_inputs| -> Result<_, BatchingError> {
+                            // Run the batching rule inside the source instruction's recorded origin so that every
+                            // staged instruction records where it came from.
                             let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                            let (outputs, evidence) = instruction
-                                .operation()
-                                .batch(&batching_context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
+                            let (outputs, evidence) = batching_context
+                                .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                                    instruction.operation().batch(
+                                        &batching_context,
+                                        &RecursiveBatchingDriver::new(&regions),
+                                        instruction_inputs,
+                                    )
+                                })?
                                 .into_parts();
                             <ArrayBatching as BatchingPolicy<TracingContext<V, O>>>::validate_operation_outputs(
                                 instruction.operation().name(),
@@ -2170,10 +2184,17 @@ impl ArrayIrBatching {
             // reference-typed capture constant ride through structural batching unchanged.
             |_, constant| Self::batch_constant(context.parent(), constant.clone()),
             |instruction, instruction_inputs| {
+                // Run the batching rule inside the source instruction's recorded origin so that every staged
+                // instruction records where it came from.
                 let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = instruction
-                    .operation()
-                    .batch(context, &RecursiveBatchingDriver::new(&regions), instruction_inputs)?
+                let (outputs, evidence) = context
+                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        instruction.operation().batch(
+                            context,
+                            &RecursiveBatchingDriver::new(&regions),
+                            instruction_inputs,
+                        )
+                    })?
                     .into_parts();
                 <Self as BatchingPolicy<C>>::validate_operation_outputs(
                     instruction.operation().name(),
@@ -3493,8 +3514,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, FreezeReferenceOperation, NewReferenceOperation, ProgramBuilder,
-        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceType,
+        EmptyRegionDriver, FreezeReferenceOperation, NewReferenceOperation, ProgramBuilder, Provenance,
+        ProvenanceScope, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::test_condition_program;
@@ -4163,7 +4184,7 @@ mod tests {
     fn test_region_batched_cache_normalizes_axes_and_specializes_semantic_arguments() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let region = program.entry_region_ref();
@@ -4330,6 +4351,7 @@ mod tests {
                 CollectiveOperation::new("items".to_string(), CollectiveKind::PSum),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program =
@@ -4438,7 +4460,12 @@ mod tests {
                 .clone(),
         );
         let output = outer
-            .add_instruction(ConditionOperation::new(), vec![first_region, second_region], vec![predicate, operand])
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![first_region, second_region],
+                vec![predicate, operand],
+                None,
+            )
             .unwrap()[0];
         let outer = outer
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -4466,7 +4493,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let mut value = builder.add_input(ArrayType::scalar(DataType::F64));
         for _ in 0..OPERATION_COUNT {
-            value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+            value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
         }
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -4579,10 +4606,50 @@ mod tests {
     }
 
     #[test]
+    fn test_program_batched_preserves_source_provenance() {
+        // Batching rewrites each source instruction into the instructions its rule stages, so every instruction of the
+        // batched program records the source instruction it came from. The mapped/replicated operand pair forces the
+        // elementwise rule down its broadcasting path, which makes the first rewrite one-to-many.
+        let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
+        let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mapped = builder.add_input(vector_type.clone());
+        let replicated = builder.add_input(vector_type);
+        let summed = builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![mapped, replicated], Some(first.clone()))
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(SinOperation::new(), Vec::new(), vec![summed], Some(second.clone()))
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            batched
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![("broadcast", first.clone()), ("add", first), ("sin", second)],
+        );
+    }
+
+    #[test]
     fn test_program_batched_rejects_mismatched_output_axes_count() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -5358,14 +5425,16 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(scalar_type.into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         assert!(
             builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
                 .unwrap()
                 .is_empty(),
         );
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -5451,7 +5520,8 @@ mod tests {
     fn test_program_batched_rejects_undischarged_references() {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -5938,6 +6008,7 @@ mod tests {
             ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![branch_array],
+            None,
         )?[0];
         let branch = branch_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![branch_array, branch_dimension],
@@ -6177,6 +6248,7 @@ mod tests {
             ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![body_array],
+            None,
         )?[0];
         let body = body_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![false_value, negated, body_dimension],
@@ -6329,11 +6401,13 @@ mod tests {
             ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
             Vec::new(),
             vec![carry, item],
+            None,
         )?[0];
         let output = body_builder.add_instruction(
             ArrayIrOperation::Array(ArrayOperation::Neg(NegOperation::new())),
             Vec::new(),
             vec![item],
+            None,
         )?[0];
         let body = body_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![next_carry, dimension, output],
@@ -6440,6 +6514,7 @@ mod tests {
                     )),
                     Vec::new(),
                     vec![left, right],
+                    None
                 )?
                 .is_empty(),
         );

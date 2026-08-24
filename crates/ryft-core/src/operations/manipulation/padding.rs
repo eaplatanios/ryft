@@ -1805,8 +1805,9 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, PadOperation<ArrayType>>::new();
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
-        let program_output =
-            builder.add_instruction(operation, Vec::new(), vec![program_input, program_padding_value]).unwrap()[0];
+        let program_output = builder
+            .add_instruction(operation, Vec::new(), vec![program_input, program_padding_value], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -2041,6 +2042,7 @@ mod tests {
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![dynamic_input, dynamic_padding],
+                None
             ),
             Err(ProgramError::Type(TypeError::invalid(
                 "`pad` dynamic axis 0 requires an explicit result-dimension operand".to_string(),

@@ -1497,7 +1497,7 @@ mod tests {
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
         let program_output =
-            builder.add_instruction(operation, Vec::new(), vec![program_first, program_second]).unwrap()[0];
+            builder.add_instruction(operation, Vec::new(), vec![program_first, program_second], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Array>(vec![program_output], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -1710,7 +1710,7 @@ mod tests {
         let left = builder.add_input(left_type);
         let right = builder.add_input(right_type);
         let output = builder
-            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right])
+            .add_instruction(ConcatenateOperation::new(0, 2).unwrap(), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])

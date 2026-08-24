@@ -579,7 +579,7 @@ where
         }
         let mut zero_atoms = Vec::with_capacity(other.edge_types.len());
         for edge_type in other.edge_types.iter() {
-            let zeros = builder.add_instruction(O::zero_operation(edge_type.clone())?, Vec::new(), Vec::new())?;
+            let zeros = builder.add_instruction(O::zero_operation(edge_type.clone())?, Vec::new(), Vec::new(), None)?;
             check_count!("output", zeros, 1, ProgramError);
             zero_atoms.push(zeros[0]);
         }
@@ -1441,7 +1441,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let inputs = if matches!(operation, ArrayOperation::Add(_)) { vec![input, input] } else { vec![input] };
-        let output = builder.add_instruction(operation, Vec::new(), inputs).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1458,7 +1458,12 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_constant(Array::scalar(0.0));
         let output = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![input, zero],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1468,7 +1473,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let factor = builder.add_constant(Array::scalar(factor));
-        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1477,7 +1482,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)])));
         let factor = builder.add_constant(Array::scalar(factor));
-        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -1622,9 +1627,14 @@ mod tests {
         // Inference rejects branch interfaces with mismatched output signatures.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let boolean_output = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![input, zero])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![input, zero],
+                None,
+            )
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
@@ -1697,6 +1707,7 @@ mod tests {
                 ArrayOperation::Condition(operation),
                 vec![true_region, false_region],
                 vec![program_predicate, program_operand],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1737,7 +1748,7 @@ mod tests {
         let branch = |label| {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(operand_type.clone());
-            builder.add_instruction(PrintOperation::new(label), Vec::new(), vec![input]).unwrap();
+            builder.add_instruction(PrintOperation::new(label), Vec::new(), vec![input], None).unwrap();
             let output = builder.add_constant(Array::scalar(1.0));
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         };
@@ -1756,6 +1767,7 @@ mod tests {
                 ArrayOperation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, operand],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1800,7 +1812,7 @@ mod tests {
             let input = builder.add_input(operand_type.clone());
             let one = builder.add_constant(Array::from_f64s(operand_type.clone(), vec![1.0]));
             let output = builder
-                .add_instruction(ArrayOperation::Div(DivOperation::new()), Vec::new(), vec![one, input])
+                .add_instruction(ArrayOperation::Div(DivOperation::new()), Vec::new(), vec![one, input], None)
                 .unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         };
@@ -1819,6 +1831,7 @@ mod tests {
                 ArrayOperation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, operand],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -2179,7 +2192,7 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             builder
-                .add_instruction(ArrayOperation::Print(PrintOperation::new(label)), Vec::new(), vec![input])
+                .add_instruction(ArrayOperation::Print(PrintOperation::new(label)), Vec::new(), vec![input], None)
                 .unwrap();
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
         };
@@ -2345,10 +2358,11 @@ mod tests {
                     ArrayOperation::Condition(ConditionOperation::new()),
                     regions,
                     vec![predicate, operand],
+                    None,
                 )
                 .unwrap()[0];
             for _ in 0..epilogue {
-                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
             }
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -2425,9 +2439,10 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let factor = builder.add_constant(Array::scalar(factor));
-            let mut value = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor]).unwrap()[0];
+            let mut value =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, factor], None).unwrap()[0];
             for _ in 1..operation_count {
-                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
             }
             Arc::new(
                 builder.build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder], vec![Placeholder]).unwrap(),
@@ -2457,10 +2472,11 @@ mod tests {
                             ArrayOperation::Condition(ConditionOperation::new()),
                             regions,
                             vec![predicate, operand],
+                            None,
                         )
                         .unwrap()[0];
                     for _ in 0..=index {
-                        value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value]).unwrap()[0];
+                        value = builder.add_instruction(SinOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
                     }
                     builder
                         .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -2529,18 +2545,20 @@ mod tests {
         // source output boundary exactly, and the entry root receives no hidden final-state output.
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
-        let snapshot =
-            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let doubled = true_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot])
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = false_builder.add_input(reference_type.clone().into());
-        let snapshot =
-            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2554,6 +2572,7 @@ mod tests {
                 ConditionOperation::<TestValue>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference],
+                None,
             )
             .unwrap()[0];
         let source = builder
@@ -2590,15 +2609,16 @@ mod tests {
         let reference = true_builder.add_input(reference_type.clone().into());
         let replacement = true_builder.add_constant(TestValue::Array(Array::scalar(7.0f32)));
         let snapshot = true_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement])
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = false_builder.add_input(reference_type.clone().into());
-        let snapshot =
-            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let snapshot = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2612,6 +2632,7 @@ mod tests {
                 ConditionOperation::<TestValue>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, reference],
+                None,
             )
             .unwrap()[0];
         let source = builder
@@ -2645,9 +2666,10 @@ mod tests {
         let first = true_builder.add_input(reference_type.clone().into());
         let second = true_builder.add_input(reference_type.clone().into());
         let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
-        let snapshot = true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first]).unwrap()[0];
+        let snapshot =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
         true_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![second, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![second, update], None)
             .unwrap();
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
@@ -2655,9 +2677,10 @@ mod tests {
         let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let first = false_builder.add_input(reference_type.clone().into());
         let second = false_builder.add_input(reference_type.clone().into());
-        false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first]).unwrap();
-        let snapshot =
-            false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second]).unwrap()[0];
+        false_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap();
+        let snapshot = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None)
+            .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2672,6 +2695,7 @@ mod tests {
                 ConditionOperation::<TestValue>::new(),
                 vec![true_branch, false_branch],
                 vec![predicate, first, second],
+                None,
             )
             .unwrap()[0];
         let source = builder

@@ -2647,7 +2647,9 @@ mod tests {
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::Parameter;
-    use crate::programs::{Effects, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType};
+    use crate::programs::{
+        Effects, Provenance, ProvenanceScope, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
+    };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
@@ -2657,9 +2659,14 @@ mod tests {
     fn greater_than_zero_condition() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
         let predicate = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![state, zero])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![state, zero],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -2668,8 +2675,8 @@ mod tests {
     fn subtract_one_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-        let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+        let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
         builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -2826,7 +2833,7 @@ mod tests {
         // multi-output conditions, and body outputs that do not match the state signature.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
-        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
             operation.infer_output_types(
@@ -2919,7 +2926,12 @@ mod tests {
         let body_region = builder.import_region(body.entry_region_ref());
         let program_state = builder.add_input(state_type);
         let program_output = builder
-            .add_instruction(ArrayOperation::While(bounded), vec![condition_region, body_region], vec![program_state])
+            .add_instruction(
+                ArrayOperation::While(bounded),
+                vec![condition_region, body_region],
+                vec![program_state],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![program_output], vec![Placeholder], vec![Placeholder])
@@ -2991,12 +3003,13 @@ mod tests {
             let counter = builder.add_input(scalar());
             let _acc = builder.add_input(scalar());
             let _k = builder.add_input(scalar());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::GreaterThan),
                     Vec::new(),
                     vec![counter, zero],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -3010,10 +3023,11 @@ mod tests {
             let counter = builder.add_input(scalar());
             let acc = builder.add_input(scalar());
             let k = builder.add_input(scalar());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
-            let next_counter = builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
-            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![k, k]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, ksq]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
+            let next_counter =
+                builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation::new(), Vec::new(), vec![k, k], None).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, ksq], None).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_counter, next_acc, k],
@@ -3038,6 +3052,7 @@ mod tests {
                 ArrayOperation::While(operation),
                 vec![condition_region, body_region],
                 vec![counter_init, acc_init, k_init],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -3125,9 +3140,14 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let x = builder.add_input(state_type.clone());
             let _k = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![x, zero])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
+                    Vec::new(),
+                    vec![x, zero],
+                    None,
+                )
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
@@ -3138,8 +3158,8 @@ mod tests {
             let x = builder.add_input(state_type.clone());
             let k = builder.add_input(state_type.clone());
             let one = builder.add_constant(Array::from_f64s(state_type.clone(), vec![1.0]));
-            let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, k]).unwrap()[0];
-            let next_x = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, inverse]).unwrap()[0];
+            let inverse = builder.add_instruction(DivOperation::new(), Vec::new(), vec![one, k], None).unwrap()[0];
+            let next_x = builder.add_instruction(AddOperation::new(), Vec::new(), vec![x, inverse], None).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![next_x, k], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -3154,6 +3174,7 @@ mod tests {
                 ArrayOperation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![x, k],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -3199,12 +3220,13 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let counter = builder.add_input(scalar());
             let _acc = builder.add_input(scalar());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
             let predicate = builder
                 .add_instruction(
                     CompareOperation::new(ComparisonDirection::GreaterThan),
                     Vec::new(),
                     vec![counter, zero],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -3215,9 +3237,11 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let counter = builder.add_input(scalar());
             let acc = builder.add_input(scalar());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter]).unwrap()[0];
-            let next_counter = builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
-            let next_acc = builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, counter]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![counter], None).unwrap()[0];
+            let next_counter =
+                builder.add_instruction(SubOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
+            let next_acc =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![acc, counter], None).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(
                     vec![next_counter, next_acc],
@@ -3236,6 +3260,7 @@ mod tests {
                 ArrayOperation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![counter_init, acc_init],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -3286,17 +3311,23 @@ mod tests {
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![state, zero])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
+                    Vec::new(),
+                    vec![state, zero],
+                    None,
+                )
                 .unwrap()[0];
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let next_state =
+                builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build(vec![next_state], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let operation = WhileOperation::new();
@@ -3327,19 +3358,25 @@ mod tests {
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
-            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
+            let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::GreaterThan), Vec::new(), vec![state, zero])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
+                    Vec::new(),
+                    vec![state, zero],
+                    None,
+                )
                 .unwrap()[0];
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         let effectful_body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let state = builder.add_input(state_type.clone());
-            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state]).unwrap()[0];
-            let next_state = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one]).unwrap()[0];
+            let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+            let next_state =
+                builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             let printed =
-                builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![next_state]).unwrap()[0];
+                builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![next_state], None).unwrap()[0];
             builder.build(vec![printed], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         assert_eq!(
@@ -3365,7 +3402,12 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             builder.add_input(state_type.clone());
             let predicate = builder
-                .add_instruction(crate::operations::constants::ZeroOperation::new(predicate_type), Vec::new(), vec![])
+                .add_instruction(
+                    crate::operations::constants::ZeroOperation::new(predicate_type),
+                    Vec::new(),
+                    vec![],
+                    None,
+                )
                 .unwrap()[0];
             builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
         };
@@ -3574,7 +3616,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
-        let output = builder.add_instruction(TestOperation::Sub, Vec::new(), vec![input, one]).unwrap()[0];
+        let output = builder.add_instruction(TestOperation::Sub, Vec::new(), vec![input, one], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -3583,7 +3625,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output = condition_builder
-            .add_instruction(TestOperation::IsPositive, Vec::new(), vec![condition_input])
+            .add_instruction(TestOperation::IsPositive, Vec::new(), vec![condition_input], None)
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
@@ -3605,7 +3647,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output = condition_builder
-            .add_instruction(TestOperation::IsPositive, Vec::new(), vec![condition_input])
+            .add_instruction(TestOperation::IsPositive, Vec::new(), vec![condition_input], None)
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
@@ -3616,7 +3658,12 @@ mod tests {
         let body_region = builder.import_region(subtract_one_branch().entry_region_ref());
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
-            .add_instruction(TestOperation::While(while_operation), vec![condition_region, body_region], vec![input])
+            .add_instruction(
+                TestOperation::While(while_operation),
+                vec![condition_region, body_region],
+                vec![input],
+                None,
+            )
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -3684,6 +3731,19 @@ mod tests {
 
         fn is_eager(&self) -> bool {
             false
+        }
+
+        // This test domain executes values directly and records no instructions, so provenance is a no-op.
+        fn provenance(&self) -> Provenance {
+            Provenance::unknown()
+        }
+
+        fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+            function()
+        }
+
+        fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+            function()
         }
     }
 
@@ -3771,6 +3831,19 @@ mod tests {
         fn is_eager(&self) -> bool {
             true
         }
+
+        // This test context executes eagerly and records no instructions, so provenance is a no-op.
+        fn provenance(&self) -> Provenance {
+            Provenance::unknown()
+        }
+
+        fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+            function()
+        }
+
+        fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+            function()
+        }
     }
 
     impl crate::operations::constants::Zero<Array> for CountingPrintContext {
@@ -3809,7 +3882,12 @@ mod tests {
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let threshold = builder.add_constant(Array::scalar(threshold));
         let predicate = builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![state, threshold])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![state, threshold],
+                None,
+            )
             .unwrap()[0];
         builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -3823,7 +3901,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
         let two = builder.add_constant(Array::scalar(2.0));
-        let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, two]).unwrap()[0];
+        let doubled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, two], None).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3837,9 +3915,11 @@ mod tests {
         let condition = scalar_threshold_condition(8.0);
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let input = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let printed = body_builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![input]).unwrap()[0];
+        let printed =
+            body_builder.add_instruction(PrintOperation::new("state"), Vec::new(), vec![input], None).unwrap()[0];
         let two = body_builder.add_constant(Array::scalar(2.0));
-        let output = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, two]).unwrap()[0];
+        let output =
+            body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![printed, two], None).unwrap()[0];
         let body = body_builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         (WhileOperation::new(), vec![condition, body])
     }
@@ -3854,7 +3934,7 @@ mod tests {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(scalar_f64);
-        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3871,7 +3951,7 @@ mod tests {
     ) -> (WhileOperation<ArrayType>, Vec<Program<Array, TestDomainOperation, Vec<Array>, Vec<Array>>>) {
         let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
-        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
         let body = builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3998,19 +4078,25 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![condition_state])
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![condition_state], None)
             .unwrap()[0];
         let threshold = condition_builder.add_constant(Array::scalar(20.0));
         let predicate = condition_builder
-            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![summed, threshold])
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::LessThan),
+                Vec::new(),
+                vec![summed, threshold],
+                None,
+            )
             .unwrap()[0];
         let condition = condition_builder
             .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(vector_f64.clone());
-        let squared =
-            body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![body_state, body_state]).unwrap()[0];
+        let squared = body_builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![body_state, body_state], None)
+            .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4127,13 +4213,14 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder
-            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![condition_state])
+            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![condition_state], None)
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::GreaterThan),
                 Vec::new(),
                 vec![condition_state, zero],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4141,8 +4228,9 @@ mod tests {
             .unwrap();
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_state = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_state]).unwrap()[0];
-        let next = body_builder.add_instruction(SubOperation::new(), Vec::new(), vec![body_state, one]).unwrap()[0];
+        let one = body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_state], None).unwrap()[0];
+        let next =
+            body_builder.add_instruction(SubOperation::new(), Vec::new(), vec![body_state, one], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4258,6 +4346,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
                 Vec::new(),
                 vec![condition_state],
+                None,
             )
             .unwrap()[0];
         let predicate = condition_builder
@@ -4267,6 +4356,7 @@ mod tests {
                 ))),
                 Vec::new(),
                 vec![condition_state, zero],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4283,6 +4373,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::OneLike(OneLikeOperation::new())),
                 Vec::new(),
                 vec![body_state],
+                None,
             )
             .unwrap()[0];
         let next = body_builder
@@ -4290,6 +4381,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Sub(SubOperation::new())),
                 Vec::new(),
                 vec![body_state, one],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -4426,13 +4518,14 @@ mod tests {
         let condition_counter = condition_builder.add_input(scalar_f64.clone());
         condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder
-            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![condition_counter])
+            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![condition_counter], None)
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
                 CompareOperation::new(ComparisonDirection::GreaterThan),
                 Vec::new(),
                 vec![condition_counter, zero],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4441,11 +4534,14 @@ mod tests {
         let mut body_builder = ProgramBuilder::<Array, TestDomainOperation>::new();
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_counter]).unwrap()[0];
-        let next_counter =
-            body_builder.add_instruction(SubOperation::new(), Vec::new(), vec![body_counter, one]).unwrap()[0];
-        let doubled =
-            body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![body_value, body_value]).unwrap()[0];
+        let one =
+            body_builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![body_counter], None).unwrap()[0];
+        let next_counter = body_builder
+            .add_instruction(SubOperation::new(), Vec::new(), vec![body_counter, one], None)
+            .unwrap()[0];
+        let doubled = body_builder
+            .add_instruction(AddOperation::new(), Vec::new(), vec![body_value, body_value], None)
+            .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![next_counter, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -4612,6 +4708,7 @@ mod tests {
                 TestDomainOperation::While(while_operation),
                 vec![condition_region, body_region],
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let fused = builder
@@ -4646,7 +4743,12 @@ mod tests {
             let counter = builder.add_input(counter_type.clone());
             let bound = builder.add_constant(Array::from_elements(counter_type.clone(), &[3i64]).unwrap());
             let predicate = builder
-                .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), Vec::new(), vec![counter, bound])
+                .add_instruction(
+                    CompareOperation::new(ComparisonDirection::LessThan),
+                    Vec::new(),
+                    vec![counter, bound],
+                    None,
+                )
                 .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
@@ -4656,9 +4758,11 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, TestDomainOperation>::new();
             let state = builder.add_input(float_type.clone());
             let counter = builder.add_input(counter_type.clone());
-            let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state]).unwrap()[0];
+            let squared =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, state], None).unwrap()[0];
             let one = builder.add_constant(Array::from_elements(counter_type.clone(), &[1i64]).unwrap());
-            let incremented = builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one]).unwrap()[0];
+            let incremented =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![counter, one], None).unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![squared, incremented], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -4673,6 +4777,7 @@ mod tests {
                 TestDomainOperation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![state, counter],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -4769,13 +4874,14 @@ mod tests {
         let counter = condition_builder.add_input(scalar_type.clone().into());
         let reference = condition_builder.add_input(reference_type.clone().into());
         let threshold = condition_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
                 ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
                 Vec::new(),
                 vec![counter, threshold],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4786,7 +4892,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.clone().into());
         let step = body_builder.add_constant(TestValue::Array(Array::scalar(-1.0f32)));
         let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step])
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -4801,7 +4907,12 @@ mod tests {
         let reference = builder.add_input(reference_type.clone().into());
         let counter = builder.add_input(scalar_type.clone().into());
         let final_counter = builder
-            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![counter, reference])
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![condition, body],
+                vec![counter, reference],
+                None,
+            )
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![final_counter], vec![Placeholder; 2], vec![Placeholder])
@@ -4850,10 +4961,10 @@ mod tests {
         let reference = condition_builder.add_input(reference_type.clone().into());
         let update = condition_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
         condition_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
         let current = condition_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let limit = condition_builder.add_constant(TestValue::Array(Array::scalar(3.0f32)));
         let predicate = condition_builder
@@ -4861,6 +4972,7 @@ mod tests {
                 ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
                 Vec::new(),
                 vec![current, limit],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -4876,9 +4988,10 @@ mod tests {
         let body = builder.import_program(body);
         let reference = builder.add_input(reference_type.into());
         let reference = builder
-            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference])
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference], None)
             .unwrap()[0];
-        let value = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
             .unwrap();

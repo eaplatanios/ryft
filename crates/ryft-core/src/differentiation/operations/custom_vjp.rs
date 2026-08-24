@@ -787,7 +787,7 @@ mod tests {
     fn sin_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -795,8 +795,8 @@ mod tests {
     fn sin_forward_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let residual = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let residual = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
         builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap()
     }
 
@@ -809,8 +809,9 @@ mod tests {
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
         let three = builder.add_constant(Array::scalar(3.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual]).unwrap()[0];
-        let gradient = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![three, residual], None).unwrap()[0];
+        let gradient =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, cotangent], None).unwrap()[0];
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -836,7 +837,7 @@ mod tests {
             regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect::<Vec<_>>();
         let input_count = input_types.len();
         let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-        let outputs = builder.add_instruction(operation, region_ids, inputs).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, region_ids, inputs, None).unwrap().to_vec();
         let output_count = outputs.len();
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
@@ -946,7 +947,7 @@ mod tests {
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
         let input = builder.add_input(scalar.clone());
-        let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, region_ids, vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -1242,14 +1243,14 @@ mod tests {
             let mut builder = ProgramBuilder::new();
             let x = builder.add_input(scalar_type.clone());
             let y = builder.add_input(scalar_type.clone());
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y], None).unwrap()[0];
             builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap()
         };
         let forward = {
             let mut builder = ProgramBuilder::new();
             let x = builder.add_input(scalar_type.clone());
             let y = builder.add_input(scalar_type.clone());
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, y], None).unwrap()[0];
             builder.build(vec![output, x, y], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap()
         };
         let backward = {
@@ -1257,8 +1258,10 @@ mod tests {
             let x = builder.add_input(scalar_type.clone());
             let y = builder.add_input(scalar_type.clone());
             let cotangent = builder.add_input(scalar_type.clone());
-            let x_cotangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![y, cotangent]).unwrap()[0];
-            let y_cotangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, cotangent]).unwrap()[0];
+            let x_cotangent =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![y, cotangent], None).unwrap()[0];
+            let y_cotangent =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, cotangent], None).unwrap()[0];
             builder.build(vec![x_cotangent, y_cotangent], vec![Placeholder; 3], vec![Placeholder; 2]).unwrap()
         };
         let program = wrapped_call_program(

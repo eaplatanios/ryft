@@ -1061,9 +1061,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(array_type.clone()).into());
         let update = builder.add_input(array_type.into());
-        let old = builder.add_instruction(TestSwap::new(), Vec::new(), vec![reference, update]).unwrap()[0];
-        builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update]).unwrap();
-        let frozen = builder.add_instruction(TestFreeze::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let old = builder.add_instruction(TestSwap::new(), Vec::new(), vec![reference, update], None).unwrap()[0];
+        builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
+        let frozen = builder.add_instruction(TestFreeze::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![old, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -1344,7 +1344,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let external = builder.add_input(ReferenceType::new(array_type.clone()).into());
         let replacement = builder.add_input(array_type.into());
-        builder.add_instruction(TestSwap::new(), Vec::new(), vec![external, replacement]).unwrap();
+        builder.add_instruction(TestSwap::new(), Vec::new(), vec![external, replacement], None).unwrap();
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![external], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1368,8 +1368,10 @@ mod tests {
 
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let true_input = true_builder.add_input(array_type.clone().into());
-        let true_reference = true_builder.add_instruction(TestNew::new(), Vec::new(), vec![true_input]).unwrap()[0];
-        let true_output = true_builder.add_instruction(TestRead::new(), Vec::new(), vec![true_reference]).unwrap()[0];
+        let true_reference =
+            true_builder.add_instruction(TestNew::new(), Vec::new(), vec![true_input], None).unwrap()[0];
+        let true_output =
+            true_builder.add_instruction(TestRead::new(), Vec::new(), vec![true_reference], None).unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![true_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -1390,6 +1392,7 @@ mod tests {
                 ArrayIrOperation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, input],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1411,7 +1414,7 @@ mod tests {
         let build_branch = || {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = builder.add_input(reference_type.clone().into());
-            let output = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference]).unwrap()[0];
+            let output = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -1424,12 +1427,13 @@ mod tests {
         let false_region = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(array_type.into());
-        let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let output = builder
             .add_instruction(
                 ArrayIrOperation::Condition(ConditionOperation::new()),
                 vec![true_region, false_region],
                 vec![predicate, reference],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1464,18 +1468,18 @@ mod tests {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let state = builder.add_input(array_type.clone().into());
             let predicate = builder.add_input(boolean_type.clone().into());
-            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![state]).unwrap()[0];
-            builder.add_instruction(TestRead::new(), Vec::new(), vec![reference]).unwrap();
+            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![state], None).unwrap()[0];
+            builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap();
             builder.build::<Values, Values>(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap()
         };
         let body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let state = builder.add_input(array_type.clone().into());
             builder.add_input(boolean_type.clone().into());
-            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![state]).unwrap()[0];
+            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![state], None).unwrap()[0];
             let update = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
-            builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update]).unwrap();
-            let state = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference]).unwrap()[0];
+            builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
+            let state = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
             let done = builder.add_constant(TestValue::Array(Array::scalar(false)));
             builder
                 .build::<Values, Values>(vec![state, done], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -1491,6 +1495,7 @@ mod tests {
                 ArrayIrOperation::While(WhileOperation::new()),
                 vec![condition_region, body_region],
                 vec![state, predicate],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1514,9 +1519,9 @@ mod tests {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
-            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![carry]).unwrap()[0];
-            builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, item]).unwrap();
-            let next = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference]).unwrap()[0];
+            let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![carry], None).unwrap()[0];
+            builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, item], None).unwrap();
+            let next = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
                 .build::<Values, Values>(vec![next, next], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -1526,7 +1531,7 @@ mod tests {
         let carry = builder.add_input(scalar_type.into());
         let items = builder.add_input(stacked_type.into());
         let outputs = builder
-            .add_instruction(ScanOperation::new(1, 3), vec![body_region], vec![carry, items])
+            .add_instruction(ScanOperation::new(1, 3), vec![body_region], vec![carry, items], None)
             .unwrap()
             .to_vec();
         let program = builder.build::<Values, Values>(outputs, vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();

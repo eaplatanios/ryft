@@ -170,7 +170,7 @@ mod tests {
         // instead of converting the narrower primal output.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F8E8M0FNU));
-        let output = builder.add_instruction(SqrtOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SqrtOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()

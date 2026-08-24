@@ -700,7 +700,7 @@ mod tests {
     };
     use crate::operations::{Add, Compare, ComparisonDirection, Select, Sin, ZeroLike};
     use crate::parameters::{ParameterPath, Parameterized};
-    use crate::programs::{Typed, Value};
+    use crate::programs::{Instruction, Operation, Program, Provenance, ProvenanceScope, Typed, Value};
 
     use super::*;
 
@@ -1211,6 +1211,75 @@ mod tests {
             })
             .unwrap();
         assert_abs_diff_eq!(derivative.iter_blocks().next().unwrap().value().to_f64s()[0], 2.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_staged_jacobian_scopes_its_coordinate_basis() {
+        // Tracing a Jacobian stages its internal jvp/batching pipeline into the enclosing program, so the coordinate
+        // basis primitives must still be recognizable there. The rank-two input makes each basis rank greater than one
+        // and the second input carries a nonzero coordinate offset, which is the case that adds the offsetting
+        // `constant`/`broadcast`/`add` primitives to the basis construction.
+        let matrix_type = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+
+        // Partitions a staged program's instructions into the ones carrying the framework-owned coordinate-basis
+        // scopes and the remaining ones, returning both operation-name sequences in program order. The remaining
+        // instructions must all carry unknown provenance, because the user computation, its batched derivative
+        // replay, and the block extraction are staged outside any framework scope.
+        let coordinate_basis = Provenance::scope(
+            ProvenanceScope::new("ryft"),
+            Provenance::scope(
+                ProvenanceScope::new("differentiation"),
+                Provenance::scope(ProvenanceScope::new("coordinate_basis"), Provenance::unknown()),
+            ),
+        );
+        let partition = |program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>| {
+            let (basis, other): (Vec<_>, Vec<_>) =
+                program.instructions().iter().partition(|instruction| instruction.provenance() == &coordinate_basis);
+            assert!(other.iter().all(|instruction| instruction.provenance().is_unknown()));
+            let names = |instructions: Vec<&Instruction<ArrayOperation<Array>>>| {
+                instructions.iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>().join(" ")
+            };
+            (names(basis), names(other))
+        };
+
+        // Forward mode builds one basis per input, so the second input's basis carries the nonzero coordinate offset
+        // that adds the `constant`/`broadcast`/`add` primitives.
+        let (_, forward) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context().clone();
+                let jacobian = context
+                    .differentiate_at(inputs)
+                    .jacobian_forward(|values: Vec<_>| Ok(vec![values[0].clone() * values[1].clone()]))
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                Ok(jacobian.into_values())
+            },
+            vec![matrix_type.clone(), matrix_type.clone()],
+        )
+        .unwrap();
+        let (basis, user) = partition(&forward);
+        assert_eq!(
+            basis,
+            "iota iota compare zero one select reshape \
+             iota iota constant broadcast add compare zero one select reshape",
+        );
+        assert_eq!(user, "mul broadcast mul broadcast mul add slice reshape transpose slice reshape transpose");
+
+        // Reverse mode builds its basis over the single output instead, so one offset-free basis is staged.
+        let (_, reverse) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let context = inputs[0].context().clone();
+                let jacobian = context
+                    .differentiate_at(inputs)
+                    .jacobian_reverse(|values: Vec<_>| Ok(vec![values[0].clone() * values[1].clone()]))
+                    .map_err(|error| ProgramError::MalformedProgram(error.to_string()))?;
+                Ok(jacobian.into_values())
+            },
+            vec![matrix_type.clone(), matrix_type],
+        )
+        .unwrap();
+        let (basis, user) = partition(&reverse);
+        assert_eq!(basis, "iota iota compare zero one select reshape");
+        assert_eq!(user, "mul broadcast mul broadcast mul reshape reshape");
     }
 
     #[test]

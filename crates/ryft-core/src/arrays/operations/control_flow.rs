@@ -452,6 +452,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(MulOperation::new())),
                 Vec::new(),
                 vec![operand, factor],
+                None,
             )
             .unwrap()[0];
         builder.build(vec![extent, output], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
@@ -474,6 +475,7 @@ mod tests {
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
                 vec![predicate, extent, operand],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -551,6 +553,7 @@ mod tests {
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
                 vec![predicate, extent, operand],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -596,8 +599,9 @@ mod tests {
         let branch = || {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let extent = builder.add_input(extent_type.clone().into());
-            let output =
-                builder.add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![extent]).unwrap()[0];
+            let output = builder
+                .add_instruction(ZeroOperation::new(output_type.clone()), Vec::new(), vec![extent], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -609,7 +613,8 @@ mod tests {
             builder.import_region(branch().entry_region_ref()),
             builder.import_region(branch().entry_region_ref()),
         ];
-        let output = builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, extent]).unwrap()[0];
+        let output =
+            builder.add_instruction(ConditionOperation::new(), regions, vec![predicate, extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -734,6 +739,7 @@ mod tests {
                     TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                     Vec::new(),
                     vec![left, right],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -752,6 +758,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(StopGradientOperation::<ArrayType>::new())),
                 Vec::new(),
                 vec![right],
+                None,
             )
             .unwrap()[0];
         let regions = vec![
@@ -763,6 +770,7 @@ mod tests {
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
                 vec![predicate, extent, left, severed],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -802,6 +810,7 @@ mod tests {
                     TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                     Vec::new(),
                     vec![operand, operand],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -825,6 +834,7 @@ mod tests {
                 TestOperation::Condition(ConditionOperation::new()),
                 regions,
                 vec![predicate, extent, operand],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -888,6 +898,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![first, second],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -899,7 +910,7 @@ mod tests {
         let second = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let region = builder.import_region(body.entry_region_ref());
         let outputs = builder
-            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![first, second])
+            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![first, second], None)
             .unwrap()
             .to_vec();
         // Keeping only the accumulating carry leaves the second carry dead, so the reversed scan needs a dynamic zero
@@ -945,6 +956,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(MulOperation::new())),
                 Vec::new(),
                 vec![carry, item],
+                None,
             )
             .unwrap()[0];
         builder.build(vec![extent, product, product], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap()
@@ -970,6 +982,7 @@ mod tests {
                 TestOperation::Scan(ScanOperation::new(2, length)),
                 vec![region],
                 vec![extent, carry, values, runtime_length],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1026,6 +1039,7 @@ mod tests {
                 TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
                 Vec::new(),
                 vec![counter],
+                None,
             )
             .unwrap()[0];
         let repeated = body_builder
@@ -1033,6 +1047,7 @@ mod tests {
                 TestOperation::from(DynamicBroadcastOperation::new(Vec::new())),
                 Vec::new(),
                 vec![state, iteration],
+                None,
             )
             .unwrap()[0];
         let next_state = body_builder
@@ -1040,6 +1055,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
                 Vec::new(),
                 vec![repeated],
+                None,
             )
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_u64)));
@@ -1048,6 +1064,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![counter, one],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -1063,7 +1080,7 @@ mod tests {
         let counter = builder.add_input(ArrayIrType::Array(scalar_u64));
         let region = builder.import_region(body.entry_region_ref());
         let outputs = builder
-            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![state, counter])
+            .add_instruction(TestOperation::Scan(ScanOperation::new(2, 2)), vec![region], vec![state, counter], None)
             .unwrap()
             .to_vec();
         let program = builder
@@ -1098,6 +1115,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
                 Vec::new(),
                 vec![state, limit],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder.build(vec![predicate], vec![Placeholder; 2], vec![Placeholder]).unwrap();
@@ -1110,6 +1128,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![state, state],
+                None,
             )
             .unwrap()[0];
         let body = body_builder.build(vec![extent, doubled], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
@@ -1130,6 +1149,7 @@ mod tests {
                 TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                 regions,
                 vec![extent, state],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1168,6 +1188,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
                 Vec::new(),
                 vec![state, limits],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -1181,6 +1202,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![state, state],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -1196,6 +1218,7 @@ mod tests {
                 TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                 regions,
                 vec![state],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1232,6 +1255,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
                 Vec::new(),
                 vec![state, limits],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -1247,6 +1271,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![state, state],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -1263,6 +1288,7 @@ mod tests {
                 TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                 regions,
                 vec![extent, state],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1319,6 +1345,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
                 Vec::new(),
                 vec![counter, limit],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -1330,7 +1357,12 @@ mod tests {
         let vector = body_builder.add_input(ArrayIrType::Array(vector_type.clone()));
         let counter = body_builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let reshaped = body_builder
-            .add_instruction(TestOperation::from(DynamicReshapeOperation::new()), Vec::new(), vec![vector, extent])
+            .add_instruction(
+                TestOperation::from(DynamicReshapeOperation::new()),
+                Vec::new(),
+                vec![vector, extent],
+                None,
+            )
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_i64)));
         let next_counter = body_builder
@@ -1338,6 +1370,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![counter, one],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -1359,6 +1392,7 @@ mod tests {
                 TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                 regions,
                 vec![extent, vector, counter],
+                None,
             )
             .unwrap()
             .to_vec();
@@ -1404,6 +1438,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(CompareOperation::new(ComparisonDirection::LessThan))),
                 Vec::new(),
                 vec![counter, limit],
+                None,
             )
             .unwrap()[0];
         let condition = condition_builder
@@ -1418,6 +1453,7 @@ mod tests {
                 TestOperation::from(DimensionFromScalarOperation::new(iteration_variable)),
                 Vec::new(),
                 vec![counter],
+                None,
             )
             .unwrap()[0];
         let repeated = body_builder
@@ -1425,6 +1461,7 @@ mod tests {
                 TestOperation::from(DynamicBroadcastOperation::new(Vec::new())),
                 Vec::new(),
                 vec![state, iteration],
+                None,
             )
             .unwrap()[0];
         let next_state = body_builder
@@ -1432,6 +1469,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
                 Vec::new(),
                 vec![repeated],
+                None,
             )
             .unwrap()[0];
         let one = body_builder.add_constant(array(Array::scalar(1_u64)));
@@ -1440,6 +1478,7 @@ mod tests {
                 TestOperation::Array(ArrayOperation::from(AddOperation::new())),
                 Vec::new(),
                 vec![counter, one],
+                None,
             )
             .unwrap()[0];
         let body = body_builder
@@ -1460,6 +1499,7 @@ mod tests {
                 TestOperation::While(WhileOperation::new().with_iteration_bound(4).unwrap()),
                 regions,
                 vec![state, counter],
+                None,
             )
             .unwrap()
             .to_vec();

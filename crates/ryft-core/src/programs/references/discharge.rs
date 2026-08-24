@@ -2365,21 +2365,21 @@ where
         self.parent.is_eager()
     }
 
-    // Reference discharge stages rewritten primitive work through its destination parent, so provenance state lives
-    // with the parent.
     #[inline]
-    fn current_provenance(&self) -> Provenance {
-        self.parent.current_provenance()
+    fn provenance(&self) -> Provenance {
+        // Reference discharge stages rewritten primitive work through its destination parent, so that provenance state
+        // lives with the parent.
+        self.parent.provenance()
     }
 
     #[inline]
-    fn with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.parent.with_provenance_scope(scope, function)
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.invoke_with_provenance_origin(origin, function)
     }
 
     #[inline]
-    fn with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.parent.with_provenance_origin(origin, function)
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.invoke_with_provenance_scope(scope, function)
     }
 
     #[inline]
@@ -2981,7 +2981,7 @@ where
             let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
             // Run the discharge rule inside the source instruction's recorded origin so every staged instruction
             // records where it came from.
-            context.with_provenance_origin(instruction.provenance().clone(), || {
+            context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
                 instruction.operation().discharge_references(context, &driver, instruction_inputs)
             })
         },

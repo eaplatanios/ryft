@@ -1560,6 +1560,7 @@ mod tests {
                     ))),
                     Vec::new(),
                     vec![input],
+                    None,
                 )
                 .unwrap()[0];
             let program = builder

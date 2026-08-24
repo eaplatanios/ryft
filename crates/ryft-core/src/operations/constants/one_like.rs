@@ -147,7 +147,7 @@ mod tests {
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, OneLikeOperation<ArrayType>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

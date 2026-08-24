@@ -258,8 +258,8 @@ where
         let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.to_dimension();
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let scalar = builder.add_input(ArrayIrType::Array(input_type.clone()));
-        let dimension = builder.add_instruction(self.clone(), Vec::new(), vec![scalar])?[0];
-        let scalar = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension])?[0];
+        let dimension = builder.add_instruction(self.clone(), Vec::new(), vec![scalar], None)?[0];
+        let scalar = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None)?[0];
         let body =
             builder.build::<Vec<C::Constant>, Vec<C::Constant>>(vec![scalar], vec![Placeholder], vec![Placeholder])?;
 
@@ -581,7 +581,7 @@ mod tests {
         let value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar])
+            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
         builder
             .add_instruction(
@@ -591,16 +591,18 @@ mod tests {
                 )),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap();
         let broadcast = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, extent], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Sin(SinOperation::new())),
                 Vec::new(),
                 vec![broadcast],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -650,13 +652,13 @@ mod tests {
         let first_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let second_value = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar])
+            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
         let first = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![first_value, extent], None)
             .unwrap()[0];
         let second = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![second_value, extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![second_value, extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

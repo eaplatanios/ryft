@@ -1351,7 +1351,8 @@ mod tests {
         // Program rendering uses the canonical operation name and includes the captured metadata.
         let mut builder = ProgramBuilder::<Array, BroadcastOperation>::new();
         let program_input = builder.add_input(input_type);
-        let program_output = builder.add_instruction(operation.clone(), Vec::new(), vec![program_input]).unwrap()[0];
+        let program_output =
+            builder.add_instruction(operation.clone(), Vec::new(), vec![program_input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![program_output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

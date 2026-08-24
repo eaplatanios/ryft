@@ -156,6 +156,7 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
                     DimensionSizeOperation::new(source_type, axis)?,
                     Vec::new(),
                     vec![source],
+                    None,
                 )?[0])
             })
             .collect()
@@ -621,6 +622,7 @@ mod tests {
                 )),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -683,6 +685,7 @@ mod tests {
                 )),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -788,6 +791,7 @@ mod tests {
                 .unwrap(),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -824,6 +828,7 @@ mod tests {
                 ZeroOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -886,6 +891,7 @@ mod tests {
                 OneOperation::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(formal)]))),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -927,6 +933,7 @@ mod tests {
                     .unwrap(),
                 Vec::new(),
                 vec![extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -999,10 +1006,15 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let extent = builder.add_input(extent_type.clone().into());
         let scalar = builder
-            .add_instruction(ArrayOperation::from(ConstantOperation::new(Array::scalar(2.5_f64))), Vec::new(), vec![])
+            .add_instruction(
+                ArrayOperation::from(ConstantOperation::new(Array::scalar(2.5_f64))),
+                Vec::new(),
+                vec![],
+                None,
+            )
             .unwrap()[0];
         let output = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent])
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![scalar, extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -1040,6 +1052,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::StopGradient(StopGradientOperation::new())),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder

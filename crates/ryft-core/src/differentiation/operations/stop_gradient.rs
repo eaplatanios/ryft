@@ -315,7 +315,7 @@ mod tests {
         // sees it. The blanket elementwise batching rule would interpret the operation as an identity and erase it.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let (batched, output_axes) = program
@@ -402,7 +402,7 @@ mod tests {
         // tangent output materializes as a canonical zero.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()

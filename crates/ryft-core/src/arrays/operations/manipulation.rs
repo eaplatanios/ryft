@@ -820,7 +820,7 @@ mod tests {
         let first_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let second_extent = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()));
         let output = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, first_extent, second_extent])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, first_extent, second_extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -857,7 +857,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
         let source_extent = builder
-            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input])
+            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
         let two_value = DimensionValue::constant(2).unwrap();
         let two_type = two_value.r#type().into_owned();
@@ -868,10 +868,11 @@ mod tests {
                 DimensionOperation::Mul(DimensionMulOperation::new(&source_type, &two_type).unwrap()),
                 Vec::new(),
                 vec![source_extent, two],
+                None,
             )
             .unwrap()[0];
         let output = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, two, doubled_extent])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, two, doubled_extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -1039,7 +1040,7 @@ in (%4)
         let source_extent = builder.add_input(source_type.into());
         let four = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()));
         let output = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, source_extent, four])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, source_extent, four], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -1066,10 +1067,11 @@ in (%4)
         let extent_scalar = builder.add_input(ArrayType::scalar(DataType::I32).into());
         let total = DimensionVariable::new("total", DimensionBounds::new(1, Some(33)).unwrap());
         let extent = builder
-            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar])
+            .add_instruction(DimensionFromScalarOperation::new(total), Vec::new(), vec![extent_scalar], None)
             .unwrap()[0];
-        let output =
-            builder.add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent]).unwrap()[0];
+        let output = builder
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, extent], None)
+            .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -1178,13 +1180,14 @@ in (%4)
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.clone().into());
         let extent = builder
-            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input])
+            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
                 DynamicReshapeOperation::new().with_dimensions([1, 0]),
                 Vec::new(),
                 vec![input, extent, extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1258,6 +1261,7 @@ in (%4)
                 DynamicReshapeOperation::new().with_output_sharding(sharding),
                 Vec::new(),
                 vec![input, extent, four],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1284,6 +1288,7 @@ in (%4)
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value, output_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1318,6 +1323,7 @@ in (%4)
                 PadOperation::new(vec![1], vec![2], vec![1]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value, output_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1400,6 +1406,7 @@ in (%4)
                 PadOperation::new(vec![0, 1], vec![0, 1], vec![0, 0]).unwrap(),
                 Vec::new(),
                 vec![input, padding_value, rows, output_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1454,6 +1461,7 @@ in (%4)
                 ArrayIrOperation::<Array>::from(IotaOperation::new(input_type, 0).unwrap()),
                 Vec::new(),
                 vec![source_extent],
+                None,
             )
             .unwrap()[0];
         let output = builder
@@ -1461,6 +1469,7 @@ in (%4)
                 PadOperation::new(vec![1], vec![1], vec![0]).unwrap(),
                 Vec::new(),
                 vec![operand, padding_value, output_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1510,9 +1519,10 @@ in (%4)
                 ArrayIrOperation::<Array>::from(IotaOperation::new(left_type, 0).unwrap()),
                 Vec::new(),
                 vec![left_extent],
+                None,
             )
             .unwrap()[0];
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -1548,6 +1558,7 @@ in (%4)
                 ArrayIrOperation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2]))),
                 Vec::new(),
                 vec![input, start],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1596,6 +1607,7 @@ in (%4)
                 )),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1640,6 +1652,7 @@ in (%4)
                 ArrayIrOperation::Array(ArrayOperation::Gather(operation)),
                 Vec::new(),
                 vec![input, indices],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1705,6 +1718,7 @@ in (%4)
                 ))),
                 Vec::new(),
                 vec![input, indices, updates],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1775,10 +1789,11 @@ in (%4)
                 ))),
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap()[0];
         let operand = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![ones, padded_extent])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![ones, padded_extent], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
@@ -1788,6 +1803,7 @@ in (%4)
                 ))),
                 Vec::new(),
                 vec![operand, indices, updates],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1824,6 +1840,7 @@ in (%4)
                 ArrayIrOperation::Array(ArrayOperation::Slice(SliceOperation::new(vec![1], vec![3]))),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1869,6 +1886,7 @@ in (%4)
                 ArrayIrOperation::Array(ArrayOperation::UpdateSlice(UpdateSliceOperation::new(vec![1]))),
                 Vec::new(),
                 vec![input, update],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1921,6 +1939,7 @@ in (%4)
                 ArrayIrOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)),
                 Vec::new(),
                 vec![input, update, start],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1977,7 +1996,7 @@ in (%4)
         let extent = builder.add_input(source_dimension_type.into());
         let four = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()));
         let output = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![array, extent, four])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![array, extent, four], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2113,6 +2132,7 @@ in (%4)
                 DynamicBroadcastOperation::new(vec![1]),
                 Vec::new(),
                 vec![input, first_extent, second_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -2149,7 +2169,7 @@ in (%4)
             .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(dynamic_variable)])).into());
         let extent = builder.add_input(dynamic_extent.clone().into());
         let output = builder
-            .add_instruction(DynamicBroadcastOperation::new(vec![0]), Vec::new(), vec![input, extent])
+            .add_instruction(DynamicBroadcastOperation::new(vec![0]), Vec::new(), vec![input, extent], None)
             .unwrap()[0];
         let dynamic_program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2181,7 +2201,7 @@ in (%4)
         let extent = builder.add_input(DimensionType::new(source.clone()).into());
         let one = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(1).unwrap()));
         let output = builder
-            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![input, extent, one])
+            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![input, extent, one], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2244,7 +2264,7 @@ in (%4)
         let start = builder.add_constant(dimension(1)?);
         let size = builder.add_constant(dimension(2)?);
         let output =
-            builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, size])?[0];
+            builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![input, start, size], None)?[0];
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![output],
             vec![Placeholder],
@@ -2278,21 +2298,28 @@ in (%4)
             ArrayIrOperation::Array(ArrayOperation::from(ConvertElementTypeOperation::<ArrayType>::new(DataType::I64))),
             Vec::new(),
             vec![mask],
+            None,
         )?[0];
         let count = builder.add_instruction(
             ArrayIrOperation::Array(ArrayOperation::from(ReduceOperation::new(vec![0], ReductionKind::Sum))),
             Vec::new(),
             vec![mask],
+            None,
         )?[0];
         let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5))?);
         let count = builder.add_instruction(
             DimensionFromScalarOperation::new(count_variable.clone()),
             Vec::new(),
             vec![count],
+            None,
         )?[0];
         let start = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
-        let output =
-            builder.add_instruction(DynamicShapeSliceOperation::new(1), Vec::new(), vec![values, start, count])?[0];
+        let output = builder.add_instruction(
+            DynamicShapeSliceOperation::new(1),
+            Vec::new(),
+            vec![values, start, count],
+            None,
+        )?[0];
         let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
             vec![output],
             vec![Placeholder, Placeholder],
@@ -2575,13 +2602,13 @@ in (%4)
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let left_input = builder.add_input(left_type.into());
         let right_input = builder.add_input(right_type.into());
-        let left_size = builder.add_instruction(left_size_operation, Vec::new(), vec![left_input]).unwrap()[0];
-        let right_size = builder.add_instruction(right_size_operation, Vec::new(), vec![right_input]).unwrap()[0];
+        let left_size = builder.add_instruction(left_size_operation, Vec::new(), vec![left_input], None).unwrap()[0];
+        let right_size = builder.add_instruction(right_size_operation, Vec::new(), vec![right_input], None).unwrap()[0];
         let result_extent = builder
-            .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_size, right_size])
+            .add_instruction(DimensionOperation::Add(add_operation), Vec::new(), vec![left_size, right_size], None)
             .unwrap()[0];
         let concatenated = builder
-            .add_instruction(dynamic_operation, Vec::new(), vec![left_input, right_input, result_extent])
+            .add_instruction(dynamic_operation, Vec::new(), vec![left_input, right_input, result_extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2725,7 +2752,7 @@ in (%4)
         let left = builder.add_input(left_type.into());
         let right = builder.add_input(right_type.into());
         let extent = builder.add_constant(ArrayIrValue::Dimension(extent_value));
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2782,7 +2809,7 @@ in (%4)
         let left = builder.add_input(left_type.into());
         let right = builder.add_input(right_type.into());
         let extent = builder.add_constant(ArrayIrValue::Dimension(extent_value));
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2849,7 +2876,7 @@ in (%4)
         let left = builder.add_input(left_type.into());
         let right = builder.add_input(right_type.into());
         let extent = builder.add_input(result_extent_type.into());
-        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right, extent], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2885,7 +2912,7 @@ in (%4)
         let fixed_array = builder.add_input(fixed_array_type.clone().into());
         let result_extent = builder.add_input(result_extent_type.into());
         let output = builder
-            .add_instruction(operation, Vec::new(), vec![source_array, fixed_array, result_extent])
+            .add_instruction(operation, Vec::new(), vec![source_array, fixed_array, result_extent], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(

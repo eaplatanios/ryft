@@ -84,7 +84,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let left = builder.add_input(left_type.clone());
         let right = builder.add_input(right_type.clone());
-        let result = builder.add_instruction(operation, Vec::new(), vec![left, right]).unwrap()[0];
+        let result = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
                 vec![result],

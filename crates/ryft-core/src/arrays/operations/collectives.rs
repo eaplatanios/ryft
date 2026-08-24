@@ -175,6 +175,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![array, result_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -248,6 +249,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![array, result_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -292,6 +294,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![array, participant_extent, input_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -329,6 +332,7 @@ mod tests {
                 PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![array, result_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -358,6 +362,7 @@ mod tests {
                 AllToAllOperation::new("x".to_string(), 1, 0, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![array, extent],
+                None,
             )
             .unwrap()[0];
         let program = builder

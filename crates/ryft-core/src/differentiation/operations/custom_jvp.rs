@@ -610,7 +610,7 @@ mod tests {
     fn sin_program(r#type: &ArrayType) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -620,11 +620,11 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
-        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
         let two = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![two, cosine]).unwrap()[0];
-        let tangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, dx]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![two, cosine], None).unwrap()[0];
+        let tangent = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scaled, dx], None).unwrap()[0];
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
             .unwrap()
@@ -652,7 +652,7 @@ mod tests {
             regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect::<Vec<_>>();
         let input_count = input_types.len();
         let inputs = input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-        let outputs = builder.add_instruction(operation, region_ids, inputs).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, region_ids, inputs, None).unwrap().to_vec();
         let output_count = outputs.len();
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
@@ -663,7 +663,7 @@ mod tests {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         builder.add_input(r#type.clone());
-        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x]).unwrap()[0];
+        let y = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
         let tangent = builder.add_constant(Array::scalar(1.0));
         builder
             .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
@@ -758,7 +758,7 @@ mod tests {
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
         let input = builder.add_input(scalar.clone());
-        let output = builder.add_instruction(operation, region_ids, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, region_ids, vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -858,7 +858,7 @@ mod tests {
             let mut builder = ProgramBuilder::new();
             builder.add_input(scalar_type.clone());
             let index = builder
-                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             builder.build(vec![index], vec![Placeholder], vec![Placeholder]).unwrap()
         };
@@ -867,7 +867,7 @@ mod tests {
             builder.add_input(scalar_type.clone());
             builder.add_input(scalar_type);
             let index = builder
-                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+                .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             let tangent = builder.add_constant(Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap());
             builder.build(vec![index, tangent], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
@@ -999,7 +999,7 @@ mod tests {
             .map(|region| builder.import_region(region.entry_region_ref()))
             .collect::<Vec<_>>();
         let input = builder.add_input(r#type.clone());
-        let output = builder.add_instruction(operation.clone(), region_ids, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation.clone(), region_ids, vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert!(matches!(

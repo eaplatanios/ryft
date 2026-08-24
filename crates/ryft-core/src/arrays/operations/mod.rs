@@ -1959,7 +1959,7 @@ mod tests {
     fn composite_scaled(builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId, scale: f64) -> AtomId {
         let scale = builder.add_constant(ArrayIrValue::Array(Array::scalar(scale)));
         builder
-            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale])
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, scale], None)
             .unwrap()[0]
     }
 
@@ -2232,7 +2232,7 @@ mod tests {
             .collect::<Vec<_>>();
         let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
         let output = builder
-            .add_instruction(ArrayOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input])
+            .add_instruction(ArrayOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input], None)
             .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -2351,6 +2351,7 @@ mod tests {
                 ArrayIrOperation::<Array>::Array(ArrayOperation::Mul(MulOperation::new())),
                 Vec::new(),
                 vec![input, factor],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -2379,6 +2380,7 @@ mod tests {
                     ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
                     Vec::new(),
                     vec![input],
+                    None,
                 )
                 .unwrap()[0];
             let program = builder
@@ -2423,6 +2425,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum))),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -2465,6 +2468,7 @@ mod tests {
                     ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0], kind))),
                     Vec::new(),
                     vec![input],
+                    None,
                 )
                 .unwrap()[0];
             let program = builder
@@ -2516,6 +2520,7 @@ mod tests {
                 DimensionOperation::Mul(DimensionMulOperation::new(&extent_type, &one_type).unwrap()),
                 Vec::new(),
                 vec![extent, one],
+                None,
             )
             .unwrap()[0];
         let two = builder
@@ -2523,16 +2528,18 @@ mod tests {
                 DimensionOperation::Add(DimensionAddOperation::new(&one_type, &one_type).unwrap()),
                 Vec::new(),
                 vec![one, one],
+                None,
             )
             .unwrap()[0];
         let reshaped = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![input, one, repeated_extent], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
                 DynamicBroadcastOperation::new(vec![0, 1]),
                 Vec::new(),
                 vec![reshaped, two, repeated_extent],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -2668,24 +2675,26 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(per_item_type.clone().into());
         let doubled = builder
-            .add_instruction(ArrayOperation::Add(AddOperation::new()), Vec::new(), vec![input, input])
+            .add_instruction(ArrayOperation::Add(AddOperation::new()), Vec::new(), vec![input, input], None)
             .unwrap()[0];
-        let extent = builder.add_instruction(extent_operation, Vec::new(), vec![doubled]).unwrap()[0];
+        let extent = builder.add_instruction(extent_operation, Vec::new(), vec![doubled], None).unwrap()[0];
         let total = builder
             .add_instruction(
                 DimensionOperation::Add(DimensionAddOperation::new(&extent_type, &extent_type).unwrap()),
                 Vec::new(),
                 vec![extent, extent],
+                None,
             )
             .unwrap()[0];
         let widened = builder
-            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![doubled, total, extent])
+            .add_instruction(DynamicBroadcastOperation::new(vec![1]), Vec::new(), vec![doubled, total, extent], None)
             .unwrap()[0];
         let output = builder
             .add_instruction(
                 ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
                 Vec::new(),
                 vec![widened],
+                None,
             )
             .unwrap()[0];
         let program = builder

@@ -589,14 +589,14 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(input_type.into());
         let one = builder.add_constant(ArrayIrValue::Dimension(one_value));
-        let size = builder.add_instruction(size_operation, Vec::new(), vec![input]).unwrap()[0];
+        let size = builder.add_instruction(size_operation, Vec::new(), vec![input], None).unwrap()[0];
         let sum = builder
-            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size])
+            .add_instruction(DimensionOperation::Add(sum_operation), Vec::new(), vec![size, size], None)
             .unwrap()[0];
         let concatenated =
-            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum]).unwrap()[0];
+            builder.add_instruction(concatenate_operation, Vec::new(), vec![input, input, sum], None).unwrap()[0];
         let reshaped = builder
-            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one])
+            .add_instruction(DynamicReshapeOperation::new(), Vec::new(), vec![concatenated, sum, one], None)
             .unwrap()[0];
         let program = builder
             .build::<ArrayIrValue<Array>, ArrayIrValue<Array>>(vec![reshaped], Placeholder, Placeholder)

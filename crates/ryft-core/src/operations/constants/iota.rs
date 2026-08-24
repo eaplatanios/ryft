@@ -336,7 +336,7 @@ mod tests {
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, IotaOperation<ArrayType>>::new();
-        let output = builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
+        let output = builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
         let program = builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

@@ -53,8 +53,10 @@ pub(crate) mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(r#type.clone());
         let tangent = builder.add_input(r#type.clone());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output, tangent],
@@ -77,8 +79,9 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         let input = builder.add_input(scalar_type.clone());
         let tangent = include_tangent_output.then(|| builder.add_input(scalar_type.clone()));
-        let output =
-            builder.add_instruction(CustomJvpOperation::<ArrayIrType>::new(), regions, vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(CustomJvpOperation::<ArrayIrType>::new(), regions, vec![input], None)
+            .unwrap()[0];
         let mut outputs = vec![output];
         if let Some(tangent) = tangent {
             outputs.push(tangent);

@@ -23,8 +23,8 @@ use crate::partial::{
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, ProjectedValue, Region, RegionDriver, RegionRef, RegionReplayMappings,
-    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, Region, RegionDriver, RegionRef,
+    RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -1210,6 +1210,23 @@ where
         // (i.e., never over a staging parent context, always over an eager one).
         self.parent.is_eager()
     }
+
+    #[inline]
+    fn provenance(&self) -> Provenance {
+        // Forward-mode differentiation stages rewritten primitive work through its parent, so that provenance state
+        // lives with the parent.
+        self.parent.provenance()
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.invoke_with_provenance_scope(scope, function)
+    }
 }
 
 impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> RegionRef<'_, V, O>
@@ -1332,31 +1349,41 @@ where
                     Ok(true)
                 };
                 let driver = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-                let output_duals = if all_input_tangents_are_zero && can_materialize_output_tangents_without_rules()? {
-                    let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-                    context
-                        .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
-                        .into_iter()
-                        .enumerate()
-                        .map(|(output_index, primal)| {
-                            // When the primal instruction is itself known to produce zero and its output already
-                            // has the required tangent type, the primal Single Static Assignment (SSA) value is the
-                            // canonical materialized tangent. Reusing it preserves source-relative geometry such as
-                            // explicit shaped-constructor extents and avoids inventing a nullary dynamic zero at the
-                            // fused Jacobian-Vector Product (JVP) boundary.
-                            let primal_type = primal.r#type();
-                            let tangent_type = primal_type.tangent()?;
-                            if instruction.operation().is_zero(output_index) && primal_type.as_ref() == &tangent_type {
-                                DifferentiationDual::new(primal.clone(), primal)
-                            } else {
-                                DifferentiationDual::new_with_zero_tangent(primal)
-                            }
-                        })
-                        .collect::<Result<Vec<_>, DifferentiationError>>()?
-                } else {
-                    let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
-                    instruction.operation().jvp(&context, &differentiation_driver, input_duals.as_slice())?
-                };
+
+                // Both dispatch paths run inside the replayed instruction's recorded origin so that everything they
+                // stage records where it came from: the one-to-one fast path preserves the source provenance exactly,
+                // and a rule that stages several instructions attaches it to each of them.
+                let use_zero_tangent_fast_path =
+                    all_input_tangents_are_zero && can_materialize_output_tangents_without_rules()?;
+                let output_duals = context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    if use_zero_tangent_fast_path {
+                        let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+                        context
+                            .stage_operation(instruction.operation().clone(), driver, primal_inputs.as_slice())?
+                            .into_iter()
+                            .enumerate()
+                            .map(|(output_index, primal)| {
+                                // When the primal instruction is itself known to produce zero and its output already
+                                // has the required tangent type, the primal Single Static Assignment (SSA) value is
+                                // the canonical materialized tangent. Reusing it preserves source-relative geometry
+                                // such as explicit shaped-constructor extents and avoids inventing a nullary dynamic
+                                // zero at the fused Jacobian-Vector Product (JVP) boundary.
+                                let primal_type = primal.r#type();
+                                let tangent_type = primal_type.tangent()?;
+                                if instruction.operation().is_zero(output_index)
+                                    && primal_type.as_ref() == &tangent_type
+                                {
+                                    DifferentiationDual::new(primal.clone(), primal)
+                                } else {
+                                    DifferentiationDual::new_with_zero_tangent(primal)
+                                }
+                            })
+                            .collect::<Result<Vec<_>, DifferentiationError>>()
+                    } else {
+                        let differentiation_driver = RecursiveDifferentiationDriver { driver: &driver };
+                        instruction.operation().jvp(&context, &differentiation_driver, input_duals.as_slice())
+                    }
+                })?;
 
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
                 for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
@@ -1530,8 +1557,12 @@ where
             input_duals,
             |_, constant| differentiation_context.lift(constant.clone()),
             |instruction, inputs| {
+                // Bind inside the source instruction's recorded origin so linearization propagates provenance like
+                // every other interpretation/replay boundary.
                 let regions = ReplayRegionDriver::new(*self, instruction.regions(), &region_mappings)?;
-                differentiation_context.bind(instruction.operation().clone(), regions, inputs)
+                differentiation_context.invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    differentiation_context.bind(instruction.operation().clone(), regions, inputs)
+                })
             },
         )?;
 
@@ -2482,7 +2513,7 @@ mod tests {
         // its tangent.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let fused = program.jvp().unwrap();
@@ -2510,8 +2541,8 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
-        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
@@ -2537,14 +2568,53 @@ mod tests {
     }
 
     #[test]
+    fn test_program_jvp_preserves_source_provenance() {
+        // Every instruction the fused JVP program stages for one source instruction records that source instruction as
+        // its origin, both for the primal replay and for the instructions the tangent rule contributes. The two source
+        // instructions carry distinct scopes so per-instruction attribution is observable rather than incidental.
+        let first = Provenance::scope(ProvenanceScope::new("a"), Provenance::unknown());
+        let second = Provenance::scope(ProvenanceScope::new("b"), Provenance::unknown());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sine =
+            builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], Some(first.clone())).unwrap()[0];
+        let squared = builder
+            .add_instruction(MulOperation::new(), Vec::new(), vec![sine, sine], Some(second.clone()))
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![squared], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let fused = program.jvp().unwrap();
+        assert_eq!(
+            fused
+                .instructions()
+                .iter()
+                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("sin", first.clone()),
+                ("cos", first.clone()),
+                ("mul", first),
+                ("mul", second.clone()),
+                ("mul", second.clone()),
+                ("mul", second.clone()),
+                ("add", second),
+            ],
+        );
+    }
+
+    #[test]
     fn test_program_jvp_rejects_unresolved_references() {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2570,7 +2640,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let input = builder.add_input(scalar_type.clone());
             let outputs = builder
-                .add_instruction(ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input])
+                .add_instruction(ArrayIrOperation::CustomJvp(CustomJvpOperation::new()), regions, vec![input], None)
                 .unwrap()
                 .to_vec();
             builder
@@ -2622,7 +2692,7 @@ mod tests {
         // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let callee = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
@@ -2648,8 +2718,8 @@ mod tests {
         // A region whose contents are genuinely rewritten starts over with a freshly derived program.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output]).unwrap();
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
         let with_dead_work =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let before = with_dead_work.entry_region_ref().jvp_shared().unwrap();
@@ -2664,7 +2734,7 @@ mod tests {
     fn test_region_jvp_shared_debug_recheck_detects_corrupted_cached_program() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -2673,7 +2743,7 @@ mod tests {
         // not compute.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
@@ -2696,7 +2766,7 @@ mod tests {
         // whose trailing output is the `cos(x)` residual, and the linear tangent sub-program `(ẋ, r) ↦ r · ẋ`.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let linearization = program.linearize().unwrap();
@@ -2745,7 +2815,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let constant = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -2786,11 +2856,13 @@ mod tests {
     fn test_program_linearize_rejects_unresolved_references() {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2872,7 +2944,7 @@ mod tests {
         let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = condition_builder.add_input(reference_type.clone().into());
         condition_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference])
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap();
         let predicate = condition_builder.add_constant(ArrayIrValue::Array(Array::scalar(true)));
         let condition = condition_builder
@@ -2887,7 +2959,7 @@ mod tests {
         let reference = body_builder.add_input(reference_type.into());
         let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
         body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update])
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
         let body = body_builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
@@ -2901,10 +2973,12 @@ mod tests {
         let condition = builder.import_region(condition.entry_region_ref());
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(ArrayIrType::Array(scalar_type));
-        let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial]).unwrap()[0];
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
-        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference]).unwrap()[0];
-        let output = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference]).unwrap()[0];
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2974,7 +3048,7 @@ mod tests {
         // repeated re-transformation that outer programs interning one callee would otherwise pay.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let callee = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
@@ -3003,8 +3077,8 @@ mod tests {
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
-        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output]).unwrap();
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
         let with_dead_work =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let before = with_dead_work.entry_region_ref().linearize_shared().unwrap();
@@ -3022,7 +3096,7 @@ mod tests {
         );
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(dynamic_type);
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let dynamic_callee =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let formal = dynamic_callee.entry_region_ref().linearize_shared().unwrap();
@@ -3042,7 +3116,7 @@ mod tests {
         fn branch(operation: ArrayOperation<Array>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let output = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap()[0];
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
             builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 
@@ -3054,7 +3128,7 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
-            .add_instruction(ConditionOperation::new(), vec![sine, sine], vec![predicate, input])
+            .add_instruction(ConditionOperation::new(), vec![sine, sine], vec![predicate, input], None)
             .unwrap()[0];
         let first = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -3089,7 +3163,7 @@ mod tests {
         // therefore the strongest ownership-cycle attempt available through today's built-in transform API.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let source_cache = program.entry_region().transform_cache.downgrade();
@@ -3112,7 +3186,7 @@ mod tests {
     fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -3121,7 +3195,7 @@ mod tests {
         // compute.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input]).unwrap()[0];
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let unrelated = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
@@ -3153,7 +3227,7 @@ mod tests {
         fn tagged_program(key: &str) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let output = builder.add_instruction(TagOperation::new(key), Vec::new(), vec![input]).unwrap()[0];
+            let output = builder.add_instruction(TagOperation::new(key), Vec::new(), vec![input], None).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 
@@ -3192,7 +3266,8 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
             let constant = builder.add_constant(Array::scalar(factor));
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant]).unwrap()[0];
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
         }
 

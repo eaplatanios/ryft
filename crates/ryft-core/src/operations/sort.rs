@@ -665,7 +665,7 @@ mod tests {
         // A one-operand sort stages as a single-output instruction.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(vector_type(4));
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap().to_vec();
         let program = builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
             program.to_string(),

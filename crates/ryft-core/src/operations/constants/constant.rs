@@ -257,7 +257,7 @@ mod tests {
 
         // Verify the operation's textual form when it appears in a program.
         let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
-        let output = program_builder.add_instruction(operation, Vec::new(), vec![]).unwrap()[0];
+        let output = program_builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
         let program = program_builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

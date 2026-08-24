@@ -98,6 +98,7 @@ fn test_dot_accumulation_type() {
             DotOperation::matmul().with_accumulation_type(DataType::F32),
             Vec::new(),
             vec![lhs_input, rhs_input],
+            None,
         )
         .unwrap()[0];
     let program = builder

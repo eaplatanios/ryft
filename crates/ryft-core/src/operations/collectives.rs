@@ -4857,6 +4857,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
@@ -4885,6 +4886,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
@@ -4913,6 +4915,7 @@ mod tests {
                 ),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
@@ -4933,6 +4936,7 @@ mod tests {
                 PSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
@@ -4950,6 +4954,7 @@ mod tests {
                 AllToAllOperation::new("x".to_string(), 2, 0, 1, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![input],
+                None,
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
@@ -5030,7 +5035,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(f32_vector(2));
         let output = builder
-            .add_instruction(PpermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]), Vec::new(), vec![input])
+            .add_instruction(
+                PpermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]),
+                Vec::new(),
+                vec![input],
+                None,
+            )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();

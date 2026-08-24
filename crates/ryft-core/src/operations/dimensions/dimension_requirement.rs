@@ -639,7 +639,7 @@ mod tests {
     ) -> Program<DimensionValue, DimensionOperation<DimensionValue>, Vec<DimensionValue>, Vec<DimensionValue>> {
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
         let inputs = input_types.iter().cloned().map(|input| builder.add_input(input)).collect::<Vec<_>>();
-        builder.add_instruction(operation, Vec::new(), inputs).unwrap();
+        builder.add_instruction(operation, Vec::new(), inputs, None).unwrap();
         builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
                 Vec::new(),
@@ -693,13 +693,19 @@ mod tests {
         let left_atom = builder.add_input(left.clone());
         let right_atom = builder.add_input(right.clone());
         builder
-            .add_instruction(DimensionRequirementOperation::equal(&left, &left), Vec::new(), vec![left_atom, left_atom])
+            .add_instruction(
+                DimensionRequirementOperation::equal(&left, &left),
+                Vec::new(),
+                vec![left_atom, left_atom],
+                None,
+            )
             .unwrap();
         builder
             .add_instruction(
                 DimensionRequirementOperation::less_than_or_equal(&left, &right),
                 Vec::new(),
                 vec![left_atom, right_atom],
+                None,
             )
             .unwrap();
         builder
@@ -707,6 +713,7 @@ mod tests {
                 DimensionRequirementOperation::equal(&left, &right),
                 Vec::new(),
                 vec![left_atom, right_atom],
+                None,
             )
             .unwrap();
         let program = builder
@@ -793,12 +800,14 @@ mod tests {
         let extent_atom = builder.add_input(extent.clone());
         let four_atom = builder.add_constant(four);
         let two_atom = builder.add_constant(two.clone());
-        let product = builder.add_instruction(multiplication, Vec::new(), vec![extent_atom, four_atom]).unwrap()[0];
+        let product =
+            builder.add_instruction(multiplication, Vec::new(), vec![extent_atom, four_atom], None).unwrap()[0];
         builder
             .add_instruction(
                 DimensionRequirementOperation::divisible_by(&product_type, two.r#type().as_ref()),
                 Vec::new(),
                 vec![product, two_atom],
+                None,
             )
             .unwrap();
         let program = builder
@@ -834,6 +843,7 @@ mod tests {
                 DimensionRequirementOperation::less_than_or_equal(&left, &right),
                 Vec::new(),
                 vec![left_atom, right_atom],
+                None,
             )
             .unwrap();
         builder
@@ -841,6 +851,7 @@ mod tests {
                 DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
                 Vec::new(),
                 vec![right_atom],
+                None,
             )
             .unwrap();
         let program = builder
@@ -989,6 +1000,7 @@ mod tests {
                     DimensionRequirementOperation::less_than_or_equal(&left, &right),
                     Vec::new(),
                     vec![left_atom, right_atom],
+                    None,
                 )
                 .unwrap();
             let sum = builder
@@ -996,6 +1008,7 @@ mod tests {
                     DimensionAddOperation::new(&left, &right).unwrap(),
                     Vec::new(),
                     vec![left_atom, right_atom],
+                    None,
                 )
                 .unwrap()[0];
             builder
@@ -1003,6 +1016,7 @@ mod tests {
                     DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
                     Vec::new(),
                     vec![right_atom],
+                    None,
                 )
                 .unwrap();
             builder
@@ -1046,6 +1060,7 @@ mod tests {
                 DimensionRequirementOperation::bounds(&right, DimensionBounds::new(2, Some(8)).unwrap()),
                 Vec::new(),
                 vec![right_atom],
+                None,
             )
             .unwrap();
         let sum = builder
@@ -1053,6 +1068,7 @@ mod tests {
                 DimensionAddOperation::new(&left, &right).unwrap(),
                 Vec::new(),
                 vec![left_atom, right_atom],
+                None,
             )
             .unwrap()[0];
         builder
@@ -1060,6 +1076,7 @@ mod tests {
                 DimensionRequirementOperation::less_than_or_equal(&left, &right),
                 Vec::new(),
                 vec![left_atom, right_atom],
+                None,
             )
             .unwrap();
         let swapped = builder
@@ -1101,8 +1118,8 @@ mod tests {
             let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
             let left_atom = builder.add_input(left.clone());
             let right_atom = builder.add_input(right.clone());
-            builder.add_instruction(first, Vec::new(), vec![left_atom, right_atom]).unwrap();
-            builder.add_instruction(second, Vec::new(), vec![left_atom, right_atom]).unwrap();
+            builder.add_instruction(first, Vec::new(), vec![left_atom, right_atom], None).unwrap();
+            builder.add_instruction(second, Vec::new(), vec![left_atom, right_atom], None).unwrap();
             let program = builder
                 .build::<Vec<DimensionValue>, Vec<DimensionValue>>(
                     Vec::new(),

@@ -553,6 +553,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
                 Vec::new(),
                 vec![input, bias],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -918,16 +919,23 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new())),
                 Vec::new(),
                 vec![input, bias],
+                None,
             )
             .unwrap()[0];
         let activated = builder
-            .add_instruction(ArrayIrOperation::Array(ArrayOperation::Tanh(TanhOperation::new())), Vec::new(), vec![sum])
+            .add_instruction(
+                ArrayIrOperation::Array(ArrayOperation::Tanh(TanhOperation::new())),
+                Vec::new(),
+                vec![sum],
+                None,
+            )
             .unwrap()[0];
         let loss = builder
             .add_instruction(
                 ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
                 Vec::new(),
                 vec![activated],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -994,6 +1002,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new())),
                 Vec::new(),
                 vec![input, scale],
+                None,
             )
             .unwrap()[0];
         let loss = builder
@@ -1001,6 +1010,7 @@ mod tests {
                 ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(vec![0, 1], ReductionKind::Sum))),
                 Vec::new(),
                 vec![scaled],
+                None,
             )
             .unwrap()[0];
         let program = builder

@@ -227,7 +227,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()

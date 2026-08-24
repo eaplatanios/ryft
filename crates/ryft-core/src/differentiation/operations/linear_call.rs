@@ -838,7 +838,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let residual = builder.add_input(r#type.clone());
         let linear = builder.add_input(r#type);
-        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, residual]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, residual], None).unwrap()[0];
         builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()
@@ -851,12 +851,12 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let index = builder
-            .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new())
+            .add_instruction(AxisIndexOperation::new("items".to_string()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let factor = builder
-            .add_instruction(ConvertElementTypeOperation::new(DataType::F64), Vec::new(), vec![index])
+            .add_instruction(ConvertElementTypeOperation::new(DataType::F64), Vec::new(), vec![index], None)
             .unwrap()[0];
-        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, factor]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![linear, factor], None).unwrap()[0];
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -982,7 +982,7 @@ mod tests {
         let residual = builder.add_input(residual_type);
         let linear = builder.add_input(linear_type);
         let output = builder
-            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<ProjectedProgramValue>, Vec<ProjectedProgramValue>>(
@@ -1055,6 +1055,7 @@ mod tests {
                 LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
                 vec![transpose],
                 vec![residual, linear],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1102,6 +1103,7 @@ mod tests {
                 )),
                 vec![transpose],
                 vec![residual, linear],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1128,7 +1130,7 @@ mod tests {
         let residual = builder.add_input(r#type.clone());
         let linear = builder.add_input(r#type);
         let output = builder
-            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -1210,6 +1212,7 @@ mod tests {
                 LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type]),
                 vec![transpose],
                 vec![residual, linear],
+                None,
             )
             .unwrap()[0];
         let program = builder
@@ -1265,7 +1268,7 @@ mod tests {
         let residual = builder.add_input(ArrayType::scalar(DataType::F64));
         let linear = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
-            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
@@ -1411,7 +1414,7 @@ mod tests {
         let residual = builder.add_input(r#type.clone());
         let linear = builder.add_input(r#type);
         let output = builder
-            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear])
+            .add_instruction(LinearCallOperation::new(1), vec![forward, transpose], vec![residual, linear], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -1467,8 +1470,9 @@ mod tests {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let residual = builder.add_input(r#type.clone());
             let output_cotangent = builder.add_input(r#type.clone());
-            let input_cotangent =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![output_cotangent, residual]).unwrap()[0];
+            let input_cotangent = builder
+                .add_instruction(AddOperation::new(), Vec::new(), vec![output_cotangent, residual], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<Array>, Vec<Array>>(vec![input_cotangent], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -1553,7 +1557,7 @@ mod tests {
         let residual = transpose_builder.add_input(r#type.clone());
         let output_cotangent = transpose_builder.add_input(r#type.clone());
         let first_input_cotangent = transpose_builder
-            .add_instruction(MulOperation::new(), Vec::new(), vec![residual, output_cotangent])
+            .add_instruction(MulOperation::new(), Vec::new(), vec![residual, output_cotangent], None)
             .unwrap()[0];
         let transpose = transpose_builder
             .build::<Vec<Array>, Vec<Array>>(
@@ -1599,7 +1603,7 @@ mod tests {
         let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         transpose_builder.add_input(cotangent_type.clone());
         let zero = transpose_builder
-            .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new())
+            .add_instruction(ZeroOperation::new(cotangent_type.clone()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let transpose = transpose_builder
             .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
@@ -1622,7 +1626,7 @@ mod tests {
         let mut transpose_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = transpose_builder.add_input(cotangent_type.clone());
         let zero_like = transpose_builder
-            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![output_cotangent])
+            .add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![output_cotangent], None)
             .unwrap()[0];
         let transpose = transpose_builder
             .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])

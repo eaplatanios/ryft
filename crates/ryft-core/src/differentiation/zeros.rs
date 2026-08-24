@@ -525,7 +525,7 @@ mod tests {
         // Spending no residuals assembles the type-only zero, which the transposition path stages normally.
         let (operation, operands) =
             ArrayOperation::<Array>::zero_operation_with_residuals(r#type.clone(), &[] as &[AtomId]).unwrap();
-        let zero = builder.add_instruction(operation, Vec::new(), operands).unwrap()[0];
+        let zero = builder.add_instruction(operation, Vec::new(), operands, None).unwrap()[0];
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.interpret(vec![Array::scalar(3.0)]), Ok(vec![Array::scalar(0.0)]));

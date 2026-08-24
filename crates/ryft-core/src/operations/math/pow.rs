@@ -191,7 +191,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let base = builder.add_input(ArrayType::scalar(DataType::F64));
         let exponent = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(PowOperation::new(), Vec::new(), vec![base, exponent]).unwrap()[0];
+        let output = builder.add_instruction(PowOperation::new(), Vec::new(), vec![base, exponent], None).unwrap()[0];
         let jvp_program = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap()

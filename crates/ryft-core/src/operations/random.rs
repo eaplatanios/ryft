@@ -356,7 +356,7 @@ where
         // item's advanced state and bits.
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let state_input = builder.add_input(self.algorithm.state_type());
-        let outputs = builder.add_instruction(self.clone(), Vec::new(), vec![state_input])?.to_vec();
+        let outputs = builder.add_instruction(self.clone(), Vec::new(), vec![state_input], None)?.to_vec();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             outputs,
             vec![Placeholder],
@@ -419,7 +419,7 @@ where
             .collect::<Vec<_>>();
         let state_input = builder.add_input(ArrayIrType::Array(self.algorithm().state_type()));
         let operation_inputs = std::iter::once(state_input).chain(extent_inputs.iter().copied()).collect::<Vec<_>>();
-        let random_outputs = builder.add_instruction(self.clone(), Vec::new(), operation_inputs)?.to_vec();
+        let random_outputs = builder.add_instruction(self.clone(), Vec::new(), operation_inputs, None)?.to_vec();
         let body_outputs = extent_inputs.iter().copied().chain(random_outputs).collect::<Vec<_>>();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             body_outputs,
@@ -947,7 +947,7 @@ mod tests {
         // Staging through a program builder produces one instruction with both outputs.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(RandomAlgorithm::ThreeFry.state_type());
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap().to_vec();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
             .unwrap();
@@ -1006,7 +1006,7 @@ mod tests {
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(4));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(RandomAlgorithm::ThreeFry.state_type());
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap().to_vec();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
             .unwrap();
@@ -1121,7 +1121,7 @@ mod tests {
         let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(4));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(RandomAlgorithm::ThreeFry.state_type());
-        let outputs = builder.add_instruction(operation, Vec::new(), vec![input]).unwrap().to_vec();
+        let outputs = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap().to_vec();
         let program = builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
             .unwrap();
