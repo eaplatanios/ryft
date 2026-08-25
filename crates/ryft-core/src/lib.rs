@@ -80,7 +80,7 @@ pub use interpretation::{
 pub use operations::compare::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection};
 pub use operations::constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation,
-    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
+    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, OneOperationProvider,
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
     ZeroOperationProvider,
 };

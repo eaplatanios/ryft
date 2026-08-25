@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayIrValue, ArrayOperation,
-    ArrayType, DataType, dispatch_on_array_element_type,
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+    ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -114,6 +114,51 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
     |context, output_type, _operation| context.one(&output_type),
 );
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
+//  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
+//  is built from `Self` (E0284). The equality is enforced per method through a `where` clause instead.
+/// Supplies the canonical one [`Operation`] of a program type's operation family. [`Self::one_operation`] covers ones
+/// that can be constructed from a type without operands, which is all that staging and reverse-mode gradient seeding
+/// need.
+///
+/// The super-trait is plain [`Operation`] rather than `Operation<Type = T>` because the current trait solver cannot
+/// discharge that projection equality where this provider is requested through a context's operation family. The
+/// equality is instead required by [`one_operation`](Self::one_operation) itself, so a provider whose
+/// [`Operation::Type`] disagrees with `T` cannot construct anything.
+pub trait OneOperationProvider<T: Type>: Operation {
+    /// Constructs an [`Operation`] that materializes a one of `r#type` without operands.
+    fn one_operation(r#type: T) -> Result<Self, ProgramError>
+    where
+        Self: Operation<Type = T>;
+}
+
+impl<T: Type, O: Operation<Type = T> + From<OneOperation<T>>> OneOperationProvider<T> for O {
+    #[inline]
+    fn one_operation(r#type: T) -> Result<Self, ProgramError> {
+        Ok(Self::from(OneOperation::new(r#type)))
+    }
+}
+
+impl<A: Value<Type = ArrayType>> OneOperationProvider<ArrayIrType> for ArrayIrOperation<A> {
+    fn one_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
+        let r#type = match r#type {
+            ArrayIrType::Array(r#type) => r#type,
+            ArrayIrType::Dimension(_) => {
+                return Err(TypeError::invalid("cannot materialize a one for a first-class dimension type").into());
+            }
+            ArrayIrType::Reference(r#type) => {
+                return Err(TypeError::invalid(format!(
+                    "cannot materialize a one for reference type `{}`; references must be discharged first",
+                    r#type,
+                ))
+                .into());
+            }
+        };
+        check_constructor_type_has_no_identity_references(ONE_OPERATION_NAME, &r#type)?;
+        Ok(Self::Array(ArrayOperation::One(OneOperation::new(r#type))))
+    }
+}
+
 /// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
 /// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
@@ -161,10 +206,10 @@ where
     }
 }
 
-impl<C: StagingContext<Operation: From<OneOperation<C::Type>>>> One<Tracer<C>> for C {
+impl<C: StagingContext<Operation: OneOperationProvider<C::Type>>> One<Tracer<C>> for C {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
-        let mut outputs = self.stage_nullary_operation(OneOperation::new(r#type.clone()))?;
+        let mut outputs = self.stage_nullary_operation(C::Operation::one_operation(r#type.clone())?)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -174,11 +219,11 @@ impl<C: Context> One<PartialTracer<C>> for PartialEvaluationContext<C>
 where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + From<OneOperation<C::Type>>,
+        + OneOperationProvider<C::Type>,
 {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(OneOperation::new(r#type.clone()), Vec::new(), &[])?;
+        let mut outputs = self.bind(C::Operation::one_operation(r#type.clone())?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -217,7 +262,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
 
     use super::*;
 
@@ -281,6 +326,51 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_one_operation_provider() {
+        // Homogeneous operation families receive the infallible provider implementation through their ordinary
+        // `From<OneOperation<T>>` conversion.
+        let static_type = ArrayType::new_static(DataType::F32, [2]);
+        let ArrayOperation::<Array>::One(operation) = ArrayOperation::one_operation(static_type.clone()).unwrap()
+        else {
+            panic!("expected a homogeneous one operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // The composite provider projects a valid operand-free array one into the homogeneous member family.
+        let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
+            ArrayIrOperation::one_operation(ArrayIrType::Array(static_type.clone())).unwrap()
+        else {
+            panic!("expected a composite homogeneous one operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed ones must instead receive their
+        // concrete extents as dimension operands.
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Array(dynamic_type)).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
+                "`one` cannot construct type f32[size] without operands because it references identity size",
+            )),
+        );
+
+        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be
+        // replaced by a one of its referent type; it must be discharged before construction.
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
+        );
+        let reference_type = ReferenceType::new(static_type);
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(format!(
+                "cannot materialize a one for reference type `{reference_type}`; references must be discharged first",
+            ))),
         );
     }
 

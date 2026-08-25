@@ -1,7 +1,6 @@
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::Context;
@@ -59,34 +58,6 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayType>> for ArrayIrOperat
             Self::DynamicOne(operation)
         } else {
             Self::Array(ArrayOperation::One(operation))
-        }
-    }
-}
-
-impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayIrType>> for ArrayIrOperation<A> {
-    #[inline]
-    fn from(operation: OneOperation<ArrayIrType>) -> Self {
-        // A composite one names its complete output type, so it needs no composite carrier of its own: it normalizes
-        // into the same canonical member encodings that the homogeneous lift above selects. This conversion exists so
-        // that type-generic transform drivers can name the multiplicative identity in the composite universe with a
-        // plain `From<OneOperation<C::Type>>` bound, which is what reverse-mode differentiation gradient seeding
-        // requires.
-        match operation.r#type() {
-            ArrayIrType::Array(r#type) => Self::from(OneOperation::new(r#type.clone())),
-            ArrayIrType::Dimension(_) => {
-                // A first-class dimension is a shape quantity rather than numerical data, so it has no one value. The
-                // composite universe already represents a dimension's differential space as the zero-space array member
-                // (refer to `DifferentiableType::cotangent` for more information), and that member is where this
-                // request is routed. It materializes no value, because constructing a one of data type zero is
-                // rejected. Reverse-mode differentiation gradient seeding never reaches this arm, because it rejects
-                // a zero-space output before constructing its seed.
-                Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
-            }
-            ArrayIrType::Reference(_) => {
-                // Fallible cotangent derivation rejects references before reverse-mode seeding reaches this conversion.
-                // Retain the same invalid sentinel used for dimensions solely so this public conversion remains total.
-                Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
-            }
         }
     }
 }
@@ -725,31 +696,8 @@ mod tests {
 
     #[test]
     fn test_array_ir_gradient_terminals_seed_a_composite_one() {
-        // A composite one carries its complete output type and therefore normalizes into the same canonical member
-        // encodings as the homogeneous lift: the static array member, or the mixed dynamic constructor.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(OneOperation::new(ArrayIrType::Array(ArrayType::scalar(DataType::F64)))),
-            ArrayIrOperation::Array(ArrayOperation::One(_)),
-        ));
-        assert!(matches!(
-            ArrayIrOperation::<Array>::from(OneOperation::new(ArrayIrType::Array(dynamic_type))),
-            ArrayIrOperation::DynamicOne(_),
-        ));
-
-        // A first-class dimension has no one value, so the conversion stays total by routing to the zero-space array
-        // member that represents a dimension's differential space, which materializes nothing.
-        let dimension_type = ArrayIrType::Dimension(DimensionType::new(extent));
-        let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
-            ArrayIrOperation::from(OneOperation::new(dimension_type))
-        else {
-            panic!("expected the zero-space array member encoding");
-        };
-        assert_eq!(operation.r#type(), &ArrayType::scalar(DataType::Zero));
-
         // Reverse-mode gradient terminals seed the output cotangent by binding a `one` of the composite cotangent
-        // type, which the composite family normalizes into its canonical array member encoding. The differentiated
+        // type through the fallible provider, which constructs the canonical array member encoding. The differentiated
         // function reaches ordinary array math through the array member projection, because homogeneous array
         // capabilities deliberately do not exist at the composite level.
         let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0]));

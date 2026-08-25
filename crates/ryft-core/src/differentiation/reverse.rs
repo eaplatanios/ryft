@@ -10,7 +10,7 @@ use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
-use crate::operations::{AddOperation, OneOperation, Zero};
+use crate::operations::{AddOperation, OneOperationProvider, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::transforms::{Transform, TransformArtifact};
@@ -1294,7 +1294,7 @@ pub trait ReverseModeDifferentiate:
     ///   - `holomorphic`: Whether a complex output is accepted under the caller's holomorphy promise.
     fn gradient_seed(&self, output: &Self::Value, holomorphic: bool) -> Result<Self::Value, DifferentiationError>
     where
-        Self::Operation: From<OneOperation<Self::Type>>,
+        Self::Operation: OneOperationProvider<Self::Type>,
     {
         // Reverse mode only defines a gradient for scalar-output functions.
         let output_type = output.r#type();
@@ -1313,7 +1313,7 @@ pub trait ReverseModeDifferentiate:
             return Err(DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() });
         }
 
-        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), Vec::new(), &[])?;
+        let mut seeds = self.bind(Self::Operation::one_operation(output_cotangent_type)?, Vec::new(), &[])?;
         check_count!("output", seeds, 1, ProgramError);
         Ok(seeds.pop().unwrap())
     }
@@ -1334,7 +1334,7 @@ where
 /// Computes a value and its gradient in `context` capturing `capture` as a non-differentiated `function` input
 /// and selecting ordinary or holomorphic output validation.
 pub(crate) fn value_and_gradient_in_context<
-    C: ReverseModeDifferentiate<Operation: From<OneOperation<C::Type>>> + Zero<C::Value>,
+    C: ReverseModeDifferentiate<Operation: OneOperationProvider<C::Type>> + Zero<C::Value>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,
@@ -1356,7 +1356,7 @@ pub(crate) fn value_and_gradient_in_context<
 /// `function` input and selecting ordinary or holomorphic output validation. Only the scalar value is differentiated.
 /// Auxiliary leaves receive zero cotangent seeds.
 pub(crate) fn value_and_gradient_auxiliary_in_context<
-    C: ReverseModeDifferentiate<Operation: ResidualZeroProvider<C::Type> + From<OneOperation<C::Type>>> + Zero<C::Value>,
+    C: ReverseModeDifferentiate<Operation: ResidualZeroProvider<C::Type> + OneOperationProvider<C::Type>> + Zero<C::Value>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
     Input: Parameterized<C::Value, To<C::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<C>>>,
     Capture: Parameterized<C::Value, To<C::Value> = Capture, Family: ParameterizedFamily<LinearizationTracer<C>>>,

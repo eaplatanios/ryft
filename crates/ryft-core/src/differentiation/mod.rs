@@ -137,7 +137,7 @@ use crate::differentiation::hessian::hessian_in_context;
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
-use crate::operations::{AddOperation, OneOperation, Zero, ZeroLikeOperation};
+use crate::operations::{AddOperation, OneOperationProvider, Zero, ZeroLikeOperation};
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, TypeError, Value};
@@ -849,7 +849,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>:
-            ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>> + Zero<V>,
+            ReverseModeDifferentiate<Operation: OneOperationProvider<V::Type>> + Zero<V>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -891,7 +891,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>:
-            ReverseModeDifferentiate<Operation: From<OneOperation<V::Type>>> + Zero<V>,
+            ReverseModeDifferentiate<Operation: OneOperationProvider<V::Type>> + Zero<V>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1193,7 +1193,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1261,7 +1261,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -1692,7 +1692,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>>,
+            OneOperationProvider<V::Type>,
     {
         value_and_gradient_in_context(
             &self.context.resolve(&self.primal)?,
@@ -1741,7 +1741,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>>,
+            OneOperationProvider<V::Type>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -2053,7 +2053,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
     {
         value_and_gradient_auxiliary_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2129,7 +2129,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
         <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            From<OneOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
