@@ -1,37 +1,31 @@
-//! Structural reference types, operation-local reference semantics, entry-boundary reference sources, and the
-//! trace-time liveness state derived from them.
-
-// TODO(eaplatanios): Review this module.
-
 use std::borrow::Borrow;
 use std::fmt::Display;
 
-use ryft_macros::Parameter;
 use serde::Serialize;
+
+use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
 
-/// Meaning of one reference input access performed by an operation.
-///
-/// The modes form a deliberately small vocabulary mirroring JAX's `ReadEffect`/`WriteEffect`/`AccumEffect` reference
-/// effects, plus consumption as a lifetime event. There is intentionally no `ReadWrite` mode: `Write` asserts that
-/// the access writes, not that no read occurs (see [`ReferenceAccessMode::Write`]), which matches JAX classifying
-/// `swap` as a plain write.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceAccessMode {
-    /// Reads the current state without replacing it.
+    /// Reads the referenced value without replacing it.
     Read,
 
-    /// Replaces the current state. `Write` is an over-approximation floor: it asserts that the access *writes*, not
-    /// that no read occurs. An operation may still observe the previous state through its results (e.g.,
-    /// `reference_swap` returns the old value), so generic analyses must treat a `Write` conservatively as possibly
-    /// reading prior state through its results — in particular, any future dead-store elimination on a state chain
-    /// must not remove an earlier write based on this mode alone. Whether a specific write actually reads is an
-    /// operation-specific question (e.g., kernel lowering of `reference_swap` knows its own old-value result and can
-    /// emit a plain store when that result is dead); this descriptor deliberately carries no access-to-result
-    /// mapping until a generic analysis genuinely needs one.
+    /// Replaces the referenced value. [`ReferenceAccessMode::Write`] is an over-approximation floor: it asserts that
+    /// the access _writes_, and not that no read occurs. An operation may still observe the previous state through its
+    /// results (e.g., a `reference_swap` operation can return the old value), so generic analyses must treat a
+    /// [`ReferenceAccessMode::Write`] conservatively as possibly reading prior state through its results (in
+    /// particular, any future dead-store elimination on a state chain must not remove an earlier write based on
+    /// this mode alone). Whether a specific write actually reads is an operation-specific question (e.g., the kernel
+    /// lowering of the `reference_swap` operation knows its own old-value result and can emit a plain store when that
+    /// result is dead). This descriptor deliberately carries no access-to-result mapping until a generic analysis
+    /// genuinely needs one.
     Write,
 
     /// Combines an update with the current state as an *ordered* additive accumulation. Accumulation stays distinct
@@ -48,6 +42,7 @@ pub enum ReferenceAccessMode {
 }
 
 impl Display for ReferenceAccessMode {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read => write!(formatter, "read"),
