@@ -5,12 +5,15 @@
 //! patterns to fully materialize into lower level dialects.
 //!
 //! Refer to the [official StableHLO documentation](https://openxla.org/stablehlo/generated/chlo) for more information.
+
 use ryft_xla_sys::bindings::mlirGetDialectHandle__chlo__;
 
 use crate::{DialectHandle, Error};
 
+pub mod attributes;
 pub mod operations;
 
+pub use attributes::*;
 pub use operations::*;
 
 impl DialectHandle<'_, '_> {

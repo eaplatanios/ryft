@@ -2842,7 +2842,7 @@ impl ReferenceRegionSummary {
         self.accesses.get(&root).copied().unwrap_or_default().iter()
     }
 
-    /// Returns whether the closure accesses `root` with exactly `mode`.
+    /// Returns whether `mode` is among the closure's recorded access modes for `root`.
     #[inline]
     pub fn has_access(&self, root: ReferenceRootHandle, mode: ReferenceAccessMode) -> bool {
         self.access_modes(root).any(|recorded| recorded == mode)

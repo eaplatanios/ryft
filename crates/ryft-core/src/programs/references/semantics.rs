@@ -20,7 +20,9 @@ pub enum ReferenceAccessMode {
     /// Replaces the selected referenced value without observing its previous contents.
     Write,
 
-    /// Observes the selected referenced value and replaces it with a successor in program order.
+    /// Observes the selected referenced value and replaces it with a successor in program order. A swap remains
+    /// `ReadWrite` even when a caller leaves its old-value result dead: liveness is a use-site fact, not operation
+    /// semantics.
     ReadWrite,
 
     /// Combines an update with the current state as an *ordered* additive accumulation. Accumulation stays distinct
