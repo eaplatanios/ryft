@@ -11,7 +11,21 @@ pub const RAGGED_DOT_DIMENSIONS_ATTRIBUTE: &str = "ragged_dot_dimension_numbers"
 /// Name of the [`RaggedDotOperation::precision`] attribute.
 pub const RAGGED_DOT_PRECISION_ATTRIBUTE: &str = "precision_config";
 
-/// CHLO [`Operation`] that computes a grouped generalized dot product using explicit group sizes.
+/// CHLO [`Operation`] that computes a generalized dot product over one ragged LHS dimension. The integer
+/// [`RaggedDotOperation::group_sizes`] operand partitions that dimension into groups, while
+/// [`RaggedDotOperation::dimensions`] identifies the batch, contracting, ragged, and optional RHS group dimensions.
+/// The operation supports three modes, depending on the role of the LHS ragged dimension:
+///
+///   - Non-contracting: `[b, m, k]`, `[g, b, k, n]`, `[b, g]` produce `[b, m, n]`; the RHS has group dimension `g`.
+///   - Contracting: `[b, m, k]`, `[b, k, n]`, `[b, g]` produce `[g, b, m, n]`.
+///   - Batching: `[b, m, k]`, `[b, k, n]`, `[g]` produce `[b, m, n]`.
+///
+/// Here `b`, `k`, and `g` denote batch, contracting, and group dimensions, respectively. The optional
+/// [`RaggedDotOperation::precision`] configuration supplies one precision value for each data operand.
+///
+/// Refer to the
+/// [official CHLO specification](https://openxla.org/stablehlo/generated/chlo#chloragged_dot_chloraggeddotop)
+/// for the complete shape and type constraints.
 pub trait RaggedDotOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the LHS operand.
     fn lhs(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
@@ -66,17 +80,28 @@ mlir_op_trait!(RaggedDot, OneResult);
 mlir_op_trait!(RaggedDot, ZeroRegions);
 mlir_op_trait!(RaggedDot, ZeroSuccessors);
 
-/// Constructs a detached [`RaggedDotOperation`] at `location`.
+/// Constructs a detached [`RaggedDotOperation`] at `location`. Refer to the documentation of [`RaggedDotOperation`]
+/// for the supported modes and shape constraints.
+///
+/// # Parameters
+///
+///   - `lhs`: Left data operand containing exactly one ragged dimension.
+///   - `rhs`: Right data operand, optionally containing one group dimension.
+///   - `group_sizes`: Integer tensor containing the ragged group sizes.
+///   - `dimensions`: Batch, contracting, ragged, and group dimension assignments.
+///   - `precision`: Optional per-operand precision values, ordered as LHS then RHS.
+///   - `result_type`: Result tensor type implied by the selected ragged-dot mode.
+///   - `location`: Source location to attach to the operation.
 pub fn ragged_dot<
     'lhs,
     'rhs,
     'groups,
     'c: 'lhs + 'rhs + 'groups,
     't: 'c,
+    T: Type<'c, 't>,
     LHS: Value<'lhs, 'c, 't>,
     RHS: Value<'rhs, 'c, 't>,
     Groups: Value<'groups, 'c, 't>,
-    T: Type<'c, 't>,
     L: Location<'c, 't>,
 >(
     lhs: LHS,
@@ -152,9 +177,9 @@ mod tests {
 
     use crate::dialects::chlo::attributes::Precision;
     use crate::dialects::func;
-    use crate::{Block, Context, OneOperand, Operation, Size};
+    use crate::{Attribute, Block, Context, Error, OneOperand, Operation, Size};
 
-    use super::{RaggedDotOperation, erf, ragged_dot};
+    use super::*;
 
     #[test]
     fn test_ragged_dot() {
@@ -180,6 +205,66 @@ mod tests {
             .append_operation({
                 let mut block =
                     context.block(&[(lhs_type, location), (rhs_type, location), (group_sizes_type, location)]);
+
+                let mut operation_without_precision = ragged_dot(
+                    block.argument(0).unwrap(),
+                    block.argument(1).unwrap(),
+                    block.argument(2).unwrap(),
+                    dimensions,
+                    None,
+                    result_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(operation_without_precision.precision().unwrap(), None);
+
+                operation_without_precision.set_attribute(
+                    RAGGED_DOT_PRECISION_ATTRIBUTE,
+                    context.array_attribute(&[context.chlo_precision(Precision::Default).unwrap()]),
+                );
+                assert!(matches!(
+                    operation_without_precision.precision(),
+                    Err(Error::InvalidArgument { message, .. })
+                        if message == "invalid `precision_config` attribute in `chlo.ragged_dot`",
+                ));
+
+                operation_without_precision.set_attribute(
+                    RAGGED_DOT_PRECISION_ATTRIBUTE,
+                    context.array_attribute(&[
+                        context.chlo_precision(Precision::Default).unwrap().as_ref(),
+                        context.string_attribute("rhs").as_ref(),
+                    ]),
+                );
+                assert!(matches!(
+                    operation_without_precision.precision(),
+                    Err(Error::InvalidArgument { message, .. })
+                        if message == "invalid `precision_config` attribute in `chlo.ragged_dot`",
+                ));
+
+                operation_without_precision.set_attribute(
+                    RAGGED_DOT_PRECISION_ATTRIBUTE,
+                    context.array_attribute(&[context.string_attribute("lhs"), context.string_attribute("rhs")]),
+                );
+                assert!(matches!(
+                    operation_without_precision.precision(),
+                    Err(Error::InvalidArgument { message, .. })
+                        if message == "invalid `precision_config` attribute in `chlo.ragged_dot`",
+                ));
+
+                operation_without_precision.set_attribute(
+                    RAGGED_DOT_PRECISION_ATTRIBUTE,
+                    context.array_attribute(&[
+                        context.chlo_precision(Precision::Default).unwrap(),
+                        context.chlo_precision(Precision::High).unwrap(),
+                        context.chlo_precision(Precision::Highest).unwrap(),
+                    ]),
+                );
+                assert!(matches!(
+                    operation_without_precision.precision(),
+                    Err(Error::InvalidArgument { message, .. })
+                        if message == "invalid `precision_config` attribute in `chlo.ragged_dot`",
+                ));
+
                 let operation = ragged_dot(
                     block.argument(0).unwrap(),
                     block.argument(1).unwrap(),

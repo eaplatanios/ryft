@@ -311,10 +311,12 @@ impl Display for CustomCallRaggedOutputBinding {
 /// elements.
 ///
 /// The contract intentionally supports one ragged axis per operand and one ragged batching level. A second ragged
-/// batching level is rejected because representing it requires recording a complete nested extent-axis mapping rather
-/// than a single existing extent operand. The declaration supplies no differentiation semantics: ragged custom calls
-/// continue to follow the ordinary custom-call differentiation contract. Padding remains unspecified downstream; the
-/// result [`RaggedAxis`] metadata is what lets extent-aware operations avoid observing it.
+/// batching level is rejected because representing it requires associating each ragged axis with another independent
+/// extent value. Ordinary dense `BroadcastAll` batching remains composable: the contract records every accumulated
+/// leading dense axis so that its existing extent operands and outputs retain their complete axis mapping. The
+/// declaration supplies no differentiation semantics: ragged custom calls continue to follow the ordinary custom-call
+/// differentiation contract. Padding remains unspecified downstream; the result [`RaggedAxis`] metadata is what lets
+/// extent-aware operations avoid observing it.
 /// Runtime extent values must lie within the declared [`DimensionVariable`] bounds and must not exceed their packed
 /// physical axis. Eager foreign-kernel implementations are responsible for checking that precondition when decoding
 /// their ordinary extent operands and outputs.
@@ -329,8 +331,11 @@ pub struct CustomCallRaggedContract {
     /// Whether the kernel promises that live outputs are independent of padded input elements.
     padding_independent: bool,
 
-    /// Internally recorded batch-prefix axis after `BroadcastAll` discharges this contract.
-    batch_axis: Option<usize>,
+    /// Number of leading dense batch axes accumulated as `BroadcastAll` repeatedly batches this contract.
+    batch_prefix_count: usize,
+
+    /// Whether an earlier batching pass discharged active ragged input bindings.
+    ragged_discharged: bool,
 }
 
 impl CustomCallRaggedContract {
@@ -346,7 +351,7 @@ impl CustomCallRaggedContract {
         output_bindings: Vec<CustomCallRaggedOutputBinding>,
         padding_independent: bool,
     ) -> Self {
-        Self { input_bindings, output_bindings, padding_independent, batch_axis: None }
+        Self { input_bindings, output_bindings, padding_independent, batch_prefix_count: 0, ragged_discharged: false }
     }
 
     /// Returns the named packed-input bindings in declaration order.
@@ -367,15 +372,9 @@ impl CustomCallRaggedContract {
         self.padding_independent
     }
 
-    /// Returns a contract describing the `BroadcastAll` call after all operands and outputs gain a leading batch
-    /// dimension. The public contract supports only one ragged batching level, so an already-prefixed declaration is
-    /// rejected explicitly.
-    fn batch_prefixed(&self) -> Result<Self, BatchingError> {
-        if self.batch_axis.is_some() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "custom-call ragged contracts do not support nested ragged batching".to_string(),
-            });
-        }
+    /// Returns a contract describing the `BroadcastAll` call after all operands and outputs gain another leading
+    /// dense batch dimension.
+    fn batch_prefixed(&self, discharges_ragged: bool) -> Self {
         let mut contract = self.clone();
         for binding in &mut contract.input_bindings {
             binding.axis += 1;
@@ -387,8 +386,54 @@ impl CustomCallRaggedContract {
                 CustomCallRaggedOutputBinding::Consumed => {}
             }
         }
-        contract.batch_axis = Some(0);
-        Ok(contract)
+        contract.batch_prefix_count += 1;
+        contract.ragged_discharged |= discharges_ragged;
+        contract
+    }
+
+    /// Returns a contract recording that active ragged bindings were discharged without changing operand or output
+    /// axes. This transition is used by `Sequential`, whose scan body sees one unbatched slice at a time.
+    fn ragged_discharged(&self) -> Self {
+        let mut contract = self.clone();
+        contract.ragged_discharged = true;
+        contract
+    }
+
+    /// Returns the unique active dimensions that are absent from every preserved ragged output.
+    fn consumed_dimensions<V>(&self, active: &[(String, RaggedAxis<V>)]) -> Vec<DimensionVariable> {
+        let mut consumed = Vec::new();
+        for (_, axis) in active {
+            let dimension = axis.dimension();
+            let preserved = active.iter().any(|(name, candidate)| {
+                candidate.dimension() == dimension
+                    && self.output_bindings.iter().any(|binding| {
+                        matches!(
+                            binding,
+                            CustomCallRaggedOutputBinding::Preserved { input_binding, .. }
+                                if input_binding == name
+                        )
+                    })
+            });
+            if !preserved && !consumed.contains(dimension) {
+                consumed.push(dimension.clone());
+            }
+        }
+        consumed
+    }
+
+    /// Returns the complete extent-axis mapping for a new ragged level whose packed data and extent operand carry the
+    /// current mapped axis at `data_batch_axis` and `extent_batch_axis`, respectively.
+    fn active_extent_axes(&self, data_batch_axis: usize, extent_batch_axis: usize) -> Vec<usize> {
+        (0..=self.batch_prefix_count)
+            .map(|extent_axis| {
+                if extent_axis == extent_batch_axis {
+                    data_batch_axis
+                } else {
+                    let prefix_axis = extent_axis - usize::from(extent_axis > extent_batch_axis);
+                    prefix_axis + usize::from(prefix_axis >= data_batch_axis)
+                }
+            })
+            .collect()
     }
 
     /// Returns this contract after renaming every dimension identity.
@@ -424,8 +469,11 @@ impl Display for CustomCallRaggedContract {
             write!(formatter, "{binding}")?;
         }
         write!(formatter, "], padding_independent={}", self.padding_independent)?;
-        if let Some(batch_axis) = self.batch_axis {
-            write!(formatter, ", batch_axis={batch_axis}")?;
+        if self.batch_prefix_count != 0 {
+            write!(formatter, ", batch_prefix_count={}", self.batch_prefix_count)?;
+        }
+        if self.ragged_discharged {
+            formatter.write_str(", ragged_discharged=true")?;
         }
         formatter.write_str("}")
     }
@@ -891,6 +939,12 @@ impl<T: Type> CustomCallOperation<T> {
                 self.output_types.len(),
             )));
         }
+        let expected_extent_rank = contract.batch_prefix_count;
+        let expected_extent_type = match expected_extent_rank {
+            0 => "an integer scalar".to_string(),
+            1 => "a batch-prefixed integer vector".to_string(),
+            rank => format!("a rank-{rank} batch-prefixed integer tensor"),
+        };
 
         for (binding_index, binding) in contract.input_bindings.iter().enumerate() {
             if let Some(existing) =
@@ -908,6 +962,19 @@ impl<T: Type> CustomCallOperation<T> {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` ragged input bindings `{}` and `{}` both bind operand {}",
                     existing.name, binding.name, binding.operand_index,
+                )));
+            }
+            if let Some(existing) = contract.input_bindings[..binding_index].iter().find(|existing| {
+                existing.dimension == binding.dimension && existing.extent_operand_index != binding.extent_operand_index
+            }) {
+                return Err(TypeError::invalid(format!(
+                    "`{CUSTOM_CALL_OPERATION_NAME}` ragged input bindings `{}` and `{}` reuse dimension `{}` with \
+                     different extent operands {} and {}",
+                    existing.name,
+                    binding.name,
+                    binding.dimension,
+                    existing.extent_operand_index,
+                    binding.extent_operand_index,
                 )));
             }
             let Some(input_type) = input_types.get(binding.operand_index) else {
@@ -929,12 +996,10 @@ impl<T: Type> CustomCallOperation<T> {
                     input_types.len(),
                 )));
             };
-            let expected_rank = usize::from(contract.batch_axis.is_some());
-            if extent_type.rank() != expected_rank || !extent_type.data_type().is_integer() {
-                let expected = if expected_rank == 0 { "an integer scalar" } else { "a batch-prefixed integer vector" };
+            if extent_type.rank() != expected_extent_rank || !extent_type.data_type().is_integer() {
                 return Err(TypeError::invalid(format!(
                     "`{CUSTOM_CALL_OPERATION_NAME}` ragged input binding `{}` requires extent operand {} to be \
-                     {expected} but got `{extent_type}`",
+                     {expected_extent_type} but got `{extent_type}`",
                     binding.name, binding.extent_operand_index,
                 )));
             }
@@ -971,9 +1036,10 @@ impl<T: Type> CustomCallOperation<T> {
                     }
                 }
                 CustomCallRaggedOutputBinding::Consumed => {
-                    if let Some(alias) =
-                        self.input_output_aliases.iter().find(|alias| alias.output_index == output_index)
-                    {
+                    if let Some(alias) = self.input_output_aliases.iter().find(|alias| {
+                        alias.output_index == output_index
+                            && contract.input_bindings.iter().any(|binding| binding.operand_index == alias.input_index)
+                    }) {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` consumed ragged output {output_index} cannot retain alias \
                              `{alias}`",
@@ -981,6 +1047,37 @@ impl<T: Type> CustomCallOperation<T> {
                     }
                 }
                 CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => {
+                    if let Some(input_binding) =
+                        contract.input_bindings.iter().find(|binding| binding.dimension == *dimension)
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{CUSTOM_CALL_OPERATION_NAME}` fresh ragged output {output_index} dimension \
+                             `{dimension}` is already declared by input binding `{}`",
+                            input_binding.name,
+                        )));
+                    }
+                    if let Some((existing_output_index, existing_extent_output_index)) =
+                        contract.output_bindings[..output_index].iter().enumerate().find_map(
+                            |(existing_output_index, binding)| match binding {
+                                CustomCallRaggedOutputBinding::Fresh {
+                                    extent_output_index: existing_extent_output_index,
+                                    dimension: existing_dimension,
+                                    ..
+                                } if existing_dimension == dimension
+                                    && existing_extent_output_index != extent_output_index =>
+                                {
+                                    Some((existing_output_index, existing_extent_output_index))
+                                }
+                                _ => None,
+                            },
+                        )
+                    {
+                        return Err(TypeError::invalid(format!(
+                            "`{CUSTOM_CALL_OPERATION_NAME}` fresh ragged outputs {existing_output_index} and \
+                             {output_index} reuse dimension `{dimension}` with different extent outputs \
+                             {existing_extent_output_index} and {extent_output_index}",
+                        )));
+                    }
                     self.validate_ragged_axis(
                         "output",
                         output_index,
@@ -995,18 +1092,16 @@ impl<T: Type> CustomCallOperation<T> {
                             self.output_types.len(),
                         )));
                     };
-                    let expected_rank = usize::from(contract.batch_axis.is_some());
-                    if extent_type.rank() != expected_rank || !extent_type.data_type().is_integer() {
-                        let expected =
-                            if expected_rank == 0 { "an integer scalar" } else { "a batch-prefixed integer vector" };
+                    if extent_type.rank() != expected_extent_rank || !extent_type.data_type().is_integer() {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` fresh ragged output {output_index} requires extent output \
-                             {extent_output_index} to be {expected} but got `{extent_type}`",
+                             {extent_output_index} to be {expected_extent_type} but got `{extent_type}`",
                         )));
                     }
-                    if let Some(alias) =
-                        self.input_output_aliases.iter().find(|alias| alias.output_index == output_index)
-                    {
+                    if let Some(alias) = self.input_output_aliases.iter().find(|alias| {
+                        alias.output_index == output_index
+                            && contract.input_bindings.iter().any(|binding| binding.operand_index == alias.input_index)
+                    }) {
                         return Err(TypeError::invalid(format!(
                             "`{CUSTOM_CALL_OPERATION_NAME}` fresh ragged output {output_index} cannot retain alias \
                              `{alias}`",
@@ -1040,7 +1135,7 @@ impl<T: Type> CustomCallOperation<T> {
             }
             return Ok(Vec::new());
         };
-        if contract.batch_axis.is_some() && inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
+        if contract.ragged_discharged && inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("custom call `{}` does not support nested ragged batching", self.target_name),
             });
@@ -1075,17 +1170,6 @@ impl<T: Type> CustomCallOperation<T> {
                     ),
                 });
             };
-            if ragged_axis.extent_axes() != [batch_axis] {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "custom call `{}` supports one ragged batching level, but operand {operand_index} ragged \
-                         dimension `{}` has extent-axis mapping `{:?}`",
-                        self.target_name,
-                        ragged_axis.dimension(),
-                        ragged_axis.extent_axes(),
-                    ),
-                });
-            }
             let logical_axis = ragged_axis.axis() - usize::from(batch_axis < ragged_axis.axis());
             let Some(binding) = contract
                 .input_bindings
@@ -1112,11 +1196,24 @@ impl<T: Type> CustomCallOperation<T> {
                 });
             }
             let extent_operand = &inputs[binding.extent_operand_index];
-            if extent_operand.batch_axis().is_replicated() {
+            let Some(extent_batch_axis) = extent_operand.batch_axis_position() else {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
                         "custom call `{}` ragged input binding `{}` requires mapped extent operand {}",
                         self.target_name, binding.name, binding.extent_operand_index,
+                    ),
+                });
+            };
+            let expected_extent_axes = contract.active_extent_axes(batch_axis, extent_batch_axis);
+            if ragged_axis.extent_axes() != expected_extent_axes {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "custom call `{}` supports one ragged batching level, but operand {operand_index} ragged \
+                         dimension `{}` has extent-axis mapping `{:?}` instead of `{:?}`",
+                        self.target_name,
+                        ragged_axis.dimension(),
+                        ragged_axis.extent_axes(),
+                        expected_extent_axes,
                     ),
                 });
             }
@@ -1144,9 +1241,14 @@ impl<T: Type> CustomCallOperation<T> {
             let output = ArrayBatch::replicated(value);
             let ragged_axis =
                 self.ragged_contract.as_ref().and_then(|contract| match &contract.output_bindings[output_index] {
-                    CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => Some(
-                        RaggedAxis::new(*axis, values[*extent_output_index].clone(), dimension.clone(), Vec::new()),
-                    ),
+                    CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => {
+                        Some(RaggedAxis::new(
+                            *axis,
+                            values[*extent_output_index].clone(),
+                            dimension.clone(),
+                            (0..contract.batch_prefix_count).collect(),
+                        ))
+                    }
                     CustomCallRaggedOutputBinding::Preserved { .. } | CustomCallRaggedOutputBinding::Consumed => None,
                 });
             outputs.push(match ragged_axis {
@@ -1161,21 +1263,33 @@ impl<T: Type> CustomCallOperation<T> {
     fn array_ragged_outputs<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>>(
         &self,
         values: Vec<C::Value>,
+        inputs: &[ArrayBatch<C::Value>],
         active: &[(String, RaggedAxis<C::Value>)],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
         let contract = self.ragged_contract.as_ref().unwrap();
+        let extent_axes = (0..=contract.batch_prefix_count).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(values.len());
         for (output_index, value) in values.iter().cloned().enumerate() {
             let ragged_axis = match &contract.output_bindings[output_index] {
                 CustomCallRaggedOutputBinding::Preserved { input_binding, axis } => {
                     active.iter().find(|(name, _)| name == input_binding).map(|(_, source)| {
-                        RaggedAxis::new(*axis + 1, source.extents().clone(), source.dimension().clone(), vec![0])
+                        let binding =
+                            contract.input_bindings.iter().find(|binding| binding.name == *input_binding).unwrap();
+                        RaggedAxis::new(
+                            *axis + 1,
+                            inputs[binding.extent_operand_index].value().clone(),
+                            source.dimension().clone(),
+                            extent_axes.clone(),
+                        )
                     })
                 }
                 CustomCallRaggedOutputBinding::Consumed => None,
-                CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => {
-                    Some(RaggedAxis::new(*axis + 1, values[*extent_output_index].clone(), dimension.clone(), vec![0]))
-                }
+                CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => Some(RaggedAxis::new(
+                    *axis + 1,
+                    values[*extent_output_index].clone(),
+                    dimension.clone(),
+                    extent_axes.clone(),
+                )),
             };
             let output = ArrayBatch::new(value, BatchAxis::new(0))?;
             outputs.push(match ragged_axis {
@@ -1183,19 +1297,7 @@ impl<T: Type> CustomCallOperation<T> {
                 None => output,
             });
         }
-        let consumed = active
-            .iter()
-            .filter(|(name, _)| {
-                !contract.output_bindings.iter().any(|binding| {
-                    matches!(
-                        binding,
-                        CustomCallRaggedOutputBinding::Preserved { input_binding, .. }
-                            if input_binding == name
-                    )
-                })
-            })
-            .map(|(_, axis)| axis.dimension().clone())
-            .collect();
+        let consumed = contract.consumed_dimensions(active);
         Ok(BatchedOutputs::new(outputs, consumed))
     }
 
@@ -1221,7 +1323,7 @@ impl<T: Type> CustomCallOperation<T> {
             }
             return Ok(Vec::new());
         };
-        if contract.batch_axis.is_some() && inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
+        if contract.ragged_discharged && inputs.iter().any(|input| !input.ragged_axes().is_empty()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("custom call `{}` does not support nested ragged batching", self.target_name),
             });
@@ -1260,17 +1362,6 @@ impl<T: Type> CustomCallOperation<T> {
                     ),
                 });
             };
-            if ragged_axis.extent_axes() != [batch_axis] {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "custom call `{}` supports one ragged batching level, but operand {operand_index} ragged \
-                         dimension `{}` has extent-axis mapping `{:?}`",
-                        self.target_name,
-                        ragged_axis.dimension(),
-                        ragged_axis.extent_axes(),
-                    ),
-                });
-            }
             let logical_axis = ragged_axis.axis() - usize::from(batch_axis < ragged_axis.axis());
             let Some(binding) = contract
                 .input_bindings
@@ -1297,11 +1388,24 @@ impl<T: Type> CustomCallOperation<T> {
                 });
             }
             let extent_operand = &inputs[binding.extent_operand_index];
-            if extent_operand.batch_axis().is_replicated() {
+            let Some(extent_batch_axis) = extent_operand.batch_axis_position() else {
                 return Err(BatchingError::InvalidBatchMetadata {
                     message: format!(
                         "custom call `{}` ragged input binding `{}` requires mapped extent operand {}",
                         self.target_name, binding.name, binding.extent_operand_index,
+                    ),
+                });
+            };
+            let expected_extent_axes = contract.active_extent_axes(batch_axis, extent_batch_axis);
+            if ragged_axis.extent_axes() != expected_extent_axes {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "custom call `{}` supports one ragged batching level, but operand {operand_index} ragged \
+                         dimension `{}` has extent-axis mapping `{:?}` instead of `{:?}`",
+                        self.target_name,
+                        ragged_axis.dimension(),
+                        ragged_axis.extent_axes(),
+                        expected_extent_axes,
                     ),
                 });
             }
@@ -1329,9 +1433,14 @@ impl<T: Type> CustomCallOperation<T> {
             let output = ArrayIrBatch::replicated(value);
             let ragged_axis =
                 self.ragged_contract.as_ref().and_then(|contract| match &contract.output_bindings[output_index] {
-                    CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => Some(
-                        RaggedAxis::new(*axis, values[*extent_output_index].clone(), dimension.clone(), Vec::new()),
-                    ),
+                    CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => {
+                        Some(RaggedAxis::new(
+                            *axis,
+                            values[*extent_output_index].clone(),
+                            dimension.clone(),
+                            (0..contract.batch_prefix_count).collect(),
+                        ))
+                    }
                     CustomCallRaggedOutputBinding::Preserved { .. } | CustomCallRaggedOutputBinding::Consumed => None,
                 });
             outputs.push(match ragged_axis {
@@ -1346,21 +1455,33 @@ impl<T: Type> CustomCallOperation<T> {
     fn array_ir_ragged_outputs<C: Context<Type = ArrayIrType>>(
         &self,
         values: Vec<C::Value>,
+        inputs: &[ArrayIrBatch<C::Value>],
         active: &[(String, RaggedAxis<C::Value>)],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         let contract = self.ragged_contract.as_ref().unwrap();
+        let extent_axes = (0..=contract.batch_prefix_count).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(values.len());
         for (output_index, value) in values.iter().cloned().enumerate() {
             let ragged_axis = match &contract.output_bindings[output_index] {
                 CustomCallRaggedOutputBinding::Preserved { input_binding, axis } => {
                     active.iter().find(|(name, _)| name == input_binding).map(|(_, source)| {
-                        RaggedAxis::new(*axis + 1, source.extents().clone(), source.dimension().clone(), vec![0])
+                        let binding =
+                            contract.input_bindings.iter().find(|binding| binding.name == *input_binding).unwrap();
+                        RaggedAxis::new(
+                            *axis + 1,
+                            inputs[binding.extent_operand_index].value().clone(),
+                            source.dimension().clone(),
+                            extent_axes.clone(),
+                        )
                     })
                 }
                 CustomCallRaggedOutputBinding::Consumed => None,
-                CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => {
-                    Some(RaggedAxis::new(*axis + 1, values[*extent_output_index].clone(), dimension.clone(), vec![0]))
-                }
+                CustomCallRaggedOutputBinding::Fresh { axis, extent_output_index, dimension } => Some(RaggedAxis::new(
+                    *axis + 1,
+                    values[*extent_output_index].clone(),
+                    dimension.clone(),
+                    extent_axes.clone(),
+                )),
             };
             let output = ArrayIrBatch::new(value, BatchAxis::new(0))?;
             outputs.push(match ragged_axis {
@@ -1368,19 +1489,7 @@ impl<T: Type> CustomCallOperation<T> {
                 None => output,
             });
         }
-        let consumed = active
-            .iter()
-            .filter(|(name, _)| {
-                !contract.output_bindings.iter().any(|binding| {
-                    matches!(
-                        binding,
-                        CustomCallRaggedOutputBinding::Preserved { input_binding, .. }
-                            if input_binding == name
-                    )
-                })
-            })
-            .map(|(_, axis)| axis.dimension().clone())
-            .collect();
+        let consumed = contract.consumed_dimensions(active);
         Ok(BatchedOutputs::new(outputs, consumed))
     }
 }
@@ -1622,7 +1731,11 @@ where
                     operands[index] = Some(builder.add_input(input_type));
                 }
                 let operands = operands.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands, None)?.to_vec();
+                let ragged_contract = self.ragged_contract.as_ref().map(|contract| {
+                    if active_ragged_bindings.is_empty() { contract.clone() } else { contract.ragged_discharged() }
+                });
+                let operation = Self { ragged_contract, ..self.clone() };
+                let outputs = builder.add_instruction(operation, Vec::new(), operands, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -1649,7 +1762,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?
                         .into())
                 } else {
-                    self.array_ragged_outputs::<C, P>(outputs, active_ragged_bindings.as_slice())
+                    self.array_ragged_outputs::<C, P>(outputs, aligned.as_slice(), active_ragged_bindings.as_slice())
                 }
             }
             CustomCallBatching::BroadcastAll => {
@@ -1664,8 +1777,10 @@ where
                     context.axis_sharding(),
                 )?;
                 let values = aligned.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
-                let ragged_contract =
-                    self.ragged_contract.as_ref().map(CustomCallRaggedContract::batch_prefixed).transpose()?;
+                let ragged_contract = self
+                    .ragged_contract
+                    .as_ref()
+                    .map(|contract| contract.batch_prefixed(!active_ragged_bindings.is_empty()));
                 let operation = Self { output_types, ragged_contract, ..self.clone() };
                 let outputs = context.parent().bind(operation, Vec::new(), values.as_slice())?;
                 if self.ragged_contract.is_none() {
@@ -1675,7 +1790,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?
                         .into())
                 } else {
-                    self.array_ragged_outputs::<C, P>(outputs, active_ragged_bindings.as_slice())
+                    self.array_ragged_outputs::<C, P>(outputs, aligned.as_slice(), active_ragged_bindings.as_slice())
                 }
             }
         }
@@ -1778,7 +1893,11 @@ where
                     .map(Option::unwrap)
                     .chain(carry_inputs[..extents.len()].iter().copied())
                     .collect::<Vec<_>>();
-                let outputs = builder.add_instruction(self.clone(), Vec::new(), operands, None)?.to_vec();
+                let ragged_contract = self.ragged_contract.as_ref().map(|contract| {
+                    if active_ragged_bindings.is_empty() { contract.clone() } else { contract.ragged_discharged() }
+                });
+                let operation = Self { ragged_contract, ..self.clone() };
+                let outputs = builder.add_instruction(operation, Vec::new(), operands, None)?.to_vec();
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
@@ -1807,7 +1926,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?
                         .into())
                 } else {
-                    self.array_ir_ragged_outputs::<C>(outputs, active_ragged_bindings.as_slice())
+                    self.array_ir_ragged_outputs::<C>(outputs, aligned.as_slice(), active_ragged_bindings.as_slice())
                 }
             }
             CustomCallBatching::BroadcastAll => {
@@ -1824,8 +1943,10 @@ where
                     batch_dimension.clone(),
                     context.axis_sharding(),
                 )?;
-                let ragged_contract =
-                    self.ragged_contract.as_ref().map(CustomCallRaggedContract::batch_prefixed).transpose()?;
+                let ragged_contract = self
+                    .ragged_contract
+                    .as_ref()
+                    .map(|contract| contract.batch_prefixed(!active_ragged_bindings.is_empty()));
                 let operation = Self { output_types, ragged_contract, ..self.clone() };
 
                 // Regroup the trailing extents: each output's inserted batch axis is its new leading dynamic axis,
@@ -1850,7 +1971,7 @@ where
                         .collect::<Result<Vec<_>, _>>()?
                         .into())
                 } else {
-                    self.array_ir_ragged_outputs::<C>(outputs, active_ragged_bindings.as_slice())
+                    self.array_ir_ragged_outputs::<C>(outputs, aligned.as_slice(), active_ragged_bindings.as_slice())
                 }
             }
         }
@@ -2121,7 +2242,8 @@ mod tests {
             "CustomCallRaggedContract { input_bindings: [CustomCallRaggedInputBinding { name: \"data\", \
              operand_index: 0, axis: 0, extent_operand_index: 1, dimension: DimensionVariable { name: \"length\", \
              bounds: DimensionBounds { lower: 0, upper: Some(5) }, .. } }], output_bindings: [Preserved { \
-             input_binding: \"data\", axis: 0 }], padding_independent: true, batch_axis: None }",
+             input_binding: \"data\", axis: 0 }], padding_independent: true, batch_prefix_count: 0, \
+             ragged_discharged: false }",
         );
         let operation = CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
             .with_batching(CustomCallBatching::BroadcastAll)
@@ -2161,6 +2283,34 @@ mod tests {
         renaming.insert(length, renamed_length.clone()).unwrap();
         let renamed = operation.rename_type_identities(&renaming).unwrap();
         assert_eq!(renamed.ragged_contract().unwrap().input_bindings()[0].dimension(), &renamed_length);
+
+        // Fresh output identities are renamed independently from input bindings.
+        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
+        let renamed_output_length =
+            DimensionVariable::new("renamed_output_length", DimensionBounds::new(0, Some(5)).unwrap());
+        let fresh_operation = CustomCallOperation::new(
+            "ryft.test.fresh_ragged",
+            vec![packed_type.clone(), ArrayType::scalar(DataType::I32)],
+        )
+        .with_ragged_contract(CustomCallRaggedContract::new(
+            vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, renamed_length.clone())],
+            vec![
+                CustomCallRaggedOutputBinding::Fresh {
+                    axis: 0,
+                    extent_output_index: 1,
+                    dimension: output_length.clone(),
+                },
+                CustomCallRaggedOutputBinding::Consumed,
+            ],
+            true,
+        ));
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(output_length, renamed_output_length.clone()).unwrap();
+        let renamed = fresh_operation.rename_type_identities(&renaming).unwrap();
+        assert!(matches!(
+            &renamed.ragged_contract().unwrap().output_bindings()[0],
+            CustomCallRaggedOutputBinding::Fresh { dimension, .. } if dimension == &renamed_output_length,
+        ));
 
         assert_eq!(
             CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
@@ -2255,8 +2405,8 @@ mod tests {
             )),
         );
 
-        // Alias preservation requires the same bound input and physical axis; dense and fresh outputs cannot retain
-        // an alias inherited from the unbatched declaration.
+        // Alias preservation requires the same bound input and physical axis. Consumed and fresh outputs cannot alias
+        // a ragged-bound input, but an alias to an unrelated dense input remains valid.
         let matrix_type = ArrayType::new_static(DataType::F32, [4, 4]);
         let alias_conflict = CustomCallOperation::new("ryft.test.ragged", vec![matrix_type.clone()])
             .with_input_output_alias(0, 0)
@@ -2272,14 +2422,13 @@ mod tests {
                 vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "data".to_string(), axis: 1 }],
                 true,
             ));
-        assert_eq!(
+        assert!(matches!(
             alias_conflict.infer_output_types(&[matrix_type, extent_type.clone()], &[]),
-            Err(TypeError::invalid(
-                "`custom_call` alias `0->0` conflicts with preserved ragged binding `data` because aliases require \
-                 the same packed input, physical axis, dimension identity, and extent binding",
-            )),
-        );
-        assert_eq!(
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` alias `0->0` conflicts with preserved ragged binding `data` because \
+                    aliases require the same packed input, physical axis, dimension identity, and extent binding",
+        ));
+        assert!(matches!(
             CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
                 .with_input_output_alias(0, 0)
                 .unwrap()
@@ -2295,9 +2444,10 @@ mod tests {
                     true,
                 ))
                 .infer_output_types(&[packed_type.clone(), extent_type.clone()], &[]),
-            Err(TypeError::invalid("`custom_call` consumed ragged output 0 cannot retain alias `0->0`")),
-        );
-        assert_eq!(
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` consumed ragged output 0 cannot retain alias `0->0`",
+        ));
+        assert!(matches!(
             CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone(), ArrayType::scalar(DataType::I32)],)
                 .with_input_output_alias(0, 0)
                 .unwrap()
@@ -2322,9 +2472,176 @@ mod tests {
                     ],
                     true,
                 ))
-                .infer_output_types(&[packed_type, extent_type], &[]),
-            Err(TypeError::invalid("`custom_call` fresh ragged output 0 cannot retain alias `0->0`")),
+                .infer_output_types(&[packed_type.clone(), extent_type.clone()], &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` fresh ragged output 0 cannot retain alias `0->0`",
+        ));
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
+                .with_input_output_alias(1, 0)
+                .unwrap()
+                .with_ragged_contract(CustomCallRaggedContract::new(
+                    vec![CustomCallRaggedInputBinding::new(
+                        "data",
+                        0,
+                        0,
+                        2,
+                        DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap()),
+                    )],
+                    vec![CustomCallRaggedOutputBinding::Consumed],
+                    true,
+                ))
+                .infer_output_types(&[packed_type.clone(), packed_type.clone(), extent_type.clone()], &[]),
+            Ok(vec![packed_type.clone()]),
         );
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone(), ArrayType::scalar(DataType::I32)],)
+                .with_input_output_alias(1, 0)
+                .unwrap()
+                .with_ragged_contract(CustomCallRaggedContract::new(
+                    vec![CustomCallRaggedInputBinding::new(
+                        "data",
+                        0,
+                        0,
+                        2,
+                        DimensionVariable::new("input_length", DimensionBounds::new(0, Some(5)).unwrap()),
+                    )],
+                    vec![
+                        CustomCallRaggedOutputBinding::Fresh {
+                            axis: 0,
+                            extent_output_index: 1,
+                            dimension: DimensionVariable::new(
+                                "output_length",
+                                DimensionBounds::new(0, Some(5)).unwrap(),
+                            ),
+                        },
+                        CustomCallRaggedOutputBinding::Consumed,
+                    ],
+                    true,
+                ))
+                .infer_output_types(&[packed_type.clone(), packed_type.clone(), extent_type.clone()], &[]),
+            Ok(vec![packed_type.clone(), ArrayType::scalar(DataType::I32)]),
+        );
+
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        assert!(matches!(
+            CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone(), ArrayType::scalar(DataType::I32)],)
+                .with_ragged_contract(CustomCallRaggedContract::new(
+                    vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, length.clone())],
+                    vec![
+                        CustomCallRaggedOutputBinding::Fresh { axis: 0, extent_output_index: 1, dimension: length },
+                        CustomCallRaggedOutputBinding::Consumed,
+                    ],
+                    true,
+                ))
+                .infer_output_types(&[packed_type, extent_type], &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` fresh ragged output 0 dimension `length` is already declared by input \
+                    binding `data`",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_validates_complete_dense_prefix_rank() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
+        let twice_prefixed =
+            preserved_ragged_contract(length.clone(), true).batch_prefixed(false).batch_prefixed(false);
+        assert!(matches!(
+            CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
+                .with_ragged_contract(twice_prefixed)
+                .infer_output_types(&[packed_type.clone(), ArrayType::new_static(DataType::I32, [2])], &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` ragged input binding `data` requires extent operand 1 to be a rank-2 \
+                    batch-prefixed integer tensor but got `i32[2]`",
+        ));
+
+        let fresh_contract = CustomCallRaggedContract::new(
+            Vec::new(),
+            vec![
+                CustomCallRaggedOutputBinding::Fresh { axis: 0, extent_output_index: 1, dimension: length },
+                CustomCallRaggedOutputBinding::Consumed,
+            ],
+            true,
+        )
+        .batch_prefixed(false)
+        .batch_prefixed(false);
+        assert!(matches!(
+            CustomCallOperation::new(
+                "ryft.test.fresh_ragged",
+                vec![packed_type.clone(), ArrayType::new_static(DataType::I32, [2])],
+            )
+            .with_ragged_contract(fresh_contract)
+            .infer_output_types(std::slice::from_ref(&packed_type), &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` fresh ragged output 0 requires extent output 1 to be a rank-2 \
+                    batch-prefixed integer tensor but got `i32[2]`",
+        ));
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_reuses_extent_sources_for_shared_dimensions() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let packed_type = ArrayType::new_static(DataType::F32, [4]);
+        let extent_type = ArrayType::scalar(DataType::I32);
+        let input_types = [packed_type.clone(), packed_type.clone(), extent_type.clone(), extent_type.clone()];
+        let shared_input_contract = |second_extent_operand_index| {
+            CustomCallRaggedContract::new(
+                vec![
+                    CustomCallRaggedInputBinding::new("lhs", 0, 0, 2, length.clone()),
+                    CustomCallRaggedInputBinding::new("rhs", 1, 0, second_extent_operand_index, length.clone()),
+                ],
+                vec![CustomCallRaggedOutputBinding::Consumed],
+                true,
+            )
+        };
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.shared_input_dimension", vec![packed_type.clone()])
+                .with_ragged_contract(shared_input_contract(2))
+                .infer_output_types(&input_types, &[]),
+            Ok(vec![packed_type.clone()]),
+        );
+        assert!(matches!(
+            CustomCallOperation::new("ryft.test.shared_input_dimension", vec![packed_type.clone()])
+                .with_ragged_contract(shared_input_contract(3))
+                .infer_output_types(&input_types, &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` ragged input bindings `lhs` and `rhs` reuse dimension `length` with \
+                    different extent operands 2 and 3",
+        ));
+
+        let output_types =
+            [packed_type.clone(), extent_type.clone(), packed_type.clone(), extent_type.clone()].to_vec();
+        let shared_output_contract = |second_extent_output_index| {
+            CustomCallRaggedContract::new(
+                Vec::new(),
+                vec![
+                    CustomCallRaggedOutputBinding::Fresh { axis: 0, extent_output_index: 1, dimension: length.clone() },
+                    CustomCallRaggedOutputBinding::Consumed,
+                    CustomCallRaggedOutputBinding::Fresh {
+                        axis: 0,
+                        extent_output_index: second_extent_output_index,
+                        dimension: length.clone(),
+                    },
+                    CustomCallRaggedOutputBinding::Consumed,
+                ],
+                true,
+            )
+        };
+        assert_eq!(
+            CustomCallOperation::new("ryft.test.shared_output_dimension", output_types.clone())
+                .with_ragged_contract(shared_output_contract(1))
+                .infer_output_types(&[], &[]),
+            Ok(output_types.clone()),
+        );
+        assert!(matches!(
+            CustomCallOperation::new("ryft.test.shared_output_dimension", output_types)
+                .with_ragged_contract(shared_output_contract(3))
+                .infer_output_types(&[], &[]),
+            Err(TypeError::Invalid { message })
+                if message == "`custom_call` fresh ragged outputs 0 and 2 reuse dimension `length` with different \
+                    extent outputs 1 and 3",
+        ));
     }
 
     #[test]
@@ -2523,7 +2840,7 @@ mod tests {
                                     target=ryft.test.ragged,
                                     batching=sequential,
                                     ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
-                         outputs=[preserve(data)@0], padding_independent=true},
+                         outputs=[preserve(data)@0], padding_independent=true, ragged_discharged=true},
                                 ] %0 %1
                                 in (%2)
                             },
@@ -2541,7 +2858,8 @@ mod tests {
                             target=ryft.test.ragged,
                             batching=broadcast_all,
                             ragged_contract={inputs=[data:operand(0)@1<=operand(1):length], \
-                         outputs=[preserve(data)@1], padding_independent=true, batch_axis=0},
+                         outputs=[preserve(data)@1], padding_independent=true, batch_prefix_count=1, \
+                         ragged_discharged=true},
                         ] %0 %1
                         in (%2)
                     "}
@@ -2576,12 +2894,7 @@ mod tests {
         ));
 
         let nested = CustomCallOperation {
-            ragged_contract: operation
-                .ragged_contract
-                .as_ref()
-                .map(CustomCallRaggedContract::batch_prefixed)
-                .transpose()
-                .unwrap(),
+            ragged_contract: operation.ragged_contract.as_ref().map(CustomCallRaggedContract::ragged_discharged),
             ..operation
         };
         assert!(matches!(
@@ -2589,6 +2902,147 @@ mod tests {
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "custom call `ryft.test.ragged` does not support nested ragged batching",
         ));
+    }
+
+    #[test]
+    fn test_array_ir_sequential_custom_call_records_ragged_discharge_in_the_scan_body() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let axis_extent = trace.input(DimensionType::new(batch_size).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+            1,
+            extents.clone(),
+            length.clone(),
+            vec![0],
+        )])?;
+        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+                .with_batching(CustomCallBatching::Sequential { unroll: None })
+                .with_ragged_contract(preserved_ragged_contract(length, true)),
+        );
+        let output = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts().0.remove(0);
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.value().atom_id().unwrap()],
+            vec![Placeholder; 3],
+            vec![Placeholder],
+        )?;
+        let scan = program
+            .entry_region()
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Scan(_)))
+            .unwrap();
+        let body = program.region(scan.regions()[0])?;
+        let contract = body
+            .instructions()
+            .iter()
+            .find_map(|instruction| match instruction.operation() {
+                ArrayIrOperation::CustomCall(operation) => operation.ragged_contract(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(contract.ragged_discharged);
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_consumes_shared_dimensions_only_when_no_binding_is_preserved() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let contract = CustomCallRaggedContract::new(
+            vec![
+                CustomCallRaggedInputBinding::new("lhs", 0, 0, 2, length.clone()),
+                CustomCallRaggedInputBinding::new("rhs", 1, 0, 2, length.clone()),
+            ],
+            vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "rhs".to_string(), axis: 0 }],
+            true,
+        );
+        let active = vec![
+            ("lhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32), length.clone(), Vec::new())),
+            ("rhs".to_string(), RaggedAxis::new(0, Array::scalar(2_i32), length.clone(), Vec::new())),
+        ];
+        assert!(contract.consumed_dimensions(active.as_slice()).is_empty());
+
+        let consumed_contract = CustomCallRaggedContract::new(
+            contract.input_bindings.clone(),
+            vec![CustomCallRaggedOutputBinding::Consumed],
+            true,
+        );
+        assert_eq!(consumed_contract.consumed_dimensions(active.as_slice()), vec![length]);
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_accepts_first_ragged_discharge_after_a_dense_prefix() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 3, 4]));
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [3, 2]));
+        let context = BatchingContext::<_, ArrayBatching>::new(trace.clone(), 2);
+        let data = ArrayBatch::new(packed, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
+            .unwrap();
+        let extent_operand = ArrayBatch::new(extents, BatchAxis::new(1)).unwrap();
+        let operation =
+            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [3, 4])])
+                .with_batching(CustomCallBatching::BroadcastAll)
+                .with_ragged_contract(preserved_ragged_contract(length.clone(), true).batch_prefixed(false));
+
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts().0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
+        assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
+        assert_eq!(
+            outputs[0].ragged_axes()[0].extents().r#type().into_owned(),
+            ArrayType::new_static(DataType::I32, [2, 3]),
+        );
+
+        let builder = trace.builder();
+        let builder = builder.borrow();
+        let staged_contract = builder
+            .instructions()
+            .iter()
+            .find_map(|instruction| match instruction.operation() {
+                ArrayOperation::CustomCall(operation) => operation.ragged_contract(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(staged_contract.batch_prefix_count, 2);
+        assert!(staged_contract.ragged_discharged);
+        drop(builder);
+
+        // The mixed-universe path performs the same alignment and must attach the aligned extent value as well.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 3, 4]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [3, 2]).into());
+        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
+            .unwrap();
+        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(1)).unwrap();
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [3, 4])])
+                .with_batching(CustomCallBatching::BroadcastAll)
+                .with_ragged_contract(preserved_ragged_contract(length, true).batch_prefixed(false)),
+        );
+        let outputs = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts().0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
+        assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
+        let extent_type = outputs[0].ragged_axes()[0].extents().r#type();
+        assert_eq!(
+            <&ArrayType>::try_from(extent_type.as_ref()).unwrap(),
+            &ArrayType::new_static(DataType::I32, [2, 3]),
+        );
     }
 
     #[test]
@@ -2740,6 +3194,84 @@ mod tests {
         assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
         assert!(outputs[0].ragged_axes()[0].extent_axes().is_empty());
         assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_custom_call_fresh_output_composes_under_nested_dense_batching() -> Result<(), ProgramError> {
+        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new(
+                "ryft.test.fresh_ragged",
+                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
+            )
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_ragged_contract(CustomCallRaggedContract::new(
+                Vec::new(),
+                vec![
+                    CustomCallRaggedOutputBinding::Fresh {
+                        axis: 0,
+                        extent_output_index: 1,
+                        dimension: output_length.clone(),
+                    },
+                    CustomCallRaggedOutputBinding::Consumed,
+                ],
+                true,
+            )),
+        );
+        let output_types = operation
+            .output_types
+            .iter()
+            .map(|output_type| output_type.with_inserted_dimension(0, Dimension::Static(3)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation = CustomCallOperation {
+            output_types,
+            ragged_contract: operation.ragged_contract.as_ref().map(|contract| contract.batch_prefixed(false)),
+            ..operation
+        };
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5)).unwrap());
+        let axis_extent = trace.input(DimensionType::new(outer.clone()).into());
+        let input = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(outer), Dimension::Static(3), Dimension::Static(4)]),
+            )
+            .into(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let (outputs, evidence) = operation
+            .batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
+            .into_parts();
+        assert!(evidence.is_empty());
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
+        assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
+        assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
+
+        let output_ids = outputs.iter().map(|output| output.value().atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            output_ids,
+            vec![Placeholder, Placeholder],
+            vec![Placeholder, Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<outer ∈ [1, 5)>, %1:f32[outer, 3, 4] .
+                let %2:f32[outer, 3, 4], %3:i32[outer, 3] = custom_call [
+                    target=ryft.test.fresh_ragged,
+                    batching=broadcast_all,
+                    ragged_contract={inputs=[], outputs=[fresh@2<=output(1):output_length, consume], \
+                 padding_independent=true, batch_prefix_count=2},
+                ] %1 %0 %0
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
         Ok(())
     }
 
@@ -3083,6 +3615,56 @@ mod tests {
                 lambda %0:f32[2, 3, 2] .
                 let %1:f32[2, 3, 2] = custom_call [target=ryft.test.add_one, batching=broadcast_all] %0
                 in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_composes_under_nested_dense_batching() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let packed_type = ArrayType::new_static(DataType::F32, [4]);
+        let extent_type = ArrayType::scalar(DataType::I32);
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation = CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
+                    .with_batching(CustomCallBatching::BroadcastAll)
+                    .with_ragged_contract(preserved_ragged_contract(length.clone(), true));
+                Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
+            },
+            vec![packed_type.clone(), extent_type],
+        )
+        .unwrap();
+        let (inner, _) = program
+            .batched(
+                3,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        let (outer, output_axes) = inner
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::new(0)]);
+        assert_eq!(
+            outer.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3, 4], %1:i32[2, 3] .
+                let %2:f32[2, 3, 4] = custom_call [
+                    target=ryft.test.ragged,
+                    batching=broadcast_all,
+                    ragged_contract={inputs=[data:operand(0)@2<=operand(1):length], \
+                 outputs=[preserve(data)@2], padding_independent=true, batch_prefix_count=2},
+                ] %0 %1
+                in (%2)
             "}
             .trim_end(),
         );

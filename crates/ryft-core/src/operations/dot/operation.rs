@@ -271,8 +271,10 @@ where
 ///
 /// `group_sizes` is either a rank-one `[group_count]` array shared by every prefix or an array whose trailing axis is
 /// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped-dot iteration
-/// space. Grouped expansion modes require an element type that can represent zero; in particular, they reject
-/// `f8e8m0fnu`. Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
+/// space. The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical LHS
+/// ragged extent, so an over-covering group is clipped and every later group is empty once its raw start reaches or
+/// exceeds that extent. Grouped expansion modes require an element type that can represent zero; in particular, they
+/// reject `f8e8m0fnu`. Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotOperation {
     /// Grouped-dot dimension-number specification.
@@ -344,7 +346,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedDo
 /// Value-level grouped generalized dot capability.
 pub trait RaggedDot: Sized {
     /// Computes a grouped generalized dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three
-    /// modes, metadata shapes, and zero-group and uncovered-position semantics.
+    /// modes, metadata shapes, cumulative-interval clipping, and zero-group and uncovered-position semantics.
     fn ragged_dot_general(
         &self,
         rhs: &Self,

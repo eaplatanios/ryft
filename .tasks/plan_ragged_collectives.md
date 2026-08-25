@@ -1118,3 +1118,51 @@ warnings. Rustdoc completed for `ryft-core`, `ryft-mlir`, and `ryft-xla`; the fi
 leaving only the repository's pre-existing warnings. Formatting, whitespace, and added-line width checks passed.
 The Phase 2 stale-name search found only deliberate references to upstream `jax.lax.p*` names and differential case
 identifiers, not stale Ryft APIs. No changelog file was modified.
+
+## Post-plan feedback remediation
+
+- [x] Represent every accumulated dense custom-call batch prefix, while continuing to reject a genuinely nested
+  ragged batch, and cover homogeneous and mixed double batching.
+- [x] Reject fresh output dimensions that collide with input ragged dimensions, narrow alias rejection to
+  ragged-bound inputs, and pin fresh renaming and mapped mixed-universe attachment.
+- [x] Route replicated `parallel_permute` extents through the participant permutation so untargeted participants have
+  zero extents.
+- [x] Make eager `ragged_dot_general` clip over-covering group sizes consistently with staged lowering and document
+  the behavior.
+- [x] Reject batching-internal participant-packed `ragged_all_to_all` operations at the XLA per-device custom-call
+  lowering boundary while preserving the public logical form used inside `shard_map`.
+- [x] Add the missing numerical ragged-reduction, nonuniform transpose, and prefix-shaped lowering regressions.
+- [x] Run focused and affected-crate verification without modifying changelog files.
+- [x] Complete independent correctness, conventions, and simplicity audit rounds, fix every finding, and repeat until
+  all three tracks report no findings.
+
+### Post-plan feedback remediation review
+
+Custom-call ragged contracts now count every accumulated dense prefix independently from whether a prior transform
+discharged a ragged level. `BroadcastAll` shifts the contract for each dense prefix, while `Sequential` records a
+ragged discharge without shifting the scan body's per-item axes. Repeated dimension identities require one extent
+source, fresh identities cannot collide with input identities, consumption evidence is unique per dimension and is
+emitted only when no binding for that dimension is preserved, and aligned outputs retain the aligned extent carrier.
+The homogeneous and mixed implementations have regressions for double dense batching, differing mapped axes, fresh
+outputs, sequential discharge, shared dimensions, and genuine nested-ragged rejection.
+
+Replicated ragged extents now follow `parallel_permute` values through the same participant permutation, including
+zero extents for untargeted participants; partial permutations reject positive lower bounds that cannot represent
+those zeros. Numerical parallel-sum and parallel-max tests pin padding identities and reduced extents. Eager
+`ragged_dot_general` clips over-covering group intervals to the physical extent and stops before irrelevant later
+metadata can overflow. XLA widens group metadata to `u64`, caps every value before the reassociable StableHLO window
+reduction, accumulates saturating intervals, and reuses one interval pipeline for both contracting operands. Exact
+snapshots and CPU execution cover narrow metadata, prefix-shaped groups, and `u64::MAX` overflow cases. Nonuniform
+ragged-dot transpose tests pin the cotangent semantics.
+
+The XLA per-device ABI continues to accept the public logical `ragged_all_to_all` representation used by `shard_map`
+and explicitly rejects only the batching-internal participant-packed physical representation. A direct lowering test
+constructs that representation through the public batching path and pins the diagnostic.
+
+Final verification passed with `cargo test -p ryft-core --lib` (1,720 passed, 3 ignored), `cargo test -p ryft-xla
+--lib` (554 passed, 5 ignored), all-target checks for both crates, `cargo test -p ryft-core --doc` (67 passed, 16
+ignored, plus 6 compile-fail cases), `cargo test -p ryft-xla --doc`, `cargo +nightly fmt --all -- --check`, and
+`git diff --check`. Focused suites included 33 custom-call tests, 8 parallel-permute tests, 12 parallel-reduce tests,
+and 7 XLA ragged-dot lowering and CPU tests. Independent correctness, conventions, and simplicity auditors reviewed
+the post-fix tree repeatedly; every finding was fixed, including the StableHLO reduction-order portability issue, and
+the final closure round reported no findings in all three tracks. No changelog file was modified.

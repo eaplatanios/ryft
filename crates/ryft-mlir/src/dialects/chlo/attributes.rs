@@ -80,7 +80,23 @@ mlir_subtype_trait_impls!(
 );
 
 impl<'t> Context<'t> {
-    /// Creates a CHLO [`RaggedDotDimensionsAttributeRef`] owned by this context.
+    /// Creates a CHLO [`RaggedDotDimensionsAttributeRef`] owned by this context. Refer to the documentation of
+    /// [`RaggedDotOperation`](super::operations::RaggedDotOperation) for the supported ragged-dot modes and dimension
+    /// constraints.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lhs_batching_dimensions`: Left-Hand Side (LHS) dimensions paired with `rhs_batching_dimensions`
+    ///     as batch dimensions.
+    ///   - `rhs_batching_dimensions`: Right-Hand Side (RHS) dimensions paired with `lhs_batching_dimensions`
+    ///     as batch dimensions.
+    ///   - `lhs_contracting_dimensions`: Left-Hand Side (LHS) dimensions paired with `rhs_contracting_dimensions`
+    ///     for contraction.
+    ///   - `rhs_contracting_dimensions`: Right-Hand Side (RHS) dimensions paired with `lhs_contracting_dimensions`
+    ///     for contraction.
+    ///   - `lhs_ragged_dimensions`: Left-Hand Side (LHS) dimension that is partitioned according to the `group_sizes`
+    ///     operand.
+    ///   - `rhs_group_dimensions`: Optional Right-Hand Side (RHS) dimension that indexes ragged groups.
     pub fn chlo_ragged_dot_dimensions<'c>(
         &'c self,
         lhs_batching_dimensions: &[usize],

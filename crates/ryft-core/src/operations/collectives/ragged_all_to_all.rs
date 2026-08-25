@@ -217,8 +217,12 @@ impl RaggedAllToAllOperation {
     }
 
     /// Returns whether this operation carries the batching-internal physical operand representation.
+    ///
+    /// This predicate is exposed for backend lowerings, which must reject the host-batching representation before
+    /// emitting a custom call whose operands are local to one device participant.
+    #[doc(hidden)]
     #[inline]
-    pub(crate) fn is_physical(&self) -> bool {
+    pub fn is_physical(&self) -> bool {
         self.representation == RaggedAllToAllRepresentation::Physical
     }
 

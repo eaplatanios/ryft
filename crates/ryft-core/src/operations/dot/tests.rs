@@ -1171,6 +1171,18 @@ fn test_ragged_dot_eager_zero_groups_and_uncovered_rows() {
     assert_eq!(output.r#type().into_owned(), plain_array(&[5, 1]));
     assert_eq!(output.to_f64s(), vec![12.0, 34.0, 50.0, 68.0, 0.0]);
 
+    // Over-cover clips the intersecting group and leaves every later raw cumulative interval empty.
+    let lhs = Array::matrix(4, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let output = lhs.ragged_dot(&rhs, &Array::vector(vec![3_i32, 3, 2])).unwrap();
+    assert_eq!(output, Array::matrix(4, 1, vec![12.0_f32, 34.0, 56.0, 38.0]));
+
+    // Sizes in intervals that begin after the physical extent are unobservable, even when their cumulative sum would
+    // overflow the host index type.
+    let lhs = Array::matrix(1, 1, vec![2.0_f32]);
+    let rhs = Array::from_f64s(plain_array(&[2, 1, 1]), vec![3.0, 100.0]);
+    let output = lhs.ragged_dot(&rhs, &Array::vector(vec![1_u64, u64::MAX])).unwrap();
+    assert_eq!(output, Array::matrix(1, 1, vec![6.0_f32]));
+
     let lhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]), vec![1.0, 2.0]);
     let rhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [1, 1, 1]), vec![1.0]);
     assert!(matches!(
@@ -1194,6 +1206,13 @@ fn test_ragged_dot_eager_contracting_batch_and_group_prefixes() {
     assert_eq!(output.r#type().into_owned(), plain_array(&[3, 2, 1]));
     assert_eq!(output.to_f64s(), vec![10.0, 50.0, 0.0, 0.0, 130.0, 330.0]);
 
+    // Contracting groups use the same clipped raw intervals, with empty trailing groups retaining zero output slices.
+    let output = lhs.ragged_dot_general(&rhs, &Array::vector(vec![3_i32, 3, 2]), &contracting_dimensions).unwrap();
+    assert_eq!(
+        output,
+        Array::from_elements(plain_array(&[3, 2, 1]), &[140.0_f32, 380.0, 160.0, 320.0, 0.0, 0.0]).unwrap(),
+    );
+
     let prefixed_contracting_dimensions = RaggedDotDimensionNumbers::new(
         DotDimensionNumbers::new(vec![0, 1], vec![0, 1], Vec::new(), Vec::new()),
         vec![1],
@@ -1205,6 +1224,10 @@ fn test_ragged_dot_eager_contracting_batch_and_group_prefixes() {
     let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
     assert_eq!(output.r#type().into_owned(), plain_array(&[2, 1, 1]));
     assert_eq!(output.to_f64s(), vec![24.0, 148.0]);
+
+    let group_sizes = Array::matrix(2, 2, vec![2_i32, 3, 4, 1]);
+    let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
+    assert_eq!(output, Array::from_elements(plain_array(&[2, 1, 1]), &[82.0_f32, 90.0]).unwrap());
 
     let batch_dimensions = RaggedDotDimensionNumbers::new(
         DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
@@ -1374,8 +1397,8 @@ fn test_ragged_dot_jvp_and_noncontracting_transpose() {
                     (@known, rhs.clone()),
                     (@known, group_sizes.clone()),
                 ],
-                output_cotangents = [Array::matrix(3, 1, vec![1.0_f32; 3])],
-                input_cotangents = [Array::matrix(3, 2, vec![10.0_f32, 1.0, 2.0, 3.0, 2.0, 3.0])],
+                output_cotangents = [Array::matrix(3, 1, vec![2.0_f32, 3.0, 5.0])],
+                input_cotangents = [Array::matrix(3, 2, vec![20.0_f32, 2.0, 6.0, 9.0, 10.0, 15.0])],
             },
             {
                 inputs = [
@@ -1383,8 +1406,8 @@ fn test_ragged_dot_jvp_and_noncontracting_transpose() {
                     (@linear(type = rhs.r#type().into_owned())),
                     (@known, group_sizes),
                 ],
-                output_cotangents = [Array::matrix(3, 1, vec![1.0_f32; 3])],
-                input_cotangents = [Array::from_f64s(plain_array(&[2, 2, 1]), vec![1.0, 2.0, 8.0, 10.0])],
+                output_cotangents = [Array::matrix(3, 1, vec![2.0_f32, 3.0, 5.0])],
+                input_cotangents = [Array::from_f64s(plain_array(&[2, 2, 1]), vec![2.0, 4.0, 34.0, 42.0])],
             },
         ],
     );

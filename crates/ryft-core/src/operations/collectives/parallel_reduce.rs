@@ -507,12 +507,12 @@ mod tests {
     use crate::arrays::batching::DynamicArrayBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, RaggedAxis, Shape,
+        DimensionValue, DimensionVariable, RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxisSpecification, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
-    use crate::programs::ValueProjection;
+    use crate::programs::{EmptyRegionDriver, ValueProjection};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -535,7 +535,7 @@ mod tests {
         }
         .unwrap();
         let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
-            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
+            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
             .unwrap()
             .into_parts()
             .0;
@@ -552,7 +552,7 @@ mod tests {
         }
         .unwrap();
         let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Max)
-            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
+            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
             .unwrap()
             .into_parts()
             .0;
@@ -575,7 +575,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
             .with_axis_name("data".to_string());
         let outputs = ParallelReduceOperation::new("data".to_string(), ParallelReductionKind::Mean)
-            .batch(&context, &crate::EmptyRegionDriver, &[input])
+            .batch(&context, &EmptyRegionDriver, &[input])
             .unwrap()
             .into_parts()
             .0;
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(
             ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Mean).batch(
                 &batching_context(2),
-                &crate::EmptyRegionDriver,
+                &EmptyRegionDriver,
                 &[input]
             ),
             Err(BatchingError::UnsupportedOperation {
@@ -634,7 +634,7 @@ mod tests {
                 .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected()?, length.clone(), vec![0])])?;
 
             let output = ParallelReduceOperation::new("i".to_string(), kind)
-                .batch(&context, &crate::EmptyRegionDriver, &[input])?
+                .batch(&context, &EmptyRegionDriver, &[input])?
                 .into_parts()
                 .0
                 .remove(0);
@@ -664,10 +664,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_sum_and_max_numerically_mask_ragged_padding() -> Result<(), BatchingError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let parent = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+            ProjectedContext::new(parent),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("i".to_string());
+
+        let sum_input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32, 100.0, 100.0, 2.0, 3.0, 100.0]), 0)?
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]), length.clone(), vec![0])])?;
+        let sum = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
+            .batch(&context, &EmptyRegionDriver, &[sum_input])?
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(sum.batch_axis(), BatchAxis::replicated());
+        assert_eq!(sum.value(), &Array::vector(vec![3.0_f32, 3.0, 0.0]));
+        assert_eq!(sum.ragged_axes()[0].extents(), &Array::scalar(2_i32));
+
+        let max_input = ArrayBatch::new(Array::matrix(2, 3, vec![-5.0_f32, 100.0, 100.0, -3.0, -4.0, 100.0]), 0)?
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]), length, vec![0])])?;
+        let maximum = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Max)
+            .batch(&context, &EmptyRegionDriver, &[max_input])?
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(maximum.batch_axis(), BatchAxis::replicated());
+        assert_eq!(maximum.value(), &Array::vector(vec![-3.0_f32, -4.0, f32::NEG_INFINITY]));
+        assert_eq!(maximum.ragged_axes()[0].extents(), &Array::scalar(2_i32));
+        Ok(())
+    }
+
+    #[test]
     fn test_parallel_reduce_passes_through_replicated_input() {
         let input = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
         let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
-            .batch(&batching_context(3), &crate::EmptyRegionDriver, &[input])
+            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
             .unwrap()
             .into_parts()
             .0;

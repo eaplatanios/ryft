@@ -1447,9 +1447,10 @@ impl Array {
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
 
-    /// Evaluates grouped generalized dot extent-exactly. Each concrete group becomes a pair of operand slices, the
-    /// ordinary generalized-dot kernel contracts those slices, and the result is written into its output window.
-    /// This keeps temporary storage proportional to one group rather than the whole operand times the group count.
+    /// Evaluates grouped generalized dot extent-exactly. Each concrete group's raw cumulative interval is clipped to
+    /// the physical ragged extent, the resulting pair of operand slices is contracted by the ordinary generalized-dot
+    /// kernel, and the result is written into its output window. This keeps temporary storage proportional to one
+    /// group rather than the whole operand times the group count.
     fn ragged_dot_elements<T: ElementZero + ElementAdd + ElementMul>(
         &self,
         rhs: &Self,
@@ -1492,22 +1493,6 @@ impl Array {
             });
         }
         let ragged_extent = self.r#type().shape().dimensions()[ragged_axis].value().unwrap();
-        for prefix in 0..prefix_count {
-            let metadata_prefix = if group_sizes.r#type().rank() == 1 { 0 } else { prefix };
-            let group_range = metadata_prefix * group_count..(metadata_prefix + 1) * group_count;
-            let total = sizes[group_range].iter().try_fold(0usize, |total, size| total.checked_add(*size)).ok_or_else(
-                || ProgramError::InvalidArgument {
-                    message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes sum does not fit in `usize`"),
-                },
-            )?;
-            if total > ragged_extent {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "`{RAGGED_DOT_OPERATION_NAME}` group sizes sum {total} exceeds ragged extent {ragged_extent}",
-                    ),
-                });
-            }
-        }
         let lhs_shape = self.r#type().static_shape().unwrap();
         let rhs_shape = rhs.r#type().static_shape().unwrap();
         let lhs_strides = vec![1; lhs_shape.rank()];
@@ -1613,12 +1598,17 @@ impl Array {
                 }
                 RaggedDotMode::Batch => unreachable!(),
             }
-            let mut ragged_start = 0usize;
+            let mut raw_ragged_start = 0usize;
             for (group, &group_size) in sizes[group_range].iter().enumerate() {
-                if group_size == 0 {
+                if raw_ragged_start >= ragged_extent {
+                    break;
+                }
+                let ragged_start = raw_ragged_start;
+                let ragged_limit = raw_ragged_start.saturating_add(group_size).min(ragged_extent);
+                raw_ragged_start = ragged_limit;
+                if ragged_start == ragged_limit {
                     continue;
                 }
-                let ragged_limit = ragged_start + group_size;
                 lhs_starts[ragged_axis] = ragged_start;
                 lhs_limits[ragged_axis] = ragged_limit;
                 let lhs_slice = self.slice(&lhs_starts, &lhs_limits, &lhs_strides)?;
@@ -1650,7 +1640,6 @@ impl Array {
                     RaggedDotMode::Batch => unreachable!(),
                 };
                 output = output.replace_block(&dot, &output_starts);
-                ragged_start = ragged_limit;
             }
         }
         Ok(output)

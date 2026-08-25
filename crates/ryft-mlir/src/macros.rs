@@ -940,4 +940,4 @@ macro_rules! mlir_pass {
     };
 }
 
-pub use crate::{mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_subtype_trait_impls};
+pub(crate) use crate::{mlir_attribute_field, mlir_enum_attribute, mlir_op, mlir_op_trait, mlir_subtype_trait_impls};
