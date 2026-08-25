@@ -31,10 +31,10 @@
 //!
 //! - `semantics.rs` defines [`ReferenceType`], the operation-local [`ReferenceOperationSemantics`] descriptor,
 //!   access modes, root/alias classifications, and entry-boundary sources.
-//! - `operations.rs` defines the five generic primitives and their value-level capabilities: allocation
-//!   ([`NewReference`]), immutable reads ([`ReferenceRead`]), exact replacement ([`ReferenceSwap`]), ordered additive
-//!   updates ([`ReferenceAddUpdate`]), and consuming finalization ([`FreezeReference`]). It also owns their type
-//!   inference, effects, eager interpretation, and discharge rules.
+//! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
+//!   ([`NewReference`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
+//!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
+//!   ([`FreezeReference`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
 //! - `runtime.rs` implements [`Reference`] and its synchronized holder state machine. The hidden backend interface
 //!   uses generations, completion dependencies, read leases, reservations, pending installation, and terminal
 //!   poisoning to coordinate external state across synchronous and asynchronous execution.
@@ -48,7 +48,7 @@
 //!
 //! # Eager and Staged State
 //!
-//! Eager code acts directly on a [`Reference`] holder. Staged programs instead use the five reference operations.
+//! Eager code acts directly on a [`Reference`] holder. Staged programs instead use the six reference operations.
 //! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
 //! operations into explicit state dataflow. A local root disappears entirely after that rewrite. An external root
 //! becomes an ordinary state input and, when mutated, a hidden final-state output described by a
@@ -93,8 +93,9 @@ pub use discharge::{
 pub use operations::{
     FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
     NewReference, NewReferenceOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-    REFERENCE_SWAP_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation,
 };
 pub use runtime::{
     PreparedReferenceValue, Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
