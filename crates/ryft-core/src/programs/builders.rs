@@ -615,10 +615,23 @@ impl ReferenceLifetimes {
         }
     }
 
-    /// Records `output` as an alias of `input`, resolving the family root eagerly. `narrows` means that this edge
-    /// introduces a view mapping instead of preserving the input handle's exact whole-root mapping. Narrowing is
-    /// _transitive_ meaning that once any edge in an alias chain introduces a view, later identity aliases remain
-    /// narrowing and cannot be used to consume the family as though they represented its whole root.
+    /// Records `output` as an alias of `input`, resolving the family root eagerly. `narrows` is `true` when this edge
+    /// makes `output` a derived view of `input`, such as an indexed row or slice, rather than another handle to the
+    /// entire referenced value. Narrowing is _transitive_ meaning that an identity alias of a narrowed input still
+    /// represents only that view. A narrowed alias can access its view, but cannot consume the reference because
+    /// consumption invalidates the complete alias family and must use a handle representing the entire root value.
+    ///
+    /// # Examples
+    ///
+    /// For a root referencing an entire matrix, a whole-value alias does not narrow, while selecting a row does. An
+    /// identity alias subsequently derived from that row remains narrowed even though its own edge does not narrow:
+    ///
+    /// ```text
+    /// root        -> entire matrix
+    /// whole_alias -> root          (narrows = false; represents the entire matrix)
+    /// row         -> root[2, :]    (narrows = true; represents only one row)
+    /// row_alias   -> row           (narrows = false; remains narrowed through `row`)
+    /// ```
     fn alias(&mut self, output: AtomId, input: AtomId, narrows: bool) {
         let source = self.aliases.get(&input).copied();
         let edge = ResolvedReferenceAlias {
