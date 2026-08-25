@@ -85,8 +85,6 @@ impl<C: Context<Operation: From<ZeroLikeOperation<C::Type>>>> PartiallyEvaluatab
 
 impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to synthesize a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart
 /// to [`Zero`](super::Zero). It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait ZeroLike: Sized {

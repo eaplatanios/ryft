@@ -80,8 +80,6 @@ impl<C: Context<Operation: From<OneLikeOperation<C::Type>>>> PartiallyEvaluatabl
 
 impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the ability to synthesize a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart
 /// to [`One`](super::One). It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait OneLike: Sized {

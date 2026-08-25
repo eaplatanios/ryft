@@ -20,8 +20,6 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`IotaOperation`].
 pub const IOTA_OPERATION_NAME: &str = "iota";
 
@@ -56,10 +54,6 @@ impl<T: Type> IotaOperation<T> {
 
 impl IotaOperation<ArrayType> {
     /// Creates an [`IotaOperation`] after validating its element type and varying dimension.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] if `r#type` does not have a numeric element type or if `dimension` is outside its rank.
     #[inline]
     pub fn new(r#type: ArrayType, dimension: usize) -> Result<Self, TypeError> {
         if !r#type.data_type().is_numeric() {
@@ -120,7 +114,7 @@ impl Operation for IotaOperation<ArrayType> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, IOTA_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("type", &self.r#type)?;
-            operation.field("dimension", &self.dimension)
+            operation.field("dimension", self.dimension)
         })
     }
 }
@@ -165,7 +159,7 @@ pub trait Iota<V: Typed> {
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Type of the value to produce.
+    ///   - `r#type`: [`Type`] of the value to produce.
     ///   - `dimension`: Dimension of `type` along which the produced values increase from `0`.
     fn iota(&self, r#type: &V::Type, dimension: usize) -> Result<V, ProgramError>;
 }
@@ -180,6 +174,7 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
             ))
             .into());
         }
+
         let sizes = r#type
             .shape()
             .dimensions()
@@ -194,12 +189,14 @@ impl<O: Operation<Type = ArrayType>> Iota<Array> for EagerContext<Array, O> {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
         if dimension >= sizes.len() {
             return Err(TypeError::invalid(format!(
                 "iota dimension {dimension} is out of bounds for array type {type}",
             ))
             .into());
         }
+
         // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
         // `stride` is the product of the sizes of the dimensions after `dimension`.
         let size = sizes[dimension];
