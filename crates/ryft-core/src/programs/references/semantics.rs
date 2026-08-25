@@ -22,7 +22,6 @@ use crate::programs::types::{Type, TypeError, TypeRefinements};
 /// the access writes, not that no read occurs (see [`ReferenceAccessMode::Write`]), which matches JAX classifying
 /// `swap` as a plain write.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum ReferenceAccessMode {
     /// Reads the current state without replacing it.
     Read,
