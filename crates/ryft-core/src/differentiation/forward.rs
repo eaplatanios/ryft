@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, Domain, ProjectedContext, StagingContext, ValueResolution};
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DifferentiableType;
@@ -1226,6 +1226,13 @@ where
     #[inline]
     fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
         self.parent.invoke_with_provenance_scope(scope, function)
+    }
+
+    #[inline]
+    fn resolve(&self, value: &DifferentiationTracer<C>) -> ValueResolution<C::Constant> {
+        // A value is constant in the differentiated computation only when its primal resolves in the parent and its
+        // tangent is structurally zero. A live tangent makes the dual input-dependent even if its primal is constant.
+        if value.tangent().is_zero() { self.parent.resolve(value.primal()) } else { ValueResolution::Opaque }
     }
 }
 
