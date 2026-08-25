@@ -630,7 +630,7 @@ impl LowPrecisionFloatingPointFormat {
                 .nan_bits(negative)
                 .ok_or_else(|| TypeError::invalid(format!("data type {} cannot represent NaN", self.data_type))),
             FpCategory::Zero if exponent_only => {
-                Err(TypeError::invalid(format!("data type {} cannot represent zero", self.data_type)))
+                Err(TypeError::invalid(format!("data type `{}` cannot represent zero", self.data_type)))
             }
             FpCategory::Zero => Ok(self.signed_bits(0, negative)),
             FpCategory::Infinite => Ok(self.overflow_bits(negative)),
@@ -1679,7 +1679,7 @@ mod tests {
         assert!(matches!(
             f8e8m0fnu::from_real(0.0),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type f8e8m0fnu cannot represent zero",
+                if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
 
         // Real inputs into native integer destinations saturate at the destination's bounds, and NaN collapses to
@@ -2129,11 +2129,11 @@ mod tests {
         assert_eq!(f8e8m0fnu::from_f64(f64::NAN).map(f8e8m0fnu::to_bits), Ok(0xff));
         assert!(matches!(
             f8e8m0fnu::from_f64(0.0),
-            Err(TypeError::Invalid { message }) if message == "data type f8e8m0fnu cannot represent zero",
+            Err(TypeError::Invalid { message }) if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
         assert!(matches!(
             f8e8m0fnu::from_f64(-0.0),
-            Err(TypeError::Invalid { message }) if message == "data type f8e8m0fnu cannot represent zero",
+            Err(TypeError::Invalid { message }) if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
     }
 

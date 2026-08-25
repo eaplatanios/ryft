@@ -74,7 +74,7 @@ impl<C: Domain<Value: ZeroLike>> InterpretableOperation<C> for ZeroLikeOperation
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].zero_like()])
+        Ok(vec![inputs[0].zero_like()?])
     }
 }
 
@@ -89,18 +89,20 @@ impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 
 /// Represents the ability to synthesize a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart
 /// to [`Zero`](super::Zero). It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
-pub trait ZeroLike {
-    /// Returns a _zero_ value with the same structure as `self`.
-    fn zero_like(&self) -> Self;
+pub trait ZeroLike: Sized {
+    /// Returns a _zero_ value with the same structure as `self`, or an error if that structure cannot represent zero.
+    fn zero_like(&self) -> Result<Self, ProgramError>;
 }
 
 impl ZeroLike for Array {
-    fn zero_like(&self) -> Self {
-        match self.r#type().data_type() {
-            DataType::Token | DataType::Zero | DataType::F8E8M0FNU => self.clone(),
+    fn zero_like(&self) -> Result<Self, ProgramError> {
+        let data_type = self.r#type().data_type();
+        match data_type {
+            DataType::Token => Err(TypeError::invalid(format!("data type `{data_type}` cannot represent zero")).into()),
+            DataType::Zero => Ok(self.clone()),
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(0).unwrap();
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
+                let element = Element::from_unsigned(0)?;
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element))
             }),
         }
     }
@@ -108,11 +110,11 @@ impl ZeroLike for Array {
 
 impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation<V::Type>>>>> ZeroLike for V {
     #[inline]
-    fn zero_like(&self) -> Self {
-        self.dispatch_domain()
-            .bind(ZeroLikeOperation::new(), Vec::new(), &[self.clone()])
-            .expect("`zero_like` operation failed")
-            .remove(0)
+    fn zero_like(&self) -> Result<Self, ProgramError> {
+        let operation = ZeroLikeOperation::new();
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -150,6 +152,17 @@ mod tests {
             ),
             Ok(vec![Array::scalar(0.0)]),
         );
+        let input =
+            Array::from_elements(ArrayType::scalar(DataType::F8E8M0FNU), &[f8e8m0fnu::from_bits(0x7f)]).unwrap();
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[input],
+            ),
+            Err(ProgramError::Type(TypeError::invalid("data type `f8e8m0fnu` cannot represent zero"))),
+        );
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, ZeroLikeOperation<ArrayType>>::new();
@@ -179,28 +192,38 @@ mod tests {
             (Array::scalar(3.0f32), Array::scalar(0.0f32)),
             (Array::scalar(7.0f64), Array::scalar(0.0f64)),
         ] {
-            assert_eq!(input.zero_like(), expected);
+            assert_eq!(input.zero_like(), Ok(expected));
         }
 
         let input = Array::vector(vec![1.5f32, -2.5]);
-        let output = input.zero_like();
+        let output = input.zero_like().unwrap();
         assert_eq!(output.elements::<f32>(), Ok(vec![0.0, 0.0]));
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
 
-        // `f8e8m0fnu` cannot represent zero, so zero-like retains the exemplar exactly.
+        // Unsupported data types report exact errors instead of fabricating a zero from the exemplar.
         let input = Array::from_elements(
             ArrayType::new_static(DataType::F8E8M0FNU, [2]),
             &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
         )
         .unwrap();
-        assert_eq!(input.zero_like(), input);
+        assert_eq!(
+            input.zero_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `f8e8m0fnu` cannot represent zero"))),
+        );
+        let token = Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap();
+        assert_eq!(
+            token.zero_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `token` cannot represent zero"))),
+        );
+        let zero = Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap();
+        assert_eq!(zero.zero_like(), Ok(zero.clone()));
     }
 
     #[test]
     fn test_staging_zero_like() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
-        let output = input.zero_like();
+        let output = input.zero_like().unwrap();
         let program = context
             .builder()
             .borrow()
@@ -222,7 +245,7 @@ mod tests {
     fn test_partial_evaluation_zero_like() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5])));
-        let output = input.zero_like();
+        let output = input.zero_like().unwrap();
         assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![0.0f32, 0.0])));
     }
 
@@ -233,7 +256,7 @@ mod tests {
             context,
             ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),
         );
-        let output = input.zero_like();
+        let output = input.zero_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::vector(vec![0.0f32, 0.0]));
     }
@@ -242,7 +265,7 @@ mod tests {
     fn test_differentiation_zero_like() {
         // Dense reverse-mode differentiation batches the constant rule while constructing the identity Jacobian.
         let jacobian = differentiate_at(Array::scalar(2.0))
-            .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()))
+            .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()?))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().to_f64s(), vec![1.0]);

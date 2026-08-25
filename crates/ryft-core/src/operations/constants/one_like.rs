@@ -69,7 +69,7 @@ impl<C: Domain<Value: OneLike>> InterpretableOperation<C> for OneLikeOperation<C
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].one_like()])
+        Ok(vec![inputs[0].one_like()?])
     }
 }
 
@@ -84,18 +84,21 @@ impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 
 /// Represents the ability to synthesize a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart
 /// to [`One`](super::One). It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
-pub trait OneLike {
-    /// Returns a _one_ value with the same structure as `self`.
-    fn one_like(&self) -> Self;
+pub trait OneLike: Sized {
+    /// Returns a _one_ value with the same structure as `self`, or an error if that structure cannot represent one.
+    fn one_like(&self) -> Result<Self, ProgramError>;
 }
 
 impl OneLike for Array {
-    fn one_like(&self) -> Self {
-        match self.r#type().data_type() {
-            DataType::Token | DataType::Zero => self.clone(),
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        let data_type = self.r#type().data_type();
+        match data_type {
+            DataType::Token | DataType::Zero => {
+                Err(TypeError::invalid(format!("data type `{data_type}` cannot represent one")).into())
+            }
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                let element = Element::from_unsigned(1).unwrap();
-                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element)).unwrap()
+                let element = Element::from_unsigned(1)?;
+                Self::from_fn_elements(self.r#type().into_owned(), |_| Ok(element))
             }),
         }
     }
@@ -103,11 +106,11 @@ impl OneLike for Array {
 
 impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation<V::Type>>>>> OneLike for V {
     #[inline]
-    fn one_like(&self) -> Self {
-        self.dispatch_domain()
-            .bind(OneLikeOperation::new(), Vec::new(), &[self.clone()])
-            .expect("`one_like` operation failed")
-            .remove(0)
+    fn one_like(&self) -> Result<Self, ProgramError> {
+        let operation = OneLikeOperation::new();
+        let mut outputs = self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
     }
 }
 
@@ -143,6 +146,16 @@ mod tests {
             ),
             Ok(vec![Array::scalar(1.0)]),
         );
+        let input = Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap();
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[input],
+            ),
+            Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
+        );
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, OneLikeOperation<ArrayType>>::new();
@@ -172,11 +185,11 @@ mod tests {
             (Array::scalar(3.0f32), Array::scalar(1.0f32)),
             (Array::scalar(7.0f64), Array::scalar(1.0f64)),
         ] {
-            assert_eq!(input.one_like(), expected);
+            assert_eq!(input.one_like(), Ok(expected));
         }
 
         let input = Array::vector(vec![1.5f32, -2.5]);
-        let output = input.one_like();
+        let output = input.one_like().unwrap();
         assert_eq!(output.elements::<f32>(), Ok(vec![1.0, 1.0]));
         assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::F32, [2]));
 
@@ -186,14 +199,26 @@ mod tests {
             &[f8e8m0fnu::from_bits(0x7e), f8e8m0fnu::from_bits(0x80)],
         )
         .unwrap();
-        assert_eq!(input.one_like().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
+        assert_eq!(input.one_like().unwrap().elements::<f8e8m0fnu>(), Ok(vec![f8e8m0fnu::from_bits(0x7f); 2]));
+
+        // Types without a multiplicative identity report exact errors instead of returning their exemplar.
+        let token = Array::new(ArrayType::scalar(DataType::Token), Vec::new()).unwrap();
+        assert_eq!(
+            token.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `token` cannot represent one"))),
+        );
+        let zero = Array::new(ArrayType::new_static(DataType::Zero, [2]), Vec::new()).unwrap();
+        assert_eq!(
+            zero.one_like(),
+            Err(ProgramError::Type(TypeError::invalid("data type `zero` cannot represent one"))),
+        );
     }
 
     #[test]
     fn test_staging_one_like() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
-        let output = input.one_like();
+        let output = input.one_like().unwrap();
         let program = context
             .builder()
             .borrow()
@@ -215,7 +240,7 @@ mod tests {
     fn test_partial_evaluation_one_like() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
         let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5])));
-        let output = input.one_like();
+        let output = input.one_like().unwrap();
         assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![1.0f32, 1.0])));
     }
 
@@ -226,7 +251,7 @@ mod tests {
             context,
             ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),
         );
-        let output = input.one_like();
+        let output = input.one_like().unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::vector(vec![1.0f32, 1.0]));
     }
@@ -235,7 +260,7 @@ mod tests {
     fn test_differentiation_one_like() {
         // Dense forward-mode differentiation batches the constant rule while constructing the identity Jacobian.
         let jacobian = differentiate_at(Array::scalar(2.0))
-            .jacobian_forward(|input| Ok(input.clone() + input.one_like()))
+            .jacobian_forward(|input| Ok(input.clone() + input.one_like()?))
             .unwrap();
         let block = jacobian.iter_blocks().next().unwrap();
         assert_eq!(block.value().to_f64s(), vec![1.0]);
