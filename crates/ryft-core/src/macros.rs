@@ -4587,9 +4587,9 @@ pub use crate::{
     check_operation_partial_evaluation, check_operation_transposition, check_operation_type_inference, check_sharding,
     check_types, define_arithmetic_dimension_capability, define_arithmetic_dimension_operation,
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
-    impl_differentiable_elementwise_operation, impl_differentiable_operation, impl_non_differentiable_operation,
-    impl_non_transposable_operation, impl_nullary_batchable_operation, impl_nullary_transposable_operation,
-    impl_reference_free_dischargeable_operation,
+    dispatch_on_array_element_type, impl_differentiable_elementwise_operation, impl_differentiable_operation,
+    impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
+    impl_nullary_transposable_operation, impl_reference_free_dischargeable_operation,
 };
 
 #[cfg(test)]
