@@ -17,16 +17,11 @@ pub enum ReferenceAccessMode {
     /// Reads the referenced value without replacing it.
     Read,
 
-    /// Replaces the referenced value. [`ReferenceAccessMode::Write`] is an over-approximation floor: it asserts that
-    /// the access _writes_, and not that no read occurs. An operation may still observe the previous state through its
-    /// results (e.g., a `reference_swap` operation can return the old value), so generic analyses must treat a
-    /// [`ReferenceAccessMode::Write`] conservatively as possibly reading prior state through its results (in
-    /// particular, any future dead-store elimination on a state chain must not remove an earlier write based on
-    /// this mode alone). Whether a specific write actually reads is an operation-specific question (e.g., the kernel
-    /// lowering of the `reference_swap` operation knows its own old-value result and can emit a plain store when that
-    /// result is dead). This descriptor deliberately carries no access-to-result mapping until a generic analysis
-    /// genuinely needs one.
+    /// Replaces the selected referenced value without observing its previous contents.
     Write,
+
+    /// Observes the selected referenced value and replaces it with a successor in program order.
+    ReadWrite,
 
     /// Combines an update with the current state as an *ordered* additive accumulation. Accumulation stays distinct
     /// from [`Write`](ReferenceAccessMode::Write) because it is linear in the update operand and therefore
@@ -41,12 +36,24 @@ pub enum ReferenceAccessMode {
     Consume,
 }
 
+impl ReferenceAccessMode {
+    /// Returns whether this access consumes the complete reference root.
+    #[inline]
+    pub const fn is_consuming(self) -> bool {
+        match self {
+            Self::Read | Self::Write | Self::ReadWrite | Self::Accumulate => false,
+            Self::Consume => true,
+        }
+    }
+}
+
 impl Display for ReferenceAccessMode {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Read => write!(formatter, "read"),
             Self::Write => write!(formatter, "write"),
+            Self::ReadWrite => write!(formatter, "read/write"),
             Self::Accumulate => write!(formatter, "accumulate"),
             Self::Consume => write!(formatter, "consume"),
         }
@@ -155,9 +162,13 @@ impl ReferenceInputAccess {
 ///     outputs  = []
 ///     accesses = [ReferenceInputAccess { input_index: 0, mode: Read }]
 ///
-/// reference_swap(r, x) -> old
+/// reference_write(r, x) -> ()
 ///     outputs  = []
 ///     accesses = [ReferenceInputAccess { input_index: 0, mode: Write }]
+///
+/// reference_swap(r, x) -> old
+///     outputs  = []
+///     accesses = [ReferenceInputAccess { input_index: 0, mode: ReadWrite }]
 ///
 /// reference_add_update(r, x) -> ()
 ///     outputs  = []
@@ -173,8 +184,6 @@ impl ReferenceInputAccess {
 ///     accesses = []
 /// ```
 ///
-/// Note that `reference_swap` declares `Write` even though its result observes the previous value: `Write` does not
-/// assert the absence of a read (refer to [`ReferenceAccessMode::Write`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOperationSemantics {
     /// Reference classifications of operation outputs.
@@ -609,6 +618,21 @@ mod tests {
 
         fn is_complex(&self) -> bool {
             false
+        }
+    }
+
+    #[test]
+    fn test_reference_access_mode() {
+        let cases = [
+            (ReferenceAccessMode::Read, "read", false),
+            (ReferenceAccessMode::Write, "write", false),
+            (ReferenceAccessMode::ReadWrite, "read/write", false),
+            (ReferenceAccessMode::Accumulate, "accumulate", false),
+            (ReferenceAccessMode::Consume, "consume", true),
+        ];
+        for (mode, display, is_consuming) in cases {
+            assert_eq!(mode.to_string(), display);
+            assert_eq!(mode.is_consuming(), is_consuming);
         }
     }
 

@@ -568,7 +568,7 @@ impl ReferenceLifetimes {
                 continue;
             };
             let edge = self.aliases.get(atom);
-            if access.mode() == ReferenceAccessMode::Consume && edge.is_some_and(|edge| edge.narrows) {
+            if access.mode().is_consuming() && edge.is_some_and(|edge| edge.narrows) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{name}` consumes a derived reference view, but consumption invalidates the whole alias \
                      family; consume the root handle instead",
@@ -577,9 +577,15 @@ impl ReferenceLifetimes {
             let root = edge.map_or(*atom, |edge| edge.root);
             if let Some(consumer) = self.consumed.get(&root) {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{}` {}s a reference whose alias family `{}` already consumed",
+                    "`{}` {} a reference whose alias family `{}` already consumed",
                     name,
-                    access.mode(),
+                    match access.mode() {
+                        ReferenceAccessMode::Read => "reads",
+                        ReferenceAccessMode::Write => "writes",
+                        ReferenceAccessMode::ReadWrite => "reads and writes",
+                        ReferenceAccessMode::Accumulate => "accumulates into",
+                        ReferenceAccessMode::Consume => "consumes",
+                    },
                     consumer,
                 )));
             }
@@ -591,7 +597,7 @@ impl ReferenceLifetimes {
     fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
         let semantics = operation.reference_semantics();
         for access in semantics.accesses() {
-            if access.mode() == ReferenceAccessMode::Consume
+            if access.mode().is_consuming()
                 && let Some(atom) = inputs.get(access.input_index())
             {
                 let root = self.root(*atom);
@@ -666,7 +672,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
-    use crate::programs::references::{ReferenceInputAccess, ReferenceOperationSemantics};
+    use crate::programs::references::{ReferenceAccessMode, ReferenceInputAccess, ReferenceOperationSemantics};
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
@@ -1465,7 +1471,9 @@ mod tests {
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);
-        let write = access("reference_swap", ReferenceAccessMode::Write);
+        let write = access("reference_write", ReferenceAccessMode::Write);
+        let swap = access("reference_swap", ReferenceAccessMode::ReadWrite);
+        let accumulate = access("reference_add_update", ReferenceAccessMode::Accumulate);
         let freeze = access("freeze_reference", ReferenceAccessMode::Consume);
 
         // Allocation records no alias edge. View narrowing remains transitive across later identity aliases,
@@ -1497,16 +1505,31 @@ mod tests {
 
         // Consumption invalidates every handle in the family and diagnostics name both the invalid access and the
         // consuming operation. Narrowing misuse takes precedence over the resulting dead-family diagnostic.
-        let consumed =
-            |name, mode| format!("`{name}` {mode}s a reference whose alias family `freeze_reference` already consumed");
+        let consumed = |name, action| {
+            format!("`{name}` {action} a reference whose alias family `freeze_reference` already consumed")
+        };
         lifetimes.record(&freeze, &[renamed_root], &[]);
         assert!(matches!(
             lifetimes.validate(&read, &[root]),
-            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "read"),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "reads"),
         ));
         assert!(matches!(
             lifetimes.validate(&write, &[view]),
-            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_swap", "write"),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_write", "writes"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&swap, &[view]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == consumed("reference_swap", "reads and writes"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&accumulate, &[view]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == consumed("reference_add_update", "accumulates into"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[root]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("freeze_reference", "consumes"),
         ));
         assert!(matches!(
             lifetimes.validate(&freeze, &[renamed_view]),
@@ -1526,7 +1549,7 @@ mod tests {
         lifetimes.record(&freeze, &[root], &[]);
         assert!(matches!(
             lifetimes.validate(&read, &[carry]),
-            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "read"),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "reads"),
         ));
         assert_eq!(lifetimes.validate(&read, &[AtomId::new(7)]), Ok(()));
         assert_eq!(lifetimes.validate(&read, &[]), Ok(()));
