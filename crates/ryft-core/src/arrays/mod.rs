@@ -17,7 +17,8 @@ pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySl
 pub use arrays::Array;
 pub use batching::{
     ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, DimensionSource,
-    RaggedArrayBatchingPolicy, RaggedAxis, ReplicatedDimensionBatchingPolicy, StaticArrayBatchingPolicy,
+    RaggedArrayBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReplicatedDimensionBatchingPolicy,
+    StaticArrayBatchingPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};

@@ -6,15 +6,15 @@
 
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
-use crate::operations::collectives::PpermuteOperation;
+use crate::operations::collectives::ParallelPermuteOperation;
 use crate::programs::Value;
 
 // TODO(eaplatanios): Review this.
 
-impl<A: Value<Type = ArrayType>> From<PpermuteOperation> for ArrayIrOperation<A> {
+impl<A: Value<Type = ArrayType>> From<ParallelPermuteOperation> for ArrayIrOperation<A> {
     #[inline]
-    fn from(operation: PpermuteOperation) -> Self {
-        Self::Array(ArrayOperation::Ppermute(operation))
+    fn from(operation: ParallelPermuteOperation) -> Self {
+        Self::Array(ArrayOperation::ParallelPermute(operation))
     }
 }
 
@@ -35,8 +35,8 @@ mod tests {
     use crate::differentiation::DifferentiationError;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::collectives::{
-        AllGather, AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, PSumScatter,
-        PSumScatterOperation,
+        AllGather, AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions,
+        ParallelSumScatter, ParallelSumScatterOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError, TypeError, Typed};
@@ -64,7 +64,7 @@ mod tests {
         );
         assert_eq!(
             context.bind(
-                PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
+                ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 &[input.clone(), extent.clone()],
             ),
@@ -130,12 +130,12 @@ mod tests {
         assert_eq!(
             context
                 .bind(
-                    PSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
+                    ParallelSumScatterOperation::new("empty".to_string(), 0, 0, CollectiveOptions::tiled()),
                     Vec::new(),
                     &[input.clone(), extent.clone()],
                 )
                 .unwrap_err(),
-            ProgramError::Type(TypeError::invalid("`psum_scatter` axis size must be greater than zero")),
+            ProgramError::Type(TypeError::invalid("`parallel_sum_scatter` axis size must be greater than zero")),
         );
 
         check_operation_partial_evaluation!(
@@ -329,7 +329,7 @@ mod tests {
         let result_extent = builder.add_input(dimension_type.clone().into());
         let output = builder
             .add_instruction(
-                PSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
+                ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
                 Vec::new(),
                 vec![array, result_extent],
                 None,
@@ -437,20 +437,20 @@ mod tests {
         let input_variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(input_variable)]));
         let (_, program) = TestContext::trace_with_named_axes(
-            |input| input.psum_scatter("devices", 0),
+            |input| input.parallel_sum_scatter("devices", 0),
             ArrayIrType::Array(input_type),
             vec![("devices".to_string(), NamedAxis::Mesh { axis: 0, size: 2 })],
         )
         .unwrap();
 
-        let [dimension_size, requirement, psum_scatter] = program.instructions() else {
+        let [dimension_size, requirement, parallel_sum_scatter] = program.instructions() else {
             panic!("expected dimension observation, equality requirement, and sum-scatter");
         };
         assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
         assert!(matches!(requirement.operation(), ArrayIrOperation::Dimension(DimensionOperation::Requirement(_)),));
-        assert!(matches!(psum_scatter.operation(), ArrayIrOperation::PSumScatter(_)));
+        assert!(matches!(parallel_sum_scatter.operation(), ArrayIrOperation::ParallelSumScatter(_)));
         assert_eq!(requirement.inputs()[0], dimension_size.outputs()[0]);
-        assert_eq!(psum_scatter.inputs(), &[program.input_ids()[0]]);
+        assert_eq!(parallel_sum_scatter.inputs(), &[program.input_ids()[0]]);
         assert_eq!(program.output_types(), &[ArrayIrType::Array(ArrayType::scalar(DataType::F32))],);
     }
 }

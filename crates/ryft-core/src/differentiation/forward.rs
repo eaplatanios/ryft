@@ -2382,8 +2382,8 @@ mod tests {
     use crate::differentiation::operations::tests::custom_jvp_regions_with_reference_state;
     use crate::differentiation::operations::{CustomJvpOperation, StopGradient, StopGradientOperation};
     use crate::operations::{
-        CollectiveKind, CollectiveOperation, ConditionOperation, CosOperation, Dot, DotDimensionNumbers, MulOperation,
-        Sin, SinOperation, WhileOperation,
+        ConditionOperation, CosOperation, Dot, DotDimensionNumbers, MulOperation, ParallelReduceOperation,
+        ParallelReductionKind, Sin, SinOperation, WhileOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -2451,7 +2451,7 @@ mod tests {
             .jvp(Array::scalar(1.0), |input| {
                 let severed = input.stop_gradient();
                 let mut outputs = severed.context().bind(
-                    CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
+                    ParallelReduceOperation::new("batch".to_string(), ParallelReductionKind::Sum),
                     Vec::new(),
                     &[severed.clone()],
                 )?;

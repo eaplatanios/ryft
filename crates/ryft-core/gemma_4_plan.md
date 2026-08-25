@@ -182,10 +182,10 @@ in `operations/collectives.rs`, with StableHLO lowerings emitting `all_reduce`, 
 |---|---|---|---|
 | mesh sharding annotations | data + tensor parallel training | ✅ | `ReshardOperation` (`Reshard`) and `ShardingConstraintOperation` (`ConstrainSharding`), `Sharding`, `DeviceMesh` |
 | `shard_map` | MoE dispatch, custom collective regions | ✅ | `ShardMapOperation` (lowered via manual computations in `experimental/shard_map.rs`) |
-| `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `CollectiveOperation` with `CollectiveKind::{PSum, PMean, PMax}` (no `PMin`; not needed) |
+| `lax.psum` / `pmean` / `pmax` | gradient sync inside `shard_map` | ✅ | `ParallelReduceOperation` with `ParallelReductionKind::{Sum, Mean, Max}` (no `Min`; not needed) |
 | `lax.all_gather` | tensor-parallel gathers | ✅ | `AllGatherOperation`, tiled/untiled modes, `axis_index_groups` |
-| reduce-scatter | ZeRO-style gradient sharding | ✅ | `PSumScatterOperation` |
-| `lax.ppermute` | pipeline parallelism | ✅ | `PpermuteOperation` (+ `Pshuffle`, `PSwapAxes` conveniences) |
+| reduce-scatter | ZeRO-style gradient sharding | ✅ | `ParallelSumScatterOperation` |
+| `lax.ppermute` | pipeline parallelism | ✅ | `ParallelPermuteOperation` (+ `ParallelShuffle`, `ParallelSwapAxes` conveniences) |
 | `lax.all_to_all` | MoE expert exchange | ✅ | `AllToAllOperation` |
 
 ### 1.9 Autodiff & training transforms
@@ -223,7 +223,7 @@ The transform stack was rebuilt around a single builder entry point:
 - [x] fused `dot_product_attention` (+ backward) with causal mask, sliding window, GQA, dropout, bias, sequence lengths, cuDNN FMHA lowering
 - [x] Device-side RNG (`rng_bit_generator` with ThreeFry/Philox; `split_key`, `normal`, `uniform`, `categorical`)
 - [x] `condition`, `while_loop`, `scan`
-- [x] Collectives (`psum`/`pmean`/`pmax`, `all_gather`, `psum_scatter`, `ppermute`, `all_to_all`) + `shard_map`, `reshard`, sharding constraints
+- [x] Collectives (`parallel_sum`/`parallel_mean`/`parallel_max`, `all_gather`, `parallel_sum_scatter`, `parallel_permute`, `all_to_all`) + `shard_map`, `reshard`, sharding constraints
 - [x] Activation checkpointing (`rematerialize` with JAX-parity policies and offload)
 - [x] `custom_jvp` / `custom_vjp`, `stop_gradient`, `tag`, `print`, `custom_call`, `transfer_to_memory`
 - [x] `jvp`, `linearize`, `vjp`, `gradient`, `value_and_gradient`, Jacobians/Hessians, `batch` (vmap), backend-neutral `jit`

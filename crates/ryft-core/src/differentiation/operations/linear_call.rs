@@ -294,10 +294,10 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         // is the level being unnamed rather than the operands being replicated: an attached region's value can vary per
         // batch item with no mapped operand at all, but only by addressing the level _by name_ (e.g., an `axis_index`
         // or a collective over this level's axis, both of which a transposed program naturally contains because
-        // `all_gather` transposes to `psum_scatter` and vice versa). Every named-axis operation resolves the level it
-        // belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an unnamed level is
-        // provably invisible to all of them, including those of operation families this crate does not know about. A
-        // named level therefore batches its regions structurally, which is also what lets the named-axis operations
+        // `all_gather` transposes to `parallel_sum_scatter` and vice versa). Every named-axis operation resolves the
+        // level it belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an unnamed level
+        // is provably invisible to all of them, including those of operation families this crate does not know about.
+        // A named level therefore batches its regions structurally, which is also what lets the named-axis operations
         // inside them resolve against it.
         if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
             let outputs = context.parent().bind(

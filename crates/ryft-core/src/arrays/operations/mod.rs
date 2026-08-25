@@ -27,7 +27,9 @@ use crate::differentiation::{
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
 };
-use crate::operations::collectives::{AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation};
+use crate::operations::collectives::{
+    AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
+};
 use crate::operations::complex::{
     Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
@@ -36,24 +38,27 @@ use crate::operations::random::RngBitGeneratorOperation;
 use crate::operations::sort::{Sort, SortOperation};
 use crate::operations::{
     Abs, AbsOperation, Add, AddOperation, And, AndOperation, Atan2, Atan2Operation, Broadcast, BroadcastOperation,
-    Ceil, CeilOperation, CollectiveOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation,
-    ConditionOperation, ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation,
-    DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
-    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
-    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
-    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
-    DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
-    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log,
-    LogOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
-    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation, Pow,
-    PowOperation, PrintOperation, Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation,
-    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
-    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Ceil, CeilOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation,
+    ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, CumulativeLogSumExp,
+    CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
+    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, DimensionAddOperation,
+    DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
+    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
+    DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation, DynamicShapeSliceOperation,
+    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
+    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log, Log1p, Log1pOperation, LogAddExp,
+    LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation,
+    Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation,
+    OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow, PowOperation, PrintOperation,
+    Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation,
+    Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select,
+    SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
+    SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
+    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     FreezeReference, FreezeReferenceOperation, MaybeZero, NewReference, NewReferenceOperation, Operation,
@@ -70,6 +75,7 @@ mod compare;
 mod complex;
 mod constants;
 mod control_flow;
+mod cumulative;
 mod custom_call;
 mod dimensions;
 mod logical;
@@ -82,6 +88,10 @@ mod references;
 mod sharding;
 mod sort;
 mod tag;
+
+// The element-level extrema of the reference kernels are the canonical least and greatest values of each element data
+// type, so the ragged identity masking of `arrays::batching` reads them through this facade instead of restating them.
+pub(crate) use math::ElementExtremum;
 
 // TODO(eaplatanios): This seems a bit weirdly placed.
 pub use references::{
@@ -118,6 +128,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Atan2(Atan2Operation<ArrayType>),
     Exp(ExpOperation<ArrayType>),
     Log(LogOperation<ArrayType>),
+    Log1p(Log1pOperation<ArrayType>),
+    LogAddExp(LogAddExpOperation<ArrayType>),
     Sqrt(SqrtOperation<ArrayType>),
     Rsqrt(RsqrtOperation<ArrayType>),
     Tanh(TanhOperation<ArrayType>),
@@ -144,12 +156,18 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     DotProductAttention(DotProductAttentionOperation),
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
     Reduce(ReduceOperation),
+    LogSumExp(LogSumExpOperation),
+    CumulativeSum(CumulativeSumOperation),
+    CumulativeProduct(CumulativeProductOperation),
+    CumulativeMax(CumulativeMaxOperation),
+    CumulativeMin(CumulativeMinOperation),
+    CumulativeLogSumExp(CumulativeLogSumExpOperation),
     Sort(SortOperation),
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
-    Collective(CollectiveOperation),
+    ParallelReduce(ParallelReduceOperation),
     AllGather(AllGatherOperation),
-    PSumScatter(PSumScatterOperation),
-    Ppermute(PpermuteOperation),
+    ParallelSumScatter(ParallelSumScatterOperation),
+    ParallelPermute(ParallelPermuteOperation),
     AllToAll(AllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
@@ -212,11 +230,12 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     explicit algorithm state rather than shaping a value-to-value capability;
 ///   - the collectives ([`AllGather`](crate::operations::collectives::AllGather),
 ///     [`AllToAll`](crate::operations::collectives::AllToAll),
-///     [`PSumScatter`](crate::operations::collectives::PSumScatter),
-///     [`PSwapAxes`](crate::operations::collectives::PSwapAxes),
-///     [`Pshuffle`](crate::operations::collectives::Pshuffle), [`Reshard`](crate::operations::sharding::Reshard),
+///     [`ParallelSumScatter`](crate::operations::collectives::ParallelSumScatter),
+///     [`ParallelSwapAxes`](crate::operations::collectives::ParallelSwapAxes),
+///     [`ParallelShuffle`](crate::operations::collectives::ParallelShuffle),
+///     [`Reshard`](crate::operations::sharding::Reshard),
 ///     [`ConstrainSharding`](crate::operations::sharding::ConstrainSharding),
-///     [`Collective`](crate::operations::collectives::Collective), and
+///     [`ParallelReduce`](crate::operations::collectives::ParallelReduce), and
 ///     [`TransferToMemory`](crate::operations::memory::TransferToMemory)), so that single-device generic code never
 ///     carries sharded-programming obligations; and
 ///   - differentiation plumbing such as [`ReverseModeDifferentiate`](crate::differentiation::ReverseModeDifferentiate)
@@ -240,7 +259,8 @@ pub trait ArrayOperations:
     + StandardMul<Output = Self> + StandardDiv<Output = Self>
     + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign
     // Elementwise math and logic.
-    + Sin + Cos + Atan2 + Exp + Log + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil + Round
+    + Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil
+    + Round
     + Not + And + Or + Xor
     // Complex numbers.
     + Complex + Conjugate + Real + Imaginary
@@ -250,7 +270,8 @@ pub trait ArrayOperations:
     + Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
     + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
-    + Dot + ScaledDot + DotProductAttention + Reduce
+    + Dot + ScaledDot + DotProductAttention + Reduce + LogSumExp
+    + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
     // Constants and differentiation barriers.
     + ZeroLike + OneLike + StopGradient
 {
@@ -263,11 +284,14 @@ where
     V: Value<Type = ArrayType>,
     V: StandardNeg<Output = V> + StandardAdd<Output = V> + StandardSub<Output = V> + StandardMul<Output = V>,
     V: StandardDiv<Output = V> + Neg + Add + Sub + Mul + Div + Rem + Pow + Max + Min + Abs + Sign,
-    V: Sin + Cos + Atan2 + Exp + Log + Sqrt + Rsqrt + Tanh + Logistic + Erf + Floor + Ceil + Round,
+    V: Sin + Cos + Atan2 + Exp + Log + Log1p + LogAddExp + Sqrt + Rsqrt + Tanh + Logistic + Erf,
+    V: Floor + Ceil + Round,
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
-    V: Dot + ScaledDot + DotProductAttention + Reduce + ZeroLike + OneLike + StopGradient,
+    V: Dot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
+    V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
+    V: ZeroLike + OneLike + StopGradient,
 {
 }
 
@@ -469,7 +493,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
     /// Mixed sum-scatter whose trailing dimension operands define every result axis in axis order.
     #[ryft(mixed)]
-    PSumScatter(PSumScatterOperation),
+    ParallelSumScatter(ParallelSumScatterOperation),
 
     /// Mixed all-to-all whose trailing dimension operands define every result axis in axis order.
     #[ryft(mixed)]
@@ -800,6 +824,7 @@ where
             | ArrayOperation::Max(_)
             | ArrayOperation::Min(_)
             | ArrayOperation::Atan2(_)
+            | ArrayOperation::LogAddExp(_)
             | ArrayOperation::And(_)
             | ArrayOperation::Or(_)
             | ArrayOperation::Xor(_)
@@ -2874,7 +2899,7 @@ mod tests {
             ArrayIrOperation::DynamicShapeSlice(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::RngBitGenerator(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::AllGather(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::PSumScatter(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::AllToAll(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
@@ -2999,7 +3024,7 @@ mod tests {
                 MemberKindSignature::GeometryMixed,
             ),
             (
-                ArrayIrOperation::PSumScatter(PSumScatterOperation::new(
+                ArrayIrOperation::ParallelSumScatter(ParallelSumScatterOperation::new(
                     "x".to_string(),
                     2,
                     0,

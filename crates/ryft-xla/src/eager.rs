@@ -283,12 +283,13 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CpuArray, ArrayType, Atan2, BatchAxis, Ceil, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, Cos, DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension,
-        DimensionBounds, Dot, Erf, Exp, Floor, ForwardModeDifferentiate, Log, LogicalMesh, Logistic, Max, MeshAxis,
-        MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape,
-        ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation,
-        ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient,
-        Tag, Tanh, Transpose, TypeError, UpdateSlice, ZeroLike, batch, differentiate_at,
+        ConvertElementType, Cos, CumulativeLogSumExp, CumulativeMax, CumulativeMin, CumulativeProduct, CumulativeSum,
+        DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension, DimensionBounds, Dot, Erf, Exp, Floor,
+        ForwardModeDifferentiate, Log, Log1p, LogAddExp, LogSumExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType,
+        Min, OneLike, Pad, Pow, ProjectedContext, Reduce, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round,
+        Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+        ShardingDimension, Sign, Sin, Slice, Sqrt, StaticShape, StopGradient, Tag, Tanh, Transpose, TypeError,
+        UpdateSlice, ZeroLike, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -521,6 +522,51 @@ mod tests {
         assert_parity(&left.max(&right).unwrap(), &reference_left.max(&reference_right).unwrap());
         assert_parity(&left.min(&right).unwrap(), &reference_left.min(&reference_right).unwrap());
         assert_parity(&left.rem(&right).unwrap(), &reference_left.rem(&reference_right).unwrap());
+
+        // The logarithmic operations that XLA has no primitive for lower as expansions, so their agreement with the
+        // reference kernels is what pins those expansions to the semantics `ryft-core` documents.
+        assert_parity(&left.log1p().unwrap(), &reference_left.log1p().unwrap());
+        assert_parity(&left.log_add_exp(&right).unwrap(), &reference_left.log_add_exp(&reference_right).unwrap());
+        assert_parity(&left.log_sum_exp(&[0]).unwrap(), &reference_left.log_sum_exp(&[0]).unwrap());
+
+        // The `log_add_exp` expansion routes same-sign infinities and NaN operands through its plain `a + b` arm, so
+        // `+inf` absorbs, `-inf` is the identity, and NaN is contagious. Those values cannot pass through a
+        // difference-based tolerance, so both backends are pinned to the exact same four results directly.
+        let infinite_values = [f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NAN];
+        let guarded_values = [f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, 1.25];
+        let infinite = f32_vector(&client, &mesh, &infinite_values);
+        let guarded = f32_vector(&client, &mesh, &guarded_values);
+        let device_values = read_f32s(&infinite.log_add_exp(&guarded).unwrap());
+        assert_eq!(device_values[0], f32::INFINITY);
+        assert_eq!(device_values[1], f32::NEG_INFINITY);
+        assert_eq!(device_values[2], f32::INFINITY);
+        assert!(device_values[3].is_nan(), "{device_values:?}");
+        let reference_values = CpuArray::vector(infinite_values.to_vec())
+            .log_add_exp(&CpuArray::vector(guarded_values.to_vec()))
+            .unwrap()
+            .to_f64s();
+        assert_eq!(reference_values[0], f64::INFINITY);
+        assert_eq!(reference_values[1], f64::NEG_INFINITY);
+        assert_eq!(reference_values[2], f64::INFINITY);
+        assert!(reference_values[3].is_nan(), "{reference_values:?}");
+
+        // Both scan directions of the `reduce_window` cumulative-sum lowering agree with the reference prefix-sum
+        // kernel element for element, and so does every other combining operator of the scan family.
+        assert_parity(&left.cumulative_sum(0).unwrap(), &reference_left.cumulative_sum(0).unwrap());
+        assert_parity(&left.reverse_cumulative_sum(0).unwrap(), &reference_left.reverse_cumulative_sum(0).unwrap());
+        assert_parity(&left.cumulative_product(0).unwrap(), &reference_left.cumulative_product(0).unwrap());
+        assert_parity(
+            &left.reverse_cumulative_product(0).unwrap(),
+            &reference_left.reverse_cumulative_product(0).unwrap(),
+        );
+        // The extrema scans are witnessed on operands whose prefixes actually move: `left` is strictly increasing, so
+        // a running maximum that collapsed into a global maximum would disagree, and `right` is non-monotone, so its
+        // reverse maximum `[4, 2.5, 2.5, 2.5]` disagrees with both a global maximum and a pass-through operand.
+        assert_parity(&left.cumulative_max(0).unwrap(), &reference_left.cumulative_max(0).unwrap());
+        assert_parity(&right.reverse_cumulative_max(0).unwrap(), &reference_right.reverse_cumulative_max(0).unwrap());
+        assert_parity(&right.cumulative_min(0).unwrap(), &reference_right.cumulative_min(0).unwrap());
+        assert_parity(&right.reverse_cumulative_min(0).unwrap(), &reference_right.reverse_cumulative_min(0).unwrap());
+        assert_parity(&left.cumulative_log_sum_exp(0).unwrap(), &reference_left.cumulative_log_sum_exp(0).unwrap());
 
         // Element-type conversion agrees, including the exact `f8e4m3fn` encodings: the device payload bytes match
         // the reference backend's encoded bits bit for bit.

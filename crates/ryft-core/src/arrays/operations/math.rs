@@ -25,10 +25,12 @@ use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::StaticShape;
 use crate::macros::check_types;
 use crate::operations::math::erf::erf_f64;
+use crate::operations::math::log_sum_exp::{log_sum_exp_abstract, validate_log_sum_exp_data_type};
 use crate::operations::math::reduce::reduce_abstract;
 use crate::operations::{
     Abs, Add, Atan2, Ceil, ConvertElementType, Cos, Div, Dot, DotDimensionNumbers, DotOperation, Erf, Exp, Floor, Log,
-    Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, Sign, Sin, Sqrt, Sub, Tanh,
+    Log1p, LogAddExp, LogSumExp, Logistic, Max, Min, Mul, Neg, Pow, Reduce, ReductionKind, Rem, Round, Rsqrt, Sign,
+    Sin, Sqrt, Sub, Tanh,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
@@ -135,9 +137,15 @@ trait ElementFloatMath: ArrayElement {
 }
 
 /// Operations supported only by real floating-point array elements.
-trait ElementRealFloatMath: ArrayElement {
+pub(crate) trait ElementRealFloatMath: ArrayElement {
     /// Computes the Gauss error function of this element.
     fn erf(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(1 + self)` without forming `1 + self`.
+    fn log1p(self) -> Result<Self, ProgramError>;
+
+    /// Computes `log(exp(self) + exp(other))` without forming either exponential.
+    fn log_add_exp(self, other: Self) -> Result<Self, ProgramError>;
 
     /// Rounds this element toward negative infinity.
     fn floor(self) -> Result<Self, ProgramError>;
@@ -950,6 +958,25 @@ macro_rules! impl_array_math_for_real_float {
             }
 
             #[inline]
+            fn log1p(self) -> Result<Self, ProgramError> {
+                ($encode)(<$work>::ln_1p(($decode)(self)))
+            }
+
+            fn log_add_exp(self, other: Self) -> Result<Self, ProgramError> {
+                // The pinned `select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))` construction. The
+                // difference is NaN exactly when it is undefined (same-sign infinities) or when an operand is NaN,
+                // which is what routes those cases through the saturating sum.
+                let left = ($decode)(self);
+                let right = ($decode)(other);
+                let delta = left - right;
+                ($encode)(if <$work>::is_nan(delta) {
+                    left + right
+                } else {
+                    <$work>::max(left, right) + <$work>::ln_1p(<$work>::exp(-<$work>::abs(delta)))
+                })
+            }
+
+            #[inline]
             fn floor(self) -> Result<Self, ProgramError> {
                 ($encode)(<$work>::floor(($decode)(self)))
             }
@@ -1326,6 +1353,66 @@ impl Array {
             let value = combine(T::decode(&bytes[output_range.clone()]), input_value)?;
             value.encode(&mut bytes[output_range]);
             input_addressing.advance_index(&mut input_index);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+
+    /// Computes one numerically stable `log(sum(exp(x)))` directly over typed elements, following the guarded
+    /// construction that [`LogSumExpOperation`](crate::operations::math::LogSumExpOperation) documents: a maximum
+    /// reduction whose identity is the element type's own lowest value, that maximum replaced by zero wherever it is
+    /// not finite, and then `log(sum(exp(x - safe_maximum))) + safe_maximum`. Every intermediate is held in the
+    /// element's own encoding, so the result matches what the equivalent staged program computes.
+    fn log_sum_exp_elements<T: ElementZero + ElementAdd + ElementSub + ElementExtremum + ElementFloatMath>(
+        &self,
+        output_type: ArrayType,
+        axes: &[usize],
+    ) -> Result<Self, ProgramError> {
+        debug_assert_eq!(self.r#type().data_type(), T::data_type());
+        debug_assert_eq!(output_type.data_type(), T::data_type());
+        let zero = T::zero()?;
+        let mut maximums =
+            self.reduce_elements::<T>(output_type.clone(), axes, T::maximum_identity(), |left, right| {
+                Ok(left.maximum(right))
+            })?;
+        maximums.map_elements_in_place::<T>(|value| {
+            Ok(if value.convert_to::<f64>()?.is_finite() { value } else { zero })
+        })?;
+
+        let input_shape = self.r#type().static_shape().unwrap();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut reduce_mask = vec![false; input_shape.rank()];
+        axes.iter().for_each(|axis| reduce_mask[*axis] = true);
+
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        for output in 0..output_addressing.element_count() {
+            zero.encode(&mut bytes[output_addressing.byte_range_for_flat_index(output)]);
+        }
+
+        let mut input_index = vec![0usize; input_shape.rank()];
+        let mut output_index = vec![0usize; output_type.rank()];
+        for _ in 0..input_addressing.element_count() {
+            let mut output_axis = 0usize;
+            for axis in 0..input_shape.rank() {
+                if !reduce_mask[axis] {
+                    output_index[output_axis] = input_index[axis];
+                    output_axis += 1;
+                }
+            }
+            let input_value = T::decode(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            let output_range = output_addressing.byte_range_unchecked(&output_index);
+            let maximum = T::decode(&maximums.storage_bytes()[output_range.clone()]);
+            let shifted = input_value.sub(maximum)?.exp()?;
+            let sum = T::decode(&bytes[output_range.clone()]).add(shifted)?;
+            sum.encode(&mut bytes[output_range]);
+            input_addressing.advance_index(&mut input_index);
+        }
+
+        for output in 0..output_addressing.element_count() {
+            let range = output_addressing.byte_range_for_flat_index(output);
+            let maximum = T::decode(&maximums.storage_bytes()[range.clone()]);
+            let value = T::decode(&bytes[range.clone()]).log()?.add(maximum)?;
+            value.encode(&mut bytes[range]);
         }
         Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
     }
@@ -1733,21 +1820,12 @@ macro_rules! impl_array_unary_math {
 }
 
 macro_rules! impl_array_binary_float_math {
+    // Public form: a binary operation supported by both real floating-point and complex elements.
     ($trait:ident, $method:ident, $argument:ident) => {
-        impl $trait for Array {
-            fn $method(&self, $argument: &Self) -> Result<Self, ProgramError> {
-                let output_type = Broadcastable::broadcast(self.r#type().as_ref(), $argument.r#type().as_ref())
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                if Self::element_count(&output_type) == 0 {
-                    let addressing = ArrayAddressing::new(output_type.clone())?;
-                    return Ok(Self::new_unchecked(output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
-                }
-                let left_type = self.r#type().data_type();
-                let right_type = $argument.r#type().data_type();
-                check_types!(@float, stringify!($method), [left_type, right_type]);
-                let data_type = output_type.data_type();
-                let left = self.promoted_to(data_type)?;
-                let right = $argument.promoted_to(data_type)?;
+        impl_array_binary_float_math! {
+            @kernel $trait, $method, $argument,
+            element_types = (@float),
+            evaluate = |data_type, left, right, output_type| {
                 if data_type.is_complex() {
                     dispatch_on_array_element_type!(@complex data_type, |Element| {
                         left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
@@ -1761,6 +1839,50 @@ macro_rules! impl_array_binary_float_math {
                         })
                     })
                 }
+            },
+        }
+    };
+
+    // Public form: a binary operation supported only by real floating-point elements.
+    (@real_float $trait:ident, $method:ident, $argument:ident) => {
+        impl_array_binary_float_math! {
+            @kernel $trait, $method, $argument,
+            element_types = (@float @real),
+            evaluate = |data_type, left, right, output_type| {
+                dispatch_on_array_element_type!(@float data_type, |Element| {
+                    left.binary_elements::<Element, Element>(&right, output_type, |left, right| {
+                        <Element as ElementRealFloatMath>::$method(left, right)
+                    })
+                })
+            },
+        }
+    };
+
+    // Internal branch: the prologue every binary floating-point kernel shares. It broadcasts the operand types, takes
+    // the empty-result shortcut, validates both element data types against the requested `check_types!` selector, and
+    // promotes both operands into the result's element type, then hands those bindings to the caller's element-level
+    // evaluation. The four binding names come from the invoking branch so that they are visible inside its own
+    // `evaluate` block.
+    (
+        @kernel $trait:ident, $method:ident, $argument:ident,
+        element_types = ($($element_types:tt)*),
+        evaluate = |$data_type:ident, $left:ident, $right:ident, $output_type:ident| $evaluate:block $(,)?
+    ) => {
+        impl $trait for Array {
+            fn $method(&self, $argument: &Self) -> Result<Self, ProgramError> {
+                let $output_type = Broadcastable::broadcast(self.r#type().as_ref(), $argument.r#type().as_ref())
+                    .map_err(|error| TypeError::invalid(error.to_string()))?;
+                if Self::element_count(&$output_type) == 0 {
+                    let addressing = ArrayAddressing::new($output_type.clone())?;
+                    return Ok(Self::new_unchecked($output_type, Arc::new(vec![0; addressing.storage_byte_len()])));
+                }
+                let left_type = self.r#type().data_type();
+                let right_type = $argument.r#type().data_type();
+                check_types!($($element_types)*, stringify!($method), [left_type, right_type]);
+                let $data_type = $output_type.data_type();
+                let $left = self.promoted_to($data_type)?;
+                let $right = $argument.promoted_to($data_type)?;
+                $evaluate
             }
         }
     };
@@ -1771,6 +1893,8 @@ impl_array_unary_math!(@float_math Cos, cos, "cosine");
 impl_array_binary_float_math!(Atan2, atan2, x);
 impl_array_unary_math!(@float_math Exp, exp, "exponential");
 impl_array_unary_math!(@float_math Log, log, "logarithm");
+impl_array_unary_math!(@real_float Log1p, log1p, "cannot compute `log1p` of a scalar of data type {}");
+impl_array_binary_float_math!(@real_float LogAddExp, log_add_exp, other);
 impl_array_unary_math!(@float_math Sqrt, sqrt, "square root");
 impl_array_unary_math!(@float_math Rsqrt, rsqrt, "reciprocal square root");
 impl_array_unary_math!(@float_math Tanh, tanh, "hyperbolic tangent");
@@ -1856,6 +1980,24 @@ impl Reduce for Array {
             ReductionKind::All => self.reduce_elements::<bool>(output_type, axes, true, |left, right| Ok(left & right)),
         };
         output.unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+impl LogSumExp for Array {
+    fn log_sum_exp(&self, axes: &[usize]) -> Result<Self, ProgramError> {
+        // Reducing along no axes is the identity, but only for the operands this primitive accepts at all, so the
+        // element data type is validated before the shortcut is taken.
+        if axes.is_empty() {
+            validate_log_sum_exp_data_type(self.r#type().data_type())?;
+            return Ok(self.clone());
+        }
+        // Reuse the abstract rule for validation and for the complete result metadata. The concrete kernel below then
+        // decodes directly from the input's physical layout into the result's addressed storage.
+        let output_type = log_sum_exp_abstract(self.r#type().as_ref(), axes)?;
+        let data_type = output_type.data_type();
+        dispatch_on_array_element_type!(@float data_type, |Element| {
+            self.log_sum_exp_elements::<Element>(output_type, axes)
+        })
     }
 }
 

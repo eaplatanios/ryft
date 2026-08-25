@@ -14,7 +14,8 @@ use ryft_core::operations::attention::{
     AttentionConfiguration, AttentionImplementation, AttentionInputs, DotProductAttention,
 };
 use ryft_core::operations::collectives::{
-    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, PSumScatter, PSwapAxes, Pshuffle,
+    AllGather, AllGatherOutputVariance, AllToAll, CollectiveOptions, ParallelShuffle, ParallelSumScatter,
+    ParallelSwapAxes,
 };
 use ryft_core::{
     Array as CpuArray, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
@@ -74,8 +75,8 @@ struct DifferentialCase {
 fn registry() -> Vec<DifferentialCase> {
     let cases = vec![
         DifferentialCase { case_id: "grouped_shape_changing_collectives", emit: emit_grouped_collectives },
-        DifferentialCase { case_id: "pshuffle", emit: emit_pshuffle },
-        DifferentialCase { case_id: "pswapaxes", emit: emit_pswapaxes },
+        DifferentialCase { case_id: "pshuffle", emit: emit_parallel_shuffle },
+        DifferentialCase { case_id: "pswapaxes", emit: emit_parallel_swap_axes },
         DifferentialCase { case_id: "data_dependent_prefix_take", emit: emit_data_dependent_prefix_take },
         DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul },
         DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention },
@@ -222,7 +223,7 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
                             local_input
                                 .all_gather_with_options("x", 0, options.clone(), AllGatherOutputVariance::Varying)
                                 .unwrap(),
-                            local_input.clone().psum_scatter_with_options("x", 0, options.clone()).unwrap(),
+                            local_input.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
                             local_input.all_to_all_with_options("x", 0, 0, options).unwrap(),
                         )
                     },
@@ -263,8 +264,8 @@ fn emit_grouped_collectives() -> Result<DifferentialObservation, Box<dyn Error>>
     })
 }
 
-/// Emits `pshuffle` behavior plus its canonical `collective_permute` StableHLO module.
-fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
+/// Emits `parallel_shuffle` behavior plus its canonical `collective_permute` StableHLO module.
+fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, sharding) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
     let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -272,7 +273,7 @@ fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
             let sharding = sharding.clone();
             move |input: ShardMapTracer| {
                 shard_map::<_, _, ArrayType, _>(
-                    |local_input: ShardMapTracer| local_input.pshuffle("x", &[2, 0, 3, 1]).unwrap(),
+                    |local_input: ShardMapTracer| local_input.parallel_shuffle("x", &[2, 0, 3, 1]).unwrap(),
                     input,
                     mesh.clone(),
                     sharding.clone(),
@@ -306,9 +307,9 @@ fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         ArrayIrValue::Array(CpuArray::matrix(4, 2, (0..8).map(|value| value as f32).collect())),
         BatchAxis::new(0),
     )?;
-    let output = BatchingTracer::new(context, input).pshuffle("x", &[2, 0, 3, 1])?.into_batch();
+    let output = BatchingTracer::new(context, input).parallel_shuffle("x", &[2, 0, 3, 1])?.into_batch();
     let ArrayIrValue::Array(output) = output.into_value() else {
-        unreachable!("pshuffle preserves the array member kind")
+        unreachable!("parallel_shuffle preserves the array member kind")
     };
     let surface_output = output
         .to_f64s()
@@ -317,7 +318,7 @@ fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         .collect::<Vec<_>>();
     let lowered_output = outputs.iter().map(|device| device[0].clone()).collect::<Vec<_>>();
     if surface_output != lowered_output {
-        return Err("pshuffle composition disagrees with its canonical ppermute lowering".into());
+        return Err("`parallel_shuffle` composition disagrees with its canonical `parallel_permute` lowering".into());
     }
     Ok(DifferentialObservation {
         schema: SCHEMA,
@@ -328,8 +329,8 @@ fn emit_pshuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     })
 }
 
-/// Emits `pswapaxes` behavior plus its canonical `all_to_all` StableHLO module.
-fn emit_pswapaxes() -> Result<DifferentialObservation, Box<dyn Error>> {
+/// Emits `parallel_swap_axes` behavior plus its canonical `all_to_all` StableHLO module.
+fn emit_parallel_swap_axes() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, _) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
     let sharding =
@@ -339,7 +340,7 @@ fn emit_pswapaxes() -> Result<DifferentialObservation, Box<dyn Error>> {
             let sharding = sharding.clone();
             move |input: ShardMapTracer| {
                 shard_map::<_, _, ArrayType, _>(
-                    |local_input: ShardMapTracer| local_input.pswapaxes("x", 0).unwrap(),
+                    |local_input: ShardMapTracer| local_input.parallel_swap_axes("x", 0).unwrap(),
                     input,
                     mesh.clone(),
                     sharding.clone(),

@@ -1225,8 +1225,10 @@ fn is_effective_identity(
         })
 }
 
-/// Constructs a scalar type on the same mesh with the same non-dimensional dependency metadata as `source`.
-fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
+/// Constructs a scalar type on the same mesh with the same non-dimensional dependency metadata as `source`. This is
+/// the type a padding value must have to pad a `source`-typed operand, so rules that stage their own `pad` build
+/// their padding constant against it.
+pub(crate) fn dependency_scalar_type(source: &ArrayType) -> Result<ArrayType, TypeError> {
     let sharding = source
         .sharding()
         .map(|sharding| {

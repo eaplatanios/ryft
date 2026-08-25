@@ -10,6 +10,7 @@ pub mod compare;
 pub mod complex;
 pub mod constants;
 pub mod control_flow;
+pub mod cumulative;
 pub mod custom_call;
 pub mod debugging;
 pub mod dimensions;
@@ -25,10 +26,11 @@ pub mod sort;
 pub mod tag;
 
 // TODO(eaplatanios): We should be importing specific symbols here wherever possible / relevant.
-pub use collectives::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
+pub use collectives::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind, forward_collective_to_parent};
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
+pub use cumulative::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,

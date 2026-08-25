@@ -4244,12 +4244,27 @@ fn scatter_data_dependent_padding_discipline(kind: ScatterReductionKind) -> Data
 fn array_data_dependent_padding_discipline(
     operation: &ArrayOperation<crate::experimental::ops::XlaArrayConstant>,
 ) -> DataDependentPaddingDiscipline {
-    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaZeroPadded};
+    use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked, XlaZeroPadded};
 
     match operation {
         ArrayOperation::Reduce(operation) => reduction_data_dependent_padding_discipline(operation.kind()),
+        // The lowering expands `log_sum_exp` into a maximum reduction and a summation reduction over the same axes,
+        // so it inherits the masking contract of exactly those two reduction kinds: XLA masks each reduction's
+        // operand with that reduction's own identity, which wipes the padding lanes of the shifted exponentials
+        // before they are summed. The rank-2 arm of `data_derived_padding_fixture` executes that expansion with the
+        // data-derived extent on the kept axis, which is the admission's execution evidence.
+        ArrayOperation::LogSumExp(_) => XlaMasked,
         ArrayOperation::Sort(operation) => sort_data_dependent_padding_discipline(operation.direction()),
         ArrayOperation::Scatter(operation) => scatter_data_dependent_padding_discipline(operation.kind()),
+        // A prefix scan mixes positions only along its scanned axis, and type inference already requires that axis to
+        // be static, so a data-derived extent can only sit on an axis the scan treats elementwise. That reasoning is
+        // the same for every combining operator of the family, so all five members share this arm, and the prefix sum
+        // in `data_derived_padding_fixture` executes it with the data-derived extent on the unscanned axis.
+        ArrayOperation::CumulativeSum(_)
+        | ArrayOperation::CumulativeProduct(_)
+        | ArrayOperation::CumulativeMax(_)
+        | ArrayOperation::CumulativeMin(_)
+        | ArrayOperation::CumulativeLogSumExp(_) => Propagated,
         ArrayOperation::Dot(_) => XlaZeroPadded,
         ArrayOperation::ScaledDot(_) => RyftMasked,
         ArrayOperation::DotProductAttention(_) | ArrayOperation::DotProductAttentionBackward(_) => RyftMasked,
@@ -4275,6 +4290,8 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Atan2(_)
         | ArrayOperation::Exp(_)
         | ArrayOperation::Log(_)
+        | ArrayOperation::Log1p(_)
+        | ArrayOperation::LogAddExp(_)
         | ArrayOperation::Sqrt(_)
         | ArrayOperation::Rsqrt(_)
         | ArrayOperation::Tanh(_)
@@ -4296,10 +4313,10 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::Conjugate(_)
         | ArrayOperation::Real(_)
         | ArrayOperation::Imaginary(_)
-        | ArrayOperation::Collective(_)
+        | ArrayOperation::ParallelReduce(_)
         | ArrayOperation::AllGather(_)
-        | ArrayOperation::PSumScatter(_)
-        | ArrayOperation::Ppermute(_)
+        | ArrayOperation::ParallelSumScatter(_)
+        | ArrayOperation::ParallelPermute(_)
         | ArrayOperation::AllToAll(_)
         | ArrayOperation::AxisIndex(_)
         | ArrayOperation::Transpose(_)
@@ -4366,7 +4383,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         | XlaOperation::Pad(_)
         | XlaOperation::DynamicShapeSlice(_)
         | XlaOperation::AllGather(_)
-        | XlaOperation::PSumScatter(_)
+        | XlaOperation::ParallelSumScatter(_)
         | XlaOperation::AllToAll(_)
         | XlaOperation::Condition(_)
         | XlaOperation::While(_)
@@ -5277,16 +5294,18 @@ mod tests {
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, ArraySliceAxis, Atan2Operation, CalleeRegionDriver,
         CaptureReference, CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher,
-        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CustomJvpOperation, Dimension,
-        DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation,
-        DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-        DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-        DynamicShapeSliceOperation, Fill, FreezeReference, FreezeReferenceOperation, IotaOperation, MulOperation,
-        NegOperation, NewReference, NewReferenceOperation, OneOperation, PrintOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ScaledDotOperation,
-        ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension,
-        StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
+        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CumulativeLogSumExpOperation,
+        CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
+        CustomJvpOperation, Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
+        DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
+        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
+        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, FreezeReference, FreezeReferenceOperation,
+        IotaOperation, LogSumExpOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation,
+        OneOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceIndexOperation, ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation,
+        ReferenceSwapOperation, ReferenceType, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers,
+        ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation,
+        ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -5506,6 +5525,8 @@ mod tests {
     fn data_derived_padding_fixture(size_type: ArrayType, extent: DimensionVariable) -> FlatXlaProgram {
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone())]));
         let index_type = dynamic_type.clone().with_data_type(DataType::U64);
+        let matrix_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(4)]));
 
         // The iota and its negation make physical suffix lanes numerically distinguishable from every admitted live
         // prefix. This catches both reduction identities and the opposite sentinels needed by ascending and descending
@@ -5573,6 +5594,22 @@ mod tests {
                 None,
             )
             .unwrap()[0];
+
+        // The rank-2 `i + j` matrix carries the data-derived extent on an axis that neither the reduction nor the scan
+        // touches, which is the configuration those two disciplines actually admit: `log_sum_exp` consumes the static
+        // axis and still has to produce a dynamically shaped result, and the prefix scan consumes the static axis
+        // while every row it emits keeps the dynamic extent.
+        let rows = builder
+            .add_instruction(IotaOperation::new(matrix_type.clone(), 0).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(IotaOperation::new(matrix_type, 1).unwrap(), Vec::new(), vec![dimension], None)
+            .unwrap()[0];
+        let matrix = builder.add_instruction(AddOperation::new(), Vec::new(), vec![rows, columns], None).unwrap()[0];
+        let log_sum_exp =
+            builder.add_instruction(LogSumExpOperation::new(vec![1]), Vec::new(), vec![matrix], None).unwrap()[0];
+        let cumulative_sum =
+            builder.add_instruction(CumulativeSumOperation::new(1), Vec::new(), vec![matrix], None).unwrap()[0];
         builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![
@@ -5586,9 +5623,13 @@ mod tests {
                     any,
                     all,
                     dot,
+                    log_sum_exp,
+                    cumulative_sum,
                 ],
                 vec![Placeholder],
                 vec![
+                    Placeholder,
+                    Placeholder,
                     Placeholder,
                     Placeholder,
                     Placeholder,
@@ -7482,7 +7523,7 @@ mod tests {
 
     #[test]
     fn test_data_dependent_padding_inventory_is_kind_and_kernel_specific() {
-        use DataDependentPaddingDiscipline::{RyftMasked, Unsupported, XlaMasked};
+        use DataDependentPaddingDiscipline::{Propagated, RyftMasked, Unsupported, XlaMasked};
 
         // Every reference operation shares one collapsed match arm, so one representative pins that arm.
         assert_eq!(
@@ -7539,6 +7580,25 @@ mod tests {
             )),
         ] {
             assert_eq!(array_data_dependent_padding_discipline(&operation), RyftMasked);
+        }
+
+        // `log_sum_exp` expands into a maximum reduction and a summation reduction, so it carries the same masking
+        // contract that those two reduction kinds carry.
+        assert_eq!(
+            array_data_dependent_padding_discipline(&ArrayOperation::LogSumExp(LogSumExpOperation::new(vec![0]))),
+            XlaMasked,
+        );
+
+        // The prefix scans own their own arm rather than sharing the collapsed shape-preserving one, because the
+        // classification rests on type inference keeping the scanned axis static.
+        for operation in [
+            ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
+            ArrayOperation::CumulativeProduct(CumulativeProductOperation::new(0)),
+            ArrayOperation::CumulativeMax(CumulativeMaxOperation::new(0)),
+            ArrayOperation::CumulativeMin(CumulativeMinOperation::new(0)),
+            ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+        ] {
+            assert_eq!(array_data_dependent_padding_discipline(&operation), Propagated);
         }
     }
 
@@ -7610,6 +7670,20 @@ mod tests {
         assert_eq!(read_booleans(&client, &small[8]), vec![true]);
         assert_eq!(read_f32s(&client, &small[9]), vec![1.0]);
 
+        // Row `i` of the `i + j` matrix reduces to `i + ln(1 + e + e² + e³)`, so exactly the live rows appear and a
+        // physical suffix row would show up as an extra element. The tolerance is here because the expansion runs
+        // `exp` and `log`, not because the discipline is approximate: the byte comparison against the reference
+        // kernel inside `execute` is exact.
+        assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
+        let log_sum_exp = read_f32s(&client, &small[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+
+        // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
+        // data-derived extent rides through on the rows it never mixes.
+        assert_eq!(small[11].shape(), StaticShape::new(vec![2, 4]));
+        assert_eq!(read_f32s(&client, &small[11]), vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0]);
+
         let at_bound = execute(4);
         assert_eq!(at_bound[0].shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, &at_bound[0]), vec![-3.0, -2.0, -1.0, 0.0]);
@@ -7622,6 +7696,20 @@ mod tests {
         assert_eq!(read_booleans(&client, &at_bound[7]), vec![true]);
         assert_eq!(read_booleans(&client, &at_bound[8]), vec![true]);
         assert_eq!(read_f32s(&client, &at_bound[9]), vec![14.0]);
+
+        // At the bound the reduction and the scan grow by exactly the two extra live rows, which is what rules out a
+        // padded row silently participating at the smaller size.
+        assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
+        let log_sum_exp = read_f32s(&client, &at_bound[10]);
+        assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[2] - 5.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[3] - 6.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(
+            read_f32s(&client, &at_bound[11]),
+            vec![0.0, 1.0, 3.0, 6.0, 1.0, 3.0, 6.0, 10.0, 2.0, 5.0, 9.0, 14.0, 3.0, 7.0, 12.0, 18.0],
+        );
     }
 
     #[test]
@@ -10997,7 +11085,7 @@ mod tests {
 
     #[test]
     fn test_eager_bind_rejects_collective_outside_a_mapping_context() {
-        use ryft_core::{CollectiveKind, CollectiveOperation};
+        use ryft_core::{ParallelReduceOperation, ParallelReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -11005,12 +11093,13 @@ mod tests {
         let domain = array_domain(&client);
 
         // A collective on a concrete array outside any `batch` / `shard_map` binder has no axis to resolve against,
-        // mirroring JAX's "unbound axis name" error for a top-level `psum`. The value-level `Collective` capability
-        // is not even implemented for `Array` (its dispatch domain carries no named-axis environment), so this binds
-        // the operation directly and asserts the axis-resolution failure surfaced at compile time.
+        // mirroring JAX's "unbound axis name" error for a top-level `psum`. The value-level `ParallelReduce`
+        // capability is not even implemented for `Array` (its dispatch domain carries no named-axis environment), so
+        // this binds the operation directly and asserts the axis-resolution failure surfaced at compile time.
         let input = f32_vector(&client, &mesh, &[1.0, 2.0]);
+        let operation = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum);
         assert!(matches!(
-            domain.bind(CollectiveOperation::new("i".to_string(), CollectiveKind::PSum), Vec::new(), &[input]),
+            domain.bind(operation, Vec::new(), &[input]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "collective over axis `i` can only be lowered inside a shard_map manual region",
         ));

@@ -19,7 +19,7 @@ use super::{
     lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
     lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dimension_requirement_to_assertion, lower_dynamic_shape_slice_assertion, lower_pad_to_mlir,
-    lower_psum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
+    lower_parallel_sum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
     lower_sharding_constraint, lower_static_custom_call_input, lower_static_index_constants, lower_tensor_type,
     physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
     static_dimensions,
@@ -1053,7 +1053,7 @@ where
                     .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
-        ArrayIrOperation::PSumScatter(operation) => {
+        ArrayIrOperation::ParallelSumScatter(operation) => {
             let Some(input) = input_values.first() else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
             };
@@ -1062,9 +1062,16 @@ where
             };
             let output_type =
                 <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
-            let result =
-                lower_psum_scatter_to_mlir(operation, collective_state, *input, output_type, block, context, location)?
-                    .remove(0);
+            let result = lower_parallel_sum_scatter_to_mlir(
+                operation,
+                collective_state,
+                *input,
+                output_type,
+                block,
+                context,
+                location,
+            )?
+            .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
         }
         ArrayIrOperation::AllToAll(operation) => {

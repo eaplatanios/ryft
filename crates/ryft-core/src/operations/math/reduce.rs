@@ -114,33 +114,60 @@ pub fn reduce_abstract(
     input: &ArrayType,
     axes: &[usize],
     kind: ReductionKind,
-    op: &'static str,
+    operation_name: &'static str,
+) -> Result<ArrayType, TypeError> {
+    reduce_shape_abstract(input, axes, operation_name, |data_type| {
+        let (requirement, supports_kind) = if kind.requires_boolean() {
+            ("Boolean", data_type.is_boolean())
+        } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
+            ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
+        } else {
+            ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
+        };
+        match supports_kind {
+            true => Ok(()),
+            false => Err(TypeError::invalid(format!(
+                "`{operation_name}` kind {kind} requires {requirement} inputs but got {data_type}"
+            ))),
+        }
+    })
+}
+
+/// Returns the output [`ArrayType`] produced by reducing `input` along `axes`, which is the axis geometry every
+/// reducing primitive shares: the reduced axes are validated, removed from the output shape while the remaining axes
+/// keep their order, and the [`Sharding`] follows the rule that [`reduce_abstract`] documents. The element data type
+/// passes through unchanged.
+///
+/// Reducing primitives differ only in which element data types they accept, so that check is supplied by the caller
+/// rather than encoded here. It is invoked between the axis validation and the output construction, which is what
+/// makes an out-of-bounds or duplicate axis outrank an unsupported element type in the reported diagnostic.
+///
+/// # Parameters
+///
+///   - `input`: Type of the reduced operand.
+///   - `axes`: Reduced axes, in the operand's own coordinate system.
+///   - `operation_name`: Operation name used in diagnostics.
+///   - `validate_element_type`: Caller's element data-type domain check.
+pub(crate) fn reduce_shape_abstract(
+    input: &ArrayType,
+    axes: &[usize],
+    operation_name: &'static str,
+    validate_element_type: impl FnOnce(DataType) -> Result<(), TypeError>,
 ) -> Result<ArrayType, TypeError> {
     let rank = input.rank();
     let mut reduce_mask = vec![false; rank];
     for axis in axes {
         if *axis >= rank {
-            return Err(TypeError::invalid(format!("`{op}` axis {axis} is out of bounds for rank {rank}")));
+            return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
         }
         if reduce_mask[*axis] {
-            return Err(TypeError::invalid(format!("`{op}` contains duplicate axis {axis}")));
+            return Err(TypeError::invalid(format!("`{operation_name}` contains duplicate axis {axis}")));
         }
         reduce_mask[*axis] = true;
     }
 
     let data_type = input.data_type();
-    let (requirement, supports_kind) = if kind.requires_boolean() {
-        ("Boolean", data_type.is_boolean())
-    } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
-        ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
-    } else {
-        ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
-    };
-    if !supports_kind {
-        return Err(TypeError::invalid(format!(
-            "`{op}` kind {kind} requires {requirement} inputs but got {data_type}"
-        )));
-    }
+    validate_element_type(data_type)?;
 
     let dimensions = input
         .shape()
@@ -149,7 +176,7 @@ pub fn reduce_abstract(
         .enumerate()
         .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(size.clone()))
         .collect::<Vec<_>>();
-    let sharding = reduce_sharding(input.sharding(), &reduce_mask, op)?;
+    let sharding = reduce_sharding(input.sharding(), &reduce_mask, operation_name)?;
     ArrayType::new(data_type, Shape::new(dimensions))
         .with_memory(input.memory())
         .with_sharding(sharding)
@@ -159,10 +186,10 @@ pub fn reduce_abstract(
 /// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
 /// axes' per-dimension entries are deleted; the remaining entries keep their order and the reduction-state and
 /// manual-axis sets pass through unchanged. Refer to the documentation of [`reduce_abstract`] for the full rule.
-fn reduce_sharding(
+pub(crate) fn reduce_sharding(
     sharding: Option<&Sharding>,
     reduce_mask: &[bool],
-    op: &'static str,
+    operation_name: &'static str,
 ) -> Result<Option<Sharding>, TypeError> {
     sharding
         .map(|sharding| {
@@ -176,7 +203,9 @@ fn reduce_sharding(
                 .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
                 .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
                 .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                .map_err(|error| TypeError::invalid(format!("`{op}` output sharding construction failed: {error}")))
+                .map_err(|error| {
+                    TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
+                })
         })
         .transpose()
 }
@@ -426,30 +455,70 @@ where
             None => None,
         };
         let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
-        let consumed_ragged_dimensions = inputs[0]
-            .ragged_axes()
-            .iter()
-            .filter(|axis| lifted_op.axes().contains(&axis.axis()))
-            .map(|axis| axis.dimension().clone())
-            .collect::<Vec<_>>();
-        let input = P::mask_reduction_input(context, &inputs[0], lifted_op.axes(), self.kind)?;
-        let remaining_ragged_axes = input
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .filter_map(|ragged_axis| ragged_axis.reduced(lifted_op.axes()))
-            .collect::<Vec<_>>();
-        let mut outputs = lifted_op.interpret_with_batch_axes(
-            context,
-            std::slice::from_ref(&input),
-            &[BatchAxis::from_position(output_axis)],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        let output = outputs.remove(0);
-        let output = ArrayBatch::new(output.into_value(), BatchAxis::from_position(output_axis))?
-            .with_ragged_axes(remaining_ragged_axes)?;
-        Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
+        batch_reducing_operation(context, &lifted_op, &inputs[0], lifted_op.axes(), output_axis, |input| {
+            P::mask_reduction_input(context, input, lifted_op.axes(), self.kind)
+        })
     }
+}
+
+/// Applies the batching skeleton shared by the primitives that collapse a set of array axes, given an operation whose
+/// axes have already been lifted past the inserted batch dimension.
+///
+/// Collapsing an axis is what makes it legitimate to *consume* an operand's per-item extents along a reduced bounded
+/// ragged axis: the padding is first neutralized by `mask`, so the result no longer depends on those extents, and each
+/// consumed [`DimensionVariable`] is then reported as the rule's [`BatchedOutputs`] evidence, which is how the
+/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent. The
+/// evidence is collected from the *unmasked* operand, because masking rewrites the payload while leaving the ragged
+/// metadata that the boundary is told about in place. Ragged axes outside `reduced_axes` survive onto the result.
+///
+/// This skeleton is specific to axis-collapsing primitives. A prefix scan, for instance, masks the very same way but
+/// keeps the axis it touches, and so consumes nothing and reports no evidence.
+///
+/// # Parameters
+///
+///   - `context`: Active [`BatchingContext`] for the transform level being applied.
+///   - `operation`: Lifted operation, interpreted over the physical batched value.
+///   - `input`: Operand batch, as the rule received it.
+///   - `reduced_axes`: Collapsed axes of `operation`, in the physical batched coordinate system.
+///   - `output_axis`: Position of the batch axis in the result.
+///   - `mask`: Neutralizes the operand's ragged padding along `reduced_axes` with the operation's own identity.
+pub(crate) fn batch_reducing_operation<C, P, O, Mask>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    operation: &O,
+    input: &ArrayBatch<C::Value>,
+    reduced_axes: &[usize],
+    output_axis: usize,
+    mask: Mask,
+) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    P: RaggedArrayBatchingPolicy<C>,
+    O: InterpretableOperation<C>,
+    Mask: FnOnce(&ArrayBatch<C::Value>) -> Result<ArrayBatch<C::Value>, BatchingError>,
+{
+    let consumed_ragged_dimensions = input
+        .ragged_axes()
+        .iter()
+        .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
+        .map(|ragged_axis| ragged_axis.dimension().clone())
+        .collect::<Vec<_>>();
+    let masked = mask(input)?;
+    let remaining_ragged_axes = masked
+        .ragged_axes()
+        .iter()
+        .cloned()
+        .filter_map(|ragged_axis| ragged_axis.reduced(reduced_axes))
+        .collect::<Vec<_>>();
+    let output_batch_axis = BatchAxis::from_position(output_axis);
+    let mut outputs = operation.interpret_with_batch_axes(
+        context,
+        std::slice::from_ref(&masked),
+        std::slice::from_ref(&output_batch_axis),
+    )?;
+    check_count!("output", outputs, 1, ProgramError);
+    let output =
+        ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?.with_ragged_axes(remaining_ragged_axes)?;
+    Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
 }
 
 /// Lifts a reduce's `axes` through one batching level inserted at `batch_axis`.
@@ -903,7 +972,7 @@ where
 /// Builds the `output_axes` vector that maps a reduced output's axes back to the
 /// corresponding input axes. Output axis `j` corresponds to the `j`-th non-reduced input axis;
 /// the returned vector lists those input-axis indices in order.
-fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
+pub(crate) fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
     let mut reduce_mask = vec![false; input_rank];
     for axis in reduced_axes {
         reduce_mask[*axis] = true;

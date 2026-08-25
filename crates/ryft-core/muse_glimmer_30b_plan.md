@@ -91,7 +91,7 @@ The full per-primitive tables live in [gemma_4_plan.md §1](gemma_4_plan.md); ev
 | LM-head cross-entropy over 202K vocab | `Dot`, `Reduce(Max/Sum)`, `Exp`, `Log`, one-hot contraction | ✅ | same `logsumexp` composition as the Gemma plan §3.5 |
 | Distillation loss (from Muse Spark logits) | `Exp`, `Log`, `Reduce`, `Mul`, `Sub` | ✅ | forward-KL on log-softmax outputs is a composition of existing ops; only relevant if reproducing Meta's distillation recipe rather than fine-tuning |
 | Autodiff / vmap / jit / remat | `differentiate_at`, `batch`, `jit`, `rematerialize` | ✅ | unchanged from Gemma plan §1.9 |
-| Collectives / sharding for 30B-scale training | `psum`/`all_gather`/`psum_scatter`/`reshard`/`shard_map` | ✅ | unchanged; 30B dense wants FSDP-style `psum_scatter` + `all_gather` which exist |
+| Collectives / sharding for 30B-scale training | `parallel_sum`/`all_gather`/`parallel_sum_scatter`/`reshard`/`shard_map` | ✅ | unchanged; 30B dense wants FSDP-style `parallel_sum_scatter` + `all_gather` which exist |
 | Optimizer (AdamW + clip-by-global-norm) | parameter-tree pure functions | ❌ | **same gap as Gemma plan R1** — nothing model-specific |
 | Mixed-precision policy (bf16/fp32) | `ConvertElementType`, `dot_with_accumulation_type` | ❌ | same gap as Gemma plan |
 | Vision tower (ViT-G/14) | **`Convolution`** (patch embed) + attention + MLP + `Reshape`/`Transpose` (pixel shuffle) | ⚠️ | patch embedding needs the one missing primitive (`stablehlo.convolution` lowering — Gemma plan R5); everything after the patch embed exists. The 14×14/stride-14 patch conv is also expressible as `Reshape` + `Transpose` + `Dot` (space-to-depth then matmul), which removes the conv dependency entirely — see §2 |

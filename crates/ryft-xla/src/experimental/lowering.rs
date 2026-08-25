@@ -11,7 +11,7 @@ use ryft_core::operations::attention::{
     dot_product_attention_backward_ir_composition, dot_product_attention_ir_composition,
 };
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, CollectiveMode, PSumScatterOperation, PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, CollectiveMode, ParallelPermuteOperation, ParallelSumScatterOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
@@ -21,14 +21,16 @@ use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
 use ryft_core::operations::sort::{SORT_OPERATION_NAME, SortDirection, SortOperation};
 use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
-    Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME, CaptureReference,
-    CeilOperation, CollectiveKind, CollectiveOperation, ComparisonDirection, ConstantOperation,
-    ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
-    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext, DotOperation,
-    Effect, Effects, ErfOperation, ExpOperation, FloorOperation, GATHER_OPERATION_NAME, GatherOperation,
-    GatherScatterMode, Instruction, IotaOperation, Layout, LogOperation, LogicalMesh, LogisticOperation,
-    MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
-    PadOperation, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
+    Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
+    CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
+    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CaptureReference, CeilOperation,
+    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, DataType, Dimension,
+    DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
+    DivOperation, DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
+    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, Log1pOperation,
+    LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
+    MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation,
+    ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
     REMATERIALIZE_OPERATION_NAME, ReductionKind, ReferenceStateBinding, RegionId, RegionRef, RemOperation,
     ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation,
     ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
@@ -1058,6 +1060,45 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogOperation<ArrayType>
                 .block
                 .append_operation(stable_hlo::log(input_values[0], Accuracy::Default, lowerer.location)?)?;
         Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Log1pOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::log_plus_one(
+            input_values[0],
+            Accuracy::Default,
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).expect("stablehlo.log_plus_one should return one result").as_ref()])
+    }
+}
+
+// StableHLO has no `logaddexp` primitive, so the operation lowers by expanding the guarded construction that
+// `ryft-core` pins, shared with the `cumulative_log_sum_exp` reducer body through `lower_log_add_exp_to_mlir`.
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogAddExpOperation<ArrayType> {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let [left, right] = normalize_binary_elementwise_operands(
+            input_values,
+            output_types,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let value = lower_log_add_exp_to_mlir(left, right, &mut lowerer.block, lowerer.location)?;
+        Ok(vec![value])
     }
 }
 
@@ -3044,6 +3085,22 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
+            ArrayOperation::Log1p(operation) => <Log1pOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::LogAddExp(operation) => {
+                <LogAddExpOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Sqrt(operation) => <SqrtOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -3298,6 +3355,88 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 )?;
                 Ok(vec![value])
             }
+            ArrayOperation::LogSumExp(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_log_sum_exp_to_mlir(
+                    operation.axes(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
+            ArrayOperation::CumulativeSum(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_cumulative_to_mlir(
+                    CumulativeKind::Sum,
+                    operation.axis(),
+                    operation.reverse(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
+            ArrayOperation::CumulativeProduct(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_cumulative_to_mlir(
+                    CumulativeKind::Product,
+                    operation.axis(),
+                    operation.reverse(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
+            ArrayOperation::CumulativeMax(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_cumulative_to_mlir(
+                    CumulativeKind::Max,
+                    operation.axis(),
+                    operation.reverse(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
+            ArrayOperation::CumulativeMin(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_cumulative_to_mlir(
+                    CumulativeKind::Min,
+                    operation.axis(),
+                    operation.reverse(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
+            ArrayOperation::CumulativeLogSumExp(operation) => {
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_cumulative_to_mlir(
+                    CumulativeKind::LogSumExp,
+                    operation.axis(),
+                    operation.reverse(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
+            }
             ArrayOperation::Sort(operation) => lower_sort_to_mlir(
                 operation,
                 input_values,
@@ -3402,7 +3541,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 let result = lowerer.block.append_operation(stable_hlo::xor(left, right, lowerer.location)?)?;
                 Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
-            ArrayOperation::Collective(operation) => {
+            ArrayOperation::ParallelReduce(operation) => {
                 // This plain dispatch serves nested programs (control-flow bodies, inlined custom-derivative and
                 // rematerialized primals), which can sit inside a shard_map manual region: the threaded
                 // `CollectiveLoweringState` resolves the collective's mesh axis there and errors outside manual
@@ -3435,11 +3574,11 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer.location,
                 )
             }
-            ArrayOperation::PSumScatter(operation) => {
+            ArrayOperation::ParallelSumScatter(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
                 check_count!("output", output_types, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
-                lower_psum_scatter_to_mlir(
+                lower_parallel_sum_scatter_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
@@ -3449,10 +3588,10 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                     lowerer.location,
                 )
             }
-            ArrayOperation::Ppermute(operation) => {
+            ArrayOperation::ParallelPermute(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
                 let collective_state = lowerer.collective_state.clone();
-                lower_ppermute_to_mlir(
+                lower_parallel_permute_to_mlir(
                     operation,
                     &collective_state,
                     input_values[0],
@@ -7309,17 +7448,6 @@ fn comparison_type_for_mlir_type<'c, 't>(r#type: TypeRef<'c, 't>) -> Result<stab
     Ok(stable_hlo::ComparisonType::Float)
 }
 
-/// Lowers one [`CollectiveOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over the
-/// device mesh axis the collective names.
-///
-/// The replica groups are dense global device-id groups derived from the mesh's row-major device linearization: one
-/// group per combination of the other axes' coordinates, each listing the devices along the named axis. The emitted
-/// operation carries a module-unique channel id with a device-to-device channel type and `use_global_device_ids`, the
-/// standard SPMD emission for cross-partition collectives. Explicit logical participant groups are expanded inside
-/// every fixed coordinate of the mesh's other axes without reordering either groups or their members. `PSum`/`PMean`
-/// reduce with `add` (a `PMean` divides by the effective group size) and `PMax` reduces with `maximum`, reusing the
-/// same scalar combiner regions as `stablehlo.reduce` lowering. A collective lowered outside any manual region, or
-/// naming an axis the innermost region does not bind as a manual mesh axis, is an error.
 /// Resolves the replica groups of one named mesh axis inside the innermost enclosing `shard_map` manual region,
 /// returning the groups together with the axis size. Devices are linearized row-major over the mesh axes, so the
 /// devices along the named axis with all other coordinates fixed form one replica group: the group base ids
@@ -7466,10 +7594,10 @@ pub(super) fn lower_all_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result.result(0).expect("stablehlo.all_gather should return one result").as_ref()])
 }
 
-/// Lowers one traced `psum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the named
-/// mesh axis's replica groups.
-pub(super) fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &PSumScatterOperation,
+/// Lowers one traced `parallel_sum_scatter` to a channeled `stablehlo.reduce_scatter` with a sum reduction over the
+/// named mesh axis's replica groups.
+pub(super) fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelSumScatterOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
@@ -7510,10 +7638,10 @@ pub(super) fn lower_psum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
-/// Lowers one traced `ppermute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
+/// Lowers one traced `parallel_permute` to a channeled `stablehlo.collective_permute`, expanding the axis-local
 /// `(source, target)` pairs to global device pairs across the named mesh axis's replica groups.
-fn lower_ppermute_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &PpermuteOperation,
+fn lower_parallel_permute_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &ParallelPermuteOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -7604,8 +7732,19 @@ pub(super) fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
+/// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
+/// the device mesh axis the collective names.
+///
+/// The replica groups are the dense global device-id groups that [`mesh_axis_replica_groups`] derives from the mesh's
+/// row-major device linearization, or, when the collective records explicit logical participant groups, those groups
+/// expanded inside every fixed coordinate of the mesh's other axes without reordering either the groups or their
+/// members. The emitted operation carries a module-unique channel id with a device-to-device channel type and
+/// `use_global_device_ids`, the standard SPMD emission for cross-partition collectives. `Sum`/`Mean` reduce with
+/// `add` (a `Mean` divides by the effective group size) and `Max` reduces with `maximum`, reusing the same scalar
+/// combiner regions as `stablehlo.reduce` lowering. A collective lowered outside any manual region, or naming an axis
+/// the innermost region does not bind as a manual mesh axis, is an error.
 fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
-    operation: &CollectiveOperation,
+    operation: &ParallelReduceOperation,
     collective_state: &CollectiveLoweringState,
     input_value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
@@ -7642,10 +7781,10 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     let reduced = result.result(0).expect("stablehlo.all_reduce should return one result").as_ref();
-    if !matches!(operation.kind(), CollectiveKind::PMean) {
+    if !matches!(operation.kind(), ParallelReductionKind::Mean) {
         return Ok(reduced);
     }
-    // `PMean` is the mean over the effective participant group: divide the all-reduced sum by the group size.
+    // `Mean` is the mean over the effective participant group: divide the all-reduced sum by the group size.
     let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
     let divisor = lower_f64_constant_splat(
         effective_axis_size as f64,
@@ -7835,6 +7974,54 @@ fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
 }
 
+/// Lowers one elementwise `log(exp(a) + exp(b))` by expanding the guarded construction that `ryft-core`'s
+/// [`LogAddExpOperation`] pins, since StableHLO has no `logaddexp` primitive:
+///
+/// ```text
+/// log_add_exp(a, b) = select(isnan(a - b), a + b, max(a, b) + log1p(exp(-|a - b|)))
+/// ```
+///
+/// Factoring the larger operand out of the sum keeps `exp` from overflowing anywhere on the real line, and the
+/// `isnan(a - b)` arm routes the cases whose difference is undefined through `a + b`, which pins `(+∞, +∞) ↦ +∞`,
+/// `(-∞, -∞) ↦ -∞`, and NaN propagation. Both operands must already carry the same tensor type, which is what the
+/// callers guarantee: the elementwise operation normalizes its broadcast operands, and the
+/// `cumulative_log_sum_exp` reducer body applies the same expansion to two scalar block arguments.
+fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let difference = block.append_operation(stable_hlo::subtract(left, right, location)?)?;
+    let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
+    let is_nan = block.append_operation(stable_hlo::compare(
+        difference,
+        difference,
+        stable_hlo::ComparisonDirection::NotEqual,
+        stable_hlo::ComparisonType::Float,
+        location,
+    )?)?;
+    let is_nan = is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let naive = block.append_operation(stable_hlo::add(left, right, location)?)?;
+    let naive = naive.result(0).expect("stablehlo.add should return one result").as_ref();
+    let magnitude = block.append_operation(stable_hlo::abs(difference, location)?)?;
+    let magnitude = magnitude.result(0).expect("stablehlo.abs should return one result").as_ref();
+    let negated = block.append_operation(stable_hlo::negate(magnitude, location)?)?;
+    let negated = negated.result(0).expect("stablehlo.negate should return one result").as_ref();
+    let exponential = block.append_operation(stable_hlo::exponential(negated, Accuracy::Default, location)?)?;
+    let exponential = exponential.result(0).expect("stablehlo.exponential should return one result").as_ref();
+    let correction = block.append_operation(stable_hlo::log_plus_one(exponential, Accuracy::Default, location)?)?;
+    let correction = correction.result(0).expect("stablehlo.log_plus_one should return one result").as_ref();
+    // The guard already routes every NaN operand through the `a + b` arm, so the shift can use the plain StableHLO
+    // maximum rather than the NaN-propagating total-order expansion that `lower_extremum_to_mlir` emits.
+    let shift = block.append_operation(stable_hlo::maximum(left, right, location)?)?;
+    let shift = shift.result(0).expect("stablehlo.maximum should return one result").as_ref();
+    let stable = block.append_operation(stable_hlo::add(shift, correction, location)?)?;
+    let stable = stable.result(0).expect("stablehlo.add should return one result").as_ref();
+    let result = block.append_operation(stable_hlo::select(is_nan, naive, stable, location)?)?;
+    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+}
+
 /// Builds a reduction-body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
 /// region has one block taking two scalar tensor arguments of `tensor<{element_type}>` and produces one scalar result
 /// through the combiner matching the reduction kind.
@@ -7920,6 +8107,331 @@ fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         lower_f64_constant_splat(count.max(1) as f64, output_array_type, output_tensor_type, block, context, location)?;
     let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
     Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
+}
+
+/// Lowers an [`ArrayOperation::LogSumExp`] dispatch by expanding the guarded max-shifted construction that
+/// `ryft-core`'s [`LogSumExpOperation`](ryft_core::LogSumExpOperation) pins, since StableHLO has no `logsumexp`
+/// primitive:
+///
+/// ```text
+/// m      = reduce_max(x)                      // with a -∞ initial value
+/// safe_m = select(is_finite(m), m, 0)
+/// result = log(reduce_sum(exp(x - broadcast(safe_m)))) + safe_m
+/// ```
+///
+/// Shifting by the maximum is what keeps the exponentials in range, and the `safe_m` substitution is what keeps the
+/// shift itself defined: a raw maximum of `-∞` (the maximum's identity, and therefore the result for an all-`-∞`
+/// slice or an empty reduction) would compute `-∞ - -∞ = NaN`, while substituting zero there leaves `log(0) + 0`,
+/// which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the sum. The
+/// shift is broadcast back over the reduced axes with the identity map from the output's axes to the operand's
+/// kept axes, so both reductions see the operand's own shape.
+fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
+    axes: &[usize],
+    input_value: ValueRef<'b, 'c, 't>,
+    output_array_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let element_type = output_array_type.data_type();
+    let input_type = input_value.r#type()?;
+    let input_tensor_type = input_type.cast::<TensorTypeRef>().ok_or_else(|| LoweringError::UnsupportedOp {
+        op: format!("`log_sum_exp` operand has non-tensor MLIR type `{input_type}`"),
+    })?;
+    let maximum_initial_value =
+        build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)?;
+    let maximum_body_region = build_reduce_body_region(ReductionKind::Max, element_type, context, location)?;
+    let maximum = block.append_operation(stable_hlo::reduce(
+        &[input_value],
+        &[maximum_initial_value],
+        axes,
+        maximum_body_region,
+        location,
+    )?)?;
+    let maximum = maximum.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    let finite = block.append_operation(stable_hlo::is_finite(maximum, location)?)?;
+    let finite = finite.result(0).expect("stablehlo.is_finite should return one result").as_ref();
+    let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
+    let zero = lower_f64_constant_splat(0.0, output_array_type, output_tensor_type, block, context, location)?;
+    let shift = block.append_operation(stable_hlo::select(finite, maximum, zero, location)?)?;
+    let shift = shift.result(0).expect("stablehlo.select should return one result").as_ref();
+    let kept_axes = (0..input_tensor_type.rank()).filter(|axis| !axes.contains(axis)).collect::<Vec<_>>();
+    let broadcast_shift =
+        block.append_operation(stable_hlo::broadcast(shift, input_tensor_type, kept_axes.as_slice(), location)?)?;
+    let broadcast_shift = broadcast_shift.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+    let shifted = block.append_operation(stable_hlo::subtract(input_value, broadcast_shift, location)?)?;
+    let shifted = shifted.result(0).expect("stablehlo.subtract should return one result").as_ref();
+    let exponentials = block.append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?;
+    let exponentials = exponentials.result(0).expect("stablehlo.exponential should return one result").as_ref();
+    let sum_initial_value =
+        build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
+    let sum_body_region = build_reduce_body_region(ReductionKind::Sum, element_type, context, location)?;
+    let total = block.append_operation(stable_hlo::reduce(
+        &[exponentials],
+        &[sum_initial_value],
+        axes,
+        sum_body_region,
+        location,
+    )?)?;
+    let total = total.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    let logarithm = block.append_operation(stable_hlo::log(total, Accuracy::Default, location)?)?;
+    let logarithm = logarithm.result(0).expect("stablehlo.log should return one result").as_ref();
+    let result = block.append_operation(stable_hlo::add(logarithm, shift, location)?)?;
+    Ok(result.result(0).expect("stablehlo.add should return one result").as_ref())
+}
+
+/// Combining operator of one prefix scan, selecting the `stablehlo.reduce_window` reducer body and the initial value
+/// that makes the padded window positions of [`lower_cumulative_to_mlir`] inert.
+#[derive(Copy, Clone, Debug)]
+enum CumulativeKind {
+    /// Prefix summation, whose identity is zero.
+    Sum,
+
+    /// Prefix product, whose identity is one.
+    Product,
+
+    /// Running maximum, whose identity is the element data type's lowest value.
+    Max,
+
+    /// Running minimum, whose identity is the element data type's highest value.
+    Min,
+
+    /// Running `log(sum(exp(x)))`, whose identity is negative infinity, the value whose exponential is the inner
+    /// sum's zero identity.
+    LogSumExp,
+}
+
+impl CumulativeKind {
+    /// Returns the canonical `ryft-core` operation name of the prefix scan combining with this operator, used in
+    /// lowering diagnostics.
+    fn operation_name(self) -> &'static str {
+        match self {
+            CumulativeKind::Sum => CUMULATIVE_SUM_OPERATION_NAME,
+            CumulativeKind::Product => CUMULATIVE_PRODUCT_OPERATION_NAME,
+            CumulativeKind::Max => CUMULATIVE_MAX_OPERATION_NAME,
+            CumulativeKind::Min => CUMULATIVE_MIN_OPERATION_NAME,
+            CumulativeKind::LogSumExp => CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME,
+        }
+    }
+
+    /// Builds the scalar `tensor<{element_type}>` value seeding every window of the scan's `reduce_window`, which is
+    /// the identity of the combining operator so that the padded positions of a window cannot change its prefix.
+    fn build_initial_value<'b, 'c: 'b, 't: 'c>(
+        self,
+        element_type: DataType,
+        block: &mut BlockRef<'b, 'c, 't>,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+        match self {
+            CumulativeKind::Sum => {
+                build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)
+            }
+            // A scalar `one` reaches the same real and complex constant synthesis that the `one` primitive lowers
+            // through, which the reduction identities do not cover because no reduction kind multiplies.
+            CumulativeKind::Product => {
+                Ok(lower_unplaced_constant_output(&[ArrayType::scalar(element_type)], 1, block, context, location)?[0])
+            }
+            CumulativeKind::Max => {
+                build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+            }
+            CumulativeKind::Min => {
+                build_reduction_identity_constant(ReductionKind::Min, element_type, block, context, location)
+            }
+            // The maximum's identity is exactly the negative infinity this scan needs at `bf16`, `f16`, `f32`, `f64`,
+            // `f8e3m4`, `f8e4m3`, and `f8e5m2`, the formats that have one. The finite-only formats instead get their
+            // lowest representable value, which is the seed only as far as the fold-count reasoning in
+            // [`lower_cumulative_to_mlir`] allows: `f8e8m0fnu`, `f6e2m3fn`, `f4e2m1fn`, `f6e3m2fn`, and
+            // `f8e4m3b11fnuz` are all rejected there outright, and the three that remain reach this arm only at a
+            // scanned extent their lowest value holds across.
+            CumulativeKind::LogSumExp => {
+                build_reduction_identity_constant(ReductionKind::Max, element_type, block, context, location)
+            }
+        }
+    }
+
+    /// Builds the scalar reducer body region of the scan's `reduce_window`. The three combiners that a reduction
+    /// kind also names delegate to [`build_reduce_body_region`] verbatim, which keeps the extrema on the same
+    /// portable total-order expansion that `reduce` emits. The other two build their own region over the same pair
+    /// of scalar block arguments.
+    fn build_body_region<'c, 't>(
+        self,
+        element_type: DataType,
+        context: &'c MlirContext<'t>,
+        location: LocationRef<'c, 't>,
+    ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
+        // This scalar block scaffold belongs to the two combiners that own their body; the other three return the
+        // region `build_reduce_body_region` builds for them and leave it unused.
+        let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+        let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+        let mut region = context.region();
+        let mut block_ref = region.append_block(block)?;
+        let left = block_ref.argument(0)?.as_ref();
+        let right = block_ref.argument(1)?.as_ref();
+        let body_value = match self {
+            CumulativeKind::Sum => {
+                return build_reduce_body_region(ReductionKind::Sum, element_type, context, location);
+            }
+            CumulativeKind::Max => {
+                return build_reduce_body_region(ReductionKind::Max, element_type, context, location);
+            }
+            CumulativeKind::Min => {
+                return build_reduce_body_region(ReductionKind::Min, element_type, context, location);
+            }
+            CumulativeKind::Product => block_ref
+                .append_operation(stable_hlo::multiply(left, right, location)?)?
+                .result(0)
+                .expect("stablehlo.multiply should return one result")
+                .as_ref(),
+            CumulativeKind::LogSumExp => lower_log_add_exp_to_mlir(left, right, &mut block_ref, location)?,
+        };
+        block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
+        Ok(region)
+    }
+}
+
+/// Lowers one prefix-scan dispatch to a `stablehlo.reduce_window` whose window spans the whole scanned axis.
+///
+/// The window has extent `n` along the scanned axis and extent one everywhere else, and the scan direction is
+/// expressed purely through the padding of that axis: a forward scan pads `(n - 1, 0)` so that output position `i`
+/// covers input positions `0..=i`, and a reverse scan pads `(0, n - 1)` so that it covers `i..n`. The reducer body
+/// and the initial value come from the scan's [`CumulativeKind`], whose identity is what makes the padded positions
+/// inert.
+///
+/// The window form looks quadratic, but it is the same emission JAX's `cumred_reduce_window_impl` produces, and XLA's
+/// `TryOptimizeAssociativeScan` rewriter is documented to recognize the forward full-prefix-window shape and rewrite
+/// it into a logarithmic-depth parallel scan. Whether the reverse padding is matched by the same rewriter has not
+/// been verified here, so a reverse scan may execute as the window form it is emitted as.
+fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
+    kind: CumulativeKind,
+    axis: usize,
+    reverse: bool,
+    input_value: ValueRef<'b, 'c, 't>,
+    output_array_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    // The scanned extent is static by construction: `ryft-core` type inference rejects a dynamic scanned axis, so a
+    // dynamic extent here means the staged program bypassed that rule.
+    let extent = match output_array_type.shape().dimensions().get(axis) {
+        Some(Dimension::Static(extent)) => *extent,
+        _ => {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!("`{}` over dynamically sized axis {axis}", kind.operation_name()),
+            });
+        }
+    };
+    // An empty scanned axis accumulates nothing, and a zero-extent window is not a valid `reduce_window`.
+    if extent == 0 {
+        return Ok(input_value);
+    }
+    let element_type = output_array_type.data_type();
+    // The `log(sum(exp(x)))` seed only neutralizes the padded positions of a window while it stays the combining
+    // operator's identity across every copy that window folds. A window accumulates one copy to begin with and one
+    // more per padded position, so the widest window of this scan — the one at the leading output position — folds
+    // `extent` of them, and folding `k` copies of the seed `lowest` yields `lowest + ln(k)`. That is the seed again
+    // only while the drift stays inside half the gap to `lowest`'s neighbor, which is what
+    // `log_sum_exp_seed_fold_bound` tabulates for the formats whose lowest value is finite.
+    if matches!(kind, CumulativeKind::LogSumExp) {
+        // Five formats hold their sentinel across too few folds for any useful scan length — `f8e8m0fnu` has no
+        // usable sentinel at all, since it carries bare positive exponents and its lowest value is the *positive*
+        // `2^-127`, while `f6e2m3fn`, `f4e2m1fn`, `f8e4m3b11fnuz`, and `f6e3m2fn` hold theirs across one, two, two,
+        // and seven copies. `ryft-core` type inference rejects all five by format, for the stronger reason that its
+        // own ragged masking folds a number of sentinels no type carries. Checking them again here is defensive: it
+        // keeps the unchecked construction path from seeding a window with a constant that would silently corrupt
+        // every prefix.
+        if matches!(
+            element_type,
+            DataType::F8E8M0FNU
+                | DataType::F6E2M3FN
+                | DataType::F4E2M1FN
+                | DataType::F8E4M3B11FNUZ
+                | DataType::F6E3M2FN
+        ) {
+            return Err(LoweringError::UnsupportedOp {
+                op: format!(
+                    "`{}` over `{element_type}`, whose lowest value holds as a `log_add_exp` identity across too \
+                     few folds to seed a window and which `ryft-core` type inference already rejects",
+                    kind.operation_name(),
+                ),
+            });
+        }
+        if let Some(bound) = log_sum_exp_seed_fold_bound(element_type) {
+            if extent > bound {
+                return Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "`{}` over `{element_type}` along an axis of extent {extent}, whose widest window folds \
+                         {extent} seed sentinels but whose lowest value stays a `log_add_exp` identity across only \
+                         {bound}",
+                        kind.operation_name(),
+                    ),
+                });
+            }
+        }
+    }
+    let initial_value = kind.build_initial_value(element_type, block, context, location)?;
+    let body_region = kind.build_body_region(element_type, context, location)?;
+    let rank = output_array_type.rank();
+    let mut window_dimensions = vec![1; rank];
+    window_dimensions[axis] = extent;
+    let mut padding = vec![(0, 0); rank];
+    padding[axis] = match reverse {
+        true => (0, extent - 1),
+        false => (extent - 1, 0),
+    };
+    let result = block.append_operation(stable_hlo::reduce_window(
+        &[input_value],
+        &[initial_value],
+        &window_dimensions,
+        None,
+        None,
+        None,
+        Some(&padding),
+        body_region,
+        location,
+    )?)?;
+    Ok(result.result(0).expect("stablehlo.reduce_window should return one result").as_ref())
+}
+
+/// Returns how many copies of the `cumulative_log_sum_exp` window seed one `stablehlo.reduce_window` window may fold
+/// at the given data type before the folded seed stops being a `log_add_exp` identity, or `None` when no fold count
+/// is too many. `None` is the answer for the floating-point formats whose seed is a true negative infinity —
+/// [`DataType::BF16`], [`DataType::F16`], [`DataType::F32`], [`DataType::F64`], [`DataType::F8E3M4`],
+/// [`DataType::F8E4M3`], and [`DataType::F8E5M2`] — and is also what the catch-all returns for every element type
+/// that has no sentinel to bound at all, none of which reaches this function: [`lower_cumulative_to_mlir`] rejects
+/// the remaining floating-point formats outright before consulting the bound, and a non-floating-point element type
+/// has no `cumulative_log_sum_exp` to lower in the first place.
+///
+/// Folding `k` copies of the seed `lowest` produces `lowest + ln(k)`, which is still exactly `lowest` while the drift
+/// `ln(k)` stays inside half the gap between `lowest` and its neighbor toward zero, so the bound is the largest `k`
+/// with `ln(k) < half gap`, namely `floor(e^(half gap))`:
+///
+/// | data type    |   lowest |  neighbor | half gap | folds held |
+/// | ------------ | -------- | --------- | -------- | ---------- |
+/// | `f8e4m3fn`   |   `-448` |    `-416` |     `16` |  8_886_110 |
+/// | `f8e4m3fnuz` |   `-240` |    `-224` |      `8` |      2_980 |
+/// | `f8e5m2fnuz` | `-57344` |  `-49152` |   `4096` |  unbounded |
+///
+/// The floating-point formats missing from that table are the five that [`lower_cumulative_to_mlir`] rejects outright
+/// by format, having held too few folds for any useful scan length: `f6e3m2fn` (half gap `2`, seven folds),
+/// `f8e4m3b11fnuz` (half gap `1`, two folds), `f4e2m1fn` (half gap `1`, two folds), `f6e2m3fn` (half gap `0.25`, one
+/// fold), and `f8e8m0fnu`, which has no usable sentinel at all. `ryft-core` type inference rejects all five already,
+/// so that guard only catches an unchecked construction.
+fn log_sum_exp_seed_fold_bound(data_type: DataType) -> Option<usize> {
+    let half_gap: f64 = match data_type {
+        DataType::F8E4M3FN => 16.0,
+        DataType::F8E4M3FNUZ => 8.0,
+        DataType::F8E5M2FNUZ => 4096.0,
+        _ => return None,
+    };
+    // `f8e5m2fnuz`'s bound is `e^4096`, which no floating-point or integer width can hold and no window extent can
+    // approach, so it saturates instead of wrapping.
+    let bound = half_gap.exp().floor();
+    Some(match bound < usize::MAX as f64 {
+        true => bound as usize,
+        false => usize::MAX,
+    })
 }
 
 /// Lowers an [`ArrayOperation::Gather`] dispatch to `stablehlo.gather`. StableHLO `gather` clamps out-of-bounds start
@@ -8438,14 +8950,15 @@ mod tests {
     use ryft_core::operations::random::{RandomAlgorithm, RngBitGeneratorOperation};
     use ryft_core::{
         AndOperation, Array as CpuArray, ArrayOperation, Atan2Operation, BroadcastOperation, CompareOperation,
-        ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos, Differentiate, Dimension,
-        DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation, DimensionType,
-        DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation, DynamicSliceOperation,
-        DynamicUpdateSliceOperation, EagerContext, Fill, LogicalMesh, MeshAxis, MeshAxisType, OneLike,
-        OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder, ProgramBuilder, Provenance,
-        ProvenanceScope, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate, ScanOperation, SelectOperation,
-        Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError, UpdateSliceOperation,
-        WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        ConcatenateOperation, ConditionOperation, ConstantOperation, Context, Cos, CumulativeLogSumExpOperation,
+        CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
+        Differentiate, Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionSizeOperation,
+        DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
+        DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Fill, LogSumExpOperation, LogicalMesh,
+        MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder,
+        ProgramBuilder, Provenance, ProvenanceScope, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate,
+        ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError,
+        UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -10456,6 +10969,122 @@ mod tests {
         );
     }
 
+    /// Builds a one-instruction program applying the given single-operand operation to an input of the given data
+    /// type and dimensions, and returns the result of lowering it to a rendered StableHLO module.
+    fn lowered_unary_module(
+        operation: ArrayOperation<XlaArrayConstant>,
+        data_type: DataType,
+        dimensions: Vec<usize>,
+    ) -> Result<String, LoweringError> {
+        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        to_mlir_module_for_plain_program(&program, "main")
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_log1p_and_log_add_exp() {
+        // `log1p` has a StableHLO primitive of its own, so it lowers to exactly one operation.
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Log1p(Log1pOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.log_plus_one %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // `log_add_exp` has none, so it expands into the guarded max-shifted construction: the `NE` self-comparison
+        // is the `isnan(a - b)` test that routes same-sign infinities and NaN operands through the plain `a + b`
+        // sum, while the ordinary arm shifts by the larger operand so that the exponential never overflows.
+        let mut builder = XlaProgramBuilder::new();
+        let left = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
+        let right = builder.add_input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)])));
+        let output = builder
+            .add_instruction(ArrayOperation::LogAddExp(LogAddExpOperation::new()), Vec::new(), vec![left, right], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.subtract %arg0, %arg1 : tensor<4xf32>
+                    %1 = stablehlo.compare NE, %0, %0, FLOAT : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
+                    %2 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                    %3 = stablehlo.abs %0 : tensor<4xf32>
+                    %4 = stablehlo.negate %3 : tensor<4xf32>
+                    %5 = stablehlo.exponential %4 : tensor<4xf32>
+                    %6 = stablehlo.log_plus_one %5 : tensor<4xf32>
+                    %7 = stablehlo.maximum %arg0, %arg1 : tensor<4xf32>
+                    %8 = stablehlo.add %7, %6 : tensor<4xf32>
+                    %9 = stablehlo.select %1, %2, %8 : tensor<4xi1>, tensor<4xf32>
+                    return %9 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_log_sum_exp_as_a_guarded_max_shifted_reduction() {
+        // The expansion reduces the maximum with a `-inf` identity, replaces a nonfinite maximum with zero so that
+        // an all-`-inf` or empty slice shifts by zero instead of computing `-inf - -inf`, broadcasts the safe
+        // maximum back over the reduced axis, and adds it to the logarithm of the shifted exponential sum.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::LogSumExp(LogSumExpOperation::new(vec![1])),
+                DataType::F32,
+                vec![2, 3],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
+                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : \
+                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                     reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
+                      %10 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %11 = stablehlo.select %10, %arg1, %arg2 : tensor<i1>, tensor<f32>
+                      %12 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %13 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %14 = stablehlo.select %13, %arg2, %11 : tensor<i1>, tensor<f32>
+                      %15 = stablehlo.select %12, %arg1, %14 : tensor<i1>, tensor<f32>
+                      stablehlo.return %15 : tensor<f32>
+                    }
+                    %1 = stablehlo.is_finite %0 : (tensor<2xf32>) -> tensor<2xi1>
+                    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                    %3 = stablehlo.select %1, %0, %2 : tensor<2xi1>, tensor<2xf32>
+                    %4 = stablehlo.broadcast_in_dim %3, dims = [0] : (tensor<2xf32>) -> tensor<2x3xf32>
+                    %5 = stablehlo.subtract %arg0, %4 : tensor<2x3xf32>
+                    %6 = stablehlo.exponential %5 : tensor<2x3xf32>
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %7 = stablehlo.reduce(%6 init: %cst_1) applies stablehlo.add across dimensions = [1] : \
+                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                    %8 = stablehlo.log %7 : tensor<2xf32>
+                    %9 = stablehlo.add %8, %3 : tensor<2xf32>
+                    return %9 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_complex_sine_and_cosine() {
         let complex_type = ArrayType::scalar(DataType::C64);
@@ -10491,16 +11120,7 @@ mod tests {
         axes: Vec<usize>,
         dimensions: Vec<usize>,
     ) -> Result<String, LoweringError> {
-        let input_type = ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()));
-        let mut builder = XlaProgramBuilder::new();
-        let input = builder.add_input(input_type);
-        let output = builder
-            .add_instruction(ArrayOperation::Reduce(ReduceOperation::new(axes, kind)), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        to_mlir_module_for_plain_program(&program, "main")
+        lowered_unary_module(ArrayOperation::Reduce(ReduceOperation::new(axes, kind)), data_type, dimensions)
     }
 
     #[test]
@@ -10568,6 +11188,347 @@ mod tests {
                 }
             "#}
         );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_cumulative_sum_as_a_full_prefix_reduce_window() {
+        // A forward scan pads `(n - 1, 0)` on the scanned axis so that the full-extent window ending at output
+        // position `i` covers input positions `0..=i`, with the padded positions made inert by the summation
+        // identity that also seeds the window.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[3, 0]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // A reverse scan keeps the same window and flips the padding to `(0, n - 1)`, so the window starting at
+        // output position `i` covers input positions `i..n`.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0).with_reverse(true)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[0, 3]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // Every axis other than the scanned one keeps a unit window and no padding, so the scan runs independently
+        // per row rather than mixing rows.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(1)),
+                DataType::F32,
+                vec![2, 3],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[0, 0], [2, 0]]> : tensor<2x2xi64>, \
+                      window_dimensions = array<i64: 1, 3>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<2x3xf32>, tensor<f32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+
+        // An empty scanned axis accumulates nothing and would give `reduce_window` a degenerate zero-extent window,
+        // so the lowering forwards the operand instead of emitting any operation.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeSum(CumulativeSumOperation::new(0)),
+                DataType::F32,
+                vec![0, 2],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<0x2xf32>) -> tensor<0x2xf32> {
+                    return %arg0 : tensor<0x2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_the_remaining_prefix_scans() {
+        // A prefix product keeps the scan's window and padding shape and differs from the summation only in its
+        // reducer body and in the multiplicative identity seeding every window.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeProduct(CumulativeProductOperation::new(0)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[3, 0]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.multiply %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // The running maximum seeds its windows with negative infinity and reuses the portable total-order reducer
+        // body that `reduce` uses, so signed zeros order correctly and NaNs propagate on every backend.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeMax(CumulativeMaxOperation::new(0)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[3, 0]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f32>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f32>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f32>
+                      stablehlo.return %6 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // The running minimum is the mirrored construction, seeded with positive infinity, and its reverse direction
+        // flips the padding exactly as the summation's does.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeMin(CumulativeMinOperation::new(0).with_reverse(true)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<0x7F800000> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[0, 3]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f32>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f32>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f32>
+                      stablehlo.return %6 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+
+        // The running `log(sum(exp(x)))` inlines the whole guarded `log_add_exp` expansion into the reducer body and
+        // seeds its windows with negative infinity, whose exponential is the inner sum's zero identity.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                DataType::F32,
+                vec![4],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %0 = \"stablehlo.reduce_window\"(%arg0, %cst) <{\
+                      padding = dense<[[3, 0]]> : tensor<1x2xi64>, \
+                      window_dimensions = array<i64: 4>\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.subtract %arg1, %arg2 : tensor<f32>
+                      %2 = stablehlo.compare NE, %1, %1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %3 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      %4 = stablehlo.abs %1 : tensor<f32>
+                      %5 = stablehlo.negate %4 : tensor<f32>
+                      %6 = stablehlo.exponential %5 : tensor<f32>
+                      %7 = stablehlo.log_plus_one %6 : tensor<f32>
+                      %8 = stablehlo.maximum %arg1, %arg2 : tensor<f32>
+                      %9 = stablehlo.add %8, %7 : tensor<f32>
+                      %10 = stablehlo.select %2, %3, %9 : tensor<i1>, tensor<f32>
+                      stablehlo.return %10 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_rejects_a_dynamically_sized_scanned_axis() {
+        // The window extent of the emitted `reduce_window` is the scanned extent, so the scan has no lowering when
+        // that extent is only known at runtime. `ryft-core` type inference already keeps the scanned axis static,
+        // which is why reaching the lowering's own guard takes an unchecked instruction whose output type carries a
+        // dynamic scanned dimension. The diagnostic names the scan the caller wrote, not the shared window helper.
+        let scanned = DimensionVariable::new("scanned", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(scanned)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(dynamic_type.clone());
+        let output = builder.add_variable(dynamic_type);
+        builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+            vec![input],
+            vec![output],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::UnsupportedOp {
+                op: "`cumulative_log_sum_exp` over dynamically sized axis 0".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_plain_program_rejects_drifting_log_sum_exp_seed_formats() {
+        // Five formats hold their window seed across too few folds for any useful scan length: `f8e8m0fnu` has no
+        // usable sentinel at all, its "lowest" value being the *positive* `2^-127`, while `f6e2m3fn`, `f4e2m1fn`,
+        // `f8e4m3b11fnuz`, and `f6e3m2fn` hold theirs across one, two, two, and seven copies. `ryft-core` type
+        // inference rejects all five by format, so reaching the lowering's own guard takes an unchecked instruction;
+        // the guard is what keeps that path from seeding a window with a constant that drifts as the window folds it.
+        for element_type in
+            [DataType::F8E8M0FNU, DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN]
+        {
+            let array_type = ArrayType::new(element_type, Shape::new(vec![Dimension::Static(4)]));
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(array_type.clone());
+            let output = builder.add_variable(array_type);
+            builder.add_instruction_unchecked(Instruction::new(
+                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                vec![input],
+                vec![output],
+                Vec::new(),
+            ));
+            let program = builder
+                .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            assert_eq!(
+                to_mlir_module_for_plain_program(&program, "main"),
+                Err(LoweringError::UnsupportedOp {
+                    op: format!(
+                        "`cumulative_log_sum_exp` over `{element_type}`, whose lowest value holds as a \
+                         `log_add_exp` identity across too few folds to seed a window and which `ryft-core` type \
+                         inference already rejects"
+                    ),
+                }),
+            );
+        }
+
+        // The three formats whose lowest value holds across a useful number of folds clear type inference and are
+        // gated by the scanned extent instead, because the widest window of the scan folds exactly `extent` seed
+        // copies. `f8e4m3fnuz` is the tightest of them at `floor(e^8)` folds, so it lowers at any extent through 2980
+        // and is rejected from 2981 on.
+        for extent in [4, 2980] {
+            assert!(
+                lowered_unary_module(
+                    ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                    DataType::F8E4M3FNUZ,
+                    vec![extent],
+                )
+                .is_ok(),
+            );
+        }
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                DataType::F8E4M3FNUZ,
+                vec![2981],
+            ),
+            Err(LoweringError::UnsupportedOp {
+                op: "`cumulative_log_sum_exp` over `f8e4m3fnuz` along an axis of extent 2981, whose widest window \
+                     folds 2981 seed sentinels but whose lowest value stays a `log_add_exp` identity across only 2980"
+                    .to_string(),
+            }),
+        );
+
+        // A format with a true negative infinity has no such bound, and neither in practice does `f8e5m2fnuz`, whose
+        // `e^4096` reach no extent can approach.
+        for data_type in [DataType::F32, DataType::F8E5M2FNUZ] {
+            assert!(
+                lowered_unary_module(
+                    ArrayOperation::CumulativeLogSumExp(CumulativeLogSumExpOperation::new(0)),
+                    data_type,
+                    vec![3000],
+                )
+                .is_ok(),
+            );
+        }
     }
 
     #[test]

@@ -3355,8 +3355,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_psum_lowers_to_all_reduce_and_executes_on_cpu() {
-        use ryft_core::{Collective, CollectiveKind};
+    fn test_shard_map_parallel_sum_lowers_to_all_reduce_and_executes_on_cpu() {
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -3375,7 +3375,7 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // `psum` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to a
+        // `parallel_sum` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to a
         // `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
         // elementwise sum of all four local shards.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
@@ -3384,13 +3384,13 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with psum should trace")
+                    .expect("shard_map with parallel_sum should trace")
                 }
             },
             global_input_type,
@@ -3583,8 +3583,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_pmean_lowers_to_all_reduce_with_axis_size_division() {
-        use ryft_core::{Collective, CollectiveKind};
+    fn test_shard_map_parallel_mean_lowers_to_all_reduce_with_axis_size_division() {
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3596,13 +3596,13 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PMean).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Mean).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with pmean should trace")
+                    .expect("shard_map with parallel_mean should trace")
                 }
             },
             global_input_type,
@@ -3634,8 +3634,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_grouped_pmean_preserves_group_order_and_uses_group_divisor() {
-        use ryft_core::{Collective, CollectiveKind};
+    fn test_shard_map_grouped_parallel_mean_preserves_group_order_and_uses_group_divisor() {
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3646,9 +3646,9 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             local_x
-                                .collective_with_axis_index_groups(
+                                .parallel_reduce_with_axis_index_groups(
                                     "x",
-                                    CollectiveKind::PMean,
+                                    ParallelReductionKind::Mean,
                                     vec![vec![0, 2], vec![3, 1]],
                                 )
                                 .unwrap()
@@ -3672,16 +3672,16 @@ mod tests {
 
     #[test]
     fn test_batch_inside_shard_map_forwards_mesh_collective_to_all_reduce() {
-        use ryft_core::{Batch, BatchAxis, BatchAxisSpecification, Collective, CollectiveKind};
+        use ryft_core::{Batch, BatchAxis, BatchAxisSpecification, ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // A named `batch` level inside the shard_map body binds `"b"`, while `psum` names the *mesh* axis `"x"`: the
-        // batching rule forwards the collective through the batch level to the seeded base trace (which binds `"x"`),
-        // so it lands in the body program on the batched physical value and lowers to the same `all_reduce` as a
-        // direct `psum` — resolution composes across binder kinds.
+        // A named `batch` level inside the shard_map body binds `"b"`, while `parallel_sum` names the *mesh* axis
+        // `"x"`: the batching rule forwards the collective through the batch level to the seeded base trace (which
+        // binds `"x"`), so it lands in the body program on the batched physical value and lowers to the same
+        // `all_reduce` as a direct `parallel_sum` — resolution composes across binder kinds.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
@@ -3692,7 +3692,7 @@ mod tests {
                             let context = local_x.dispatch_domain();
                             let summed: ShardMapTracer = Batch::batch(
                                 &context,
-                                |item| item.collective("x", CollectiveKind::PSum),
+                                |item| item.parallel_reduce("x", ParallelReductionKind::Sum),
                                 local_x,
                                 BatchAxis::new(0),
                                 BatchAxis::new(0),
@@ -3706,14 +3706,15 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with vmapped psum should trace")
+                    .expect("shard_map with vmapped parallel_sum should trace")
                 }
             },
             global_input_type,
         )
         .unwrap();
 
-        // The module is identical to the direct-psum module: the batch level forwarded the mesh collective untouched.
+        // The module is identical to the direct `parallel_sum` module: the batch level forwarded the mesh collective
+        // untouched.
         assert_eq!(
             traced.to_mlir_module("main").unwrap(),
             indoc! {r#"
@@ -3736,9 +3737,9 @@ mod tests {
     }
 
     #[test]
-    fn test_collective_inside_condition_inside_shard_map_lowers_to_all_reduce() {
+    fn test_parallel_reduce_inside_condition_inside_shard_map_lowers_to_all_reduce() {
         use ryft_core::{
-            CollectiveKind, CollectiveOperation, Compare, ComparisonDirection, ConditionOperation, Reduce,
+            Compare, ComparisonDirection, ConditionOperation, ParallelReduceOperation, ParallelReductionKind, Reduce,
             ReductionKind,
         };
 
@@ -3746,9 +3747,9 @@ mod tests {
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // The `psum` sits inside a `condition` branch inside the shard_map body, so it lowers through the nested
-        // control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
-        // `stablehlo.if` region and emits the same `all_reduce` as a body-level `psum` would.
+        // The `parallel_sum` sits inside a `condition` branch inside the shard_map body, so it lowers through the
+        // nested control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
+        // `stablehlo.if` region and emits the same `all_reduce` as a body-level `parallel_sum` would.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = mesh.clone();
@@ -3757,12 +3758,12 @@ mod tests {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
                             let local_type = local_x.r#type().into_owned();
-                            let psum_branch = {
+                            let parallel_sum_branch = {
                                 let mut builder = XlaProgramBuilder::new();
                                 let input = builder.add_input(ArrayIrType::Array(local_type.clone()));
                                 let output = builder
                                     .add_instruction(
-                                        CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
+                                        ParallelReduceOperation::new("x".to_string(), ParallelReductionKind::Sum),
                                         Vec::new(),
                                         vec![input],
                                         None,
@@ -3783,7 +3784,7 @@ mod tests {
                             let mut outputs = context
                                 .stage_operation(
                                     XlaOperation::Condition(ConditionOperation::new()),
-                                    vec![psum_branch, identity_branch],
+                                    vec![parallel_sum_branch, identity_branch],
                                     &[predicate.into_value(), local_x.into_value()],
                                 )
                                 .unwrap();
@@ -3795,7 +3796,7 @@ mod tests {
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with psum inside a condition should trace")
+                    .expect("shard_map with parallel_sum inside a condition should trace")
                 }
             },
             global_input_type,
@@ -3833,7 +3834,7 @@ mod tests {
 
     #[test]
     fn test_two_shard_maps_with_collectives_receive_unique_channel_ids() {
-        use ryft_core::{Collective, CollectiveKind};
+        use ryft_core::{ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -3847,7 +3848,7 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     let first = shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
@@ -3855,7 +3856,7 @@ mod tests {
                     )
                     .expect("first shard_map should trace");
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_reduce("x", ParallelReductionKind::Sum).unwrap(),
                         first,
                         mesh.clone(),
                         sharding.clone(),
@@ -4074,7 +4075,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_collective_over_unbound_axis_is_rejected_at_trace_time() {
-        use ryft_core::{AxisError, BatchingError, Collective, CollectiveKind};
+        use ryft_core::{AxisError, BatchingError, ParallelReduce, ParallelReductionKind};
 
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -4089,7 +4090,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            let error = local_x.collective("y", CollectiveKind::PSum).unwrap_err();
+                            let error = local_x.parallel_reduce("y", ParallelReductionKind::Sum).unwrap_err();
                             assert!(matches!(
                                 error.downcast_custom::<BatchingError>(),
                                 Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "y",
@@ -4374,7 +4375,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_grouped_shape_changing_collectives_execute_on_cpu() {
-        use ryft_core::operations::collectives::{AllToAll, PSumScatter};
+        use ryft_core::operations::collectives::{AllToAll, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4401,7 +4402,7 @@ mod tests {
                                 local_x
                                     .all_gather_with_options("x", 0, options.clone(), AllGatherOutputVariance::Varying)
                                     .unwrap(),
-                                local_x.clone().psum_scatter_with_options("x", 0, options.clone()).unwrap(),
+                                local_x.clone().parallel_sum_scatter_with_options("x", 0, options.clone()).unwrap(),
                                 local_x.all_to_all_with_options("x", 0, 0, options).unwrap(),
                             )
                         },
@@ -4496,8 +4497,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_psum_scatter_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::{CollectiveOptions, PSumScatter};
+    fn test_shard_map_parallel_sum_scatter_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::{CollectiveOptions, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4516,9 +4517,9 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(8)]));
 
-        // `psum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and scatters
-        // the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`. The
-        // staged collective lowers to a channeled `stablehlo.reduce_scatter` with a sum reduction.
+        // `parallel_sum_scatter` over the manual mesh axis `"x"` sums the two local `f32[4]` shards elementwise and
+        // scatters the sum, leaving each device with its own `f32[2]` chunk, so the sharded global output is `f32[4]`.
+        // The staged collective lowers to a channeled `stablehlo.reduce_scatter` with a sum reduction.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
                 let mesh = device_mesh.logical_mesh().clone();
@@ -4526,14 +4527,14 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x.psum_scatter_with_options("x", 0, CollectiveOptions::tiled()).unwrap()
+                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::tiled()).unwrap()
                         },
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with psum_scatter should trace")
+                    .expect("shard_map with parallel_sum_scatter should trace")
                 }
             },
             global_input_type,
@@ -4616,8 +4617,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_untiled_psum_scatter_lowers_rank_removal() {
-        use ryft_core::operations::collectives::{CollectiveOptions, PSumScatter};
+    fn test_shard_map_untiled_parallel_sum_scatter_lowers_rank_removal() {
+        use ryft_core::operations::collectives::{CollectiveOptions, ParallelSumScatter};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4642,7 +4643,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
                         |local_x: ShardMapTracer| {
-                            local_x.psum_scatter_with_options("x", 0, CollectiveOptions::default()).unwrap()
+                            local_x.parallel_sum_scatter_with_options("x", 0, CollectiveOptions::default()).unwrap()
                         },
                         x,
                         mesh.clone(),
@@ -4710,8 +4711,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_ppermute_lowers_and_executes_on_cpu() {
-        use ryft_core::operations::collectives::Ppermute;
+    fn test_shard_map_parallel_permute_lowers_and_executes_on_cpu() {
+        use ryft_core::operations::collectives::ParallelPermute;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
@@ -4730,8 +4731,8 @@ mod tests {
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
 
-        // `ppermute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two local
-        // shards without changing their shapes. The staged collective lowers to a channeled
+        // `parallel_permute` over the manual mesh axis `"x"` with the rotation pairs [(0, 1), (1, 0)] swaps the two
+        // local shards without changing their shapes. The staged collective lowers to a channeled
         // `stablehlo.collective_permute` with the axis-local pairs expanded to global device pairs.
         let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
             {
@@ -4739,13 +4740,13 @@ mod tests {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
                     shard_map::<_, _, ArrayType, _>(
-                        |local_x: ShardMapTracer| local_x.ppermute("x", vec![(0, 1), (1, 0)]).unwrap(),
+                        |local_x: ShardMapTracer| local_x.parallel_permute("x", vec![(0, 1), (1, 0)]).unwrap(),
                         x,
                         mesh.clone(),
                         sharding.clone(),
                         sharding.clone(),
                     )
-                    .expect("shard_map with ppermute should trace")
+                    .expect("shard_map with parallel_permute should trace")
                 }
             },
             global_input_type,

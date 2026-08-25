@@ -1851,15 +1851,15 @@ mod tests {
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
         Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceViewTransform,
-        ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos, DataType, Device,
-        DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
-        DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext, Exp, Fill,
-        ForwardModeDifferentiate, FreezeReference, Hessian, Iota, Jacobian, LogicalMesh, Logistic, MeshAxis,
-        MeshAxisType, Mul, NewReference, OneLike, ProgramError, ProjectedValue, Reduce, ReductionKind,
-        ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
-        ReferenceCompletionResult, ReferenceError, ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding,
-        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike,
+        ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos,
+        CumulativeLogSumExp, CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
+        DimensionBounds, DimensionVariable, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, FreezeReference, Hessian, Iota,
+        Jacobian, LogSumExp, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, NewReference, OneLike, ProgramError,
+        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend,
+        ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError, ReferenceRead, ReferenceType, Reshape,
+        Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value,
+        ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2074,6 +2074,104 @@ mod tests {
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
+    }
+
+    #[test]
+    fn test_jit_cumulative_sum_runs_end_to_end() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let values = [1.0f32, 2.0, 3.0, 4.0];
+        let source = || {
+            Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap()
+        };
+
+        // The compiled `reduce_window` scan reproduces the exact prefix sums of the operand, and its reverse
+        // direction the exact suffix sums.
+        let forward: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let output = engine.interpret(&forward.executable_function(), source()).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![1.0, 3.0, 6.0, 10.0]);
+
+        let reverse: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.reverse_cumulative_sum(0).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let output = engine.interpret(&reverse.executable_function(), source()).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![10.0, 9.0, 7.0, 4.0]);
+
+        // Reverse-mode differentiation through the compiled scan exercises the transposed direction end to end:
+        // summing every prefix weights element `i` by the number of prefixes that contain it, so the gradient is
+        // the reverse scan of ones.
+        let total: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |x| x.cumulative_sum(0).unwrap().reduce(&[0], ReductionKind::Sum),
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = total.gradient(&engine).unwrap();
+        let output = engine.interpret(&gradient.executable_function(), source()).unwrap();
+        assert_eq!(read_f32_array(&client, &output), vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_jit_log_sum_exp_and_cumulative_log_sum_exp_run_end_to_end() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let source = |values: [f32; 4]| {
+            Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&values).as_slice(),
+            )
+            .unwrap()
+        };
+        // Both lowerings are expansions over transcendental StableHLO operations, so the compiled results are
+        // compared within a tolerance scaled to the magnitude of the expected `f32` value.
+        let assert_close = |observed: &[f32], expected: &[f32]| {
+            assert_eq!(observed.len(), expected.len());
+            for (index, (observed, expected)) in observed.iter().zip(expected).enumerate() {
+                let tolerance = 1e-6 * expected.abs().max(1.0);
+                assert!(
+                    (observed - expected).abs() <= tolerance,
+                    "element {index}: compiled {observed} but expected {expected}",
+                );
+            }
+        };
+
+        // The compiled guarded expansion returns `log(4)` for four equal zeros, and the same value shifted by the
+        // maximum for four equal thousands, where a shift-free `sum(exp(x))` would have overflowed `f32` outright.
+        let reduced: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let output = engine.interpret(&reduced.executable_function(), source([0.0; 4])).unwrap();
+        assert_close(&read_f32_array(&client, &output), &[4.0f32.ln()]);
+        let output = engine.interpret(&reduced.executable_function(), source([1000.0; 4])).unwrap();
+        assert_close(&read_f32_array(&client, &output), &[1000.0 + 4.0f32.ln()]);
+
+        // The reverse prefix scan folds the pairwise stable `log_add_exp` over each suffix, so position `i` of an
+        // all-zero operand holds `log(4 - i)` and the final position holds `log(1) = 0`.
+        let scanned: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.reverse_cumulative_log_sum_exp(0).unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
+        let output = engine.interpret(&scanned.executable_function(), source([0.0; 4])).unwrap();
+        assert_close(&read_f32_array(&client, &output), &[4.0f32.ln(), 3.0f32.ln(), 2.0f32.ln(), 0.0]);
     }
 
     #[test]

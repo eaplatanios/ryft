@@ -31,12 +31,12 @@ pub use arrays::{
     DimensionError, DimensionOperation, DimensionOperations, DimensionSource, DimensionTracingContext, DimensionType,
     DimensionValue, DimensionVariable, ExactShape, ExactShapeDimension, Layout, LayoutError, LinearResiduals,
     LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, ProcessIndex, REFERENCE_INDEX_OPERATION_NAME,
-    REFERENCE_SLICE_OPERATION_NAME, RaggedArrayBatchingPolicy, RaggedAxis, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceSlice, ReferenceSliceOperation, ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension,
-    ShardingError, ShardingVisualization, StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension,
-    TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn,
-    f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1,
-    i2, i4, materialize_array_tangent, u1, u2, u4, validate_storage_bytes,
+    REFERENCE_SLICE_OPERATION_NAME, RaggedArrayBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReferenceIndex,
+    ReferenceIndexOperation, ReferenceSlice, ReferenceSliceOperation, ReplicatedDimensionBatchingPolicy, Shape,
+    Sharding, ShardingDimension, ShardingError, ShardingVisualization, StaticArrayBatchingPolicy, StaticShape,
+    StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements,
+    encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2,
+    f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent, u1, u2, u4, validate_storage_bytes,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -89,6 +89,12 @@ pub use operations::control_flow::{
     SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
     transpose_primal_condition, transpose_primal_scan,
 };
+pub use operations::cumulative::{
+    CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
+    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CumulativeLogSumExp,
+    CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
+    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation,
+};
 pub use operations::dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use operations::logical::{
     AND_OPERATION_NAME, And, AndOperation, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME, Or, OrOperation,
@@ -110,13 +116,15 @@ pub use operations::math::{
     ABS_OPERATION_NAME, ADD_OPERATION_NAME, ATAN2_OPERATION_NAME, Abs, AbsOperation, Add, AddOperation, Atan2,
     Atan2Operation, CEIL_OPERATION_NAME, COS_OPERATION_NAME, Ceil, CeilOperation, Clamp, Cos, CosOperation,
     DIV_OPERATION_NAME, Div, DivOperation, ERF_OPERATION_NAME, EXP_OPERATION_NAME, Erf, ErfOperation, Exp,
-    ExpOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, LOG_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Log,
-    LogOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME, MIN_OPERATION_NAME, MUL_OPERATION_NAME, Max,
-    MaxOperation, Min, MinOperation, Mul, MulOperation, NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME, Pow,
-    PowOperation, REM_OPERATION_NAME, ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, Reduce, ReduceOperation,
-    ReductionKind, Rem, RemOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME,
-    SIN_OPERATION_NAME, SQRT_OPERATION_NAME, SUB_OPERATION_NAME, Sign, SignOperation, Sin, SinOperation, Sqrt,
-    SqrtOperation, Sub, SubOperation, TANH_OPERATION_NAME, Tanh, TanhOperation,
+    ExpOperation, FLOOR_OPERATION_NAME, Floor, FloorOperation, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,
+    LOG_SUM_EXP_OPERATION_NAME, LOG1P_OPERATION_NAME, LOGISTIC_OPERATION_NAME, Log, Log1p, Log1pOperation, LogAddExp,
+    LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, MAX_OPERATION_NAME,
+    MIN_OPERATION_NAME, MUL_OPERATION_NAME, Max, MaxOperation, Min, MinOperation, Mul, MulOperation,
+    NEG_OPERATION_NAME, Neg, NegOperation, POW_OPERATION_NAME, Pow, PowOperation, REM_OPERATION_NAME,
+    ROUND_OPERATION_NAME, RSQRT_OPERATION_NAME, Reduce, ReduceOperation, ReductionKind, Rem, RemOperation, Round,
+    RoundOperation, Rsqrt, RsqrtOperation, SIGN_OPERATION_NAME, SIN_OPERATION_NAME, SQRT_OPERATION_NAME,
+    SUB_OPERATION_NAME, Sign, SignOperation, Sin, SinOperation, Sqrt, SqrtOperation, Sub, SubOperation,
+    TANH_OPERATION_NAME, Tanh, TanhOperation,
 };
 pub use operations::quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
 pub use operations::sharding::{
@@ -124,21 +132,21 @@ pub use operations::sharding::{
     ShardingConstraintOperation,
 };
 pub use operations::{
-    ArithmeticDimensionOperation, Collective, CollectiveKind, CollectiveOperation, DIMENSION_ADD_OPERATION_NAME,
-    DIMENSION_DIV_FLOOR_OPERATION_NAME, DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME,
-    DIMENSION_MIN_OPERATION_NAME, DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME,
-    DIMENSION_REM_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME,
-    DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME, DIMENSION_REQUIRE_EQUAL_OPERATION_NAME,
-    DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_SATURATING_SUB_OPERATION_NAME,
-    DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME, DIMENSION_TO_SCALAR_OPERATION_NAME,
-    DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
-    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
-    DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
+    ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,
+    DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
+    DIMENSION_MUL_OPERATION_NAME, DIMENSION_POW_OPERATION_NAME, DIMENSION_REM_OPERATION_NAME,
+    DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME,
+    DIMENSION_REQUIRE_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME,
+    DIMENSION_SATURATING_SUB_OPERATION_NAME, DIMENSION_SIZE_OPERATION_NAME, DIMENSION_SUB_OPERATION_NAME,
+    DIMENSION_TO_SCALAR_OPERATION_NAME, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation,
+    DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin,
+    DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation,
+    DimensionRequirement, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionSaturatingSub,
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, ElementwiseOperation, PRINT_OPERATION_NAME, Print, PrintOperation,
-    RUNTIME_DIMENSION_DATA_TYPE, TAG_OPERATION_NAME, TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation,
-    TransferToMemory, TransferToMemoryOperation, forward_collective_to_parent,
+    DimensionToScalarOperation, ElementwiseOperation, PRINT_OPERATION_NAME, ParallelReduce, ParallelReduceOperation,
+    ParallelReductionKind, Print, PrintOperation, RUNTIME_DIMENSION_DATA_TYPE, TAG_OPERATION_NAME,
+    TRANSFER_TO_MEMORY_OPERATION_NAME, Tag, TagOperation, TransferToMemory, TransferToMemoryOperation,
+    forward_collective_to_parent,
 };
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,

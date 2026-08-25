@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
-    AllGatherOperation, AllToAllOperation, PSumScatterOperation, PpermuteOperation,
+    AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
@@ -18,9 +18,10 @@ use ryft_core::{
     ArrayIrType, ArrayOperation, ArrayReferenceOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform,
     ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram,
     BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant,
-    CaptureReference, CeilOperation, CollectiveOperation, CompareOperation, CompiledCallOperation,
-    ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation,
-    CosOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
+    CaptureReference, CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable,
+    ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation, CosOperation,
+    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
+    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation,
     DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
     DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
@@ -28,10 +29,11 @@ use ryft_core::{
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     EagerContext, ErfOperation, ExpOperation, FloorOperation, FreezeReferenceOperation, GatherOperation, IotaOperation,
-    LinearCallOperation, LogOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation, MulOperation,
-    NegOperation, NewReferenceOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
-    OrOperation, OutputRegionProvenance, PadOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation,
+    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NewReferenceOperation, NotOperation,
+    OneLikeOperation, OneOperation, Operation, OperationFormatter, OrOperation, OutputRegionProvenance, PadOperation,
+    ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
     ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation, ReferenceReadOperation,
@@ -324,7 +326,7 @@ where
 
     /// Scatters values with one explicit extent per result axis.
     #[ryft(mixed)]
-    PSumScatter(PSumScatterOperation),
+    ParallelSumScatter(ParallelSumScatterOperation),
 
     /// Exchanges values with one explicit extent per result axis.
     #[ryft(mixed)]
@@ -434,7 +436,7 @@ where
             ArrayIrOperation::DynamicShapeSlice(operation) => Self::DynamicShapeSlice(operation),
             ArrayIrOperation::RngBitGenerator(operation) => Self::RngBitGenerator(operation),
             ArrayIrOperation::AllGather(operation) => Self::AllGather(operation),
-            ArrayIrOperation::PSumScatter(operation) => Self::PSumScatter(operation),
+            ArrayIrOperation::ParallelSumScatter(operation) => Self::ParallelSumScatter(operation),
             ArrayIrOperation::AllToAll(operation) => Self::AllToAll(operation),
             ArrayIrOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayIrOperation::While(operation) => Self::While(operation),
@@ -571,6 +573,8 @@ impl_array_operation_conversion!(
     Atan2Operation<ArrayType>,
     ExpOperation<ArrayType>,
     LogOperation<ArrayType>,
+    Log1pOperation<ArrayType>,
+    LogAddExpOperation<ArrayType>,
     SqrtOperation<ArrayType>,
     RsqrtOperation<ArrayType>,
     TanhOperation<ArrayType>,
@@ -597,9 +601,15 @@ impl_array_operation_conversion!(
     DotProductAttentionOperation,
     DotProductAttentionBackwardOperation,
     ReduceOperation,
+    LogSumExpOperation,
+    CumulativeSumOperation,
+    CumulativeProductOperation,
+    CumulativeMaxOperation,
+    CumulativeMinOperation,
+    CumulativeLogSumExpOperation,
     SortOperation,
-    CollectiveOperation,
-    PpermuteOperation,
+    ParallelReduceOperation,
+    ParallelPermuteOperation,
     AxisIndexOperation,
     TransposeOperation,
     ReshapeOperation,
@@ -709,7 +719,7 @@ where
             Self::DynamicShapeSlice(operation) => ArrayIrOperation::DynamicShapeSlice(operation.clone()),
             Self::RngBitGenerator(operation) => ArrayIrOperation::RngBitGenerator(operation.clone()),
             Self::AllGather(operation) => ArrayIrOperation::AllGather(operation.clone()),
-            Self::PSumScatter(operation) => ArrayIrOperation::PSumScatter(operation.clone()),
+            Self::ParallelSumScatter(operation) => ArrayIrOperation::ParallelSumScatter(operation.clone()),
             Self::AllToAll(operation) => ArrayIrOperation::AllToAll(operation.clone()),
             Self::Condition(_)
             | Self::While(_)
