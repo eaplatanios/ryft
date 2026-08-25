@@ -157,3 +157,56 @@ where
         Ok(BatchedOutputs::new(vec![output], contracted_dimensions))
     }
 }
+
+impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for RaggedDotOperation
+where
+    RaggedDotOperation: InterpretableOperation<C>,
+{
+    // The explicit group metadata and both data operands must be mapped over their leading axis, matching the exact
+    // leading-axis restriction of the grouped-dot contract. Bounded ragged-axis metadata is rejected because explicit
+    // `group_sizes` are the sole source of raggedness for this primitive.
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        check_count!("input", inputs, 3, ProgramError);
+        if let Some(ragged_axis) = inputs.iter().flat_map(ArrayBatch::ragged_axes).next() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` does not accept bounded ragged dimension `{}`; use explicit group \
+                     sizes instead",
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
+        let batch_axes = inputs.iter().map(ArrayBatch::batch_axis_position).collect::<Vec<_>>();
+        if batch_axes.iter().all(Option::is_none) {
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        }
+        if batch_axes.iter().any(|axis| *axis != Some(0)) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` batching requires every operand to be mapped over leading axis 0",
+                ),
+            });
+        }
+        ArrayBatch::common_batch_size(inputs)?;
+
+        let lhs_rank = inputs[0].r#type().rank() - 1;
+        let mode = self.dimensions().mode(lhs_rank)?;
+        let (dot_dimensions, _) = lift_dot_dimensions(self.dimensions().dot_dimensions(), Some(0), Some(0)).unwrap();
+        let dimensions = RaggedDotDimensionNumbers::new(
+            dot_dimensions,
+            self.dimensions().lhs_ragged_dimensions().iter().map(|axis| axis + 1).collect(),
+            self.dimensions().rhs_group_dimensions().iter().map(|axis| axis + 1).collect(),
+        );
+        let operation = RaggedDotOperation::new(dimensions).with_lowering_strategy(self.lowering_strategy());
+        let output_axis = if mode == RaggedDotMode::Contracting { 1 } else { 0 };
+        Ok(operation
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(output_axis)])?
+            .into())
+    }
+}

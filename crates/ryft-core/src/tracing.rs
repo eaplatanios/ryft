@@ -1171,8 +1171,8 @@ mod tests {
         );
 
         // Test staging value-level identity helpers through the tracer convenience API.
-        let zero = tracer.zero_like();
-        let one = tracer.one_like();
+        let zero = tracer.zero_like().unwrap();
+        let one = tracer.one_like().unwrap();
         assert_eq!(zero.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(one.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         let zero_atom = zero.atom_id().expect("zero_like output should remain live");
@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     fn test_tracing_context_trace() {
         let (output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| Ok(x.clone() * x.clone() + x.one_like()),
+            |x| Ok(x.clone() * x.clone() + x.one_like()?),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -1583,7 +1583,7 @@ mod tests {
 
         // Test tracing value-level identity helpers as ordinary operations.
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok((x.zero_like(), x.one_like())), Array::scalar(2.0)).unwrap();
+            domain.interpret_and_trace(|x| Ok((x.zero_like()?, x.one_like()?)), Array::scalar(2.0)).unwrap();
         assert_eq!(output, (Array::scalar(0.0), Array::scalar(1.0)));
         assert_eq!(
             program.to_string(),

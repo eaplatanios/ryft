@@ -150,11 +150,12 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 /// Batching rule for [`DotOperation`]: the operands are aligned onto one common mapped axis, the dimension numbers are
 /// lifted past it with [`lift_dot_dimensions`], and the lifted contraction is re-interpreted over the packed values.
 ///
-/// Alignment is delegated to [`ArrayBatchingPolicy::match_axis`], so this rule never needs a statically known mapped
-/// extent: under a dimension-valued policy the batch axis materialized on a replicated operand is grounded by the
-/// transform's first-class extent value, and the staged contraction simply carries that possibly-dynamic mapped
-/// [`Dimension`] on its batching dimension. Two mapped operands must still describe the same mapped extent, which for
-/// dynamic extents means the same [`DimensionVariable`](crate::arrays::DimensionVariable).
+/// Alignment is delegated to
+/// [`ArrayBatchingPolicy::match_axis`](crate::arrays::ArrayBatchingPolicy::match_axis), so this rule never needs a
+/// statically known mapped extent: under a dimension-valued policy the batch axis materialized on a replicated operand
+/// is grounded by the transform's first-class extent value, and the staged contraction simply carries that
+/// possibly-dynamic mapped [`Dimension`] on its batching dimension. Two mapped operands must still describe the same
+/// mapped extent, which for dynamic extents means the same [`DimensionVariable`](crate::arrays::DimensionVariable).
 ///
 /// A contraction is also a zero-padding-discipline consumer of bounded ragged axes. Every ragged axis of an operand is
 /// either contracted or free:
@@ -253,6 +254,197 @@ where
             )
             .expect("`dot` operation failed")
             .remove(0)
+    }
+}
+
+/// Backend strategy used when lowering a [`RaggedDotOperation`].
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RaggedDotLoweringStrategy {
+    /// Expand the grouped dot into masking plus ordinary dense generalized dots.
+    #[default]
+    Decomposition,
+
+    /// Emit the dedicated CHLO `ragged_dot` instruction.
+    Instruction,
+}
+
+/// Primitive representing a grouped generalized dot with explicit group sizes.
+///
+/// Exactly one LHS dimension is ragged. Its role selects one of three modes:
+///
+///   - A non-contracting ragged dimension is partitioned into consecutive groups. The corresponding RHS group
+///     dimension selects one RHS slice per group, and the grouped products are written back along the LHS result
+///     dimension. A zero-size group contributes nothing and any uncovered suffix of that dimension is zero.
+///   - A contracting ragged dimension partitions the paired contracting dimensions into consecutive groups. The
+///     output gains a leading group dimension, and a zero-size group produces a zero slice.
+///   - A batching ragged dimension has ordinary batched-dot semantics. `group_sizes` participates in type inference
+///     but its values do not affect the result.
+///
+/// `group_sizes` is either a rank-one `[group_count]` array shared by every prefix or an array whose trailing axis is
+/// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped-dot iteration
+/// space. Grouped expansion modes require an element type that can represent zero; in particular, they reject
+/// `f8e8m0fnu`. Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RaggedDotOperation {
+    /// Grouped-dot dimension-number specification.
+    dimensions: RaggedDotDimensionNumbers,
+
+    /// Requested backend lowering strategy.
+    lowering_strategy: RaggedDotLoweringStrategy,
+}
+
+impl RaggedDotOperation {
+    /// Creates a grouped generalized dot using the portable decomposition lowering.
+    #[inline]
+    pub fn new(dimensions: RaggedDotDimensionNumbers) -> Self {
+        Self { dimensions, lowering_strategy: RaggedDotLoweringStrategy::Decomposition }
+    }
+
+    /// Returns the grouped-dot dimension-number specification.
+    #[inline]
+    pub fn dimensions(&self) -> &RaggedDotDimensionNumbers {
+        &self.dimensions
+    }
+
+    /// Returns the selected backend lowering strategy.
+    #[inline]
+    pub fn lowering_strategy(&self) -> RaggedDotLoweringStrategy {
+        self.lowering_strategy
+    }
+
+    /// Returns a copy configured to emit the dedicated CHLO instruction.
+    #[inline]
+    pub fn with_lowering_strategy(mut self, lowering_strategy: RaggedDotLoweringStrategy) -> Self {
+        self.lowering_strategy = lowering_strategy;
+        self
+    }
+}
+
+impl Display for RaggedDotOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for RaggedDotOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        RAGGED_DOT_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 3, TypeError);
+        Ok(vec![ragged_dot_abstract(&input_types[0], &input_types[1], &input_types[2], &self.dimensions)?])
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
+            operation.field("dimensions", &self.dimensions)?;
+            if self.lowering_strategy != RaggedDotLoweringStrategy::Decomposition {
+                operation.field("lowering_strategy", &format_args!("{:?}", self.lowering_strategy))?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl<C: Domain<Type = ArrayType, Value: RaggedDot>> InterpretableOperation<C> for RaggedDotOperation {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 3, ProgramError);
+        Ok(vec![inputs[0].ragged_dot_general_with_lowering_strategy(
+            &inputs[1],
+            &inputs[2],
+            &self.dimensions,
+            self.lowering_strategy,
+        )?])
+    }
+}
+
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedDotOperation where
+    C::Operation: From<RaggedDotOperation>
+{
+}
+
+/// Value-level grouped generalized dot capability.
+pub trait RaggedDot: Sized {
+    /// Computes a grouped generalized dot using explicit `group_sizes`. Refer to [`RaggedDotOperation`] for the three
+    /// modes, metadata shapes, and zero-group and uncovered-position semantics.
+    fn ragged_dot_general(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+    ) -> Result<Self, ProgramError>;
+
+    /// Computes a grouped generalized dot with an explicit backend lowering strategy. Refer to [`RaggedDotOperation`]
+    /// for the grouped-dot semantics and [`RaggedDotLoweringStrategy`] for the available backend representations.
+    #[inline]
+    fn ragged_dot_general_with_lowering_strategy(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+        lowering_strategy: RaggedDotLoweringStrategy,
+    ) -> Result<Self, ProgramError> {
+        let _ = lowering_strategy;
+        self.ragged_dot_general(rhs, group_sizes, dimensions)
+    }
+
+    /// Computes the basic non-contracting form `[M, K] × [G, K, N] → [M, N]`. Refer to [`RaggedDotOperation`] for
+    /// zero-size-group and uncovered-row behavior.
+    #[inline]
+    fn ragged_dot(&self, rhs: &Self, group_sizes: &Self) -> Result<Self, ProgramError> {
+        self.ragged_dot_general(rhs, group_sizes, &RaggedDotDimensionNumbers::matmul())
+    }
+}
+
+impl<V: Value<Type = ArrayType>> RaggedDot for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<RaggedDotOperation>,
+{
+    fn ragged_dot_general(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+    ) -> Result<Self, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(
+                RaggedDotOperation::new(dimensions.clone()),
+                Vec::new(),
+                &[self.clone(), rhs.clone(), group_sizes.clone()],
+            )?
+            .remove(0))
+    }
+
+    fn ragged_dot_general_with_lowering_strategy(
+        &self,
+        rhs: &Self,
+        group_sizes: &Self,
+        dimensions: &RaggedDotDimensionNumbers,
+        lowering_strategy: RaggedDotLoweringStrategy,
+    ) -> Result<Self, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(
+                RaggedDotOperation::new(dimensions.clone()).with_lowering_strategy(lowering_strategy),
+                Vec::new(),
+                &[self.clone(), rhs.clone(), group_sizes.clone()],
+            )?
+            .remove(0))
     }
 }
 

@@ -557,7 +557,8 @@ where
         let fresh_states = (0..count)
             .map(|index| {
                 let key = keys.slice(&[index], &[index + 1], &[1])?;
-                Concatenate::concatenate([&key, &key.zero_like()], 0)
+                let zero = key.zero_like()?;
+                Concatenate::concatenate([&key, &zero], 0)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((state, fresh_states))

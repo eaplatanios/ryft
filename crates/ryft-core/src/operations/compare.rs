@@ -341,7 +341,7 @@ mod tests {
     fn piecewise_select(
         x: DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>,
     ) -> Result<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
+        let mask = x.compare(&x.zero_like()?, ComparisonDirection::GreaterThan)?;
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
     }
 

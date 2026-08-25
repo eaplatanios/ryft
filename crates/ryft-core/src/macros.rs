@@ -6033,6 +6033,15 @@ mod tests {
                 Ok(current.clone())
             }
 
+            fn write(
+                _context: &C,
+                _current: &C::Value,
+                replacement: C::Value,
+                _alias: &WholeArray,
+            ) -> Result<C::Value, ProgramError> {
+                Ok(replacement)
+            }
+
             fn replace(
                 _context: &C,
                 current: &C::Value,

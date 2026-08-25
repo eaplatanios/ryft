@@ -631,8 +631,8 @@ pub trait Operation: Clone {
     /// ```
     ///
     /// The condition therefore permits [`ReferenceAccessMode::Read`] through its input. It rejects
-    /// [`ReferenceAccessMode::Write`], [`ReferenceAccessMode::Accumulate`], and [`ReferenceAccessMode::Consume`].
-    /// A `while` implementation consequently reports:
+    /// [`ReferenceAccessMode::Write`], [`ReferenceAccessMode::ReadWrite`], [`ReferenceAccessMode::Accumulate`],
+    /// and [`ReferenceAccessMode::Consume`]. A `while` implementation consequently reports:
     ///
     /// ```text
     /// condition + read:  true
@@ -1243,6 +1243,7 @@ mod tests {
         assert_eq!(operation.region_capture_input_count(0), None);
         assert_eq!(operation.reference_output_identity_input(0), None);
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.is_zero(0));
         assert_eq!(operation.effects(), Effects::PURE);
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
@@ -1285,6 +1286,7 @@ mod tests {
         assert_eq!(operation.reference_output_identity_input(2), None);
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
         let semantics = operation.reference_semantics();
         assert_eq!(semantics.outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }]);

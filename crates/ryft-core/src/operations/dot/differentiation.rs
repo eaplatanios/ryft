@@ -169,3 +169,143 @@ impl<
         }
     }
 }
+
+// A grouped dot is jointly linear in its two data operands. Group sizes are integer metadata and therefore carry no
+// tangent; the two surviving product-rule terms reuse the same grouped-dot dimensions and lowering strategy.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for RaggedDotOperation
+where
+    C::Operation: From<ConvertElementTypeOperation<ArrayType>> + From<RaggedDotOperation>,
+    C::Value: ConvertElementType + RaggedDot + std::ops::Add<Output = C::Value>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 3, ProgramError);
+        let lhs = &inputs[0];
+        let rhs = &inputs[1];
+        let group_sizes = inputs[2].primal();
+        let apply = |lhs: &C::Value, rhs: &C::Value| {
+            lhs.ragged_dot_general_with_lowering_strategy(rhs, group_sizes, self.dimensions(), self.lowering_strategy())
+        };
+        let primal = apply(lhs.primal(), rhs.primal())?;
+        let tangent_type = primal.r#type().tangent()?;
+        let convert_to_tangent_type = |value: &C::Value| {
+            if value.r#type().data_type() == tangent_type.data_type() {
+                Ok(value.clone())
+            } else {
+                value.convert_element_type(tangent_type.data_type()).map_err(DifferentiationError::from)
+            }
+        };
+        let apply_tangent = |lhs: &C::Value, rhs: &C::Value| {
+            if lhs.r#type().data_type() == rhs.r#type().data_type() {
+                apply(lhs, rhs)
+            } else {
+                apply(&convert_to_tangent_type(lhs)?, &convert_to_tangent_type(rhs)?)
+            }
+        };
+        let lhs_term = lhs.tangent().as_value().map(|tangent| apply_tangent(tangent, rhs.primal())).transpose()?;
+        let rhs_term = rhs.tangent().as_value().map(|tangent| apply_tangent(lhs.primal(), tangent)).transpose()?;
+        let tangent = lhs_term
+            .into_iter()
+            .chain(rhs_term)
+            .reduce(|lhs, rhs| lhs + rhs)
+            .map_or_else(|| MaybeZero::Zero(tangent_type), MaybeZero::Value);
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+// JAX defines grouped-dot transposition only for the non-contracting mode. Each data-operand adjoint is another
+// grouped dot followed by the inverse of the axis order produced by its adjoint dimension numbers.
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for RaggedDotOperation
+where
+    O: Operation<Type = ArrayType>
+        + From<ConvertElementTypeOperation<ArrayType>>
+        + From<RaggedDotOperation>
+        + From<crate::operations::manipulation::TransposeOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TracingContext<V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 3, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let mode = self.dimensions().mode(inputs[0].r#type().rank())?;
+        if mode != RaggedDotMode::NonContracting {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("`{RAGGED_DOT_OPERATION_NAME}` transposition is unsupported in `{mode}` mode"),
+            }
+            .into());
+        }
+        let group_sizes = inputs[2].as_known().ok_or_else(|| ProgramError::UnsupportedOperation {
+            message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes must be known during transposition"),
+        })?;
+        let zero_contributions = || {
+            inputs
+                .iter()
+                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                .collect::<Result<Vec<_>, DifferentiationError>>()
+        };
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return zero_contributions();
+        };
+        if inputs[0].is_unknown() && inputs[1].is_unknown() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "bilinear `{RAGGED_DOT_OPERATION_NAME}` with two linear operands cannot be transposed",
+                ),
+            }
+            .into());
+        }
+        let mut contributions = zero_contributions()?;
+        let (linear_index, dimensions, output_axes, mut operands) = if inputs[0].is_unknown() {
+            let known_rhs = inputs[1].as_known().unwrap();
+            let (dimensions, output_axes) = adjoint_ragged_dimensions_for_lhs(
+                self.dimensions(),
+                inputs[0].r#type().rank(),
+                inputs[1].r#type().rank(),
+            );
+            (0, dimensions, output_axes, [cotangent.clone(), known_rhs.clone(), group_sizes.clone()])
+        } else if inputs[1].is_unknown() {
+            let known_lhs = inputs[0].as_known().unwrap();
+            let (dimensions, output_axes) = adjoint_ragged_dimensions_for_rhs(
+                self.dimensions(),
+                inputs[0].r#type().rank(),
+                inputs[1].r#type().rank(),
+            );
+            (1, dimensions, output_axes, [known_lhs.clone(), cotangent.clone(), group_sizes.clone()])
+        } else {
+            return Ok(contributions);
+        };
+        let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
+        for operand in &mut operands[..2] {
+            if operand.r#type().data_type() != cotangent.r#type().data_type() {
+                *operand = operand.convert_element_type(cotangent.r#type().data_type())?;
+            }
+        }
+        let mut adjoint = context.stage_operation(
+            RaggedDotOperation::new(dimensions).with_lowering_strategy(self.lowering_strategy()),
+            Vec::new(),
+            &operands,
+        )?;
+        check_count!("output", adjoint, 1, ProgramError);
+        let adjoint = adjoint.remove(0);
+        let mut permutation = vec![0; output_axes.len()];
+        for (axis, output_axis) in output_axes.into_iter().enumerate() {
+            permutation[output_axis] = axis;
+        }
+        let adjoint = adjoint.transpose(permutation)?;
+        let adjoint = if adjoint.r#type().data_type() == linear_cotangent_type.data_type() {
+            adjoint
+        } else {
+            adjoint.convert_element_type(linear_cotangent_type.data_type())?
+        };
+        contributions[linear_index] = MaybeZero::Value(adjoint);
+        Ok(contributions)
+    }
+}

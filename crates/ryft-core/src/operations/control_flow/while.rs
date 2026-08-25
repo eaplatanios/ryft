@@ -959,17 +959,6 @@ where
         check_count!("input", body.input_ids(), inputs.len(), ProgramError);
         check_count!("output", body.output_ids(), inputs.len(), ProgramError);
         let condition_summary = context.region_summary(self, 0, condition, carries.as_slice())?;
-
-        // The condition returns only a predicate, so it has nowhere to publish a successor state and a loop that
-        // exits on its first test would lose the write entirely. This restates the operation's own
-        // `allows_reference_access_through_region_input` contract where the offending region can still be named; the
-        // rebuilt condition is held to it again below, against what its replay actually did.
-        if let Some(root) = condition_summary.accessed().find(|root| condition_summary.is_mutated(*root)) {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{name}` observes entering state in its condition but can publish none from it, so its \
-                 condition may not mutate {root}",
-            )));
-        }
         let summary = condition_summary.merged(&context.region_summary(self, 1, body, carries.as_slice())?);
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
@@ -2801,9 +2790,11 @@ mod tests {
         assert_eq!(operation.reference_output_identity_input(0), Some(0));
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+        assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Accumulate));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Consume));
         assert!(operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Write));
+        assert!(operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::ReadWrite));
         assert_eq!(format!("{operation}"), "while");
 
         // Type inference validates the region interfaces and the input types, and returns the state types.
@@ -3469,20 +3460,20 @@ mod tests {
     }
 
     impl ZeroLike for TestValue {
-        fn zero_like(&self) -> Self {
-            match self {
+        fn zero_like(&self) -> Result<Self, ProgramError> {
+            Ok(match self {
                 Self::Bool(_) => Self::Bool(false),
                 Self::Number(_) => Self::Number(0.0),
-            }
+            })
         }
     }
 
     impl OneLike for TestValue {
-        fn one_like(&self) -> Self {
-            match self {
+        fn one_like(&self) -> Result<Self, ProgramError> {
+            Ok(match self {
                 Self::Bool(_) => Self::Bool(true),
                 Self::Number(_) => Self::Number(1.0),
-            }
+            })
         }
     }
 
@@ -4956,7 +4947,7 @@ mod tests {
         // A condition that mutates a root is rejected rather than widened, because the condition's boundary returns
         // only a predicate and so can publish no successor state: a loop that exits on its first test would lose the
         // write entirely. The summary reports it while the offending region can still be named, and the rebuilt
-        // condition is held to the same fact again afterwards against what its replay actually did.
+        // condition is held to the exact rejected access mode before replay.
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = condition_builder.add_input(reference_type.clone().into());
         let update = condition_builder.add_constant(TestValue::Array(Array::scalar(1.0f32)));
@@ -4978,30 +4969,21 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let condition = builder.import_program(condition);
-        let body = builder.import_program(body);
-        let reference = builder.add_input(reference_type.into());
-        let reference = builder
-            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference], None)
-            .unwrap()[0];
-        let value =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
-            Err(ProgramError::MalformedProgram(message))
-                if message.starts_with(
-                    "operation `while` observes entering state in its condition but can publish none from it, so its \
-                     condition may not mutate reference root ",
-                ),
-        ));
+        let context = ReferenceDischargeContext::<EagerContext<TestValue, TestOperation>, ArrayReferenceDischarge>::new(
+            EagerContext::new(),
+        );
+        let reference = context.allocate_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32)));
+        let root = reference.expect_reference("the loop-carried root").unwrap().root();
+        assert_eq!(
+            context.region_summary(
+                &WhileOperation::<ArrayIrType>::new(),
+                0,
+                condition.entry_region_ref(),
+                &[Some(root)],
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `while` does not allow region 0 to access {root} with mode `accumulate`",
+            ))),
+        );
     }
 }
