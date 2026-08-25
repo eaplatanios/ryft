@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -13,7 +13,7 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
-use crate::programs::references::ReferenceLifetimes;
+use crate::programs::references::{ReferenceAccessMode, ReferenceAliasKind, ReferenceOutputSemantics};
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -62,7 +62,7 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// own. It stays empty (and its checks stay one emptiness test each) for reference-free programs, and it
     /// deliberately excludes [`add_instruction_unchecked`](Self::add_instruction_unchecked) appends. Refer to the
     /// documentation of [`ReferenceLifetimes`] for the "checked-appends-only" contract.
-    pub(crate) references: ReferenceLifetimes,
+    references: ReferenceLifetimes,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
@@ -535,8 +535,112 @@ pub(crate) struct CalleeInstantiation<V: Typed + Parameter, O> {
     pub(crate) region: RegionId,
 }
 
+/// [`Reference`](crate::Reference) alias topology and consumption state of a [`Region`] under construction. The
+/// legality of one checked instruction append depends on every earlier checked instruction append, so this is the
+/// incrementally maintained fold owned by the [`ProgramBuilder`] that spans them. Consumption applies to a complete
+/// alias family: each derived handle is resolved to its root, and narrowing view chains are distinguished from
+/// identity-preserving aliases. [`ProgramBuilder::add_instruction_unchecked`] deliberately bypasses this state.
+#[derive(Clone, Debug, Default)]
+struct ReferenceLifetimes {
+    /// Name of the consuming [`Operation`], per consumed alias-family root.
+    consumed: BTreeMap<AtomId, &'static str>,
+
+    /// Resolved family membership of each derived [`Reference`](crate::Reference) [`Atom`].
+    aliases: BTreeMap<AtomId, ResolvedReferenceAlias>,
+}
+
+impl ReferenceLifetimes {
+    /// Returns the alias-family root of `atom`.
+    #[inline]
+    fn root(&self, atom: AtomId) -> AtomId {
+        self.aliases.get(&atom).map_or(atom, |edge| edge.root)
+    }
+
+    /// Rejects an access to a consumed family or consumption through a narrowing view.
+    fn validate<O: Operation>(&self, operation: &O, inputs: &[AtomId]) -> Result<(), ProgramError> {
+        if self.consumed.is_empty() && self.aliases.is_empty() {
+            return Ok(());
+        }
+        let name = operation.name();
+        let semantics = operation.reference_semantics();
+        for access in semantics.accesses() {
+            let Some(atom) = inputs.get(access.input_index()) else {
+                continue;
+            };
+            let edge = self.aliases.get(atom);
+            if access.mode() == ReferenceAccessMode::Consume && edge.is_some_and(|edge| edge.narrows) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{name}` consumes a derived reference view, but consumption invalidates the whole alias \
+                     family; consume the root handle instead",
+                )));
+            }
+            let root = edge.map_or(*atom, |edge| edge.root);
+            if let Some(consumer) = self.consumed.get(&root) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{}` {}s a reference whose alias family `{}` already consumed",
+                    name,
+                    access.mode(),
+                    consumer,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records the consumptions and alias edges performed by one accepted application.
+    fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
+        let semantics = operation.reference_semantics();
+        for access in semantics.accesses() {
+            if access.mode() == ReferenceAccessMode::Consume
+                && let Some(atom) = inputs.get(access.input_index())
+            {
+                let root = self.root(*atom);
+                self.consumed.insert(root, operation.name());
+            }
+        }
+        for (output_index, output_atom) in outputs.iter().copied().enumerate() {
+            let Some(input_index) = operation.reference_output_identity_input(output_index) else {
+                continue;
+            };
+            if let Some(input_atom) = inputs.get(input_index) {
+                self.alias(output_atom, *input_atom, false);
+            }
+        }
+        for output in semantics.outputs() {
+            if let ReferenceOutputSemantics::Alias { output_index, input_index, kind } = *output
+                && let (Some(output_atom), Some(input_atom)) = (outputs.get(output_index), inputs.get(input_index))
+            {
+                self.alias(*output_atom, *input_atom, kind == ReferenceAliasKind::View);
+            }
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Records `output` as an alias of `input`, resolving the family root eagerly.
+    fn alias(&mut self, output: AtomId, input: AtomId, narrows: bool) {
+        let source = self.aliases.get(&input).copied();
+        let edge = ResolvedReferenceAlias {
+            root: source.map_or(input, |source| source.root),
+            narrows: narrows || source.is_some_and(|source| source.narrows),
+        };
+        self.aliases.insert(output, edge);
+    }
+}
+
+// TODO(eaplatanios): Review this.
+/// Resolved alias-family membership of one derived reference atom.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct ResolvedReferenceAlias {
+    /// Alias-family root this atom belongs to.
+    root: AtomId,
+
+    /// Whether the chain from the root to this atom narrows the referent.
+    narrows: bool,
+}
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
@@ -548,6 +652,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
+    use crate::programs::references::{ReferenceInputAccess, ReferenceOperationSemantics};
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
@@ -1286,5 +1391,130 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "region ^0 is not reachable from the program entry region",
         ));
+    }
+
+    #[test]
+    fn test_reference_lifetimes() {
+        // One operation stands in for every reference primitive and structured identity-forwarding operation. The
+        // lifetime state derives everything it records from the operation itself, so the fixture cannot describe one
+        // contract and be recorded under another.
+        #[derive(Clone)]
+        struct TestReferenceOperation {
+            name: &'static str,
+            semantics: ReferenceOperationSemantics,
+            forwarded: Option<(usize, usize)>,
+        }
+
+        impl Operation for TestReferenceOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                self.name
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+
+            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+                Cow::Borrowed(&self.semantics)
+            }
+
+            fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+                self.forwarded.and_then(|(output, input)| (output == output_index).then_some(input))
+            }
+        }
+
+        let access = |name, mode| TestReferenceOperation {
+            name,
+            semantics: ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, mode)]),
+            forwarded: None,
+        };
+        let alias = |name, kind| TestReferenceOperation {
+            name,
+            semantics: ReferenceOperationSemantics::new(
+                vec![ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind }],
+                Vec::new(),
+            ),
+            forwarded: None,
+        };
+        let allocation = TestReferenceOperation {
+            name: "new_reference",
+            semantics: ReferenceOperationSemantics::new(
+                vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
+                Vec::new(),
+            ),
+            forwarded: None,
+        };
+        let read = access("reference_read", ReferenceAccessMode::Read);
+        let write = access("reference_swap", ReferenceAccessMode::Write);
+        let freeze = access("freeze_reference", ReferenceAccessMode::Consume);
+
+        // Allocation records no alias edge. View narrowing remains transitive across later identity aliases,
+        // while identity aliases of the root remain valid consumption handles.
+        let root = AtomId::new(1);
+        let view = AtomId::new(2);
+        let renamed_view = AtomId::new(3);
+        let renamed_root = AtomId::new(4);
+        let mut lifetimes = ReferenceLifetimes::default();
+        assert_eq!(lifetimes.validate(&read, &[root]), Ok(()));
+        lifetimes.record(&allocation, &[AtomId::new(0)], &[root]);
+        assert_eq!(lifetimes.validate(&freeze, &[root]), Ok(()));
+        lifetimes.record(&alias("reference_slice", ReferenceAliasKind::View), &[root], &[view]);
+        lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[view], &[renamed_view]);
+        lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[root], &[renamed_root]);
+        assert_eq!(lifetimes.validate(&read, &[renamed_view]), Ok(()));
+        let narrowed = "`freeze_reference` consumes a derived reference view, but consumption invalidates the whole \
+                        alias family; consume the root handle instead";
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[view]),
+            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
+        ));
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[renamed_view]),
+            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
+        ));
+        assert_eq!(lifetimes.validate(&freeze, &[renamed_root]), Ok(()));
+        assert_eq!(lifetimes.validate(&freeze, &[AtomId::new(9)]), Ok(()));
+
+        // Consumption invalidates every handle in the family and diagnostics name both the invalid access and the
+        // consuming operation. Narrowing misuse takes precedence over the resulting dead-family diagnostic.
+        let consumed =
+            |name, mode| format!("`{name}` {mode}s a reference whose alias family `freeze_reference` already consumed");
+        lifetimes.record(&freeze, &[renamed_root], &[]);
+        assert!(matches!(
+            lifetimes.validate(&read, &[root]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "read"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&write, &[view]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_swap", "write"),
+        ));
+        assert!(matches!(
+            lifetimes.validate(&freeze, &[renamed_view]),
+            Err(ProgramError::MalformedProgram(message)) if message == narrowed,
+        ));
+
+        // Structured identity forwarding joins the output to its operand's family without declaring reference
+        // semantics. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
+        let mut lifetimes = ReferenceLifetimes::default();
+        let carry = AtomId::new(6);
+        let carrier = TestReferenceOperation {
+            name: "while",
+            semantics: ReferenceOperationSemantics::default(),
+            forwarded: Some((0, 0)),
+        };
+        lifetimes.record(&carrier, &[root], &[carry]);
+        lifetimes.record(&freeze, &[root], &[]);
+        assert!(matches!(
+            lifetimes.validate(&read, &[carry]),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_read", "read"),
+        ));
+        assert_eq!(lifetimes.validate(&read, &[AtomId::new(7)]), Ok(()));
+        assert_eq!(lifetimes.validate(&read, &[]), Ok(()));
     }
 }

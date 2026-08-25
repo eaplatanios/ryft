@@ -1,88 +1,78 @@
-//! Generic reference primitives, semantics, discharge, and eager runtime holders.
+//! Generic reference types, operations, eager holders, and staged discharge.
 //!
-//! This module owns value-family-independent reference concepts. Array view geometry and immutable array operation
-//! replay remain in [`crate::arrays`].
+//! References are Ryft's second-class mutable-state values. A reference may be created, aliased, read, replaced,
+//! updated, and consumed inside a program, but it is not ordinary immutable data: numeric operations cannot consume
+//! it directly, a local reference cannot escape as a public output, and an external reference denotes state owned by
+//! the caller. Reference operations carry ordered-state effects so that optimization and transformation machinery
+//! cannot reorder or duplicate them as if they were pure computations.
 //!
-//! # Correspondence with JAX
+//! This module owns the value-family-independent reference language. It does not assume that a referent is an array
+//! or that an alias is an array view. Array-specific view geometry, eager view traversal, and the array discharge
+//! policy live in [`crate::arrays`].
 //!
-//! The vocabulary is JAX's, with the same division of labor. A [`ReferenceType`] is a `Ref`; three of the five
-//! primitives in [`operations`] are `jax._src.state`'s `get`, `swap`, and `addupdate`, and the other two —
-//! allocation and `freeze` — are JAX's mutable-array core surface rather than its state module;
-//! [`ReferenceAccessMode`] mirrors `ReadEffect`/`WriteEffect`/`AccumEffect` plus consumption as a lifetime event; and
-//! [`ReferenceDischarge`] is `discharge_state`, rewriting reference state into explicit immutable state threaded
-//! through the program. Partial discharge follows `should_discharge`, which Pallas uses to discharge pipeline state
-//! while keeping kernel references live, and [`ReferenceDischargeSite`] is the checked selection vocabulary that
-//! names what to discharge.
+//! # Core Model
 //!
-//! Two things are deliberately ahead of that correspondence. Read-only pruning keeps a root out of a structured
-//! operation's widened boundary when no closure writes it, where `discharge_state` returns a final value for every
-//! discharged reference. And the eager holders have typed runtime failure semantics — generations, read leases,
-//! poisoning — where JAX's reference model is staged. Two further properties are load-bearing here without being
-//! deltas: reference accesses carry ordered-state effects, so the ordering machinery sees them; and eager and staged
-//! reference semantics share one view traversal, so they are held to each other by construction.
+//! Three similarly named types serve different stages of the system:
 //!
-//! # The prevention ladder
+//! - [`ReferenceType<T>`](ReferenceType) is structural program metadata. It says that a value refers to a `T`, but
+//!   contains no eager holder and no process-local resource identity.
+//! - [`Reference<V>`] is the eager runtime handle. Its clones share one synchronized holder, so mutation through one
+//!   handle is visible through every alias. A read returns an immutable snapshot, and a consuming
+//!   [`freeze`](Reference::freeze) invalidates the complete alias family.
+//! - [`ReferenceDischargeReference`] is a temporary handle used only while a program is being discharged. It names a
+//!   root in the transform's environment and carries the policy-owned alias metadata for that particular handle.
 //!
-//! Reference misuse is caught at three rungs, each reporting against what it can actually see. The rungs are not
-//! redundant: each one exists because the rung above it cannot observe the program the rung below receives.
+//! A reference family has one canonical root and any number of aliases. An alias preserves the root while possibly
+//! selecting a narrower view. Every access resolves through that root, and consumption invalidates the whole family.
 //!
-//! 1. **Construction time**, within the region being built. `ProgramBuilder::add_instruction` maintains the alias
-//!    family of every reference atom in the region under construction and rejects an access to a consumed family, or
-//!    a consumption of a handle whose view narrows its root, at the append that performs it — for a traced program,
-//!    that is the staging call. Constant lifting ([`Context::lift`](crate::Context::lift)) likewise rejects a value
-//!    family that forbids constant storage at the lift. This rung sees the *call*, which is the most useful thing to
-//!    name, and it is keyed by the atom, so every clone of one tracer shares it. Its horizon is one region: a builder
-//!    constructs exactly one, so a consumption performed inside an attached region is invisible here and is left to
-//!    the rungs below. `ProgramBuilder::add_instruction_unchecked` bypasses the rung for rebuilds of
-//!    already-accepted programs and for tests that need a malformed program the rungs below reject.
-//! 2. **The eager runtime**, while handles are used directly. [`Reference`] invalidates a complete alias family on
-//!    [`freeze`](Reference::freeze) and reports every later access as [`ReferenceError::Frozen`], with generations
-//!    and read leases covering concurrent and asynchronous misuse. This rung sees runtime identity, which no static
-//!    rung has. The eager interpretation boundary validation belongs to this rung: interpretation rejects a program
-//!    whose entry expects an external reference input, because generic interpretation has no holder binding table.
-//! 3. **Discharge**, while the rewrite runs. Its root environment reports what it observes — an access to a
-//!    consumed root, a derived view crossing a structured boundary, an escaping region-local allocation, a mutation
-//!    the widening did not predict — against the environment root it reached rather than against a source
-//!    coordinate, because its root handles are interpreter identities; the structured-boundary rejections
-//!    additionally name the operation whose rule raised them. This rung sees the interpreter's own state, which the
-//!    static rungs approximate.
+//! # Module Structure
 //!
-//! There is deliberately no standing whole-program lint between the second and third rungs. A static analysis that
-//! resolved roots, aliases, and capture scopes over a complete region closure existed and was removed once its only
-//! production consumers reduced to facts derivable at the entry boundary; a program built outside tracing meets its
-//! reference rules when it is discharged, which every staged consumer requires anyway. Kernel-style validation of
-//! preserved reference bodies is planned to reintroduce a closure analysis as part of `plan-pallas.md`.
+//! The implementation is split by responsibility:
 //!
-//! Rung 1 is the one worth seeing, because it is the rung a user meets while writing the program:
+//! - `semantics.rs` defines [`ReferenceType`], the operation-local [`ReferenceOperationSemantics`] descriptor,
+//!   access modes, root/alias classifications, and entry-boundary sources.
+//! - `operations.rs` defines the five generic primitives and their value-level capabilities: allocation
+//!   ([`NewReference`]), immutable reads ([`ReferenceRead`]), exact replacement ([`ReferenceSwap`]), ordered additive
+//!   updates ([`ReferenceAddUpdate`]), and consuming finalization ([`FreezeReference`]). It also owns their type
+//!   inference, effects, eager interpretation, and discharge rules.
+//! - `runtime.rs` implements [`Reference`] and its synchronized holder state machine. The hidden backend interface
+//!   uses generations, completion dependencies, read leases, reservations, pending installation, and terminal
+//!   poisoning to coordinate external state across synchronous and asynchronous execution.
+//! - `discharge.rs` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
+//!   roots with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep
+//!   the transform open to non-array value families and to third-party operations.
 //!
-//! ```
-//! use ryft_core::{
-//!     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType, FreezeReference, NewReference,
-//!     ProgramError, ReferenceRead, Trace, Tracer, TracingContext,
-//! };
+//! Structured operations own their reference boundary rewrites. For example, condition, while, and scan operations
+//! decide how immutable state is added to their branch or loop boundaries; the discharge driver supplies isolated
+//! region rebuilding, root summaries, and validation rather than choosing the rewrite for them.
 //!
-//! type Destination = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+//! # Eager and Staged State
 //!
-//! // Freezing consumes the handle it is given, so a second handle has to be cloned deliberately — and that clone
-//! // names the same staged atom, which is what the trace notices.
-//! let error = Destination::trace(
-//!     |input: Tracer<Destination>| {
-//!         let reference = input.new_reference()?;
-//!         let alias = reference.clone();
-//!         reference.freeze()?;
-//!         alias.read()
-//!     },
-//!     ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-//! )
-//! .unwrap_err();
+//! Eager code acts directly on a [`Reference`] holder. Staged programs instead use the five reference operations.
+//! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
+//! operations into explicit state dataflow. A local root disappears entirely after that rewrite. An external root
+//! becomes an ordinary state input and, when mutated, a hidden final-state output described by a
+//! [`ReferenceStateBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
+//! the caller's holder. Refer to the `discharge.rs` module documentation for a concrete before-and-after example.
 //!
-//! assert_eq!(
-//!     error,
-//!     ProgramError::MalformedProgram(
-//!         "`reference_read` reads a reference whose alias family `freeze_reference` already consumed".to_string(),
-//!     ),
-//! );
-//! ```
+//! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned roots
+//! become immutable state while other references deliberately remain in the program. A full
+//! [`ReferenceDischargeResult`] additionally proves that no reference type or reference operation survives anywhere
+//! in the rewritten region closure.
+//!
+//! # Lifetime Enforcement
+//!
+//! Reference validity is enforced at the earliest layer that has enough information:
+//!
+//! 1. [`ProgramBuilder::add_instruction`](crate::ProgramBuilder::add_instruction) tracks aliases within the region
+//!    under construction and rejects an access after consumption or consumption through a narrowing view.
+//! 2. The eager [`Reference`] holder rejects frozen, poisoned, conflicting, and stale-generation accesses while
+//!    preserving atomic replacement semantics.
+//! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound roots, invalid
+//!    structured-region threading, escaping local allocations, and surviving references in a claimed full result.
+//!
+//! These checks are complementary. Construction sees the source call, the eager holder sees runtime aliases and
+//! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
 
 // TODO(eaplatanios): Review this whole module, its submodules, and all of the documentation and tests.
 
@@ -110,7 +100,6 @@ pub use runtime::{
     PreparedReferenceValue, Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
     ReferenceCompletionResult, ReferenceError, ReferenceGeneration, ReferenceGuard, ReferenceId,
 };
-pub(crate) use semantics::ReferenceLifetimes;
 pub use semantics::{
     ReferenceAccessMode, ReferenceAliasKind, ReferenceInputAccess, ReferenceOperationSemantics,
     ReferenceOutputSemantics, ReferenceSource, ReferenceType, ReferenceTypeRefinements,

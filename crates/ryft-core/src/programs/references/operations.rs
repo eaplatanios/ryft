@@ -5,6 +5,8 @@
 //! universe `U`; the ordinary [`From`] and borrowed [`TryFrom`] conversion seam is the complete relationship between
 //! those types. Reference views remain value-family-owned because their coordinate transformations are not generic.
 
+// TODO(eaplatanios): Review this module.
+
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};

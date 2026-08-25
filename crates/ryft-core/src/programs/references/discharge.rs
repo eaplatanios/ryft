@@ -1,15 +1,97 @@
-//! Value-family-independent reference discharge.
+//! Reference discharge: rewriting mutable reference state into explicit immutable dataflow.
 //!
-//! This module owns two things. The *interpreter* surface is the [`ReferenceDischargePolicy`] naming everything that
-//! varies from one reference universe to another, its [`ReferenceAccumulationPolicy`] refinement, the
-//! [`ReferenceDischargeContext`] holding the live root environment and the active [`ReferenceCaptureScope`], the
-//! [`ReferenceDischargeTracer`] flowing through it, the [`ReferenceDischargeDriver`] exposing replay position and
-//! attached regions, and the [`ReferenceDischargeableOperation`] rule each operation implements. The *result* surface
-//! is the [`ReferenceDischargeResult`] and [`PartialReferenceDischargeResult`] envelopes together with the
-//! [`ReferenceDischargeSite`] selection vocabulary.
+//! A program containing reference operations is not ordinary functional Single Static Assignment (SSA) dataflow. A
+//! read depends on the latest write to the same root even though that dependency is represented by a reference handle
+//! rather than by an SSA operand carrying the current value. Many transforms and backends require the dependency to
+//! be explicit. Reference discharge makes it explicit by replaying the program while replacing each selected root
+//! with an immutable state value that is threaded from one access to the next.
 //!
-//! Discharge is an ordinary Ryft transform: a context, a driver, and one rule per operation, replayed into a fresh
-//! trace of the source program's own universe. Nothing here selects a rewrite on an operation's behalf.
+//! # Example
+//!
+//! Consider this schematic program with one local reference:
+//!
+//! ```text
+//! %reference = new_reference(%initial)
+//! %before = reference_swap(%reference, %replacement)
+//! %after = reference_read(%reference)
+//! %final = freeze_reference(%reference)
+//! return %before, %after, %final
+//! ```
+//!
+//! Discharge removes the mutable root and exposes the same dependencies as immutable values:
+//!
+//! ```text
+//! %state0 = %initial
+//! %before = %state0
+//! %state1 = %replacement
+//! %after = %state1
+//! %final = %state1
+//! return %before, %after, %final
+//! ```
+//!
+//! The exact rewritten program may simplify aliases such as `%state0`, but the semantic relationship is the same:
+//! replacement returns the previous state and produces a successor state, while every subsequent access consumes
+//! that successor. The reference is an implementation detail of the source program and no reference survives in the
+//! full result.
+//!
+//! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed
+//! input becomes an ordinary input carrying the entering referent. If the program mutates the root, its final state is
+//! appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
+//! argument owns that state, which discharged input receives the snapshot, and which hidden output must be installed
+//! back into the holder. A read-only external root has no hidden output.
+//!
+//! Discharge rewrites a program; it does not itself lock eager holders or execute a backend. The stateful compilation
+//! surface uses the result's binding metadata together with the runtime holder protocol after compilation.
+//!
+//! # Full and Partial Discharge
+//!
+//! [`ReferenceDischargeResult`] is the full-discharge contract. Its payload is proven reference-free across the
+//! complete attached-region closure, its public outputs form a prefix of its complete outputs, and the remaining
+//! suffix contains exactly the final states of mutated external roots in canonical boundary order.
+//!
+//! [`PartialReferenceDischargeResult`] permits selected roots to become immutable state while unselected roots and
+//! their operations remain in the payload. Callers select entry roots or allocation sites through
+//! [`ReferenceDischargeSite`]. This is useful when normalizing a pipeline's internal state while deliberately
+//! preserving references that a kernel will lower to target memory operations. Conversion from a partial result to a
+//! full result performs a closure-wide proof that no reference type or reference operation remains.
+//!
+//! # Interpreter Architecture
+//!
+//! Discharge follows Ryft's context-and-per-operation-rule transform architecture:
+//!
+//! - [`ReferenceDischargePolicy`] names everything that varies by reference universe: the referent type family, the
+//!   handle's composed alias metadata, type lifting and projection, and the mechanics of reading and replacing a
+//!   selected value. [`ReferenceAccumulationPolicy`] adds ordered accumulation only for universes that support it.
+//! - [`ReferenceDischargeValue`] is the context-free carrier flowing between rules. It contains either an ordinary
+//!   destination value or an opaque [`ReferenceDischargeReference`] handle. [`ReferenceDischargeTracer`] stamps that
+//!   carrier with the active context so it can participate in normal Ryft interpretation.
+//! - [`ReferenceDischargeContext`] owns the live root environment. Each root is either `Discharged`, with a current
+//!   immutable state and mutation bit, or `Preserved`, with the exact destination reference value that survived.
+//! - [`ReferenceDischargeableOperation`] is the rule implemented by each operation. Reference primitives rewrite
+//!   their own accesses, structured operations own their boundary widening, and reference-free operations replay
+//!   unchanged through the parent context.
+//! - [`ReferenceDischargeDriver`] exposes the current source instruction and attached regions. It can replay a region
+//!   against the live environment or rebuild one against an isolated environment and return a sealed
+//!   [`ReferenceRegionDischargeFork`]. [`ReferenceRegionSummary`] supplies the transitive access facts a structured
+//!   rule needs before choosing its state boundary.
+//!
+//! The driver provides shared mechanics but never chooses how an operation is rewritten. This keeps the system open:
+//! a third-party primitive or structured operation participates by implementing its own rule, while a non-array
+//! value family supplies its own policy without changing this interpreter.
+//!
+//! # Root Identities and Boundaries
+//!
+//! [`ReferenceDischargeSite`] is a source-program coordinate used before replay to select an external root or an
+//! allocation. [`ReferenceRootHandle`] is different: it is a temporary identity minted inside one live discharge
+//! environment. Handles from isolated region forks cannot address parent roots, and fork results carry sealed
+//! programs and context-free summaries rather than child-context values.
+//!
+//! Structured rules use [`ReferenceRegionDischargeBoundary`] to describe their declared inputs plus the discharged
+//! roots that must enter and leave a rebuilt region. Read-only roots are pruned where the operation's boundary permits
+//! it; loop-shaped operations retain the symmetry their fixed-point contracts require. Every rebuilt region is
+//! validated against the roots and mutations its summary predicted before the parent environment accepts its outputs.
+
+// TODO(eaplatanios): Review this module.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
