@@ -14,6 +14,8 @@ pub mod ops;
 /// Tracing-backed `shard_map` surface and the supporting manual-computation metadata model.
 pub mod shard_map;
 
+pub use lowering::RaggedDotLoweringStrategy;
+
 pub use domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
     XlaOptimizedProgram,

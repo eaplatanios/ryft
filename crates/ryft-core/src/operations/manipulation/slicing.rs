@@ -1622,7 +1622,7 @@ where
         let axis_size = axis_size.expect("a mapped input pins the batch size");
         let mut sizes = self.sizes().to_vec();
         sizes.insert(batch_axis, axis_size);
-        let zero_index = ArrayBatch::replicated(inputs[1].value().clone().zero_like());
+        let zero_index = ArrayBatch::replicated(inputs[1].value().zero_like()?);
         let mut lifted_inputs = inputs.to_vec();
         lifted_inputs.insert(1 + batch_axis, zero_index);
         Ok(DynamicSliceOperation::new(sizes)
@@ -2096,7 +2096,7 @@ where
         }
         let input = P::match_axis(context, &inputs[0], Axis::from(batch_axis))?;
         let update = P::match_axis(context, &inputs[1], Axis::from(batch_axis))?;
-        let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
+        let zero_index = ArrayBatch::replicated(inputs[2].value().zero_like()?);
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
         lifted_inputs.insert(2 + batch_axis, zero_index);

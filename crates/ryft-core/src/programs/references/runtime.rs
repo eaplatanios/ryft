@@ -7,7 +7,7 @@
 //!   identity belongs to [`Reference`] and never participates in structural equality, hashing, or retained-program
 //!   specialization.
 //! - [`Reference`] is the generic cloneable root holder. Clones alias one holder, reads return
-//!   immutable value snapshots, replacement is atomic and preserves the exact declared referent type, handle-local
+//!   immutable value snapshots, writes and swaps are atomic and preserve the exact declared referent type, handle-local
 //!   type-identity mappings reconstruct values bidirectionally at the holder boundary, and a consuming freeze
 //!   invalidates the complete alias family. Array indexing and slicing live in the array-owned
 //!   [`ArrayReference`](crate::arrays::ArrayReference) wrapper rather than this generic layer.
@@ -17,9 +17,9 @@
 //! but never as public program outputs or in ordinary numeric use. Trace-time staging checks and discharge enforce
 //! that root, lifetime, and second-class boundary contract, and eager program replay rejects an entry that expects
 //! an external reference outright. The reference operations themselves —
-//! allocation, snapshot read, replacement, ordered additive update, and consuming freeze — are independent operation
-//! payloads defined in [`crate::programs::references::operations`] rather than one homogeneous reference operation
-//! family, and binding-level sugar such as `write` is defined over `swap` instead of adding IR operations.
+//! allocation, snapshot read, write-only replacement, swapping, ordered additive update, and consuming freeze — are
+//! independent operation payloads defined in [`crate::programs::references::operations`] rather than one homogeneous
+//! reference operation family.
 //!
 //! Array reference views are statically validated and eliminated by canonical slice, reshape, and update-slice
 //! discharge. Local references compose with the supported program transforms only after that discharge. External
@@ -46,7 +46,7 @@
 //! ```
 //! use ryft_core::{
 //!     Array, ArrayIrValue, ArraySliceAxis, FreezeReference, NewReference, ReferenceRead, ReferenceSlice,
-//!     ReferenceSwap,
+//!     ReferenceWrite,
 //! };
 //!
 //! let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
@@ -521,6 +521,26 @@ impl<V: Value> Reference<V> {
         value
             .rename_type_identities(&self.root_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
+    }
+
+    /// Atomically replaces the stored value without reconstructing or returning the previous handle-local value.
+    ///
+    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the live holder
+    /// unchanged.
+    pub fn write(&self, replacement: V) -> Result<(), ReferenceError> {
+        let mut state = self.lock_ready(true)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("lock_ready yields only ready states")
+        };
+        self.validate_referent_type(&replacement)?;
+        let stored_replacement = replacement
+            .rename_type_identities(&self.handle_to_root)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        self.validate_root_type(&stored_replacement)?;
+        let next_generation = generation.next().ok_or(ReferenceError::GenerationExhausted)?;
+        *current = stored_replacement;
+        *generation = next_generation;
+        Ok(())
     }
 
     /// Atomically replaces the stored value and returns the previous referent value.
@@ -1175,6 +1195,7 @@ mod tests {
     }
 
     struct ControlledCompletionState {
+        awaiting: bool,
         result: Option<ReferenceCompletionResult>,
         callbacks: Vec<ReferenceCompletionCallback>,
     }
@@ -1183,9 +1204,17 @@ mod tests {
         fn new() -> Self {
             Self {
                 state: Arc::new((
-                    Mutex::new(ControlledCompletionState { result: None, callbacks: Vec::new() }),
+                    Mutex::new(ControlledCompletionState { awaiting: false, result: None, callbacks: Vec::new() }),
                     Condvar::new(),
                 )),
+            }
+        }
+
+        fn wait_until_awaited(&self) {
+            let (state, awaiting) = &*self.state;
+            let mut state = state.lock().unwrap();
+            while !state.awaiting {
+                state = awaiting.wait(state).unwrap();
             }
         }
 
@@ -1208,6 +1237,8 @@ mod tests {
         fn r#await(&self) -> ReferenceCompletionResult {
             let (state, ready) = &*self.state;
             let mut state = state.lock().unwrap();
+            state.awaiting = true;
+            ready.notify_all();
             while state.result.is_none() {
                 state = ready.wait(state).unwrap();
             }
@@ -1274,6 +1305,7 @@ mod tests {
         assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
 
         assert_eq!(alias.read(), Err(ReferenceError::Frozen));
+        assert_eq!(alias.write(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
         assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
         assert_eq!(reference.freeze(), Err(ReferenceError::Frozen));
 
@@ -1296,6 +1328,12 @@ mod tests {
 
         assert_eq!(
             reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])),
+            Err(ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() }),
+        );
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
+        assert_eq!(
+            reference.write(Array::vector(vec![3.0_f32, 4.0, 5.0])),
             Err(ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() }),
         );
         assert_eq!(reference.read(), Ok(initial.clone()));
@@ -1324,16 +1362,17 @@ mod tests {
         let replacement = Array::vector(vec![3.0_f32, 4.0]);
         let retained_replacement = replacement.clone();
 
-        let swapped_snapshot = first.swap(replacement).unwrap();
+        first.write(replacement).unwrap();
+        let swapped_snapshot = first.swap(Array::vector(vec![7.0_f32, 8.0])).unwrap();
         first.update_with(|current| current.add(&Array::vector(vec![10.0_f32, 20.0]))).unwrap();
         assert_eq!(second.read(), Ok(initializer.clone()));
         assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer.clone()));
 
         assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]));
         assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(swapped_snapshot, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(swapped_snapshot, Array::vector(vec![3.0_f32, 4.0]));
         assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]));
-        assert_eq!(first.read(), Ok(Array::vector(vec![13.0_f32, 24.0])));
+        assert_eq!(first.read(), Ok(Array::vector(vec![17.0_f32, 28.0])));
         assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0])));
     }
 
@@ -1349,13 +1388,50 @@ mod tests {
         let swapped_generation = reference.lock().unwrap().current_generation().unwrap();
         assert!(swapped_generation > initial_generation);
 
+        assert_eq!(reference.write(Array::scalar(3.0_f32)), Ok(()));
+        let written_generation = reference.lock().unwrap().current_generation().unwrap();
+        assert!(written_generation > swapped_generation);
+
         let rejected = ProgramError::InvalidArgument { message: "rejected update".to_string() };
         assert_eq!(reference.update_with(|_| Err(rejected.clone())), Err(rejected));
-        assert_eq!(reference.lock().unwrap().current_generation(), Ok(swapped_generation));
+        assert_eq!(reference.lock().unwrap().current_generation(), Ok(written_generation));
 
-        reference.update_with(|_| Ok(Array::scalar(3.0_f32))).unwrap();
+        reference.update_with(|_| Ok(Array::scalar(4.0_f32))).unwrap();
         let updated_generation = reference.lock().unwrap().current_generation().unwrap();
-        assert!(updated_generation > swapped_generation);
+        assert!(updated_generation > written_generation);
+    }
+
+    #[test]
+    fn test_reference_write_preserves_state_when_the_generation_is_exhausted() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        {
+            let mut state = reference.holder.state.lock().unwrap();
+            let ReferenceState::Ready { generation, .. } = &mut *state else {
+                unreachable!("a newly allocated reference is ready")
+            };
+            *generation = ReferenceGeneration(u64::MAX);
+        }
+
+        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::GenerationExhausted));
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.lock().unwrap().current_generation(), Ok(ReferenceGeneration(u64::MAX)));
+    }
+
+    #[test]
+    fn test_concurrent_reference_writes_serialize_on_one_holder() {
+        let reference = Reference::new(Array::scalar(1.0_f32));
+        let initial_generation = reference.lock().unwrap().current_generation().unwrap();
+        let first = reference.clone();
+        let second = reference.clone();
+        let first = std::thread::spawn(move || first.write(Array::scalar(2.0_f32)));
+        let second = std::thread::spawn(move || second.write(Array::scalar(3.0_f32)));
+
+        assert_eq!(first.join().unwrap(), Ok(()));
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert!(
+            matches!(reference.read(), Ok(value) if value == Array::scalar(2.0_f32) || value == Array::scalar(3.0_f32))
+        );
+        assert_eq!(reference.lock().unwrap().current_generation().unwrap().0, initial_generation.0 + 2);
     }
 
     #[test]
@@ -1370,6 +1446,7 @@ mod tests {
             .is_err(),
         );
         assert_eq!(reference.read(), Err(ReferenceError::Poisoned));
+        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::Poisoned));
     }
 
     #[test]
@@ -1531,6 +1608,7 @@ mod tests {
             let value = reader_reference.read();
             *reader_observed.lock().unwrap() = Some(value);
         });
+        backend.wait_until_awaited();
         assert_eq!(*observed.lock().unwrap(), None);
         backend.complete(Ok(()));
         reader.join().unwrap();
@@ -1539,6 +1617,31 @@ mod tests {
         // The successful completion was applied to the holder, so the value is now ready without any dependency.
         assert!(reference.lock().unwrap().dependency().is_none());
         assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_write_awaits_a_pending_completion_resolved_by_another_thread() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let generation = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
+        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        guard.install_pending(generation, value).unwrap();
+        drop(guard);
+
+        let observed = Arc::new(Mutex::new(None));
+        let writing_reference = Arc::clone(&reference);
+        let writing_observed = Arc::clone(&observed);
+        let writer = std::thread::spawn(move || {
+            let result = writing_reference.write(Array::scalar(3.0_f32));
+            *writing_observed.lock().unwrap() = Some(result);
+        });
+        backend.wait_until_awaited();
+        assert_eq!(*observed.lock().unwrap(), None);
+        backend.complete(Ok(()));
+        writer.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(Ok(())));
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
 
     #[test]
@@ -1556,8 +1659,33 @@ mod tests {
         backend.complete(Err("device execution failed".into()));
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "device execution failed".to_string() };
         assert_eq!(reference.read(), Err(poisoned.clone()));
+        assert_eq!(reference.write(Array::scalar(3.0_f32)), Err(poisoned.clone()));
         assert_eq!(reference.swap(Array::scalar(3.0_f32)), Err(poisoned.clone()));
         assert_eq!(reference.freeze(), Err(poisoned));
+    }
+
+    #[test]
+    fn test_reference_write_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)));
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        let observed = Arc::new(Mutex::new(None));
+        let writing_reference = Arc::clone(&reference);
+        let writing_observed = Arc::clone(&observed);
+        let writer = std::thread::spawn(move || {
+            let result = writing_reference.write(Array::scalar(2.0_f32));
+            *writing_observed.lock().unwrap() = Some(result);
+        });
+        lease.wait_until_awaited();
+        assert_eq!(*observed.lock().unwrap(), None);
+        lease.complete(Ok(()));
+        writer.join().unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(Ok(())));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
     }
 
     #[test]
@@ -1577,6 +1705,7 @@ mod tests {
             let old = swapping_reference.swap(Array::scalar(2.0_f32));
             *swapping_observed.lock().unwrap() = Some(old);
         });
+        lease.wait_until_awaited();
         assert_eq!(*observed.lock().unwrap(), None);
         lease.complete(Ok(()));
         swapper.join().unwrap();
@@ -1601,6 +1730,7 @@ mod tests {
             let value = freezing_reference.freeze();
             *freezing_observed.lock().unwrap() = Some(value);
         });
+        lease.wait_until_awaited();
         assert_eq!(*observed.lock().unwrap(), None);
         lease.complete(Ok(()));
         freezer.join().unwrap();

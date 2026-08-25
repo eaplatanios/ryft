@@ -101,6 +101,149 @@ impl Display for DotDimensionNumbers {
     }
 }
 
+/// Placement mode of the single ragged LHS dimension in a [`RaggedDotDimensionNumbers`] specification.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RaggedDotMode {
+    /// The ragged dimension is a non-contracting result dimension.
+    NonContracting,
+
+    /// The ragged dimension is contracted with the RHS operand.
+    Contracting,
+
+    /// The ragged dimension is one of the paired batching dimensions.
+    Batch,
+}
+
+impl Display for RaggedDotMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NonContracting => "non-contracting",
+            Self::Contracting => "contracting",
+            Self::Batch => "batch",
+        })
+    }
+}
+
+/// Dimension-number specification for a grouped generalized dot product.
+///
+/// The ordinary [`DotDimensionNumbers`] describe the contraction and batching axes. Exactly one LHS axis is marked
+/// ragged, and RHS group dimensions identify the explicit group axis used by non-contracting ragged dots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RaggedDotDimensionNumbers {
+    /// Underlying generalized-dot dimension numbers.
+    dot_dimensions: DotDimensionNumbers,
+
+    /// LHS axes marked ragged. Type inference requires exactly one entry.
+    lhs_ragged_dimensions: Vec<usize>,
+
+    /// RHS axes indexing groups. Non-contracting mode requires exactly one; the other modes require none.
+    rhs_group_dimensions: Vec<usize>,
+}
+
+impl RaggedDotDimensionNumbers {
+    /// Creates a grouped-dot dimension-number specification.
+    #[inline]
+    pub fn new(
+        dot_dimensions: DotDimensionNumbers,
+        lhs_ragged_dimensions: Vec<usize>,
+        rhs_group_dimensions: Vec<usize>,
+    ) -> Self {
+        Self { dot_dimensions, lhs_ragged_dimensions, rhs_group_dimensions }
+    }
+
+    /// Creates the basic non-contracting matrix form `[M, K] × [G, K, N] → [M, N]`.
+    #[inline]
+    pub fn matmul() -> Self {
+        Self::new(DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()), vec![0], vec![0])
+    }
+
+    /// Returns the underlying generalized-dot dimensions.
+    #[inline]
+    pub fn dot_dimensions(&self) -> &DotDimensionNumbers {
+        &self.dot_dimensions
+    }
+
+    /// Returns the LHS ragged dimensions.
+    #[inline]
+    pub fn lhs_ragged_dimensions(&self) -> &[usize] {
+        &self.lhs_ragged_dimensions
+    }
+
+    /// Returns the RHS group dimensions.
+    #[inline]
+    pub fn rhs_group_dimensions(&self) -> &[usize] {
+        &self.rhs_group_dimensions
+    }
+
+    /// Classifies this specification according to the role of its single LHS ragged dimension.
+    pub fn mode(&self, lhs_rank: usize) -> Result<RaggedDotMode, TypeError> {
+        if self.lhs_ragged_dimensions.len() != 1 {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` expects exactly one LHS ragged dimension, but got {}",
+                self.lhs_ragged_dimensions.len(),
+            )));
+        }
+        let axis = self.lhs_ragged_dimensions[0];
+        if axis >= lhs_rank {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` LHS ragged dimension {axis} is out of bounds for rank {lhs_rank}",
+            )));
+        }
+        if self.dot_dimensions.lhs_contracting_dimensions().contains(&axis) {
+            Ok(RaggedDotMode::Contracting)
+        } else if self.dot_dimensions.lhs_batching_dimensions().contains(&axis) {
+            Ok(RaggedDotMode::Batch)
+        } else {
+            Ok(RaggedDotMode::NonContracting)
+        }
+    }
+
+    /// Returns the input-prefix axes that index a prefix-shaped `group_sizes` operand.
+    pub fn group_sizes_prefix_dimensions(&self, lhs_rank: usize) -> Result<Vec<usize>, TypeError> {
+        let ragged_axis = *self.lhs_ragged_dimensions.first().ok_or_else(|| {
+            TypeError::invalid(format!("`{RAGGED_DOT_OPERATION_NAME}` expects exactly one LHS ragged dimension",))
+        })?;
+        let dimensions = self.dot_dimensions();
+        Ok(match self.mode(lhs_rank)? {
+            RaggedDotMode::NonContracting => {
+                let result_axes = lhs_result_axes(dimensions, lhs_rank);
+                let position = result_axes.iter().position(|axis| *axis == ragged_axis).unwrap();
+                dimensions
+                    .lhs_batching_dimensions()
+                    .iter()
+                    .copied()
+                    .chain(result_axes[..position].iter().copied())
+                    .collect()
+            }
+            RaggedDotMode::Contracting => {
+                let position =
+                    dimensions.lhs_contracting_dimensions().iter().position(|axis| *axis == ragged_axis).unwrap();
+                dimensions
+                    .lhs_batching_dimensions()
+                    .iter()
+                    .copied()
+                    .chain(dimensions.lhs_contracting_dimensions()[..position].iter().copied())
+                    .collect()
+            }
+            RaggedDotMode::Batch => {
+                let position =
+                    dimensions.lhs_batching_dimensions().iter().position(|axis| *axis == ragged_axis).unwrap();
+                dimensions.lhs_batching_dimensions()[..position].to_vec()
+            }
+        })
+    }
+}
+
+impl Display for RaggedDotDimensionNumbers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "(dot={}, lhs_ragged={:?}, rhs_group={:?})",
+            self.dot_dimensions, self.lhs_ragged_dimensions, self.rhs_group_dimensions,
+        )
+    }
+}
+
 /// Returns the lhs result axes of `dimensions` for an LHS of the supplied rank.
 pub fn lhs_result_axes(dimensions: &DotDimensionNumbers, lhs_rank: usize) -> Vec<usize> {
     (0..lhs_rank)
@@ -216,4 +359,92 @@ pub fn adjoint_dimensions_for_right_dot(
             .collect(),
         rhs_contracting_dimensions: factor_result,
     }
+}
+
+/// Computes the grouped-dot dimensions and unpermuted output-axis order for the LHS adjoint of a non-contracting
+/// [`RaggedDotDimensionNumbers`] specification.
+pub(super) fn adjoint_ragged_dimensions_for_lhs(
+    dimensions: &RaggedDotDimensionNumbers,
+    lhs_rank: usize,
+    rhs_rank: usize,
+) -> (RaggedDotDimensionNumbers, Vec<usize>) {
+    let dot = dimensions.dot_dimensions();
+    let lhs_kept = lhs_result_axes(dot, lhs_rank);
+    let rhs_kept = rhs_result_axes(dot, rhs_rank)
+        .into_iter()
+        .filter(|axis| !dimensions.rhs_group_dimensions().contains(axis))
+        .collect::<Vec<_>>();
+    let output_batch = 0..dot.lhs_batching_dimensions().len();
+    let output_rhs = (output_batch.end + lhs_kept.len())..(output_batch.end + lhs_kept.len() + rhs_kept.len());
+    let lhs_ragged_axis = dimensions.lhs_ragged_dimensions()[0];
+    let ragged_output_axis =
+        dot.lhs_batching_dimensions().len() + lhs_kept.iter().position(|axis| *axis == lhs_ragged_axis).unwrap();
+    let adjoint = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(
+            output_rhs.collect(),
+            rhs_kept,
+            output_batch.collect(),
+            dot.rhs_batching_dimensions().to_vec(),
+        ),
+        vec![ragged_output_axis],
+        dimensions.rhs_group_dimensions().to_vec(),
+    );
+    let mut sorted_contracting = dot
+        .lhs_contracting_dimensions()
+        .iter()
+        .copied()
+        .zip(dot.rhs_contracting_dimensions().iter().copied())
+        .collect::<Vec<_>>();
+    sorted_contracting.sort_by_key(|(_, rhs_axis)| *rhs_axis);
+    let output_axes = dot
+        .lhs_batching_dimensions()
+        .iter()
+        .copied()
+        .chain(lhs_kept)
+        .chain(sorted_contracting.into_iter().map(|(lhs_axis, _)| lhs_axis))
+        .collect();
+    (adjoint, output_axes)
+}
+
+/// Computes the grouped-dot dimensions and unpermuted output-axis order for the RHS adjoint of a non-contracting
+/// [`RaggedDotDimensionNumbers`] specification.
+pub(super) fn adjoint_ragged_dimensions_for_rhs(
+    dimensions: &RaggedDotDimensionNumbers,
+    lhs_rank: usize,
+    rhs_rank: usize,
+) -> (RaggedDotDimensionNumbers, Vec<usize>) {
+    let dot = dimensions.dot_dimensions();
+    let lhs_kept = lhs_result_axes(dot, lhs_rank);
+    let rhs_kept = rhs_result_axes(dot, rhs_rank)
+        .into_iter()
+        .filter(|axis| !dimensions.rhs_group_dimensions().contains(axis))
+        .collect::<Vec<_>>();
+    let output_batch = 0..dot.lhs_batching_dimensions().len();
+    let output_lhs = output_batch.end..(output_batch.end + lhs_kept.len());
+    let adjoint = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(
+            lhs_kept,
+            output_lhs.collect(),
+            dot.lhs_batching_dimensions().to_vec(),
+            output_batch.collect(),
+        ),
+        dimensions.lhs_ragged_dimensions().to_vec(),
+        Vec::new(),
+    );
+    let mut sorted_contracting = dot
+        .rhs_contracting_dimensions()
+        .iter()
+        .copied()
+        .zip(dot.lhs_contracting_dimensions().iter().copied())
+        .collect::<Vec<_>>();
+    sorted_contracting.sort_by_key(|(_, lhs_axis)| *lhs_axis);
+    let output_axes = dimensions
+        .rhs_group_dimensions()
+        .iter()
+        .copied()
+        .chain(dot.rhs_batching_dimensions().iter().copied())
+        .chain(sorted_contracting.into_iter().map(|(rhs_axis, _)| rhs_axis))
+        .chain(rhs_kept)
+        .collect();
+    (adjoint, output_axes)
 }

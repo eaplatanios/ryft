@@ -40,7 +40,7 @@ impl_differentiable_elementwise_operation! {
     {
         // d(log1p(x)) = dx / (1 + x). The denominator is formed from the aligned input primal so that it carries the
         // tangent's element data type, and `one_like` supplies the one at exactly that type.
-        |(input, input_tangent)| input_tangent / (input.one_like() + input)
+        |(input, input_tangent)| input_tangent / (input.one_like()? + input)
     },
     transpose = @nonlinear,
 }

@@ -30,7 +30,7 @@ impl_differentiable_elementwise_operation! {
         C::Value: OneLike + StandardMul<Output = C::Value> + StandardSub<Output = C::Value>,
     {
         // d(tanh(x)) = (1 - tanh(x)²) · dx, reusing the primal output evaluated at the tangent type.
-        |(_, input_tangent) -> output| (output.one_like() - output.clone() * output) * input_tangent
+        |(_, input_tangent) -> output| (output.one_like()? - output.clone() * output) * input_tangent
     },
     transpose = @nonlinear,
 }

@@ -35,7 +35,9 @@ use ryft_pjrt::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::lowering::{XlaExecutableSignature, contains_unresolved_references, contains_unresolved_state};
+use super::lowering::{
+    RaggedDotLoweringStrategy, XlaExecutableSignature, contains_unresolved_references, contains_unresolved_state,
+};
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays::ArrayTypeExtension;
@@ -1314,8 +1316,8 @@ impl BucketedDispatchSignature {
 }
 
 /// Backend-specific per-call options for the [`CompilationDomain`] implementation on
-/// [`XlaDomain`]. Carries the device mesh, optional sharding overrides for inputs/outputs,
-/// optional per-input donation flags, and retained-dispatch policies.
+/// [`XlaDomain`]. Carries the device mesh, optional sharding overrides for inputs/outputs, optional per-input donation
+/// flags, backend lowering choices, and retained-dispatch policies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XlaOptions {
     /// Concrete device mesh the compiled program runs against.
@@ -1336,10 +1338,15 @@ pub struct XlaOptions {
 
     /// Optional host-side bound bucketing policy for retained-JIT input signatures.
     pub input_bound_bucketing: Option<XlaInputBoundBucketing>,
+
+    /// Backend representation used to lower grouped generalized dots. Defaults to
+    /// [`RaggedDotLoweringStrategy::Decomposition`].
+    pub ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 }
 
 impl XlaOptions {
-    /// Constructs default options for `mesh` with no shardings overrides and no donation.
+    /// Constructs options for `mesh` with no sharding overrides or donation and with portable grouped-dot
+    /// decomposition.
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
         Self {
@@ -1349,6 +1356,7 @@ impl XlaOptions {
             donation_flags: None,
             feedback_directed_profile: None,
             input_bound_bucketing: None,
+            ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
         }
     }
 
@@ -1410,6 +1418,13 @@ impl XlaOptions {
         self.input_bound_bucketing = Some(bucketing);
         self
     }
+
+    /// Selects the backend representation used to lower grouped generalized dots.
+    #[inline]
+    pub fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
+        self.ragged_dot_lowering_strategy = strategy;
+        self
+    }
 }
 
 impl std::hash::Hash for XlaOptions {
@@ -1423,6 +1438,7 @@ impl std::hash::Hash for XlaOptions {
         self.donation_flags.hash(state);
         self.feedback_directed_profile.hash(state);
         self.input_bound_bucketing.hash(state);
+        self.ragged_dot_lowering_strategy.hash(state);
     }
 }
 
@@ -3507,6 +3523,7 @@ impl<'c> XlaDomain<'c> {
             lowered_result_shardings,
             target_platform.as_deref(),
             reference_states.as_slice(),
+            options.ragged_dot_lowering_strategy,
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
         let (stable_hlo, signature, requires_assertion_handler) = lowered_module.into_parts();
@@ -4266,11 +4283,17 @@ fn array_data_dependent_padding_discipline(
         | ArrayOperation::CumulativeMin(_)
         | ArrayOperation::CumulativeLogSumExp(_) => Propagated,
         ArrayOperation::Dot(_) => XlaZeroPadded,
+        ArrayOperation::RaggedDot(_) => {
+            Unsupported { reason: "group-size metadata may describe positions in bounded physical padding" }
+        }
         ArrayOperation::ScaledDot(_) => RyftMasked,
         ArrayOperation::DotProductAttention(_) | ArrayOperation::DotProductAttentionBackward(_) => RyftMasked,
         ArrayOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
+        ArrayOperation::RaggedAllToAll(_) => {
+            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
+        }
         ArrayOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         ArrayOperation::Print(_) => Unsupported { reason: "print exposes the physical representation of its operand" },
         ArrayOperation::Zero(_)
@@ -4356,11 +4379,15 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         XlaOperation::RngBitGenerator(_) => Unsupported {
             reason: "random generation advances state according to physical rather than logical element count",
         },
+        XlaOperation::RaggedAllToAll(_) => {
+            Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
+        }
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         XlaOperation::NewReference(_)
         | XlaOperation::ReferenceIndex(_)
         | XlaOperation::ReferenceSlice(_)
         | XlaOperation::ReferenceRead(_)
+        | XlaOperation::ReferenceWrite(_)
         | XlaOperation::ReferenceSwap(_)
         | XlaOperation::ReferenceAddUpdate(_)
         | XlaOperation::FreezeReference(_) => {
@@ -5301,11 +5328,12 @@ mod tests {
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
         DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, FreezeReference, FreezeReferenceOperation,
         IotaOperation, LogSumExpOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation,
-        OneOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceIndexOperation, ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation,
-        ReferenceSwapOperation, ReferenceType, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers,
-        ScatterOperation, SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation,
-        ZeroOperation, try_jit_with_options,
+        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+        ReferenceWriteOperation, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation,
+        SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation,
+        try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6028,6 +6056,52 @@ mod tests {
         assert_eq!(domain.compilation_options(), &CompilationOptions::default());
         assert!(Arc::ptr_eq(&domain.compilation_options, &cloned.compilation_options));
         assert!(size_of::<XlaDomain<'_>>() < size_of::<CompilationOptions>());
+    }
+
+    #[test]
+    fn test_ragged_dot_lowering_strategy_is_xla_compilation_policy() {
+        use std::collections::HashMap;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let lhs_type = ArrayType::new_static(DataType::F32, [5, 2]);
+        let rhs_type = ArrayType::new_static(DataType::F32, [3, 2, 1]);
+        let group_sizes_type = ArrayType::new_static(DataType::I32, [3]);
+        let mut builder = XlaProgramBuilder::new();
+        let lhs = builder.add_input(ArrayIrType::Array(lhs_type));
+        let rhs = builder.add_input(ArrayIrType::Array(rhs_type));
+        let group_sizes = builder.add_input(ArrayIrType::Array(group_sizes_type));
+        let output = builder
+            .add_instruction(
+                RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+                Vec::new(),
+                vec![lhs, rhs, group_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let decomposition_options = XlaOptions::new(mesh.clone());
+        let instruction_options =
+            XlaOptions::new(mesh).with_ragged_dot_lowering_strategy(RaggedDotLoweringStrategy::Instruction);
+        let decomposition = domain.lower_xla_program(&program, 0, &decomposition_options).unwrap();
+        let instruction = domain.lower_xla_program(&program, 0, &instruction_options).unwrap();
+
+        assert!(decomposition.stable_hlo().contains("stablehlo.dot_general"));
+        assert!(!decomposition.stable_hlo().contains("chlo.ragged_dot"));
+        assert!(instruction.stable_hlo().contains("chlo.ragged_dot"));
+        assert_ne!(decomposition.stable_hlo(), instruction.stable_hlo());
+        assert_ne!(decomposition_options, instruction_options);
+        let options_by_representation = HashMap::from([
+            (decomposition_options.clone(), "decomposition"),
+            (instruction_options.clone(), "instruction"),
+        ]);
+        assert_eq!(options_by_representation.len(), 2);
+        assert_eq!(options_by_representation.get(&decomposition_options), Some(&"decomposition"));
+        assert_eq!(options_by_representation.get(&instruction_options), Some(&"instruction"));
     }
 
     #[test]
@@ -9389,8 +9463,12 @@ mod tests {
 
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone().into());
+        let replacement = builder.add_input(scalar_type.clone().into());
         let reference =
             builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
         let snapshot =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
@@ -9401,7 +9479,7 @@ mod tests {
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![snapshot, final_value],
-                vec![Placeholder],
+                vec![Placeholder; 2],
                 vec![Placeholder; 2],
             )
             .unwrap();
@@ -9409,7 +9487,8 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
         assert_eq!(lowered.output_types(), &[scalar_type.clone(), scalar_type]);
         let expected_signature = concat!(
-            "  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
+            "  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
+            "%arg1: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) -> ",
             "(tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}, ",
             "tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, []>}) {",
         );
@@ -9417,25 +9496,29 @@ mod tests {
             module {
               sdy.mesh @mesh = <["x"=1]>
             @SIGNATURE@
-                %0 = stablehlo.add %arg0, %arg0 : tensor<f32>
-                return %arg0, %0 : tensor<f32>, tensor<f32>
+                %0 = stablehlo.add %arg1, %arg0 : tensor<f32>
+                return %arg1, %0 : tensor<f32>, tensor<f32>
               }
             }
         "#}
         .replace("@SIGNATURE@", expected_signature);
         assert_eq!(lowered.stable_hlo(), expected_stable_hlo,);
         let compiled = domain.compile_xla_program(&lowered).unwrap();
-        let outputs = domain.execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 3.0)]).unwrap();
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![3.0]);
-        assert_eq!(read_f32s(&client, &outputs[1]), vec![6.0]);
+        let outputs = domain
+            .execute_xla_program(&compiled, vec![f32_scalar(&client, &mesh, 3.0), f32_scalar(&client, &mesh, 5.0)])
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![5.0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![8.0]);
 
         let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32));
+        let eager_replacement = ArrayIrValue::Array(CpuArray::scalar(5.0f32));
         let eager_reference = eager_input.new_reference().unwrap();
+        eager_reference.write(&eager_replacement).unwrap();
         let eager_snapshot = eager_reference.read().unwrap();
         eager_reference.add_update(&eager_input).unwrap();
         let eager_final = eager_reference.freeze().unwrap();
-        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(3.0f32)));
-        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(6.0f32)));
+        assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(5.0f32)));
+        assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(8.0f32)));
     }
 
     #[test]
@@ -9550,6 +9633,47 @@ mod tests {
         assert_eq!(read_f32s(&client, &outputs[0]), vec![4.0]);
         assert_eq!(read_f32s(&client, &outputs[1]), vec![2.0, 3.0]);
         assert_eq!(read_f32s(&client, &outputs[2]), vec![1.0, 11.0, 22.0, 4.0]);
+    }
+
+    #[test]
+    fn test_xla_lowering_discharges_and_executes_a_write_through_a_reference_view() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let vector_type = replicated_vector_type(&mesh, 4);
+        let pair_type = replicated_vector_type(&mesh, 2);
+        let mut builder = XlaProgramBuilder::new();
+        let initial = builder.add_input(vector_type.into());
+        let replacement = builder.add_input(pair_type.into());
+        let reference =
+            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let view = builder
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![view, replacement], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program: FlatXlaProgram = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_xla_program(&lowered).unwrap();
+        let outputs = domain
+            .execute_xla_program(
+                &compiled,
+                vec![f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]), f32_vector(&client, &mesh, &[10.0, 20.0])],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 10.0, 20.0, 4.0]);
     }
 
     #[test]

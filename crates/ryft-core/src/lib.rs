@@ -97,7 +97,7 @@ pub use operations::cumulative::{
 };
 pub use operations::dot::{
     DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
-    RaggedDotDimensionNumbers, RaggedDotLoweringStrategy, RaggedDotMode, RaggedDotOperation,
+    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
 };
 pub use operations::logical::{
     AND_OPERATION_NAME, And, AndOperation, NOT_OPERATION_NAME, Not, NotOperation, OR_OPERATION_NAME, Or, OrOperation,
@@ -177,17 +177,16 @@ pub use programs::{
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceError, ReferenceGeneration, ReferenceGuard, ReferenceId,
-    ReferenceInitializationBehavior, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics,
-    ReferenceRead, ReferenceReadOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource,
-    ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements,
-    ReferenceWrite, ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
-    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata,
-    ReplayRegionDriver, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId,
-    ValueProjection, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation, infer_projected_operation_output_types,
-    infer_projected_operation_region_input_types,
+    ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead, ReferenceReadOperation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionDischargeInput,
+    ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource, ReferenceStateBinding,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements, ReferenceWrite,
+    ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
+    Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition,
+    TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId, ValueProjection,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,

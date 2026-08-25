@@ -334,6 +334,7 @@ trait Operation: Clone {
 enum ReferenceAccessMode {
     Read,
     Write,
+    ReadWrite,
 }
 
 /// Stand-in for `ryft_core::OperationProjection`.
@@ -1416,8 +1417,10 @@ fn test_operation_generates_operation_forwarding() {
     assert_eq!(add.reference_output_identity_input(3), None);
     assert_eq!(print.reference_output_identity_input(3), Some(1));
     assert!(add.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+    assert!(add.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
     assert!(print.allows_reference_access_through_region_input(0, ReferenceAccessMode::Read));
     assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
+    assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
     assert!(!print.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
     assert_eq!(add.input_region_provenance(0, 0), None);
     assert_eq!(print.input_region_provenance(0, 2), Some(2));

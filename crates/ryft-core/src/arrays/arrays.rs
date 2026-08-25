@@ -1300,7 +1300,7 @@ mod tests {
         assert!(matches!(
             Array::scalar(0.0f64).converted_to(DataType::F8E8M0FNU),
             Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "data type f8e8m0fnu cannot represent zero",
+                if message == "data type `f8e8m0fnu` cannot represent zero",
         ));
 
         // Cross-type conversion traverses the logical order selected by the input layout and preserves the same

@@ -41,8 +41,9 @@ pub enum ArrayReferenceViewError {
 ///
 /// A transform describes both directions of one view step: applying it extracts a selected child value from its
 /// parent, while replacing that child reconstructs a value with exactly the parent's original type. This
-/// bidirectional contract lets reference reads operate on the selected value and lets swaps or additive updates write
-/// the result back into the shared root without changing the root's declared type.
+/// bidirectional contract lets reference reads operate on the selected value and lets write-only replacements, swaps,
+/// or additive updates reconstruct the shared root without changing its declared type. A write-only traversal
+/// materializes the strict parents needed for reconstruction but deliberately skips extracting the overwritten leaf.
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one statically selected
 /// axis; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis.
@@ -369,6 +370,29 @@ impl ArrayReferenceView {
         let reconstructed = self.reconstruct_in(carrier, intermediates.as_slice(), replacement)?;
         Ok((previous, reconstructed))
     }
+
+    /// Replaces this view's selected coordinates through `carrier` without materializing the selected old value.
+    ///
+    /// Immutable root reconstruction still needs each strict parent of the selected leaf so coordinates outside the
+    /// logical view survive. The final transform is deliberately not applied: its output is exactly the old selected
+    /// value that write-only semantics must not observe. An identity view therefore returns `replacement` directly.
+    pub(crate) fn write_in<C: ViewWriteCarrier>(
+        &self,
+        carrier: &mut C,
+        root: C::Value,
+        replacement: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        if self.transforms.is_empty() {
+            return Ok(replacement);
+        }
+        let mut intermediates = Vec::with_capacity(self.transforms.len());
+        intermediates.push(root);
+        for transform in &self.transforms[..self.transforms.len() - 1] {
+            let child = transform.apply_in(carrier, intermediates.last().unwrap())?;
+            intermediates.push(child);
+        }
+        self.reconstruct_in(carrier, intermediates.as_slice(), replacement)
+    }
 }
 
 /// One value carrier through which a reference view maps between a shared root and one derived handle.
@@ -539,6 +563,22 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.root.update_with_result(|current| {
             self.validate_view_referent_type(&replacement)?;
             self.view.swap(current, &replacement)
+        })
+    }
+
+    /// Replaces this handle's selected coordinates without returning their previous snapshot.
+    pub fn write(&self, replacement: A) -> Result<(), ProgramError>
+    where
+        A: Reshape + Slice + UpdateSlice,
+    {
+        if self.view.is_root() {
+            return self.root.write(replacement).map_err(ProgramError::custom);
+        }
+        // Validation remains inside the holder transaction so frozen, poisoned, and leased-state diagnostics retain
+        // precedence over replacement-type errors, matching the root write and swap paths.
+        self.root.update_with(|current| {
+            self.validate_view_referent_type(&replacement)?;
+            self.view.write_in(&mut EagerViewCarrier(PhantomData), current.clone(), replacement)
         })
     }
 
@@ -747,6 +787,7 @@ mod tests {
         // The bound-free accessor returns the complete root snapshot and rejects every derived handle, because
         // selecting a view requires the array-manipulation capabilities that this accessor deliberately does not bind.
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+
         assert_eq!(
             derived.read().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
             Some(&ArrayReferenceViewError::CannotReadViewDirectly),
@@ -776,6 +817,16 @@ mod tests {
         );
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
 
+        let error = view.write(Array::vector(vec![10.0_f32, 20.0])).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ReferentTypeMismatch {
+                expected: "f32[3]".to_string(),
+                actual: "f32[2]".to_string(),
+            }),
+        );
+        assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+
         // An additive update whose result type drifts away from the view's element data type is rejected by the same
         // check, after the addition itself succeeded, so the holder still retains its previous value.
         let error = view.add_update(&Array::vector(vec![1.0_f64, 2.0, 3.0])).unwrap_err();
@@ -788,14 +839,18 @@ mod tests {
         );
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
 
-        // A replacement of exactly the derived type returns the previous view snapshot and writes back into exactly
-        // the selected root coordinates.
-        assert_eq!(view.swap(Array::vector(vec![10.0_f32, 20.0, 30.0])), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0])));
+        // A write-only replacement of exactly the derived type preserves unaffected coordinates without returning the
+        // selected snapshot. A following swap observes that installed value and replaces it again.
+        assert_eq!(view.write(Array::vector(vec![10.0_f32, 20.0, 30.0])), Ok(()));
         assert_eq!(root.read(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
+        assert_eq!(view.swap(Array::vector(vec![40.0_f32, 50.0, 60.0])), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0])));
+        assert_eq!(root.read(), Ok(Array::vector(vec![40.0_f32, 50.0, 60.0, 4.0])));
 
         // Holder-state errors take precedence over the replacement-type diagnostic: a frozen root swapped through a
         // derived view with a wrongly typed replacement reports the terminal state, not a shape to fix.
-        assert_eq!(root.freeze(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
+        assert_eq!(root.freeze(), Ok(Array::vector(vec![40.0_f32, 50.0, 60.0, 4.0])));
+        let error = view.write(Array::vector(vec![1.0_f32, 2.0])).unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
         let error = view.swap(Array::vector(vec![1.0_f32, 2.0])).unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
@@ -813,10 +868,15 @@ mod tests {
             .unwrap();
         assert_eq!(view.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
-        // The composed mapping selects row 2 of the sliced view, which is the leading pair of the root's last row, so
-        // the additive update writes back through both view steps and leaves every other coordinate unchanged.
+        // The composed mapping selects row 2 of the sliced view. A write reconstructs both strict parents without
+        // returning the selected leaf, and the following additive update reaches the same coordinates.
+        view.write(Array::vector(vec![70.0_f32, 80.0])).unwrap();
+        assert_eq!(
+            root.read(),
+            Ok(Array::from_f64s(root_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 70.0, 80.0, 9.0])),
+        );
         view.add_update(&Array::vector(vec![10.0_f32, 20.0])).unwrap();
-        assert_eq!(root.read(), Ok(Array::from_f64s(root_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 17.0, 28.0, 9.0])),);
+        assert_eq!(root.read(), Ok(Array::from_f64s(root_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 80.0, 100.0, 9.0])),);
     }
 
     #[test]

@@ -133,6 +133,7 @@ fn try_same_mesh<'o>(
         donation_flags: Some(vec![donate]),
         feedback_directed_profile: None,
         input_bound_bucketing: None,
+        ragged_dot_lowering_strategy: Default::default(),
     };
 
     let staged: crate::jit::StagedXlaFunction<'_, ArrayType, ArrayType> =

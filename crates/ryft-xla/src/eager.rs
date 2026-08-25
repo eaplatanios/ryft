@@ -846,6 +846,84 @@ mod tests {
         );
     }
 
+    /// A declared ragged custom-call contract reaches the registered FFI handler with its existing extent operand,
+    /// preserves the result's ragged metadata, and lets a downstream sum mask the padded suffix.
+    #[test]
+    fn test_eager_ragged_custom_call_contract_composes_with_masked_reduction() {
+        use ryft_core::arrays::batching::DynamicArrayBatchingPolicy;
+        use ryft_core::operations::custom_call::{
+            CustomCallBatching, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
+            CustomCallRaggedOutputBinding,
+        };
+        use ryft_core::{
+            ArrayBatch, ArrayBatching, ArrayIrValue, BatchableOperation, BatchingContext, DimensionValue,
+            EmptyRegionDriver, RaggedAxis, ReduceOperation,
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let mesh = cpu_mesh(&client);
+        let row_type = replicated_type(&mesh, DataType::F32, &[4]);
+        let input = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::F32, &[3, 4]),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 99.0, 99.0, 3.0, 4.0, 5.0, 99.0, 7.0, 99.0, 99.0, 99.0]),
+        )
+        .unwrap();
+        let invalid_input = input.clone();
+        let extents = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[3]),
+            mesh.clone(),
+            values_to_bytes::<i32>(&[2, 3, 1]),
+        )
+        .unwrap();
+        let invalid_extents = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I32, &[3]),
+            mesh,
+            values_to_bytes::<i32>(&[2, 5, 1]),
+        )
+        .unwrap();
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+            input.execution_domain(),
+            ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
+        );
+        let data = ArrayBatch::new(input, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), length.clone(), vec![0])])
+            .unwrap();
+        let extent_operand = ArrayBatch::new(extents, BatchAxis::new(0)).unwrap();
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![row_type])
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_ragged_contract(CustomCallRaggedContract::new(
+                vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, length.clone())],
+                vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "data".to_string(), axis: 0 }],
+                true,
+            ));
+        let (mut outputs, evidence) =
+            operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts();
+        assert!(evidence.is_empty());
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        let (outputs, evidence) = ReduceOperation::new(vec![0], ReductionKind::Sum)
+            .batch(&context, &EmptyRegionDriver, &[outputs.remove(0)])
+            .unwrap()
+            .into_parts();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(read_f32s(outputs[0].value()), vec![5.0, 15.0, 8.0]);
+
+        let invalid_data = ArrayBatch::new(invalid_input, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, invalid_extents.clone(), length, vec![0])])
+            .unwrap();
+        let invalid_extent_operand = ArrayBatch::new(invalid_extents, BatchAxis::new(0)).unwrap();
+        let error = operation.batch(&context, &EmptyRegionDriver, &[invalid_data, invalid_extent_operand]).unwrap_err();
+        assert!(error.to_string().contains("extent 5 at batch item 1 lies outside the packed bound 4"), "{error}");
+    }
+
     /// A custom call wrapped with `custom_vjp` differentiates through the user-provided rule while the primal
     /// executes the registered FFI handler, which is the documented pairing for differentiable foreign kernels
     /// (the bare operation rejects differentiation).
@@ -1540,8 +1618,8 @@ mod tests {
         // Reduction sums along the requested axis, and the like-constants match the receiver's shape.
         let total = vector.reduce(&[0], ReductionKind::Sum);
         assert_eq!(read_f32s(&total), vec![10.0]);
-        assert_eq!(read_f32s(&vector.zero_like()), vec![0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(read_f32s(&vector.one_like()), vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(read_f32s(&vector.zero_like().unwrap()), vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(read_f32s(&vector.one_like().unwrap()), vec![1.0, 1.0, 1.0, 1.0]);
 
         // Tag and stop-gradient behave as eager identities on the payload.
         assert_eq!(read_f32s(&vector.clone().tag("residual")), vec![1.0, 2.0, 3.0, 4.0]);
@@ -1565,7 +1643,7 @@ mod tests {
 
         // Elementwise truthiness is an explicit comparison against zero: zero maps to false and nonzero maps to true.
         let input = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]);
-        let boolean = input.compare(&input.zero_like(), ComparisonDirection::NotEqual).unwrap();
+        let boolean = input.compare(&input.zero_like().unwrap(), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.data_type(), DataType::Boolean);
         assert_eq!(read_booleans(&boolean), vec![false, true, false]);
 

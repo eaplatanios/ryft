@@ -710,7 +710,7 @@ mod tests {
     where
         V::DispatchDomain: Context<Type = ArrayType, Constant = Array, Operation = ArrayOperation<Array>>,
     {
-        let condition = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
+        let condition = x.compare(&x.zero_like().unwrap(), ComparisonDirection::GreaterThan).unwrap();
         let doubled = x.add(&x).unwrap();
         let tripled = doubled.add(&x).unwrap();
         Select::select(&condition, &doubled, &tripled).unwrap()
@@ -884,7 +884,7 @@ mod tests {
 
         let jacobian = differentiate_at((scalar.clone(), vector.clone()))
             .jacobian_reverse(|(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                let condition = vector.compare(&vector.zero_like()?, ComparisonDirection::GreaterThan)?;
                 Select::select(&condition, &scalar, &vector)
             })
             .unwrap();
@@ -900,7 +900,7 @@ mod tests {
 
         let jacobian = differentiate_at((scalar, vector))
             .jacobian_reverse(|(scalar, vector)| {
-                let condition = vector.compare(&vector.zero_like(), ComparisonDirection::GreaterThan)?;
+                let condition = vector.compare(&vector.zero_like()?, ComparisonDirection::GreaterThan)?;
                 Select::select(&condition, &vector, &scalar)
             })
             .unwrap();

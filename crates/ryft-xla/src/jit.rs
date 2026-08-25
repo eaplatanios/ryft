@@ -1581,8 +1581,7 @@ where
     )
 }
 
-/// Same as [`compile`] but accepts a full [`XlaOptions`] payload for XLA mesh placement, sharding overrides,
-/// and per-input buffer donation flags.
+/// Same as [`compile`] but accepts an explicit [`XlaOptions`] payload.
 #[track_caller]
 pub fn compile_with_options<'domain, 'c: 'domain, F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
@@ -5580,7 +5579,7 @@ mod tests {
         let output_weights = &state[12];
 
         // Embed the current token and append its projected key/value row to the caches at `position`.
-        let zero_index = position.zero_like();
+        let zero_index = position.zero_like()?;
         let embedding = embeddings
             .dynamic_slice(&[token, zero_index.clone()], &[1, dimension])?
             .reshape(static_shape(&[dimension]))?;
@@ -5637,7 +5636,7 @@ mod tests {
             }
         };
         let tokens = tokens.dynamic_update_slice(&next_token.reshape(static_shape(&[1]))?, &[position.clone()])?;
-        let position = position.add(&position.one_like())?;
+        let position = position.add(&position.one_like()?)?;
         Ok(vec![
             position,
             next_token,

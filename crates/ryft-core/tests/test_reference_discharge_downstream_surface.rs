@@ -191,6 +191,15 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
         Ok(current.clone())
     }
 
+    fn write(
+        _context: &C,
+        _current: &C::Value,
+        replacement: C::Value,
+        _alias: &WholeRegister,
+    ) -> Result<C::Value, ProgramError> {
+        Ok(replacement)
+    }
+
     fn replace(
         _context: &C,
         current: &C::Value,
@@ -201,12 +210,45 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
     }
 }
 
+/// Structured-operation stand-in that permits every non-consuming reference mode through its only region.
+#[derive(Copy, Clone, Debug)]
+struct RegisterRegionOperation;
+
+impl Display for RegisterRegionOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl Parameter for RegisterRegionOperation {}
+
+impl Operation for RegisterRegionOperation {
+    type Type = RegisterIrType;
+
+    fn name(&self) -> &'static str {
+        "register.region"
+    }
+
+    fn infer_output_types(
+        &self,
+        _input_types: &[RegisterIrType],
+        _region_interfaces: &[RegionInterface<RegisterIrType>],
+    ) -> Result<Vec<RegisterIrType>, TypeError> {
+        Ok(Vec::new())
+    }
+
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        region_index == 0 && !mode.is_consuming()
+    }
+}
+
 /// Operation family of the downstream universe.
 #[derive(Copy, Clone, Debug)]
 enum RegisterOperation {
     Negate,
     NewReference,
     Read,
+    Write,
     Swap,
     Freeze,
 }
@@ -225,6 +267,7 @@ impl Operation for RegisterOperation {
             Self::Negate => "register.negate",
             Self::NewReference => "register.new_reference",
             Self::Read => "register.read",
+            Self::Write => "register.write",
             Self::Swap => "register.swap",
             Self::Freeze => "register.freeze",
         }
@@ -252,6 +295,11 @@ impl Operation for RegisterOperation {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![RegisterIrType::Register(referent()?)])
             }
+            Self::Write => {
+                check_count!("input", input_types, 2, TypeError);
+                referent()?;
+                Ok(Vec::new())
+            }
             Self::Swap => {
                 check_count!("input", input_types, 2, TypeError);
                 Ok(vec![RegisterIrType::Register(referent()?)])
@@ -270,9 +318,13 @@ impl Operation for RegisterOperation {
                 Vec::new(),
                 vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
             )),
-            Self::Swap => Cow::Owned(ReferenceOperationSemantics::new(
+            Self::Write => Cow::Owned(ReferenceOperationSemantics::new(
                 Vec::new(),
                 vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
+            )),
+            Self::Swap => Cow::Owned(ReferenceOperationSemantics::new(
+                Vec::new(),
+                vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
             )),
             Self::Freeze => Cow::Owned(ReferenceOperationSemantics::new(
                 Vec::new(),
@@ -340,6 +392,16 @@ where
                     return discharge_preserved_access(self, context, inputs);
                 }
                 Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+            }
+            Self::Write => {
+                check_count!("input", inputs, 2, ProgramError);
+                let reference = inputs[0].expect_reference("a reference to write")?;
+                let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+                if reference.preserved().is_some() {
+                    return discharge_preserved_access(self, context, inputs);
+                }
+                context.write(reference, replacement)?;
+                Ok(Vec::new())
             }
             Self::Swap => {
                 check_count!("input", inputs, 2, ProgramError);
@@ -510,6 +572,43 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
 }
 
 #[test]
+fn test_downstream_region_summary_exposes_exact_access_modes() {
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
+    let read = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+    builder
+        .add_instruction(RegisterOperation::Write, Vec::new(), vec![reference, replacement], None)
+        .unwrap();
+    let swapped = builder
+        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![reference, replacement], None)
+        .unwrap()[0];
+    let region = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
+            vec![read, swapped],
+            vec![Placeholder; 2],
+            vec![Placeholder; 2],
+        )
+        .unwrap();
+
+    let context = RegisterDischargeContext::new(RegisterDestination::new());
+    let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1));
+    let root = reference.expect_reference("a downstream root").unwrap().root();
+    let summary = context
+        .region_summary(&RegisterRegionOperation, 0, region.entry_region_ref(), &[Some(root), None])
+        .unwrap();
+
+    assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![root]);
+    assert_eq!(
+        summary.access_modes(root).collect::<Vec<_>>(),
+        vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite],
+    );
+    assert!(summary.has_access(root, ReferenceAccessMode::ReadWrite));
+    assert!(!summary.has_access(root, ReferenceAccessMode::Accumulate));
+    assert!(summary.is_mutated(root));
+}
+
+#[test]
 fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_discharge() {
     // Partial discharge is reachable from downstream position too, and the register universe declines accumulation
     // and views entirely, so this is the minimal shape a backend needs: `f(counter, buffer, replacement) = replaced`,
@@ -522,7 +621,7 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
     let replaced =
         builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![counter, observed], None).unwrap()[0];
     builder
-        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![buffer, replacement], None)
+        .add_instruction(RegisterOperation::Write, Vec::new(), vec![buffer, replacement], None)
         .unwrap();
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![replaced], vec![Placeholder; 3], vec![Placeholder])
@@ -552,7 +651,7 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
         indoc! {"
             lambda %0:register, %1:ref<register>, %2:register .
             let %3:register = register.read %1
-                %4:register = register.swap %1 %2
+                register.write %1 %2
             in (%0, %3)"},
     );
 }

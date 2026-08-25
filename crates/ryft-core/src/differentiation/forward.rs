@@ -2436,6 +2436,32 @@ mod tests {
     }
 
     #[test]
+    fn test_differentiation_context_resolves_only_structural_zero_duals() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let constant = context.lift(Array::scalar(2.0)).unwrap();
+        assert!(matches!(
+            context.resolve(&constant),
+            ValueResolution::Constant(value) if value == Array::scalar(2.0)
+        ));
+
+        let live = DifferentiationTracer::new(
+            DifferentiationDual::new(Array::scalar(2.0), Array::scalar(1.0)).unwrap(),
+            context.clone(),
+        );
+        assert!(matches!(context.resolve(&live), ValueResolution::Opaque));
+
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let foreign = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal = foreign.input(ArrayType::scalar(DataType::F64));
+        let context = DifferentiationContext::new(parent);
+        let opaque = DifferentiationTracer::new(
+            DifferentiationDual::new(primal, MaybeZero::Zero(ArrayType::scalar(DataType::F64))).unwrap(),
+            context.clone(),
+        );
+        assert!(matches!(context.resolve(&opaque), ValueResolution::Opaque));
+    }
+
+    #[test]
     fn test_differentiation_context_rejects_state_before_symbolic_zero_fast_path() {
         let context = DifferentiationContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let input = DifferentiationTracer::new(

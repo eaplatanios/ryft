@@ -31,7 +31,7 @@ impl_differentiable_elementwise_operation! {
     {
         // d(logistic(x)) = logistic(x) · (1 - logistic(x)) · dx, reusing the primal output evaluated at the
         // tangent type.
-        |(_, input_tangent) -> output| output.clone() * (output.one_like() - output) * input_tangent
+        |(_, input_tangent) -> output| output.clone() * (output.one_like()? - output) * input_tangent
     },
     transpose = @nonlinear,
 }

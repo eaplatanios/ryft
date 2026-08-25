@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType};
+use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, RaggedAxis};
 use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -28,9 +28,9 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::{
-    forward_collective_to_parent, interpret_degenerate_collective, reject_ragged_collective_inputs,
-    resolve_named_axis_size, shape_changing_collective, shape_changing_collective_dimensions,
-    shape_changing_collective_output_type, transpose_shape_changing_collective, validate_collective_axis_size,
+    forward_collective_to_parent, interpret_degenerate_collective, resolve_named_axis_size, shape_changing_collective,
+    shape_changing_collective_dimensions, shape_changing_collective_output_type, transpose_shape_changing_collective,
+    validate_collective_axis_size,
 };
 
 shape_changing_collective! {
@@ -40,7 +40,9 @@ shape_changing_collective! {
     /// [StableHLO's `collective_permute`](https://openxla.org/stablehlo/spec#collective_permute). Participants that
     /// no pair targets receive zeros. The output shape is unchanged. The collective is linear and its transpose is
     /// the permutation with every pair inverted. A matching `batch` level consumes the mapped batch axis by
-    /// reassembling it in target order from per-item slices, with zero slices at untargeted positions.
+    /// reassembling it in target order from per-item slices, with zero slices at untargeted positions. Bounded ragged
+    /// extents follow the same source-to-target routing as their packed values; untargeted participants receive zero
+    /// extents together with their zero-filled values.
     operation = ParallelPermuteOperation,
     name = PARALLEL_PERMUTE_OPERATION_NAME = "parallel_permute",
     /// Value-level entry point for staging a [`ParallelPermuteOperation`]. Refer to its documentation for the semantics
@@ -157,7 +159,6 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
         }
@@ -175,13 +176,6 @@ where
                 ),
             });
         }
-        let Some(shape) = input.value().r#type().static_shape() else {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_permute` batching requires statically shaped operands".to_string(),
-            });
-        };
-        let dimensions = shape.dimensions().to_vec();
-        let value = input.into_value();
         // Map each target position along the batch axis to the source item that sends to it; positions that no pair
         // targets receive zeros. Pair uniqueness is enforced by output type inference, so it is not revalidated here.
         let mut sources = vec![None; batch_size];
@@ -195,33 +189,63 @@ where
             }
             sources[*target] = Some(*source);
         }
-        // Slice each item `[i, i + 1)` from the leading batch axis and concatenate the slices back in target order.
-        let rank = dimensions.len();
-        let strides = vec![1; rank];
-        let slice_item = |item: usize| -> Result<<C as Domain>::Value, ProgramError> {
-            let mut start_indices = vec![0; rank];
-            let mut limit_indices = dimensions.clone();
-            start_indices[0] = item;
-            limit_indices[0] = item + 1;
-            value.slice(&start_indices, &limit_indices, &strides)
-        };
-        let mut zero_item = None;
-        let mut items = Vec::with_capacity(batch_size);
-        for source in sources {
-            match source {
-                Some(source) => items.push(slice_item(source)?),
-                None => {
-                    if zero_item.is_none() {
-                        zero_item = Some(slice_item(0)?.zero_like());
-                    }
-                    // The zero slice was materialized right above when absent.
-                    items.push(zero_item.clone().unwrap());
+        let permuted = permute_participant_axis(input.value(), 0, sources.as_slice())?;
+        let ragged_axes = input
+            .ragged_axes()
+            .iter()
+            .map(|ragged_axis| {
+                let extents = ragged_axis.extent_axes().iter().position(|axis| *axis == 0).map_or_else(
+                    || Ok(ragged_axis.extents().clone()),
+                    |extent_axis| permute_participant_axis(ragged_axis.extents(), extent_axis, sources.as_slice()),
+                )?;
+                Ok(RaggedAxis::new(
+                    ragged_axis.axis(),
+                    extents,
+                    ragged_axis.dimension().clone(),
+                    ragged_axis.extent_axes().to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        Ok(vec![ArrayBatch::new(permuted, Some(0))?.with_ragged_axes(ragged_axes)?].into())
+    }
+}
+
+/// Applies one participant permutation to `axis` of a packed value, filling untargeted destinations with zeros.
+fn permute_participant_axis<V>(value: &V, axis: usize, sources: &[Option<usize>]) -> Result<V, BatchingError>
+where
+    V: Value<Type = ArrayType> + Concatenate + Slice + Transpose + ZeroLike,
+{
+    let value = if axis == 0 { value.clone() } else { value.clone().move_axis(axis, 0)? };
+    let Some(shape) = value.r#type().static_shape() else {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "`parallel_permute` batching requires statically shaped operands and ragged extents".to_string(),
+        });
+    };
+    let dimensions = shape.dimensions().to_vec();
+    let rank = dimensions.len();
+    let strides = vec![1; rank];
+    let slice_item = |item: usize| -> Result<V, ProgramError> {
+        let mut start_indices = vec![0; rank];
+        let mut limit_indices = dimensions.clone();
+        start_indices[0] = item;
+        limit_indices[0] = item + 1;
+        value.slice(&start_indices, &limit_indices, &strides)
+    };
+    let mut zero_item = None;
+    let mut items = Vec::with_capacity(sources.len());
+    for source in sources {
+        match source {
+            Some(source) => items.push(slice_item(*source)?),
+            None => {
+                if zero_item.is_none() {
+                    zero_item = Some(slice_item(0)?.zero_like()?);
                 }
+                items.push(zero_item.clone().unwrap());
             }
         }
-        let permuted = Concatenate::concatenate(&items, 0)?;
-        Ok(vec![ArrayBatch::new(permuted, Some(0))?].into())
     }
+    let permuted = Concatenate::concatenate(&items, 0)?;
+    if axis == 0 { Ok(permuted) } else { Ok(permuted.move_axis(0, axis)?) }
 }
 
 // Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
@@ -255,7 +279,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionValue, Shape,
+        DimensionBounds, DimensionValue, DimensionVariable, RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::EagerContext;
@@ -332,6 +356,36 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
         );
         assert_eq!(output.to_f64s(), vec![3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_parallel_permute_co_moves_ragged_extents() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+
+        let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)])
+            .batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+
+        assert_eq!(output.value().to_f64s(), vec![2.0, 3.0, 4.0, 1.0, 0.0, 0.0]);
+        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::vector(vec![3_i32, 1]), variable, vec![0])],);
+
+        let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)])
+            .batch(&context, &crate::EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.value().to_f64s(), vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(output.ragged_axes()[0].extents(), &Array::vector(vec![0_i32, 1]));
     }
 
     #[test]

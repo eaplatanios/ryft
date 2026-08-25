@@ -755,7 +755,10 @@ kernel body executes.
 
 - [ ] Add scoped uninitialized/initialized scratch allocation with memory-space, shape, layout eligibility, alignment,
       lifetime, and non-escape validation.
-- [ ] Implement path-sensitive definite initialization through conditions and fixed-point loops.
+- [ ] Implement path-sensitive definite initialization through conditions and fixed-point loops. Derive each transfer
+      from the exact access mode together with its root-relative view, mask, and proven coverage; do not add a generic
+      whole-reference initialization classifier to `ReferenceAccessMode`, because a partial or masked write does not
+      necessarily initialize its complete root.
 - [ ] Add masked load/store/swap, ordered accumulation, device-scoped sequentially consistent atomics, and async-copy
       tokens/waits with exact operation-local reference semantics. Define the typed extension contract used later by
       target barriers and semaphores without pretending they are portable operations.

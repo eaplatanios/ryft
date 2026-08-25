@@ -9,7 +9,9 @@
 use std::fmt::Display;
 use std::ops::Mul as StdMul;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Shape};
+use crate::arrays::{
+    ArrayBatch, ArrayBatching, ArrayType, DataType, RaggedArrayBatchingPolicy, RaggedAxis, RaggedMaskIdentity, Shape,
+};
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -23,10 +25,7 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-use super::{
-    effective_collective_axis_size, forward_collective_to_parent, reject_ragged_collective_inputs,
-    resolve_named_axis_size,
-};
+use super::{effective_collective_axis_size, forward_collective_to_parent, resolve_named_axis_size};
 
 /// Kind of collective performed by a [`ParallelReduceOperation`].
 ///
@@ -85,6 +84,13 @@ impl Display for ParallelReductionKind {
 /// `batch` levels, the batching rule below owns that decision: a matching level consumes the mapped batch axis, while
 /// a non-matching level forwards the collective untouched to its parent context via
 /// [`forward_collective_to_parent`], where the next level repeats the same name resolution.
+///
+/// A matching `parallel_sum` or `parallel_max` accepts bounded ragged operands. Padding is replaced with the
+/// reduction identity before the participant reduction, and each surviving ragged extent is the elementwise maximum
+/// across the participating mapped items. Participants whose local extents exclude a position contribute the identity;
+/// with multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers
+/// is therefore the identity. `parallel_mean` rejects ragged operands because its denominator has no single implied
+/// meaning: participant count, present-value count, and logical-element count define different operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelReduceOperation {
     /// Axis name referenced by this collective. Matches the `axis_name` argument of an enclosing
@@ -238,7 +244,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Parallel
 // The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `Mean`'s `1 / N`
 // rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
 // trace under a staging parent — so one rule serves eager and staged batching alike.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ParallelReduceOperation
+impl<C, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ParallelReduceOperation
 where
     C: Context<Type = ArrayType> + Fill<f64, C::Value>,
     C::Operation: From<ParallelReduceOperation>,
@@ -250,7 +256,6 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        reject_ragged_collective_inputs(self.name(), inputs)?;
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let parent_operation = C::Operation::from(self.clone());
             return Ok(forward_collective_to_parent(context, parent_operation, inputs)?.into());
@@ -263,7 +268,7 @@ where
                 ),
             });
         }
-        Ok(collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
+        Ok(collective_reduce_batch(context, self.kind, inputs, |factor_type, inverse_axis_size| {
             // The `1 / N` rank-0 factor binds into the batching context's parent — interpreted eagerly under an eager
             // parent, staged into the enclosing trace under a staging parent.
             context.parent().fill(&factor_type, inverse_axis_size)
@@ -276,31 +281,70 @@ where
 /// axis with the kind's [`ReductionKind`] and, for `Mean`, scales the replicated result by `1 / N` using a
 /// `make_parallel_mean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
 /// Outside a matching batching context (no mapped axis), it is an identity pass-through.
-fn collective_reduce_batch<V, MakeParallelMeanFactor>(
+fn collective_reduce_batch<C, P, MakeParallelMeanFactor>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
     kind: ParallelReductionKind,
-    inputs: &[ArrayBatch<V>],
+    inputs: &[ArrayBatch<C::Value>],
     make_parallel_mean_factor: MakeParallelMeanFactor,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    V: Value<Type = ArrayType> + Reduce + StdMul<Output = V>,
-    MakeParallelMeanFactor: FnOnce(ArrayType, f64) -> Result<V, ProgramError>,
+    C: Context<Type = ArrayType>,
+    C::Value: Reduce + StdMul<Output = C::Value>,
+    P: RaggedArrayBatchingPolicy<C>,
+    MakeParallelMeanFactor: FnOnce(ArrayType, f64) -> Result<C::Value, ProgramError>,
 {
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
+    if matches!(kind, ParallelReductionKind::Mean) && !input.ragged_axes().is_empty() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "`parallel_mean` does not define a denominator for bounded ragged inputs".to_string(),
+        });
+    }
     let Some(batch_axis) = input.batch_axis_position() else {
         // Outside any matching batching context: identity pass-through.
         return Ok(vec![input.clone()]);
+    };
+    let masked_axes = input.ragged_axes().iter().map(RaggedAxis::axis).collect::<Vec<_>>();
+    let input = match kind {
+        ParallelReductionKind::Sum => {
+            P::mask_identity_input(context, input, masked_axes.as_slice(), RaggedMaskIdentity::Zero)?
+        }
+        ParallelReductionKind::Max => {
+            P::mask_identity_input(context, input, masked_axes.as_slice(), RaggedMaskIdentity::Lowest)?
+        }
+        ParallelReductionKind::Mean => input.clone(),
     };
     // Reduce along the mapped batch axis with the corresponding reduction kind. The output is replicated: every
     // batch item sees the same reduced value, matching JAX's `psum`/`pmean`/`pmax` broadcast semantics.
     let mut output_value = input.value().clone().reduce(&[batch_axis], kind.reduction_kind());
     if matches!(kind, ParallelReductionKind::Mean) {
         // Mean divides the summed value by the batch size, which must be statically known to scale by `1 / N`.
-        let inverse_axis_size = 1.0 / parallel_mean_batch_size(input)? as f64;
+        let inverse_axis_size = 1.0 / parallel_mean_batch_size(&input)? as f64;
         let factor_type = parallel_mean_factor_type(output_value.r#type().data_type());
         output_value = make_parallel_mean_factor(factor_type, inverse_axis_size)? * output_value;
     }
-    Ok(vec![ArrayBatch::new(output_value, BatchAxis::replicated())?])
+    let ragged_axes = input
+        .ragged_axes()
+        .iter()
+        .map(|ragged_axis| {
+            let extent_batch_axis = ragged_axis.extent_axes().iter().position(|axis| *axis == batch_axis);
+            let extents = extent_batch_axis.map_or_else(
+                || ragged_axis.extents().clone(),
+                |extent_batch_axis| ragged_axis.extents().clone().reduce(&[extent_batch_axis], ReductionKind::Max),
+            );
+            RaggedAxis::new(
+                ragged_axis.axis() - usize::from(batch_axis < ragged_axis.axis()),
+                extents,
+                ragged_axis.dimension().clone(),
+                ragged_axis
+                    .extent_axes()
+                    .iter()
+                    .filter_map(|axis| (*axis != batch_axis).then_some(*axis - usize::from(batch_axis < *axis)))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(vec![ArrayBatch::new(output_value, BatchAxis::replicated())?.with_ragged_axes(ragged_axes)?])
 }
 
 /// Returns the static batch size for a `Mean` over the mapped batch axis of `input`, erroring when
@@ -460,12 +504,16 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::batching::DynamicArrayBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, RaggedAxis, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
+        DimensionVariable, RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxisSpecification, batch};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
     use crate::differentiation::differentiate_at;
+    use crate::programs::ValueProjection;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -540,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_reduce_batching_rejects_ragged_operands_before_binding() {
+    fn test_parallel_mean_batching_rejects_ragged_operands_without_a_denominator_definition() {
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
             .unwrap()
@@ -548,15 +596,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum).batch(
+            ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Mean).batch(
                 &batching_context(2),
                 &crate::EmptyRegionDriver,
                 &[input]
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_sum` does not support bounded ragged dimension `length` on operand 0".to_string(),
+                message: "`parallel_mean` does not define a denominator for bounded ragged inputs".to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_parallel_sum_and_max_mask_ragged_padding_and_reduce_extents_with_max() -> Result<(), BatchingError> {
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        for kind in [ParallelReductionKind::Sum, ParallelReductionKind::Max] {
+            let trace = TraceContext::new();
+            let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+            let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+            let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+            let packed = trace.input(
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]),
+                )
+                .into(),
+            );
+            let extents =
+                trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
+            let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+                ProjectedContext::new(trace),
+                batch_extent,
+            )
+            .with_axis_name("i".to_string());
+            let input = ArrayBatch::new(packed.into_projected()?, BatchAxis::new(0))?
+                .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected()?, length.clone(), vec![0])])?;
+
+            let output = ParallelReduceOperation::new("i".to_string(), kind)
+                .batch(&context, &crate::EmptyRegionDriver, &[input])?
+                .into_parts()
+                .0
+                .remove(0);
+
+            assert_eq!(output.batch_axis(), BatchAxis::replicated());
+            assert_eq!(output.ragged_axes().len(), 1);
+            assert_eq!(output.ragged_axes()[0].axis(), 0);
+            assert_eq!(output.ragged_axes()[0].dimension(), &length);
+            assert!(output.ragged_axes()[0].extent_axes().is_empty());
+            assert_eq!(output.ragged_axes()[0].extents().r#type().rank(), 0);
+
+            let operation_names = context
+                .parent()
+                .parent()
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>();
+            let expected_identity_operation = if kind == ParallelReductionKind::Sum { "zero_like" } else { "constant" };
+            assert!(operation_names.contains(&expected_identity_operation));
+            assert!(operation_names.contains(&"select"));
+            assert_eq!(operation_names.iter().filter(|name| name.starts_with("reduce_")).count(), 2);
+        }
+        Ok(())
     }
 
     #[test]

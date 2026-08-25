@@ -83,8 +83,8 @@ mod tests {
     fn masked_select(
         x: DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>,
     ) -> Result<DifferentiationTracer<EagerContext<Array, ArrayOperation<Array>>>, ProgramError> {
-        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
-        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan)?;
+        let positive = x.compare(&x.zero_like()?, ComparisonDirection::GreaterThan)?;
+        let above_one = x.compare(&x.one_like()?, ComparisonDirection::GreaterThan)?;
         let mask = positive & above_one;
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
     }

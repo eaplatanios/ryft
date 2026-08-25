@@ -1078,12 +1078,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
 /// an operation rather than call a value capability, narrows `C` to [`Context`] on its own implementation and uses
 /// it.
 ///
-/// This trait carries only what every reference universe can serve: allocation, reading, and replacement. Ordered
-/// accumulation is a separate contract, [`ReferenceAccumulationPolicy`], because whether it is available at all, and
-/// what the destination must provide for it, genuinely varies. Splitting it keeps capability requirements at
-/// per-access granularity rather than collapsing them into one implementation-level union: a universe that cannot
-/// accumulate implements only this trait and still discharges every program that reads and replaces, while a program
-/// containing `reference_add_update` fails to discharge for it at compile time, scoped to exactly that operation.
+/// This trait carries only what every reference universe can serve: allocation, reading, write-only replacement, and
+/// swapping. Ordered accumulation is a separate contract, [`ReferenceAccumulationPolicy`], because its availability
+/// and destination requirements genuinely vary. Splitting it keeps capability requirements at per-access granularity
+/// rather than collapsing them into one implementation-level union: a universe that cannot accumulate implements
+/// only this trait and still discharges every program that reads and replaces, while a program containing
+/// `reference_add_update` fails to discharge for it at compile time, scoped to exactly that operation.
 /// Each implementation additionally states whatever its own alias mechanics need on its `impl` block.
 ///
 /// An implementation should leave [`Domain::Value`] generic and constrain it by the capabilities it uses, rather than
@@ -1132,6 +1132,23 @@ pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
     ///   - `current`: Current immutable state of the whole root.
     ///   - `alias`: Composed view chain selecting the coordinates to read.
     fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError>;
+
+    /// Replaces the coordinates that `alias` selects and returns the successor state of the whole root without
+    /// observing the previous selection.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Destination context that owns `current` and any work this application performs.
+    ///   - `current`: Current immutable state of the whole root. A view implementation may consult it only to
+    ///     preserve coordinates outside the selected logical handle.
+    ///   - `replacement`: Value written into the selected coordinates.
+    ///   - `alias`: Composed view chain selecting the coordinates to replace.
+    fn write(
+        context: &C,
+        current: &C::Value,
+        replacement: C::Value,
+        alias: &Self::Alias,
+    ) -> Result<C::Value, ProgramError>;
 
     /// Replaces the coordinates that `alias` selects and returns the previous selection followed by the successor
     /// state of the whole root.
@@ -2041,6 +2058,28 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         P::read(&self.parent, &current, reference.alias())
     }
 
+    /// Replaces the coordinates that `reference` selects without observing their previous contents.
+    ///
+    /// # Parameters
+    ///
+    ///   - `reference`: Handle selecting the coordinates to replace.
+    ///   - `replacement`: Value written into the selected coordinates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the root is not live or was preserved, and propagates the
+    /// policy's error when the write cannot be applied.
+    pub fn write(
+        &self,
+        reference: &ReferenceDischargeReference<C, P>,
+        replacement: C::Value,
+    ) -> Result<(), ProgramError> {
+        let root = reference.root();
+        let current = self.discharged_state(root)?;
+        let successor = P::write(&self.parent, &current, replacement, reference.alias())?;
+        self.set_discharged_state(root, successor)
+    }
+
     /// Replaces the coordinates that `reference` selects and returns their previous contents.
     ///
     /// # Parameters
@@ -2184,7 +2223,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// operation declares a capture prefix longer than the region's boundary, when a reference-typed nested boundary
     /// position declares no provenance the summary could follow, when the closure reaches a reference that entered
     /// neither through its boundary nor through its capture scope, or when the closure consumes a caller root, which
-    /// no state boundary can express.
+    /// no state boundary can express. It also returns this error when `operation` does not permit one of the exact
+    /// access modes the closure performs through `region_index`.
     pub fn region_summary<O: Operation>(
         &self,
         operation: &O,
@@ -2200,6 +2240,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         )?;
         let mut summary = ReferenceRegionSummary::default();
         summary.output_roots = summarize_region_closure(region, inputs, &captures, &mut summary)?;
+        validate_region_accesses(operation, region_index, &summary)?;
         Ok(summary)
     }
 
@@ -2733,6 +2774,47 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
     }
 }
 
+/// Exact non-consuming access modes recorded for one caller root.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct ReferenceAccessModes {
+    /// Whether the root is read.
+    read: bool,
+
+    /// Whether the root is written without observing its selected previous state.
+    write: bool,
+
+    /// Whether the root is read and replaced.
+    read_write: bool,
+
+    /// Whether the root receives an ordered additive update.
+    accumulate: bool,
+}
+
+impl ReferenceAccessModes {
+    /// Records one non-consuming mode.
+    fn insert(&mut self, mode: ReferenceAccessMode) {
+        match mode {
+            ReferenceAccessMode::Read => self.read = true,
+            ReferenceAccessMode::Write => self.write = true,
+            ReferenceAccessMode::ReadWrite => self.read_write = true,
+            ReferenceAccessMode::Accumulate => self.accumulate = true,
+            ReferenceAccessMode::Consume => unreachable!("consuming accesses are rejected before summary insertion"),
+        }
+    }
+
+    /// Returns the recorded modes in semantic order.
+    fn iter(self) -> impl Iterator<Item = ReferenceAccessMode> {
+        [
+            self.read.then_some(ReferenceAccessMode::Read),
+            self.write.then_some(ReferenceAccessMode::Write),
+            self.read_write.then_some(ReferenceAccessMode::ReadWrite),
+            self.accumulate.then_some(ReferenceAccessMode::Accumulate),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 /// Transitive reference-access summary of one region closure, expressed in the caller roots its boundary names.
 ///
 /// This is the analysis a structured rule needs *before* it can size its state boundary, and it is computed entirely
@@ -2741,8 +2823,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
 /// deliberately absent: they belong to no caller and cross no boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceRegionSummary {
-    /// Every caller root the closure accesses, mapped to whether some access writes or accumulates into it.
-    accesses: BTreeMap<ReferenceRootHandle, bool>,
+    /// Every caller root the closure accesses, mapped to its exact non-consuming access modes.
+    accesses: BTreeMap<ReferenceRootHandle, ReferenceAccessModes>,
 
     /// Caller root each *declared* region output denotes, or [`None`] where the output is an ordinary value.
     output_roots: Vec<Option<ReferenceRootHandle>>,
@@ -2753,6 +2835,17 @@ impl ReferenceRegionSummary {
     #[inline]
     pub fn accessed(&self) -> impl Iterator<Item = ReferenceRootHandle> + '_ {
         self.accesses.keys().copied()
+    }
+
+    /// Returns the exact access modes recorded for `root`, in semantic order.
+    pub fn access_modes(&self, root: ReferenceRootHandle) -> impl Iterator<Item = ReferenceAccessMode> {
+        self.accesses.get(&root).copied().unwrap_or_default().iter()
+    }
+
+    /// Returns whether the closure accesses `root` with exactly `mode`.
+    #[inline]
+    pub fn has_access(&self, root: ReferenceRootHandle, mode: ReferenceAccessMode) -> bool {
+        self.access_modes(root).any(|recorded| recorded == mode)
     }
 
     /// Returns the caller root each declared region output denotes, or [`None`] where the output is an ordinary
@@ -2769,7 +2862,12 @@ impl ReferenceRegionSummary {
     /// which is the fact read-only pruning consults.
     #[inline]
     pub fn is_mutated(&self, root: ReferenceRootHandle) -> bool {
-        self.accesses.get(&root).copied().unwrap_or(false)
+        self.access_modes(root).any(|mode| {
+            matches!(
+                mode,
+                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate,
+            )
+        })
     }
 
     /// Returns the summary of the two closures taken together, which is what an operation with several attached
@@ -2780,18 +2878,22 @@ impl ReferenceRegionSummary {
     /// as a condition, has that agreement checked against the rebuilt regions themselves.
     pub fn merged(&self, other: &Self) -> Self {
         let mut merged = self.clone();
-        for (root, mutated) in &other.accesses {
-            let entry = merged.accesses.entry(*root).or_insert(false);
-            *entry = *entry || *mutated;
+        for (root, modes) in &other.accesses {
+            let entry = merged.accesses.entry(*root).or_default();
+            for mode in modes.iter() {
+                entry.insert(mode);
+            }
         }
         merged
     }
 
     /// Merges another closure's accesses into this summary in place, leaving the declared output roots alone.
     fn absorb(&mut self, other: &Self) {
-        for (root, mutated) in &other.accesses {
-            let entry = self.accesses.entry(*root).or_insert(false);
-            *entry = *entry || *mutated;
+        for (root, modes) in &other.accesses {
+            let entry = self.accesses.entry(*root).or_default();
+            for mode in modes.iter() {
+                entry.insert(mode);
+            }
         }
     }
 
@@ -2813,14 +2915,12 @@ impl ReferenceRegionSummary {
         // depend on which branch ran, which the caller's environment cannot represent. Rejecting here is stricter
         // than the standalone analysis, which permits the access and leaves the caller holding a root that is no
         // longer live.
-        if mode == ReferenceAccessMode::Consume {
+        if mode.is_consuming() {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge cannot pass {root} into a region that consumes it through `{operation}`",
             )));
         }
-        let mutated = matches!(mode, ReferenceAccessMode::Write | ReferenceAccessMode::Accumulate);
-        let entry = self.accesses.entry(root).or_insert(false);
-        *entry = *entry || mutated;
+        self.accesses.entry(root).or_default().insert(mode);
         Ok(())
     }
 }
@@ -3399,7 +3499,7 @@ fn nested_capture_scope<Constant>(
 /// Returns [`ProgramError::MalformedProgram`] when `inputs` does not describe the region's boundary, when the closure
 /// reaches a reference that entered neither through the boundary nor through the capture scope, when a nested
 /// reference-typed boundary position declares no provenance to follow, when an operation's own contract forbids the
-/// mutation its closure performs, or when the closure consumes a caller root.
+/// access mode its closure performs, or when the closure consumes a caller root.
 fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     region: RegionRef<'_, V, O>,
     inputs: &[Option<ReferenceRootHandle>],
@@ -3523,17 +3623,7 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
             let mut nested_summary = ReferenceRegionSummary::default();
             let nested_outputs =
                 summarize_region_closure(attached, nested.as_slice(), &nested_captures, &mut nested_summary)?;
-            if !operation.allows_reference_access_through_region_input(region_index, ReferenceAccessMode::Write)
-                && !operation
-                    .allows_reference_access_through_region_input(region_index, ReferenceAccessMode::Accumulate)
-                && let Some(root) = nested_summary.accessed().find(|root| nested_summary.is_mutated(*root))
-            {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` does not allow region {region_index} to write through an entering reference, but \
-                     its closure mutates {root}",
-                    operation.name(),
-                )));
-            }
+            validate_region_accesses(operation, region_index, &nested_summary)?;
             summary.absorb(&nested_summary);
             attached_output_roots.push(nested_outputs);
         }
@@ -3560,6 +3650,25 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
         .copied()
         .map(|output| if is_reference(output) { roots.get(&output).copied().flatten() } else { None })
         .collect())
+}
+
+/// Validates every exact access mode in `summary` against one attached-region policy.
+fn validate_region_accesses<O: Operation>(
+    operation: &O,
+    region_index: usize,
+    summary: &ReferenceRegionSummary,
+) -> Result<(), ProgramError> {
+    for root in summary.accessed() {
+        for mode in summary.access_modes(root) {
+            if !operation.allows_reference_access_through_region_input(region_index, mode) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` does not allow region {region_index} to access {root} with mode `{mode}`",
+                    operation.name(),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Returns the caller root one region-carrying operation's reference-typed output forwards out of its attached
@@ -4471,6 +4580,15 @@ mod tests {
             bind_list(context, ListOperation::Select { offset: alias.offset, length: alias.length }, &[current.clone()])
         }
 
+        fn write(
+            context: &C,
+            current: &C::Value,
+            replacement: C::Value,
+            alias: &ListAlias,
+        ) -> Result<C::Value, ProgramError> {
+            bind_list(context, ListOperation::Splice { offset: alias.offset }, &[current.clone(), replacement])
+        }
+
         fn replace(
             context: &C,
             current: &C::Value,
@@ -4510,6 +4628,7 @@ mod tests {
         NewReference,
         Slice { offset: usize, length: usize },
         Read,
+        Write,
         Swap,
         AddUpdate,
         Freeze,
@@ -4533,6 +4652,7 @@ mod tests {
                 Self::NewReference => "list.new_reference",
                 Self::Slice { .. } => "list.slice",
                 Self::Read => "list.read",
+                Self::Write => "list.write",
                 Self::Swap => "list.swap",
                 Self::AddUpdate => "list.add_update",
                 Self::Freeze => "list.freeze",
@@ -4621,6 +4741,11 @@ mod tests {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![ListIrType::List(referent(0)?)])
                 }
+                Self::Write => {
+                    check_count!("input", input_types, 2, TypeError);
+                    referent(0)?;
+                    Ok(Vec::new())
+                }
                 Self::Swap => {
                     check_count!("input", input_types, 2, TypeError);
                     Ok(vec![ListIrType::List(referent(0)?)])
@@ -4656,9 +4781,13 @@ mod tests {
                     Vec::new(),
                     vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
                 ),
-                Self::Swap => ReferenceOperationSemantics::new(
+                Self::Write => ReferenceOperationSemantics::new(
                     Vec::new(),
                     vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
+                ),
+                Self::Swap => ReferenceOperationSemantics::new(
+                    Vec::new(),
+                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
                 ),
                 Self::AddUpdate => ReferenceOperationSemantics::new(
                     Vec::new(),
@@ -4682,6 +4811,36 @@ mod tests {
                 }
                 _ => Effects::single(Effect::OrderedState),
             }
+        }
+    }
+
+    /// Region-policy stand-in that permits exactly one non-consuming reference access mode.
+    #[derive(Copy, Clone, Debug)]
+    struct SingleModeRegionOperation(ReferenceAccessMode);
+
+    impl Display for SingleModeRegionOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.name())
+        }
+    }
+
+    impl Operation for SingleModeRegionOperation {
+        type Type = ListIrType;
+
+        fn name(&self) -> &'static str {
+            "test.single_mode_region"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ListIrType],
+            _region_interfaces: &[RegionInterface<ListIrType>],
+        ) -> Result<Vec<ListIrType>, TypeError> {
+            Ok(Vec::new())
+        }
+
+        fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+            region_index == 0 && mode == self.0
         }
     }
 
@@ -4798,6 +4957,16 @@ mod tests {
                         return discharge_preserved_access(self, context, inputs);
                     }
                     Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+                }
+                Self::Write => {
+                    check_count!("input", inputs, 2, ProgramError);
+                    let reference = inputs[0].expect_reference("a reference to write")?;
+                    let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+                    if reference.preserved().is_some() {
+                        return discharge_preserved_access(self, context, inputs);
+                    }
+                    context.write(reference, replacement)?;
+                    Ok(Vec::new())
                 }
                 Self::Swap => {
                     check_count!("input", inputs, 2, ProgramError);
@@ -5777,6 +5946,7 @@ mod tests {
         let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
         builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
         let replacement = builder.add_constant(ListIrValue::List(vec![7, 8]));
+        builder.add_instruction(ListOperation::Write, Vec::new(), vec![view, replacement], None).unwrap();
         let replaced =
             builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
         let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
@@ -5795,7 +5965,7 @@ mod tests {
         assert_eq!(
             outputs.into_iter().map(ReferenceDischargeTracer::into_value).collect::<Vec<_>>(),
             vec![
-                ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![19, 31])),
+                ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![14, 16])),
                 ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1, 7, 8, 4])),
             ],
         );
@@ -5806,6 +5976,139 @@ mod tests {
         // Replay through `interpret_in_context` binds each instruction without its source coordinate, which is why
         // an allocation rule that consults its replay position sees `None` on this path.
         assert_eq!(OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone), vec![None]);
+    }
+
+    #[test]
+    fn test_reference_region_summary_unions_exact_access_modes() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated =
+            context.allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]));
+        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let mut left = ReferenceRegionSummary::default();
+        left.record(root, ReferenceAccessMode::Read, "list.read").unwrap();
+        left.record(root, ReferenceAccessMode::ReadWrite, "list.swap").unwrap();
+        let mut right = ReferenceRegionSummary::default();
+        right.record(root, ReferenceAccessMode::Write, "list.write").unwrap();
+        right.record(root, ReferenceAccessMode::Accumulate, "list.add_update").unwrap();
+
+        let merged = left.merged(&right);
+        assert_eq!(
+            merged.access_modes(root).collect::<Vec<_>>(),
+            vec![
+                ReferenceAccessMode::Read,
+                ReferenceAccessMode::Write,
+                ReferenceAccessMode::ReadWrite,
+                ReferenceAccessMode::Accumulate,
+            ],
+        );
+        assert!(merged.is_mutated(root));
+    }
+
+    #[test]
+    fn test_reference_region_summary_validates_each_exact_access_mode() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated =
+            context.allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]));
+        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let modes = [
+            ReferenceAccessMode::Read,
+            ReferenceAccessMode::Write,
+            ReferenceAccessMode::ReadWrite,
+            ReferenceAccessMode::Accumulate,
+        ];
+
+        for accessed in modes {
+            let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+            let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+            let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
+            match accessed {
+                ReferenceAccessMode::Read => {
+                    builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap();
+                }
+                ReferenceAccessMode::Write => {
+                    builder
+                        .add_instruction(ListOperation::Write, Vec::new(), vec![reference, replacement], None)
+                        .unwrap();
+                }
+                ReferenceAccessMode::ReadWrite => {
+                    builder
+                        .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+                        .unwrap();
+                }
+                ReferenceAccessMode::Accumulate => {
+                    builder
+                        .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, replacement], None)
+                        .unwrap();
+                }
+                ReferenceAccessMode::Consume => unreachable!(),
+            }
+            let region = builder
+                .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+                .unwrap();
+
+            for allowed in modes {
+                let result = context.region_summary(
+                    &SingleModeRegionOperation(allowed),
+                    0,
+                    region.entry_region_ref(),
+                    &[Some(root), None],
+                );
+                if allowed == accessed {
+                    let summary = result.unwrap();
+                    assert_eq!(summary.access_modes(root).collect::<Vec<_>>(), vec![accessed]);
+                    assert_eq!(
+                        summary.is_mutated(root),
+                        matches!(
+                            accessed,
+                            ReferenceAccessMode::Write
+                                | ReferenceAccessMode::ReadWrite
+                                | ReferenceAccessMode::Accumulate,
+                        ),
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(ProgramError::MalformedProgram(format!(
+                            "operation `test.single_mode_region` does not allow region 0 to access {root} with mode \
+                             `{accessed}`",
+                        ))),
+                    );
+                }
+            }
+        }
+
+        // A nested call's swap remains `ReadWrite` at the outer policy boundary; permitting `Write` cannot admit it
+        // through a lossy generic mutation fact.
+        let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let replacement = callee_builder.add_input(ListIrType::List(ListType { length: 2 }));
+        callee_builder
+            .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let callee = callee_builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let callee = builder.import_program(callee);
+        builder
+            .add_instruction(ListOperation::Call, vec![callee], vec![reference, replacement], None)
+            .unwrap();
+        let region = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        assert_eq!(
+            context.region_summary(
+                &SingleModeRegionOperation(ReferenceAccessMode::Write),
+                0,
+                region.entry_region_ref(),
+                &[Some(root), None],
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `test.single_mode_region` does not allow region 0 to access {root} with mode `read/write`",
+            ))),
+        );
     }
 
     #[test]
@@ -5854,6 +6157,13 @@ mod tests {
         // The caller root is reported as mutated because the nested callee replaces it, while the region's own
         // allocation crosses no boundary and is therefore absent from the summary entirely.
         assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![root]);
+        assert_eq!(
+            summary.access_modes(root).collect::<Vec<_>>(),
+            vec![ReferenceAccessMode::Read, ReferenceAccessMode::ReadWrite],
+        );
+        assert!(summary.has_access(root, ReferenceAccessMode::Read));
+        assert!(summary.has_access(root, ReferenceAccessMode::ReadWrite));
+        assert!(!summary.has_access(root, ReferenceAccessMode::Write));
         assert!(summary.is_mutated(root));
 
         // A declared output resolves to the caller root it denotes: the first output returns the root itself, the

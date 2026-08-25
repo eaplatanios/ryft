@@ -19,10 +19,10 @@ use super::{
     lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
     lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dimension_requirement_to_assertion, lower_dynamic_shape_slice_assertion, lower_pad_to_mlir,
-    lower_parallel_sum_scatter_to_mlir, lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64,
-    lower_sharding_constraint, lower_static_custom_call_input, lower_static_index_constants, lower_tensor_type,
-    physical_bound_type, reshape_dimension_i32, reshape_dimension_i64, stable_hlo_dynamic_dimension_bound,
-    static_dimensions,
+    lower_parallel_sum_scatter_to_mlir, lower_ragged_all_to_all_to_mlir, lower_rng_bit_generator_to_mlir,
+    lower_runtime_dimension_size_i64, lower_sharding_constraint, lower_static_custom_call_input,
+    lower_static_index_constants, lower_tensor_type, physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
+    stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
 
 /// Physical lowering plan for one axis of a first-class dynamic shape slice.
@@ -548,6 +548,7 @@ where
         | ArrayIrOperation::ReferenceIndex(_)
         | ArrayIrOperation::ReferenceSlice(_)
         | ArrayIrOperation::ReferenceRead(_)
+        | ArrayIrOperation::ReferenceWrite(_)
         | ArrayIrOperation::ReferenceSwap(_)
         | ArrayIrOperation::ReferenceAddUpdate(_)
         | ArrayIrOperation::FreezeReference(_)) => {
@@ -1100,6 +1101,32 @@ where
             )?
             .remove(0);
             refine_collective_result_dimensions(result, &input_values[1..], output_type, block, context, location)
+        }
+        ArrayIrOperation::RaggedAllToAll(operation) => {
+            if input_values.len() != 6 {
+                return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_values.len() }.into());
+            }
+            if input_types.len() != 6 {
+                return Err(ProgramError::InvalidInputCount { expected: 6, actual: input_types.len() }.into());
+            }
+            let array_input_types = input_types
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| LoweringError::Tracing(error.into()))?;
+            let [output_type] = output_types else {
+                return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+            };
+            <&ArrayType>::try_from(output_type).map_err(|error| LoweringError::Tracing(error.into()))?;
+            lower_ragged_all_to_all_to_mlir(
+                operation,
+                collective_state,
+                input_values,
+                array_input_types.as_slice(),
+                block,
+                context,
+                location,
+            )
         }
         ArrayIrOperation::Condition(_)
         | ArrayIrOperation::While(_)

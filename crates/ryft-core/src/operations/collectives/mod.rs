@@ -5,7 +5,7 @@
 //! This module owns the vocabulary that every collective shares — [`CollectiveMode`], [`CollectiveOptions`], named
 //! axis resolution, and the shape-changing collective engine with its two operation-generating macros — while each
 //! operation family lives in its own submodule: [`parallel_reduce`], [`all_gather`], [`parallel_sum_scatter`],
-//! [`parallel_permute`], and [`all_to_all`].
+//! [`parallel_permute`], [`all_to_all`], and [`ragged_all_to_all`].
 //!
 //! Collectives reference an enclosing named-axis binder by name, validated against the active
 //! [`NamedAxes`] environment at staging time. A name bound by an enclosing `batch` level is
@@ -47,6 +47,7 @@ pub mod all_to_all;
 pub mod parallel_permute;
 pub mod parallel_reduce;
 pub mod parallel_sum_scatter;
+pub mod ragged_all_to_all;
 
 pub use all_gather::{ALL_GATHER_OPERATION_NAME, AllGather, AllGatherOperation, AllGatherOutputVariance};
 pub use all_to_all::{ALL_TO_ALL_OPERATION_NAME, AllToAll, AllToAllOperation, ParallelSwapAxes};
@@ -55,6 +56,7 @@ pub use parallel_permute::{
 };
 pub use parallel_reduce::{ParallelReduce, ParallelReduceOperation, ParallelReductionKind};
 pub use parallel_sum_scatter::{PARALLEL_SUM_SCATTER_OPERATION_NAME, ParallelSumScatter, ParallelSumScatterOperation};
+pub use ragged_all_to_all::{RAGGED_ALL_TO_ALL_OPERATION_NAME, RaggedAllToAll, RaggedAllToAllOperation};
 
 /// Shape semantics used by collectives that can either materialize a named axis or tile an existing array axis.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -1069,28 +1071,25 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-/// Validates a mixed collective's array operand and replicated result extents.
+/// Splits a mixed collective's inputs into its validated array operand and unchecked explicit result extents.
 pub(super) fn explicit_collective_inputs<'a, V: Value<Type = ArrayIrType>>(
-    operation_name: &str,
     inputs: &'a [ArrayIrBatch<V>],
 ) -> Result<(&'a ArrayIrBatch<V>, &'a [ArrayIrBatch<V>]), BatchingError> {
     let Some((array, output_extents)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
     <&ArrayType>::try_from(&array.unbatched_type())?;
-    if let Some(ragged_axis) = array.ragged_axes().first() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`{}` does not support bounded ragged dimension `{}` on operand 0",
-                operation_name,
-                ragged_axis.dimension(),
-            ),
-        });
-    }
+    Ok((array, output_extents))
+}
+
+/// Validates that every explicit result extent of a mixed collective is replicated.
+pub(super) fn validate_explicit_collective_output_extents<V: Value<Type = ArrayIrType>>(
+    output_extents: &[ArrayIrBatch<V>],
+) -> Result<(), BatchingError> {
     for output_extent in output_extents {
         output_extent.validate_replicated_dimension()?;
     }
-    Ok((array, output_extents))
+    Ok(())
 }
 
 /// Binds a mixed collective over a non-matching named axis after lifting the mapped axis into its explicit result

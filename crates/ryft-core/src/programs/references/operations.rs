@@ -1,11 +1,13 @@
 //! Generic reference primitive operations and their value-level capabilities.
 //!
-//! This module owns reference allocation, immutable reads, exact replacement, ordered additive updates, and
-//! consuming finalization. Each payload is parameterized by the referent type `T` and the enclosing program type
-//! universe `U`; the ordinary [`From`] and borrowed [`TryFrom`] conversion seam is the complete relationship between
-//! those types. Reference views remain value-family-owned because their coordinate transformations are not generic.
+//! This module owns reference allocation, immutable reads, write-only replacement, swapping, ordered additive
+//! updates, and consuming finalization. Each payload is parameterized by the referent type `T` and the enclosing
+//! program type universe `U`; the ordinary [`From`] and borrowed [`TryFrom`] conversion seam is the complete
+//! relationship between those types. Reference views remain value-family-owned because their coordinate
+//! transformations are not generic.
 
 // TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Should this module be moved to `ryft_core::operations::reference`?
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -45,6 +47,9 @@ pub const NEW_REFERENCE_OPERATION_NAME: &str = "new_reference";
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
 
+/// Canonical operation name for [`ReferenceWriteOperation`].
+pub const REFERENCE_WRITE_OPERATION_NAME: &str = "reference_write";
+
 /// Canonical operation name for [`ReferenceSwapOperation`].
 pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
 
@@ -66,16 +71,16 @@ pub trait ReferenceRead<Output = Self>: Sized {
     fn read(&self) -> Result<Output, ProgramError>;
 }
 
+/// Replaces the value stored by a reference without observing the previous value.
+pub trait ReferenceWrite<Replacement = Self>: Sized {
+    /// Installs `replacement` in program order.
+    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
+}
+
 /// Replaces the value stored by a reference in program order and returns its previous immutable snapshot.
 pub trait ReferenceSwap<Replacement = Self, Output = Replacement>: Sized {
     /// Installs `replacement` in program order and returns the previously stored value.
     fn swap(&self, replacement: &Replacement) -> Result<Output, ProgramError>;
-
-    /// Installs `replacement` in program order and discards the previously stored value.
-    #[inline]
-    fn write(&self, replacement: &Replacement) -> Result<(), ProgramError> {
-        self.swap(replacement).map(drop)
-    }
 }
 
 /// Adds an update into the value stored by a reference in program order.
@@ -132,8 +137,12 @@ static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics>
     ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)])
 });
 
-static REFERENCE_SWAP_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+static REFERENCE_WRITE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)])
+});
+
+static REFERENCE_SWAP_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)])
 });
 
 static REFERENCE_ADD_UPDATE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
@@ -210,6 +219,11 @@ define_reference_primitive_payload!(
 );
 
 define_reference_primitive_payload!(
+    /// Replaces a reference's stored value with an exactly matching referent without observing the old value.
+    ReferenceWriteOperation
+);
+
+define_reference_primitive_payload!(
     /// Replaces a reference's stored value with an exactly matching referent and returns the old value.
     ReferenceSwapOperation
 );
@@ -238,6 +252,7 @@ macro_rules! impl_reference_primitive_display {
 
 impl_reference_primitive_display!(NewReferenceOperation, NEW_REFERENCE_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceReadOperation, REFERENCE_READ_OPERATION_NAME);
+impl_reference_primitive_display!(ReferenceWriteOperation, REFERENCE_WRITE_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceSwapOperation, REFERENCE_SWAP_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceAddUpdateOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME);
 impl_reference_primitive_display!(FreezeReferenceOperation, FREEZE_REFERENCE_OPERATION_NAME);
@@ -304,6 +319,50 @@ where
     #[inline]
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
         Cow::Borrowed(&REFERENCE_READ_OPERATION_SEMANTICS)
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::single(Effect::OrderedState)
+    }
+}
+
+impl<T, U> Operation for ReferenceWriteOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    for<'t> &'t T: TryFrom<&'t U, Error = TypeError>,
+    for<'t> &'t ReferenceType<T>: TryFrom<&'t U, Error = TypeError>,
+{
+    type Type = U;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        REFERENCE_WRITE_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[U],
+        region_interfaces: &[RegionInterface<U>],
+    ) -> Result<Vec<U>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<T>>::try_from(&input_types[0])?;
+        let replacement = <&T>::try_from(&input_types[1])?;
+        if replacement != reference.referent() {
+            return Err(TypeError::invalid(format!(
+                "`{REFERENCE_WRITE_OPERATION_NAME}` replacement type `{replacement}` must exactly match reference \
+                 referent type `{}`",
+                reference.referent(),
+            )));
+        }
+        Ok(Vec::new())
+    }
+
+    #[inline]
+    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        Cow::Borrowed(&REFERENCE_WRITE_OPERATION_SEMANTICS)
     }
 
     #[inline]
@@ -476,6 +535,25 @@ where
     }
 }
 
+impl<T, U, C> InterpretableOperation<C> for ReferenceWriteOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceWrite<C::Value>>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        inputs[0].write(&inputs[1])?;
+        Ok(Vec::new())
+    }
+}
+
 impl<T, U, C> InterpretableOperation<C> for ReferenceSwapOperation<T, U>
 where
     T: Type,
@@ -565,7 +643,7 @@ where
 }
 
 // Every reference primitive owns its own discharge rewrite, and each one is expressed purely through the discharge
-// context's root services and the policy's alias mechanics, so these five rules serve every reference universe. None
+// context's root services and the policy's alias mechanics, so these six rules serve every reference universe. None
 // of them names the referent type parameter `T`: an allocation reads its fresh root's reference type back out of its
 // own inferred output type through the policy's projection, and every access reads the type off the flowing handle.
 //
@@ -632,6 +710,32 @@ where
             return discharge_preserved_access(self, context, inputs);
         }
         Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+    }
+}
+
+impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let reference = inputs[0].expect_reference("a reference to write")?;
+        let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+        validate_operand_types(self, inputs)?;
+        if reference.preserved().is_some() {
+            return discharge_preserved_access(self, context, inputs);
+        }
+        context.write(reference, replacement)?;
+        Ok(Vec::new())
     }
 }
 
@@ -781,6 +885,7 @@ macro_rules! impl_unsupported_reference_transforms {
 
 impl_unsupported_reference_transforms!(NewReferenceOperation);
 impl_unsupported_reference_transforms!(ReferenceReadOperation);
+impl_unsupported_reference_transforms!(ReferenceWriteOperation);
 impl_unsupported_reference_transforms!(ReferenceSwapOperation);
 impl_unsupported_reference_transforms!(ReferenceAddUpdateOperation);
 impl_unsupported_reference_transforms!(FreezeReferenceOperation);
@@ -793,6 +898,12 @@ impl_non_transposable_operation!(
 );
 impl_non_transposable_operation!(
     <T, U> ReferenceReadOperation<T, U>
+    where
+        T: Type,
+        U: Type,
+);
+impl_non_transposable_operation!(
+    <T, U> ReferenceWriteOperation<T, U>
     where
         T: Type,
         U: Type,
@@ -1096,6 +1207,7 @@ mod tests {
 
     define_partial_test_universe!(NewUniverse);
     define_partial_test_universe!(ReadFreezeUniverse);
+    define_partial_test_universe!(WriteUniverse);
     define_partial_test_universe!(SwapUniverse);
     define_partial_test_universe!(AddUpdateUniverse);
 
@@ -1129,6 +1241,28 @@ mod tests {
             match r#type {
                 ReadFreezeUniverse::Reference(r#type) => Ok(r#type),
                 ReadFreezeUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
+            }
+        }
+    }
+
+    impl<'t> TryFrom<&'t WriteUniverse> for &'t TestReferent {
+        type Error = TypeError;
+
+        fn try_from(r#type: &'t WriteUniverse) -> Result<Self, Self::Error> {
+            match r#type {
+                WriteUniverse::Value(r#type) => Ok(r#type),
+                WriteUniverse::Reference(_) => Err(TypeError::invalid("expected value type but got reference type")),
+            }
+        }
+    }
+
+    impl<'t> TryFrom<&'t WriteUniverse> for &'t ReferenceType<TestReferent> {
+        type Error = TypeError;
+
+        fn try_from(r#type: &'t WriteUniverse) -> Result<Self, Self::Error> {
+            match r#type {
+                WriteUniverse::Reference(r#type) => Ok(r#type),
+                WriteUniverse::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
             }
         }
     }
@@ -1187,6 +1321,7 @@ mod tests {
 
     type New = NewReferenceOperation<TestReferent, TestType>;
     type Read = ReferenceReadOperation<TestReferent, TestType>;
+    type Write = ReferenceWriteOperation<TestReferent, TestType>;
     type Swap = ReferenceSwapOperation<TestReferent, TestType>;
     type AddUpdate = ReferenceAddUpdateOperation<TestReferent, TestType>;
     type Freeze = FreezeReferenceOperation<TestReferent, TestType>;
@@ -1220,7 +1355,7 @@ mod tests {
 
     /// Operation family of the discharge-rule test destinations.
     ///
-    /// It carries the five reference primitives, because replaying an access to a preserved root binds the access
+    /// It carries the six reference primitives, because replaying an access to a preserved root binds the access
     /// itself into the destination, and one addition, because that is how this universe's accumulation policy reaches
     /// its sum. A real family reaches the same shape through a dispatch derive.
     #[derive(Copy, Clone, Debug)]
@@ -1228,6 +1363,7 @@ mod tests {
         Add,
         New(New),
         Read(Read),
+        Write(Write),
         Swap(Swap),
         AddUpdate(AddUpdate),
         Freeze(Freeze),
@@ -1247,6 +1383,7 @@ mod tests {
                 Self::Add => "test.add",
                 Self::New(operation) => operation.name(),
                 Self::Read(operation) => operation.name(),
+                Self::Write(operation) => operation.name(),
                 Self::Swap(operation) => operation.name(),
                 Self::AddUpdate(operation) => operation.name(),
                 Self::Freeze(operation) => operation.name(),
@@ -1271,6 +1408,7 @@ mod tests {
                 }
                 Self::New(operation) => operation.infer_output_types(input_types, region_interfaces),
                 Self::Read(operation) => operation.infer_output_types(input_types, region_interfaces),
+                Self::Write(operation) => operation.infer_output_types(input_types, region_interfaces),
                 Self::Swap(operation) => operation.infer_output_types(input_types, region_interfaces),
                 Self::AddUpdate(operation) => operation.infer_output_types(input_types, region_interfaces),
                 Self::Freeze(operation) => operation.infer_output_types(input_types, region_interfaces),
@@ -1282,6 +1420,7 @@ mod tests {
                 Self::Add => Cow::Borrowed(ReferenceOperationSemantics::empty()),
                 Self::New(operation) => operation.reference_semantics(),
                 Self::Read(operation) => operation.reference_semantics(),
+                Self::Write(operation) => operation.reference_semantics(),
                 Self::Swap(operation) => operation.reference_semantics(),
                 Self::AddUpdate(operation) => operation.reference_semantics(),
                 Self::Freeze(operation) => operation.reference_semantics(),
@@ -1293,6 +1432,7 @@ mod tests {
                 Self::Add => Effects::PURE,
                 Self::New(operation) => operation.effects(),
                 Self::Read(operation) => operation.effects(),
+                Self::Write(operation) => operation.effects(),
                 Self::Swap(operation) => operation.effects(),
                 Self::AddUpdate(operation) => operation.effects(),
                 Self::Freeze(operation) => operation.effects(),
@@ -1336,6 +1476,7 @@ mod tests {
 
     impl_test_operation_from_reference_primitive!(New, New);
     impl_test_operation_from_reference_primitive!(Read, Read);
+    impl_test_operation_from_reference_primitive!(Write, Write);
     impl_test_operation_from_reference_primitive!(Swap, Swap);
     impl_test_operation_from_reference_primitive!(AddUpdate, AddUpdate);
     impl_test_operation_from_reference_primitive!(Freeze, Freeze);
@@ -1357,6 +1498,7 @@ mod tests {
                 Self::Add => discharge_reference_free_operation(self, context, driver, inputs),
                 Self::New(operation) => operation.discharge_references(context, driver, inputs),
                 Self::Read(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Write(operation) => operation.discharge_references(context, driver, inputs),
                 Self::Swap(operation) => operation.discharge_references(context, driver, inputs),
                 Self::AddUpdate(operation) => operation.discharge_references(context, driver, inputs),
                 Self::Freeze(operation) => operation.discharge_references(context, driver, inputs),
@@ -1460,6 +1602,15 @@ mod tests {
             Ok(current.clone())
         }
 
+        fn write(
+            _context: &C,
+            _current: &C::Value,
+            replacement: C::Value,
+            _alias: &TestAlias,
+        ) -> Result<C::Value, ProgramError> {
+            Ok(replacement)
+        }
+
         fn replace(
             _context: &C,
             current: &C::Value,
@@ -1482,6 +1633,58 @@ mod tests {
             let mut outputs = context.bind(TestOperation::Add, Vec::new(), &[current.clone(), update])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs.remove(0))
+        }
+    }
+
+    /// Reference policy that deliberately supports write discharge without supporting accumulation.
+    #[derive(Copy, Clone, Debug)]
+    struct WriteOnlyReferenceDischarge;
+
+    impl<C: Context<Type = TestType, Operation: From<TestOperation>>> ReferenceDischargePolicy<C>
+        for WriteOnlyReferenceDischarge
+    {
+        type Referent = TestReferent;
+        type Alias = TestAlias;
+
+        fn root_alias(_referent: &TestReferent) -> TestAlias {
+            TestAlias
+        }
+
+        fn lift_reference_type(r#type: ReferenceType<TestReferent>) -> TestType {
+            TestType::Reference(r#type)
+        }
+
+        fn lift_referent_type(referent: TestReferent) -> TestType {
+            TestType::Value(referent)
+        }
+
+        fn project_reference_type(r#type: &TestType) -> Option<ReferenceType<TestReferent>> {
+            match r#type {
+                TestType::Reference(reference) => Some(reference.clone()),
+                TestType::Value(_) => None,
+            }
+        }
+
+        fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
+            Ok(current.clone())
+        }
+
+        fn write(
+            _context: &C,
+            _current: &C::Value,
+            replacement: C::Value,
+            _alias: &TestAlias,
+        ) -> Result<C::Value, ProgramError> {
+            Ok(replacement)
+        }
+
+        fn replace(
+            _context: &C,
+            _current: &C::Value,
+            _replacement: C::Value,
+            _alias: &TestAlias,
+        ) -> Result<(C::Value, C::Value), ProgramError> {
+            Err(ProgramError::MalformedProgram("write-only discharge policy must not replace".to_string()))
         }
     }
 
@@ -1524,6 +1727,14 @@ mod tests {
         );
 
         assert_eq!(
+            ReferenceWriteOperation::<TestReferent, WriteUniverse>::new().infer_output_types(
+                &[WriteUniverse::Reference(ReferenceType::new(referent)), WriteUniverse::Value(referent),],
+                &[],
+            ),
+            Ok(Vec::new()),
+        );
+
+        assert_eq!(
             ReferenceSwapOperation::<TestReferent, SwapUniverse>::new().infer_output_types(
                 &[SwapUniverse::Reference(ReferenceType::new(referent)), SwapUniverse::Value(referent)],
                 &[],
@@ -1555,10 +1766,18 @@ mod tests {
 
         assert_eq!(New::new().infer_output_types(std::slice::from_ref(&value), &[]), Ok(vec![reference.clone()]));
         assert_eq!(Read::new().infer_output_types(std::slice::from_ref(&reference), &[]), Ok(vec![value.clone()]));
+        assert_eq!(Write::new().infer_output_types(&[reference.clone(), value.clone()], &[]), Ok(Vec::new()));
         assert_eq!(Swap::new().infer_output_types(&[reference.clone(), value.clone()], &[]), Ok(vec![value.clone()]));
         assert_eq!(AddUpdate::new().infer_output_types(&[reference.clone(), value.clone()], &[]), Ok(Vec::new()));
         assert_eq!(Freeze::new().infer_output_types(std::slice::from_ref(&reference), &[]), Ok(vec![value]));
 
+        assert_eq!(
+            Write::new().infer_output_types(&[reference.clone(), TestType::Value(promoted_refinement)], &[]),
+            Err(TypeError::invalid(
+                "`reference_write` replacement type `value<i7,p32>` must exactly match reference referent type \
+                 `value<i7,p16>`",
+            )),
+        );
         assert_eq!(
             Swap::new().infer_output_types(&[reference.clone(), TestType::Value(promoted_refinement)], &[]),
             Err(TypeError::invalid(
@@ -1595,6 +1814,22 @@ mod tests {
             Err(TypeError::invalid("expected value type but got reference type")),
         );
         assert_eq!(
+            Write::new().infer_output_types(std::slice::from_ref(&reference), &[]),
+            Err(TypeError::invalid("expected 2 inputs but got 1")),
+        );
+        assert_eq!(
+            Write::new().infer_output_types(&[value.clone(), value.clone()], &[]),
+            Err(TypeError::invalid("expected reference type but got value type")),
+        );
+        assert_eq!(
+            Write::new().infer_output_types(&[reference.clone(), reference.clone()], &[]),
+            Err(TypeError::invalid("expected value type but got reference type")),
+        );
+        assert_eq!(
+            Write::new().infer_output_types(&[reference.clone(), value], std::slice::from_ref(&region)),
+            Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+        assert_eq!(
             Swap::new().infer_output_types(std::slice::from_ref(&reference), &[]),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
         );
@@ -1612,6 +1847,7 @@ mod tests {
 
         assert_parameter_roundtrip(New::new());
         assert_parameter_roundtrip(Read::new());
+        assert_parameter_roundtrip(Write::new());
         assert_parameter_roundtrip(Swap::new());
         assert_parameter_roundtrip(AddUpdate::new());
         assert_parameter_roundtrip(Freeze::new());
@@ -1620,12 +1856,14 @@ mod tests {
         assert_eq!(format!("{:?}", New::new()), "NewReferenceOperation");
         assert_eq!(New::new().to_string(), NEW_REFERENCE_OPERATION_NAME);
         assert_eq!(Read::new().to_string(), REFERENCE_READ_OPERATION_NAME);
+        assert_eq!(Write::new().to_string(), REFERENCE_WRITE_OPERATION_NAME);
         assert_eq!(Swap::new().to_string(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(AddUpdate::new().to_string(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
         assert_eq!(Freeze::new().to_string(), FREEZE_REFERENCE_OPERATION_NAME);
 
         assert_eq!(New::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Read::new().effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(Write::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Swap::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(AddUpdate::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Freeze::new().effects(), Effects::single(Effect::OrderedState));
@@ -1641,8 +1879,12 @@ mod tests {
             &[ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
         );
         assert_eq!(
-            Swap::new().reference_semantics().accesses(),
+            Write::new().reference_semantics().accesses(),
             &[ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
+        );
+        assert_eq!(
+            Swap::new().reference_semantics().accesses(),
+            &[ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
         );
         assert_eq!(
             AddUpdate::new().reference_semantics().accesses(),
@@ -1683,6 +1925,15 @@ mod tests {
 
         fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
             Ok(current.clone())
+        }
+
+        fn write(
+            _context: &C,
+            _current: &C::Value,
+            replacement: C::Value,
+            _alias: &TestAlias,
+        ) -> Result<C::Value, ProgramError> {
+            Ok(replacement)
         }
 
         fn replace(
@@ -1751,6 +2002,39 @@ mod tests {
                 "reference discharge expected a reference to read but received an ordinary value".to_string(),
             )),
         );
+    }
+
+    #[test]
+    fn test_reference_write_operation_reference_discharge() {
+        // A policy with no accumulation capability installs successor state through `write`, produces no old-value
+        // result, and marks the root mutated. Its `replace` path is an error, making accidental swap dispatch visible.
+        let context =
+            ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
+        let initial = TestValue::new(REFERENT, 4);
+        let allocated = context.allocate_discharged(ReferenceType::new(REFERENT), initial);
+        let reference = allocated.expect_reference("the allocated root").unwrap().clone();
+        let inputs = vec![
+            ReferenceDischargeValue::Reference(reference.clone()),
+            ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
+        ];
+        assert_eq!(Write::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()), Ok(Vec::new()),);
+        assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
+        assert_eq!(context.is_mutated(reference.root()), Ok(true));
+
+        // Exact operand inference runs before mutation, so a rejected replacement leaves the root unchanged.
+        let invalid = vec![
+            ReferenceDischargeValue::Reference(reference.clone()),
+            ReferenceDischargeValue::Ordinary(TestValue::new(TestReferent::new(7, 32), 1)),
+        ];
+        assert_eq!(
+            Write::new().discharge_references(&context, &EmptyRegionDriver, invalid.as_slice()),
+            Err(TypeError::invalid(
+                "`reference_write` replacement type `value<i7,p32>` must exactly match reference referent type \
+                 `value<i7,p16>`",
+            )
+            .into()),
+        );
+        assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
     }
 
     #[test]
@@ -1841,6 +2125,14 @@ mod tests {
             let update: TestStagingDischargeValue = ReferenceDischargeValue::Ordinary(inputs[1].clone());
             let observed =
                 Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))?;
+            assert_eq!(
+                Write::new().discharge_references(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[preserved.clone(), update.clone()]
+                )?,
+                Vec::new(),
+            );
             let previous =
                 Swap::new().discharge_references(&context, &EmptyRegionDriver, &[preserved.clone(), update.clone()])?;
             assert_eq!(
@@ -1877,6 +2169,7 @@ mod tests {
             indoc! {"
                 lambda %0:ref<value<i7,p16>>, %1:value<i7,p16> .
                 let %2:value<i7,p16> = reference_read %0
+                    reference_write %0 %1
                     %3:value<i7,p16> = reference_swap %0 %1
                     reference_add_update %0 %1
                     %4:value<i7,p16> = freeze_reference %0

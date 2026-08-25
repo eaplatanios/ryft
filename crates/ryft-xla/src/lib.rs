@@ -16,6 +16,7 @@ pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, bl
 pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
+pub use experimental::RaggedDotLoweringStrategy;
 pub use experimental::domains::{
     XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaInputBoundBucketing,
     XlaMemoryAnalysis, XlaOptimizedProgram, XlaOptions,
@@ -119,7 +120,8 @@ pub(crate) mod tests {
     }
 
     /// XLA FFI handler for [`ADD_ONE_CUSTOM_CALL_TARGET`] custom calls: reads one `f32` input buffer and writes
-    /// `input + increment` elementwise into the single `f32` output buffer.
+    /// `input + increment` elementwise into the single `f32` output buffer. Tests may pass a second `i32` extent
+    /// buffer, which the handler validates against the leading batch and trailing packed axes.
     unsafe extern "C" fn add_one_handler(
         call_frame: *mut ryft_pjrt::extensions::ffi::XLA_FFI_CallFrame,
     ) -> *mut ryft_pjrt::extensions::ffi::XLA_FFI_Error {
@@ -168,9 +170,23 @@ pub(crate) mod tests {
         let mut inputs = call_frame.inputs();
         let Some(Ok(FfiInput::Buffer { buffer: input })) = inputs.next() else {
             return Err(FfiError::invalid_argument(format!(
-                "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to have one input buffer"
+                "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to have an input buffer"
             )));
         };
+        let mut extents = None;
+        for input in inputs {
+            let FfiInput::Buffer { buffer } = input?;
+            // Side-effecting calls carry a hidden ordered-I/O token after their explicit operands. It is part of the
+            // FFI frame but not part of this handler's public array contract.
+            if buffer.element_type() == FfiBufferType::Token {
+                continue;
+            }
+            if extents.replace(buffer).is_some() {
+                return Err(FfiError::invalid_argument(format!(
+                    "expected the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to have at most one extent input"
+                )));
+            }
+        }
         let mut outputs = call_frame.outputs();
         let Some(Ok(FfiOutput::Buffer { buffer: output })) = outputs.next() else {
             return Err(FfiError::invalid_argument(format!(
@@ -187,6 +203,37 @@ pub(crate) mod tests {
             )));
         }
         let count = input.dimensions().iter().map(|&dimension| dimension.max(0) as usize).product::<usize>();
+        if let Some(extents) = extents {
+            let dimensions = input.dimensions();
+            if extents.element_type() != FfiBufferType::I32
+                || dimensions.len() != 2
+                || extents.dimensions() != [dimensions[0]]
+            {
+                return Err(FfiError::invalid_argument(format!(
+                    "expected the optional extent input of the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call to be an \
+                     i32 vector matching the data buffer's leading axis"
+                )));
+            }
+            let extent_count = dimensions[0].max(0) as usize;
+            let packed_bound = dimensions[1].max(0) as i32;
+            // SAFETY: The runtime-owned extent buffer is valid for the duration of this FFI handler.
+            let extent_data = unsafe { extents.data() } as *const i32;
+            if extent_count > 0 && extent_data.is_null() {
+                return Err(FfiError::internal(format!(
+                    "encountered null extent pointer in the `{ADD_ONE_CUSTOM_CALL_TARGET}` custom call"
+                )));
+            }
+            // SAFETY: The XLA runtime owns the optional extent buffer for the duration of the call and the checks
+            // above establish an `i32[extent_count]` allocation.
+            for index in 0..extent_count {
+                let extent = unsafe { *extent_data.add(index) };
+                if !(0..=packed_bound).contains(&extent) {
+                    return Err(FfiError::invalid_argument(format!(
+                        "extent {extent} at batch item {index} lies outside the packed bound {packed_bound}"
+                    )));
+                }
+            }
+        }
         // SAFETY: Both data pointers are provided by the XLA runtime, are valid for the duration of the handler
         // invocation, and (per the element type and shape equality checks above) are backed by allocations of at
         // least `count` `f32` elements. The elementwise loop is also valid when the output aliases the input because

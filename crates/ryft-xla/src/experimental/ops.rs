@@ -7,6 +7,7 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{DotProductAttentionBackwardOperation, DotProductAttentionOperation};
 use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
+    RaggedAllToAllOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::CustomCallOperation;
@@ -34,16 +35,17 @@ use ryft_core::{
     OneLikeOperation, OneOperation, Operation, OperationFormatter, OrOperation, OutputRegionProvenance, PadOperation,
     ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
     PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, ReduceOperation,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
     ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation, ReferenceReadOperation,
-    ReferenceSliceOperation, ReferenceSwapOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
-    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type,
-    TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation,
-    Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
+    ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot,
+    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    discharge_positional_region_operation,
 };
 use ryft_macros::Parameter;
 
@@ -284,6 +286,9 @@ where
     /// Unresolved read from a root reference or derived view retained until reference discharge.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
 
+    /// Unresolved write-only replacement through a root reference or derived view retained until reference discharge.
+    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
+
     /// Unresolved replacement through a root reference or derived view retained until reference discharge.
     ReferenceSwap(ReferenceSwapOperation<ArrayType, ArrayIrType>),
 
@@ -331,6 +336,10 @@ where
     /// Exchanges values with one explicit extent per result axis.
     #[ryft(mixed)]
     AllToAll(AllToAllOperation),
+
+    /// Exchanges variable-length leading-axis slices through an XLA FFI custom call.
+    #[ryft(mixed)]
+    RaggedAllToAll(RaggedAllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
     Condition(ConditionOperation<Constant>),
@@ -423,6 +432,7 @@ where
             ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
             ArrayIrOperation::ReferenceSlice(operation) => Self::ReferenceSlice(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
+            ArrayIrOperation::ReferenceWrite(operation) => Self::ReferenceWrite(operation),
             ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
             ArrayIrOperation::ReferenceAddUpdate(operation) => Self::ReferenceAddUpdate(operation),
             ArrayIrOperation::FreezeReference(operation) => Self::FreezeReference(operation),
@@ -438,6 +448,7 @@ where
             ArrayIrOperation::AllGather(operation) => Self::AllGather(operation),
             ArrayIrOperation::ParallelSumScatter(operation) => Self::ParallelSumScatter(operation),
             ArrayIrOperation::AllToAll(operation) => Self::AllToAll(operation),
+            ArrayIrOperation::RaggedAllToAll(operation) => Self::RaggedAllToAll(operation),
             ArrayIrOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayIrOperation::While(operation) => Self::While(operation),
             ArrayIrOperation::Scan(operation) => {
@@ -597,6 +608,7 @@ impl_array_operation_conversion!(
     RealOperation<ArrayType>,
     ImaginaryOperation<ArrayType>,
     DotOperation,
+    RaggedDotOperation,
     ScaledDotOperation,
     DotProductAttentionOperation,
     DotProductAttentionBackwardOperation,
@@ -706,6 +718,7 @@ where
             Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
             Self::ReferenceSlice(operation) => ArrayIrOperation::ReferenceSlice(operation.clone()),
             Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
+            Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(*operation),
             Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
             Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
             Self::FreezeReference(operation) => ArrayIrOperation::FreezeReference(*operation),
@@ -721,6 +734,7 @@ where
             Self::AllGather(operation) => ArrayIrOperation::AllGather(operation.clone()),
             Self::ParallelSumScatter(operation) => ArrayIrOperation::ParallelSumScatter(operation.clone()),
             Self::AllToAll(operation) => ArrayIrOperation::AllToAll(operation.clone()),
+            Self::RaggedAllToAll(operation) => ArrayIrOperation::RaggedAllToAll(operation.clone()),
             Self::Condition(_)
             | Self::While(_)
             | Self::Scan(_)
@@ -1356,9 +1370,10 @@ mod tests {
         NewReferenceOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder,
         ProgramError, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceIndexOperation, ReferenceReadOperation,
         ReferenceSliceOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
-        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
-        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
+        ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
+        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
+        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1563,6 +1578,11 @@ mod tests {
 
     #[test]
     fn test_core_reference_operations_promote_to_xla_reference_operations() {
+        let write: XlaOperation<XlaConstant> =
+            ArrayIrOperation::<XlaArrayConstant>::ReferenceWrite(ReferenceWriteOperation::new()).into();
+        assert!(matches!(&write, XlaOperation::ReferenceWrite(_)));
+        assert!(matches!(write.to_core_operation(), Some(ArrayIrOperation::ReferenceWrite(_))));
+
         let swap: XlaOperation<XlaConstant> =
             ArrayIrOperation::<XlaArrayConstant>::ReferenceSwap(ReferenceSwapOperation::new()).into();
         assert!(matches!(&swap, XlaOperation::ReferenceSwap(_)));

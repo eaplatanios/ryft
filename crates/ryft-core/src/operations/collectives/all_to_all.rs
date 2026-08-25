@@ -46,10 +46,10 @@ use super::{
     divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
-    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, reject_ragged_collective_inputs,
-    require_collective_axis_divisible, require_collective_axis_extent, resolve_named_axis_size,
-    shape_changing_collective, shape_changing_collective_dimensions, shape_changing_collective_output_type,
-    transpose_shape_changing_collective, validate_collective_axis_size,
+    jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, require_collective_axis_divisible,
+    require_collective_axis_extent, resolve_named_axis_size, shape_changing_collective,
+    shape_changing_collective_dimensions, shape_changing_collective_output_type, transpose_shape_changing_collective,
+    validate_collective_axis_size, validate_explicit_collective_output_extents,
 };
 
 /// Infers the composite all-to-all contract.
@@ -200,6 +200,10 @@ shape_changing_collective! {
     /// linear and its transpose is the exchange with the split and concatenation axes swapped. A matching `batch`
     /// level consumes the mapped batch axis with a reshape/transpose block exchange: batch item `i` receives every
     /// item's chunk `i` of `split_axis`, concatenated item-major along `concat_axis`.
+    ///
+    /// A bounded ragged operand is rejected even when its logical extents are available. One extent per item does not
+    /// determine how each source partitions its live prefix among destinations; that requires the explicit input and
+    /// output offsets and per-destination sizes of [`RaggedAllToAllOperation`](super::RaggedAllToAllOperation).
     operation = AllToAllOperation,
     name = ALL_TO_ALL_OPERATION_NAME = "all_to_all",
     fields = {
@@ -557,7 +561,15 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        reject_ragged_collective_inputs(self.name(), inputs)?;
+        if let Some(ragged_axis) = inputs.iter().find_map(|input| input.ragged_axes().first()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
+                     offsets and sizes; use `ragged_all_to_all`",
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let [input] = inputs else {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
@@ -626,7 +638,17 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(self.name(), inputs)?;
+        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        if let Some(ragged_axis) = array.ragged_axes().first() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
+                     offsets and sizes; use `ragged_all_to_all`",
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
+        validate_explicit_collective_output_extents(output_extents)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
         let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
@@ -721,9 +743,11 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DataType};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionVariable, RaggedAxis,
+    };
     use crate::axes::NamedAxis;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, batch};
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
     use crate::contexts::EagerContext;
 
     use super::*;
@@ -811,6 +835,55 @@ mod tests {
             panic!("`all_to_all` must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_all_to_all_rejects_ragged_operands_without_explicit_routing() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 4, vec![1.0_f32; 8]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![2_i32, 4]), variable.clone(), vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+
+        assert_eq!(
+            AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch(
+                &context,
+                &crate::EmptyRegionDriver,
+                &[input],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`all_to_all` cannot route bounded ragged dimension `length` without explicit \
+                          per-destination offsets and sizes; use `ragged_all_to_all`"
+                    .to_string(),
+            }),
+        );
+
+        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]));
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8])), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+        let output_extent =
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable)).unwrap();
+        assert_eq!(
+            AllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled()).batch_in_parent(
+                &context,
+                &crate::EmptyRegionDriver,
+                &[input, output_extent],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`all_to_all` cannot route bounded ragged dimension `length` without explicit \
+                          per-destination offsets and sizes; use `ragged_all_to_all`"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]

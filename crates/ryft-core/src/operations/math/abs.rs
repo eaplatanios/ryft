@@ -86,8 +86,8 @@ impl_differentiable_operation! {
                 MaybeZero::Value(tangent) => {
                     if input.primal().r#type().is_complex() {
                         let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
-                        let zero = denominator.zero_like();
-                        let one = denominator.one_like();
+                        let zero = denominator.zero_like()?;
+                        let one = denominator.one_like()?;
                         let denominator_is_zero = denominator.compare(&zero, ComparisonDirection::Equal)?;
                         let denominator = C::Value::select(&denominator_is_zero, &one, &denominator)?;
                         // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
@@ -103,7 +103,7 @@ impl_differentiable_operation! {
                     } else {
                         let input = input.primal().align_tangent(&primal_tangent_type, &primal)?;
                         let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
-                        let zero = input.zero_like();
+                        let zero = input.zero_like()?;
                         let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;
                         MaybeZero::Value(C::Value::select(&non_negative, &tangent, &-tangent.clone())?)
                     }

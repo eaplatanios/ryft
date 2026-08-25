@@ -29,6 +29,7 @@ use crate::operations::attention::{
 };
 use crate::operations::collectives::{
     AllGatherOperation, AllToAllOperation, ParallelPermuteOperation, ParallelSumScatterOperation,
+    RaggedAllToAllOperation,
 };
 use crate::operations::complex::{
     Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -53,18 +54,18 @@ use crate::operations::{
     LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation,
     Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation,
     OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow, PowOperation, PrintOperation,
-    Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round, RoundOperation,
-    Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation, Select,
-    SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice, SliceOperation, Sqrt,
-    SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose,
-    TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation,
+    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
+    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
+    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
+    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
+    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
     FreezeReference, FreezeReferenceOperation, MaybeZero, NewReference, NewReferenceOperation, Operation,
     OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, Type, TypeError, TypeIdentityPosition, Typed, Value,
-    ValueProjection,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Type,
+    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -152,6 +153,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Real(RealOperation<ArrayType>),
     Imaginary(ImaginaryOperation<ArrayType>),
     Dot(DotOperation),
+    RaggedDot(RaggedDotOperation),
     ScaledDot(ScaledDotOperation),
     DotProductAttention(DotProductAttentionOperation),
     DotProductAttentionBackward(DotProductAttentionBackwardOperation),
@@ -169,6 +171,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     ParallelSumScatter(ParallelSumScatterOperation),
     ParallelPermute(ParallelPermuteOperation),
     AllToAll(AllToAllOperation),
+    RaggedAllToAll(RaggedAllToAllOperation),
     AxisIndex(AxisIndexOperation),
     Transpose(TransposeOperation),
     Reshape(ReshapeOperation),
@@ -230,6 +233,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     explicit algorithm state rather than shaping a value-to-value capability;
 ///   - the collectives ([`AllGather`](crate::operations::collectives::AllGather),
 ///     [`AllToAll`](crate::operations::collectives::AllToAll),
+///     [`RaggedAllToAll`](crate::operations::collectives::RaggedAllToAll),
 ///     [`ParallelSumScatter`](crate::operations::collectives::ParallelSumScatter),
 ///     [`ParallelSwapAxes`](crate::operations::collectives::ParallelSwapAxes),
 ///     [`ParallelShuffle`](crate::operations::collectives::ParallelShuffle),
@@ -270,7 +274,7 @@ pub trait ArrayOperations:
     + Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice
     + DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort
     // Linear algebra and reduction.
-    + Dot + ScaledDot + DotProductAttention + Reduce + LogSumExp
+    + Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp
     + CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp
     // Constants and differentiation barriers.
     + ZeroLike + OneLike + StopGradient
@@ -289,7 +293,7 @@ where
     V: Not + And + Or + Xor + Complex + Conjugate + Real + Imaginary + Compare + Select,
     V: Transpose + Reshape + Broadcast + Pad + Concatenate + Gather + Scatter + Slice + UpdateSlice,
     V: DynamicSlice + DynamicUpdateSlice + ConvertElementType + Sort,
-    V: Dot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
+    V: Dot + RaggedDot + ScaledDot + DotProductAttention + Reduce + LogSumExp,
     V: CumulativeSum + CumulativeProduct + CumulativeMax + CumulativeMin + CumulativeLogSumExp,
     V: ZeroLike + OneLike + StopGradient,
 {
@@ -445,6 +449,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Reads the array value selected by a root reference or derived view.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
 
+    /// Replaces the array value selected by a root reference or derived view without observing its previous value.
+    ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType>),
+
     /// Derives an axis-removing indexed view of a reference.
     ReferenceIndex(ReferenceIndexOperation),
 
@@ -498,6 +505,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Mixed all-to-all whose trailing dimension operands define every result axis in axis order.
     #[ryft(mixed)]
     AllToAll(AllToAllOperation),
+
+    /// Direct array-only ragged all-to-all carrier. It is explicit because the composite enum already has one
+    /// projected array-family variant and operation projection permits only one canonical member carrier.
+    #[ryft(mixed)]
+    RaggedAllToAll(RaggedAllToAllOperation),
 
     /// Composite condition whose attached branches use the complete array IR storage universe. Validated local,
     /// nonescaping reference state can execute eagerly; reference-valued boundaries and generic transforms/backends
@@ -602,8 +614,8 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperatio
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
 ///     [`DynamicReshape`], the whole-value reference capabilities [`NewReference`], [`ReferenceRead`],
-///     [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`], and the reference view derivations
-///     [`ReferenceIndex`] and [`ReferenceSlice`].
+///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`], and the reference view
+///     derivations [`ReferenceIndex`] and [`ReferenceSlice`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
 ///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand
@@ -678,7 +690,8 @@ pub trait ArrayIrOperations:
     + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
-    + NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceSwap + ReferenceAddUpdate
+    + NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
+    + ReferenceAddUpdate
     + FreezeReference
 {
 }
@@ -690,7 +703,8 @@ where
     V: Value<Type = ArrayIrType> + Compare,
     V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
-    V: NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceSwap + ReferenceAddUpdate,
+    V: NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap,
+    V: ReferenceAddUpdate,
     V: FreezeReference,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
@@ -709,6 +723,7 @@ impl<A: Value<Type = ArrayType>> From<ArrayOperation<A>> for ArrayIrOperation<A>
     fn from(operation: ArrayOperation<A>) -> Self {
         match operation {
             ArrayOperation::Zero(operation) => Self::from(operation),
+            ArrayOperation::RaggedAllToAll(operation) => Self::RaggedAllToAll(operation),
             ArrayOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
             ArrayOperation::While(operation) => {
                 Self::While(WhileOperation::new().with_iteration_bound(operation.iteration_bound()).unwrap())
@@ -2830,7 +2845,7 @@ mod tests {
     /// produces as *values*.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     enum MemberKindSignature {
-        /// Homogeneous array boundary, reached through the [`ArrayType`] operation projection.
+        /// Array-only boundary, reached through the [`ArrayType`] operation projection or an explicit direct carrier.
         ArrayToArray,
 
         /// Homogeneous first-class-dimension boundary, reached through the [`DimensionType`] projection.
@@ -2886,6 +2901,7 @@ mod tests {
                 MemberKindSignature::ReferenceToReference
             }
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
+            ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
             ArrayIrOperation::ReferenceAddUpdate(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::FreezeReference(_) => MemberKindSignature::ReferenceToArray,
@@ -2901,6 +2917,7 @@ mod tests {
             ArrayIrOperation::AllGather(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ParallelSumScatter(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::AllToAll(_) => MemberKindSignature::GeometryMixed,
+            ArrayIrOperation::RaggedAllToAll(_) => MemberKindSignature::ArrayToArray,
             ArrayIrOperation::Condition(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::While(_) => MemberKindSignature::RegionForwarding,
             ArrayIrOperation::Scan(_) => MemberKindSignature::RegionForwarding,
@@ -2959,6 +2976,10 @@ mod tests {
                 MemberKindSignature::ReferenceToReference,
             ),
             (ArrayIrOperation::ReferenceRead(ReferenceReadOperation::new()), MemberKindSignature::ReferenceToArray),
+            (
+                ArrayIrOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+                MemberKindSignature::ReferenceAndArrayToUnit,
+            ),
             (
                 ArrayIrOperation::ReferenceSwap(ReferenceSwapOperation::new()),
                 MemberKindSignature::ReferenceAndArrayToArray,
@@ -3042,6 +3063,10 @@ mod tests {
                 )),
                 MemberKindSignature::GeometryMixed,
             ),
+            (
+                ArrayIrOperation::RaggedAllToAll(RaggedAllToAllOperation::new("x".to_string(), 2)),
+                MemberKindSignature::ArrayToArray,
+            ),
             (ArrayIrOperation::Condition(ConditionOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::While(WhileOperation::new()), MemberKindSignature::RegionForwarding),
             (ArrayIrOperation::Scan(ScanOperation::new(1, 4)), MemberKindSignature::RegionForwarding),
@@ -3058,7 +3083,7 @@ mod tests {
 
         // The table must stay complete: every variant that `member_kind_signature` can classify appears above exactly
         // once, so the two enumeration claims above are enumerated rather than sampled.
-        assert_eq!(expected.len(), 33);
+        assert_eq!(expected.len(), 35);
         assert_eq!(
             expected
                 .iter()
@@ -3100,7 +3125,7 @@ mod tests {
                 .iter()
                 .filter(|(_, signature)| *signature == MemberKindSignature::ReferenceAndArrayToUnit)
                 .count(),
-            1,
+            2,
         );
     }
 }

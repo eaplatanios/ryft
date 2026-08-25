@@ -41,7 +41,7 @@ mod tests {
     /// Clamps `x` elementwise to the `[-1, 1]` interval, staging the bounds from `x` itself so that the helper works
     /// for both eager values and tracers.
     fn clamp_to_unit_interval<V: Clone + Clamp + OneLike + std::ops::Neg<Output = V>>(x: V) -> Result<V, ProgramError> {
-        let upper = x.one_like();
+        let upper = x.one_like()?;
         let lower = -upper.clone();
         x.clamp(&lower, &upper)
     }

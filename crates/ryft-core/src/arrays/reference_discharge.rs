@@ -326,6 +326,15 @@ where
         Ok(intermediates.pop().unwrap())
     }
 
+    fn write(
+        context: &C,
+        current: &C::Value,
+        replacement: C::Value,
+        alias: &ArrayReferenceView,
+    ) -> Result<C::Value, ProgramError> {
+        alias.write_in(&mut DestinationViewCarrier(context), current.clone(), replacement)
+    }
+
     fn replace(
         context: &C,
         current: &C::Value,
@@ -444,7 +453,7 @@ mod tests {
         OutputRegionProvenance, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext,
         ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation,
         ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource, ReferenceStateBinding,
-        ReferenceSwapOperation, ReferenceType, RegionInterface, RegionSlot, TypeError,
+        ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError,
         discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
@@ -480,9 +489,9 @@ mod tests {
 
     #[test]
     fn test_flat_reference_discharge_rewrites_the_complete_flat_language() {
-        // Discharge is exercised over the complete flat reference language: allocation, read, swap, additive update,
-        // freeze, and both composed view derivations, over a local root and over external roots. Every case asserts
-        // the exact rewritten program before asserting behavior.
+        // Discharge is exercised over the complete flat reference language: allocation, read, write, swap, additive
+        // update, freeze, and both composed view derivations, over a local root and over external roots. Every case
+        // asserts the exact rewritten program before asserting behavior.
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
         let pair_type = ArrayType::new_static(DataType::F32, [2]);
 
@@ -512,6 +521,9 @@ mod tests {
                 None,
             )
             .unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![pair, replacement], None)
+            .unwrap();
         let replaced = builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![pair, replacement], None)
             .unwrap()[0];
@@ -844,6 +856,38 @@ mod tests {
     }
 
     #[test]
+    fn test_array_reference_discharge_policy_write_skips_the_replaced_leaf_selection() {
+        let alias = ArrayReferenceView::root()
+            .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
+            })
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+        let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
+            let context = inputs[0].context().clone();
+            Ok(vec![ArrayReferenceDischarge::write(&context, &inputs[0], inputs[1].clone(), &alias)?])
+        };
+        let (_, staged): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
+            EagerContext::<TestValue, TestOperation>::trace(
+                stage,
+                vec![
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 3])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 3], %1:f32[2] .
+                let %2:f32[2, 2] = slice [start_indices=[1, 0], limit_indices=[3, 2]] %0
+                    %3:f32[1, 2] = reshape [shape=[1, 2]] %1
+                    %4:f32[2, 2] = update_slice [start_indices=[1, 0]] %2 %3
+                    %5:f32[3, 3] = update_slice [start_indices=[1, 0]] %0 %4
+                in (%5)"},
+        );
+    }
+
+    #[test]
     fn test_reference_free_discharge_is_identity() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(scalar_type().into());
@@ -872,6 +916,9 @@ mod tests {
             builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let first_snapshot =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
         let swapped_snapshot = builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
@@ -891,15 +938,16 @@ mod tests {
             )
             .unwrap();
 
-        // The allocation, read, swap, and freeze primitives all disappear: the initializer becomes the entering state,
-        // the read and the swap both forward the previous state value, and only the accumulation stages real work.
+        // Allocation and every reference access disappear: the initializer becomes entering state, the read forwards
+        // it, the write installs the replacement without producing a value, the swap forwards that replacement, and
+        // only accumulation stages real work.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[], %2:f32[] .
                 let %3:f32[] = add %1 %2
-                in (%0, %0, %3)"},
+                in (%0, %1, %3)"},
         );
         assert_eq!(discharged.public_output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
@@ -1101,6 +1149,9 @@ mod tests {
             /// Observe the current state.
             Read,
 
+            /// Replace the current state without observing it.
+            Write,
+
             /// Replace the current state with the shared replacement input.
             Swap,
 
@@ -1108,20 +1159,21 @@ mod tests {
             AddUpdate,
         }
 
-        // Every bounded read/swap/accumulate sequence must agree with both an independent scalar oracle and the eager
-        // reference interpreter, which pins the state-threading rewrite over all short primitive orderings at once.
+        // Every bounded read/write/swap/accumulate sequence must agree with both an independent scalar oracle and the
+        // eager reference interpreter, which pins the state-threading rewrite over all short primitive orderings.
         for length in 0usize..=3 {
-            for code in 0..3usize.pow(length as u32) {
+            for code in 0..4usize.pow(length as u32) {
                 let mut remainder = code;
                 let steps = (0..length)
                     .map(|_| {
-                        let step = match remainder % 3 {
+                        let step = match remainder % 4 {
                             0 => Step::Read,
-                            1 => Step::Swap,
-                            2 => Step::AddUpdate,
+                            1 => Step::Write,
+                            2 => Step::Swap,
+                            3 => Step::AddUpdate,
                             _ => unreachable!(),
                         };
-                        remainder /= 3;
+                        remainder /= 4;
                         step
                     })
                     .collect::<Vec<_>>();
@@ -1143,6 +1195,17 @@ mod tests {
                                     .unwrap()[0],
                             );
                             oracle_outputs.push(scalar(oracle_state));
+                        }
+                        Step::Write => {
+                            builder
+                                .add_instruction(
+                                    ReferenceWriteOperation::new(),
+                                    Vec::new(),
+                                    vec![reference, replacement],
+                                    None,
+                                )
+                                .unwrap();
+                            oracle_state = 7.0;
                         }
                         Step::Swap => {
                             outputs.push(
@@ -1457,7 +1520,7 @@ mod tests {
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
             if writes {
                 builder
-                    .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![kernel, observed], None)
+                    .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![kernel, observed], None)
                     .unwrap();
             }
             builder
@@ -1511,7 +1574,7 @@ mod tests {
                     %4:f32[] = condition %0 %1 %3 [
                         true={
                             lambda %0:f32[], %1:ref<f32[]> .
-                            let %2:f32[] = reference_swap %1 %0
+                            let reference_write %1 %0
                             in (%0)
                         },
                         false={
@@ -1934,8 +1997,11 @@ mod tests {
         let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
         let replacement = true_builder.add_input(scalar_type().into());
+        true_builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
         let snapshot = true_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
@@ -1979,7 +2045,7 @@ mod tests {
                 let %3:f32[], %4:f32[] = condition %0 %1 %2 [
                     true={
                         lambda %0:f32[], %1:f32[] .
-                        in (%0, %1)
+                        in (%1, %1)
                     },
                     false={
                         lambda %0:f32[], %1:f32[] .
@@ -1991,10 +2057,10 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
 
-        // The true branch swaps, so the public snapshot is the entering state and the final state is the replacement.
+        // The true branch writes and then reads, so both the public snapshot and final state are the replacement.
         assert_eq!(
             discharged.program().interpret(vec![boolean(true), scalar(10.0), scalar(7.0)]),
-            Ok(vec![scalar(10.0), scalar(7.0)]),
+            Ok(vec![scalar(7.0), scalar(7.0)]),
         );
 
         // The false branch only reads, so the entering state is both the snapshot and the final state.
@@ -2755,6 +2821,7 @@ mod tests {
 
         impl_calling_operation_from_reference_primitive!(NewReferenceOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceReadOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceWriteOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceSwapOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceAddUpdateOperation);
         impl_calling_operation_from_reference_primitive!(FreezeReferenceOperation);
@@ -2780,6 +2847,9 @@ mod tests {
                         operation.discharge_references(context, driver, inputs)
                     }
                     Self::Native(ArrayIrOperation::ReferenceRead(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceWrite(operation)) => {
                         operation.discharge_references(context, driver, inputs)
                     }
                     Self::Native(ArrayIrOperation::ReferenceSwap(operation)) => {

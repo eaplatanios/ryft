@@ -203,7 +203,7 @@ where
             self.dimensions().lhs_ragged_dimensions().iter().map(|axis| axis + 1).collect(),
             self.dimensions().rhs_group_dimensions().iter().map(|axis| axis + 1).collect(),
         );
-        let operation = RaggedDotOperation::new(dimensions).with_lowering_strategy(self.lowering_strategy());
+        let operation = RaggedDotOperation::new(dimensions);
         let output_axis = if mode == RaggedDotMode::Contracting { 1 } else { 0 };
         Ok(operation
             .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(output_axis)])?

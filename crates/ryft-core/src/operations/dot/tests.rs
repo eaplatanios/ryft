@@ -957,3 +957,509 @@ fn test_dot_partitioned_transpose_computes_operand_adjoints() {
         ],
     );
 }
+
+#[test]
+fn test_ragged_dot_inference_modes_and_group_prefixes() {
+    let group_sizes = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)]));
+    let dimensions = RaggedDotDimensionNumbers::matmul();
+    assert_eq!(
+        dimensions.to_string(),
+        "(dot=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]), lhs_ragged=[0], \
+         rhs_group=[0])",
+    );
+    assert_eq!(
+        format!("{dimensions:?}"),
+        "RaggedDotDimensionNumbers { dot_dimensions: DotDimensionNumbers { lhs_contracting_dimensions: [1], \
+         rhs_contracting_dimensions: [1], lhs_batching_dimensions: [], rhs_batching_dimensions: [] }, \
+         lhs_ragged_dimensions: [0], rhs_group_dimensions: [0] }",
+    );
+    assert_eq!(RaggedDotMode::NonContracting.to_string(), "non-contracting");
+    assert_eq!(RaggedDotMode::Contracting.to_string(), "contracting");
+    assert_eq!(RaggedDotMode::Batch.to_string(), "batch");
+    assert_eq!(
+        format!("{:?}", [RaggedDotMode::NonContracting, RaggedDotMode::Contracting, RaggedDotMode::Batch]),
+        "[NonContracting, Contracting, Batch]",
+    );
+    check_operation_type_inference!(
+        operation = RaggedDotOperation::new(dimensions),
+        cases = [
+            {
+                input_types = [plain_array(&[5, 2]), plain_array(&[3, 2, 4]), group_sizes.clone()],
+                output_types = [plain_array(&[5, 4])],
+            },
+            {
+                input_types = [
+                    plain_array(&[5, 2]),
+                    plain_array(&[3, 2, 4]),
+                    ArrayType::new_static(DataType::F32, [3]),
+                ],
+                error = "`ragged_dot_general` group sizes must have an integer data type",
+            },
+            {
+                input_types = [
+                    plain_array(&[5, 2]),
+                    plain_array(&[3, 2, 4]),
+                    ArrayType::scalar(DataType::I32),
+                ],
+                error = "`ragged_dot_general` group sizes must have rank at least one",
+            },
+            {
+                input_types = [plain_array(&[5, 2]), plain_array(&[2, 2, 4]), group_sizes.clone()],
+                error = "`ragged_dot_general` RHS group dimension has extent 2 but group sizes describe 3",
+            },
+            {
+                input_types = [
+                    ArrayType::new_static(DataType::F8E8M0FNU, [5, 2]),
+                    ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 4]),
+                    group_sizes.clone(),
+                ],
+                error = "`ragged_dot_general` does not support element data type `f8e8m0fnu` in grouped expansion \
+                         modes because it cannot represent zero",
+            },
+        ],
+    );
+
+    check_operation_type_inference!(
+        operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+            DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new()),
+            vec![0],
+            Vec::new(),
+        )),
+        cases = [{
+            input_types = [plain_array(&[5, 2]), plain_array(&[3, 2, 4]), group_sizes.clone()],
+            error = "`ragged_dot_general` requires exactly one RHS group dimension when the LHS ragged dimension is \
+                     non-contracting",
+        }],
+    );
+
+    let contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+        vec![1],
+        Vec::new(),
+    ));
+    check_operation_type_inference!(
+        operation = contracting,
+        cases = [
+            {
+                input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
+                output_types = [plain_array(&[3, 2, 4])],
+            },
+            {
+                input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), ArrayType::new_static(DataType::I64, [3])],
+                output_types = [plain_array(&[3, 2, 4])],
+            },
+            {
+                input_types = [
+                    ArrayType::new_static(DataType::F8E8M0FNU, [2, 5]),
+                    ArrayType::new_static(DataType::F8E8M0FNU, [5, 4]),
+                    group_sizes.clone(),
+                ],
+                error = "`ragged_dot_general` does not support element data type `f8e8m0fnu` in grouped expansion \
+                         modes because it cannot represent zero",
+            },
+        ],
+    );
+    check_operation_type_inference!(
+        operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+            vec![1],
+            vec![1],
+        )),
+        cases = [{
+            input_types = [plain_array(&[2, 5]), plain_array(&[5, 4]), group_sizes.clone()],
+            error = "`ragged_dot_general` requires zero RHS group dimensions when the LHS ragged dimension is \
+                     contracting or batching",
+        }],
+    );
+
+    let batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+        vec![0],
+        Vec::new(),
+    ));
+    check_operation_type_inference!(
+        operation = batch,
+        cases = [
+            {
+                input_types = [plain_array(&[5, 2]), plain_array(&[5, 2, 4]), group_sizes.clone()],
+                output_types = [plain_array(&[5, 4])],
+            },
+            {
+                input_types = [
+                    ArrayType::new_static(DataType::F8E8M0FNU, [5, 2]),
+                    ArrayType::new_static(DataType::F8E8M0FNU, [5, 2, 4]),
+                    group_sizes.clone(),
+                ],
+                output_types = [ArrayType::new_static(DataType::F8E8M0FNU, [5, 4])],
+            },
+        ],
+    );
+
+    let prefixed = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
+        vec![1],
+        vec![0],
+    ));
+    check_operation_type_inference!(
+        operation = prefixed,
+        cases = [
+            {
+                input_types = [
+                    plain_array(&[2, 5, 3]),
+                    plain_array(&[4, 2, 3, 6]),
+                    ArrayType::new(
+                        DataType::I32,
+                        Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
+                    ),
+                ],
+                output_types = [plain_array(&[2, 5, 6])],
+            },
+            {
+                input_types = [
+                    plain_array(&[2, 5, 3]),
+                    plain_array(&[4, 2, 3, 6]),
+                    ArrayType::new(
+                        DataType::I32,
+                        Shape::new(vec![Dimension::Static(3), Dimension::Static(4)]),
+                    ),
+                ],
+                error = "`ragged_dot_general` group sizes prefix must be `[2]`, but got `[3]`",
+            },
+        ],
+    );
+
+    let prefixed_contracting = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]),
+        vec![2],
+        Vec::new(),
+    ));
+    check_operation_type_inference!(
+        operation = prefixed_contracting,
+        cases = [{
+            input_types = [
+                plain_array(&[2, 3, 4]),
+                plain_array(&[2, 4, 5]),
+                ArrayType::new_static(DataType::I32, [2, 3]),
+            ],
+            output_types = [plain_array(&[3, 2, 3, 5])],
+        }],
+    );
+
+    let prefixed_batch = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
+        vec![1],
+        Vec::new(),
+    ));
+    check_operation_type_inference!(
+        operation = prefixed_batch,
+        cases = [{
+            input_types = [
+                plain_array(&[2, 4, 3]),
+                plain_array(&[2, 4, 3, 5]),
+                ArrayType::new_static(DataType::I32, [2, 3]),
+            ],
+            output_types = [plain_array(&[2, 4, 5])],
+        }],
+    );
+}
+
+#[test]
+fn test_ragged_dot_eager_zero_groups_and_uncovered_rows() {
+    let lhs = Array::matrix(5, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+    let rhs = Array::from_f64s(plain_array(&[3, 2, 1]), vec![10.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    let output = lhs.ragged_dot(&rhs, &Array::vector(vec![2_i32, 0, 2])).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[5, 1]));
+    assert_eq!(output.to_f64s(), vec![12.0, 34.0, 50.0, 68.0, 0.0]);
+
+    let lhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]), vec![1.0, 2.0]);
+    let rhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [1, 1, 1]), vec![1.0]);
+    assert!(matches!(
+        lhs.ragged_dot(&rhs, &Array::vector(vec![1_i32])),
+        Err(ProgramError::Type(TypeError::Invalid { message }))
+            if message == "`ragged_dot_general` does not support element data type `f8e8m0fnu` in grouped expansion \
+                           modes because it cannot represent zero",
+    ));
+}
+
+#[test]
+fn test_ragged_dot_eager_contracting_batch_and_group_prefixes() {
+    let contracting_dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+        vec![1],
+        Vec::new(),
+    );
+    let lhs = Array::matrix(2, 4, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let rhs = Array::matrix(4, 1, vec![10.0_f32, 20.0, 30.0, 40.0]);
+    let output = lhs.ragged_dot_general(&rhs, &Array::vector(vec![1_i32, 0, 2]), &contracting_dimensions).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[3, 2, 1]));
+    assert_eq!(output.to_f64s(), vec![10.0, 50.0, 0.0, 0.0, 130.0, 330.0]);
+
+    let prefixed_contracting_dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![0, 1], vec![0, 1], Vec::new(), Vec::new()),
+        vec![1],
+        Vec::new(),
+    );
+    let lhs = Array::from_f64s(plain_array(&[2, 3, 1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 3, 1]), vec![10.0, 20.0, 30.0, 1.0, 2.0, 3.0]);
+    let group_sizes = Array::matrix(2, 2, vec![1_i32, 2, 2, 1]);
+    let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_contracting_dimensions).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[2, 1, 1]));
+    assert_eq!(output.to_f64s(), vec![24.0, 148.0]);
+
+    let batch_dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+        vec![0],
+        Vec::new(),
+    );
+    let lhs = Array::matrix(4, 1, vec![1.0_f32, 2.0, 3.0, 4.0]);
+    let rhs = Array::from_f64s(plain_array(&[4, 1, 1]), vec![10.0, 20.0, 30.0, 40.0]);
+    // Batch mode is the ordinary batched dot; group-size values do not participate in its runtime semantics.
+    let output = lhs.ragged_dot_general(&rhs, &Array::vector(vec![5_i32, -1, 99]), &batch_dimensions).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[4, 1]));
+    assert_eq!(output.to_f64s(), vec![10.0, 40.0, 90.0, 160.0]);
+
+    let lhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]), vec![1.0, 2.0]);
+    let rhs = Array::from_f64s(ArrayType::new_static(DataType::F8E8M0FNU, [2, 1, 1]), vec![2.0, 4.0]);
+    let output = lhs.ragged_dot_general(&rhs, &Array::vector(vec![-1_i32]), &batch_dimensions).unwrap();
+    assert_eq!(output.to_f64s(), vec![2.0, 8.0]);
+
+    let prefixed_dimensions =
+        RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]), vec![1], vec![0]);
+    let lhs = Array::from_f64s(plain_array(&[2, 3, 1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 2, 1, 1]), vec![10.0, 100.0, 20.0, 200.0]);
+    let group_sizes = Array::matrix(2, 2, vec![1_i32, 1, 2, 0]);
+    let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_dimensions).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[2, 3, 1]));
+    assert_eq!(output.to_f64s(), vec![10.0, 40.0, 0.0, 400.0, 500.0, 0.0]);
+
+    let prefixed_batch_dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![2], vec![2], vec![0, 1], vec![0, 1]),
+        vec![1],
+        Vec::new(),
+    );
+    let lhs = Array::from_f64s(plain_array(&[2, 4, 1]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 4, 1, 1]), vec![10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0]);
+    let group_sizes = Array::matrix(2, 3, vec![1_i32, 0, 2, 0, 2, 2]);
+    let output = lhs.ragged_dot_general(&rhs, &group_sizes, &prefixed_batch_dimensions).unwrap();
+    assert_eq!(output.r#type().into_owned(), plain_array(&[2, 4, 1]));
+    assert_eq!(output.to_f64s(), vec![10.0, 40.0, 90.0, 160.0, 5.0, 12.0, 21.0, 32.0]);
+}
+
+#[test]
+fn test_ragged_dot_batching_leading_axis_and_ragged_axis_rejection() {
+    let operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul());
+    let lhs = ArrayBatch::new(
+        Array::from_f64s(plain_array(&[2, 2, 2]), vec![1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 4.0, 3.0]),
+        BatchAxis::new(0),
+    )
+    .unwrap();
+    let rhs = ArrayBatch::new(
+        Array::from_f64s(plain_array(&[2, 2, 2, 1]), vec![10.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+        BatchAxis::new(0),
+    )
+    .unwrap();
+    let group_sizes = ArrayBatch::new(Array::matrix(2, 2, vec![1_i32, 1, 1, 1]), BatchAxis::new(0)).unwrap();
+    let context = BatchingContext::new(EagerContext::<Array>::new(), 2);
+    let outputs = operation
+        .batch(&context, &crate::EmptyRegionDriver, &[lhs.clone(), rhs.clone(), group_sizes.clone()])
+        .unwrap()
+        .into_parts()
+        .0;
+    assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+    assert_eq!(outputs[0].value().to_f64s(), vec![12.0, 18.0, 13.0, 45.0]);
+
+    let contracting_operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+        vec![1],
+        Vec::new(),
+    ));
+    let contracting_lhs = ArrayBatch::new(
+        Array::from_f64s(
+            plain_array(&[2, 2, 4]),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 2.0, 1.0, 0.0, 1.0, 1.0, 2.0, 1.0, 0.0],
+        ),
+        BatchAxis::new(0),
+    )
+    .unwrap();
+    let contracting_rhs = ArrayBatch::new(
+        Array::from_f64s(plain_array(&[2, 4, 1]), vec![10.0, 20.0, 30.0, 40.0, 1.0, 2.0, 3.0, 4.0]),
+        BatchAxis::new(0),
+    )
+    .unwrap();
+    let contracting_groups = ArrayBatch::new(Array::matrix(2, 2, vec![1_i32, 2, 2, 2]), BatchAxis::new(0)).unwrap();
+    let outputs = contracting_operation
+        .batch(&context, &crate::EmptyRegionDriver, &[contracting_lhs, contracting_rhs, contracting_groups])
+        .unwrap()
+        .into_parts()
+        .0;
+    assert_eq!(outputs[0].batch_axis(), BatchAxis::new(1));
+    assert_eq!(outputs[0].value().to_f64s(), vec![10.0, 50.0, 4.0, 5.0, 130.0, 330.0, 4.0, 3.0]);
+
+    let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(2)).unwrap());
+    let ragged_lhs = lhs
+        .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 2]), variable, vec![0])])
+        .unwrap();
+    assert_eq!(
+        operation.batch(&context, &crate::EmptyRegionDriver, &[ragged_lhs, rhs, group_sizes]).unwrap_err(),
+        crate::batching::BatchingError::UnsupportedOperation {
+            message: "`ragged_dot_general` does not accept bounded ragged dimension `length`; use explicit group \
+                      sizes instead"
+                .to_string(),
+        },
+    );
+}
+
+#[test]
+fn test_ragged_dot_jvp_and_noncontracting_transpose() {
+    let lhs = Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 2, 1]), vec![10.0, 1.0, 2.0, 3.0]);
+    let group_sizes = Array::vector(vec![1_i32, 2]);
+
+    let mut builder = crate::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+    let lhs_input = builder.add_input(lhs.r#type().into_owned());
+    let rhs_input = builder.add_input(rhs.r#type().into_owned());
+    let groups = builder.add_constant(group_sizes.clone());
+    let output = builder
+        .add_instruction(
+            RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+            Vec::new(),
+            vec![lhs_input, rhs_input, groups],
+            None,
+        )
+        .unwrap()[0];
+    let program = builder
+        .build::<Vec<Array>, Vec<Array>>(vec![output], vec![crate::Placeholder; 2], vec![crate::Placeholder])
+        .unwrap();
+    let lhs_tangent = Array::matrix(3, 2, vec![1.0_f32; 6]);
+    let rhs_tangent = Array::from_f64s(plain_array(&[2, 2, 1]), vec![1.0; 4]);
+    let outputs = program
+        .clone()
+        .jvp()
+        .unwrap()
+        .interpret(vec![lhs.clone(), rhs.clone(), lhs_tangent.clone(), rhs_tangent.clone()])
+        .unwrap();
+    assert_eq!(outputs[0].to_f64s(), vec![12.0, 18.0, 28.0]);
+    assert_eq!(outputs[1].to_f64s(), vec![14.0, 12.0, 16.0]);
+    let step = 1e-3;
+    let plus = (lhs.clone() + lhs_tangent.clone() * step)
+        .ragged_dot(&(rhs.clone() + rhs_tangent.clone() * step), &group_sizes)
+        .unwrap();
+    let minus = (lhs.clone() - lhs_tangent * step)
+        .ragged_dot(&(rhs.clone() - rhs_tangent * step), &group_sizes)
+        .unwrap();
+    assert_abs_diff_eq!(outputs[1], (plus - minus) * (0.5 / step), epsilon = 1e-3);
+
+    let transpose = program.transpose_with_respect_to(&[0]).unwrap();
+    assert_eq!(
+        transpose.to_string(),
+        indoc! {"
+            lambda %0:f32[3, 1], %1:f32[2, 2, 1] .
+            let %2:i32[2] = const [1, 2]
+                %3:f32[3, 2] = ragged_dot_general [
+                    dimensions=(dot=(lhs_contracting=[1], rhs_contracting=[2], lhs_batching=[], \
+                    rhs_batching=[]), lhs_ragged=[0], rhs_group=[0]),
+                ] %0 %1 %2
+            in (%3)
+        "}
+        .trim_end(),
+    );
+
+    check_operation_transposition!(
+        @exact,
+        operation = RaggedDotOperation::new(RaggedDotDimensionNumbers::matmul()),
+        cases = [
+            {
+                inputs = [
+                    (@linear(type = lhs.r#type().into_owned())),
+                    (@known, rhs.clone()),
+                    (@known, group_sizes.clone()),
+                ],
+                output_cotangents = [Array::matrix(3, 1, vec![1.0_f32; 3])],
+                input_cotangents = [Array::matrix(3, 2, vec![10.0_f32, 1.0, 2.0, 3.0, 2.0, 3.0])],
+            },
+            {
+                inputs = [
+                    (@known, lhs.clone()),
+                    (@linear(type = rhs.r#type().into_owned())),
+                    (@known, group_sizes),
+                ],
+                output_cotangents = [Array::matrix(3, 1, vec![1.0_f32; 3])],
+                input_cotangents = [Array::from_f64s(plain_array(&[2, 2, 1]), vec![1.0, 2.0, 8.0, 10.0])],
+            },
+        ],
+    );
+}
+
+#[test]
+fn test_ragged_dot_batch_widened_differential_staging() {
+    let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
+    let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 1]);
+    let dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+        vec![0],
+        Vec::new(),
+    );
+    let mut builder = crate::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+    let lhs = builder.add_input(lhs_type.clone());
+    let rhs = builder.add_input(rhs_type.clone());
+    let group_sizes = builder.add_constant(Array::vector(vec![1_i32, 2]));
+    let output = builder
+        .add_instruction(RaggedDotOperation::new(dimensions), Vec::new(), vec![lhs, rhs, group_sizes], None)
+        .unwrap()[0];
+    let program = builder
+        .build::<Vec<Array>, Vec<Array>>(vec![output], vec![crate::Placeholder; 2], vec![crate::Placeholder])
+        .unwrap();
+
+    let jvp = program.clone().jvp().unwrap();
+    assert_eq!(
+        jvp.input_types(),
+        vec![
+            lhs_type.clone(),
+            rhs_type.clone(),
+            ArrayType::new_static(DataType::F32, [3, 2]),
+            ArrayType::new_static(DataType::F32, [3, 2, 1]),
+        ],
+    );
+    assert_eq!(
+        jvp.output_types(),
+        vec![ArrayType::new_static(DataType::F8E8M0FNU, [3, 1]), ArrayType::new_static(DataType::F32, [3, 1]),],
+    );
+}
+
+#[test]
+fn test_ragged_dot_transpose_rejects_contracting_and_batch_modes() {
+    let cases = [
+        (
+            RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+                vec![1],
+                Vec::new(),
+            )),
+            [plain_array(&[2, 5]), plain_array(&[5, 4]), ArrayType::new_static(DataType::I32, [3])],
+            RaggedDotMode::Contracting,
+        ),
+        (
+            RaggedDotOperation::new(RaggedDotDimensionNumbers::new(
+                DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+                vec![0],
+                Vec::new(),
+            )),
+            [plain_array(&[5, 2]), plain_array(&[5, 2, 4]), ArrayType::new_static(DataType::I32, [3])],
+            RaggedDotMode::Batch,
+        ),
+    ];
+    for (operation, input_types, mode) in cases {
+        let mut builder = crate::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = input_types.map(|input_type| builder.add_input(input_type));
+        let outputs = builder.add_instruction(operation, Vec::new(), inputs.to_vec(), None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![crate::Placeholder; 3], vec![crate::Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            crate::differentiation::DifferentiationError::Program(crate::ProgramError::UnsupportedOperation {
+                message: format!("`{RAGGED_DOT_OPERATION_NAME}` transposition is unsupported in `{mode}` mode"),
+            }),
+        );
+    }
+}

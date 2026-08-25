@@ -12,6 +12,7 @@ use ryft_core::operations::attention::{
 };
 use ryft_core::operations::collectives::{
     AllGatherOperation, AllToAllOperation, CollectiveMode, ParallelPermuteOperation, ParallelSumScatterOperation,
+    RaggedAllToAllOperation,
 };
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::custom_call::{CUSTOM_CALL_OPERATION_NAME, CustomCallAttribute, CustomCallOperation};
@@ -26,19 +27,19 @@ use ryft_core::{
     CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CaptureReference, CeilOperation,
     ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, DataType, Dimension,
     DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
-    DivOperation, DomainTracingContext, DotOperation, Effect, Effects, ErfOperation, ExpOperation, FloorOperation,
-    GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout, Log1pOperation,
-    LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT, MaxOperation, Memory,
-    MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation, ParallelReduceOperation,
-    ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue, Provenance,
-    REMATERIALIZE_OPERATION_NAME, ReductionKind, ReferenceStateBinding, RegionId, RegionRef, RemOperation,
-    ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME, SCATTER_OPERATION_NAME, ScaledDotOperation,
-    ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, ShardingError,
-    SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation, TanhOperation, TransposeOperation,
-    Type as RyftType, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
+    DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, Effect, Effects, ErfOperation, ExpOperation,
+    FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout,
+    Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
+    MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
+    ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
+    Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind, ReferenceStateBinding,
+    RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME,
+    SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding,
+    ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation,
+    TanhOperation, TransposeOperation, Type as RyftType, TypeError, Typed, Value, WHILE_OPERATION_NAME, WhileOperation,
 };
 #[cfg(test)]
-use ryft_core::{Complex as ComplexNumber, ReshapeParameters};
+use ryft_core::{Complex as ComplexNumber, RaggedDotDimensionNumbers, ReshapeParameters};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, CustomCallMemoryLayouts, Precision};
 use ryft_mlir::dialects::{chlo, func, shardy, stable_hlo, tensor};
 use ryft_mlir::{
@@ -542,6 +543,19 @@ fn token_threaded_effects(effects: Effects) -> impl Iterator<Item = Effect> {
 pub(crate) enum PlainMlirLoweringMode {
     /// Lower the program exactly as traced.
     Unpacked,
+}
+
+/// XLA representation used when lowering grouped generalized dots. Selection is compilation-wide through
+/// [`XlaOptions::with_ragged_dot_lowering_strategy`](crate::XlaOptions::with_ragged_dot_lowering_strategy).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RaggedDotLoweringStrategy {
+    /// Expand grouped dots into masking plus ordinary dense generalized dots. This is the default used by
+    /// [`XlaOptions::new`](crate::XlaOptions::new).
+    #[default]
+    Decomposition,
+
+    /// Emit dedicated CHLO `ragged_dot` instructions.
+    Instruction,
 }
 
 /// Lowering helper passed to op-owned plain StableHLO lowering hooks.
@@ -1442,6 +1456,275 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     }
 }
 
+/// Expands one grouped-dot operand into a zero-masked dense group axis. The intermediate order keeps the
+/// `group_sizes` prefix axes first so every broadcast dimension is monotonic; one final transpose produces
+/// `[group, original axes...]` for the dense dot.
+fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
+    input: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    group_sizes: ValueRef<'b, 'c, 't>,
+    group_sizes_type: &ArrayType,
+    ragged_axis: usize,
+    prefix_axes: &[usize],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(ValueRef<'b, 'c, 't>, ArrayType), LoweringError> {
+    let group_axis = group_sizes_type.rank() - 1;
+    let group_count = group_sizes_type.dimension(group_axis);
+    let group_ends = lower_cumulative_to_mlir(
+        CumulativeKind::Sum,
+        group_axis,
+        false,
+        group_sizes,
+        group_sizes_type,
+        block,
+        context,
+        location,
+    )?;
+    let group_starts = block.append_operation(stable_hlo::subtract(group_ends, group_sizes, location)?)?;
+    let group_starts = group_starts.result(0).expect("stablehlo.subtract should return one result").as_ref();
+
+    let remaining_axes = (0..input_type.rank()).filter(|axis| !prefix_axes.contains(axis)).collect::<Vec<_>>();
+    let input_permutation = prefix_axes.iter().copied().chain(remaining_axes.iter().copied()).collect::<Vec<_>>();
+    let input = if input_permutation.iter().enumerate().all(|(axis, source)| axis == *source) {
+        input
+    } else {
+        let transpose =
+            block.append_operation(stable_hlo::transpose(input, input_permutation.as_slice(), location)?)?;
+        transpose.result(0).expect("stablehlo.transpose should return one result").as_ref()
+    };
+    let mut intermediate_dimensions = prefix_axes.iter().map(|axis| input_type.dimension(*axis)).collect::<Vec<_>>();
+    intermediate_dimensions.push(group_count.clone());
+    intermediate_dimensions.extend(remaining_axes.iter().map(|axis| input_type.dimension(*axis)));
+    let intermediate_type = input_type.clone().with_shape(Shape::new(intermediate_dimensions));
+    let intermediate_tensor_type = lower_tensor_type(&intermediate_type, context, location)?;
+    let input_broadcast_dimensions =
+        (0..prefix_axes.len()).chain((prefix_axes.len() + 1)..intermediate_type.rank()).collect::<Vec<_>>();
+    let input = block.append_operation(stable_hlo::broadcast(
+        input,
+        intermediate_tensor_type,
+        input_broadcast_dimensions.as_slice(),
+        location,
+    )?)?;
+    let input = input.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+
+    let metadata_broadcast_dimensions =
+        if group_sizes_type.rank() == 1 { vec![prefix_axes.len()] } else { (0..=prefix_axes.len()).collect() };
+    let group_starts = block.append_operation(stable_hlo::broadcast(
+        group_starts,
+        context.tensor_type(
+            lower_element_type(group_sizes_type.data_type(), context)?,
+            intermediate_tensor_type.dimensions().collect::<Vec<_>>().as_slice(),
+            None,
+            location,
+        )?,
+        metadata_broadcast_dimensions.as_slice(),
+        location,
+    )?)?;
+    let group_starts = group_starts.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+    let metadata_tensor_type = group_starts.r#type()?.cast::<TensorTypeRef>().unwrap();
+    let group_ends = block.append_operation(stable_hlo::broadcast(
+        group_ends,
+        metadata_tensor_type,
+        metadata_broadcast_dimensions.as_slice(),
+        location,
+    )?)?;
+    let group_ends = group_ends.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+    let ragged_intermediate_axis =
+        prefix_axes.len() + 1 + remaining_axes.iter().position(|axis| *axis == ragged_axis).unwrap();
+    let indices =
+        block.append_operation(stable_hlo::iota(metadata_tensor_type, ragged_intermediate_axis, location)?)?;
+    let indices = indices.result(0).expect("stablehlo.iota should return one result").as_ref();
+    let after_start =
+        lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, group_starts, indices, block, location)?;
+    let before_end = lower_compare_to_mlir(ComparisonDirection::LessThan, indices, group_ends, block, location)?;
+    let mask = block.append_operation(stable_hlo::and(after_start, before_end, location)?)?;
+    let mask = mask.result(0).expect("stablehlo.and should return one result").as_ref();
+    let zero =
+        lower_unplaced_constant_output(&[ArrayType::scalar(input_type.data_type())], 0, block, context, location)?[0];
+    let zero = block.append_operation(stable_hlo::broadcast(zero, intermediate_tensor_type, &[], location)?)?;
+    let zero = zero.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+    let masked = block.append_operation(stable_hlo::select(mask, input, zero, location)?)?;
+    let masked = masked.result(0).expect("stablehlo.select should return one result").as_ref();
+
+    let labels = prefix_axes
+        .iter()
+        .copied()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .chain(remaining_axes.iter().copied().map(Some))
+        .collect::<Vec<_>>();
+    let final_permutation = std::iter::once(labels.iter().position(Option::is_none).unwrap())
+        .chain((0..input_type.rank()).map(|axis| labels.iter().position(|label| *label == Some(axis)).unwrap()))
+        .collect::<Vec<_>>();
+    let expanded = block.append_operation(stable_hlo::transpose(masked, final_permutation.as_slice(), location)?)?;
+    let expanded = expanded.result(0).expect("stablehlo.transpose should return one result").as_ref();
+    Ok((expanded, input_type.with_inserted_dimension(0, group_count).map_err(ProgramError::from)?))
+}
+
+/// Emits one ordinary dense dot after the grouped operands have been expanded.
+fn lower_dense_ragged_dot<'b, 'c: 'b, 't: 'c>(
+    lhs: ValueRef<'b, 'c, 't>,
+    rhs: ValueRef<'b, 'c, 't>,
+    dimensions: &DotDimensionNumbers,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let dimensions = context.stable_hlo_dot_dimensions(
+        dimensions.lhs_batching_dimensions(),
+        dimensions.rhs_batching_dimensions(),
+        dimensions.lhs_contracting_dimensions(),
+        dimensions.rhs_contracting_dimensions(),
+    )?;
+    let dot = block.append_operation(stable_hlo::dot_general(
+        lhs,
+        rhs,
+        dimensions,
+        Some((Precision::Default, Precision::Default)),
+        None,
+        lower_tensor_type(output_type, context, location)?,
+        location,
+    )?)?;
+    Ok(dot.result(0).expect("stablehlo.dot_general should return one result").as_ref())
+}
+
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RaggedDotOperation {
+    // Lower grouped dot either to its portable masked-dense decomposition or to the opt-in CHLO instruction.
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        check_count!("input", input_values, 3, ProgramError);
+        check_count!("input", lowerer.input_types, 3, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let dimensions = self.dimensions();
+        if lowerer.collective_state.ragged_dot_lowering_strategy() == RaggedDotLoweringStrategy::Instruction {
+            // JAX applies an explicit RHS transpose only for its TPU instruction path as a backend layout workaround.
+            // Ryft emits the canonical CHLO contract and leaves target-specific layout selection to legalization.
+            let dot = dimensions.dot_dimensions();
+            let attribute = lowerer.context.chlo_ragged_dot_dimensions(
+                dot.lhs_batching_dimensions(),
+                dot.rhs_batching_dimensions(),
+                dot.lhs_contracting_dimensions(),
+                dot.rhs_contracting_dimensions(),
+                dimensions.lhs_ragged_dimensions(),
+                dimensions.rhs_group_dimensions(),
+            )?;
+            let result = lowerer.block.append_operation(chlo::ragged_dot(
+                input_values[0],
+                input_values[1],
+                input_values[2],
+                attribute,
+                Some((chlo::Precision::Default, chlo::Precision::Default)),
+                lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?,
+                lowerer.location,
+            )?)?;
+            return Ok(vec![result.result(0).expect("chlo.ragged_dot should return one result").as_ref()]);
+        }
+
+        let lhs_type = &lowerer.input_types[0];
+        let rhs_type = &lowerer.input_types[1];
+        let group_sizes_type = &lowerer.input_types[2];
+        let mode = dimensions.mode(lhs_type.rank()).map_err(ProgramError::from)?;
+        if mode == RaggedDotMode::Batch {
+            return Ok(vec![lower_dense_ragged_dot(
+                input_values[0],
+                input_values[1],
+                dimensions.dot_dimensions(),
+                &output_types[0],
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?]);
+        }
+        let lhs_ragged_axis = dimensions.lhs_ragged_dimensions()[0];
+        let lhs_prefix = dimensions.group_sizes_prefix_dimensions(lhs_type.rank()).map_err(ProgramError::from)?;
+        let (lhs, _) = lower_ragged_dot_expansion(
+            input_values[0],
+            lhs_type,
+            input_values[2],
+            group_sizes_type,
+            lhs_ragged_axis,
+            lhs_prefix.as_slice(),
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?;
+        let shift = |axes: &[usize]| axes.iter().map(|axis| axis + 1).collect::<Vec<_>>();
+        let dot = dimensions.dot_dimensions();
+        let dense_dimensions = match mode {
+            RaggedDotMode::NonContracting => {
+                let mut lhs_contracting = shift(dot.lhs_contracting_dimensions());
+                lhs_contracting.push(0);
+                let mut rhs_contracting = dot.rhs_contracting_dimensions().to_vec();
+                rhs_contracting.push(dimensions.rhs_group_dimensions()[0]);
+                DotDimensionNumbers::new(
+                    lhs_contracting,
+                    rhs_contracting,
+                    shift(dot.lhs_batching_dimensions()),
+                    dot.rhs_batching_dimensions().to_vec(),
+                )
+            }
+            RaggedDotMode::Contracting => {
+                let position =
+                    dot.lhs_contracting_dimensions().iter().position(|axis| *axis == lhs_ragged_axis).unwrap();
+                let rhs_ragged_axis = dot.rhs_contracting_dimensions()[position];
+                let rhs_prefix = dot
+                    .rhs_batching_dimensions()
+                    .iter()
+                    .copied()
+                    .chain(dot.rhs_contracting_dimensions()[..position].iter().copied())
+                    .collect::<Vec<_>>();
+                let (rhs, _) = lower_ragged_dot_expansion(
+                    input_values[1],
+                    rhs_type,
+                    input_values[2],
+                    group_sizes_type,
+                    rhs_ragged_axis,
+                    rhs_prefix.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                let mut lhs_batching = vec![0];
+                lhs_batching.extend(shift(dot.lhs_batching_dimensions()));
+                let mut rhs_batching = vec![0];
+                rhs_batching.extend(shift(dot.rhs_batching_dimensions()));
+                return Ok(vec![lower_dense_ragged_dot(
+                    lhs,
+                    rhs,
+                    &DotDimensionNumbers::new(
+                        shift(dot.lhs_contracting_dimensions()),
+                        shift(dot.rhs_contracting_dimensions()),
+                        lhs_batching,
+                        rhs_batching,
+                    ),
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?]);
+            }
+            RaggedDotMode::Batch => unreachable!(),
+        };
+        Ok(vec![lower_dense_ragged_dot(
+            lhs,
+            input_values[1],
+            &dense_dimensions,
+            &output_types[0],
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )?])
+    }
+}
+
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for IotaOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1961,12 +2244,23 @@ fn lower_like_constant<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Locat
     if input_values.len() != 1 {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
     }
-    // The zero-space type has exactly one value. Both `zero_like` and `one_like` therefore materialize that value,
-    // even though a typed `one` operation remains invalid because the type has no numeric multiplicative identity.
-    let integer_value = match output_types {
-        [output_type] if output_type.data_type().is_zero() => 0,
-        _ => integer_value,
-    };
+    check_count!("output", output_types, 1, ProgramError);
+    let data_type = output_types[0].data_type();
+    match (integer_value, data_type) {
+        (0, DataType::Token | DataType::F8E8M0FNU) => {
+            return Err(ProgramError::Type(TypeError::invalid(format!(
+                "data type `{data_type}` cannot represent zero",
+            )))
+            .into());
+        }
+        (1, DataType::Token | DataType::Zero) => {
+            return Err(ProgramError::Type(TypeError::invalid(format!(
+                "data type `{data_type}` cannot represent one",
+            )))
+            .into());
+        }
+        _ => {}
+    }
     lower_constant_output(output_types, integer_value, block, context, location)
 }
 
@@ -3322,6 +3616,13 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
+            ArrayOperation::RaggedDot(operation) => <RaggedDotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -3716,6 +4017,18 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 lowerer.context,
                 lowerer.location,
             ),
+            ArrayOperation::RaggedAllToAll(operation) => {
+                let collective_state = lowerer.collective_state.clone();
+                lower_ragged_all_to_all_to_mlir(
+                    operation,
+                    &collective_state,
+                    input_values,
+                    &lowerer.input_types,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )
+            }
             ArrayOperation::Condition(operation) => Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -3970,13 +4283,14 @@ fn attention_backward_composition_key(
     }
 }
 
-/// StableHLO collective in a module must carry a distinct channel id, so one shared counter serves every manual region
-/// in the module) and the innermost enclosing `sdy.manual_computation` region's [`ShardMap`] (whose manual device mesh
-/// axes collectives resolve by name), or `None` outside manual regions.
+/// Module-scoped lowering state shared across nested regions. StableHLO collectives use the channel counter and the
+/// innermost enclosing `sdy.manual_computation` region's [`ShardMap`], while other lowerings consume immutable target
+/// and representation policy stored alongside that shared state.
 ///
-/// The state is created once per lowered module, cloned per instruction lowerer (both shared pieces sit behind
-/// [`Rc`]s), and [`enter_manual_region`](Self::enter_manual_region) derives the state used inside one manual region's
-/// body — sharing the module's channel allocator while swapping in the region's [`ShardMap`].
+/// The state is created once per lowered module and cloned per instruction lowerer. Module-owned mutable state and
+/// registries are shared through [`Rc`], while immutable target and representation policies are copied or cloned.
+/// [`enter_manual_region`](Self::enter_manual_region) preserves that module state and policy while replacing the
+/// innermost region's [`ShardMap`].
 #[derive(Clone)]
 pub(crate) struct CollectiveLoweringState {
     /// Module-scoped counter producing the next collective channel id.
@@ -3989,6 +4303,9 @@ pub(crate) struct CollectiveLoweringState {
     /// no target information. Platform-gated lowerings such as fused attention consult this and
     /// fall back to their portable form when it is absent.
     target_platform: Option<Rc<str>>,
+
+    /// Backend representation used to lower grouped generalized dots in this module.
+    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
     /// Module-owned private decompositions used by named StableHLO composites.
     named_compositions: Option<Rc<NamedCompositionFunctionMap>>,
@@ -4007,6 +4324,7 @@ impl CollectiveLoweringState {
             channel_ids: Rc::new(Cell::new(1)),
             manual_shard_map: None,
             target_platform: None,
+            ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
             named_compositions: None,
             has_provenance: Rc::new(Cell::new(false)),
         }
@@ -4015,6 +4333,12 @@ impl CollectiveLoweringState {
     /// Returns a copy of this state carrying the PJRT platform name of the compilation target.
     pub(crate) fn with_target_platform(mut self, target_platform: Option<&str>) -> Self {
         self.target_platform = target_platform.map(Rc::from);
+        self
+    }
+
+    /// Returns a copy of this state carrying the grouped-dot lowering strategy.
+    pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
+        self.ragged_dot_lowering_strategy = strategy;
         self
     }
 
@@ -4030,13 +4354,20 @@ impl CollectiveLoweringState {
         self.target_platform.as_deref()
     }
 
-    /// Derives the state used inside one `sdy.manual_computation` region's body: the module's channel allocator and
-    /// target platform are shared and the region's [`ShardMap`] becomes the innermost manual region.
+    /// Returns the grouped-dot lowering strategy for this module.
+    pub(crate) fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
+        self.ragged_dot_lowering_strategy
+    }
+
+    /// Derives the state used inside one `sdy.manual_computation` region's body. The target platform, grouped-dot
+    /// representation, named compositions, provenance state, and module channel allocator are inherited, while the
+    /// provided [`ShardMap`] becomes the innermost manual region.
     pub(crate) fn enter_manual_region(&self, shard_map: ShardMap) -> Self {
         Self {
             channel_ids: self.channel_ids.clone(),
             manual_shard_map: Some(Rc::new(shard_map)),
             target_platform: self.target_platform.clone(),
+            ragged_dot_lowering_strategy: self.ragged_dot_lowering_strategy,
             named_compositions: self.named_compositions.clone(),
             has_provenance: self.has_provenance.clone(),
         }
@@ -4480,6 +4811,7 @@ where
         result_shardings,
         target_platform,
         &[],
+        RaggedDotLoweringStrategy::default(),
     )
 }
 
@@ -4503,6 +4835,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Outp
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
     reference_states: &[ReferenceStateBinding],
+    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 ) -> Result<LoweredXlaModule, LoweringError>
 where
     Input: Parameterized<ArrayType>,
@@ -4654,10 +4987,11 @@ where
     // entry and nested function bodies resolve the same private symbol.
     let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
 
-    // Module-scoped collective lowering state, shared between the entry function body and private functions below so
-    // channel ids stay unique module-wide and target/composition information reaches nested bodies.
+    // Module-scoped lowering state, shared between the entry function body and private functions below so channel ids
+    // stay unique and target, representation policy, named compositions, and provenance state reach nested bodies.
     let collective_state = CollectiveLoweringState::new()
         .with_target_platform(target_platform)
+        .with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy)
         .with_named_compositions(named_compositions.clone());
 
     // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
@@ -5009,12 +5343,33 @@ pub(crate) fn to_mlir_module_for_plain_program<
     program: &Program<V, O, Input, Output>,
     function_name: S,
 ) -> Result<String, LoweringError> {
+    to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
+        program,
+        function_name,
+        RaggedDotLoweringStrategy::default(),
+    )
+}
+
+/// Lowers a plain traced program with an explicit XLA grouped-dot representation.
+#[cfg(test)]
+fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
+    V: MlirLowerableValue,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    O: LowerableXlaOperation<V>,
+    S: AsRef<str>,
+>(
+    program: &Program<V, O, Input, Output>,
+    function_name: S,
+    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+) -> Result<String, LoweringError> {
     let function_name = normalize_function_name(function_name.as_ref())?;
     let context = MlirContext::new();
     let location = context.unknown_location();
     let module = context.module(location)?;
     // Module-scoped collective lowering state: this entry point lowers one whole module.
-    let collective_state = CollectiveLoweringState::new();
+    let collective_state =
+        CollectiveLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
     let mut mesh = None;
     for region in program.regions().iter() {
         for atom in region.atoms() {
@@ -7732,6 +8087,293 @@ pub(super) fn lower_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![collapse_singleton_axis(result, output_array_type, block, context, location)?])
 }
 
+/// Emits one overwrite-mode `ragged_all_to_all` typed-FFI custom call.
+fn emit_ragged_all_to_all_custom_call<'b, 'c: 'b, 't: 'c>(
+    collective_state: &CollectiveLoweringState,
+    replica_groups: &[Vec<usize>],
+    inputs: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    let group_size = replica_groups.first().map(Vec::len).unwrap_or(0);
+    if replica_groups.iter().any(|group| group.len() != group_size) {
+        return Err(ProgramError::MalformedProgram(
+            "`ragged_all_to_all` replica groups must all have the same size".to_string(),
+        )
+        .into());
+    }
+    let replica_group_type = context
+        .tensor_type(
+            context.signless_integer_type(64),
+            &[MlirSize::Static(replica_groups.len()), MlirSize::Static(group_size)],
+            None,
+            location,
+        )
+        .map_err(|_| LoweringError::InvalidTensorType {
+            array_type: ArrayType::new_static(DataType::I64, [replica_groups.len(), group_size]),
+        })?;
+    let replica_group_values = replica_groups
+        .iter()
+        .flatten()
+        .map(|&device| {
+            i64::try_from(device).map_err(|_| {
+                ProgramError::MalformedProgram(format!(
+                    "`ragged_all_to_all` replica id {device} cannot be represented as an i64 backend attribute",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let replica_groups = context
+        .dense_i64_elements_attribute(replica_group_type, replica_group_values.as_slice())
+        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+    let channel_id = collective_state.next_channel_id();
+    let channel_id = i64::try_from(channel_id).map_err(|_| {
+        ProgramError::MalformedProgram(format!(
+            "`ragged_all_to_all` channel id {channel_id} cannot be represented as an i64 backend attribute",
+        ))
+    })?;
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier("replica_groups"), replica_groups.as_ref()),
+        context.named_attribute(
+            context.identifier("channel_id"),
+            context.integer_attribute(context.signless_integer_type(64), channel_id),
+        ),
+    ]);
+    let output_type = inputs[1].r#type()?;
+    let custom_call = block.append_operation(stable_hlo::custom_call(
+        inputs,
+        "ragged_all_to_all",
+        false,
+        Some(backend_config.as_ref()),
+        CustomCallApiVersion::TypedFfi,
+        &[],
+        None,
+        &[],
+        None,
+        &[output_type],
+        location,
+    )?)?;
+    Ok(custom_call.result(0).expect("ragged_all_to_all custom call should return one result").as_ref())
+}
+
+/// Rejects target platforms whose runtime does not register the accelerator ragged-collective custom call.
+fn validate_ragged_all_to_all_target(collective_state: &CollectiveLoweringState) -> Result<(), LoweringError> {
+    if collective_state.target_platform().is_some_and(|platform| platform.eq_ignore_ascii_case("cpu")) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: "`ragged_all_to_all` is not supported by the XLA CPU backend".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Lowers one named-axis ragged exchange to XLA's typed-FFI `ragged_all_to_all` custom call.
+///
+/// The public overwrite operation maps directly to one call. The transpose-only additive form rebases every transfer
+/// into a private lane of an expanded output, then reduces the lanes and adds the supplied output seed. The custom
+/// call therefore still writes disjoint regions while duplicate sends accumulate in the reduction.
+pub(super) fn lower_ragged_all_to_all_to_mlir<'b, 'c: 'b, 't: 'c>(
+    operation: &RaggedAllToAllOperation,
+    collective_state: &CollectiveLoweringState,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    validate_ragged_all_to_all_target(collective_state)?;
+    check_count!("input", input_values, 6, ProgramError);
+    check_count!("input", input_types, 6, ProgramError);
+    let (replica_groups, effective_axis_size) = collective_replica_groups(
+        collective_state,
+        operation.axis_name(),
+        operation.axis_size(),
+        operation.axis_index_groups(),
+    )?;
+    if !operation.accumulates_updates() {
+        return Ok(vec![emit_ragged_all_to_all_custom_call(
+            collective_state,
+            replica_groups.as_slice(),
+            input_values,
+            block,
+            context,
+            location,
+        )?]);
+    }
+
+    let metadata_length = input_types[2].shape().dimensions()[0].value().ok_or_else(|| {
+        ProgramError::MalformedProgram(
+            "`ragged_all_to_all` additive lowering requires a static metadata length".to_string(),
+        )
+    })?;
+    if metadata_length % effective_axis_size != 0 {
+        return Err(ProgramError::MalformedProgram(format!(
+            "`ragged_all_to_all` metadata length {metadata_length} is not divisible by group size \
+             {effective_axis_size}",
+        ))
+        .into());
+    }
+    let transfers_per_participant = metadata_length / effective_axis_size;
+    let output_extent = input_types[1].shape().dimensions()[0].value().ok_or_else(|| {
+        ProgramError::MalformedProgram(
+            "`ragged_all_to_all` additive lowering requires a static output leading dimension".to_string(),
+        )
+    })?;
+    let expanded_extent = metadata_length.checked_mul(output_extent).ok_or_else(|| {
+        ProgramError::MalformedProgram(
+            "`ragged_all_to_all` additive lowering overflowed its expanded output extent".to_string(),
+        )
+    })?;
+    let mut expanded_dimensions = input_types[1].shape().dimensions().to_vec();
+    expanded_dimensions[0] = Dimension::Static(expanded_extent);
+    let expanded_output_type = input_types[1].clone().with_shape(Shape::new(expanded_dimensions));
+    let expanded_output = if expanded_output_type.static_shape().is_some() {
+        lower_constant_output(std::slice::from_ref(&expanded_output_type), 0, block, context, location)?.remove(0)
+    } else {
+        let physical_type = physical_bound_type(&expanded_output_type)?;
+        let zero = lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+        let dimension_sources =
+            (0..expanded_output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
+        lower_restore_dynamic_dimensions(
+            zero,
+            &expanded_output_type,
+            dimension_sources.as_slice(),
+            block,
+            context,
+            location,
+        )?
+    };
+
+    let metadata_type = input_types[2].clone().with_data_type(DataType::U64);
+    let metadata_tensor_type = lower_tensor_type(&metadata_type, context, location)?;
+    let metadata = input_values[2..]
+        .iter()
+        .zip(&input_types[2..])
+        .map(|(&value, r#type)| {
+            if r#type.data_type() == DataType::U64 {
+                return Ok(value);
+            }
+            let converted = block.append_operation(stable_hlo::convert(value, metadata_tensor_type, location)?)?;
+            Ok(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
+        })
+        .collect::<Result<Vec<_>, LoweringError>>()?;
+    let metadata_indices = block.append_operation(stable_hlo::iota(metadata_tensor_type, 0, location)?)?;
+    let metadata_indices = metadata_indices.result(0).expect("stablehlo.iota should return one result").as_ref();
+    let transfers_per_participant_value = lower_u64_scalar_constant(
+        u64::try_from(transfers_per_participant).map_err(|_| {
+            ProgramError::MalformedProgram(
+                "`ragged_all_to_all` transfers per participant cannot be represented as u64".to_string(),
+            )
+        })?,
+        block,
+        context,
+        location,
+    )?;
+    let transfer_count = block.append_operation(stable_hlo::broadcast(
+        transfers_per_participant_value,
+        metadata_tensor_type,
+        &[],
+        location,
+    )?)?;
+    let transfer_count =
+        transfer_count.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+    let transfer_slots = block.append_operation(stable_hlo::remainder(metadata_indices, transfer_count, location)?)?;
+    let transfer_slots = transfer_slots.result(0).expect("stablehlo.remainder should return one result").as_ref();
+    let source_axis_index = lower_axis_index_to_coordinate(
+        &AxisIndexOperation::new(operation.axis_name().to_string()),
+        collective_state,
+        block,
+        context,
+        location,
+    )?;
+    let source_group_position = if let Some(groups) = operation.axis_index_groups() {
+        let mut positions = vec![0_i64; operation.axis_size()];
+        for group in groups {
+            for (position, &axis_index) in group.iter().enumerate() {
+                positions[axis_index] = i64::try_from(position).map_err(|_| {
+                    ProgramError::MalformedProgram(format!(
+                        "`ragged_all_to_all` group position {position} cannot be represented as an i64 backend \
+                         attribute",
+                    ))
+                })?;
+            }
+        }
+        let positions_type =
+            lower_tensor_type(&ArrayType::new_static(DataType::I64, [operation.axis_size()]), context, location)?;
+        let positions = context
+            .dense_i64_elements_attribute(positions_type, positions.as_slice())
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::I64 })?;
+        let positions = block.append_operation(stable_hlo::constant(positions, location)?)?;
+        let positions = positions.result(0).expect("stablehlo.constant should return one result").as_ref();
+        let position =
+            block.append_operation(stable_hlo::dynamic_slice(positions, &[source_axis_index], &[1], location)?)?;
+        let position = position.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref();
+        let position = block.append_operation(stable_hlo::convert(
+            position,
+            lower_tensor_type(&ArrayType::new_static(DataType::U64, [1]), context, location)?,
+            location,
+        )?)?;
+        let position = position.result(0).expect("stablehlo.convert should return one result").as_ref();
+        let position = block.append_operation(stable_hlo::reshape_with_output_type(
+            position,
+            lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?,
+            location,
+        )?)?;
+        position.result(0).expect("stablehlo.reshape should return one result").as_ref()
+    } else {
+        source_axis_index
+    };
+    let source_lane_base = block.append_operation(stable_hlo::multiply(
+        source_group_position,
+        transfers_per_participant_value,
+        location,
+    )?)?;
+    let source_lane_base = source_lane_base.result(0).expect("stablehlo.multiply should return one result").as_ref();
+    let source_lane_base =
+        block.append_operation(stable_hlo::broadcast(source_lane_base, metadata_tensor_type, &[], location)?)?;
+    let source_lane_base =
+        source_lane_base.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+    let lane_indices = block.append_operation(stable_hlo::add(source_lane_base, transfer_slots, location)?)?;
+    let lane_indices = lane_indices.result(0).expect("stablehlo.add should return one result").as_ref();
+    let lane_stride = lower_constant_elements_attribute(
+        DataType::U64,
+        metadata_tensor_type,
+        i64::try_from(output_extent).map_err(|_| {
+            ProgramError::MalformedProgram(format!(
+                "`ragged_all_to_all` output extent {output_extent} cannot be represented by its metadata",
+            ))
+        })?,
+        context,
+    )?;
+    let lane_stride = block.append_operation(stable_hlo::constant(lane_stride, location)?)?;
+    let lane_stride = lane_stride.result(0).expect("stablehlo.constant should return one result").as_ref();
+    let lane_offsets = block.append_operation(stable_hlo::multiply(lane_indices, lane_stride, location)?)?;
+    let lane_offsets = lane_offsets.result(0).expect("stablehlo.multiply should return one result").as_ref();
+    let output_offsets = block.append_operation(stable_hlo::add(metadata[2], lane_offsets, location)?)?;
+    let output_offsets = output_offsets.result(0).expect("stablehlo.add should return one result").as_ref();
+    let transfer_inputs = [input_values[0], expanded_output, metadata[0], metadata[1], output_offsets, metadata[3]];
+    let expanded = emit_ragged_all_to_all_custom_call(
+        collective_state,
+        replica_groups.as_slice(),
+        transfer_inputs.as_slice(),
+        block,
+        context,
+        location,
+    )?;
+    let mut lane_dimensions = input_types[1].shape().dimensions().to_vec();
+    lane_dimensions[0] = Dimension::Static(output_extent);
+    lane_dimensions.insert(0, Dimension::Static(metadata_length));
+    let lane_type =
+        lower_tensor_type(&input_types[1].clone().with_shape(Shape::new(lane_dimensions)), context, location)?;
+    let lanes = block.append_operation(stable_hlo::reshape_with_output_type(expanded, lane_type, location)?)?;
+    let lanes = lanes.result(0).expect("stablehlo.reshape should return one result").as_ref();
+    let contribution =
+        lower_reduce_to_mlir(ReductionKind::Sum, &[0], lanes, &input_types[1], block, context, location)?;
+    let sum = block.append_operation(stable_hlo::add(input_values[1], contribution, location)?)?;
+    Ok(vec![sum.result(0).expect("stablehlo.add should return one result").as_ref()])
+}
+
 /// Lowers one [`ParallelReduceOperation`] inside a `sdy.manual_computation` region to a `stablehlo.all_reduce` over
 /// the device mesh axis the collective names.
 ///
@@ -8956,9 +9598,10 @@ mod tests {
         DimensionType, DimensionVariable, DivOperation, Dot, DotDimensionNumbers, DynamicBroadcastOperation,
         DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, Fill, LogSumExpOperation, LogicalMesh,
         MeshAxis, MeshAxisType, OneLike, OneLikeOperation, OneOperation, OrOperation, PadOperation, Placeholder,
-        ProgramBuilder, Provenance, ProvenanceScope, ReduceOperation, ReshapeOperation, ReverseModeDifferentiate,
-        ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin, SliceOperation, Transpose, TypeError,
-        UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike, ZeroOperation, i1, i2, i4, u1, u2, u4,
+        ProgramBuilder, Provenance, ProvenanceScope, RaggedDot, ReduceOperation, ReshapeOperation,
+        ReverseModeDifferentiate, ScanOperation, SelectOperation, Shape, Sharding, ShardingDimension, Sin,
+        SliceOperation, Transpose, TypeError, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLike,
+        ZeroLikeOperation, ZeroOperation, i1, i2, i4, u1, u2, u4,
     };
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -9611,7 +10254,7 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
-        use ryft_core::{FreezeReferenceOperation, NewReferenceOperation};
+        use ryft_core::{FreezeReferenceOperation, NewReferenceOperation, ReferenceWriteOperation};
 
         assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
 
@@ -9623,6 +10266,14 @@ mod tests {
         let reference = builder
             .add_instruction(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), vec![input], None)
             .unwrap()[0];
+        builder
+            .add_instruction(
+                XlaOperation::ReferenceWrite(ReferenceWriteOperation::new()),
+                Vec::new(),
+                vec![reference, input],
+                None,
+            )
+            .unwrap();
         let output = builder
             .add_instruction(
                 XlaOperation::FreezeReference(FreezeReferenceOperation::new()),
@@ -9690,6 +10341,7 @@ mod tests {
             Some(result_shardings.as_slice()),
             None,
             &states,
+            RaggedDotLoweringStrategy::default(),
         )
         .unwrap();
         assert_eq!(lowered.signature.input_mapping(), &[None, Some(0), Some(1)]);
@@ -9728,6 +10380,7 @@ mod tests {
                 Some(result_shardings.as_slice()),
                 None,
                 std::slice::from_ref(&invalid_state),
+                RaggedDotLoweringStrategy::default(),
             ),
             Err(LoweringError::InvalidReferenceStateAbi { message })
                 if message == "logical state input 0 is erased from the executable boundary",
@@ -9749,6 +10402,7 @@ mod tests {
                     result_shardings,
                     None,
                     &states,
+                    RaggedDotLoweringStrategy::default(),
                 ),
                 Err(LoweringError::InvalidReferenceStateAbi { message })
                     if message == asymmetric_sharding_message,
@@ -9767,6 +10421,7 @@ mod tests {
                 Some(mismatched_result_shardings.as_slice()),
                 None,
                 &states,
+                RaggedDotLoweringStrategy::default(),
             ),
             Err(LoweringError::InvalidReferenceStateAbi { message })
                 if message == "state input 1 and output 0 must use the same sharding",
@@ -9797,6 +10452,7 @@ mod tests {
                 Some(std::slice::from_ref(&sharding)),
                 None,
                 std::slice::from_ref(&reference_state),
+                RaggedDotLoweringStrategy::default(),
             ),
             Err(LoweringError::InvalidReferenceStateAbi { message })
                 if message == "state input 0 and output 0 must be static because bounded-dynamic mutation alias \
@@ -10932,7 +11588,7 @@ mod tests {
             |x| {
                 let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul());
                 let waveform = (-product).cos().unwrap().sin().unwrap();
-                (waveform.clone() * waveform.one_like()) + waveform.zero_like()
+                (waveform.clone() * waveform.one_like().unwrap()) + waveform.zero_like().unwrap()
             },
             global_input_type,
             mesh.clone(),
@@ -10984,6 +11640,417 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         to_mlir_module_for_plain_program(&program, "main")
+    }
+
+    // Lowers one grouped-dot signature using `strategy`.
+    fn lowered_ragged_dot_module_for(
+        dimensions: RaggedDotDimensionNumbers,
+        lhs_type: ArrayType,
+        rhs_type: ArrayType,
+        group_sizes_type: ArrayType,
+        strategy: RaggedDotLoweringStrategy,
+    ) -> Result<String, LoweringError> {
+        let mut builder = XlaProgramBuilder::new();
+        let lhs = builder.add_input(lhs_type);
+        let rhs = builder.add_input(rhs_type);
+        let group_sizes = builder.add_input(group_sizes_type);
+        let output = builder
+            .add_instruction(
+                ArrayOperation::RaggedDot(RaggedDotOperation::new(dimensions)),
+                Vec::new(),
+                vec![lhs, rhs, group_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(&program, "main", strategy)
+    }
+
+    // Lowers the basic non-contracting grouped-matrix form using `strategy`.
+    fn lowered_ragged_dot_module(strategy: RaggedDotLoweringStrategy) -> Result<String, LoweringError> {
+        lowered_ragged_dot_module_for(
+            RaggedDotDimensionNumbers::matmul(),
+            ArrayType::new_static(DataType::F32, [5, 2]),
+            ArrayType::new_static(DataType::F32, [3, 2, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            strategy,
+        )
+    }
+
+    #[test]
+    fn test_ragged_dot_lowering_strategies() {
+        let decomposition = lowered_ragged_dot_module(RaggedDotLoweringStrategy::Decomposition).unwrap();
+        assert_eq!(
+            decomposition,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<5x2xf32>, \
+                  %arg1: tensor<3x2x1xf32>, %arg2: tensor<3xi32>) -> tensor<5x1xf32> {
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %0 = \"stablehlo.reduce_window\"(%arg2, %c) \
+                    <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
+                    ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):
+                      %13 = stablehlo.add %arg3, %arg4 : tensor<i32>
+                      stablehlo.return %13 : tensor<i32>
+                    }) : (tensor<3xi32>, tensor<i32>) -> tensor<3xi32>
+                    %1 = stablehlo.subtract %0, %arg2 : tensor<3xi32>
+                    %2 = stablehlo.broadcast_in_dim %arg0, dims = [1, 2] : (tensor<5x2xf32>) -> tensor<3x5x2xf32>
+                    %3 = stablehlo.broadcast_in_dim %1, dims = [0] : (tensor<3xi32>) -> tensor<3x5x2xi32>
+                    %4 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<3xi32>) -> tensor<3x5x2xi32>
+                    %5 = stablehlo.iota dim = 1 : tensor<3x5x2xi32>
+                    %6 = stablehlo.compare LE, %3, %5, SIGNED : \
+                    (tensor<3x5x2xi32>, tensor<3x5x2xi32>) -> tensor<3x5x2xi1>
+                    %7 = stablehlo.compare LT, %5, %4, SIGNED : \
+                    (tensor<3x5x2xi32>, tensor<3x5x2xi32>) -> tensor<3x5x2xi1>
+                    %8 = stablehlo.and %6, %7 : tensor<3x5x2xi1>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %9 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x5x2xf32>
+                    %10 = stablehlo.select %8, %2, %9 : tensor<3x5x2xi1>, tensor<3x5x2xf32>
+                    %11 = stablehlo.transpose %10, dims = [0, 1, 2] : (tensor<3x5x2xf32>) -> tensor<3x5x2xf32>
+                    %12 = stablehlo.dot_general %11, %arg1, contracting_dims = [2, 0] x [1, 0], \
+                    precision = [DEFAULT, DEFAULT] : \
+                    (tensor<3x5x2xf32>, tensor<3x2x1xf32>) -> tensor<5x1xf32>
+                    return %12 : tensor<5x1xf32>
+                  }
+                }
+            "},
+        );
+
+        let instruction = lowered_ragged_dot_module(RaggedDotLoweringStrategy::Instruction).unwrap();
+        assert_eq!(
+            instruction,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<5x2xf32>, \
+                  %arg1: tensor<3x2x1xf32>, %arg2: tensor<3xi32>) -> tensor<5x1xf32> {
+                    %0 = \"chlo.ragged_dot\"(%arg0, %arg1, %arg2) \
+                    <{precision_config = [#chlo<precision DEFAULT>, #chlo<precision DEFAULT>], \
+                    ragged_dot_dimension_numbers = \
+                    #chlo.ragged_dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1], \
+                    lhs_ragged_dimensions = [0], rhs_group_dimensions = [0]>}> : \
+                    (tensor<5x2xf32>, tensor<3x2x1xf32>, tensor<3xi32>) -> tensor<5x1xf32>
+                    return %0 : tensor<5x1xf32>
+                  }
+                }
+            "},
+        );
+
+        let contracting_dimensions = RaggedDotDimensionNumbers::new(
+            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+            vec![1],
+            Vec::new(),
+        );
+        let contracting = lowered_ragged_dot_module_for(
+            contracting_dimensions.clone(),
+            ArrayType::new_static(DataType::F32, [2, 5]),
+            ArrayType::new_static(DataType::F32, [5, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            RaggedDotLoweringStrategy::Decomposition,
+        )
+        .unwrap();
+        assert_eq!(
+            contracting,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x5xf32>, \
+                  %arg1: tensor<5x1xf32>, %arg2: tensor<3xi32>) -> tensor<3x2x1xf32> {
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %0 = \"stablehlo.reduce_window\"(%arg2, %c) \
+                    <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
+                    ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):
+                      %25 = stablehlo.add %arg3, %arg4 : tensor<i32>
+                      stablehlo.return %25 : tensor<i32>
+                    }) : (tensor<3xi32>, tensor<i32>) -> tensor<3xi32>
+                    %1 = stablehlo.subtract %0, %arg2 : tensor<3xi32>
+                    %2 = stablehlo.broadcast_in_dim %arg0, dims = [1, 2] : (tensor<2x5xf32>) -> tensor<3x2x5xf32>
+                    %3 = stablehlo.broadcast_in_dim %1, dims = [0] : (tensor<3xi32>) -> tensor<3x2x5xi32>
+                    %4 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<3xi32>) -> tensor<3x2x5xi32>
+                    %5 = stablehlo.iota dim = 2 : tensor<3x2x5xi32>
+                    %6 = stablehlo.compare LE, %3, %5, SIGNED : \
+                    (tensor<3x2x5xi32>, tensor<3x2x5xi32>) -> tensor<3x2x5xi1>
+                    %7 = stablehlo.compare LT, %5, %4, SIGNED : \
+                    (tensor<3x2x5xi32>, tensor<3x2x5xi32>) -> tensor<3x2x5xi1>
+                    %8 = stablehlo.and %6, %7 : tensor<3x2x5xi1>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %9 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x2x5xf32>
+                    %10 = stablehlo.select %8, %2, %9 : tensor<3x2x5xi1>, tensor<3x2x5xf32>
+                    %11 = stablehlo.transpose %10, dims = [0, 1, 2] : (tensor<3x2x5xf32>) -> tensor<3x2x5xf32>
+                    %c_0 = stablehlo.constant dense<0> : tensor<i32>
+                    %12 = \"stablehlo.reduce_window\"(%arg2, %c_0) \
+                    <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
+                    ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):
+                      %25 = stablehlo.add %arg3, %arg4 : tensor<i32>
+                      stablehlo.return %25 : tensor<i32>
+                    }) : (tensor<3xi32>, tensor<i32>) -> tensor<3xi32>
+                    %13 = stablehlo.subtract %12, %arg2 : tensor<3xi32>
+                    %14 = stablehlo.broadcast_in_dim %arg1, dims = [1, 2] : (tensor<5x1xf32>) -> tensor<3x5x1xf32>
+                    %15 = stablehlo.broadcast_in_dim %13, dims = [0] : (tensor<3xi32>) -> tensor<3x5x1xi32>
+                    %16 = stablehlo.broadcast_in_dim %12, dims = [0] : (tensor<3xi32>) -> tensor<3x5x1xi32>
+                    %17 = stablehlo.iota dim = 1 : tensor<3x5x1xi32>
+                    %18 = stablehlo.compare LE, %15, %17, SIGNED : \
+                    (tensor<3x5x1xi32>, tensor<3x5x1xi32>) -> tensor<3x5x1xi1>
+                    %19 = stablehlo.compare LT, %17, %16, SIGNED : \
+                    (tensor<3x5x1xi32>, tensor<3x5x1xi32>) -> tensor<3x5x1xi1>
+                    %20 = stablehlo.and %18, %19 : tensor<3x5x1xi1>
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %21 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<3x5x1xf32>
+                    %22 = stablehlo.select %20, %14, %21 : tensor<3x5x1xi1>, tensor<3x5x1xf32>
+                    %23 = stablehlo.transpose %22, dims = [0, 1, 2] : (tensor<3x5x1xf32>) -> tensor<3x5x1xf32>
+                    %24 = stablehlo.dot_general %11, %23, batching_dims = [0] x [0], \
+                    contracting_dims = [2] x [1], precision = [DEFAULT, DEFAULT] : \
+                    (tensor<3x2x5xf32>, tensor<3x5x1xf32>) -> tensor<3x2x1xf32>
+                    return %24 : tensor<3x2x1xf32>
+                  }
+                }
+            "},
+        );
+        let contracting_instruction = lowered_ragged_dot_module_for(
+            contracting_dimensions,
+            ArrayType::new_static(DataType::F32, [2, 5]),
+            ArrayType::new_static(DataType::F32, [5, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            RaggedDotLoweringStrategy::Instruction,
+        )
+        .unwrap();
+        assert_eq!(
+            contracting_instruction,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x5xf32>, \
+                  %arg1: tensor<5x1xf32>, %arg2: tensor<3xi32>) -> tensor<3x2x1xf32> {
+                    %0 = \"chlo.ragged_dot\"(%arg0, %arg1, %arg2) \
+                    <{precision_config = [#chlo<precision DEFAULT>, #chlo<precision DEFAULT>], \
+                    ragged_dot_dimension_numbers = \
+                    #chlo.ragged_dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0], \
+                    lhs_ragged_dimensions = [1]>}> : \
+                    (tensor<2x5xf32>, tensor<5x1xf32>, tensor<3xi32>) -> tensor<3x2x1xf32>
+                    return %0 : tensor<3x2x1xf32>
+                  }
+                }
+            "},
+        );
+
+        let batch_dimensions = RaggedDotDimensionNumbers::new(
+            DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+            vec![0],
+            Vec::new(),
+        );
+        let batch = lowered_ragged_dot_module_for(
+            batch_dimensions.clone(),
+            ArrayType::new_static(DataType::F32, [5, 2]),
+            ArrayType::new_static(DataType::F32, [5, 2, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            RaggedDotLoweringStrategy::Decomposition,
+        )
+        .unwrap();
+        assert_eq!(
+            batch,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<5x2xf32>, \
+                  %arg1: tensor<5x2x1xf32>, %arg2: tensor<3xi32>) -> tensor<5x1xf32> {
+                    %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [0] x [0], \
+                    contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : \
+                    (tensor<5x2xf32>, tensor<5x2x1xf32>) -> tensor<5x1xf32>
+                    return %0 : tensor<5x1xf32>
+                  }
+                }
+            "},
+        );
+        let batch_instruction = lowered_ragged_dot_module_for(
+            batch_dimensions,
+            ArrayType::new_static(DataType::F32, [5, 2]),
+            ArrayType::new_static(DataType::F32, [5, 2, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            RaggedDotLoweringStrategy::Instruction,
+        )
+        .unwrap();
+        assert_eq!(
+            batch_instruction,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<5x2xf32>, \
+                  %arg1: tensor<5x2x1xf32>, %arg2: tensor<3xi32>) -> tensor<5x1xf32> {
+                    %0 = \"chlo.ragged_dot\"(%arg0, %arg1, %arg2) \
+                    <{precision_config = [#chlo<precision DEFAULT>, #chlo<precision DEFAULT>], \
+                    ragged_dot_dimension_numbers = \
+                    #chlo.ragged_dot<lhs_batching_dimensions = [0], rhs_batching_dimensions = [0], \
+                    lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [1], \
+                    lhs_ragged_dimensions = [0]>}> : \
+                    (tensor<5x2xf32>, tensor<5x2x1xf32>, tensor<3xi32>) -> tensor<5x1xf32>
+                    return %0 : tensor<5x1xf32>
+                  }
+                }
+            "},
+        );
+
+        let complex = lowered_ragged_dot_module_for(
+            RaggedDotDimensionNumbers::matmul(),
+            ArrayType::new_static(DataType::C64, [5, 2]),
+            ArrayType::new_static(DataType::C64, [3, 2, 1]),
+            ArrayType::new_static(DataType::I32, [3]),
+            RaggedDotLoweringStrategy::Decomposition,
+        )
+        .unwrap();
+        assert_eq!(
+            complex,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<5x2xcomplex<f32>>, \
+                  %arg1: tensor<3x2x1xcomplex<f32>>, %arg2: tensor<3xi32>) -> tensor<5x1xcomplex<f32>> {
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %0 = \"stablehlo.reduce_window\"(%arg2, %c) \
+                    <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
+                    ^bb0(%arg3: tensor<i32>, %arg4: tensor<i32>):
+                      %14 = stablehlo.add %arg3, %arg4 : tensor<i32>
+                      stablehlo.return %14 : tensor<i32>
+                    }) : (tensor<3xi32>, tensor<i32>) -> tensor<3xi32>
+                    %1 = stablehlo.subtract %0, %arg2 : tensor<3xi32>
+                    %2 = stablehlo.broadcast_in_dim %arg0, dims = [1, 2] : \
+                    (tensor<5x2xcomplex<f32>>) -> tensor<3x5x2xcomplex<f32>>
+                    %3 = stablehlo.broadcast_in_dim %1, dims = [0] : (tensor<3xi32>) -> tensor<3x5x2xi32>
+                    %4 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<3xi32>) -> tensor<3x5x2xi32>
+                    %5 = stablehlo.iota dim = 1 : tensor<3x5x2xi32>
+                    %6 = stablehlo.compare LE, %3, %5, SIGNED : \
+                    (tensor<3x5x2xi32>, tensor<3x5x2xi32>) -> tensor<3x5x2xi1>
+                    %7 = stablehlo.compare LT, %5, %4, SIGNED : \
+                    (tensor<3x5x2xi32>, tensor<3x5x2xi32>) -> tensor<3x5x2xi1>
+                    %8 = stablehlo.and %6, %7 : tensor<3x5x2xi1>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %9 = stablehlo.complex %cst, %cst_0 : tensor<complex<f32>>
+                    %10 = stablehlo.broadcast_in_dim %9, dims = [] : \
+                    (tensor<complex<f32>>) -> tensor<3x5x2xcomplex<f32>>
+                    %11 = stablehlo.select %8, %2, %10 : tensor<3x5x2xi1>, tensor<3x5x2xcomplex<f32>>
+                    %12 = stablehlo.transpose %11, dims = [0, 1, 2] : \
+                    (tensor<3x5x2xcomplex<f32>>) -> tensor<3x5x2xcomplex<f32>>
+                    %13 = stablehlo.dot_general %12, %arg1, contracting_dims = [2, 0] x [1, 0], \
+                    precision = [DEFAULT, DEFAULT] : \
+                    (tensor<3x5x2xcomplex<f32>>, tensor<3x2x1xcomplex<f32>>) -> tensor<5x1xcomplex<f32>>
+                    return %13 : tensor<5x1xcomplex<f32>>
+                  }
+                }
+            "},
+        );
+    }
+
+    // Returns the single-device CPU compilation contract shared by grouped-dot execution and rejection coverage.
+    fn ragged_dot_cpu_compilation_options() -> ryft_pjrt::protos::CompilationOptions {
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+
+        CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: Default::default(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        }
+    }
+
+    // Compiles and executes the basic grouped-matrix decomposition on the CPU plugin.
+    fn execute_ragged_dot_decomposition_on_cpu() -> Vec<f32> {
+        use std::sync::Arc;
+
+        use ryft_pjrt::{
+            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+            load_cpu_plugin,
+        };
+
+        use crate::tests::values_from_bytes;
+
+        let module = lowered_ragged_dot_module(RaggedDotLoweringStrategy::Decomposition).unwrap();
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let lhs = client
+            .buffer(
+                values_to_bytes(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]).as_slice(),
+                BufferType::F32,
+                &[5, 2],
+                None,
+                device.clone(),
+                None,
+            )
+            .unwrap();
+        let rhs = client
+            .buffer(
+                values_to_bytes(&[10.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0]).as_slice(),
+                BufferType::F32,
+                &[3, 2, 1],
+                None,
+                device.clone(),
+                None,
+            )
+            .unwrap();
+        let group_sizes = client
+            .buffer(values_to_bytes(&[1_i32, 0, 3]).as_slice(), BufferType::I32, &[3], None, device, None)
+            .unwrap();
+        let inputs = [lhs, rhs, group_sizes]
+            .into_iter()
+            .map(|buffer| ExecutionInput { buffer: Arc::new(buffer), donatable: false })
+            .collect::<Vec<_>>();
+        let mut executions = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: inputs.as_slice(), ..Default::default() }],
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let output = executions.remove(0).outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+        values_from_bytes::<f32>(output.as_slice())
+    }
+
+    #[test]
+    fn test_ragged_dot_decomposition_executes_on_cpu() {
+        let lhs = CpuArray::matrix(5, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+        let rhs =
+            CpuArray::from_f64s(ArrayType::new_static(DataType::F32, [3, 2, 1]), vec![10.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let eager = lhs.ragged_dot(&rhs, &CpuArray::vector(vec![1_i32, 0, 3])).unwrap();
+        let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
+        assert_eq!(expected, vec![12.0, 32.0, 50.0, 68.0, 0.0]);
+        assert_eq!(execute_ragged_dot_decomposition_on_cpu(), expected);
+    }
+
+    #[test]
+    fn test_ragged_dot_instruction_is_explicitly_unsupported_on_cpu() {
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, Error, Program as PjrtProgram, load_cpu_plugin};
+
+        let module = lowered_ragged_dot_module(RaggedDotLoweringStrategy::Instruction).unwrap();
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        assert!(matches!(
+            client.compile(
+                &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                &ragged_dot_cpu_compilation_options(),
+            ),
+            Err(Error::Unimplemented { message, .. })
+                if message == "HLO opcode `ragged-dot` is not supported by XLA:CPU ThunkEmitter",
+        ));
     }
 
     #[test]
@@ -15931,7 +16998,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_space_one_like_lowers_to_the_unique_zero_value() {
+    fn test_zero_space_one_like_is_rejected() {
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
@@ -15940,11 +17007,30 @@ mod tests {
             .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::Tracing(ProgramError::Type(TypeError::invalid(
+                "data type `zero` cannot represent one",
+            )))),
+        );
+    }
 
-        assert!(stablehlo.contains("func.func @main(%arg0: tensor<3xi1>) -> tensor<3xi1>"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.constant dense<false> : tensor<i1>"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.broadcast_in_dim"), "{stablehlo}");
+    #[test]
+    fn test_f8e8m0fnu_zero_like_is_rejected() {
+        let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaArrayConstant>, Vec<XlaArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(LoweringError::Tracing(ProgramError::Type(TypeError::invalid(
+                "data type `f8e8m0fnu` cannot represent zero",
+            )))),
+        );
     }
 
     #[test]

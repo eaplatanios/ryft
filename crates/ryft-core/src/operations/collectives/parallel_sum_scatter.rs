@@ -51,6 +51,7 @@ use super::{
     jvp_shape_changing_collective_with_adjoint, reject_ragged_collective_inputs, require_collective_axis_extent,
     resolve_named_axis_size, shape_changing_collective, shape_changing_collective_dimensions,
     shape_changing_collective_output_type, transpose_shape_changing_collective, validate_collective_axis_size,
+    validate_explicit_collective_output_extents,
 };
 
 /// Applies sum-scatter's reduction-state transition. Ordinary operands preserve their variance metadata. An operand
@@ -548,7 +549,17 @@ where
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(self.name(), inputs)?;
+        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        if let Some(ragged_axis) = array.ragged_axes().first() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{}` does not support bounded ragged dimension `{}` on operand 0",
+                    self.name(),
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
+        validate_explicit_collective_output_extents(output_extents)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types =
             infer_explicit_parallel_sum_scatter_output_types(self, logical_input_types.as_slice())?;
@@ -640,8 +651,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DataType};
-    use crate::batching::{BatchAxis, BatchAxisSpecification, batch};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionType, DimensionVariable, RaggedAxis,
+    };
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::operations::collectives::tests::f32_vector;
 
@@ -676,6 +689,35 @@ mod tests {
         assert_eq!(forwarded_parallel_sum_scatter_axes(CollectiveMode::Tiled, 0, 1), (0, 1));
         assert_eq!(forwarded_parallel_sum_scatter_axes(CollectiveMode::Untiled, 0, 1), (0, 0));
         assert_eq!(forwarded_parallel_sum_scatter_axes(CollectiveMode::Untiled, 1, 0), (2, 0));
+    }
+
+    #[test]
+    fn test_array_ir_parallel_sum_scatter_rejects_ragged_input_before_mapped_extents() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let extents = ArrayIrValue::Array(Array::vector(vec![2_i32, 4]));
+        let input = ArrayIrBatch::new(ArrayIrValue::Array(Array::matrix(2, 4, vec![1.0_f32; 8])), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents.clone(), variable.clone(), vec![0])])
+            .unwrap();
+        let output_extent =
+            ArrayIrBatch::mapped_dimension(extents, BatchAxis::new(0), DimensionType::new(variable)).unwrap();
+        let context = BatchingContext::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        )
+        .with_axis_name("x".to_string());
+
+        assert_eq!(
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled()).batch_in_parent(
+                &context,
+                &crate::EmptyRegionDriver,
+                &[input, output_extent],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on operand 0"
+                    .to_string(),
+            }),
+        );
     }
 
     #[test]

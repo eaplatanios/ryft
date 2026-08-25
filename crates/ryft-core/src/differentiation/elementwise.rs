@@ -112,7 +112,7 @@ impl<
             } else {
                 exemplar.convert_element_type(target.data_type())?
             };
-            value.add(&exemplar.zero_like())?
+            value.add(&exemplar.zero_like()?)?
         } else {
             let output_axes = (0..rank).map(|axis| axis + offset).collect::<Vec<_>>();
             value.broadcast(target.clone(), output_axes.as_slice())?

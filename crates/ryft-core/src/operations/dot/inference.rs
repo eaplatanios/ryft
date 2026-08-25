@@ -36,6 +36,103 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
 /// Canonical operation name for [`DotOperation`].
 pub const DOT_OPERATION_NAME: &str = "dot";
 
+/// Canonical operation name for [`RaggedDotOperation`].
+pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
+
+/// Computes the abstract result type of one grouped generalized dot product.
+pub(crate) fn ragged_dot_abstract(
+    lhs: &ArrayType,
+    rhs: &ArrayType,
+    group_sizes: &ArrayType,
+    dimensions: &RaggedDotDimensionNumbers,
+) -> Result<ArrayType, TypeError> {
+    if !group_sizes.data_type().is_integer() {
+        return Err(TypeError::invalid(format!(
+            "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have an integer data type",
+        )));
+    }
+    if group_sizes.rank() == 0 {
+        return Err(TypeError::invalid(format!(
+            "`{RAGGED_DOT_OPERATION_NAME}` group sizes must have rank at least one",
+        )));
+    }
+    let mode = dimensions.mode(lhs.rank())?;
+    let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
+    if group_sizes.rank() != 1 {
+        let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
+        let actual_prefix = Shape::new(group_sizes.shape().dimensions()[..group_sizes.rank() - 1].to_vec());
+        if actual_prefix != expected_prefix {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` group sizes prefix must be `{expected_prefix}`, but got \
+                 `{actual_prefix}`",
+            )));
+        }
+    }
+    let group_count = group_sizes.dimension(group_sizes.rank() - 1);
+    let rhs_group_dimensions = dimensions.rhs_group_dimensions();
+    match mode {
+        RaggedDotMode::NonContracting => {
+            if rhs_group_dimensions.len() != 1 {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` requires exactly one RHS group dimension when the LHS ragged \
+                     dimension is non-contracting",
+                )));
+            }
+            let group_axis = rhs_group_dimensions[0];
+            if group_axis >= rhs.rank() {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension {group_axis} is out of bounds for rank {}",
+                    rhs.rank(),
+                )));
+            }
+            let dot_dimensions = dimensions.dot_dimensions();
+            if dot_dimensions.rhs_batching_dimensions().contains(&group_axis)
+                || dot_dimensions.rhs_contracting_dimensions().contains(&group_axis)
+            {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension must be distinct from batching and contracting \
+                     dimensions",
+                )));
+            }
+            if rhs.dimension(group_axis) != group_count {
+                return Err(TypeError::invalid(format!(
+                    "`{RAGGED_DOT_OPERATION_NAME}` RHS group dimension has extent {} but group sizes describe \
+                     {group_count}",
+                    rhs.dimension(group_axis),
+                )));
+            }
+        }
+        RaggedDotMode::Contracting | RaggedDotMode::Batch if !rhs_group_dimensions.is_empty() => {
+            return Err(TypeError::invalid(format!(
+                "`{RAGGED_DOT_OPERATION_NAME}` requires zero RHS group dimensions when the LHS ragged dimension is \
+                 contracting or batching",
+            )));
+        }
+        RaggedDotMode::Contracting | RaggedDotMode::Batch => {}
+    }
+
+    let mut output = dot_abstract(lhs, rhs, dimensions.dot_dimensions(), None, None)?;
+    if mode != RaggedDotMode::Batch && lhs.data_type() == DataType::F8E8M0FNU {
+        return Err(TypeError::invalid(format!(
+            "`{RAGGED_DOT_OPERATION_NAME}` does not support element data type `f8e8m0fnu` in grouped expansion \
+             modes because it cannot represent zero",
+        )));
+    }
+    match mode {
+        RaggedDotMode::NonContracting => {
+            let rhs_results = rhs_result_axes(dimensions.dot_dimensions(), rhs.rank());
+            let group_position = rhs_results.iter().position(|axis| *axis == rhs_group_dimensions[0]).unwrap();
+            let output_axis = dimensions.dot_dimensions().lhs_batching_dimensions().len()
+                + lhs_result_axes(dimensions.dot_dimensions(), lhs.rank()).len()
+                + group_position;
+            output = output.without_dimension(output_axis)?.0;
+        }
+        RaggedDotMode::Contracting => output = output.with_inserted_dimension(0, group_count)?,
+        RaggedDotMode::Batch => {}
+    }
+    Ok(output)
+}
+
 /// Computes the abstract output type of one generalized dot product.
 ///
 /// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand

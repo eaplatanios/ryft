@@ -38,11 +38,11 @@ impl_differentiable_elementwise_operation! {
         // `select(left <= right, left_tangent, right_tangent)`.
         |(left, left_tangent), (right, _)| {
             let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?;
-            C::Value::select(&left_wins, &left_tangent, &left_tangent.zero_like())?
+            C::Value::select(&left_wins, &left_tangent, &left_tangent.zero_like()?)?
         };
         |(left, _), (right, right_tangent)| {
             let left_wins = left.compare(&right, ComparisonDirection::LessThanOrEqual)?;
-            C::Value::select(&left_wins, &right_tangent.zero_like(), &right_tangent)?
+            C::Value::select(&left_wins, &right_tangent.zero_like()?, &right_tangent)?
         };
     },
     transpose = @nonlinear,

@@ -46,7 +46,10 @@ pub use dimensions::{
     DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
     DimensionToScalarOperation, RUNTIME_DIMENSION_DATA_TYPE,
 };
-pub use dot::{DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps};
+pub use dot::{
+    DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
+    RaggedDotDimensionNumbers, RaggedDotMode, RaggedDotOperation,
+};
 pub use logical::*;
 pub use manipulation::*;
 pub use math::*;

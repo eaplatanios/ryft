@@ -46,12 +46,12 @@ impl_differentiable_elementwise_operation! {
         // d(x^y) = y · x^{y-1} · dx + x^y · log(x) · dy, with log(x) evaluated at a base of one when x = 0 so
         // that the exponent contribution vanishes instead of producing log(0) = -∞.
         |(left, left_tangent), (right, _)| {
-            let exponent = right.clone() - right.one_like();
+            let exponent = right.clone() - right.one_like()?;
             right * left.pow(&exponent)? * left_tangent
         };
         |(left, _), (right, right_tangent)| {
-            let base_is_zero = left.compare(&left.zero_like(), ComparisonDirection::Equal)?;
-            let safe_base = C::Value::select(&base_is_zero, &left.one_like(), &left)?;
+            let base_is_zero = left.compare(&left.zero_like()?, ComparisonDirection::Equal)?;
+            let safe_base = C::Value::select(&base_is_zero, &left.one_like()?, &left)?;
             left.pow(&right)? * safe_base.log()? * right_tangent
         };
     },
@@ -211,7 +211,7 @@ mod tests {
             differentiate_at(Array::scalar(input))
                 .holomorphic()
                 .gradient(|input| {
-                    let exponent = input.one_like() + input.one_like();
+                    let exponent = input.one_like().unwrap() + input.one_like().unwrap();
                     input.pow(&exponent).unwrap()
                 })
                 .unwrap(),

@@ -5,9 +5,11 @@ cumulative-reduction family (`cumulative_sum` is needed by the ragged transpose 
 rename the `p*` collectives to their full-word `parallel_*` forms, split `operations::collectives` into
 per-operation-kind submodules, add a first-class `ragged_all_to_all` collective (packed data + explicit
 offsets/sizes, mirroring `jax.lax.ragged_all_to_all`), add a declared ragged batching contract to
-`CustomCallOperation` (deliberately exceeding JAX, which only supports the manual explicit-operand pattern), and
-keep the per-collective ragged rules as an explicitly gated final phase. The existing
-pre-binding rejection of `RaggedAxis` operands stays the default for every operation without an exact contract.
+`CustomCallOperation` (deliberately exceeding JAX, which only supports the manual explicit-operand pattern), keep
+the per-collective ragged rules as an explicitly gated phase, and add `ragged_dot_general` (grouped matrix
+multiplication with explicit `group_sizes`, JAX's surviving explicit-raggedness track) as a final phase. The
+existing pre-binding rejection of `RaggedAxis` operands stays the default for every operation without an exact
+contract.
 
 Reference semantics (verified against `jax/_src/lax/parallel.py` and the JAX docs):
 
@@ -17,12 +19,14 @@ Reference semantics (verified against `jax/_src/lax/parallel.py` and the JAX doc
 - `output_offsets` are in the **receiver's** coordinate frame; `send_sizes == all_to_all(receive_sizes)` must hold.
 - JVP is jointly linear in `(operand, output)`: tangent result is `ragged_all_to_all` of the tangents with the same
   metadata. Metadata is nondifferentiable.
-- Transpose is another `ragged_all_to_all` with roles swapped and offsets collectively permuted:
+- Transpose uses another `ragged_all_to_all` with roles swapped, collectively permuted offsets, and an internal
+  additive-update mode so cotangents from overlapping forward send regions accumulate:
   `operand_cotangent = ragged_all_to_all(cotangent, zeros, all_to_all(output_offsets), receive_sizes,
   all_to_all(input_offsets), send_sizes)`; `output_cotangent` is the cotangent with the received regions masked to
   zero (regions defined by the permuted `output_offsets` and `receive_sizes`).
 - vmap over an unrelated axis merges the batch dimension into the packed leading axis (offsets rebased by
-  `iota * N` / `iota * M`); vmap over the collective's own axis and `axis_index_groups` batching are unsupported.
+  `iota * N` / `iota * M`) and rejects `axis_index_groups`. Vmap over the collective's own named axis uses the
+  eager physical participant path, including groups; staged nonconstant metadata remain explicitly gated.
 - Lowering is `stablehlo.custom_call @ragged_all_to_all` with `api_version = 4` (typed FFI) and a dictionary
   `backend_config` carrying `replica_groups` (equally sized groups required) plus `channel_id` under SPMD.
 
@@ -44,8 +48,9 @@ each source instruction's origin into its rule automatically. Two consequences f
 - Tests and snapshots are unaffected by default: provenance renders only under
   `ProgramRenderingMode::WithProvenance` (comment-style ` ; ...` suffixes), and provenance-free modules keep
   byte-identical StableHLO text at lowering (`ryft-xla` `lowering.rs:3859`). Where a phase introduces a scope, add
-  one `WithProvenance` rendering assertion pinning the scope path; Phase 7 lowering snapshots of
-  provenance-carrying transformed programs print debug information, so pin those snapshots with locations in mind.
+  one exact structural assertion that every instruction in the expansion carries the expected nested provenance; an
+  exact full `WithProvenance` rendering may additionally pin its presentation when useful. Phase 7 lowering snapshots
+  of provenance-carrying transformed programs print debug information, so pin those snapshots with locations in mind.
 
 ## Phase 1: Cumulative operations and logarithmic math primitives
 
@@ -93,7 +98,7 @@ full operation names.
   conventions: eager interpretation against hand-computed values including `reverse`, gradient checks exercising
   the transpose flip, batching axis shift, ragged identity-masking with `RaggedAxis` preservation, lowering
   snapshots, **and CPU XLA execution tests** (this is Ryft's first `reduce_window` lowering — snapshots alone do
-  not prove it executes); changelog entries.
+  not prove it executes). Changelog updates are excluded from this effort by request.
 
 ### Phase 1B: Remaining cumulative members and math additions
 
@@ -260,7 +265,7 @@ The operation contract is explicitly packed: six array operands, returning the u
 is batching-time metadata only (`arrays/batching.rs:49`), so it plays no role in the operation's type contract; any
 `RaggedAxis` integration is a batching-rule adapter (Phase 6), never part of this surface.
 
-- [ ] Add `collectives/ragged_all_to_all.rs` defining `RaggedAllToAllOperation` with fields `axis_name: String`,
+- [x] Add `collectives/ragged_all_to_all.rs` defining `RaggedAllToAllOperation` with fields `axis_name: String`,
   `axis_size: usize`, and `axis_index_groups: Option<Vec<Vec<usize>>>`. The stored `axis_size` follows the
   established shape-changing collective pattern (`collectives.rs:682`): `Operation::infer_output_types` only sees
   input types, so the user-facing capability trait resolves the size via `resolve_named_axis_size` at staging time
@@ -268,14 +273,14 @@ is batching-time metadata only (`arrays/batching.rs:49`), so it plays no role in
   `CollectiveOperation::grouped` does (`CollectiveMode` does not apply — there is no tiled/untiled choice). Operand
   order matches JAX: `operand`, `output`, `input_offsets`, `send_sizes`, `output_offsets`, `receive_sizes`
   (full-word naming, not `recv_sizes`). Operation name string: `ragged_all_to_all`.
-- [ ] Type inference: result type equals the `output` operand's type. Validate: `operand`/`output` share the data
+- [x] Type inference: result type equals the `output` operand's type. Validate: `operand`/`output` share the data
   type and trailing (non-leading) dimensions; the four metadata operands are rank-1 integer arrays of one shared
   integer data type and equal static length `K`; `K > 0` (zero is divisible by every group size, and JAX's
   abstract evaluation rejects empty metadata vectors — pin the exact zero-length diagnostic with a test); and `K`
   is divisible by the effective group size computed from the stored `axis_size` and `axis_index_groups`. Document
   the receiver-frame semantics of `output_offsets` and the `send_sizes == all_to_all(receive_sizes)` invariant
   (checkable only at runtime) in the operation rustdoc, linking the JAX doc page.
-- [ ] Runtime metadata contract (resolved): offsets and sizes must be nonnegative; every
+- [x] Runtime metadata contract (resolved): offsets and sizes must be nonnegative; every
   `[input_offset, input_offset + send_size)` region must lie within `N` and every receive region within `M`;
   received regions within one output must be disjoint (overlap is a precondition violation, not last-writer-wins);
   send regions may overlap (re-sending the same source slice is well defined). Enforcement is two-tier: *eager*
@@ -285,53 +290,72 @@ is batching-time metadata only (`arrays/batching.rs:49`), so it plays no role in
   than the sender-local offset vector, since `output_offsets` live in the receiver's frame; *staged/XLA* execution
   treats metadata validity as a documented precondition (undefined results on violation, matching JAX). An
   assertion-staging checked mode is explicitly deferred until a real caller requests it.
-- [ ] Keep `reject_ragged_collective_inputs` in the batching path for this operation too: `RaggedAxis`-carrying
+- [x] Keep `reject_ragged_collective_inputs` in the batching path for this operation too: `RaggedAxis`-carrying
   operands are rejected exactly like the other collectives until Phase 6's explicit rule lands.
-- [ ] Effects / partial evaluation: like the existing collectives, this is a *contextual* operation, not an
+- [x] Effects / partial evaluation: like the existing collectives, this is a *contextual* operation, not an
   effectful one — Ryft's `Effect` classes (`programs/effects.rs`) carry no named-axis class, and the operation's
   correctness rides on staging-time `NamedAxes` validation plus the batching/shard_map contexts, exactly as
   `CollectiveOperation` does today. For linearization, "known" means primal-dependent in the partial-evaluation
   split, never compile-time constant: the metadata are nondifferentiable primal operands that are runtime/device
   values, and the Phase 5 transpose consumes them as residuals.
-- [ ] Interpretation: split by value concreteness. *Eager* interpretation over concrete arrays (the named axis
+- [x] Interpretation: split by value concreteness. *Eager* interpretation over concrete arrays (the named axis
   bound as an eager batch axis, or effective group size 1) reads the concrete metadata and performs the segment
   copies directly — no staged dynamic shapes are involved, this exceeds JAX (which always errors outside a mapped
   context), and it provides device-free execution coverage mirroring
   `test_all_to_all_over_batched_axis_exchanges_chunks`. Tests compare against a plain-Rust reference computation of
   the exchange in the test module, using JAX's documented worked example.
-- [ ] *Staged* materialization over a batch-bound named axis (tracer-valued metadata) is gated: return an explicit
+- [x] *Staged* materialization over a batch-bound named axis (tracer-valued metadata) is gated: return an explicit
   `BatchingError::UnsupportedOperation` initially, because `DynamicSliceOperation` stores static slice sizes
   (`slicing.rs:1374`) so metadata-driven dynamic-length copies cannot be staged as dynamic-slice loops. Record the
   follow-up design in the rustdoc: iota-based index arithmetic + gather + `select` masking can express
   dynamic-length segment copies with existing operations at `O(group_size × M)` staged work.
-- [ ] Wire the operation through `arrays::operations`: new `ArrayOperation::RaggedAllToAll` and
+- [x] Wire the operation through `arrays::operations`: new `ArrayOperation::RaggedAllToAll` and
   `ArrayIrOperation::RaggedAllToAll` variants, `MemberKindSignature` entry, dispatch/projection plumbing, and a
   user-facing `RaggedAllToAll` capability trait alongside `AllToAll` (documented in the `arrays/operations/mod.rs`
   collectives list).
-- [ ] Unit tests: type-inference success/failure matrix (dtype, rank, zero and mismatched lengths, divisibility,
+- [x] Unit tests: type-inference success/failure matrix (dtype, rank, zero and mismatched lengths, divisibility,
   unbound axis), ragged rejection, eager metadata validation errors (including the overflow-safe bounds check),
   batched-axis exchange semantics against a hand-computed example (use JAX's documented worked example), the exact
   `UnsupportedOperation` diagnostic for the gated staged batch-bound path, and staged-program renderings for the
   mesh-staged (shard_map) operation.
 
+### Phase 4 review
+
+- Added the six-array operation contract, direct composite carrier, universe-neutral capability, eager participant
+  exchange, grouped routing, runtime metadata validation, and explicit staged/differentiation gates without adding
+  Phase 5 differentiation or Phase 7 StableHLO lowering. A private logical/physical representation marker keeps the
+  batching-only participant-prefix form unforgeable through the public rank-1 metadata API while preserving it across
+  carrier conversions and partial residualization.
+- Added focused coverage for type and grouping validation, overflow-safe eager errors, JAX's documented exchange,
+  reordered noncontiguous groups, multiple peer slices, trailing dimensions, public rank-2 rejection, raw tracing,
+  named-axis staging, constant-metadata partial residualization, the staged-metadata gate, and `RaggedAxis` rejection.
+- Verification passed: all-target checks for `ryft-core` and `ryft-xla`; the complete `ryft-core` library suite (1,662
+  passed, 3 ignored); the complete `ryft-xla` library suite (540 passed, 5 ignored); `ryft-macros` tests (57 unit tests
+  and 1 doctest passed, 7 doctests ignored); `ryft-macros-tests` operation and parameter suites (21 and 17 passed);
+  documentation builds for `ryft-core` and `ryft-xla`; workspace formatting; and `git diff --check`.
+- Four iterative independent audit cycles reviewed correctness, repository conventions, and simplicity. Every finding
+  from the first three cycles was fixed and re-reviewed; all three auditors reported no findings in the fourth cycle.
+  No changelog was modified, as requested.
+
 ## Phase 5: Differentiation rules
 
-- [ ] JVP: jointly linear in `(operand, output)`; the tangent result is `ragged_all_to_all` of the two tangents with
+- [x] JVP: jointly linear in `(operand, output)`; the tangent result is `ragged_all_to_all` of the two tangents with
   the primal metadata. Symbolic-zero handling via `MaybeZero` (both tangents zero → zero result tangent; otherwise
   materialize both). Metadata operands are nondifferentiable integers.
-- [ ] Transpose (`transpose_with_respect_to` the two data operands only):
+- [x] Transpose (`transpose_with_respect_to` the two data operands only):
   - `operand` cotangent: stage dense tiled `all_to_all` of `output_offsets` and of `input_offsets` over the same
     axis, then `ragged_all_to_all(cotangent, zero_like(operand), permuted_output_offsets, receive_sizes,
-    permuted_input_offsets, send_sizes)`.
+    permuted_input_offsets, send_sizes)` with an internal additive-update mode, so cotangents from overlapping forward
+    send regions sum rather than becoming overlapping overwrite destinations.
   - Forward `axis_index_groups` through the transpose, including into the metadata-permuting dense `all_to_all`
     calls. This is a deliberate correction over JAX, whose `_ragged_all_to_all_transpose` accepts groups on the
     primitive but drops them when permuting the offsets; document the divergence in the rule docs rather than
     claiming exact JAX parity.
   - `output` cotangent: mask the cotangent to zero on received regions, using JAX's `O(M)` construction directly
     now that Phase 1A provides `cumulative_sum`: allocate a length-`M + 1` zeros marker vector (computing `M + 1`
-    with checked arithmetic), scatter `+1` at each received region's start (`permuted_output_offsets`, with
-    `ScatterReductionKind::Overwrite` matching JAX's `.set`) and `-1` at each region's end
-    (`offset + receive_size`, with `ScatterReductionKind::Add` matching JAX's `.add`; the end index can equal `M`
+    with checked arithmetic), scatter `+1` at each received region's start (`permuted_output_offsets`) and `-1` at
+    each region's end (`offset + receive_size`), using `ScatterReductionKind::Add` for both boundaries so zero-length
+    regions cancel and adjacent regions combine deterministically at shared boundaries; the end index can equal `M`
     — the extra slot exists precisely so a region ending at the output boundary stays in bounds, where JAX's
     version silently relies on out-of-bounds-drop scatter semantics), take the `cumulative_sum` along that axis,
     slice the first `M` elements, broadcast the nonzero-inside-region mask over the trailing dimensions, and
@@ -339,46 +363,91 @@ is batching-time metadata only (`arrays/batching.rs:49`), so it plays no role in
     metadata contract (Phase 4) makes an explicit precondition.
   - Note in the rule docs that this transpose stages additional collectives (it is not a local rewrite) and relies
     on the metadata operands being primal residuals — runtime values available to the transposed program, not
-    compile-time constants.
-- [ ] Tests: gradient checks through the batched-named-axis path (eager execution from Phase 4 makes
+    compile-time constants. Gate a dynamic output leading dimension with an exact unsupported diagnostic until the
+    static scatter/slice payloads used by the `M + 1` marker construction gain first-class dimension operands.
+- [x] Tests: gradient checks through the batched-named-axis path (eager execution from Phase 4 makes
   `check_gradient`-style coverage possible without devices), involution-style transpose shape tests mirroring
   `test_shape_changing_collective_transposes_are_involutive`, and staged-program renderings pinning the transpose
   sequence (staged program shape is contract).
 
 ## Phase 6: Batching rule and `RaggedAxis` adapter
 
-- [ ] Dedicated vmap rule mirroring JAX's `_ragged_all_to_all_batched_collective`: when batching over an axis that
+- [x] Dedicated vmap rule mirroring JAX's `_ragged_all_to_all_batched_collective`: when batching over an axis that
   is not the collective's named axis, move the data batch axes to the front and flatten into the packed leading
   axis, move metadata batch axes to the trailing position, rebase `input_offsets` by `iota * N` and
   `output_offsets` by `iota * M`, run one merged `ragged_all_to_all`, and split the result. Return an explicit
   unsupported error for `axis_index_groups` under this merged rule (matching JAX). Batching over the collective's
   *own* named axis is not this rule's case at all: in Ryft that is the batch-bound named-axis path already covered
   by Phase 4 (eager interpretation supported; staged materialization gated behind an explicit unsupported error).
-- [ ] Gated `RaggedAxis` adapter: do not implement until an explicit partition/routing descriptor is designed. A
+  Gate a dynamic mapped extent or any dynamic data dimension with exact unsupported diagnostics: offset rebasing
+  stages `N` and `M` as scalar constants, while the shared homogeneous/composite reshape interface cannot yet recover
+  dynamic trailing extents uniformly from the data values.
+- [x] Gated `RaggedAxis` adapter: do not implement until an explicit partition/routing descriptor is designed. A
   `RaggedAxis` carries one logical extent per packed batch item, while `ragged_all_to_all` needs per-source,
   per-destination segment sizes plus both offset vectors — extents alone underdetermine the routing, so any adapter
   must take the partition as an explicit input rather than inferring it. Also document the frame mismatch: the
   operation's raggedness is per participant chunk, `RaggedAxis` raggedness is per batch item, and outside a
   batching transform there is no carrier to attach metadata to.
 
+### Phases 5 and 6 review
+
+- Implemented a jointly linear JVP and a transpose for both data operands. The operand adjoint permutes metadata with
+  grouped dense exchanges and uses a private additive ragged exchange so cotangents from resent source slices sum;
+  the output-seed adjoint uses an additive boundary marker, cumulative sum, and broadcast mask that handles empty,
+  adjacent, and boundary-ending receive regions. Dynamic marker extents and unavailable residual metadata fail with
+  exact unsupported diagnostics.
+- Implemented unrelated-axis batching for logical and physical carriers by aligning axes, merging the mapped extent
+  into packed data and metadata dimensions, widening and rebasing offsets, executing one exchange, and restoring the
+  output shape and axis. It rejects groups only for this merged path and gates dynamic mapped or data extents. The
+  own named-axis path continues through the eager physical participant exchange, including groups; `RaggedAxis`
+  adaptation remains explicitly gated because extents alone do not define routing.
+- Added exact transpose renderings and cotangents, finite-difference gradients for both data operands, symbolic-zero
+  JVPs, grouped logical and physical routing, sharding preservation, dynamic-dimension diagnostics, empty-batch and
+  zero-byte overflow cases, provenance attribution, and both real nested named-batching orders. The focused ragged
+  suite passes 20 tests.
+- Verification passed: `cargo test -p ryft-core --lib` (1,678 passed, 3 ignored), `cargo test -p ryft-xla --lib`
+  (540 passed, 5 ignored), all-target checks for both crates, the `ryft-core` documentation build, workspace
+  formatting, and `git diff --check`.
+- Independent correctness, convention, and simplicity auditors iteratively reviewed the full diff. Findings covering
+  overlapping-send adjoints, dynamic and empty-edge gates, checked byte arithmetic, transform composition,
+  provenance assertions, plan accuracy, conditional normalization, redundant bookkeeping, and test fixtures were
+  fixed and re-reviewed; the final cycle reported no findings. No changelog was modified, as requested.
+
 ## Phase 7: XLA lowering and execution
 
-- [ ] `ryft-xla` lowering: match the new `ArrayOperation::RaggedAllToAll` in `experimental/lowering.rs` and emit
+- [x] `ryft-xla` lowering: match the new `ArrayOperation::RaggedAllToAll` in `experimental/lowering.rs` and emit
   `stable_hlo::custom_call` with target `ragged_all_to_all`, `CustomCallApiVersion::TypedFfi`, result type equal to
   the output operand's type, and a dictionary `backend_config` holding `replica_groups` (reuse the replica-group
   computation from `lower_all_to_all_to_mlir`, validating equally sized groups) plus the collective `channel_id`
-  under SPMD/shard_map lowering, following JAX's `_ragged_all_to_all_lowering`.
-- [ ] shard_map integration: thread the operation through `experimental/shard_map.rs` like the other collectives
+  under SPMD/shard_map lowering, following JAX's `_ragged_all_to_all_lowering`. The public overwrite mode maps to the
+  custom call directly; the transpose-internal additive mode must lower to an accumulation-preserving decomposition
+  rather than silently reusing overwrite semantics.
+- [x] shard_map integration: thread the operation through `experimental/shard_map.rs` like the other collectives
   (manual-axis resolution, sharding/type propagation via the tracked output type).
-- [ ] Backend gating: surface an explicit `unsupported` error where the backend cannot execute the custom call
+- [x] Backend gating: surface an explicit `unsupported` error where the backend cannot execute the custom call
   (CPU), at the earliest layer that knows the backend; do not let it fail as an opaque runtime custom-call miss.
-- [ ] Tests, tiered by what each environment can run: the eager-interpretation semantic coverage (Phase 4) and
+- [x] Tests, tiered by what each environment can run: the eager-interpretation semantic coverage (Phase 4) and
   lowering snapshot tests (module `to_string()` comparison per the MLIR test conventions) run everywhere; device
   execution tests run only where the backend advertises support (JAX documents `ragged_all_to_all` as an
   accelerator collective, not a CPU one), gated like the existing multi-device collective coverage; include the JAX
   documentation worked example as the reference output in both tiers.
-- [ ] Changelog entries for every crate touched (`ryft-core`, `ryft-xla`, and `ryft-mlir` if the custom-call wrapper
-  needs extensions).
+- [x] Changelog updates are excluded from this effort by request.
+
+### Phase 7 review
+
+- Added direct typed-FFI overwrite lowering with replica groups and channel ids, plus an accumulation-preserving
+  transpose lowering that assigns every source transfer a disjoint expanded-output lane before reducing and adding
+  the output cotangent seed. The same helper serves homogeneous and composite lowering; the direct composite carrier
+  consumes exactly its six array operands without inventing dimension operands.
+- Added early target-aware CPU rejection and shard-map coverage for the exact overwrite module, a real grouped
+  differentiated program (including noncontiguous group-local source lanes), the everywhere JAX worked example, and
+  CUDA-gated execution of both the documented forward exchange and overlapping-send cotangent accumulation. The
+  transpose-only additive constructor remains private; the backend sees only a hidden read-only semantic query.
+- Verification passed: 20 focused `ryft-core` ragged-all-to-all tests, 4 focused default `ryft-xla` tests,
+  `cargo check -p ryft-xla --lib`, CUDA-13 all-test type-checking with the repository native archive and a non-loaded
+  placeholder plugin path, workspace formatting, and `git diff --check`. CUDA execution remains CI/hardware-gated on
+  this macOS arm64 host. An independent strict audit's correctness, convention, gating, API-surface, and redundancy
+  findings were fixed and re-reviewed to no remaining source findings. No changelog was modified.
 
 ## Phase 8: Ragged batching contract for `CustomCallOperation`
 
@@ -399,7 +468,7 @@ in JAX's manual pattern, the extents are *already* explicit ordinary operands of
 contract only names which existing operand bounds which packed axis, and a hypothetical transformed ABI would
 require an explicitly different target declaration, not a silently mutated one.
 
-- [ ] Contract data model: an optional declaration on `CustomCallOperation` (builder-style
+- [x] Contract data model: an optional declaration on `CustomCallOperation` (builder-style
   `with_ragged_contract(...)`) stating:
   - *input bindings*: for each ragged packed operand axis, the operand index + axis it lives on and the index of
     the **existing** operand carrying its extent. In the unbatched call that extent operand is a scalar (one item's
@@ -417,62 +486,215 @@ require an explicitly different target declaration, not a silently mutated one.
   Validate the declaration structurally at construction/inference time (indices in range, extent operands/outputs
   scalar integer in the unbatched form, axis bounds, no double-binding, dimension-variable/bound compatibility),
   surfacing `TypeError`s with precise messages.
-- [ ] Alias cross-checks: validate the contract against `CustomCallInputOutputAlias` declarations — a *preserved*
+- [x] Alias cross-checks: validate the contract against `CustomCallInputOutputAlias` declarations — a *preserved*
   output may alias its input only when the packed types, physical axes, dimension identity, and extent binding all
   agree; *consumed* and *fresh-extents* outputs cannot inherit an alias unchanged. Extend the validation matrix
   accordingly, not just duplicate-binding checks.
-- [ ] Batching-rule discharge: when a `RaggedAxis`-carrying batch reaches a custom call *with* a contract, stop
+- [x] Batching-rule discharge: when a `RaggedAxis`-carrying batch reaches a custom call *with* a contract, stop
   rejecting: verify that each bound extent operand's batched value is the *same value* as the packed operand's
   `RaggedAxis::extents` (identity comparison at trace time — the user threads one extents value to both places,
   exactly the manual JAX pattern), stage the call through the existing `CustomCallBatching` machinery without
   adding or reordering operands, and attach result `RaggedAxis` metadata per the output bindings. Ragged axes on
   operands or axes not covered by the contract, and extent operands that do not match the `RaggedAxis` extents,
   keep today's rejection with precise diagnostics.
-- [ ] Contract propagation: the declaration must survive every existing custom-call metadata-copy seam —
+- [x] Contract propagation: the declaration must survive every existing custom-call metadata-copy seam —
   `ArrayType` ↔ `ArrayIrType` conversion, output-identity renaming (`renamed`, `custom_call.rs:375`), operation
   rendering, and batch-prefixed output reconstruction — with tests pinning each seam.
-- [ ] Scope boundaries, stated in rustdoc: one ragged axis per operand; **one batching level** — nested ragged
+- [x] Scope boundaries, stated in rustdoc: one ragged axis per operand; **one batching level** — nested ragged
   batching is explicitly unsupported with its own diagnostic (supporting it later requires recording the
   extent-axis mapping à la `RaggedAxis::extent_axes`, not just an operand index); differentiation of ragged custom
   calls follows the existing custom-call AD story unchanged (the contract adds no AD semantics); the padded
   buffer's garbage elements remain garbage-by-contract downstream, with the attached output `RaggedAxis` making
   masked reductions and dimension-size rules compose as usual.
-- [ ] Tests: the no-contract rejection tests stay green unchanged; contract validation matrix (structural, alias
+- [x] Tests: the no-contract rejection tests stay green unchanged; contract validation matrix (structural, alias
   interactions, extents-identity mismatch, nested-batching rejection); staged-program renderings for ragged
   `Sequential` and `BroadcastAll` discharge showing the unchanged kernel arity; an eager end-to-end test with a
   test kernel asserting the extents arrive as declared and the output `RaggedAxis` composes with a downstream
   masked reduction.
 
+### Phase 8 review
+
+- Added a declarative ragged calling convention to `CustomCallOperation`, including named packed-input bindings,
+  preserved/consumed/fresh output bindings, padding independence, structural and alias validation, stable dimension
+  renaming, universe conversion, rendering, and batch-prefix propagation without changing kernel arity.
+- Both homogeneous and mixed batching paths now discharge covered one-level `RaggedAxis` metadata only when the
+  declared extent operand is the exact staged value, reject uncovered/mismatched/nested cases, and attach or consume
+  result metadata according to the positional output contract. Fresh output extents also work without an active
+  ragged input.
+- Focused verification passed: 25 `ryft-core` custom-call tests; the CPU XLA FFI end-to-end test, including concrete
+  extent-bound validation and a downstream masked sum; all-target checks for `ryft-core` and `ryft-xla`; workspace
+  formatting; and `git diff --check`. No changelog was modified.
+
 ## Phase 9 (gated): ragged-aware rules for individual collectives
 
 Demand-driven, one operation at a time, never a generic "collectives preserve raggedness" rule.
 
-- [ ] `parallel_sum`/`parallel_max`: mask padding with the reduction identity via Phase 1A's generalized
+- [x] `parallel_sum`/`parallel_max`: mask padding with the reduction identity via Phase 1A's generalized
   identity-masking capability (the existing `mask_reduction_input` zero-masks and rejects every kind but `Sum`,
   `batching.rs:2933`); result extents are the elementwise `parallel_max` of the participating extents (costs one
   extra collective on the extents; document the partial-participation semantics).
-- [ ] `parallel_mean` stays explicitly unsupported for ragged inputs unless its denominator is defined first
+- [x] `parallel_mean` stays explicitly unsupported for ragged inputs unless its denominator is defined first
   (participant count, present-value count, or logical element count are all defensible and give different results).
-- [ ] `parallel_permute` / `all_gather`: co-move the packed value and its extents, remapping the output `RaggedAxis`
-  (`all_gather` extents become per-(participant, item) via multi-axis `extent_axes`).
-- [ ] `all_to_all` over ragged operands: requires an explicit routing descriptor before any lowering to
+- [x] `parallel_permute` / untiled `all_gather`: co-move the packed value and its extents, remapping the output
+  `RaggedAxis` (`all_gather` extents become per-(participant, item) via multi-axis `extent_axes`). A tiled gather is
+  explicitly gated because fusing participant and concatenation axes can turn participant-specific live prefixes
+  into a non-prefix layout that one `RaggedAxis` cannot represent.
+- [x] `all_to_all` over ragged operands: requires an explicit routing descriptor before any lowering to
   `ragged_all_to_all` — an ordinary `all_to_all` call plus one logical extent per item does not determine the
   per-destination partition, so this is a new API surface, not an automatic rewrite.
+
+### Phase 9 review
+
+- `parallel_sum` and `parallel_max` now mask each ragged packed axis with the correct identity before reducing the
+  participant axis, preserve the surviving ragged dimensions, and reduce participant-varying extent arrays with
+  elementwise maximum. `parallel_mean` reports a precise denominator-ambiguity diagnostic before doing any work.
+- `parallel_permute` applies the same source/target routing to participant-varying extent arrays, including zero
+  extents for untargeted participants. Untiled `all_gather` relocates the participant mapping into the materialized
+  output axis; tiled gathering fails explicitly where fusion would make the metadata inexpressible. Ordinary
+  `all_to_all` directs callers to the explicit offsets-and-sizes `ragged_all_to_all` contract.
+- Focused verification passed: 11 `parallel_reduce`, 6 `parallel_permute`, 10 `all_gather`, and 6 `all_to_all` tests;
+  the complete `ryft-core` library suite passed 1,691 tests with 3 ignored; `cargo check -p ryft-core --lib`;
+  workspace formatting; and `git diff --check`. No changelog was modified.
+
+## Phase 10: `ragged_dot_general`
+
+Grouped ("ragged") matrix multiplication, mirroring `jax.lax.ragged_dot_general` (pinned `jax/_src/lax/lax.py`,
+commit `a33ed61`). Depends only on Phase 1A's `cumulative_sum`; independent of the ragged-collective phases.
+This raggedness is *grouping metadata carried as an explicit operand* (`group_sizes`), exactly the explicit-operand
+doctrine of the rest of this plan — it is unrelated to the batching-time `RaggedAxis` mechanism, and the two must
+not be conflated.
+
+Reference semantics (verified against the pinned source):
+
+- Three operands: `lhs`, `rhs`, and integer `group_sizes`; a `RaggedDotDimensionNumbers` payload wrapping ordinary
+  dot dimension numbers plus exactly one `lhs` ragged dimension and the `rhs` group dimensions. Three modes by
+  where the ragged dimension falls: *non-contracting* (`[b...,m...,k...] × [g,b...,k...,n...] → [b...,m...,n...]`,
+  exactly one `rhs` group dimension whose extent is `g`), *contracting* (`→ [g,b...,m...,n...]`, zero group
+  dimensions), and *batch* (`→ [b...,m...,n...]`, zero group dimensions). `group_sizes` is `[g]` or the
+  prefix-shaped `[b...,x...,g]`; output shape and element type otherwise defer to `dot_general`'s rules, with grouped
+  expansion modes rejecting `f8e8m0fnu` because their zero-group and uncovered-position semantics require zero.
+- JAX's **default lowering on every platform is a masked-dense decomposition**: expand a leading `g` axis, compute
+  group start/end offsets as `cumsum(group_sizes)`, mask with `start <= iota < end` selecting against zero, then
+  run ordinary dense `dot_general`s. The dedicated backend instruction is opt-in behind
+  `jax_ragged_dot_use_ragged_dot_instruction`. Rows not covered by any group therefore produce zeros — pin that as
+  the defined semantic.
+- Differentiation is dot-shaped: jointly linear in `(lhs, rhs)` (tangent = `rd(dlhs, rhs) + rd(lhs, drhs)`;
+  `group_sizes` nondifferentiable). The transpose is two `ragged_dot_general`s with rearranged dimension numbers
+  plus a plain axis transpose, implemented **only for the non-contracting mode** — JAX rejects transposition of
+  the contracting and batch modes, and so do we.
+- `group_offset` exists in JAX's signature but is signature-only at the pinned commit: every consumer of the
+  primitive rejects it with `NotImplementedError` — the JVP (`lax.py:6139`), the transpose (`:6195`), the
+  reference impl (`:6356`), and the lowering (`:6471`, before either strategy branches) — and `chlo.ragged_dot`
+  carries no such operand. Re-checked against JAX main on 2026-08-25: still signature-only — the same four
+  rejection sites persist, the new sharding rule threads the parameter without reading it, and even the Pallas GPU
+  lowering entry point rejects it (its internal `group_offsets` are the derived `cumsum(group_sizes) -
+  group_sizes` start positions, not this parameter). Ryft omitting the parameter therefore IS full JAX parity:
+  there is no supported behavior to mirror. Revisit only if JAX gives it semantics.
+- vmap: JAX reuses its dot batch rule via unpack hooks and supports only leading-dimension batching
+  (`'ragged_dot vmap over any dim but 0 - NYI'`); the ragged-contracting mode shifts the result batch axis past
+  the prepended `g` axis.
+
+Design constraints (no new redundancy):
+
+- Extend `operations/dot/` in its existing per-concern layout — no new module, no parallel vocabulary:
+  `RaggedDotDimensionNumbers` in `dimensions.rs` **wrapping** the existing `DotDimensionNumbers` (as JAX does),
+  `RaggedDotOperation` in `operation.rs` beside `DotOperation` (payload: the ragged dimension numbers only,
+  mirroring `DotOperation`'s dimension-numbers-only payload and its documented element-type contract),
+  inference in `inference.rs` reusing `dot_abstract` for the dense part, batching in `batching.rs` reusing the
+  existing dot batch rule via unpack hooks (JAX's own structure), differentiation in `differentiation.rs`
+  mirroring `DotOperation`'s joint-linear JVP discipline, adjoint-dimension helpers beside
+  `adjoint_dimensions_for_left_dot`/`adjoint_dimensions_for_right_dot` in `dimensions.rs` (JAX's
+  `grad_x_dims`/`grad_y_dims`), tests in `tests.rs`.
+- The group mask construction (`cumulative_sum` of `group_sizes` → start/end offsets → interval-membership iota
+  mask) reuses the Phase 1A operation and the established iota-compare-select staging style; it is per-operation
+  logic and lives with the dot module, not in the generic batching machinery.
+- Eager interpretation is extent-exact, not masked: with concrete `group_sizes`, the `Array` kernel loops the
+  groups and reuses the existing dense dot kernel per group slice (consistent with this plan's eager-vs-staged
+  doctrine; the staged/XLA world masks because extents are symbolic there).
+
+Checkable items:
+
+- [x] `dimensions.rs`: `RaggedDotDimensionNumbers` wrapping `DotDimensionNumbers` + the mode classification
+  (non-contracting / contracting / batch from where the single `lhs` ragged dimension falls), with validation
+  mirroring JAX's shape rule (exactly one ragged dimension; group-dimension count per mode; `group_sizes` rank-1
+  `[g]` or prefix-shaped `[b...,x...,g]`; precise `TypeError`s in Ryft's message style). Adjoint-dimension helpers
+  for the non-contracting transpose beside the existing dot adjoint helpers.
+- [x] `operation.rs`: `RaggedDotOperation` (name `ragged_dot_general`), Display/render, `Operation` inference via
+  `inference.rs` (dense shape from `dot_abstract` machinery, leading `g` prepended in the contracting mode,
+  element-type rules otherwise deferred to dot's, with the grouped-expansion zero restriction above),
+  `InterpretableOperation` on a `RaggedDot` capability,
+  `PartiallyEvaluatableOperation` default. Capability trait `RaggedDot` with
+  `ragged_dot_general(rhs, group_sizes, dimension_numbers)` and a `ragged_dot(rhs, group_sizes)` convenience for
+  JAX's basic case, both fallible.
+- [x] Eager `Array` kernel: extent-exact grouped loop reusing the existing dense dot kernel per group slice;
+  rows/positions not covered by any group are zeros (the pinned semantic); groups of size zero contribute nothing;
+  validation via the shared abstract rule.
+- [x] Differentiation: joint-linear JVP with `MaybeZero` discipline mirroring `DotOperation`'s; transpose for the
+  non-contracting mode via the two rearranged `ragged_dot_general`s + axis transpose (staged-program rendering
+  pinned), explicit precise rejections for the contracting and batch modes (JAX parity).
+- [x] Batching: reuse the dot batch rule with unpack hooks; leading-dimension mapping only, with JAX's exact
+  restriction surfaced as a precise unsupported error otherwise; the contracting mode's result batch axis shifts
+  past the prepended `g`. `RaggedAxis`-carrying operands are rejected pre-binding (the collectives idiom) — group
+  raggedness and batching raggedness stay separate concepts.
+- [x] Wiring: `ArrayOperation::RaggedDot` variant, `ArrayOperations` bundle (both lists), facade/root re-exports,
+  `ryft-macros`/`ryft-macros-tests` verification.
+- [x] `ryft-mlir`: wrap `chlo.ragged_dot` following the module's existing `chlo::erf` pattern (`mlir_op!` +
+  typed constructor in `dialects/chlo/operations.rs`), plus a `RaggedDotDimensionNumbers` CHLO attribute wrapper
+  (batching/contracting/ragged/group dimension lists) modeled on the StableHLO dot-dimension-numbers attribute
+  wrapper, accepting the same precision-config attribute the dot lowering already uses. Dialect tests per the
+  MLIR conventions (attribute construction/accessor/equality/display/casting; operation constructor + typed
+  accessors + verified module rendering).
+- [x] XLA lowering, both strategies mirroring JAX: the **default** is `lower_ragged_dot_general_to_mlir` emitting
+  the masked-dense decomposition — `cumulative_sum` of `group_sizes` via the existing Phase 1A `reduce_window`
+  emitter, start/end broadcast, the interval mask, `select` against zero, then the existing dense dot lowering —
+  reusing those emitters rather than re-building them. The **instruction** strategy emits one `chlo.ragged_dot`
+  with the full dimension-numbers attribute (all three modes; element/accumulation-type handling otherwise follows
+  the existing dot lowering conventions). Strategy selection is an XLA-owned per-compilation option, defaulting to
+  the decomposition — JAX's own default on every platform, because backend support for the instruction is uneven;
+  JAX's TPU-only rhs-transpose quirk stays out of scope with a comment. `domains.rs` padding-discipline classification
+  with the same evidence standard as the other phases; `ops.rs` conversion entry.
+- [x] Execution evidence per the domains doctrine: CPU execution tests run against the decomposition strategy;
+  the instruction strategy gets lowering snapshot tests everywhere and execution tests only where a backend
+  demonstrably runs `chlo.ragged_dot` (verify whether the CPU pipeline legalizes it — if it does, add the CPU
+  execution test and cross-strategy value parity; if not, gate execution on the accelerator suites and pin the
+  exact unsupported error).
+- [x] Tests: inference matrix across all three modes and both `group_sizes` shapes with exact errors; eager values
+  against hand-computed grouped products (including a zero-size group and an uncovered-rows case); JVP
+  finite-difference checks and the pinned transpose rendering; mode-2/3 transpose rejections; batching incl. the
+  contracting-mode axis shift and the `RaggedAxis` rejection; lowering snapshot pinning the mask + dense-dot
+  expansion; eager/XLA parity and a CPU jit execution test (compile, run, exact grouped-matmul values). Changelog
+  updates remain excluded from this effort by request.
+
+### Phase 10 review
+
+- Added the grouped-dot dimension contract, inference, semantic operation, exact eager grouped-slice kernel,
+  leading-axis batching rule, joint-linear JVP, and non-contracting transpose. Differential staging converts widened
+  tangent and cotangent representations consistently with dense dot; contracting and batch transposes remain
+  explicitly unsupported.
+- Added the CHLO dimension-number attribute and typed `chlo.ragged_dot` wrapper, including ownership, equality,
+  display/debug, casting, accessor, verification, and exact module-rendering coverage. The XLA path defaults to the
+  portable cumulative-mask decomposition and exposes the dedicated instruction through an XLA compilation strategy.
+- Verified all three modes and prefix-shaped metadata in core, exact eager values and finite-difference JVP behavior,
+  contracting-mode batch-axis placement, and the element-type boundary: batch mode ignores group values and supports
+  `f8e8m0fnu`, while grouped expansion rejects it because the required zero does not exist. Exact lowering snapshots
+  cover every mode and both lowering strategies, including native complex-zero construction for the decomposition.
+  CPU eager/XLA parity covers the decomposition, and the instruction pins the CPU plugin's exact unsupported
+  diagnostic. Focused suites pass, and no changelog was modified.
 
 ## Final verification
 
 Run after the last implemented phase, in addition to each phase's own scoped checks:
 
-- [ ] Full test suites: `cargo test -p ryft-core --lib`, `cargo test -p ryft-xla --lib`,
+- [x] Full test suites: `cargo test -p ryft-core --lib`, `cargo test -p ryft-xla --lib`,
   `cargo test -p ryft-macros`, `cargo test -p ryft-macros-tests` (300s timeouts per command).
-- [ ] `cargo check -p ryft-core --all-targets` and `cargo check -p ryft-xla --all-targets` with zero warnings.
-- [ ] Rustdoc builds cleanly for the touched crates; new items follow the documentation conventions.
-- [ ] `cargo fmt --all -- --check`, `git diff --check` (no whitespace errors), and no source or plan lines over
+- [x] `cargo check -p ryft-core --all-targets` and `cargo check -p ryft-xla --all-targets` with zero warnings.
+- [x] Rustdoc builds cleanly for the touched crates; new items follow the documentation conventions.
+- [x] `cargo fmt --all -- --check`, `git diff --check` (no whitespace errors), and no source or plan lines over
   120 columns.
-- [ ] Targeted search confirming no stale renamed identifiers remain (the Phase 2 list, plus any identifiers
+- [x] Targeted search confirming no stale renamed identifiers remain (the Phase 2 list, plus any identifiers
   renamed mid-implementation).
-- [ ] Changelogs updated for every crate whose public API, wrappers, tests, or lowerings changed.
-- [ ] Final self-review of the complete diff for scope and simplicity, summarized in the Review section below.
+- [x] Changelog updates remain excluded from this effort by request.
+- [x] Final self-review of the complete diff for scope and simplicity, summarized in the Review section below.
 
 ## Review
 
@@ -643,9 +865,10 @@ synthesis the `one` primitive uses) with a `stablehlo.multiply` body, and `cumul
 maximum's identity (`-inf` wherever the format has one) and inlines the shared `log_add_exp` expansion into its body.
 
 Padding disciplines: `log_sum_exp` is `XlaMasked`, matching `Reduce`'s `Sum`/`Max` classification because the
-expansion is exactly those two reductions and XLA masks each one's operand with its own identity; the four new scans
-join `cumulative_sum`'s dedicated `Propagated` arm, whose justification (type inference keeps the scanned axis static)
-holds for every combining operator. `ops.rs` gained all seven `impl_array_operation_conversion!` entries.
+expansion is exactly those two reductions and XLA masks each one's operand with its own identity; the four new
+scans join `cumulative_sum`'s dedicated `Propagated` arm, whose justification (type inference keeps the scanned
+axis static) holds for every combining operator. `ops.rs` gained all seven `impl_array_operation_conversion!`
+entries.
 
 Verified with `cargo check -p ryft-xla --all-targets` (clean, no warnings), `cargo test -p ryft-xla --lib`
 (537 passed, 0 failed, 5 ignored; 4 new tests), `cargo test -p ryft-macros-tests` (now unblocked, all green), and
@@ -864,5 +1087,34 @@ warnings), `cargo test -p ryft-core --lib` (1657 passed, 0 failed, 3 ignored —
 formats extend existing loops and the lowering's two rejection blocks merged into one), `cargo test -p ryft-core
 --lib collectives` (43), `cargo test -p ryft-xla --lib` (539 passed, 0 failed, 5 ignored), `cargo test -p ryft-core
 --doc` and `cargo test -p ryft-xla --doc` (both green), and `cargo doc -p ryft-core --no-deps` (the
-`AxisError::UnboundAxisName` warning gone, no new warnings, and the remaining ones are the pre-existing
-`define_elementwise_operation!` `Operation` links). Changelog updates remain excluded from this effort by request.
+`AxisError::UnboundAxisName` warning gone, no new warnings, and all remaining warnings are pre-existing). Changelog
+updates remain excluded from this effort by request.
+
+### Final verification and audit closure
+
+Completed Phases 7–10 and closed the full plan. The final implementation includes exact eager and staged ragged
+custom-call metadata semantics; a first-class ragged all-to-all across eager execution, abstract evaluation,
+batching, differentiation, StableHLO lowering, and shard-map execution; conservative bounded-ragged propagation or
+explicit rejection for the existing collective family; and grouped-dot inference, eager execution, batching,
+differentiation, CHLO modeling, portable decomposition, and instruction lowering.
+
+Three independent audit tracks reviewed the complete change set for correctness, repository conventions, and
+simplicity. Findings were iteratively fixed, including grouped-dot contracting-prefix accumulation, complex-zero and
+`f8e8m0fnu` handling, replicated custom-call freshness, mapped and replicated untiled all-gather metadata, mixed
+`ArrayIr` collective parity, mapped and replicated ragged extent carriers for mixed collectives, exact lowering
+snapshots, hot-loop allocation removal, block replacement without full-buffer cloning, and rustdoc placement. The
+final audit round reported no findings in all three tracks.
+
+A post-closure architecture cleanup then removed grouped-dot lowering policy from `ryft-core`: the semantic operation
+now carries only dimension numbers, while `ryft-xla::XlaOptions` owns the compilation-wide decomposition/instruction
+choice and includes it in cache identity. The three audit tracks reviewed that cleanup independently; their record,
+API-documentation, state-inheritance, and hash-contract findings were fixed, and the repeated final review reported no
+findings in all three tracks.
+
+Final verification passed: `ryft-core` reported 1,710 passed and 3 ignored; `ryft-xla` reported 550 passed and 5
+ignored; `ryft-macros` reported 57 unit tests passed plus its doctest suite; and `ryft-macros-tests` reported both
+21-operation and 17-parameter suites passed, including all trybuild cases. Both all-target checks completed with no
+warnings. Rustdoc completed for `ryft-core`, `ryft-mlir`, and `ryft-xla`; the final task-owned broken link was fixed,
+leaving only the repository's pre-existing warnings. Formatting, whitespace, and added-line width checks passed.
+The Phase 2 stale-name search found only deliberate references to upstream `jax.lax.p*` names and differential case
+identifiers, not stale Ryft APIs. No changelog file was modified.

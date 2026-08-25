@@ -169,7 +169,7 @@ impl_differentiable_operation! {
             let infinity = aligned_primal.dispatch_domain().fill(&target, f64::INFINITY)?;
             let replace_infinity = |value: C::Value| -> Result<C::Value, DifferentiationError> {
                 let is_positive_infinity = value.compare(&infinity, ComparisonDirection::Equal)?;
-                Ok(C::Value::select(&is_positive_infinity, &value.zero_like(), &value)?)
+                Ok(C::Value::select(&is_positive_infinity, &value.zero_like()?, &value)?)
             };
             let output_exponent = replace_infinity(aligned_primal)?;
             let left_term = left

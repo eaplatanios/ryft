@@ -171,7 +171,7 @@ impl<
 }
 
 // A grouped dot is jointly linear in its two data operands. Group sizes are integer metadata and therefore carry no
-// tangent; the two surviving product-rule terms reuse the same grouped-dot dimensions and lowering strategy.
+// tangent; the two surviving product-rule terms reuse the same grouped-dot dimensions.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for RaggedDotOperation
 where
     C::Operation: From<ConvertElementTypeOperation<ArrayType>> + From<RaggedDotOperation>,
@@ -187,9 +187,7 @@ where
         let lhs = &inputs[0];
         let rhs = &inputs[1];
         let group_sizes = inputs[2].primal();
-        let apply = |lhs: &C::Value, rhs: &C::Value| {
-            lhs.ragged_dot_general_with_lowering_strategy(rhs, group_sizes, self.dimensions(), self.lowering_strategy())
-        };
+        let apply = |lhs: &C::Value, rhs: &C::Value| lhs.ragged_dot_general(rhs, group_sizes, self.dimensions());
         let primal = apply(lhs.primal(), rhs.primal())?;
         let tangent_type = primal.r#type().tangent()?;
         let convert_to_tangent_type = |value: &C::Value| {
@@ -288,11 +286,7 @@ where
                 *operand = operand.convert_element_type(cotangent.r#type().data_type())?;
             }
         }
-        let mut adjoint = context.stage_operation(
-            RaggedDotOperation::new(dimensions).with_lowering_strategy(self.lowering_strategy()),
-            Vec::new(),
-            &operands,
-        )?;
+        let mut adjoint = context.stage_operation(RaggedDotOperation::new(dimensions), Vec::new(), &operands)?;
         check_count!("output", adjoint, 1, ProgramError);
         let adjoint = adjoint.remove(0);
         let mut permutation = vec![0; output_axes.len()];

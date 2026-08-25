@@ -239,7 +239,7 @@ impl Array {
 
     /// Overwrites the logical block of `update`'s shape starting at `start_indices` in this array with `update`. The
     /// caller guarantees that the block lies in bounds.
-    fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
+    pub(super) fn replace_block(self, update: &Array, start_indices: &[usize]) -> Self {
         let update_shape = update.r#type().static_shape().unwrap();
         let addressing = ArrayAddressing::new(self.r#type().into_owned()).unwrap();
         let update_addressing = ArrayAddressing::new(update.r#type().into_owned()).unwrap();

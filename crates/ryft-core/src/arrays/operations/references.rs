@@ -34,8 +34,8 @@ use crate::programs::{
     ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, RegionInterface, TypeError, Typed,
-    Value, ValueProjection,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
+    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
@@ -447,6 +447,37 @@ where
     }
 }
 
+impl<V: Value<Type = ArrayIrType>> ReferenceWrite<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+{
+    fn write(&self, replacement: &V) -> Result<(), ProgramError> {
+        self.dispatch_domain().bind(
+            ReferenceWriteOperation::new(),
+            Vec::new(),
+            &[self.clone(), replacement.clone()],
+        )?;
+        Ok(())
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceWrite<ProjectedValue<ArrayType, V>>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+{
+    fn write(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<(), ProgramError> {
+        self.value().dispatch_domain().bind(
+            ReferenceWriteOperation::new(),
+            Vec::new(),
+            &[self.value().clone(), replacement.value().clone()],
+        )?;
+        Ok(())
+    }
+}
+
 impl<V: Value<Type = ArrayIrType>> ReferenceSwap<V, V> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
@@ -545,6 +576,16 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValu
     }
 }
 
+impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceWrite for ArrayIrValue<A> {
+    fn write(&self, replacement: &Self) -> Result<(), ProgramError> {
+        ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()
+            .infer_output_types(&[self.r#type().into_owned(), replacement.r#type().into_owned()], &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let replacement = <Self as ValueProjection<ArrayType>>::projected(replacement)?.clone();
+        reference.write(replacement)
+    }
+}
+
 impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ReferenceSwap for ArrayIrValue<A> {
     fn swap(&self, replacement: &Self) -> Result<Self, ProgramError> {
         ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()
@@ -625,6 +666,7 @@ mod tests {
     type TestDestination = EagerContext<TestValue, TestOperation>;
     type TestNew = NewReferenceOperation<ArrayType, ArrayIrType>;
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType>;
+    type TestWrite = ReferenceWriteOperation<ArrayType, ArrayIrType>;
     type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
     type TestAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
     type TestFreeze = FreezeReferenceOperation<ArrayType, ArrayIrType>;
@@ -787,6 +829,10 @@ mod tests {
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceReadOperation::<ArrayType, ArrayIrType>::new()),
             ArrayIrOperation::ReferenceRead(_),
+        ));
+        assert!(matches!(
+            ArrayIrOperation::<Array>::from(ReferenceWriteOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceWrite(_),
         ));
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceSwapOperation::<ArrayType, ArrayIrType>::new()),
@@ -981,6 +1027,16 @@ mod tests {
         );
         assert_eq!(reference.read(), Ok(initial.clone()));
 
+        let error = reference.write(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        assert_eq!(
+            error,
+            TypeError::invalid(
+                "`reference_write` replacement type `f32[3]` must exactly match reference referent type `f32[2]`",
+            )
+            .into(),
+        );
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
         let error = reference.add_update(&ArrayIrValue::Array(Array::vector(vec![3.0_f64, 4.0]))).unwrap_err();
         assert_eq!(
             error,
@@ -1061,6 +1117,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(array_type.clone()).into());
         let update = builder.add_input(array_type.into());
+        builder.add_instruction(TestWrite::new(), Vec::new(), vec![reference, update], None).unwrap();
         let old = builder.add_instruction(TestSwap::new(), Vec::new(), vec![reference, update], None).unwrap()[0];
         builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, update], None).unwrap();
         let frozen = builder.add_instruction(TestFreeze::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -1072,7 +1129,8 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:ref<f32[2]>, %1:f32[2] .
-                let %2:f32[2] = reference_swap %0 %1
+                let reference_write %0 %1
+                    %2:f32[2] = reference_swap %0 %1
                     reference_add_update %0 %1
                     %3:f32[2] = freeze_reference %0
                 in (%2, %3)
@@ -1083,10 +1141,15 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_reference_swap_rejects_transforms_before_discharge() {
+    fn test_array_ir_reference_write_and_swap_reject_transforms_before_discharge() {
         type TestContext = EagerContext<TestValue, TestOperation>;
 
         let partial_context = PartialEvaluationContext::new(TestContext::new());
+        assert!(matches!(
+            TestWrite::new().partially_evaluate(&partial_context, &EmptyRegionDriver, &[]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`reference_write` must be discharged before partial evaluation",
+        ));
         assert!(matches!(
             TestSwap::new().partially_evaluate(&partial_context, &EmptyRegionDriver, &[]),
             Err(ProgramError::UnsupportedOperation { message })
@@ -1095,14 +1158,34 @@ mod tests {
         let batching_context =
             BatchingContext::<_, ArrayIrBatching>::new(TestContext::new(), TestValue::Array(Array::scalar(2_i64)));
         assert!(matches!(
+            TestWrite::new().batch(&batching_context, &EmptyRegionDriver, &[]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "`reference_write` must be discharged before batching",
+        ));
+        assert!(matches!(
             TestSwap::new().batch(&batching_context, &EmptyRegionDriver, &[]),
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "`reference_swap` must be discharged before batching",
         ));
         assert!(matches!(
+            TestWrite::new().jvp(&TestContext::new(), &EmptyRegionDriver, &[]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "`reference_write` must be discharged before differentiation",
+        ));
+        assert!(matches!(
             TestSwap::new().jvp(&TestContext::new(), &EmptyRegionDriver, &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`reference_swap` must be discharged before differentiation",
+        ));
+        assert!(matches!(
+            TestWrite::new().transpose(
+                &mut TracingContext::<TestValue, TestOperation>::new(),
+                &EmptyRegionDriver,
+                &[],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `reference_write` is not transposable",
         ));
         assert!(matches!(
             TestSwap::new().transpose(
@@ -1165,10 +1248,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[2], %1:f32[2], %2:f32[2] .
                 let %3:ref<f32[2]> = new_reference %0
-                    %4:f32[2] = reference_swap %3 %1
+                    reference_write %3 %1
                     reference_add_update %3 %2
-                    %5:f32[2] = freeze_reference %3
-                in (%5)
+                    %4:f32[2] = freeze_reference %3
+                in (%4)
             "}
             .trim_end(),
         );
