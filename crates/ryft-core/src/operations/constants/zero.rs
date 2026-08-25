@@ -278,7 +278,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
 
     use super::*;
 
@@ -346,6 +346,51 @@ mod tests {
                 in (%0)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_zero_operation_provider() {
+        // Homogeneous operation families receive the infallible provider implementation through their ordinary
+        // `From<ZeroOperation<T>>` conversion.
+        let static_type = ArrayType::new_static(DataType::F32, [2]);
+        let ArrayOperation::<Array>::Zero(operation) = ArrayOperation::zero_operation(static_type.clone()).unwrap()
+        else {
+            panic!("expected a homogeneous zero operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // The composite provider projects a valid operand-free array zero into the homogeneous member family.
+        let ArrayIrOperation::<Array>::Array(ArrayOperation::Zero(operation)) =
+            ArrayIrOperation::zero_operation(ArrayIrType::Array(static_type.clone())).unwrap()
+        else {
+            panic!("expected a composite homogeneous zero operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed zeros must instead receive their
+        // concrete extents as dimension operands.
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Array(dynamic_type)).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
+                "`zero` cannot construct type f32[size] without operands because it references identity size",
+            )),
+        );
+
+        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be
+        // replaced by a zero of its referent type; it must be discharged before construction.
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
+        );
+        let reference_type = ReferenceType::new(static_type);
+        assert_eq!(
+            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(format!(
+                "cannot materialize a zero for reference type `{reference_type}`; references must be discharged first",
+            ))),
         );
     }
 

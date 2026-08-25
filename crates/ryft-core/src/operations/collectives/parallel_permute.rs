@@ -188,7 +188,8 @@ where
             }
             sources[*target] = Some(*source);
         }
-        if sources.iter().any(Option::is_none)
+        let has_untargeted_participant = sources.iter().any(Option::is_none);
+        if has_untargeted_participant
             && let Some(ragged_axis) =
                 input.ragged_axes().iter().find(|ragged_axis| ragged_axis.dimension().bounds().lower() != 0)
         {
@@ -212,12 +213,14 @@ where
                 let mut extent_axes = ragged_axis.extent_axes().to_vec();
                 let extents = if let Some(extent_axis) = extent_axes.iter().position(|axis| *axis == 0) {
                     permute_participant_axis(ragged_axis.extents(), extent_axis, sources.as_slice())?
-                } else {
+                } else if has_untargeted_participant {
                     let extents =
                         P::match_axis(context, &ArrayBatch::replicated(ragged_axis.extents().clone()), 0.into())?
                             .into_value();
                     extent_axes.insert(0, 0);
                     permute_participant_axis(&extents, 0, sources.as_slice())?
+                } else {
+                    ragged_axis.extents().clone()
                 };
                 Ok(RaggedAxis::new(ragged_axis.axis(), extents, ragged_axis.dimension().clone(), extent_axes))
             })
@@ -414,6 +417,14 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())])
             .unwrap();
+        let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)])
+            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())],);
+
         let output = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1)])
             .batch(&context, &EmptyRegionDriver, &[input])
             .unwrap()

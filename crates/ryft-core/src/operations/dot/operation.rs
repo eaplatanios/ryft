@@ -271,10 +271,13 @@ where
 ///
 /// `group_sizes` is either a rank-one `[group_count]` array shared by every prefix or an array whose trailing axis is
 /// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped-dot iteration
-/// space. The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical LHS
-/// ragged extent, so an over-covering group is clipped and every later group is empty once its raw start reaches or
-/// exceeds that extent. Grouped expansion modes require an element type that can represent zero; in particular, they
-/// reject `f8e8m0fnu`. Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
+/// space. In non-contracting and contracting modes every size must be nonnegative. The eager interpreter rejects
+/// negative metadata in those modes; compiled lowering defensively clamps signed negatives to zero before unsigned
+/// accumulation so invalid runtime metadata cannot become a large interval. The sizes define consecutive raw
+/// cumulative intervals. Each interval is intersected with the physical LHS ragged extent, so an over-covering group
+/// is clipped and every later group is empty once its raw start reaches or exceeds that extent. Grouped expansion
+/// modes require an element type that can represent zero; in particular, they reject `f8e8m0fnu`. Refer to
+/// [`RaggedDotDimensionNumbers`] for the dimension-number contract.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotOperation {
     /// Grouped-dot dimension-number specification.

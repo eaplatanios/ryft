@@ -1045,7 +1045,7 @@ mod tests {
         AddOperation, ComparisonDirection, ConcatenateOperation, ConditionOperation, DimensionAddOperation,
         DimensionMulOperation, DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation,
         DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind, ScanOperation, WhileOperation,
-        ZeroOperation, ZeroOperationProvider,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -1245,17 +1245,6 @@ mod tests {
         assert_eq!(
             dimension_operation.infer_output_types(&[array_type.clone().into(), array_type.clone().into()], &[]),
             Err(TypeError::invalid("expected dimension type but got array type")),
-        );
-        assert_eq!(
-            ArrayIrOperation::<Array>::zero_operation(left_type.clone().into()).unwrap_err(),
-            ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
-        );
-        let reference_type = ReferenceType::new(array_type.clone());
-        assert_eq!(
-            ArrayIrOperation::<Array>::zero_operation(reference_type.clone().into()).unwrap_err(),
-            ProgramError::Type(TypeError::invalid(format!(
-                "cannot materialize a zero for reference type `{reference_type}`; references must be discharged first",
-            ))),
         );
 
         // The direct composite condition preserves the complete higher-order interface, including effects.

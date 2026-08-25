@@ -1166,3 +1166,44 @@ ignored, plus 6 compile-fail cases), `cargo test -p ryft-xla --doc`, `cargo +nig
 and 7 XLA ragged-dot lowering and CPU tests. Independent correctness, conventions, and simplicity auditors reviewed
 the post-fix tree repeatedly; every finding was fixed, including the StableHLO reduction-order portability issue, and
 the final closure round reported no findings in all three tracks. No changelog file was modified.
+
+## Second post-plan feedback remediation
+
+- [x] Remove the resolved custom ragged-mask identity TODO without changing the public enum.
+- [x] In grouped expansion modes, keep negative `ragged_dot_general` group sizes from becoming large unsigned
+  intervals: preserve eager rejection and defensively clamp signed compiled metadata before widening, with a compiled
+  regression.
+- [x] Exercise ragged-dot transpose permutation inversion with a genuinely non-identity permutation.
+- [x] Audit and resolve the reported custom-call dual-universe duplication, unused `padding_independent` contract
+  state, and ragged-mask provenance nesting.
+- [x] Audit and resolve the reported dead transpose collective, all-gather extent derivation, total-permutation extent
+  materialization, and misplaced dot-inference rustdoc.
+- [x] Run focused and affected-crate verification, then repeat independent correctness, conventions, and simplicity
+  audits until all three tracks report no findings.
+- [x] Record the implementation and verification evidence without modifying changelog files.
+
+### Second post-plan feedback remediation review
+
+Removed the resolved ragged-mask identity TODO without changing the enum's exhaustiveness. Grouped-dot decomposition
+now clamps signed group sizes to a shape-identical zero before widening, caps the widened values with scalar
+`stablehlo.clamp`, physicalizes prefix-shaped interval metadata before bounded broadcasts, and restores bounded dynamic
+dimensions once on the completed mask. This prevents negative values from becoming large unsigned intervals and
+avoids StableHLO forms that verify but cannot be imported by XLA. CPU execution covers `[1, -1, 2]` and a prefix whose
+runtime size is below its declared bound; verified-module tests also cover shared rank-one metadata across a bounded
+dynamic prefix. The transpose regressions use genuinely non-identity permutations and exact cotangent values.
+
+Custom-call validation now shares one carrier-based ragged-input pass across homogeneous and mixed value universes;
+the unused `padding_independent` state is gone, and the one-off provenance scopes remain inline with the masking logic
+they annotate.
+All-gather derives physical capacity from its concrete operand, total parallel permutations preserve replicated extent
+metadata without materializing it, and the ragged-all-to-all transpose no longer stages unused offset exchanges. Dot
+documentation is attached to the functions it describes.
+
+Verification in a task-only source copy passed the complete `ryft-core` library suite (1,722 passed, 3 ignored), all
+eight ragged-dot decomposition tests, and the exact multi-strategy lowering snapshot. The complete `ryft-xla` library
+run reached 554 passes and 5 ignored tests; its four failures were unrelated limitations of the isolated XLA artifact
+(missing placement custom calls and dynamic CPU buffers), while every affected test passed. Before the concurrent
+constants work made the owner checkout temporarily uncompilable, its complete `ryft-xla` suite had passed with 556
+tests and 5 ignored. Formatting and whitespace checks pass. Independent correctness, conventions, and simplicity
+auditors repeatedly reviewed the remediation; every finding was fixed and the final closure round reported no
+findings. No changelog file was modified.

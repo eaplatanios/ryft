@@ -1414,6 +1414,55 @@ fn test_ragged_dot_jvp_and_noncontracting_transpose() {
 }
 
 #[test]
+fn test_ragged_dot_noncontracting_transpose_inverts_permuted_output_axes() {
+    let dimensions =
+        RaggedDotDimensionNumbers::new(DotDimensionNumbers::new(vec![1], vec![1], vec![2], vec![2]), vec![0], vec![0]);
+    let lhs =
+        Array::from_f64s(plain_array(&[3, 2, 2]), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 2, 2, 1]), vec![2.0, 3.0, 5.0, 7.0, 11.0, 13.0, 17.0, 19.0]);
+    let group_sizes = Array::vector(vec![1_i32, 2]);
+    let output_cotangent = Array::from_f64s(plain_array(&[2, 3, 1]), vec![1.0, 2.0, 3.0, 5.0, 7.0, 11.0]);
+
+    // The LHS adjoint is initially ordered `[batch, ragged, contracting]` and must be transposed back to
+    // `[ragged, contracting, batch]` with `[1, 2, 0]`.
+    check_operation_transposition!(
+        @exact,
+        operation = RaggedDotOperation::new(dimensions.clone()),
+        cases = [{
+            inputs = [
+                (@linear(type = lhs.r#type().into_owned())),
+                (@known, rhs.clone()),
+                (@known, group_sizes.clone()),
+            ],
+            output_cotangents = [output_cotangent.clone()],
+            input_cotangents = [Array::from_f64s(
+                plain_array(&[3, 2, 2]),
+                vec![2.0, 15.0, 5.0, 35.0, 22.0, 91.0, 34.0, 133.0, 33.0, 143.0, 51.0, 209.0],
+            )],
+        }],
+    );
+
+    // The RHS adjoint is initially ordered `[group, batch, contracting, result]` and must be transposed back to
+    // `[group, contracting, batch, result]` with `[0, 2, 1, 3]`.
+    check_operation_transposition!(
+        @exact,
+        operation = RaggedDotOperation::new(dimensions),
+        cases = [{
+            inputs = [
+                (@known, lhs),
+                (@linear(type = rhs.r#type().into_owned())),
+                (@known, group_sizes),
+            ],
+            output_cotangents = [output_cotangent],
+            input_cotangents = [Array::from_f64s(
+                plain_array(&[2, 2, 2, 1]),
+                vec![1.0, 10.0, 3.0, 20.0, 37.0, 152.0, 47.0, 188.0],
+            )],
+        }],
+    );
+}
+
+#[test]
 fn test_ragged_dot_batch_widened_differential_staging() {
     let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
     let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 1]);

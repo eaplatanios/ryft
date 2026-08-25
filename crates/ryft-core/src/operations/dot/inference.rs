@@ -133,36 +133,10 @@ pub(crate) fn ragged_dot_abstract(
     Ok(output)
 }
 
-/// Computes the abstract output type of one generalized dot product.
+/// Returns whether operands of `operand` element type may accumulate at `accumulation`.
 ///
-/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand
-/// axes that are neither batching nor contracting, in their original order. The output element type is the LHS
-/// element type (after a compatibility check with the RHS element type).
-///
-/// The output [`Sharding`] follows JAX's `dot_general` sharding rule (`_dot_general_sharding_rule` in
-/// `jax/_src/lax/lax.py`); refer to the
-/// [StableHLO `dot_general` specification](https://openxla.org/stablehlo/spec#dot_general) for the underlying
-/// operation semantics. Concretely:
-///
-///   - When `output_sharding` is provided, it is validated (rank, mesh, no auto axes, and the unreduced-output rule
-///     requiring identically sharded contracting dimensions whose sharding axes equal the requested unreduced set)
-///     and returned directly, bypassing the consistency checks below.
-///   - Operands must not be unreduced. Reduced operands are legal, and reduced and varying manual axes are unioned
-///     across the operands into the output sharding.
-///   - When neither operand carries a sharding, the output carries none. When exactly one does, the rule runs with
-///     the absent side treated as fully replicated on the present operand's mesh. Operand meshes must match.
-///   - Batch dimension entries are merged preferring the more informative entry (`Sharded` over `Replicated` over
-///     `Unconstrained`); two different `Sharded` entries are an error. This intentionally diverges from JAX, which
-///     reads batch dimension specs from the LHS operand only.
-///   - Contracting dimensions sharded on both operands are an error (identically sharded ones make the output
-///     sharding ambiguous and require an explicit output sharding); a contracting dimension sharded on only one
-///     operand is allowed and its sharding is dropped from the output.
-///   - Result dimension entries are copied from the owning operand, and auto mesh axes are stripped from the final
-///     sharding.
-/// Returns whether operands of `operand` element type may accumulate at `accumulation`: the identical type is
-/// always valid, floating-point operands of any precision (including the sub-byte and 8-bit types that live outside
-/// the standard promotion lattice) accumulate at `f32` or `f64` (the accumulator widths XLA's low-precision matrix
-/// units expose), and integer operands accumulate at a same-signedness integer type at least as wide.
+/// The identical type is always valid. Floating-point operands may accumulate at `f32` or `f64`, and integer
+/// operands may accumulate at a same-signedness integer type at least as wide.
 fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) -> bool {
     /// Returns the signedness and bit width of an integer data type, or `None` for any other type.
     fn integer_parts(data_type: DataType) -> Option<(bool, usize)> {
@@ -199,6 +173,32 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
     }
 }
 
+/// Computes the abstract output type of one generalized dot product.
+///
+/// The result shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the operand
+/// axes that are neither batching nor contracting, in their original order. The output element type is the requested
+/// compatible accumulation type when one is provided, or otherwise the common operand element type.
+///
+/// The output [`Sharding`] follows JAX's `dot_general` sharding rule (`_dot_general_sharding_rule` in
+/// `jax/_src/lax/lax.py`); refer to the
+/// [StableHLO `dot_general` specification](https://openxla.org/stablehlo/spec#dot_general) for the underlying
+/// operation semantics. Concretely:
+///
+///   - When `output_sharding` is provided, it is validated (rank, mesh, no auto axes, and the unreduced-output rule
+///     requiring identically sharded contracting dimensions whose sharding axes equal the requested unreduced set)
+///     and returned directly, bypassing the consistency checks below.
+///   - Operands must not be unreduced. Reduced operands are legal, and reduced and varying manual axes are unioned
+///     across the operands into the output sharding.
+///   - When neither operand carries a sharding, the output carries none. When exactly one does, the rule runs with
+///     the absent side treated as fully replicated on the present operand's mesh. Operand meshes must match.
+///   - Batch dimension entries are merged preferring the more informative entry (`Sharded` over `Replicated` over
+///     `Unconstrained`); two different `Sharded` entries are an error. This intentionally diverges from JAX, which
+///     reads batch dimension specs from the LHS operand only.
+///   - Contracting dimensions sharded on both operands are an error (identically sharded ones make the output
+///     sharding ambiguous and require an explicit output sharding); a contracting dimension sharded on only one
+///     operand is allowed and its sharding is dropped from the output.
+///   - Result dimension entries are copied from the owning operand, and auto mesh axes are stripped from the final
+///     sharding.
 pub(crate) fn dot_abstract(
     lhs: &ArrayType,
     rhs: &ArrayType,

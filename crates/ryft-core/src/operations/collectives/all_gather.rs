@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::arrays::batching::DynamicArrayBatchingPolicy;
+use crate::arrays::batching::{DynamicArrayBatchingPolicy, folded_array_dimension};
 use crate::arrays::{
     ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension, DimensionOperation,
     DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis, Shape, Sharding,
@@ -921,8 +921,12 @@ where
                     }
                     ragged_axis.extents().clone()
                 };
+                // The packed capacity comes from the operand axis. A dimension variable's exclusive upper bound
+                // only constrains logical extents and may be looser than that physical capacity.
+                let physical_extent = folded_array_dimension(context.parent(), array.value(), ragged_axis.axis())?;
                 Ok((
                     output_axis,
+                    physical_extent,
                     RaggedAxis::new(
                         ragged_axis.axis(),
                         <C::Value as ValueProjection<ArrayType>>::into_projected(extents)?,
@@ -947,19 +951,10 @@ where
             .iter()
             .enumerate()
             .map(|(axis, extent)| {
-                if ragged_axes.iter().any(|(ragged_output_axis, _)| *ragged_output_axis == axis) {
-                    let extent_type = extent.unbatched_type();
-                    let extent_type = <&DimensionType>::try_from(&extent_type)?;
-                    let physical_extent =
-                        extent_type.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
-                            BatchingError::InvalidBatchMetadata {
-                                message: format!(
-                                    "bounded ragged dimension `{}` requires a finite, nonempty declared upper bound",
-                                    extent_type.variable(),
-                                ),
-                            }
-                        })?;
-                    return DynamicArrayBatchingPolicy::collective_extent_constant(&projected_context, physical_extent);
+                if let Some((_, physical_extent, _)) =
+                    ragged_axes.iter().find(|(ragged_output_axis, _, _)| *ragged_output_axis == axis)
+                {
+                    return Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(physical_extent.clone())?);
                 }
                 if extent.mapped_dimension_extents().is_some() {
                     let extent_type = extent.unbatched_type();
@@ -976,7 +971,7 @@ where
                 Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone())?)
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
-        let ragged_axes = ragged_axes.into_iter().map(|(_, ragged_axis)| ragged_axis).collect::<Vec<_>>();
+        let ragged_axes = ragged_axes.into_iter().map(|(_, _, ragged_axis)| ragged_axis).collect::<Vec<_>>();
         let mut output = batch_all_gather_matching_axis::<_, DynamicArrayBatchingPolicy>(
             self,
             &projected_context,
@@ -1274,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_untiled_all_gather_co_moves_ragged_extents_onto_the_participant_axis() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 0.0, 0.0, 2.0, 3.0, 4.0]), BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable.clone(), vec![0])])
@@ -1298,7 +1293,7 @@ mod tests {
 
     #[test]
     fn test_untiled_all_gather_materializes_replicated_ragged_extents() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::replicated(Array::vector(vec![1.0_f32, 2.0, 0.0]))
             .with_ragged_axes(vec![RaggedAxis::new(0, Array::scalar(2_i32), variable.clone(), Vec::new())])
             .unwrap();
@@ -1321,7 +1316,7 @@ mod tests {
 
     #[test]
     fn test_tiled_all_gather_rejects_unrepresentable_ragged_chunks() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
@@ -1348,7 +1343,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_all_gather_preserves_untiled_ragged_metadata_and_rejects_tiled() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(8)).unwrap());
         let extents = ArrayIrValue::Array(Array::vector(vec![1_i32, 3]));
         let input = ArrayIrBatch::new(
             ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0])),
@@ -1380,6 +1375,7 @@ mod tests {
             .into_parts()
             .0
             .remove(0);
+        assert_eq!(output.value(), &ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 0.0, 0.0, 2.0, 3.0, 4.0])),);
         assert_eq!(output.ragged_axes(), &[RaggedAxis::new(1, extents, variable.clone(), vec![0])]);
 
         let tiled = AllGatherOperation::new(

@@ -798,15 +798,14 @@ where
                         let send_sizes = known_transpose_input(send_sizes, "send_sizes")?;
                         let output_offsets = known_transpose_input(output_offsets, "output_offsets")?;
                         let receive_sizes = known_transpose_input(receive_sizes, "receive_sizes")?;
-                        let permuted_output_offsets = if self.is_physical() {
-                            transpose_physical_offsets(self, &output_offsets)?
+                        let (operand_cotangent, permuted_output_offsets) = if operand.is_known() {
+                            (MaybeZero::Zero(operand.r#type().cotangent()?), None)
                         } else {
-                            transpose_logical_offsets(self, context, &output_offsets)?
-                        };
-
-                        let operand_cotangent = if operand.is_known() {
-                            MaybeZero::Zero(operand.r#type().cotangent()?)
-                        } else {
+                            let permuted_output_offsets = if self.is_physical() {
+                                transpose_physical_offsets(self, &output_offsets)?
+                            } else {
+                                transpose_logical_offsets(self, context, &output_offsets)?
+                            };
                             let permuted_input_offsets = if self.is_physical() {
                                 transpose_physical_offsets(self, &input_offsets)?
                             } else {
@@ -824,13 +823,18 @@ where
                             let mut contributions =
                                 context.bind(self.with_additive_updates(), Vec::new(), &adjoint_inputs)?;
                             check_count!("output", contributions, 1, ProgramError);
-                            MaybeZero::Value(contributions.remove(0))
+                            (MaybeZero::Value(contributions.remove(0)), Some(permuted_output_offsets))
                         };
                         let output_cotangent = if output.is_known() {
                             MaybeZero::Zero(output.r#type().cotangent()?)
                         } else if self.update_kind == RaggedAllToAllUpdateKind::Add {
                             MaybeZero::Value(cotangent.clone())
                         } else {
+                            let permuted_output_offsets = match permuted_output_offsets {
+                                Some(permuted_output_offsets) => permuted_output_offsets,
+                                None if self.is_physical() => transpose_physical_offsets(self, &output_offsets)?,
+                                None => transpose_logical_offsets(self, context, &output_offsets)?,
+                            };
                             MaybeZero::Value(mask_output_cotangent(
                                 context,
                                 cotangent,
@@ -2353,6 +2357,42 @@ mod tests {
         let transposed_twice = pullback.transpose_with_respect_to(&[0]).unwrap();
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
+    }
+
+    #[test]
+    fn test_additive_ragged_all_to_all_output_transpose_does_not_exchange_offsets() {
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let operand = builder.add_input(array_type(DataType::F32, [3]));
+        let output = builder.add_input(array_type(DataType::F32, [4]));
+        let input_offsets = builder.add_constant(Array::vector(vec![0_i32]));
+        let send_sizes = builder.add_constant(Array::vector(vec![1_i32]));
+        let output_offsets = builder.add_constant(Array::vector(vec![0_i32]));
+        let receive_sizes = builder.add_constant(Array::vector(vec![1_i32]));
+        let result = builder
+            .add_instruction(
+                RaggedAllToAllOperation::new("x".to_string(), 1).with_additive_updates(),
+                Vec::new(),
+                vec![operand, output, input_offsets, send_sizes, output_offsets, receive_sizes],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+
+        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+
+        assert_eq!(
+            pullback
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(instruction.operation(), ArrayOperation::AllToAll(_)))
+                .count(),
+            0,
+        );
     }
 
     #[test]

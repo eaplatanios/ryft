@@ -902,7 +902,6 @@ mod tests {
             .with_ragged_contract(CustomCallRaggedContract::new(
                 vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, length.clone())],
                 vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "data".to_string(), axis: 0 }],
-                true,
             ));
         let (mut outputs, evidence) =
             operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand]).unwrap().into_parts();

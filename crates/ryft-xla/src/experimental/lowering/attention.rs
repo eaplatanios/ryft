@@ -12,9 +12,9 @@ use ryft_mlir::{
 };
 
 use super::{
-    CollectiveLoweringState, LoweringError, lower_decomposition_call, lower_f64_constant_splat, lower_reduce_to_mlir,
-    lower_restore_dynamic_dimensions, lower_static_custom_call_input, lower_tensor_type, physical_bound_type,
-    static_dimensions,
+    CollectiveLoweringState, LoweringError, lower_decomposition_call, lower_f64_constant_splat,
+    lower_physical_bound_value, lower_reduce_to_mlir, lower_restore_dynamic_dimensions, lower_tensor_type,
+    physical_bound_type, static_dimensions,
 };
 
 /// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-three or rank-four attention type.
@@ -348,7 +348,7 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         lengths = dynamic.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
-        lengths = lower_static_custom_call_input(lengths, &logical_type, 0.0, block, context, location)?;
+        lengths = lower_physical_bound_value(lengths, &logical_type, 0.0, block, context, location)?;
     }
     Ok(lengths)
 }
@@ -427,7 +427,7 @@ pub(super) fn lower_dot_product_attention_to_mlir<'b, 'c: 'b, 't: 'c>(
         let mut physical_inputs = input_values
             .iter()
             .zip(input_types)
-            .map(|(value, r#type)| lower_static_custom_call_input(*value, r#type, 0.0, block, context, location))
+            .map(|(value, r#type)| lower_physical_bound_value(*value, r#type, 0.0, block, context, location))
             .collect::<Result<Vec<_>, _>>()?;
         for index in 0..3 {
             let physical_type = physical_bound_type(&input_types[index])?;
@@ -670,7 +670,7 @@ pub(super) fn lower_dot_product_attention_backward_to_mlir<'b, 'c: 'b, 't: 'c>(
         let mut physical_inputs = input_values
             .iter()
             .zip(input_types)
-            .map(|(value, r#type)| lower_static_custom_call_input(*value, r#type, 0.0, block, context, location))
+            .map(|(value, r#type)| lower_physical_bound_value(*value, r#type, 0.0, block, context, location))
             .collect::<Result<Vec<_>, _>>()?;
         for index in [0, 1, 2, offset, offset + 2] {
             let physical_type = physical_bound_type(&input_types[index])?;

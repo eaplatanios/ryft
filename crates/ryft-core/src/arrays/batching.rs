@@ -922,7 +922,6 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
-// TODO(eaplatanios): Should this include a `Custom { value: V }` variant for custom identity values?
 /// Identity element that [`RaggedArrayBatchingPolicy::mask_identity_input`] writes over the padding of a bounded
 /// ragged axis. It names the value rather than the combining operator, so one masking hook serves every consumer
 /// whose operator has one of these identities.

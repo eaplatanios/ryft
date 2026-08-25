@@ -19,8 +19,8 @@ use super::{
     lower_compare_to_mlir, lower_concatenate_extent_assertion, lower_constant_elements_attribute,
     lower_constant_output, lower_custom_call_to_mlir, lower_dimension_arithmetic_assertion, lower_dimension_extent,
     lower_dimension_requirement_to_assertion, lower_dynamic_shape_slice_assertion, lower_pad_to_mlir,
-    lower_parallel_sum_scatter_to_mlir, lower_ragged_all_to_all_to_mlir, lower_rng_bit_generator_to_mlir,
-    lower_runtime_dimension_size_i64, lower_sharding_constraint, lower_static_custom_call_input,
+    lower_parallel_sum_scatter_to_mlir, lower_physical_bound_value, lower_ragged_all_to_all_to_mlir,
+    lower_rng_bit_generator_to_mlir, lower_runtime_dimension_size_i64, lower_sharding_constraint,
     lower_static_index_constants, lower_tensor_type, physical_bound_type, reshape_dimension_i32, reshape_dimension_i64,
     stable_hlo_dynamic_dimension_bound, static_dimensions,
 };
@@ -672,7 +672,7 @@ where
                     .collect::<Vec<_>>();
                 let (declared_type, physical_type) =
                     dynamic_constructor_types(operation.name(), dynamic_extents.len(), output_types)?;
-                let input = lower_static_custom_call_input(*input, input_type, 0.0, block, context, location)?;
+                let input = lower_physical_bound_value(*input, input_type, 0.0, block, context, location)?;
                 let output_tensor_type = lower_tensor_type(&physical_type, context, location)?;
                 let broadcast = block.append_operation(stable_hlo::broadcast(
                     input,
