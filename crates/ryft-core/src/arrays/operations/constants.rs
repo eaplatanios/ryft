@@ -1,13 +1,3 @@
-//! Array IR instantiations of the constants operation family contracts.
-//!
-//! Nullary constructors are the one place where a purely structural output type is not enough: materializing a zero,
-//! one, or iota whose shape has dynamic axes requires the concrete runtime extents. This module supplies the array
-//! universe's answers to those contracts — the mixed dynamic constructors that consume one first-class dimension
-//! operand per dynamic axis, the canonical lifts that route each constructor to its static or dynamic encoding, and
-//! the residual-aware zero construction that differentiation uses to rebuild a disconnected cotangent.
-
-// TODO(eaplatanios): Review this module.
-
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
@@ -21,7 +11,6 @@ use crate::operations::{
 };
 use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Value};
 
-// TODO(eaplatanios): Why is this not generated from our derive macro?
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(operation: ZeroOperation<ArrayType>) -> Self {
@@ -42,7 +31,6 @@ impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOpera
     }
 }
 
-// TODO(eaplatanios): Why is this not generated from our derive macro?
 impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayIrOperation<A> {
     #[inline]
     fn from(_: ZeroLikeOperation<ArrayIrType>) -> Self {
@@ -81,21 +69,22 @@ impl<A: Value<Type = ArrayType>> From<OneOperation<ArrayIrType>> for ArrayIrOper
         // A composite one names its complete output type, so it needs no composite carrier of its own: it normalizes
         // into the same canonical member encodings that the homogeneous lift above selects. This conversion exists so
         // that type-generic transform drivers can name the multiplicative identity in the composite universe with a
-        // plain `From<OneOperation<C::Type>>` bound, which is what reverse-mode gradient seeding requires.
+        // plain `From<OneOperation<C::Type>>` bound, which is what reverse-mode differentiation gradient seeding
+        // requires.
         match operation.r#type() {
             ArrayIrType::Array(r#type) => Self::from(OneOperation::new(r#type.clone())),
-            // A first-class dimension is a shape quantity rather than numerical data, so it has no one value. The
-            // composite universe already represents a dimension's differential space as the zero-space array member
-            // (refer to [`DifferentiableType::cotangent`](crate::DifferentiableType::cotangent)), and that member is
-            // where this request is routed: it materializes no value, because constructing a one of data type zero is
-            // rejected. Reverse-mode seeding never reaches this arm, because it rejects a zero-space output before
-            // constructing its seed.
             ArrayIrType::Dimension(_) => {
+                // A first-class dimension is a shape quantity rather than numerical data, so it has no one value. The
+                // composite universe already represents a dimension's differential space as the zero-space array member
+                // (refer to `DifferentiableType::cotangent` for more information), and that member is where this
+                // request is routed. It materializes no value, because constructing a one of data type zero is
+                // rejected. Reverse-mode differentiation gradient seeding never reaches this arm, because it rejects
+                // a zero-space output before constructing its seed.
                 Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
             }
-            // Fallible cotangent derivation rejects references before reverse-mode seeding reaches this conversion.
-            // Retain the same invalid sentinel used for dimensions solely so this public conversion remains total.
             ArrayIrType::Reference(_) => {
+                // Fallible cotangent derivation rejects references before reverse-mode seeding reaches this conversion.
+                // Retain the same invalid sentinel used for dimensions solely so this public conversion remains total.
                 Self::Array(ArrayOperation::One(OneOperation::new(ArrayType::scalar(DataType::Zero))))
             }
         }
@@ -121,6 +110,8 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 // These residual-protocol algorithms are deliberately inherent methods duplicated by thin trait-impl delegations
 // below rather than living only on the trait: the `XlaOperation` provider reuses them across operation families,
