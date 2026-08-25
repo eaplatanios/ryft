@@ -9,8 +9,6 @@ use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`OneLikeOperation`].
 pub const ONE_LIKE_OPERATION_NAME: &str = "one_like";
 
@@ -22,7 +20,7 @@ pub struct OneLikeOperation<T: Type>(PhantomData<fn() -> T>);
 impl<T: Type> Copy for OneLikeOperation<T> {}
 
 impl<T: Type> OneLikeOperation<T> {
-    /// Constructs a one-like operation for the `T` type universe.
+    /// Constructs a new [`OneLikeOperation`].
     #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
@@ -82,8 +80,10 @@ impl<C: Context<Operation: From<OneLikeOperation<C::Type>>>> PartiallyEvaluatabl
 
 impl_differentiable_elementwise_operation!(@constant<T> OneLikeOperation<T>);
 
-/// Synthesizes a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart to [`One`](super::One).
-/// It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Represents the ability to synthesize a _one_ value from an exemplar. [`OneLike`] is the value-driven counterpart
+/// to [`One`](super::One). It is what [`OneLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait OneLike {
     /// Returns a _one_ value with the same structure as `self`.
     fn one_like(&self) -> Self;

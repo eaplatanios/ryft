@@ -9,8 +9,6 @@ use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`ZeroLikeOperation`].
 pub const ZERO_LIKE_OPERATION_NAME: &str = "zero_like";
 
@@ -22,7 +20,7 @@ pub struct ZeroLikeOperation<T: Type>(PhantomData<fn() -> T>);
 impl<T: Type> Copy for ZeroLikeOperation<T> {}
 
 impl<T: Type> ZeroLikeOperation<T> {
-    /// Constructs a zero-like operation for the `T` type universe.
+    /// Constructs a new [`ZeroLikeOperation`].
     #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
@@ -87,8 +85,10 @@ impl<C: Context<Operation: From<ZeroLikeOperation<C::Type>>>> PartiallyEvaluatab
 
 impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
 
-/// Synthesizes a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart to [`Zero`](super::Zero).
-/// It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Represents the ability to synthesize a _zero_ value from an exemplar. [`ZeroLike`] is the value-driven counterpart
+/// to [`Zero`](super::Zero). It is what [`ZeroLikeOperation`] needs for its [`InterpretableOperation`] implementation.
 pub trait ZeroLike {
     /// Returns a _zero_ value with the same structure as `self`.
     fn zero_like(&self) -> Self;
