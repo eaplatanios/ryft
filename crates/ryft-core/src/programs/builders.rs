@@ -48,7 +48,7 @@ pub struct ProgramBuilder<V: Typed + Parameter, O> {
     pub(crate) callees: Vec<(Arc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
 
     /// [`TypeIdentity`](crate::TypeIdentity)-instantiated shared callees cached by source and caller input [`Type`]s.
-    pub(crate) callee_instantiations: Vec<CalleeInstantiation<V, O>>,
+    callee_instantiations: Vec<CalleeInstantiation<V, O>>,
 
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
@@ -523,16 +523,16 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 /// shared callee. The source [`Arc`] supplies a stable identity key and keeps its allocation alive, `input_types`
 /// identifies the exact instantiated boundary, and `region` points at the corresponding imported root.
 #[derive(Clone, Debug)]
-pub(crate) struct CalleeInstantiation<V: Typed + Parameter, O> {
+struct CalleeInstantiation<V: Typed + Parameter, O> {
     /// Shared source callee.
-    pub(crate) callee: Arc<Program<V, O, Vec<V>, Vec<V>>>,
+    callee: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Complete caller input [`Type`]s. An imported [`Region`] carries these exact live identities in its boundary
     /// types, so only another invocation with the same types can reuse it.
-    pub(crate) input_types: Vec<V::Type>,
+    input_types: Vec<V::Type>,
 
     /// [`RegionId`] of the imported root [`Region`].
-    pub(crate) region: RegionId,
+    region: RegionId,
 }
 
 /// [`Reference`](crate::Reference) alias topology and consumption state of a [`Region`] under construction. The
@@ -615,8 +615,10 @@ impl ReferenceLifetimes {
         }
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Records `output` as an alias of `input`, resolving the family root eagerly.
+    /// Records `output` as an alias of `input`, resolving the family root eagerly. `narrows` means that this edge
+    /// introduces a view mapping instead of preserving the input handle's exact whole-root mapping. Narrowing is
+    /// _transitive_ meaning that once any edge in an alias chain introduces a view, later identity aliases remain
+    /// narrowing and cannot be used to consume the family as though they represented its whole root.
     fn alias(&mut self, output: AtomId, input: AtomId, narrows: bool) {
         let source = self.aliases.get(&input).copied();
         let edge = ResolvedReferenceAlias {
@@ -627,7 +629,6 @@ impl ReferenceLifetimes {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Resolved alias-family membership of one derived reference atom.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct ResolvedReferenceAlias {
