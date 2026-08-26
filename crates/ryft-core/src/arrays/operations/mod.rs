@@ -61,8 +61,8 @@ use crate::operations::{
     XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
-    FreezeReference, FreezeReferenceOperation, MaybeZero, NewReference, NewReferenceOperation, Operation,
-    OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceRead,
+    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Type,
     TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
@@ -444,7 +444,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     DimensionSize(DimensionSizeOperation),
 
     /// Creates a new whole-array reference root.
-    NewReference(NewReferenceOperation<ArrayType, ArrayIrType>),
+    ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
     /// Reads the array value selected by a root reference or derived view.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType>),
@@ -465,7 +465,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
 
     /// Consumes a whole-array reference and returns its final value.
-    FreezeReference(FreezeReferenceOperation<ArrayType, ArrayIrType>),
+    ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
     /// Mixed operation that converts ordinary scalar-array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
@@ -588,8 +588,8 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperatio
 ///   - Mixed capabilities, whose signatures cross the array and first-class-dimension member kinds, exist only at
 ///     the composite level and are therefore the bundle's members: [`Compare`] of two first-class dimensions,
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
-///     [`DynamicReshape`], the whole-value reference capabilities [`NewReference`], [`ReferenceRead`],
-///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`FreezeReference`], and the reference view
+///     [`DynamicReshape`], the whole-value reference capabilities [`ReferenceNew`], [`ReferenceRead`],
+///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`ReferenceFreeze`], and the reference view
 ///     derivations [`ReferenceIndex`] and [`ReferenceSlice`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
@@ -665,9 +665,9 @@ pub trait ArrayIrOperations:
     + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
-    + NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
+    + ReferenceNew + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
     + ReferenceAddUpdate
-    + FreezeReference
+    + ReferenceFreeze
 {
 }
 
@@ -678,9 +678,9 @@ where
     V: Value<Type = ArrayIrType> + Compare,
     V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
-    V: NewReference + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap,
+    V: ReferenceNew + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap,
     V: ReferenceAddUpdate,
-    V: FreezeReference,
+    V: ReferenceFreeze,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
     V: ValueProjection<DimensionType, Projected: DimensionOperations>,
 {
@@ -1085,7 +1085,7 @@ mod tests {
         }
 
         fn reference_round_trip<V: ArrayIrOperations>(value: &V) -> Result<V, ProgramError> {
-            value.new_reference()?.freeze()
+            value.reference_new()?.freeze()
         }
 
         let input = ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]));
@@ -2860,7 +2860,7 @@ mod tests {
             ArrayIrOperation::Dimension(_) => MemberKindSignature::DimensionToDimension,
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
-            ArrayIrOperation::NewReference(_) => MemberKindSignature::ArrayToReference,
+            ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
             ArrayIrOperation::ReferenceIndex(_) | ArrayIrOperation::ReferenceSlice(_) => {
                 MemberKindSignature::ReferenceToReference
             }
@@ -2868,7 +2868,7 @@ mod tests {
             ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,
             ArrayIrOperation::ReferenceAddUpdate(_) => MemberKindSignature::ReferenceAndArrayToUnit,
-            ArrayIrOperation::FreezeReference(_) => MemberKindSignature::ReferenceToArray,
+            ArrayIrOperation::ReferenceFreeze(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::DimensionFromScalar(_) => MemberKindSignature::ArrayToDimensionGateway,
             ArrayIrOperation::DimensionToScalar(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::Reshape(_) => MemberKindSignature::GeometryMixed,
@@ -2930,7 +2930,7 @@ mod tests {
                 ArrayIrOperation::DimensionSize(DimensionSizeOperation::new(&dynamic_type, 0).unwrap()),
                 MemberKindSignature::GeometryMixed,
             ),
-            (ArrayIrOperation::NewReference(NewReferenceOperation::new()), MemberKindSignature::ArrayToReference),
+            (ArrayIrOperation::ReferenceNew(ReferenceNewOperation::new()), MemberKindSignature::ArrayToReference),
             (
                 ArrayIrOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0)),
                 MemberKindSignature::ReferenceToReference,
@@ -2952,7 +2952,7 @@ mod tests {
                 ArrayIrOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
                 MemberKindSignature::ReferenceAndArrayToUnit,
             ),
-            (ArrayIrOperation::FreezeReference(FreezeReferenceOperation::new()), MemberKindSignature::ReferenceToArray),
+            (ArrayIrOperation::ReferenceFreeze(ReferenceFreezeOperation::new()), MemberKindSignature::ReferenceToArray),
             (
                 ArrayIrOperation::DimensionFromScalar(DimensionFromScalarOperation::new(second.clone())),
                 MemberKindSignature::ArrayToDimensionGateway,

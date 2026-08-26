@@ -28,17 +28,17 @@ use ryft_core::{
     DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    EagerContext, ErfOperation, ExpOperation, FloorOperation, FreezeReferenceOperation, GatherOperation, IotaOperation,
-    LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation,
-    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NewReferenceOperation, NotOperation,
-    OneLikeOperation, OneOperation, Operation, OperationFormatter, OrOperation, OutputRegionProvenance, PadOperation,
-    ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
-    PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
-    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceIndexOperation, ReferenceReadOperation,
-    ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface, RegionSlot,
-    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation,
+    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationFormatter, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface,
+    RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
     ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
     SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
     TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
@@ -274,7 +274,7 @@ where
     DimensionSize(DimensionSizeOperation),
 
     /// Unresolved whole-array reference allocation retained until reference discharge.
-    NewReference(NewReferenceOperation<ArrayType, ArrayIrType>),
+    ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
     /// Unresolved axis-removing reference view retained until reference discharge.
     ReferenceIndex(ReferenceIndexOperation),
@@ -295,7 +295,7 @@ where
     ReferenceAddUpdate(ReferenceAddUpdateOperation<ArrayType, ArrayIrType>),
 
     /// Unresolved consuming whole-array reference freeze retained until reference discharge.
-    FreezeReference(FreezeReferenceOperation<ArrayType, ArrayIrType>),
+    ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
     /// Converts scalar array data into a checked first-class dimension.
     DimensionFromScalar(DimensionFromScalarOperation),
@@ -414,14 +414,14 @@ where
             ArrayIrOperation::Dimension(operation) => Self::Dimension(operation),
             ArrayIrOperation::Compare(operation) => Self::Compare(operation),
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
-            ArrayIrOperation::NewReference(operation) => Self::NewReference(operation),
+            ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
             ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
             ArrayIrOperation::ReferenceSlice(operation) => Self::ReferenceSlice(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
             ArrayIrOperation::ReferenceWrite(operation) => Self::ReferenceWrite(operation),
             ArrayIrOperation::ReferenceSwap(operation) => Self::ReferenceSwap(operation),
             ArrayIrOperation::ReferenceAddUpdate(operation) => Self::ReferenceAddUpdate(operation),
-            ArrayIrOperation::FreezeReference(operation) => Self::FreezeReference(operation),
+            ArrayIrOperation::ReferenceFreeze(operation) => Self::ReferenceFreeze(operation),
             ArrayIrOperation::DimensionFromScalar(operation) => Self::DimensionFromScalar(operation),
             ArrayIrOperation::DimensionToScalar(operation) => Self::DimensionToScalar(operation),
             ArrayIrOperation::Reshape(operation) => Self::Reshape(operation),
@@ -699,14 +699,14 @@ where
             Self::Dimension(operation) => ArrayIrOperation::Dimension(operation.clone()),
             Self::Compare(operation) => ArrayIrOperation::Compare(operation.clone()),
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
-            Self::NewReference(operation) => ArrayIrOperation::NewReference(*operation),
+            Self::ReferenceNew(operation) => ArrayIrOperation::ReferenceNew(*operation),
             Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
             Self::ReferenceSlice(operation) => ArrayIrOperation::ReferenceSlice(operation.clone()),
             Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
             Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(*operation),
             Self::ReferenceSwap(operation) => ArrayIrOperation::ReferenceSwap(*operation),
             Self::ReferenceAddUpdate(operation) => ArrayIrOperation::ReferenceAddUpdate(*operation),
-            Self::FreezeReference(operation) => ArrayIrOperation::FreezeReference(*operation),
+            Self::ReferenceFreeze(operation) => ArrayIrOperation::ReferenceFreeze(*operation),
             Self::DimensionFromScalar(operation) => ArrayIrOperation::DimensionFromScalar(operation.clone()),
             Self::DimensionToScalar(operation) => ArrayIrOperation::DimensionToScalar(*operation),
             Self::Reshape(operation) => ArrayIrOperation::Reshape(operation.clone()),
@@ -1350,9 +1350,9 @@ mod tests {
         CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation,
         DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
-        EmptyRegionDriver, FreezeReferenceOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
-        NewReferenceOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder,
-        ProgramError, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceSource,
+        EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation,
+        OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation,
+        ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceStateBinding, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver,
         RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
         ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
@@ -1577,9 +1577,9 @@ mod tests {
         assert!(matches!(add_update.to_core_operation(), Some(ArrayIrOperation::ReferenceAddUpdate(_)),));
 
         let freeze: XlaOperation<XlaConstant> =
-            ArrayIrOperation::<XlaArrayConstant>::FreezeReference(FreezeReferenceOperation::new()).into();
-        assert!(matches!(&freeze, XlaOperation::FreezeReference(_)));
-        assert!(matches!(freeze.to_core_operation(), Some(ArrayIrOperation::FreezeReference(_)),));
+            ArrayIrOperation::<XlaArrayConstant>::ReferenceFreeze(ReferenceFreezeOperation::new()).into();
+        assert!(matches!(&freeze, XlaOperation::ReferenceFreeze(_)));
+        assert!(matches!(freeze.to_core_operation(), Some(ArrayIrOperation::ReferenceFreeze(_)),));
     }
 
     #[test]
@@ -1593,7 +1593,7 @@ mod tests {
         let initial = builder.add_input(ArrayIrType::Array(scalar_type.clone()));
         let update = builder.add_input(ArrayIrType::Array(scalar_type));
         let root = builder
-            .add_instruction(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), vec![initial], None)
+            .add_instruction(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![initial], None)
             .unwrap()[0];
         builder
             .add_instruction(
@@ -1605,7 +1605,7 @@ mod tests {
             .unwrap();
         let local = builder
             .add_instruction(
-                XlaOperation::FreezeReference(FreezeReferenceOperation::new()),
+                XlaOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
                 Vec::new(),
                 vec![root],
                 None,
@@ -2293,7 +2293,7 @@ mod tests {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![known_input], None).unwrap();
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![known_input], None).unwrap();
             let doubled = builder
                 .add_instruction(AddOperation::new(), Vec::new(), vec![known_input, known_input], None)
                 .unwrap()[0];
@@ -2335,7 +2335,7 @@ mod tests {
             Err(ProgramError::UnsupportedOperation {
                 // The entry-level up-front closure check identifies the intrinsic state operation before
                 // carrier-specific partitioning can stage any known work.
-                message: "`new_reference` must be discharged before partial evaluation".to_string(),
+                message: "`reference_new` must be discharged before partial evaluation".to_string(),
             }),
         );
         assert!(outer.builder().borrow().instructions().is_empty());
@@ -2540,11 +2540,11 @@ mod tests {
         let callee = builder.import_program(callee);
         let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let previous = builder
             .add_instruction(XlaOperation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update], None)
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![previous, frozen],

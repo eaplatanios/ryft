@@ -45,12 +45,12 @@
 //!
 //! ```
 //! use ryft_core::{
-//!     Array, ArrayIrValue, ArraySliceAxis, FreezeReference, NewReference, ReferenceRead, ReferenceSlice,
+//!     Array, ArrayIrValue, ArraySliceAxis, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSlice,
 //!     ReferenceWrite,
 //! };
 //!
 //! let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]));
-//! let root = initial.new_reference()?;
+//! let root = initial.reference_new()?;
 //! let tail = root.reference_slice(&[ArraySliceAxis::new(1, 2, 1)])?;
 //! let snapshot = tail.read()?;
 //! tail.write(&ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0])))?;
@@ -1512,16 +1512,16 @@ mod tests {
         }
     }
 
-    fn new_reference<V: Value>(value: V) -> Reference<V> {
+    fn reference_new<V: Value>(value: V) -> Reference<V> {
         Reference::new(value).unwrap()
     }
 
     #[test]
     fn test_reference_clones_alias_one_holder_and_reads_snapshots() {
         let initial = Array::vector(vec![1.0_f32, 2.0]);
-        let reference = new_reference(initial.clone());
+        let reference = reference_new(initial.clone());
         let alias = reference.clone();
-        let distinct = new_reference(initial);
+        let distinct = reference_new(initial);
         assert_eq!(reference, alias);
         assert_ne!(reference, distinct);
         assert_eq!(reference.id(), alias.id());
@@ -1562,7 +1562,7 @@ mod tests {
         // reference-count increment.
         assert_eq!(size_of::<Reference<Array>>(), size_of::<usize>());
 
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let clone = reference.clone();
         assert!(Arc::ptr_eq(&clone.inner, &reference.inner));
     }
@@ -1578,7 +1578,7 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_invalidates_the_complete_alias_family() {
-        let reference = new_reference(Array::vector(vec![1.0_f32, 2.0]));
+        let reference = reference_new(Array::vector(vec![1.0_f32, 2.0]));
         let alias = reference.clone();
         assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
 
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn test_reference_rejected_replacements_and_updates_leave_the_holder_unchanged() {
         let initial = Array::vector(vec![1.0_f32, 2.0]);
-        let reference = new_reference(initial.clone());
+        let reference = reference_new(initial.clone());
 
         assert_eq!(
             reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])),
@@ -1634,8 +1634,8 @@ mod tests {
     #[test]
     fn test_reference_mutation_preserves_snapshots_and_independent_roots() {
         let initializer = Array::vector(vec![1.0_f32, 2.0]);
-        let first = new_reference(initializer.clone());
-        let second = new_reference(initializer.clone());
+        let first = reference_new(initializer.clone());
+        let second = reference_new(initializer.clone());
         let read_snapshot = first.read().unwrap();
         let replacement = Array::vector(vec![3.0_f32, 4.0]);
         let retained_replacement = replacement.clone();
@@ -1656,7 +1656,7 @@ mod tests {
 
     #[test]
     fn test_reference_generation_advances_only_after_committed_mutations() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let initial_generation = reference.lock().unwrap().current_generation().unwrap();
 
         assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_preserves_state_when_the_generation_is_exhausted() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         {
             let mut state = reference.inner.holder.state.lock().unwrap();
             let ReferenceState::Ready { generation, .. } = &mut *state else {
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_reference_writes_serialize_on_one_holder() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let initial_generation = reference.lock().unwrap().current_generation().unwrap();
         let first = reference.clone();
         let second = reference.clone();
@@ -1714,7 +1714,7 @@ mod tests {
 
     #[test]
     fn test_reference_read_reports_a_poisoned_holder() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let holder = Arc::clone(&reference.inner.holder);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -1729,8 +1729,8 @@ mod tests {
 
     #[test]
     fn test_reference_guard_prepares_transaction_values_for_the_exact_holder() {
-        let first = new_reference(Array::scalar(1.0_f32));
-        let second = new_reference(Array::scalar(2.0_f32));
+        let first = reference_new(Array::scalar(1.0_f32));
+        let second = reference_new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         assert_eq!(first_guard.take(), Ok(Array::scalar(1.0_f32)));
@@ -1745,7 +1745,7 @@ mod tests {
 
     #[test]
     fn test_prepared_reference_value_pins_holder_allocation_identity_after_last_handle_is_dropped() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let original_id = reference.id();
         let prepared = reference.lock().unwrap().prepare(Array::scalar(2.0_f32)).unwrap();
         let original_holder = prepared.holder.clone();
@@ -1754,7 +1754,7 @@ mod tests {
 
         // The surviving weak control block keeps the retired allocation address unavailable to a new holder. This
         // makes pointer equality a stable ownership proof even after every strong handle to the original is gone.
-        let replacement = new_reference(Array::scalar(3.0_f32));
+        let replacement = reference_new(Array::scalar(3.0_f32));
         assert_ne!(replacement.id(), original_id);
         assert_eq!(replacement.lock().unwrap().accepts(&prepared), Err(ReferenceError::TransactionHolderMismatch),);
     }
@@ -1766,7 +1766,7 @@ mod tests {
         let target = DimensionVariable::new("target", bounds);
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
         let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
-        let reference = new_reference(CaptureReference::new(0, source_type.clone()));
+        let reference = reference_new(CaptureReference::new(0, source_type.clone()));
         let mut renaming = TypeIdentityRenaming::new();
         renaming.insert(source, target).unwrap();
         let renamed = reference.rename_type_identities(&renaming).unwrap();
@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn test_reference_pending_generations_ignore_stale_completion() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn test_reference_pending_poison_is_generation_safe() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
@@ -1888,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_reference_reservation_waiter_wakes_after_installation() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let (generation, mut reservation) =
             reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_reference_read_lease_must_be_pruned_before_mutation_reservation() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
         guard.publish_read_lease_unchecked(ReferenceCompletion::ready(Ok(())));
@@ -1924,7 +1924,7 @@ mod tests {
 
     #[test]
     fn test_reference_read_awaits_a_pending_completion_resolved_by_another_thread() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_awaits_a_pending_completion_resolved_by_another_thread() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
@@ -1983,7 +1983,7 @@ mod tests {
 
     #[test]
     fn test_reference_read_reports_a_failed_pending_completion_as_execution_poisoned() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
@@ -2004,7 +2004,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_waits_for_an_active_read_lease() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
@@ -2028,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_reference_swap_waits_for_an_active_read_lease() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
@@ -2053,7 +2053,7 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_waits_for_an_active_read_lease() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
@@ -2078,7 +2078,7 @@ mod tests {
 
     #[test]
     fn test_poisoning_a_reservation_wakes_an_accessibility_waiter() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let (generation, reservation) =
             reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2104,7 +2104,7 @@ mod tests {
 
     #[test]
     fn test_dropping_reservation_ownership_while_holder_guard_is_locked_does_not_relock() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (_, reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
 
@@ -2122,7 +2122,7 @@ mod tests {
 
     #[test]
     fn test_dropping_reservation_batch_wakes_waiter_with_abandonment_failure() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let reservations = PendingReferenceReservations::new(vec![reservation]);
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -2144,7 +2144,7 @@ mod tests {
 
     #[test]
     fn test_dropping_installed_reservation_wakes_pending_waiter_before_backend_completion() {
-        let reference = Arc::new(new_reference(Array::scalar(1.0_f32)));
+        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let pending_backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, reservation) =
@@ -2178,8 +2178,8 @@ mod tests {
 
     #[test]
     fn test_explicit_batch_poison_covers_installed_and_uninstalled_reservations() {
-        let first = new_reference(Array::scalar(1.0_f32));
-        let second = new_reference(Array::scalar(2.0_f32));
+        let first = reference_new(Array::scalar(1.0_f32));
+        let second = reference_new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let mut second_guard = second.lock().unwrap();
         let (first_generation, first_reservation) =
@@ -2201,7 +2201,7 @@ mod tests {
 
     #[test]
     fn test_stale_reservation_abandonment_cannot_poison_a_newer_generation() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (first_generation, first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
@@ -2219,7 +2219,7 @@ mod tests {
 
     #[test]
     fn test_unwinding_drops_reservation_owner_and_poisons_the_holder() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2238,7 +2238,7 @@ mod tests {
 
     #[test]
     fn test_reservation_owner_drop_does_not_double_panic_after_holder_mutex_poisoning() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let holder = Arc::clone(&reference.inner.holder);
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let reservations = PendingReferenceReservations::new(vec![reservation]);
@@ -2257,9 +2257,9 @@ mod tests {
     fn test_abandonment_preempts_completion_state_before_installation() {
         let pending_backend = ControlledCompletion::new();
         let references = [
-            new_reference(Array::scalar(1.0_f32)),
-            new_reference(Array::scalar(2.0_f32)),
-            new_reference(Array::scalar(3.0_f32)),
+            reference_new(Array::scalar(1.0_f32)),
+            reference_new(Array::scalar(2.0_f32)),
+            reference_new(Array::scalar(3.0_f32)),
         ];
         let completions = [
             ReferenceCompletion::ready(Ok(())),
@@ -2283,7 +2283,7 @@ mod tests {
 
     #[test]
     fn test_reference_pending_install_rejects_a_stale_generation() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
@@ -2303,7 +2303,7 @@ mod tests {
 
     #[test]
     fn test_reference_take_rejects_an_active_read_lease() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
@@ -2322,8 +2322,8 @@ mod tests {
 
     #[test]
     fn test_reference_guard_poison_isolated_to_the_extracted_holder() {
-        let first = new_reference(Array::scalar(1.0_f32));
-        let second = new_reference(Array::scalar(2.0_f32));
+        let first = reference_new(Array::scalar(1.0_f32));
+        let second = reference_new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         first_guard.take().unwrap();
@@ -2339,7 +2339,7 @@ mod tests {
 
     #[test]
     fn test_reference_guard_poison_leaves_an_idle_holder_untouched() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let generation = guard.current_generation().unwrap();
 
@@ -2356,7 +2356,7 @@ mod tests {
 
     #[test]
     fn test_read_lease_publication_releases_completed_leases() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
         let third = ControlledCompletion::new();
@@ -2391,7 +2391,7 @@ mod tests {
 
     #[test]
     fn test_dropping_reference_guard_poisons_extracted_holder() {
-        let reference = new_reference(Array::scalar(1.0_f32));
+        let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
         drop(guard);

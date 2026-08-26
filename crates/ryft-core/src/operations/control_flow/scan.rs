@@ -3111,7 +3111,7 @@ mod tests {
     use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, FreezeReferenceOperation, NewReferenceOperation, Program, ProgramBuilder, ReferenceAddUpdateOperation,
+        Effects, Program, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceType,
     };
     use crate::tests::CountingBatchingDriver;
@@ -5240,7 +5240,7 @@ mod tests {
         let initial_state = builder.add_input(scalar_type.into());
         let elements = builder.add_input(stacked_type.into());
         let reference = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial_state], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial_state], None)
             .unwrap()[0];
         let operation = ScanOperation::<TestValue>::new(2, 3).with_reverse(true).with_unroll(3).unwrap();
         let outputs = builder
@@ -5250,7 +5250,7 @@ mod tests {
         let final_reference = outputs[1];
         let stacked = outputs[2];
         let frozen = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![final_reference], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![final_reference], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(

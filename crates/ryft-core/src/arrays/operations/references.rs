@@ -34,12 +34,12 @@ use crate::operations::{Add, Reshape, Slice, UpdateSlice};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation, Operation, OperationFormatter,
-    ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+    ReferenceNewOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionInterface,
+    TypeError, Typed, Value, ValueProjection,
 };
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
@@ -408,29 +408,29 @@ macro_rules! impl_unsupported_reference_view_transforms {
 impl_unsupported_reference_view_transforms!(ReferenceIndexOperation);
 impl_unsupported_reference_view_transforms!(ReferenceSliceOperation);
 
-impl<V: Value<Type = ArrayIrType>> NewReference<V> for V
+impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<NewReferenceOperation<ArrayType, ArrayIrType>>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
-    fn new_reference(&self) -> Result<V, ProgramError> {
+    fn reference_new(&self) -> Result<V, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(NewReferenceOperation::new(), Vec::new(), std::slice::from_ref(self))?
+            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }
 
-impl<V> NewReference<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
+impl<V> ReferenceNew<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<NewReferenceOperation<ArrayType, ArrayIrType>>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
-    fn new_reference(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+    fn reference_new(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
         self.value()
             .dispatch_domain()
-            .bind(NewReferenceOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
+            .bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0)
             .into_projected()
             .map_err(Into::into)
@@ -558,36 +558,36 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> FreezeReference<V> for V
+impl<V: Value<Type = ArrayIrType>> ReferenceFreeze<V> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation<ArrayType, ArrayIrType>>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
 {
     fn freeze(self) -> Result<V, ProgramError> {
         let domain = self.dispatch_domain();
-        Ok(domain.bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
+        Ok(domain.bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(&self))?.remove(0))
     }
 }
 
-impl<V> FreezeReference<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
+impl<V> ReferenceFreeze<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation<ArrayType, ArrayIrType>>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>,
 {
     fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
         let domain = self.value().dispatch_domain();
         domain
-            .bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
+            .bind(ReferenceFreezeOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
             .remove(0)
             .into_projected()
             .map_err(Into::into)
     }
 }
 
-impl<A: Value<Type = ArrayType>> NewReference for ArrayIrValue<A> {
-    fn new_reference(&self) -> Result<Self, ProgramError> {
-        NewReferenceOperation::<ArrayType, ArrayIrType>::new()
+impl<A: Value<Type = ArrayType>> ReferenceNew for ArrayIrValue<A> {
+    fn reference_new(&self) -> Result<Self, ProgramError> {
+        ReferenceNewOperation::<ArrayType, ArrayIrType>::new()
             .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let value = <Self as ValueProjection<ArrayType>>::projected(self)?.clone();
         Ok(Self::Reference(ArrayReference::new(value)))
@@ -633,9 +633,9 @@ impl<A: Value<Type = ArrayType> + Add + Reshape + Slice + UpdateSlice> Reference
     }
 }
 
-impl<A: Value<Type = ArrayType>> FreezeReference for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
     fn freeze(self) -> Result<Self, ProgramError> {
-        FreezeReferenceOperation::<ArrayType, ArrayIrType>::new()
+        ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()
             .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(&self)?;
         Ok(Self::Array(reference.freeze()?))
@@ -682,7 +682,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationContext;
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, NEW_REFERENCE_OPERATION_NAME, ProgramBuilder, ProgramError,
+        Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, REFERENCE_NEW_OPERATION_NAME,
         REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
@@ -692,12 +692,12 @@ mod tests {
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
     type TestDestination = EagerContext<TestValue, TestOperation>;
-    type TestNew = NewReferenceOperation<ArrayType, ArrayIrType>;
+    type TestNew = ReferenceNewOperation<ArrayType, ArrayIrType>;
     type TestRead = ReferenceReadOperation<ArrayType, ArrayIrType>;
     type TestWrite = ReferenceWriteOperation<ArrayType, ArrayIrType>;
     type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
     type TestAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
-    type TestFreeze = FreezeReferenceOperation<ArrayType, ArrayIrType>;
+    type TestFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
 
     #[test]
     fn test_array_reference_view_operations() {
@@ -853,8 +853,8 @@ mod tests {
     #[test]
     fn test_array_ir_reference_operation_conversions() {
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(NewReferenceOperation::<ArrayType, ArrayIrType>::new()),
-            ArrayIrOperation::NewReference(_),
+            ArrayIrOperation::<Array>::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceNew(_),
         ));
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceReadOperation::<ArrayType, ArrayIrType>::new()),
@@ -873,8 +873,8 @@ mod tests {
             ArrayIrOperation::ReferenceAddUpdate(_),
         ));
         assert!(matches!(
-            ArrayIrOperation::<Array>::from(FreezeReferenceOperation::<ArrayType, ArrayIrType>::new()),
-            ArrayIrOperation::FreezeReference(_),
+            ArrayIrOperation::<Array>::from(ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new()),
+            ArrayIrOperation::ReferenceFreeze(_),
         ));
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceIndexOperation::new(0, 0)),
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn test_eager_reference_allocation_and_read_roundtrip() {
         let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
-        let reference = initial.new_reference().unwrap();
+        let reference = initial.reference_new().unwrap();
         assert!(matches!(reference, ArrayIrValue::Reference(_)));
         assert_eq!(reference.read().unwrap(), initial);
     }
@@ -898,7 +898,7 @@ mod tests {
     fn test_eager_reference_index_slice_and_composition() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let root = initial.new_reference().unwrap();
+        let root = initial.reference_new().unwrap();
         let row = root.reference_index(0, 1).unwrap();
         assert_eq!(row.read(), Ok(ArrayIrValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))));
 
@@ -918,7 +918,7 @@ mod tests {
     fn test_eager_reference_indexed_mutation_reconstructs_removed_axis() {
         let matrix_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let initial = ArrayIrValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let root = initial.new_reference().unwrap();
+        let root = initial.reference_new().unwrap();
         let row = root.reference_index(0, 1).unwrap();
 
         assert_eq!(
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn test_eager_reference_views_share_overlapping_root_state() {
-        let root = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])).new_reference().unwrap();
+        let root = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])).reference_new().unwrap();
         let left = root.reference_slice(&[ArraySliceAxis::new(0, 3, 1)]).unwrap();
         let right = root.reference_slice(&[ArraySliceAxis::new(1, 3, 1)]).unwrap();
 
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn test_eager_reference_view_validation_and_freeze_invalidation() {
-        let root = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).new_reference().unwrap();
+        let root = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
         assert_eq!(
             root.reference_index(1, 0),
             Err(TypeError::invalid("reference index axis 1 is out of bounds for rank 1").into()),
@@ -1021,9 +1021,9 @@ mod tests {
     fn test_eager_reference_operations_reject_mismatched_member_kinds() {
         let array = ArrayIrValue::<Array>::Array(Array::scalar(1.0_f32));
         assert_eq!(array.read(), Err(TypeError::invalid("expected reference type but got array type").into()));
-        let reference = array.new_reference().unwrap();
+        let reference = array.reference_new().unwrap();
         assert_eq!(
-            reference.new_reference(),
+            reference.reference_new(),
             Err(TypeError::invalid("expected array type but got reference type").into()),
         );
         assert_eq!(array.swap(&array), Err(TypeError::invalid("expected reference type but got array type").into()));
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn test_eager_reference_updates_enforce_exact_storage_and_preserve_rejected_state() {
         let initial = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]));
-        let reference = initial.new_reference().unwrap();
+        let reference = initial.reference_new().unwrap();
 
         let error = reference.swap(&ArrayIrValue::Array(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
         assert_eq!(
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn test_eager_reference_freeze_invalidates_composite_aliases() {
-        let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).new_reference().unwrap();
+        let reference = ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
         let alias = reference.clone();
         assert_eq!(reference.freeze(), Ok(ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0]))));
 
@@ -1123,7 +1123,7 @@ mod tests {
         // observable only through the payload it returns.
         let initial = Array::with_unchecked_type(dynamic_type.clone(), initial_bytes.clone());
         let replacement = Array::with_unchecked_type(dynamic_type.clone(), replacement_bytes.clone());
-        let reference = ArrayIrValue::Array(initial).new_reference().unwrap();
+        let reference = ArrayIrValue::Array(initial).reference_new().unwrap();
 
         let read = referent(reference.read().unwrap());
         assert_eq!(read.r#type().into_owned(), dynamic_type);
@@ -1162,7 +1162,7 @@ mod tests {
                 let reference_write %0 %1
                     %2:f32[2] = reference_swap %0 %1
                     reference_add_update %0 %1
-                    %3:f32[2] = freeze_reference %0
+                    %3:f32[2] = reference_freeze %0
                 in (%2, %3)
             "}
             .trim_end(),
@@ -1234,7 +1234,7 @@ mod tests {
         type TestContext = TracingContext<TestValue, TestOperation>;
 
         let (output_type, program) = TestContext::trace(
-            |input| input.new_reference()?.read(),
+            |input| input.reference_new()?.read(),
             ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
         )
         .unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[] .
-                let %1:ref<f32[]> = new_reference %0
+                let %1:ref<f32[]> = reference_new %0
                     %2:f32[] = reference_read %1
                 in (%2)
             "}
@@ -1264,7 +1264,7 @@ mod tests {
                 let initial = <TestTracer as ValueProjection<ArrayType>>::into_projected(initial)?;
                 let replacement = <TestTracer as ValueProjection<ArrayType>>::into_projected(replacement)?;
                 let update = <TestTracer as ValueProjection<ArrayType>>::into_projected(update)?;
-                let reference = initial.new_reference()?;
+                let reference = initial.reference_new()?;
                 let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &reference;
                 reference.write(&replacement)?;
                 reference.add_update(&update)?;
@@ -1279,10 +1279,10 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2], %1:f32[2], %2:f32[2] .
-                let %3:ref<f32[2]> = new_reference %0
+                let %3:ref<f32[2]> = reference_new %0
                     reference_write %3 %1
                     reference_add_update %3 %2
-                    %4:f32[2] = freeze_reference %3
+                    %4:f32[2] = reference_freeze %3
                 in (%4)
             "}
             .trim_end(),
@@ -1297,7 +1297,7 @@ mod tests {
         let (output_type, program) = TestContext::trace(
             |input: TestTracer| {
                 let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 let sliced = reference.reference_slice(&[ArraySliceAxis::new(0, 2, 1)])?;
                 let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &sliced;
                 let indexed = sliced.reference_index(0, 1)?;
@@ -1314,7 +1314,7 @@ mod tests {
         assert_eq!(
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec![
-                NEW_REFERENCE_OPERATION_NAME,
+                REFERENCE_NEW_OPERATION_NAME,
                 REFERENCE_SLICE_OPERATION_NAME,
                 REFERENCE_INDEX_OPERATION_NAME,
                 REFERENCE_READ_OPERATION_NAME,
@@ -1328,14 +1328,14 @@ mod tests {
         type TestTracer = Tracer<TestContext>;
 
         let array_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 2]));
-        let consumed = "`reference_read` reads a reference whose alias family `freeze_reference` already consumed";
+        let consumed = "`reference_read` reads a reference whose alias family `reference_freeze` already consumed";
 
         // Every clone of one tracer names the same staged atom, so a handle cloned before the freeze is invalidated
         // with the rest of the alias family and its next access is reported against the operation that performs it,
         // not against the freeze and not at discharge.
         let error = TestContext::trace(
             |input: TestTracer| {
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 let alias = reference.clone();
                 reference.freeze()?;
                 alias.read()
@@ -1349,7 +1349,7 @@ mod tests {
         // edge onto the same family rather than an independent resource.
         let error = TestContext::trace(
             |input: TestTracer| {
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 let row = reference.reference_index(0, 0)?;
                 reference.freeze()?;
                 row.read()
@@ -1364,7 +1364,7 @@ mod tests {
         // when it compared the root's state type against the handle's.
         let error = TestContext::trace(
             |input: TestTracer| {
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 reference.reference_slice(&[ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 2, 1)])?.freeze()
             },
             array_type.clone(),
@@ -1373,7 +1373,7 @@ mod tests {
         assert_eq!(
             error,
             ProgramError::MalformedProgram(
-                "`freeze_reference` consumes a derived reference view, but consumption invalidates the whole alias \
+                "`reference_freeze` consumes a derived reference view, but consumption invalidates the whole alias \
                  family; consume the root handle instead"
                     .to_string(),
             ),
@@ -1382,8 +1382,8 @@ mod tests {
         // Independent roots stay independent, and a whole-family consumption of one says nothing about the other.
         let (_, program) = TestContext::trace(
             |inputs: Vec<TestTracer>| {
-                let first = inputs[0].new_reference()?;
-                let second = inputs[1].new_reference()?;
+                let first = inputs[0].reference_new()?;
+                let second = inputs[1].reference_new()?;
                 let frozen = first.freeze()?;
                 Ok(vec![frozen, second.read()?])
             },
@@ -1394,9 +1394,9 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 2], %1:f32[2, 2] .
-                let %2:ref<f32[2, 2]> = new_reference %0
-                    %3:ref<f32[2, 2]> = new_reference %1
-                    %4:f32[2, 2] = freeze_reference %2
+                let %2:ref<f32[2, 2]> = reference_new %0
+                    %3:ref<f32[2, 2]> = reference_new %1
+                    %4:f32[2, 2] = reference_freeze %2
                     %5:f32[2, 2] = reference_read %3
                 in (%4, %5)
             "}
@@ -1431,7 +1431,7 @@ mod tests {
         let error = TestContext::trace(
             |input: TestTracer| {
                 let context = input.context().clone();
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 let carried = context
                     .bind(
                         WhileOperation::new(),
@@ -1448,7 +1448,7 @@ mod tests {
         assert_eq!(
             error,
             ProgramError::MalformedProgram(
-                "`reference_read` reads a reference whose alias family `freeze_reference` already consumed".to_string(),
+                "`reference_read` reads a reference whose alias family `reference_freeze` already consumed".to_string(),
             ),
         );
     }
@@ -1466,7 +1466,7 @@ mod tests {
         let (eager_outputs, program) = TestContext::new()
             .interpret_and_trace(
                 |(initial, replacement, written, update)| {
-                    let reference = initial.new_reference()?;
+                    let reference = initial.reference_new()?;
                     let snapshot = reference.read()?;
                     let old = reference.swap(&replacement)?;
                     reference.write(&written)?;
@@ -1498,7 +1498,7 @@ mod tests {
             .unwrap();
 
         let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
-        let reference = initial.new_reference().unwrap();
+        let reference = initial.reference_new().unwrap();
         assert_eq!(
             program.interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))]),
             Err(ProgramError::UnsupportedOperation {

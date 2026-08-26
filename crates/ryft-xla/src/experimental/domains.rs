@@ -4335,14 +4335,14 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
             Unsupported { reason: "ragged collective metadata may address physical padding lanes" }
         }
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
-        XlaOperation::NewReference(_)
+        XlaOperation::ReferenceNew(_)
         | XlaOperation::ReferenceIndex(_)
         | XlaOperation::ReferenceSlice(_)
         | XlaOperation::ReferenceRead(_)
         | XlaOperation::ReferenceWrite(_)
         | XlaOperation::ReferenceSwap(_)
         | XlaOperation::ReferenceAddUpdate(_)
-        | XlaOperation::FreezeReference(_) => {
+        | XlaOperation::ReferenceFreeze(_) => {
             Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" }
         }
         XlaOperation::ShardMap(_) => {
@@ -5278,14 +5278,13 @@ mod tests {
         CustomJvpOperation, Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
         DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
         DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, FreezeReference, FreezeReferenceOperation,
-        IotaOperation, LogSumExpOperation, MulOperation, NegOperation, NewReference, NewReferenceOperation,
-        OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceIndexOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
-        ReferenceWriteOperation, ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation,
-        SelectOperation, Sharding, ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation,
-        try_jit_with_options,
+        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation, LogSumExpOperation, MulOperation,
+        NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding,
+        ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -7553,7 +7552,7 @@ mod tests {
 
         // Every reference operation shares one collapsed match arm, so one representative pins that arm.
         assert_eq!(
-            data_dependent_padding_discipline(&XlaOperation::NewReference(NewReferenceOperation::new())),
+            data_dependent_padding_discipline(&XlaOperation::ReferenceNew(ReferenceNewOperation::new())),
             Unsupported { reason: "references must be discharged before bounded-dynamic XLA validation" },
         );
 
@@ -9114,9 +9113,9 @@ mod tests {
         // The guard is operation-agnostic: it keys off unresolved reference state rather than the specific reference
         // operation, so one representative operation pins the diagnostic.
         assert_eq!(
-            XlaDomain::token().bind(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), &[]),
+            XlaDomain::token().bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`new_reference` must be discharged before XLA eager execution".to_string(),
+                message: "`reference_new` must be discharged before XLA eager execution".to_string(),
             }),
         );
 
@@ -9149,7 +9148,7 @@ mod tests {
                 .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F32)), Vec::new(), Vec::new(), None)
                 .unwrap()[0];
             let reference =
-                builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), Vec::new(), Vec::new()).unwrap()
         };
@@ -9175,7 +9174,7 @@ mod tests {
             let state = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let state_tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let reference =
-                builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let output =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
@@ -9266,7 +9265,7 @@ mod tests {
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
             input: CompilationTracer<XlaDomain<'c>>,
         ) -> Result<CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
-            Ok(input.new_reference()?)
+            Ok(input.reference_new()?)
         }
         assert!(matches!(
             domain
@@ -9417,7 +9416,7 @@ mod tests {
         let input = builder.add_input(scalar_type.clone().into());
         let replacement = builder.add_input(scalar_type.clone().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap();
@@ -9427,7 +9426,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
         let final_value =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![snapshot, final_value],
@@ -9464,7 +9463,7 @@ mod tests {
 
         let eager_input = ArrayIrValue::Array(CpuArray::scalar(3.0f32));
         let eager_replacement = ArrayIrValue::Array(CpuArray::scalar(5.0f32));
-        let eager_reference = eager_input.new_reference().unwrap();
+        let eager_reference = eager_input.reference_new().unwrap();
         eager_reference.write(&eager_replacement).unwrap();
         let eager_snapshot = eager_reference.read().unwrap();
         eager_reference.add_update(&eager_input).unwrap();
@@ -9486,7 +9485,7 @@ mod tests {
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let indexed = builder
             .add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -9515,7 +9514,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![indexed_snapshot, old, final_snapshot],
@@ -9599,7 +9598,7 @@ mod tests {
         let initial = builder.add_input(vector_type.into());
         let replacement = builder.add_input(pair_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]),
@@ -9612,7 +9611,7 @@ mod tests {
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![view, replacement], None)
             .unwrap();
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program: FlatXlaProgram = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -9641,7 +9640,7 @@ mod tests {
         let replacement = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let indexed = builder
             .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -9652,7 +9651,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![indexed, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![old, final_snapshot],
@@ -9812,7 +9811,7 @@ mod tests {
         let initial = builder.add_input(scalar_type.clone().into());
         let replacement = builder.add_input(scalar_type.clone().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::<XlaConstant>::new(),
@@ -9822,7 +9821,7 @@ mod tests {
             )
             .unwrap()[0];
         let final_value =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![snapshot, final_value],
@@ -9922,7 +9921,7 @@ mod tests {
         let predicate = builder.add_input(replicated_scalar_type(&mesh, DataType::Boolean).into());
         let initial = builder.add_input(vector_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
                 ConditionOperation::<XlaConstant>::new(),
@@ -9932,7 +9931,7 @@ mod tests {
             )
             .unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -10023,11 +10022,11 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.clone().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
         let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10074,13 +10073,13 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scan_outputs = builder
             .add_instruction(ScanOperation::<XlaConstant>::new(1, 3), vec![body], vec![reference], None)
             .unwrap()
             .to_vec();
         let final_value = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![scan_outputs[0]], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![scan_outputs[0]], None)
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -10130,7 +10129,7 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let runtime_length = builder.add_constant(XlaConstant::Dimension(length.clone()));
         let reference = builder
             .add_instruction(
@@ -10141,7 +10140,7 @@ mod tests {
             )
             .unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -10193,7 +10192,7 @@ mod tests {
         let initial = builder.add_input(scalar_type.clone().into());
         let update = builder.add_input(scalar_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
                 XlaOperation::JitCall(JitCallOperation::new(0)),
@@ -10203,7 +10202,7 @@ mod tests {
             )
             .unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

@@ -26,7 +26,7 @@ pub(crate) mod tests {
     use crate::differentiation::forward::{DifferentiationDriver, DifferentiationDual, Linearization};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        FlatProgram, NewReferenceOperation, Program, ProgramBuilder, ReferenceReadOperation, RegionDriver, RegionRef,
+        FlatProgram, Program, ProgramBuilder, ReferenceNewOperation, ReferenceReadOperation, RegionDriver, RegionRef,
     };
 
     use super::*;
@@ -54,7 +54,7 @@ pub(crate) mod tests {
         let input = builder.add_input(r#type.clone());
         let tangent = builder.add_input(r#type.clone());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let jvp_program = builder

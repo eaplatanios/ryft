@@ -620,7 +620,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// Consumes the referenced root, invalidating its complete alias family, and rejects a derived view without
     /// changing shared state.
     ///
-    /// This takes the handle by shared borrow while the value-level [`FreezeReference`](crate::FreezeReference)
+    /// This takes the handle by shared borrow while the value-level [`ReferenceFreeze`](crate::ReferenceFreeze)
     /// capability above it takes one by value. The asymmetry is mechanical rather than semantic: the composite
     /// implementation reaches this handle through a projection of its owned value, which yields a borrow, and the
     /// linearity the capability enforces is already enforced one layer up.

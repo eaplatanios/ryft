@@ -32,7 +32,7 @@ pub enum ReferenceAccessMode {
     Accumulate,
 
     /// Consumes the root. After such an access the root and its entire alias family are rendered invalid. Consumption
-    /// is a lifetime event, not a memory-access flavor: [`FreezeReferenceOperation`](crate::FreezeReferenceOperation)
+    /// is a lifetime event, not a memory-access flavor: [`ReferenceFreezeOperation`](crate::ReferenceFreezeOperation)
     /// is the consuming access that also returns the final value.
     Consume,
 }
@@ -168,7 +168,7 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 /// The array reference vocabulary declares the following semantics:
 ///
 /// ```text
-/// new_reference(x) -> r
+/// reference_new(x) -> r
 ///     inputs  = []
 ///     outputs = [Root { output_index: 0 }]
 ///
@@ -188,7 +188,7 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 ///     inputs  = [ReferenceInput { input_index: 0, mode: Accumulate }]
 ///     outputs = []
 ///
-/// freeze_reference(r) -> x
+/// reference_freeze(r) -> x
 ///     inputs  = [ReferenceInput { input_index: 0, mode: Consume }]
 ///     outputs = []
 ///
@@ -814,9 +814,9 @@ mod tests {
         let invalid_root =
             ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]);
         assert_eq!(
-            invalid_root.validate_arity("test.new_reference", 1, 0),
+            invalid_root.validate_arity("test.reference_new", 1, 0),
             Err(ProgramError::MalformedProgram(
-                "operation `test.new_reference` classifies output 0 but the application output count is 0".to_string(),
+                "operation `test.reference_new` classifies output 0 but the application output count is 0".to_string(),
             )),
         );
     }

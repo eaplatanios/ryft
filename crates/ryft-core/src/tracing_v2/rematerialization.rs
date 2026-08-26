@@ -2332,8 +2332,8 @@ mod tests {
     use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        Effect, FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType, RegionRole,
+        Effect, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RegionRole,
     };
     use crate::tests::TestOrderedStateOperation;
 
@@ -4196,12 +4196,12 @@ mod tests {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let input = builder.add_input(scalar_type);
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![output],
@@ -4217,7 +4217,7 @@ mod tests {
         assert_eq!(pre_discharge.instructions().len(), 3);
         assert!(pre_discharge.effects().contains(Effect::OrderedState));
         let unresolved = rematerialize::<ReferenceTestContext, _, _, _>(|input: DomainTracer<ReferenceTestContext>| {
-            let reference = input.new_reference()?;
+            let reference = input.reference_new()?;
             reference.add_update(&input)?;
             reference.freeze()
         });

@@ -1853,12 +1853,12 @@ mod tests {
         ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos,
         CumulativeLogSumExp, CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
         DimensionBounds, DimensionVariable, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, FreezeReference, Hessian, Iota,
-        Jacobian, LogSumExp, LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, NewReference, OneLike, ProgramError,
-        ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend,
-        ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError, ReferenceRead, ReferenceType, Reshape,
-        Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value,
-        ValueProjection, WhileOperation, ZeroLike,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
+        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend,
+        ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError, ReferenceFreeze, ReferenceNew,
+        ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2186,7 +2186,7 @@ mod tests {
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             |input| {
                 let input = input.into_value();
-                let reference = input.new_reference().unwrap();
+                let reference = input.reference_new().unwrap();
                 reference.add_update(&input).unwrap();
                 ValueProjection::<ArrayType>::into_projected(reference.freeze().unwrap()).unwrap()
             },
@@ -2961,7 +2961,7 @@ mod tests {
             XlaOptions::new(mesh.clone()),
         )
         .unwrap();
-        let new_reference = |value: f32| {
+        let reference_new = |value: f32| {
             ArrayReference::new(
                 Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
                     .unwrap(),
@@ -2969,9 +2969,9 @@ mod tests {
         };
 
         // Failures during pre-execution holder validation leave every holder Ready and unchanged.
-        let pre_handoff_first = new_reference(1.0);
-        let pre_handoff_second = new_reference(10.0);
-        let pre_handoff_read_only = new_reference(20.0);
+        let pre_handoff_first = reference_new(1.0);
+        let pre_handoff_second = reference_new(10.0);
+        let pre_handoff_read_only = reference_new(20.0);
         let wrong_update_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
@@ -2999,9 +2999,9 @@ mod tests {
         assert_eq!(read_f32_array(&client, &pre_handoff_read_only.read().unwrap()), vec![20.0]);
 
         // A fully prepared call that fails before PJRT submission publishes no lease or mutation reservation.
-        let pre_submission_first = new_reference(1.0);
-        let pre_submission_second = new_reference(10.0);
-        let pre_submission_read_only = new_reference(20.0);
+        let pre_submission_first = reference_new(1.0);
+        let pre_submission_second = reference_new(10.0);
+        let pre_submission_read_only = reference_new(20.0);
         let update =
             Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
@@ -3025,9 +3025,9 @@ mod tests {
 
         // Once mutable buffers cross the execution handoff, every mutated holder is poisoned together while a
         // read-only peer remains Ready.
-        let post_handoff_first = new_reference(1.0);
-        let post_handoff_second = new_reference(10.0);
-        let post_handoff_read_only = new_reference(20.0);
+        let post_handoff_first = reference_new(1.0);
+        let post_handoff_second = reference_new(10.0);
+        let post_handoff_read_only = reference_new(20.0);
         let update =
             Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
@@ -3057,9 +3057,9 @@ mod tests {
         assert_eq!(read_f32_array(&client, &post_handoff_read_only.read().unwrap()), vec![20.0]);
 
         // A failure confined to public reconstruction occurs only after every hidden final state is installed.
-        let installed_first = new_reference(1.0);
-        let installed_second = new_reference(10.0);
-        let installed_read_only = new_reference(20.0);
+        let installed_first = reference_new(1.0);
+        let installed_second = reference_new(10.0);
+        let installed_read_only = reference_new(20.0);
         let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(

@@ -164,30 +164,30 @@ pub use partial::{
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BindingRegionDriver, CalleeRegionDriver, Concretizable,
     DestinationRegionMapping, EagerInterpretationValidation, Effect, EffectOccurrence, Effects, EmptyRegionDriver,
-    FREEZE_REFERENCE_OPERATION_NAME, FlatProgram, FreezeReference, FreezeReferenceOperation, Instruction,
-    InstructionId, MaybeZero, MemberOperation, NEW_REFERENCE_OPERATION_NAME, NewReference, NewReferenceOperation,
-    NoIdentity, Operation, OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance,
-    ParameterProjection, PartialReferenceDischargeResult, PendingReferenceReservation, PendingReferenceReservations,
-    PreparedReferenceValue, Program, ProgramBuilder, ProgramError, ProgramLiveSets, ProgramRenderingMode,
-    ProgramStatistics, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
+    FlatProgram, Instruction, InstructionId, MaybeZero, MemberOperation, NoIdentity, Operation, OperationFormatter,
+    OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
+    PartialReferenceDischargeResult, PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue,
+    Program, ProgramBuilder, ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue,
+    Provenance, ProvenanceScope, ProvenanceState, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
+    REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
     REFERENCE_WRITE_OPERATION_NAME, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode,
     ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
     ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult,
     ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePayload,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceError, ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceInput,
-    ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionDischargeInput,
-    ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource, ReferenceStateBinding,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements, ReferenceWrite,
-    ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
-    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
-    Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition,
-    TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value, ValueId, ValueProjection,
-    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types,
+    ReferenceDischargeableOperation, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration,
+    ReferenceGuard, ReferenceId, ReferenceInput, ReferenceNew, ReferenceNewOperation, ReferenceOperationSemantics,
+    ReferenceOutput, ReferenceRead, ReferenceReadOperation, ReferenceRegionDischargeBoundary,
+    ReferenceRegionDischargeFork, ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle,
+    ReferenceRootState, ReferenceSource, ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
+    ReferenceTypeRefinements, ReferenceWrite, ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator,
+    RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
+    RegionWithMetadata, ReplayRegionDriver, Transform, TransformArtifact, TransformCache, Type, TypeError,
+    TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed, Value,
+    ValueId, ValueProjection, discharge_positional_region_operation, discharge_preserved_access,
+    discharge_reference_free_operation, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -218,9 +218,9 @@ pub(crate) mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        Effect, Effects, FreezeReferenceOperation, NewReferenceOperation, Operation, Program, ProgramBuilder,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, Region,
-        RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
+        Effect, Effects, Operation, Program, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, Region, RegionDriver,
+        RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
 
@@ -540,7 +540,7 @@ pub(crate) mod tests {
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let initial = builder.add_input(ArrayIrType::Array(scalar_type));
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::new(),
@@ -550,7 +550,7 @@ pub(crate) mod tests {
             )
             .unwrap()[0];
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap()

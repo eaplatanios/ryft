@@ -61,7 +61,7 @@
 //!     -> explicit immutable state carries at every attached-region boundary
 //!
 //! let program = program.discharge_local_references(capture_count, "differentiation")?;
-//! program.jvp()?                                  // state = new_reference(x); state.add_update(x); freeze(state)
+//! program.jvp()?                                  // state = reference_new(x); state.add_update(x); freeze(state)
 //! program.linearize()?.pullback()
 //!     -> discharge local state -> differentiate the reference-free program
 //!
@@ -75,16 +75,16 @@
 //!
 //! ```
 //! use ryft_core::{
-//!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, FreezeReferenceOperation, NewReferenceOperation,
+//!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, ReferenceFreezeOperation, ReferenceNewOperation,
 //!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischarge,
 //! };
 //!
 //! let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 //! let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
 //! let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-//! let reference = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None)?[0];
+//! let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None)?[0];
 //! builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)?;
-//! let total = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None)?[0];
+//! let total = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)?[0];
 //! let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
 //!     vec![total],
 //!     vec![Placeholder; 2],
@@ -114,7 +114,7 @@
 //!
 //! ```
 //! use ryft_core::{
-//!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, FreezeReferenceOperation, NewReferenceOperation,
+//!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, ReferenceFreezeOperation, ReferenceNewOperation,
 //!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeSite, ReferenceReadOperation,
 //! };
 //!
@@ -122,10 +122,10 @@
 //! let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
 //! let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
 //! let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-//! let accumulated = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None)?[0];
-//! let observed = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![update], None)?[0];
+//! let accumulated = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None)?[0];
+//! let observed = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![update], None)?[0];
 //! builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![accumulated, update], None)?;
-//! let total = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![accumulated], None)?[0];
+//! let total = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![accumulated], None)?[0];
 //! let seen = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![observed], None)?[0];
 //! let program = builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
 //!     vec![total, seen],
@@ -206,7 +206,7 @@ where
     ///
     /// This is the array universe's form of [`Program::partially_discharge_references_with_policy`], which documents
     /// the rewrite; [`ReferenceDischarge::discharge_references`] is its everything-selected case. A preserved array
-    /// root keeps its reference-typed boundary position or its `new_reference` instruction, every access to it replays
+    /// root keeps its reference-typed boundary position or its `reference_new` instruction, every access to it replays
     /// verbatim, and a view derived from it replays its `reference_index` or `reference_slice` step, so the surviving
     /// half of the program still denotes the same coordinates. Selected roots thread as immutable array state exactly
     /// as in full discharge, including the canonical slice, reshape, and update-slice reconstruction their views
@@ -215,7 +215,7 @@ where
     /// A preserved root crosses a condition, loop, scan, or call boundary as the reference it already is, at its own
     /// declared operand position, so the rewritten operation threads discharged state and surviving references side by
     /// side; only the discharged half widens. A preserved root may also be consumed, which full discharge rejects for
-    /// a caller-owned root: the payload keeps the `freeze_reference`, so the caller hands its holder to that operation
+    /// a caller-owned root: the payload keeps the `reference_freeze`, so the caller hands its holder to that operation
     /// instead of to a state binding. A capture-lifted program has no partial form, and keeps using
     /// [`Program::discharge_references_with_lifted_captures`].
     ///
@@ -453,12 +453,12 @@ mod tests {
     use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, FreezeReferenceOperation, Instruction, InstructionId, NewReferenceOperation, Operation,
-        OutputRegionProvenance, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext,
-        ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource, ReferenceStateBinding,
-        ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError,
-        discharge_positional_region_operation, discharge_reference_free_operation,
+        Effects, Instruction, InstructionId, Operation, OutputRegionProvenance, ProgramBuilder,
+        ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
+        ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperationSemantics,
+        ReferenceReadOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
+        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, discharge_positional_region_operation,
+        discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -504,7 +504,7 @@ mod tests {
         let initial = builder.add_input(vector_type.clone().into());
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
@@ -534,7 +534,7 @@ mod tests {
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pair, update], None)
             .unwrap();
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![element_snapshot, replaced, frozen],
@@ -623,11 +623,11 @@ mod tests {
         let initial = builder.add_input(scalar_type().into());
         let update = builder.add_constant(scalar(2.0));
         let unused = builder.add_constant(scalar(5.0));
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![root, update], None)
             .unwrap();
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -654,8 +654,8 @@ mod tests {
         // the stale read is assembled through the unchecked rebuild hatch to prove discharge's own guard.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let stale = builder.add_variable(scalar_type().into());
         builder.add_instruction_unchecked(Instruction::new(
             ReferenceReadOperation::new().into(),
@@ -679,7 +679,7 @@ mod tests {
         // value under the view's narrower type.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1)]),
@@ -690,7 +690,7 @@ mod tests {
             .unwrap()[0];
         let frozen = builder.add_variable(ArrayType::new_static(DataType::F32, [2]).into());
         builder.add_instruction_unchecked(Instruction::new(
-            FreezeReferenceOperation::new().into(),
+            ReferenceFreezeOperation::new().into(),
             vec![view],
             vec![frozen],
             Vec::new(),
@@ -723,7 +723,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 3, 1)]),
@@ -753,7 +753,7 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let external = builder.add_input(ReferenceType::new(scalar_type()).into());
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![external], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![external], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -917,7 +917,7 @@ mod tests {
         let replacement = builder.add_input(scalar_type().into());
         let update = builder.add_input(scalar_type().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let first_snapshot =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
@@ -933,7 +933,7 @@ mod tests {
                 .is_empty(),
         );
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![first_snapshot, swapped_snapshot, final_snapshot],
@@ -967,7 +967,7 @@ mod tests {
         let replacement = builder.add_input(pair_type.clone().into());
         let update = builder.add_input(pair_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let indexed = builder
             .add_instruction(ReferenceIndexOperation::new(0, 3), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -996,7 +996,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![composed, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![indexed_snapshot, old, final_snapshot],
@@ -1037,7 +1037,7 @@ mod tests {
         let replacement = builder.add_input(row_type.clone().into());
         let update = builder.add_input(row_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let row = builder
             .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -1048,7 +1048,7 @@ mod tests {
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![row, update], None)
             .unwrap();
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![old, final_snapshot],
@@ -1096,7 +1096,7 @@ mod tests {
         let initial = builder.add_input(matrix_type.clone().into());
         let replacement = builder.add_input(row_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let block = builder
             .add_instruction(
                 ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)]),
@@ -1111,7 +1111,7 @@ mod tests {
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![row, replacement], None)
             .unwrap()[0];
         let final_snapshot =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![old, final_snapshot],
@@ -1186,7 +1186,7 @@ mod tests {
                 let replacement = builder.add_input(scalar_type().into());
                 let update = builder.add_input(scalar_type().into());
                 let reference =
-                    builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+                    builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
                 let mut outputs = Vec::new();
                 let mut oracle_state = 2.0f32;
                 let mut oracle_outputs = Vec::new();
@@ -1240,7 +1240,7 @@ mod tests {
                 }
                 outputs.push(
                     builder
-                        .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None)
+                        .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
                         .unwrap()[0],
                 );
                 oracle_outputs.push(scalar(oracle_state));
@@ -1341,10 +1341,10 @@ mod tests {
         let kernel_initial = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
         let step = builder.add_input(scalar_type().into());
         let pipeline = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
             .unwrap()[0];
         let kernel = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
             .unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pipeline, step], None)
@@ -1355,9 +1355,9 @@ mod tests {
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![element, step], None)
             .unwrap()[0];
         let pipeline_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
         let kernel_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![previous, pipeline_final, kernel_final],
@@ -1387,11 +1387,11 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[3], %2:f32[] .
-                let %3:ref<f32[3]> = new_reference %1
+                let %3:ref<f32[3]> = reference_new %1
                     %4:f32[] = add %0 %2
                     %5:ref<f32[]> = reference_index [axis=0, index=1] %3
                     %6:f32[] = reference_swap %5 %2
-                    %7:f32[3] = freeze_reference %3
+                    %7:f32[3] = reference_freeze %3
                 in (%6, %4, %7)"},
         );
 
@@ -1448,10 +1448,10 @@ mod tests {
         let pipeline_initial = builder.add_input(scalar_type().into());
         let kernel_initial = builder.add_input(scalar_type().into());
         let pipeline = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
             .unwrap()[0];
         let kernel = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
             .unwrap()[0];
         let observed = builder
             .add_instruction(
@@ -1462,9 +1462,9 @@ mod tests {
             )
             .unwrap()[0];
         let pipeline_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
         let kernel_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![observed, pipeline_final, kernel_final],
@@ -1481,7 +1481,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[], %2:f32[] .
-                let %3:ref<f32[]> = new_reference %2
+                let %3:ref<f32[]> = reference_new %2
                     %4:f32[], %5:f32[] = condition %0 %1 %3 [
                         true={
                             lambda %0:f32[], %1:ref<f32[]> .
@@ -1495,7 +1495,7 @@ mod tests {
                             in (%2, %0)
                         },
                     ]
-                    %6:f32[] = freeze_reference %3
+                    %6:f32[] = reference_freeze %3
                 in (%4, %5, %6)"},
         );
 
@@ -1540,10 +1540,10 @@ mod tests {
         let pipeline_initial = builder.add_input(scalar_type().into());
         let kernel_initial = builder.add_input(scalar_type().into());
         let pipeline = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
             .unwrap()[0];
         let kernel = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
             .unwrap()[0];
         let observed = builder
             .add_instruction(
@@ -1554,9 +1554,9 @@ mod tests {
             )
             .unwrap()[0];
         let pipeline_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
         let kernel_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![observed, pipeline_final, kernel_final],
@@ -1573,7 +1573,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[], %2:f32[] .
-                let %3:ref<f32[]> = new_reference %2
+                let %3:ref<f32[]> = reference_new %2
                     %4:f32[] = condition %0 %1 %3 [
                         true={
                             lambda %0:f32[], %1:ref<f32[]> .
@@ -1585,7 +1585,7 @@ mod tests {
                             in (%0)
                         },
                     ]
-                    %5:f32[] = freeze_reference %3
+                    %5:f32[] = reference_freeze %3
                 in (%4, %1, %5)"},
         );
 
@@ -1647,10 +1647,10 @@ mod tests {
         let pipeline_initial = builder.add_input(scalar_type().into());
         let kernel_initial = builder.add_input(scalar_type().into());
         let pipeline = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
             .unwrap()[0];
         let kernel = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
             .unwrap()[0];
         let observed = builder
             .add_instruction(
@@ -1661,7 +1661,7 @@ mod tests {
             )
             .unwrap()[0];
         let pipeline_final =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![observed, pipeline_final],
@@ -1678,7 +1678,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f32[], %2:f32[] .
-                let %3:ref<f32[]> = new_reference %2
+                let %3:ref<f32[]> = reference_new %2
                     %4:f32[], %5:f32[] = condition %0 %0 %1 %3 [
                         true={
                             lambda %0:bool[], %1:f32[], %2:ref<f32[]> .
@@ -1746,7 +1746,7 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(scalar_type().into());
         let replacement = builder.add_input(scalar_type().into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let previous = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -1755,7 +1755,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![previous, frozen], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
@@ -1815,18 +1815,18 @@ mod tests {
         let counter_initial = builder.add_input(scalar_type().into());
         let step_initial = builder.add_input(scalar_type().into());
         let counter = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![counter_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![counter_initial], None)
             .unwrap()[0];
         let step =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(Some(8)).unwrap();
         let carried = builder.add_instruction(operation, vec![condition, body], vec![counter, step], None).unwrap();
         let (carried_counter, carried_step) = (carried[0], carried[1]);
         let total = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![carried_counter], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_counter], None)
             .unwrap()[0];
         let remaining = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![carried_step], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_step], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![total, remaining], vec![Placeholder; 2], vec![Placeholder; 2])
@@ -1840,7 +1840,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                let %2:ref<f32[]> = new_reference %1
+                let %2:ref<f32[]> = reference_new %1
                     %3:f32[], %4:ref<f32[]> = while [iteration_bound=8] %0 %2 [
                         condition={
                             lambda %0:f32[], %1:ref<f32[]> .
@@ -1855,7 +1855,7 @@ mod tests {
                             in (%3, %1)
                         },
                     ]
-                    %5:f32[] = freeze_reference %2
+                    %5:f32[] = reference_freeze %2
                 in (%3, %5)"},
         );
 
@@ -1899,19 +1899,19 @@ mod tests {
         let total_initial = builder.add_input(scalar_type().into());
         let step_initial = builder.add_input(scalar_type().into());
         let total = builder
-            .add_instruction(NewReferenceOperation::new(), Vec::new(), vec![total_initial], None)
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![total_initial], None)
             .unwrap()[0];
         let step =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
         let outputs = builder
             .add_instruction(ScanOperation::<TestValue>::new(2, 3), vec![body], vec![total, step], None)
             .unwrap();
         let (carried_total, carried_step, stacked) = (outputs[0], outputs[1], outputs[2]);
         let final_total = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![carried_total], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_total], None)
             .unwrap()[0];
         let final_step = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![carried_step], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_step], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -1929,7 +1929,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:f32[], %1:f32[] .
-                let %2:ref<f32[]> = new_reference %1
+                let %2:ref<f32[]> = reference_new %1
                     %3:f32[], %4:ref<f32[]>, %5:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %2 [
                         body={
                             lambda %0:f32[], %1:ref<f32[]> .
@@ -1938,7 +1938,7 @@ mod tests {
                             in (%3, %1, %3)
                         },
                     ]
-                    %6:f32[] = freeze_reference %2
+                    %6:f32[] = reference_freeze %2
                 in (%3, %5, %6)"},
         );
 
@@ -1979,12 +1979,12 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, initial], None)
             .unwrap();
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let local = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -2182,7 +2182,7 @@ mod tests {
         let false_branch = builder.import_program(branch(10.0));
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(scalar_type().into());
-        let root = builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -2197,7 +2197,7 @@ mod tests {
         let doubled = builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot], None)
             .unwrap()[0];
-        let frozen = builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -2241,7 +2241,7 @@ mod tests {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let initial = builder.add_input(scalar_type().into());
             let root =
-                builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![root], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -2260,7 +2260,7 @@ mod tests {
             )
             .unwrap()[0];
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![escaped], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![escaped], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -2300,13 +2300,13 @@ mod tests {
         let loop_body = true_builder.import_region(loop_body.entry_region_ref());
         let initial = true_builder.add_input(scalar_type().into());
         let reference =
-            true_builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            true_builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
         let reference = true_builder
             .add_instruction(operation, vec![loop_condition, loop_body], vec![reference], None)
             .unwrap()[0];
         let value = true_builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let true_branch = true_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
@@ -2813,12 +2813,12 @@ mod tests {
             };
         }
 
-        impl_calling_operation_from_reference_primitive!(NewReferenceOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceNewOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceReadOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceWriteOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceSwapOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceAddUpdateOperation);
-        impl_calling_operation_from_reference_primitive!(FreezeReferenceOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceFreezeOperation);
 
         // A third-party call-shaped family participates in structured discharge by reaching the shared positional
         // rewrite, exactly as the backend `jit_call` does, with no companion declaration surface beyond the generic
@@ -2837,7 +2837,7 @@ mod tests {
                 inputs: &[ReferenceDischargeValue<C, P>],
             ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
                 match self {
-                    Self::Native(ArrayIrOperation::NewReference(operation)) => {
+                    Self::Native(ArrayIrOperation::ReferenceNew(operation)) => {
                         operation.discharge_references(context, driver, inputs)
                     }
                     Self::Native(ArrayIrOperation::ReferenceRead(operation)) => {
@@ -2852,7 +2852,7 @@ mod tests {
                     Self::Native(ArrayIrOperation::ReferenceAddUpdate(operation)) => {
                         operation.discharge_references(context, driver, inputs)
                     }
-                    Self::Native(ArrayIrOperation::FreezeReference(operation)) => {
+                    Self::Native(ArrayIrOperation::ReferenceFreeze(operation)) => {
                         operation.discharge_references(context, driver, inputs)
                     }
                     Self::Native(_) => discharge_reference_free_operation(self, context, driver, inputs),
@@ -2884,7 +2884,7 @@ mod tests {
         let replacement = builder.add_input(scalar_type().into());
         let root = builder
             .add_instruction(
-                CallingOperation::Native(NewReferenceOperation::new().into()),
+                CallingOperation::Native(ReferenceNewOperation::new().into()),
                 Vec::new(),
                 vec![initial],
                 None,
@@ -2895,7 +2895,7 @@ mod tests {
             .unwrap()[0];
         let final_snapshot = builder
             .add_instruction(
-                CallingOperation::Native(FreezeReferenceOperation::new().into()),
+                CallingOperation::Native(ReferenceFreezeOperation::new().into()),
                 Vec::new(),
                 vec![root],
                 None,
@@ -3185,7 +3185,7 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(scalar_type().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -3195,7 +3195,7 @@ mod tests {
             )
             .unwrap()[0];
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
@@ -3244,7 +3244,7 @@ mod tests {
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let initial = builder.add_input(vector_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let reference = builder
             .add_instruction(
                 ConditionOperation::<TestValue>::new(),
@@ -3254,7 +3254,7 @@ mod tests {
             )
             .unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -3322,11 +3322,11 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
         let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -3391,14 +3391,14 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(scalar_type().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let outputs = builder
             .add_instruction(ScanOperation::<TestValue>::new(1, 4), vec![body], vec![reference], None)
             .unwrap();
         let final_reference = outputs[0];
         let stacked_values = outputs[1];
         let frozen = builder
-            .add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![final_reference], None)
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![final_reference], None)
             .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
@@ -3439,7 +3439,7 @@ mod tests {
         let initial = builder.add_input(scalar_type().into());
         let runtime_length = builder.add_input(DimensionType::new(length.clone()).into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let scanned = builder
             .add_instruction(
                 ScanOperation::<TestValue>::new(1, Dimension::Dynamic(length.clone())),
@@ -3449,7 +3449,7 @@ mod tests {
             )
             .unwrap()[0];
         let frozen =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![scanned], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![scanned], None).unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

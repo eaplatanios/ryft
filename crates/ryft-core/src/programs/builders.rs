@@ -1507,7 +1507,7 @@ mod tests {
             forwarded: None,
         };
         let allocation = TestReferenceOperation {
-            name: "new_reference",
+            name: "reference_new",
             semantics: ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]),
             forwarded: None,
         };
@@ -1515,7 +1515,7 @@ mod tests {
         let write = access("reference_write", ReferenceAccessMode::Write);
         let swap = access("reference_swap", ReferenceAccessMode::ReadWrite);
         let accumulate = access("reference_add_update", ReferenceAccessMode::Accumulate);
-        let freeze = access("freeze_reference", ReferenceAccessMode::Consume);
+        let freeze = access("reference_freeze", ReferenceAccessMode::Consume);
 
         // Allocation records no alias edge. View narrowing remains transitive across later identity aliases,
         // while identity aliases of the root remain valid consumption handles.
@@ -1531,7 +1531,7 @@ mod tests {
         lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[view], &[renamed_view]);
         lifetimes.record(&alias("rename", ReferenceAliasKind::Identity), &[root], &[renamed_root]);
         assert_eq!(lifetimes.validate(&read, &[renamed_view]), Ok(()));
-        let narrowed = "`freeze_reference` consumes a derived reference view, but consumption invalidates the whole \
+        let narrowed = "`reference_freeze` consumes a derived reference view, but consumption invalidates the whole \
                         alias family; consume the root handle instead";
         assert!(matches!(
             lifetimes.validate(&freeze, &[view]),
@@ -1547,7 +1547,7 @@ mod tests {
         // Consumption invalidates every handle in the family and diagnostics name both the invalid access and the
         // consuming operation. Narrowing misuse takes precedence over the resulting dead-family diagnostic.
         let consumed = |name, action| {
-            format!("`{name}` {action} a reference whose alias family `freeze_reference` already consumed")
+            format!("`{name}` {action} a reference whose alias family `reference_freeze` already consumed")
         };
         lifetimes.record(&freeze, &[renamed_root], &[]);
         assert!(matches!(
@@ -1570,7 +1570,7 @@ mod tests {
         ));
         assert!(matches!(
             lifetimes.validate(&freeze, &[root]),
-            Err(ProgramError::MalformedProgram(message)) if message == consumed("freeze_reference", "consumes"),
+            Err(ProgramError::MalformedProgram(message)) if message == consumed("reference_freeze", "consumes"),
         ));
         assert!(matches!(
             lifetimes.validate(&freeze, &[renamed_view]),

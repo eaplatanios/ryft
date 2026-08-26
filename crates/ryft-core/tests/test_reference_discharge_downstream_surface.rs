@@ -246,7 +246,7 @@ impl Operation for RegisterRegionOperation {
 #[derive(Copy, Clone, Debug)]
 enum RegisterOperation {
     Negate,
-    NewReference,
+    ReferenceNew,
     Read,
     Write,
     Swap,
@@ -265,7 +265,7 @@ impl Operation for RegisterOperation {
     fn name(&self) -> &'static str {
         match self {
             Self::Negate => "register.negate",
-            Self::NewReference => "register.new_reference",
+            Self::ReferenceNew => "register.reference_new",
             Self::Read => "register.read",
             Self::Write => "register.write",
             Self::Swap => "register.swap",
@@ -287,7 +287,7 @@ impl Operation for RegisterOperation {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![RegisterIrType::Register(RegisterType)])
             }
-            Self::NewReference => {
+            Self::ReferenceNew => {
                 check_count!("input", input_types, 1, TypeError);
                 Ok(vec![RegisterIrType::Reference(ReferenceType::new(RegisterType))])
             }
@@ -310,7 +310,7 @@ impl Operation for RegisterOperation {
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
         match self {
             Self::Negate => Cow::Borrowed(ReferenceOperationSemantics::empty()),
-            Self::NewReference => Cow::Owned(ReferenceOperationSemantics::new(
+            Self::ReferenceNew => Cow::Owned(ReferenceOperationSemantics::new(
                 Vec::new(),
                 vec![ReferenceOutput::Root { output_index: 0 }],
             )),
@@ -375,7 +375,7 @@ where
         // handle denotes.
         match self {
             Self::Negate => discharge_reference_free_operation(self, context, driver, inputs),
-            Self::NewReference => {
+            Self::ReferenceNew => {
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].expect_ordinary("an initial state")?.clone();
                 if context.selects_allocation(driver.instruction(), 0) {
@@ -433,7 +433,7 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+    let root = builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
     let replaced =
         builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
     let snapshot = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![root], None).unwrap()[0];
@@ -471,7 +471,7 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+    let root = builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
     let replaced =
         builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
     let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![replaced], None).unwrap()[0];

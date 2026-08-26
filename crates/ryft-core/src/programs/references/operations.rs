@@ -40,8 +40,8 @@ use super::semantics::{
     ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceType,
 };
 
-/// Canonical operation name for [`NewReferenceOperation`].
-pub const NEW_REFERENCE_OPERATION_NAME: &str = "new_reference";
+/// Canonical operation name for [`ReferenceNewOperation`].
+pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
@@ -55,13 +55,13 @@ pub const REFERENCE_SWAP_OPERATION_NAME: &str = "reference_swap";
 /// Canonical operation name for [`ReferenceAddUpdateOperation`].
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
 
-/// Canonical operation name for [`FreezeReferenceOperation`].
-pub const FREEZE_REFERENCE_OPERATION_NAME: &str = "freeze_reference";
+/// Canonical operation name for [`ReferenceFreezeOperation`].
+pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
 
 /// Creates a new reference initialized from this value.
-pub trait NewReference<Output = Self>: Sized {
+pub trait ReferenceNew<Output = Self>: Sized {
     /// Creates an independent reference whose initial state is this value.
-    fn new_reference(&self) -> Result<Output, ProgramError>;
+    fn reference_new(&self) -> Result<Output, ProgramError>;
 }
 
 /// Reads an immutable snapshot from a reference value.
@@ -89,7 +89,7 @@ pub trait ReferenceAddUpdate<Update = Self>: Sized {
 }
 
 /// Consumes a reference, returning its final value and invalidating its complete alias family.
-pub trait FreezeReference<Output = Self>: Sized {
+pub trait ReferenceFreeze<Output = Self>: Sized {
     /// Returns the final stored value and invalidates this reference and all aliases.
     ///
     /// The handle is taken by value, because consumption is linear: after this call the reference denotes nothing.
@@ -101,9 +101,9 @@ pub trait FreezeReference<Output = Self>: Sized {
     /// explicit clone-then-freeze, which reads as the deliberate act it is.
     ///
     /// ```compile_fail
-    /// use ryft_core::{Array, ArrayIrValue, FreezeReference, NewReference, ReferenceRead};
+    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
     ///
-    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).new_reference()?;
+    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
     /// let frozen = root.freeze()?;
     /// // The handle was consumed, so reading it again does not compile.
     /// let stale = root.read()?;
@@ -111,10 +111,10 @@ pub trait FreezeReference<Output = Self>: Sized {
     /// ```
     ///
     /// ```
-    /// use ryft_core::{Array, ArrayIrValue, FreezeReference, NewReference, ReferenceError, ReferenceRead};
+    /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
     ///
     /// // A clone is a separate handle onto one holder, so the misuse it enables is caught dynamically instead.
-    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).new_reference()?;
+    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
     /// let alias = root.clone();
     /// assert_eq!(root.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32)));
     /// assert_eq!(
@@ -128,7 +128,7 @@ pub trait FreezeReference<Output = Self>: Sized {
 
 // Reference semantics descriptors are constant per operation type. Sharing them through `LazyLock` statics lets the
 // per-instruction program analysis read them through `Cow::Borrowed` without allocating.
-static NEW_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> =
+static REFERENCE_NEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> =
     LazyLock::new(|| ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]));
 
 static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
@@ -147,7 +147,7 @@ static REFERENCE_ADD_UPDATE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSema
     ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Accumulate)], Vec::new())
 });
 
-static FREEZE_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+static REFERENCE_FREEZE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)], Vec::new())
 });
 
@@ -208,7 +208,7 @@ macro_rules! define_reference_primitive_payload {
 
 define_reference_primitive_payload!(
     /// Allocates a reference root for a referent of type `T` in the enclosing type universe `U`.
-    NewReferenceOperation
+    ReferenceNewOperation
 );
 
 define_reference_primitive_payload!(
@@ -233,7 +233,7 @@ define_reference_primitive_payload!(
 
 define_reference_primitive_payload!(
     /// Consumes a root reference, returning its final referent and invalidating its complete alias family.
-    FreezeReferenceOperation
+    ReferenceFreezeOperation
 );
 
 macro_rules! impl_reference_primitive_display {
@@ -248,14 +248,14 @@ macro_rules! impl_reference_primitive_display {
     };
 }
 
-impl_reference_primitive_display!(NewReferenceOperation, NEW_REFERENCE_OPERATION_NAME);
+impl_reference_primitive_display!(ReferenceNewOperation, REFERENCE_NEW_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceReadOperation, REFERENCE_READ_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceWriteOperation, REFERENCE_WRITE_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceSwapOperation, REFERENCE_SWAP_OPERATION_NAME);
 impl_reference_primitive_display!(ReferenceAddUpdateOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME);
-impl_reference_primitive_display!(FreezeReferenceOperation, FREEZE_REFERENCE_OPERATION_NAME);
+impl_reference_primitive_display!(ReferenceFreezeOperation, REFERENCE_FREEZE_OPERATION_NAME);
 
-impl<T, U> Operation for NewReferenceOperation<T, U>
+impl<T, U> Operation for ReferenceNewOperation<T, U>
 where
     T: Type,
     U: Type + From<ReferenceType<T>>,
@@ -265,7 +265,7 @@ where
 
     #[inline]
     fn name(&self) -> &'static str {
-        NEW_REFERENCE_OPERATION_NAME
+        REFERENCE_NEW_OPERATION_NAME
     }
 
     fn infer_output_types(
@@ -278,7 +278,7 @@ where
         let referent = <&T>::try_from(&input_types[0])?;
         if referent.is_reference() {
             return Err(TypeError::invalid(format!(
-                "`{NEW_REFERENCE_OPERATION_NAME}` cannot allocate a reference whose referent type `{referent}` is \
+                "`{REFERENCE_NEW_OPERATION_NAME}` cannot allocate a reference whose referent type `{referent}` is \
                  itself a reference",
             )));
         }
@@ -287,7 +287,7 @@ where
 
     #[inline]
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&NEW_REFERENCE_OPERATION_SEMANTICS)
+        Cow::Borrowed(&REFERENCE_NEW_OPERATION_SEMANTICS)
     }
 
     #[inline]
@@ -468,7 +468,7 @@ where
     }
 }
 
-impl<T, U> Operation for FreezeReferenceOperation<T, U>
+impl<T, U> Operation for ReferenceFreezeOperation<T, U>
 where
     T: Type,
     U: Type + From<T>,
@@ -478,7 +478,7 @@ where
 
     #[inline]
     fn name(&self) -> &'static str {
-        FREEZE_REFERENCE_OPERATION_NAME
+        REFERENCE_FREEZE_OPERATION_NAME
     }
 
     fn infer_output_types(
@@ -494,7 +494,7 @@ where
 
     #[inline]
     fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&FREEZE_REFERENCE_OPERATION_SEMANTICS)
+        Cow::Borrowed(&REFERENCE_FREEZE_OPERATION_SEMANTICS)
     }
 
     #[inline]
@@ -503,12 +503,12 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for NewReferenceOperation<T, U>
+impl<T, U, C> InterpretableOperation<C> for ReferenceNewOperation<T, U>
 where
     T: Type,
     U: Type,
-    NewReferenceOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: NewReference<C::Value>>,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceNew<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -517,7 +517,7 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].new_reference()?])
+        Ok(vec![inputs[0].reference_new()?])
     }
 }
 
@@ -595,12 +595,12 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for FreezeReferenceOperation<T, U>
+impl<T, U, C> InterpretableOperation<C> for ReferenceFreezeOperation<T, U>
 where
     T: Type,
     U: Type,
-    FreezeReferenceOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: FreezeReference<C::Value>>,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceFreeze<C::Value>>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -655,12 +655,12 @@ where
 // as an ordinary reference, so the honest rewrite of an access to it is the access itself, replayed verbatim through
 // `discharge_preserved_access`. That is the whole reason these rules bind their destination by `Context` rather than
 // by `Domain`: replaying a primitive requires the conversion seam into the destination's own operation family.
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for NewReferenceOperation<T, U>
+impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
 where
     T: Type,
     U: Type,
-    NewReferenceOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<NewReferenceOperation<T, U>>>,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
     P: ReferenceDischargePolicy<C>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -678,7 +678,7 @@ where
         check_count!("output", output_types, 1, ProgramError);
         let r#type = P::project_reference_type(&output_types[0]).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
-                "`{NEW_REFERENCE_OPERATION_NAME}` inferred the non-reference output type `{}`",
+                "`{REFERENCE_NEW_OPERATION_NAME}` inferred the non-reference output type `{}`",
                 output_types[0],
             ))
         })?;
@@ -807,12 +807,12 @@ where
     }
 }
 
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for FreezeReferenceOperation<T, U>
+impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceFreezeOperation<T, U>
 where
     T: Type,
     U: Type,
-    FreezeReferenceOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<FreezeReferenceOperation<T, U>>>,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
     P: ReferenceDischargePolicy<C>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
@@ -887,15 +887,15 @@ macro_rules! impl_unsupported_reference_transforms {
     };
 }
 
-impl_unsupported_reference_transforms!(NewReferenceOperation);
+impl_unsupported_reference_transforms!(ReferenceNewOperation);
 impl_unsupported_reference_transforms!(ReferenceReadOperation);
 impl_unsupported_reference_transforms!(ReferenceWriteOperation);
 impl_unsupported_reference_transforms!(ReferenceSwapOperation);
 impl_unsupported_reference_transforms!(ReferenceAddUpdateOperation);
-impl_unsupported_reference_transforms!(FreezeReferenceOperation);
+impl_unsupported_reference_transforms!(ReferenceFreezeOperation);
 
 impl_non_transposable_operation!(
-    <T, U> NewReferenceOperation<T, U>
+    <T, U> ReferenceNewOperation<T, U>
     where
         T: Type,
         U: Type,
@@ -925,7 +925,7 @@ impl_non_transposable_operation!(
         U: Type,
 );
 impl_non_transposable_operation!(
-    <T, U> FreezeReferenceOperation<T, U>
+    <T, U> ReferenceFreezeOperation<T, U>
     where
         T: Type,
         U: Type,
@@ -1407,12 +1407,12 @@ mod tests {
         }
     }
 
-    type New = NewReferenceOperation<TestReferent, TestType>;
+    type New = ReferenceNewOperation<TestReferent, TestType>;
     type Read = ReferenceReadOperation<TestReferent, TestType>;
     type Write = ReferenceWriteOperation<TestReferent, TestType>;
     type Swap = ReferenceSwapOperation<TestReferent, TestType>;
     type AddUpdate = ReferenceAddUpdateOperation<TestReferent, TestType>;
-    type Freeze = FreezeReferenceOperation<TestReferent, TestType>;
+    type Freeze = ReferenceFreezeOperation<TestReferent, TestType>;
 
     // The fixtures below give the reference-primitive discharge rules a destination to write into. The universe is
     // deliberately view-less, so that these tests isolate the rules themselves: composed views are the policy's
@@ -1797,7 +1797,7 @@ mod tests {
         let referent = TestReferent::new(7, 16);
 
         assert_eq!(
-            NewReferenceOperation::<TestReferent, NewUniverse>::new()
+            ReferenceNewOperation::<TestReferent, NewUniverse>::new()
                 .infer_output_types(&[NewUniverse::Value(referent)], &[]),
             Ok(vec![NewUniverse::Reference(ReferenceType::new(referent))]),
         );
@@ -1809,7 +1809,7 @@ mod tests {
             Ok(vec![ReadFreezeUniverse::Value(referent)]),
         );
         assert_eq!(
-            FreezeReferenceOperation::<TestReferent, ReadFreezeUniverse>::new()
+            ReferenceFreezeOperation::<TestReferent, ReadFreezeUniverse>::new()
                 .infer_output_types(std::slice::from_ref(&reference), &[]),
             Ok(vec![ReadFreezeUniverse::Value(referent)]),
         );
@@ -1883,13 +1883,13 @@ mod tests {
     }
 
     #[test]
-    fn test_new_reference_rejects_nested_referent_types() {
+    fn test_reference_new_rejects_nested_referent_types() {
         let referent = ReferenceType::new(TestReferent::new(7, 16));
         assert_eq!(
-            NewReferenceOperation::<ReferenceType<TestReferent>, NestedTestType>::new()
+            ReferenceNewOperation::<ReferenceType<TestReferent>, NestedTestType>::new()
                 .infer_output_types(&[NestedTestType::Reference(referent.clone())], &[]),
             Err(TypeError::invalid(format!(
-                "`new_reference` cannot allocate a reference whose referent type `{referent}` is itself a reference",
+                "`reference_new` cannot allocate a reference whose referent type `{referent}` is itself a reference",
             ))),
         );
     }
@@ -1953,13 +1953,13 @@ mod tests {
         assert_parameter_roundtrip(Freeze::new());
 
         assert_eq!(New::new(), New::default());
-        assert_eq!(format!("{:?}", New::new()), "NewReferenceOperation");
-        assert_eq!(New::new().to_string(), NEW_REFERENCE_OPERATION_NAME);
+        assert_eq!(format!("{:?}", New::new()), "ReferenceNewOperation");
+        assert_eq!(New::new().to_string(), REFERENCE_NEW_OPERATION_NAME);
         assert_eq!(Read::new().to_string(), REFERENCE_READ_OPERATION_NAME);
         assert_eq!(Write::new().to_string(), REFERENCE_WRITE_OPERATION_NAME);
         assert_eq!(Swap::new().to_string(), REFERENCE_SWAP_OPERATION_NAME);
         assert_eq!(AddUpdate::new().to_string(), REFERENCE_ADD_UPDATE_OPERATION_NAME);
-        assert_eq!(Freeze::new().to_string(), FREEZE_REFERENCE_OPERATION_NAME);
+        assert_eq!(Freeze::new().to_string(), REFERENCE_FREEZE_OPERATION_NAME);
 
         assert_eq!(New::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Read::new().effects(), Effects::single(Effect::OrderedState));
@@ -2038,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_reference_operation_reference_discharge() {
+    fn test_reference_new_operation_reference_discharge() {
         // Allocation binds a fresh discharged root whose entering state is the initializer and whose reference type is
         // the one this operation's own inference derives, exposed through the identity alias of an unviewed root.
         let (context, reference) = allocated_root(4);
@@ -2069,7 +2069,7 @@ mod tests {
         assert_eq!(
             New::new().discharge_references(&disagreeing, &EmptyRegionDriver, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
-                "`new_reference` inferred the non-reference output type `ref<value<i7,p16>>`".to_string(),
+                "`reference_new` inferred the non-reference output type `ref<value<i7,p16>>`".to_string(),
             )),
         );
     }
@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_freeze_reference_operation_reference_discharge() {
+    fn test_reference_freeze_operation_reference_discharge() {
         // A freeze yields the root's final state and unbinds the root, so every later access is a use-after-consume.
         let (context, reference) = allocated_root(4);
         let handle = ReferenceDischargeValue::Reference(reference.clone());
@@ -2263,7 +2263,7 @@ mod tests {
                     reference_write %0 %1
                     %3:value<i7,p16> = reference_swap %0 %1
                     reference_add_update %0 %1
-                    %4:value<i7,p16> = freeze_reference %0
+                    %4:value<i7,p16> = reference_freeze %0
                 in (%2, %3, %4)"},
         );
     }
@@ -2293,9 +2293,9 @@ mod tests {
             preserved.program().to_string(),
             indoc! {"
                 lambda %0:value<i7,p16>, %1:value<i7,p16> .
-                let %2:ref<value<i7,p16>> = new_reference %0
+                let %2:ref<value<i7,p16>> = reference_new %0
                     reference_add_update %2 %1
-                    %3:value<i7,p16> = freeze_reference %2
+                    %3:value<i7,p16> = reference_freeze %2
                 in (%3)"},
         );
 

@@ -1966,8 +1966,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Concretizable, Effects, FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation,
-        ProgramBuilder, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceDischarge,
+        AtomId, Concretizable, Effects, ProgramBuilder, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceDischarge, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceType, RegionInterface, RegionSlot,
     };
 
@@ -2847,7 +2847,7 @@ mod tests {
         let input_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let (_, source) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| {
-                let reference = input.new_reference()?;
+                let reference = input.reference_new()?;
                 reference.add_update(&input)?;
                 reference.freeze()
             },
@@ -2858,7 +2858,7 @@ mod tests {
         assert!(matches!(
             source.partially_evaluate(&[PartialValue::Known(ArrayIrValue::Array(Array::scalar(3.0_f32)))]),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "`new_reference` must be discharged before partial evaluation",
+                if message == "`reference_new` must be discharged before partial evaluation",
         ));
     }
 
@@ -2883,13 +2883,13 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(array_type.clone().into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let body = builder.import_region(body.entry_region_ref());
         let reference = builder
             .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference], None)
             .unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],

@@ -2394,8 +2394,8 @@ mod tests {
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
-        Concretizable, FreezeReferenceOperation, NewReferenceOperation, Operation, ProgramBuilder,
-        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceType, RegionId,
+        Concretizable, Operation, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischarge,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RegionId,
     };
     use crate::tests::test_condition_program;
     use crate::tracing::{NestedTracingContext, Trace};
@@ -2469,9 +2469,9 @@ mod tests {
             context.clone(),
         );
         assert!(matches!(
-            context.bind(NewReferenceOperation::new(), Vec::new(), &[input]),
+            context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "`new_reference` must be discharged before differentiation",
+                if message == "`reference_new` must be discharged before differentiation",
         ));
     }
 
@@ -2642,12 +2642,12 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -2890,12 +2890,12 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],
@@ -3007,11 +3007,11 @@ mod tests {
         let body = builder.import_region(body.entry_region_ref());
         let initial = builder.add_input(ArrayIrType::Array(scalar_type));
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
         let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let source = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],

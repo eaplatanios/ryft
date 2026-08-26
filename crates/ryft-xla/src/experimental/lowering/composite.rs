@@ -544,14 +544,14 @@ where
                 }
             }
         }
-        operation @ (ArrayIrOperation::NewReference(_)
+        operation @ (ArrayIrOperation::ReferenceNew(_)
         | ArrayIrOperation::ReferenceIndex(_)
         | ArrayIrOperation::ReferenceSlice(_)
         | ArrayIrOperation::ReferenceRead(_)
         | ArrayIrOperation::ReferenceWrite(_)
         | ArrayIrOperation::ReferenceSwap(_)
         | ArrayIrOperation::ReferenceAddUpdate(_)
-        | ArrayIrOperation::FreezeReference(_)) => {
+        | ArrayIrOperation::ReferenceFreeze(_)) => {
             Err(LoweringError::UnresolvedReference { construct: operation.name().to_string() })
         }
         ArrayIrOperation::DimensionFromScalar(operation) => {

@@ -3722,9 +3722,9 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EmptyRegionDriver, FreezeReferenceOperation, NewReferenceOperation, ProgramBuilder, ProgramRenderingMode,
-        Provenance, ProvenanceScope, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation,
-        ReferenceType,
+        EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope,
+        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::test_condition_program;
@@ -5767,7 +5767,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(scalar_type.into());
         let reference =
-            builder.add_instruction(NewReferenceOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         assert!(
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
@@ -5775,7 +5775,7 @@ mod tests {
                 .is_empty(),
         );
         let output =
-            builder.add_instruction(FreezeReferenceOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                 vec![output],

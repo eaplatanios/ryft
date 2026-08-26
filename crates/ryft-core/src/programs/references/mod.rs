@@ -30,7 +30,7 @@
 //! The reference vocabulary used throughout this module and its consumers is defined relative to one concept:
 //!
 //! - A **root** is the canonical mutable storage cell that a reference family denotes. Only
-//!   [`new_reference`](NewReferenceOperation) mints one. Eagerly, the root is the shared synchronized holder behind
+//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the root is the shared synchronized holder behind
 //!   every [`Reference`] clone; in operation semantics, it is the identity that [`ReferenceOutput::Root`] introduces
 //!   and [`ReferenceOutput::Alias`] preserves; during discharge, it is the unit of state threading, named by a
 //!   [`ReferenceRootHandle`].
@@ -53,7 +53,7 @@
 //! Every handle resolves to exactly one root: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
 //! are structurally unrepresentable rather than merely rejected, so analyses reason about state per root. Access-mode
 //! summaries, discharge state threading, and race validation are per-root facts, and consumption
-//! ([`freeze_reference`](FreezeReferenceOperation)) is a whole-root lifetime event that invalidates the complete
+//! ([`reference_freeze`](ReferenceFreezeOperation)) is a whole-root lifetime event that invalidates the complete
 //! family, which is why consuming through a narrowing view is rejected. Roots also split by provenance: a *local*
 //! root is allocated inside the program and disappears entirely after discharge, while an *external* root denotes
 //! caller-owned state entering through a public input or capture ([`ReferenceSource`]) and is what a
@@ -66,9 +66,9 @@
 //! - `semantics.rs` defines [`ReferenceType`], the operation-local [`ReferenceOperationSemantics`] descriptor,
 //!   access modes, root/alias classifications, and entry-boundary sources.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
-//!   ([`NewReference`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
+//!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
 //!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
-//!   ([`FreezeReference`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
+//!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
 //! - `runtime.rs` implements [`Reference`] and its synchronized holder state machine. The hidden backend interface
 //!   uses generations, completion dependencies, read leases, reservations, pending installation, and terminal
 //!   poisoning to coordinate external state across synchronous and asynchronous execution.
@@ -126,9 +126,9 @@ pub use discharge::{
     discharge_reference_free_operation,
 };
 pub use operations::{
-    FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
-    NewReference, NewReferenceOperation, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME,
-    REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };

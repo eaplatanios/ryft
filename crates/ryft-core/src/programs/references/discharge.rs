@@ -11,10 +11,10 @@
 //! Consider this schematic program with one local reference:
 //!
 //! ```text
-//! %reference = new_reference(%initial)
+//! %reference = reference_new(%initial)
 //! %before = reference_swap(%reference, %replacement)
 //! %after = reference_read(%reference)
-//! %final = freeze_reference(%reference)
+//! %final = reference_freeze(%reference)
 //! return %before, %after, %final
 //! ```
 //!
@@ -4708,7 +4708,7 @@ mod tests {
         Add,
         Select { offset: usize, length: usize },
         Splice { offset: usize },
-        NewReference,
+        ReferenceNew,
         Slice { offset: usize, length: usize },
         Read,
         Write,
@@ -4732,7 +4732,7 @@ mod tests {
                 Self::Add => "list.add",
                 Self::Select { .. } => "list.select",
                 Self::Splice { .. } => "list.splice",
-                Self::NewReference => "list.new_reference",
+                Self::ReferenceNew => "list.reference_new",
                 Self::Slice { .. } => "list.slice",
                 Self::Read => "list.read",
                 Self::Write => "list.write",
@@ -4802,10 +4802,10 @@ mod tests {
                     }
                     Ok(vec![input_types[0].clone()])
                 }
-                Self::NewReference => {
+                Self::ReferenceNew => {
                     check_count!("input", input_types, 1, TypeError);
                     let ListIrType::List(referent) = &input_types[0] else {
-                        return Err(TypeError::invalid("`list.new_reference` expects a list operand"));
+                        return Err(TypeError::invalid("`list.reference_new` expects a list operand"));
                     };
                     Ok(vec![ListIrType::Reference(ReferenceType::new(referent.clone()))])
                 }
@@ -4848,7 +4848,7 @@ mod tests {
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             let semantics = match self {
-                Self::NewReference => {
+                Self::ReferenceNew => {
                     ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }])
                 }
                 Self::Slice { .. } => ReferenceOperationSemantics::new(
@@ -4985,7 +4985,7 @@ mod tests {
                 Self::Add | Self::Select { .. } | Self::Splice { .. } => {
                     discharge_reference_free_operation(self, context, driver, inputs)
                 }
-                Self::NewReference => {
+                Self::ReferenceNew => {
                     check_count!("input", inputs, 1, ProgramError);
                     OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(|positions| positions.push(driver.instruction()));
                     let initial = inputs[0].expect_ordinary("an initial state")?.clone();
@@ -4995,7 +4995,7 @@ mod tests {
                         <ListReferenceDischarge as ReferenceDischargePolicy<C>>::project_reference_type(&output_type)
                             .ok_or_else(|| {
                             ProgramError::MalformedProgram(
-                                "`list.new_reference` produced a non-reference type".to_string(),
+                                "`list.reference_new` produced a non-reference type".to_string(),
                             )
                         })?;
                     if context.selects_allocation(driver.instruction(), 0) {
@@ -5571,7 +5571,7 @@ mod tests {
         // A direct bind has no source instruction, so an allocation rule that consults its replay position sees
         // `None` and treats the allocation as unconditionally discharged.
         OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
-        context.bind(ListOperation::NewReference, Vec::new(), &[lhs]).unwrap();
+        context.bind(ListOperation::ReferenceNew, Vec::new(), &[lhs]).unwrap();
         assert_eq!(OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone), vec![None]);
     }
 
@@ -6100,7 +6100,7 @@ mod tests {
         // it, adds the replaced and current selections, and finally freezes the whole root.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
             .unwrap()[0];
@@ -6299,7 +6299,7 @@ mod tests {
         let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
         let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
-        let local = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![snapshot], None).unwrap()[0];
+        let local = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![snapshot], None).unwrap()[0];
         let local_snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![local], None).unwrap()[0];
         let previous = builder
             .add_instruction(ListOperation::Call, vec![callee], vec![reference, replacement], None)
@@ -6742,7 +6742,7 @@ mod tests {
         let initial = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
         let previous = builder.add_instruction(ListOperation::Call, vec![callee], vec![root, update], None).unwrap()[0];
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
         let source = builder
@@ -6840,7 +6840,7 @@ mod tests {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let root = builder.add_instruction(ListOperation::NewReference, Vec::new(), vec![initial], None).unwrap()[0];
+        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
             .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
             .unwrap()[0];
@@ -6861,7 +6861,7 @@ mod tests {
             discharged.program().to_string(),
             indoc! {"
                 lambda %0:list<4>, %1:list<2> .
-                let %2:ref<list<4>> = list.new_reference %0
+                let %2:ref<list<4>> = list.reference_new %0
                     %3:ref<list<2>> = list.slice %2
                     list.add_update %3 %1
                     %4:list<4> = list.freeze %2
@@ -7062,9 +7062,9 @@ mod tests {
         let staged = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(staging.clone());
         let initial = ReferenceDischargeValue::Ordinary(staging.input(ListIrType::List(referent.clone())));
         assert_eq!(
-            discharge_preserved_access(&ListOperation::NewReference, &staged, std::slice::from_ref(&initial)),
+            discharge_preserved_access(&ListOperation::ReferenceNew, &staged, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
-                "reference discharge replayed `list.new_reference` over a preserved root, but its output 0 is the \
+                "reference discharge replayed `list.reference_new` over a preserved root, but its output 0 is the \
                  reference `ref<list<2>>`; an operation that derives a reference owns that root and needs a reference \
                  discharge rule of its own"
                     .to_string(),

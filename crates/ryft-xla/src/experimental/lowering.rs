@@ -10380,7 +10380,7 @@ mod tests {
 
     #[test]
     fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
-        use ryft_core::{FreezeReferenceOperation, NewReferenceOperation, ReferenceWriteOperation};
+        use ryft_core::{ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation};
 
         assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
 
@@ -10390,7 +10390,7 @@ mod tests {
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(array_type.clone()));
         let reference = builder
-            .add_instruction(XlaOperation::NewReference(NewReferenceOperation::new()), Vec::new(), vec![input], None)
+            .add_instruction(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![input], None)
             .unwrap()[0];
         builder
             .add_instruction(
@@ -10402,7 +10402,7 @@ mod tests {
             .unwrap();
         let output = builder
             .add_instruction(
-                XlaOperation::FreezeReference(FreezeReferenceOperation::new()),
+                XlaOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
                 Vec::new(),
                 vec![reference],
                 None,
