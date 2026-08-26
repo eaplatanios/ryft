@@ -135,8 +135,8 @@ pub(crate) fn ragged_dot_abstract(
 
 /// Returns whether operands of `operand` element type may accumulate at `accumulation`.
 ///
-/// The identical type is always valid. Floating-point operands may accumulate at `f32` or `f64`, and integer
-/// operands may accumulate at a same-signedness integer type at least as wide.
+/// The identical type is always valid. Floating-point operands may accumulate at `f32` or `f64`, and integer operands
+/// may accumulate at a same-signedness integer type at least as wide.
 fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) -> bool {
     /// Returns the signedness and bit width of an integer data type, or `None` for any other type.
     fn integer_parts(data_type: DataType) -> Option<(bool, usize)> {
@@ -179,6 +179,10 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
 /// axes that are neither batching nor contracting, in their original order. The output element type is the requested
 /// compatible accumulation type when one is provided, or otherwise the common operand element type.
 ///
+/// Floating-point compatibility deliberately does not use the standard elementwise promotion lattice. Backend dot
+/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit operands may accumulate
+/// at `f32` or `f64`. Integer accumulation preserves signedness and may only widen the operand type.
+///
 /// The output [`Sharding`] follows JAX's `dot_general` sharding rule (`_dot_general_sharding_rule` in
 /// `jax/_src/lax/lax.py`); refer to the
 /// [StableHLO `dot_general` specification](https://openxla.org/stablehlo/spec#dot_general) for the underlying
@@ -186,7 +190,7 @@ fn accumulation_type_is_compatible(operand: DataType, accumulation: DataType) ->
 ///
 ///   - When `output_sharding` is provided, it is validated (rank, mesh, no auto axes, and the unreduced-output rule
 ///     requiring identically sharded contracting dimensions whose sharding axes equal the requested unreduced set)
-///     and returned directly, bypassing the consistency checks below.
+///     and returned directly, bypassing the ordinary operand consistency checks.
 ///   - Operands must not be unreduced. Reduced operands are legal, and reduced and varying manual axes are unioned
 ///     across the operands into the output sharding.
 ///   - When neither operand carries a sharding, the output carries none. When exactly one does, the rule runs with

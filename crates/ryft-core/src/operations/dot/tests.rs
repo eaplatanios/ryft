@@ -1194,6 +1194,17 @@ fn test_ragged_dot_eager_zero_groups_and_uncovered_rows() {
 }
 
 #[test]
+fn test_ragged_dot_eager_rejects_negative_group_sizes() {
+    let lhs = Array::matrix(2, 1, vec![1.0_f32, 2.0]);
+    let rhs = Array::from_f64s(plain_array(&[2, 1, 1]), vec![3.0, 4.0]);
+    assert!(matches!(
+        lhs.ragged_dot(&rhs, &Array::vector(vec![1_i32, -1])),
+        Err(ProgramError::InvalidArgument { message })
+            if message == "`ragged_dot_general` `group_sizes[1]` must be nonnegative but got -1",
+    ));
+}
+
+#[test]
 fn test_ragged_dot_eager_contracting_batch_and_group_prefixes() {
     let contracting_dimensions = RaggedDotDimensionNumbers::new(
         DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),

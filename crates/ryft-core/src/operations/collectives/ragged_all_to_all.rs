@@ -647,6 +647,26 @@ where
     Ok(Tracer::concatenate(rows.iter(), 0)?)
 }
 
+/// Transposes sender-owned offset metadata in the operation's current logical or physical representation.
+fn transpose_offsets<V, O>(
+    operation: &RaggedAllToAllOperation,
+    context: &mut TracingContext<V, O>,
+    offsets: &Tracer<TracingContext<V, O>>,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType>
+        + From<AllToAllOperation>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<SliceOperation>,
+{
+    if operation.is_physical() {
+        transpose_physical_offsets(operation, offsets)
+    } else {
+        transpose_logical_offsets(operation, context, offsets)
+    }
+}
+
 /// Stages the interval mask that preserves the output seed's cotangent outside received regions.
 fn mask_output_cotangent<V, O>(
     context: &mut TracingContext<V, O>,
@@ -801,16 +821,8 @@ where
                         let (operand_cotangent, permuted_output_offsets) = if operand.is_known() {
                             (MaybeZero::Zero(operand.r#type().cotangent()?), None)
                         } else {
-                            let permuted_output_offsets = if self.is_physical() {
-                                transpose_physical_offsets(self, &output_offsets)?
-                            } else {
-                                transpose_logical_offsets(self, context, &output_offsets)?
-                            };
-                            let permuted_input_offsets = if self.is_physical() {
-                                transpose_physical_offsets(self, &input_offsets)?
-                            } else {
-                                transpose_logical_offsets(self, context, &input_offsets)?
-                            };
+                            let permuted_output_offsets = transpose_offsets(self, context, &output_offsets)?;
+                            let permuted_input_offsets = transpose_offsets(self, context, &input_offsets)?;
                             let zero = context.zero(&operand.r#type().cotangent()?)?;
                             let adjoint_inputs = [
                                 cotangent.clone(),
@@ -832,8 +844,7 @@ where
                         } else {
                             let permuted_output_offsets = match permuted_output_offsets {
                                 Some(permuted_output_offsets) => permuted_output_offsets,
-                                None if self.is_physical() => transpose_physical_offsets(self, &output_offsets)?,
-                                None => transpose_logical_offsets(self, context, &output_offsets)?,
+                                None => transpose_offsets(self, context, &output_offsets)?,
                             };
                             MaybeZero::Value(mask_output_cotangent(
                                 context,
@@ -916,7 +927,12 @@ where
                         let output_batch_axis = participant_axis_count;
                         let logical_input_types = inputs.iter().map(ArrayBatch::unbatched_type).collect::<Vec<_>>();
                         self.infer_output_types(logical_input_types.as_slice(), &[])?;
-                        let batch_size = P::axis_size(context)?;
+                        let batch_size =
+                            P::axis_dimension(context)?.value().ok_or_else(|| BatchingError::UnsupportedOperation {
+                                message: "`ragged_all_to_all` merged batching requires a statically known \
+                                          mapped-axis extent"
+                                    .to_string(),
+                            })?;
                         if batch_size == 0 {
                             let output = P::match_axis(context, &inputs[1], output_batch_axis.into())?;
                             return Ok(vec![output].into());
@@ -925,9 +941,9 @@ where
                             r#type.shape().dimensions()[axis].value().ok_or_else(|| {
                                 BatchingError::UnsupportedOperation {
                                     message: format!(
-                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching requires `{name}` axis {axis} to have \
-                         a static extent",
-                    ),
+                                        "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` merged batching requires `{name}` \
+                                         axis {axis} to have a static extent",
+                                    ),
                                 }
                             })
                         };
@@ -1207,12 +1223,12 @@ mod tests {
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::macros::{
-        check_gradient as check_ragged_gradient, check_operation_transposition, check_operation_type_inference,
-    };
+    use crate::differentiation::differentiate_at;
+    use crate::macros::{check_gradient, check_operation_transposition, check_operation_type_inference};
     use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
-    use crate::programs::Provenance;
+    use crate::programs::{ProgramBuilder, Provenance};
 
     use super::*;
 
@@ -1592,8 +1608,6 @@ mod tests {
 
     #[test]
     fn test_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
-        use crate::differentiation::differentiate_at;
-
         let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]);
         let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]);
         let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]);
@@ -1639,7 +1653,7 @@ mod tests {
         assert_eq!(gradient.0.to_f64s(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         assert_eq!(gradient.1.to_f64s(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
 
-        check_ragged_gradient!(
+        check_gradient!(
             |operand, output| {
                 let context = operand.dispatch_domain();
                 let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
@@ -1676,7 +1690,7 @@ mod tests {
             step = 1e-6,
             tolerance = 1e-6,
         );
-        check_ragged_gradient!(
+        check_gradient!(
             |output, operand| {
                 let context = output.dispatch_domain();
                 let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
@@ -1717,8 +1731,6 @@ mod tests {
 
     #[test]
     fn test_named_batch_axis_composes_outside_ragged_all_to_all_differentiation() {
-        use crate::differentiation::differentiate_at;
-
         let (values, gradients) = batch(
             |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
                 differentiate_at((operand, output))
@@ -2164,7 +2176,8 @@ mod tests {
         assert_eq!(
             error,
             &BatchingError::UnsupportedOperation {
-                message: "this batching rule requires a statically known mapped-axis extent".to_string(),
+                message: "`ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
+                    .to_string(),
             },
         );
     }
@@ -2236,9 +2249,6 @@ mod tests {
 
     #[test]
     fn test_grouped_ragged_all_to_all_transpose_stages_the_adjoint_sequence() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
         let groups = vec![vec![0, 2], vec![3, 1]];
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
@@ -2361,9 +2371,6 @@ mod tests {
 
     #[test]
     fn test_additive_ragged_all_to_all_output_transpose_does_not_exchange_offsets() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let operand = builder.add_input(array_type(DataType::F32, [3]));
         let output = builder.add_input(array_type(DataType::F32, [4]));
@@ -2397,9 +2404,6 @@ mod tests {
 
     #[test]
     fn test_ragged_all_to_all_transpose_rejects_unavailable_or_unrepresentable_metadata() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let inputs = [
             builder.add_input(ArrayType::new_static(DataType::F32, [3])),
@@ -2478,9 +2482,6 @@ mod tests {
 
     #[test]
     fn test_ragged_all_to_all_transpose_supports_leading_and_trailing_sharding() {
-        use crate::parameters::Placeholder;
-        use crate::programs::ProgramBuilder;
-
         let mesh = LogicalMesh::new(vec![MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         for dimensions in [
             vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()],

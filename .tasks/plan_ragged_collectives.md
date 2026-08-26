@@ -1207,3 +1207,109 @@ constants work made the owner checkout temporarily uncompilable, its complete `r
 tests and 5 ignored. Formatting and whitespace checks pass. Independent correctness, conventions, and simplicity
 auditors repeatedly reviewed the remediation; every finding was fixed and the final closure round reported no
 findings. No changelog file was modified.
+
+## Third post-plan feedback remediation
+
+- [x] Restore a green `ryft-xla` checkout by removing the stale `OneOperation<ArrayIrType>` composite conversion and
+  verify the constants-provider migration compiles through the backend.
+- [x] Correct the negative-group-size contract documentation so it distinguishes decomposition from instruction
+  lowering, and add eager rejection coverage alongside the compiled clamp regressions.
+- [x] Restore the custom-call no-contract fast path before ragged carrier construction and pin the dense path against
+  unnecessary ragged-contract validation.
+- [x] Hand-format the abandoned provenance block in `ragged_all_to_all` and reformat the inline ragged-mask provenance
+  scopes without reintroducing a one-off helper.
+- [x] Audit the remaining cleanup list (JVP widening duplication, dead tuple return, identity transpose, rejection-block
+  copies, static-policy diagnostic, documentation asymmetry, and test-local imports/aliases), implementing clear wins
+  and recording an explicit rationale for every declined item.
+- [x] Audit the duplicated physical/logical ragged-all-to-all transpose dispatch and remove it if doing so simplifies
+  the code without obscuring the two branch semantics.
+- [x] Run formatting, focused tests, and the complete affected `ryft-core` and `ryft-xla` library suites, then repeat
+  independent correctness, conventions, and simplicity audits until all three report no findings.
+- [x] Record exact implementation and verification evidence without modifying changelog files.
+
+### Third post-plan feedback remediation review
+
+Removed the stale `OneOperation<ArrayIrType>` composite conversion left behind by the constants-provider migration;
+the owner checkout now compiles every `ryft-xla` test target. Grouped-dot documentation now states the exact split
+between eager rejection, decomposition's defensive signed clamp, and instruction lowering's unchanged CHLO metadata.
+A focused eager test pins the exact negative-size diagnostic, while the decomposition snapshot and CPU test pin the
+clamp before unsigned widening.
+
+No-contract custom calls now reject undeclared ragged metadata without constructing ragged carriers or rebuilding
+per-item types. The homogeneous regression counts type reads and proves that the rejected dense path performs none;
+the mixed regression proves that trailing output extents are validated before an otherwise malformed array operand is
+projected. Contract-bearing paths pass their already-known contract explicitly into shared validation rather than
+hiding that precondition behind an `unwrap`. The abandoned ragged-all-to-all provenance indentation is hand-formatted,
+the ragged-mask provenance scopes remain inline, and the physical/logical offset transpose decision is shared by one
+three-use helper.
+
+The remaining cleanup audit implemented the clear wins: dense and grouped dot JVPs share one bilinear widening
+algorithm; grouped XLA expansion no longer returns an unused type; identity final transposes are omitted; the dynamic
+mapped-axis diagnostic names `ragged_all_to_all`; dot batching, differentiation, and accumulation documentation is
+attached to its owning API; and test-local imports and the redundant gradient alias are gone. Exact lowering snapshots
+were regenerated after the transpose removal.
+
+Two reported duplication families were deliberately left explicit. The all-to-all, parallel-sum-scatter, and
+all-gather rejection paths differ in accepted cases, rejection timing, and diagnostics; combining them would require a
+policy enum that obscures those semantics. Likewise, homogeneous `ArrayBatch` and mixed `ArrayIrBatch` output helpers
+operate on different carrier contracts; a private trait introduced only to merge similar-looking construction code
+would add generic and trait-solver surface without establishing a reusable semantic capability.
+
+Final owner-checkout verification passed `cargo test -p ryft-core --lib --no-fail-fast` (1,727 passed, 3 ignored),
+`cargo check -p ryft-xla --tests`, `cargo +nightly fmt --all -- --check`, and `git diff --check`. Focused suites passed
+35 custom-call tests, 30 dot tests, and 19 ragged-all-to-all tests. Because the cached native XLA archive predates a
+concurrent profiler symbol, executable verification used an isolated task checkout with a test-only linker shim that
+is not present in the production tree: all 11 affected ragged-dot lowering, strategy, snapshot, and CPU execution
+tests passed. The complete isolated `ryft-xla` run reached 554 passes and 5 ignored tests; its four failures are the
+established artifact limitations (two unavailable placement custom calls and two unsupported dynamic CPU-buffer
+cases), and no affected test failed. Independent correctness, conventions, and simplicity auditors reviewed the final
+tree after every finding was fixed; the closing round reported no findings in all three tracks. No changelog file was
+modified.
+
+## Fourth post-plan feedback remediation
+
+- [x] Refresh the in-tree `ryft-xla-sys` native artifact so the owner checkout links the current profiler API, then run
+  the affected and complete `ryft-xla` library suites directly in-tree.
+- [x] Resolve the static-policy identity-mask diagnostic and `parallel_max` multi-ragged-axis documentation asymmetry,
+  or record a precise reason for declining either item.
+- [x] Resolve or explicitly decline contracting-mode CPU execution, prefix-shaped instruction snapshots, the merged
+  grouped-dot documentation paragraph, the stale directional comment, and the undocumented zero-construction trick.
+- [x] Restore every batching precondition lost when dot implementation rustdoc was moved onto its owning public API,
+  including dynamic mapped-extent identity agreement.
+- [x] Run focused and affected-crate verification without modifying changelog files.
+- [x] Repeat independent correctness, conventions, and simplicity audits, fixing every finding until all three tracks
+  report no findings.
+- [x] Record exact implementation, decisions, artifact provenance, and verification evidence.
+
+### Fourth post-plan feedback remediation review
+
+Every stale review item has an explicit disposition. Static identity masking now reports each selected ragged
+`DimensionVariable`, its axis, and the requested identity; carriers whose ragged axes are not selected pass through
+unchanged, with a regression covering that boundary. Naming the consuming operation was deliberately declined because
+`RaggedArrayBatchingPolicy::mask_identity_input` receives only the batching context, carrier, masked axes, and identity.
+Adding operation attribution would broaden the policy contract and every caller solely for a diagnostic, while the
+dimension, axis, and identity now identify the failing contract directly. The `parallel_max` documentation now states
+the correct lowest-value hole semantics for signed, floating-point, unsigned, and Boolean element types.
+
+The remaining five coverage and cleanup items were implemented. CPU execution now covers contracting-axis grouped-dot
+decomposition; the instruction strategy has an exact prefix-shaped CHLO snapshot; grouped-dot behavior is separated
+into coherent documentation paragraphs; the inference comment no longer refers to checks "below"; and the staged
+zero-before-widening construction documents why it must remain in the signed source type. `DotOperation`'s public type
+documentation again states all batching contracts lost during the implementation-doc migration: mapped operands share
+one dynamic `DimensionVariable`, ragged evidence is preserved and consumed explicitly, padding is neutralized per
+operand, free-axis layout is retained, dense batching stays dense, JVP terms preserve the primal configuration,
+transpose pins cotangent-dual sharding, and structural-zero cotangents remain structural zeros.
+
+The native XLA artifact was rebuilt from owner-checkout HEAD `3061d6311954b69b38f3cc9271ee1ee146b6974b`
+with pinned XLA `f16a4aeb435b2896ab96b605f004f982f6c97eb8` and JAX
+`a33ed614c58ee8a10d0b7536c50c2609c38500c1` for macOS arm64 CPU. The generated archive is
+`/private/var/tmp/_bazel_eaplatanios/7618bdc684bd4d5b2687d3216e8beb3a/execroot/ryft-xla-sys/bazel-out/darwin_arm64-opt/bin/ryft-xla-sys-archive.tar.gz`
+(SHA-256 `ce1c000738e30391b89f8c66bf0d340ce3ac54c4370fb2e0d90bd8870acc12eb`). Both the archive and the
+normally selected extracted-cache library export `_RYFT_XLA_Profiler_Byte_Buffer_Destroy`. The complete owner-checkout
+`ryft-xla` library suite passed both with an explicit `RYFT_XLA_SYS_ARCHIVE` override and again through the default
+cache selection: 559 passed, 5 ignored, and no failures.
+
+The defensive static-policy regression passed directly, and the complete `ryft-core` library suite passed with 1,727
+tests and 3 ignored. The full run exposed six stale exact-error assertions for cumulative and log-sum-exp operations;
+all now pin the improved dimension, axis, and identity diagnostic, and the repeated complete run passed. Nightly
+formatting and whitespace checks pass. No changelog file was modified.

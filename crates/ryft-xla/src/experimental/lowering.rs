@@ -1472,6 +1472,9 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
         op: "`ragged_dot` with a dynamically sized group axis".to_string(),
     })?;
     let group_sizes = if group_sizes_type.data_type().is_signed() {
+        // Subtracting the value from itself constructs a shape-identical zero in the source integer type. That avoids
+        // unsigned sign extension without introducing a scalar constant that would need explicit broadcasting across
+        // static or bounded-dynamic metadata prefixes.
         let zero = block.append_operation(stable_hlo::subtract(group_sizes, group_sizes, location)?)?;
         let zero = zero.result(0).expect("stablehlo.subtract should return one result").as_ref();
         let nonnegative = block.append_operation(stable_hlo::maximum(group_sizes, zero, location)?)?;
@@ -1554,8 +1557,8 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
 
 /// Expands one grouped-dot operand into a zero-masked dense group axis. Group intervals are accumulated in `u64` and
 /// capped at the physical ragged extent so metadata arithmetic and iota indices cannot wrap. The intermediate order
-/// keeps the `group_sizes` prefix axes first so every broadcast dimension is monotonic; one final transpose produces
-/// `[group, original axes...]` for the dense dot.
+/// keeps the `group_sizes` prefix axes first so every broadcast dimension is monotonic; a final transpose, when
+/// necessary, produces `[group, original axes...]` for the dense dot.
 fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
@@ -1567,7 +1570,7 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<(ValueRef<'b, 'c, 't>, ArrayType), LoweringError> {
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
     let group_axis = group_sizes_type.rank() - 1;
     let group_count = group_sizes_type.dimension(group_axis);
 
@@ -1658,9 +1661,13 @@ fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     let final_permutation = std::iter::once(labels.iter().position(Option::is_none).unwrap())
         .chain((0..input_type.rank()).map(|axis| labels.iter().position(|label| *label == Some(axis)).unwrap()))
         .collect::<Vec<_>>();
-    let expanded = block.append_operation(stable_hlo::transpose(masked, final_permutation.as_slice(), location)?)?;
-    let expanded = expanded.result(0).expect("stablehlo.transpose should return one result").as_ref();
-    Ok((expanded, input_type.with_inserted_dimension(0, group_count).map_err(ProgramError::from)?))
+    if final_permutation.iter().enumerate().all(|(axis, source)| axis == *source) {
+        Ok(masked)
+    } else {
+        let expanded =
+            block.append_operation(stable_hlo::transpose(masked, final_permutation.as_slice(), location)?)?;
+        Ok(expanded.result(0).expect("stablehlo.transpose should return one result").as_ref())
+    }
 }
 
 /// Emits one ordinary dense dot after the grouped operands have been expanded.
@@ -1754,7 +1761,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RaggedDotOperation {
             lowerer.context,
             lowerer.location,
         )?;
-        let (lhs, _) = lower_ragged_dot_expansion(
+        let lhs = lower_ragged_dot_expansion(
             input_values[0],
             lhs_type,
             group_starts,
@@ -1791,7 +1798,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RaggedDotOperation {
                     .copied()
                     .chain(dot.rhs_contracting_dimensions()[..position].iter().copied())
                     .collect::<Vec<_>>();
-                let (rhs, _) = lower_ragged_dot_expansion(
+                let rhs = lower_ragged_dot_expansion(
                     input_values[1],
                     rhs_type,
                     group_starts,
@@ -11854,14 +11861,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_dot_decomposition_lowers_prefix_shaped_group_sizes() {
+    fn test_ragged_dot_lowering_strategies_preserve_prefix_shaped_group_sizes() {
         let dimensions = RaggedDotDimensionNumbers::new(
             DotDimensionNumbers::new(vec![2], vec![2], vec![0], vec![1]),
             vec![1],
             vec![0],
         );
         let module = lowered_ragged_dot_module_for(
-            dimensions,
+            dimensions.clone(),
             ArrayType::new_static(DataType::F32, [2, 3, 1]),
             ArrayType::new_static(DataType::F32, [2, 2, 1, 1]),
             ArrayType::new_static(DataType::I32, [2, 2]),
@@ -11917,6 +11924,33 @@ mod tests {
                     contracting_dims = [3, 0] x [2, 0], precision = [DEFAULT, DEFAULT] : \
                     (tensor<2x2x3x1xf32>, tensor<2x2x1x1xf32>) -> tensor<2x3x1xf32>
                     return %16 : tensor<2x3x1xf32>
+                  }
+                }
+            "},
+        );
+
+        let module = lowered_ragged_dot_module_for(
+            dimensions,
+            ArrayType::new_static(DataType::F32, [2, 3, 1]),
+            ArrayType::new_static(DataType::F32, [2, 2, 1, 1]),
+            ArrayType::new_static(DataType::I32, [2, 2]),
+            RaggedDotLoweringStrategy::Instruction,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3x1xf32>, \
+                  %arg1: tensor<2x2x1x1xf32>, %arg2: tensor<2x2xi32>) -> tensor<2x3x1xf32> {
+                    %0 = \"chlo.ragged_dot\"(%arg0, %arg1, %arg2) \
+                    <{precision_config = [#chlo<precision DEFAULT>, #chlo<precision DEFAULT>], \
+                    ragged_dot_dimension_numbers = \
+                    #chlo.ragged_dot<lhs_batching_dimensions = [0], rhs_batching_dimensions = [1], \
+                    lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [2], \
+                    lhs_ragged_dimensions = [1], rhs_group_dimensions = [0]>}> : \
+                    (tensor<2x3x1xf32>, tensor<2x2x1x1xf32>, tensor<2x2xi32>) -> tensor<2x3x1xf32>
+                    return %0 : tensor<2x3x1xf32>
                   }
                 }
             "},
@@ -12112,10 +12146,10 @@ mod tests {
                     <{padding = dense<[[1, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 2>}> ({
                     ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
                       %c_1 = stablehlo.constant dense<5> : tensor<ui64>
-                      %15 = stablehlo.subtract %c_1, %arg3 : tensor<ui64>
-                      %16 = stablehlo.minimum %arg4, %15 : tensor<ui64>
-                      %17 = stablehlo.add %arg3, %16 : tensor<ui64>
-                      stablehlo.return %17 : tensor<ui64>
+                      %14 = stablehlo.subtract %c_1, %arg3 : tensor<ui64>
+                      %15 = stablehlo.minimum %arg4, %14 : tensor<ui64>
+                      %16 = stablehlo.add %arg3, %15 : tensor<ui64>
+                      stablehlo.return %16 : tensor<ui64>
                     }) : (tensor<2xui64>, tensor<ui64>) -> tensor<2xui64>
                     %3 = stablehlo.pad %2, %c, low = [1], high = [-1], interior = [0] : \
                     (tensor<2xui64>, tensor<ui64>) -> tensor<2xui64>
@@ -12131,11 +12165,10 @@ mod tests {
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
                     %11 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2x5x2xf32>
                     %12 = stablehlo.select %10, %4, %11 : tensor<2x5x2xi1>, tensor<2x5x2xf32>
-                    %13 = stablehlo.transpose %12, dims = [0, 1, 2] : (tensor<2x5x2xf32>) -> tensor<2x5x2xf32>
-                    %14 = stablehlo.dot_general %13, %arg1, contracting_dims = [2, 0] x [1, 0], \
+                    %13 = stablehlo.dot_general %12, %arg1, contracting_dims = [2, 0] x [1, 0], \
                     precision = [DEFAULT, DEFAULT] : \
                     (tensor<2x5x2xf32>, tensor<2x2x1xf32>) -> tensor<5x1xf32>
-                    return %14 : tensor<5x1xf32>
+                    return %13 : tensor<5x1xf32>
                   }
                 }
             "},
@@ -12162,10 +12195,10 @@ mod tests {
                     <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
                     ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
                       %c_1 = stablehlo.constant dense<5> : tensor<ui64>
-                      %17 = stablehlo.subtract %c_1, %arg3 : tensor<ui64>
-                      %18 = stablehlo.minimum %arg4, %17 : tensor<ui64>
-                      %19 = stablehlo.add %arg3, %18 : tensor<ui64>
-                      stablehlo.return %19 : tensor<ui64>
+                      %16 = stablehlo.subtract %c_1, %arg3 : tensor<ui64>
+                      %17 = stablehlo.minimum %arg4, %16 : tensor<ui64>
+                      %18 = stablehlo.add %arg3, %17 : tensor<ui64>
+                      stablehlo.return %18 : tensor<ui64>
                     }) : (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
                     %5 = stablehlo.pad %4, %c, low = [1], high = [-1], interior = [0] : \
                     (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
@@ -12181,11 +12214,10 @@ mod tests {
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
                     %13 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x5x2xf32>
                     %14 = stablehlo.select %12, %6, %13 : tensor<3x5x2xi1>, tensor<3x5x2xf32>
-                    %15 = stablehlo.transpose %14, dims = [0, 1, 2] : (tensor<3x5x2xf32>) -> tensor<3x5x2xf32>
-                    %16 = stablehlo.dot_general %15, %arg1, contracting_dims = [2, 0] x [1, 0], \
+                    %15 = stablehlo.dot_general %14, %arg1, contracting_dims = [2, 0] x [1, 0], \
                     precision = [DEFAULT, DEFAULT] : \
                     (tensor<3x5x2xf32>, tensor<3x2x1xf32>) -> tensor<5x1xf32>
-                    return %16 : tensor<5x1xf32>
+                    return %15 : tensor<5x1xf32>
                   }
                 }
             "},
@@ -12240,10 +12272,10 @@ mod tests {
                     <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
                     ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
                       %c_2 = stablehlo.constant dense<5> : tensor<ui64>
-                      %27 = stablehlo.subtract %c_2, %arg3 : tensor<ui64>
-                      %28 = stablehlo.minimum %arg4, %27 : tensor<ui64>
-                      %29 = stablehlo.add %arg3, %28 : tensor<ui64>
-                      stablehlo.return %29 : tensor<ui64>
+                      %25 = stablehlo.subtract %c_2, %arg3 : tensor<ui64>
+                      %26 = stablehlo.minimum %arg4, %25 : tensor<ui64>
+                      %27 = stablehlo.add %arg3, %26 : tensor<ui64>
+                      stablehlo.return %27 : tensor<ui64>
                     }) : (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
                     %5 = stablehlo.pad %4, %c, low = [1], high = [-1], interior = [0] : \
                     (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
@@ -12259,24 +12291,22 @@ mod tests {
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
                     %13 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<3x2x5xf32>
                     %14 = stablehlo.select %12, %6, %13 : tensor<3x2x5xi1>, tensor<3x2x5xf32>
-                    %15 = stablehlo.transpose %14, dims = [0, 1, 2] : (tensor<3x2x5xf32>) -> tensor<3x2x5xf32>
-                    %16 = stablehlo.broadcast_in_dim %arg1, dims = [1, 2] : (tensor<5x1xf32>) -> tensor<3x5x1xf32>
-                    %17 = stablehlo.broadcast_in_dim %5, dims = [0] : (tensor<3xui64>) -> tensor<3x5x1xui64>
-                    %18 = stablehlo.broadcast_in_dim %4, dims = [0] : (tensor<3xui64>) -> tensor<3x5x1xui64>
-                    %19 = stablehlo.iota dim = 1 : tensor<3x5x1xui64>
-                    %20 = stablehlo.compare LE, %17, %19, UNSIGNED : \
+                    %15 = stablehlo.broadcast_in_dim %arg1, dims = [1, 2] : (tensor<5x1xf32>) -> tensor<3x5x1xf32>
+                    %16 = stablehlo.broadcast_in_dim %5, dims = [0] : (tensor<3xui64>) -> tensor<3x5x1xui64>
+                    %17 = stablehlo.broadcast_in_dim %4, dims = [0] : (tensor<3xui64>) -> tensor<3x5x1xui64>
+                    %18 = stablehlo.iota dim = 1 : tensor<3x5x1xui64>
+                    %19 = stablehlo.compare LE, %16, %18, UNSIGNED : \
                     (tensor<3x5x1xui64>, tensor<3x5x1xui64>) -> tensor<3x5x1xi1>
-                    %21 = stablehlo.compare LT, %19, %18, UNSIGNED : \
+                    %20 = stablehlo.compare LT, %18, %17, UNSIGNED : \
                     (tensor<3x5x1xui64>, tensor<3x5x1xui64>) -> tensor<3x5x1xi1>
-                    %22 = stablehlo.and %20, %21 : tensor<3x5x1xi1>
+                    %21 = stablehlo.and %19, %20 : tensor<3x5x1xi1>
                     %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %23 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<3x5x1xf32>
-                    %24 = stablehlo.select %22, %16, %23 : tensor<3x5x1xi1>, tensor<3x5x1xf32>
-                    %25 = stablehlo.transpose %24, dims = [0, 1, 2] : (tensor<3x5x1xf32>) -> tensor<3x5x1xf32>
-                    %26 = stablehlo.dot_general %15, %25, batching_dims = [0] x [0], \
+                    %22 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<3x5x1xf32>
+                    %23 = stablehlo.select %21, %15, %22 : tensor<3x5x1xi1>, tensor<3x5x1xf32>
+                    %24 = stablehlo.dot_general %14, %23, batching_dims = [0] x [0], \
                     contracting_dims = [2] x [1], precision = [DEFAULT, DEFAULT] : \
                     (tensor<3x2x5xf32>, tensor<3x5x1xf32>) -> tensor<3x2x1xf32>
-                    return %26 : tensor<3x2x1xf32>
+                    return %24 : tensor<3x2x1xf32>
                   }
                 }
             "},
@@ -12386,10 +12416,10 @@ mod tests {
                     <{padding = dense<[[2, 0]]> : tensor<1x2xi64>, window_dimensions = array<i64: 3>}> ({
                     ^bb0(%arg3: tensor<ui64>, %arg4: tensor<ui64>):
                       %c_2 = stablehlo.constant dense<5> : tensor<ui64>
-                      %18 = stablehlo.subtract %c_2, %arg3 : tensor<ui64>
-                      %19 = stablehlo.minimum %arg4, %18 : tensor<ui64>
-                      %20 = stablehlo.add %arg3, %19 : tensor<ui64>
-                      stablehlo.return %20 : tensor<ui64>
+                      %17 = stablehlo.subtract %c_2, %arg3 : tensor<ui64>
+                      %18 = stablehlo.minimum %arg4, %17 : tensor<ui64>
+                      %19 = stablehlo.add %arg3, %18 : tensor<ui64>
+                      stablehlo.return %19 : tensor<ui64>
                     }) : (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
                     %5 = stablehlo.pad %4, %c, low = [1], high = [-1], interior = [0] : \
                     (tensor<3xui64>, tensor<ui64>) -> tensor<3xui64>
@@ -12409,12 +12439,10 @@ mod tests {
                     %14 = stablehlo.broadcast_in_dim %13, dims = [] : \
                     (tensor<complex<f32>>) -> tensor<3x5x2xcomplex<f32>>
                     %15 = stablehlo.select %12, %6, %14 : tensor<3x5x2xi1>, tensor<3x5x2xcomplex<f32>>
-                    %16 = stablehlo.transpose %15, dims = [0, 1, 2] : \
-                    (tensor<3x5x2xcomplex<f32>>) -> tensor<3x5x2xcomplex<f32>>
-                    %17 = stablehlo.dot_general %16, %arg1, contracting_dims = [2, 0] x [1, 0], \
+                    %16 = stablehlo.dot_general %15, %arg1, contracting_dims = [2, 0] x [1, 0], \
                     precision = [DEFAULT, DEFAULT] : \
                     (tensor<3x5x2xcomplex<f32>>, tensor<3x2x1xcomplex<f32>>) -> tensor<5x1xcomplex<f32>>
-                    return %17 : tensor<5x1xcomplex<f32>>
+                    return %16 : tensor<5x1xcomplex<f32>>
                   }
                 }
             "},
@@ -12446,11 +12474,13 @@ mod tests {
 
     // Compiles and executes one grouped-matrix decomposition on the CPU plugin.
     fn execute_ragged_dot_decomposition_on_cpu(
+        dimensions: RaggedDotDimensionNumbers,
+        lhs_type: ArrayType,
+        rhs_type: ArrayType,
+        group_sizes_type: ArrayType,
         lhs_values: &[f32],
         rhs_values: &[f32],
         group_sizes_data: &[u8],
-        group_sizes_data_type: DataType,
-        group_count: usize,
     ) -> Vec<f32> {
         use std::sync::Arc;
 
@@ -12461,15 +12491,21 @@ mod tests {
 
         use crate::tests::values_from_bytes;
 
-        let lhs_rows = lhs_values.len() / 2;
         let module = lowered_ragged_dot_module_for(
-            RaggedDotDimensionNumbers::matmul(),
-            ArrayType::new_static(DataType::F32, [lhs_rows, 2]),
-            ArrayType::new_static(DataType::F32, [group_count, 2, 1]),
-            ArrayType::new_static(group_sizes_data_type, [group_count]),
+            dimensions,
+            lhs_type.clone(),
+            rhs_type.clone(),
+            group_sizes_type.clone(),
             RaggedDotLoweringStrategy::Decomposition,
         )
         .unwrap();
+        let lhs_shape = lhs_type.static_shape().unwrap();
+        let lhs_dimensions = lhs_shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
+        let rhs_shape = rhs_type.static_shape().unwrap();
+        let rhs_dimensions = rhs_shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
+        let group_sizes_shape = group_sizes_type.static_shape().unwrap();
+        let group_sizes_dimensions =
+            group_sizes_shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let executable = client
@@ -12480,7 +12516,7 @@ mod tests {
             .buffer(
                 values_to_bytes(lhs_values).as_slice(),
                 BufferType::F32,
-                &[lhs_rows as u64, 2],
+                lhs_dimensions.as_slice(),
                 None,
                 device.clone(),
                 None,
@@ -12490,14 +12526,21 @@ mod tests {
             .buffer(
                 values_to_bytes(rhs_values).as_slice(),
                 BufferType::F32,
-                &[group_count as u64, 2, 1],
+                rhs_dimensions.as_slice(),
                 None,
                 device.clone(),
                 None,
             )
             .unwrap();
         let group_sizes = client
-            .buffer(group_sizes_data, group_sizes_data_type.to_pjrt(), &[group_count as u64], None, device, None)
+            .buffer(
+                group_sizes_data,
+                group_sizes_type.data_type().to_pjrt(),
+                group_sizes_dimensions.as_slice(),
+                None,
+                device,
+                None,
+            )
             .unwrap();
         let inputs = [lhs, rhs, group_sizes]
             .into_iter()
@@ -12536,11 +12579,43 @@ mod tests {
         let group_sizes_data = values_to_bytes(&group_sizes_values);
         assert_eq!(
             execute_ragged_dot_decomposition_on_cpu(
+                RaggedDotDimensionNumbers::matmul(),
+                ArrayType::new_static(DataType::F32, [5, 2]),
+                ArrayType::new_static(DataType::F32, [3, 2, 1]),
+                ArrayType::new_static(DataType::I32, [3]),
                 &lhs_values,
                 &rhs_values,
                 group_sizes_data.as_slice(),
-                DataType::I32,
-                group_sizes_values.len(),
+            ),
+            expected,
+        );
+    }
+
+    #[test]
+    fn test_contracting_ragged_dot_decomposition_executes_on_cpu() {
+        let dimensions = RaggedDotDimensionNumbers::new(
+            DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()),
+            vec![1],
+            Vec::new(),
+        );
+        let lhs_values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let rhs_values = [10.0_f32, 20.0, 30.0, 40.0, 50.0];
+        let group_sizes_values = [2_i32, 0, 3];
+        let lhs = CpuArray::matrix(2, 5, lhs_values.to_vec());
+        let rhs = CpuArray::matrix(5, 1, rhs_values.to_vec());
+        let eager = lhs.ragged_dot_general(&rhs, &CpuArray::vector(group_sizes_values.to_vec()), &dimensions).unwrap();
+        let expected = eager.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
+        assert_eq!(expected, vec![50.0, 200.0, 0.0, 0.0, 500.0, 1_100.0]);
+        let group_sizes_data = values_to_bytes(&group_sizes_values);
+        assert_eq!(
+            execute_ragged_dot_decomposition_on_cpu(
+                dimensions,
+                ArrayType::new_static(DataType::F32, [2, 5]),
+                ArrayType::new_static(DataType::F32, [5, 1]),
+                ArrayType::new_static(DataType::I32, [3]),
+                &lhs_values,
+                &rhs_values,
+                group_sizes_data.as_slice(),
             ),
             expected,
         );
@@ -12562,11 +12637,13 @@ mod tests {
         let group_sizes_data = values_to_bytes(&group_sizes_values);
         assert_eq!(
             execute_ragged_dot_decomposition_on_cpu(
+                RaggedDotDimensionNumbers::matmul(),
+                ArrayType::new_static(DataType::F32, [4, 2]),
+                ArrayType::new_static(DataType::F32, [4, 2, 1]),
+                ArrayType::new_static(DataType::U64, [4]),
                 &lhs_values,
                 &rhs_values,
                 group_sizes_data.as_slice(),
-                DataType::U64,
-                group_sizes_values.len(),
             ),
             expected,
         );
@@ -12580,11 +12657,13 @@ mod tests {
         let group_sizes_data = values_to_bytes(&group_sizes_values);
         assert_eq!(
             execute_ragged_dot_decomposition_on_cpu(
+                RaggedDotDimensionNumbers::matmul(),
+                ArrayType::new_static(DataType::F32, [4, 2]),
+                ArrayType::new_static(DataType::F32, [3, 2, 1]),
+                ArrayType::new_static(DataType::I32, [3]),
                 &lhs_values,
                 &rhs_values,
                 group_sizes_data.as_slice(),
-                DataType::I32,
-                group_sizes_values.len(),
             ),
             vec![2.0, 10.0, 15.0, 0.0],
         );

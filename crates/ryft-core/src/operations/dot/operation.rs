@@ -2,9 +2,32 @@ use super::*;
 
 /// Primitive representing a generalized dot (tensor contraction).
 ///
-/// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix
-/// multiplication, vector inner products, and arbitrary tensor contractions. It lowers to
-/// StableHLO's `dot_general` op in the XLA backend.
+/// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix multiplication, vector inner
+/// products, and arbitrary tensor contractions. It lowers to StableHLO's `dot_general` op in the XLA backend.
+///
+/// A dot is bilinear. Forward-mode differentiation applies
+/// `d(dot(lhs, rhs)) = dot(dlhs, rhs) + dot(lhs, drhs)`. Transposition therefore accepts exactly one linear operand
+/// and contracts the output cotangent with the other, known operand using the corresponding adjoint dimension
+/// numbers. Accumulation-typed dots perform those contractions at the widened cotangent type before converting the
+/// result back to the linear operand's cotangent representation.
+///
+/// Each forward-mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
+/// accumulation type, and requested output sharding without introducing captures. Transposition pins the adjoint
+/// contraction's output sharding to the cotangent dual of the linear operand's sharding. A structural-zero output
+/// cotangent remains structural zero.
+///
+/// Batching aligns the operands onto a common mapped axis and lifts the dimension numbers past it. Materializing an
+/// axis on a replicated operand preserves a dynamic mapped extent as a first-class value. Two mapped operands must
+/// describe the same mapped extent; for dynamic extents, they must share the same
+/// [`DimensionVariable`](crate::arrays::DimensionVariable).
+///
+/// Every bounded ragged axis is either contracted or free. A contracted axis is zero-padded and consumed, and its
+/// dimension variable is reported as [`BatchedOutputs`](crate::batching::BatchedOutputs) evidence so carrier validation
+/// can distinguish deliberate consumption from a missing extent. Each operand is padded along only its own contracted
+/// ragged axes because zeroing either factor removes the corresponding product. A free ragged axis propagates to the
+/// result through the dot output layout: batching dimensions, then LHS free axes, then RHS free axes. A bounded ragged
+/// axis on a batching dimension or a replicated operand is unsupported because no shared per-item extent identity
+/// exists. Operands without bounded ragged axes use the dense path unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
@@ -140,39 +163,12 @@ impl<C: Domain<Type = ArrayType, Value: Dot>> InterpretableOperation<C> for DotO
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation uses the default fold-or-residualize behavior.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOperation where
     C::Operation: From<DotOperation>
 {
 }
 
-/// Batching rule for [`DotOperation`]: the operands are aligned onto one common mapped axis, the dimension numbers are
-/// lifted past it with [`lift_dot_dimensions`], and the lifted contraction is re-interpreted over the packed values.
-///
-/// Alignment is delegated to
-/// [`ArrayBatchingPolicy::match_axis`](crate::arrays::ArrayBatchingPolicy::match_axis), so this rule never needs a
-/// statically known mapped extent: under a dimension-valued policy the batch axis materialized on a replicated operand
-/// is grounded by the transform's first-class extent value, and the staged contraction simply carries that
-/// possibly-dynamic mapped [`Dimension`] on its batching dimension. Two mapped operands must still describe the same
-/// mapped extent, which for dynamic extents means the same [`DimensionVariable`](crate::arrays::DimensionVariable).
-///
-/// A contraction is also a zero-padding-discipline consumer of bounded ragged axes. Every ragged axis of an operand is
-/// either contracted or free:
-///
-///   - A **contracted** ragged axis is consumed. [`RaggedArrayBatchingPolicy::pad_contraction_input`] zeroes that
-///     operand's padded elements first, which removes their products from the contraction's sums, and the rule reports
-///     each consumed [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence so the
-///     carrier-invariant validation boundary can tell a deliberate consumption apart from a silently dropped extent.
-///     Each operand is zeroed along its own contracted ragged axes only, because zeroing either factor of a contracted
-///     pair already neutralizes that product.
-///   - A **free** ragged axis survives into the result and propagates onto the output carrier, relocated through the
-///     dot's output layout (i.e., the batching dimensions, then the LHS free axes, then the RHS free axes).
-///
-/// A ragged axis on a *batching* dimension of the dot is rejected: the two operands would have to agree on per-item
-/// extents along paired batch dimensions, which no dimension identity established here can guarantee. A ragged axis on
-/// a *replicated* operand is rejected as well, because materializing a batch axis on it is a broadcast with no per-item
-/// extents to relocate. Operands without any ragged axis take the dense path unchanged.
 /// Value-level generalized dot capability.
 ///
 /// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It performs the contraction
@@ -209,9 +205,8 @@ pub trait Dot<Rhs = Self>: Sized {
     ) -> Self;
 }
 
-/// Any context-carrying value takes a dot product by binding a [`DotOperation`] through its own context. The
-/// `From<DotOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Context-carrying values stage a dot through their context. The `From<DotOperation>` bound keeps this implementation
+// disjoint from eager values, whose context operation is `ConstantOperation`.
 impl<V: Value<Type = ArrayType>> Dot for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -271,13 +266,28 @@ where
 ///
 /// `group_sizes` is either a rank-one `[group_count]` array shared by every prefix or an array whose trailing axis is
 /// `group_count` and whose prefix matches the dimensions preceding the ragged position in the grouped-dot iteration
-/// space. In non-contracting and contracting modes every size must be nonnegative. The eager interpreter rejects
-/// negative metadata in those modes; compiled lowering defensively clamps signed negatives to zero before unsigned
-/// accumulation so invalid runtime metadata cannot become a large interval. The sizes define consecutive raw
-/// cumulative intervals. Each interval is intersected with the physical LHS ragged extent, so an over-covering group
-/// is clipped and every later group is empty once its raw start reaches or exceeds that extent. Grouped expansion
-/// modes require an element type that can represent zero; in particular, they reject `f8e8m0fnu`. Refer to
-/// [`RaggedDotDimensionNumbers`] for the dimension-number contract.
+/// space.
+///
+/// In non-contracting and contracting modes every size must be nonnegative. The eager interpreter rejects negative
+/// metadata in those modes. XLA's decomposition lowering additionally clamps signed negatives to zero before unsigned
+/// accumulation so invalid runtime metadata cannot become a large interval. The instruction lowering passes metadata
+/// unchanged to `chlo.ragged_dot` and therefore relies on the nonnegative-input contract.
+///
+/// The sizes define consecutive raw cumulative intervals. Each interval is intersected with the physical LHS ragged
+/// extent, so an over-covering group is clipped and every later group is empty once its raw start reaches or exceeds
+/// that extent.
+///
+/// Grouped expansion modes require an element type that can represent zero; in particular, they reject `f8e8m0fnu`.
+/// Refer to [`RaggedDotDimensionNumbers`] for the dimension-number contract.
+///
+/// The operation is linear in either data operand separately, while `group_sizes` is nondifferentiable metadata.
+/// Forward-mode differentiation applies the two-term product rule with the same group metadata. Transposition is
+/// defined only in non-contracting mode and applies another grouped dot followed by the inverse adjoint-axis
+/// permutation.
+///
+/// Batching accepts either three replicated operands or three operands mapped over leading axis zero. It rejects
+/// [`RaggedAxis`](crate::arrays::RaggedAxis) metadata because `group_sizes` is the sole source of ragged extents for
+/// this operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RaggedDotOperation {
     /// Grouped-dot dimension-number specification.

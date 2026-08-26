@@ -1,5 +1,8 @@
 use super::*;
 
+// Alignment delegates mapped-axis materialization to `ArrayBatchingPolicy::match_axis`, so a dynamic mapped extent
+// remains a first-class value. The lifted contraction zeroes contracted ragged padding and relocates every free ragged
+// axis through the dot's output layout.
 impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for DotOperation
 where

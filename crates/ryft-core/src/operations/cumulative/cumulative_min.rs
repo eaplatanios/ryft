@@ -261,7 +261,9 @@ mod tests {
                 &[input],
             ),
             Err(BatchingError::UnsupportedOperation {
-                message: "static array batching cannot identity-mask bounded ragged axes".to_string(),
+                message: "static array batching cannot identity-mask bounded ragged dimension `length` on axis 1 \
+                          with `Highest`"
+                    .to_string(),
             }),
         );
 

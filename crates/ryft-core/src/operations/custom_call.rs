@@ -1114,25 +1114,9 @@ impl<T: Type> CustomCallOperation<T> {
     /// Validates homogeneous or mixed ragged input carriers against the declaration and returns active bindings.
     fn active_ragged_bindings<V: Clone + PartialEq>(
         &self,
+        contract: &CustomCallRaggedContract,
         inputs: &[CustomCallRaggedInput<'_, V>],
     ) -> Result<Vec<(String, RaggedAxis<V>)>, BatchingError> {
-        let Some(contract) = &self.ragged_contract else {
-            if let Some((index, ragged_axis)) = inputs
-                .iter()
-                .enumerate()
-                .find_map(|(index, input)| input.ragged_axes.first().map(|axis| (index, axis)))
-            {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "custom call `{}` does not support bounded ragged dimension `{}` on operand {}",
-                        self.target_name,
-                        ragged_axis.dimension(),
-                        index,
-                    ),
-                });
-            }
-            return Ok(Vec::new());
-        };
         if contract.ragged_discharged && inputs.iter().any(|input| !input.ragged_axes.is_empty()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("custom call `{}` does not support nested ragged batching", self.target_name),
@@ -1223,6 +1207,26 @@ impl<T: Type> CustomCallOperation<T> {
             active.push((binding.name.clone(), ragged_axis.clone()));
         }
         Ok(active)
+    }
+
+    /// Rejects ragged input metadata for a call that has no declared ragged contract.
+    fn reject_undeclared_ragged_inputs<'a, V: 'a>(
+        &self,
+        mut inputs: impl Iterator<Item = (usize, &'a [RaggedAxis<V>])>,
+    ) -> Result<(), BatchingError> {
+        if let Some((index, ragged_axis)) =
+            inputs.find_map(|(index, ragged_axes)| ragged_axes.first().map(|axis| (index, axis)))
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` does not support bounded ragged dimension `{}` on operand {}",
+                    self.target_name,
+                    ragged_axis.dimension(),
+                    index,
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Wraps unchanged homogeneous outputs as replicated and attaches any fresh ragged output metadata.
@@ -1559,18 +1563,25 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        let ragged_inputs = inputs
-            .iter()
-            .map(|input| -> Result<_, BatchingError> {
-                Ok(CustomCallRaggedInput {
-                    value: input.value(),
-                    batch_axis: input.batch_axis_position(),
-                    ragged_axes: input.ragged_axes(),
-                    physical_type: input.r#type().unbatched_type(input.batch_axis())?,
+        let active_ragged_bindings = if let Some(contract) = &self.ragged_contract {
+            let ragged_inputs = inputs
+                .iter()
+                .map(|input| -> Result<_, BatchingError> {
+                    Ok(CustomCallRaggedInput {
+                        value: input.value(),
+                        batch_axis: input.batch_axis_position(),
+                        ragged_axes: input.ragged_axes(),
+                        physical_type: input.r#type().unbatched_type(input.batch_axis())?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let active_ragged_bindings = self.active_ragged_bindings(ragged_inputs.as_slice())?;
+                .collect::<Result<Vec<_>, _>>()?;
+            self.active_ragged_bindings(contract, ragged_inputs.as_slice())?
+        } else {
+            self.reject_undeclared_ragged_inputs(
+                inputs.iter().enumerate().map(|(index, input)| (index, input.ragged_axes())),
+            )?;
+            Vec::new()
+        };
         let Some((index, mapped)) = inputs.iter().enumerate().find(|(_, input)| !input.batch_axis().is_replicated())
         else {
             let values = inputs.iter().map(ArrayBatch::value).cloned().collect::<Vec<_>>();
@@ -1719,19 +1730,27 @@ where
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
         };
         let (arrays, extents) = inputs.split_at(array_input_count);
-        let ragged_inputs = arrays
-            .iter()
-            .map(|input| -> Result<_, BatchingError> {
-                let value_type = input.value().r#type();
-                Ok(CustomCallRaggedInput {
-                    value: input.value(),
-                    batch_axis: input.batch_axis_position(),
-                    ragged_axes: input.ragged_axes(),
-                    physical_type: <&ArrayType>::try_from(value_type.as_ref())?.unbatched_type(input.batch_axis())?,
+        let active_ragged_bindings = if let Some(contract) = &self.ragged_contract {
+            let ragged_inputs = arrays
+                .iter()
+                .map(|input| -> Result<_, BatchingError> {
+                    let value_type = input.value().r#type();
+                    Ok(CustomCallRaggedInput {
+                        value: input.value(),
+                        batch_axis: input.batch_axis_position(),
+                        ragged_axes: input.ragged_axes(),
+                        physical_type: <&ArrayType>::try_from(value_type.as_ref())?
+                            .unbatched_type(input.batch_axis())?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let active_ragged_bindings = self.active_ragged_bindings(ragged_inputs.as_slice())?;
+                .collect::<Result<Vec<_>, _>>()?;
+            self.active_ragged_bindings(contract, ragged_inputs.as_slice())?
+        } else {
+            self.reject_undeclared_ragged_inputs(
+                arrays.iter().enumerate().map(|(index, input)| (index, input.ragged_axes())),
+            )?;
+            Vec::new()
+        };
         for extent in extents {
             extent.validate_replicated_dimension()?;
         }
@@ -1919,6 +1938,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1934,8 +1957,8 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation};
     use crate::interpretation::InterpretableOperation;
-    use crate::parameters::Placeholder;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::{BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope};
     use crate::tracing::{DomainTracer, Trace, TracingContext};
 
     use super::*;
@@ -1951,6 +1974,111 @@ mod tests {
             vec![CustomCallRaggedInputBinding::new("data", 0, 0, 1, dimension)],
             vec![CustomCallRaggedOutputBinding::Preserved { input_binding: "data".to_string(), axis: 0 }],
         )
+    }
+
+    /// Array value whose type queries are counted for the no-contract batching fast-path regression.
+    #[derive(Clone, Debug, PartialEq)]
+    struct TypeReadCountingArray {
+        /// Array type returned by [`Typed::r#type`].
+        r#type: ArrayType,
+
+        /// Number of type queries since the last reset.
+        type_read_count: Rc<Cell<usize>>,
+    }
+
+    impl Display for TypeReadCountingArray {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.r#type.fmt(formatter)
+        }
+    }
+
+    impl Parameter for TypeReadCountingArray {}
+
+    impl Typed for TypeReadCountingArray {
+        type Type = ArrayType;
+
+        fn r#type(&self) -> Cow<'_, Self::Type> {
+            self.type_read_count.set(self.type_read_count.get() + 1);
+            Cow::Borrowed(&self.r#type)
+        }
+    }
+
+    impl Value for TypeReadCountingArray {
+        type DispatchDomain = TypeReadCountingContext;
+        type ExecutionDomain = TypeReadCountingContext;
+
+        fn dispatch_domain(&self) -> Self::DispatchDomain {
+            TypeReadCountingContext
+        }
+
+        fn execution_domain(&self) -> Self::ExecutionDomain {
+            TypeReadCountingContext
+        }
+    }
+
+    /// Minimal context used only to prove that rejected dense batching performs no input type projection.
+    #[derive(Copy, Clone)]
+    struct TypeReadCountingContext;
+
+    impl Domain for TypeReadCountingContext {
+        type Type = ArrayType;
+        type Value = TypeReadCountingArray;
+        type Constant = TypeReadCountingArray;
+        type Operation = ArrayOperation<TypeReadCountingArray>;
+    }
+
+    impl Context for TypeReadCountingContext {
+        fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+            Ok(constant)
+        }
+
+        fn bind<O: Into<Self::Operation>, D: BindingRegionDriver<Self::Constant, Self::Operation>>(
+            &self,
+            _operation: O,
+            _driver: D,
+            _inputs: &[Self::Value],
+        ) -> Result<Vec<Self::Value>, ProgramError> {
+            unreachable!("the rejected custom-call batching path must not bind an operation")
+        }
+
+        fn is_eager(&self) -> bool {
+            false
+        }
+
+        fn provenance(&self) -> Provenance {
+            Provenance::unknown()
+        }
+
+        fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
+            function()
+        }
+
+        fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
+            function()
+        }
+    }
+
+    #[test]
+    fn test_dense_custom_call_rejection_does_not_project_ragged_carriers() {
+        let type_read_count = Rc::new(Cell::new(0));
+        let input = TypeReadCountingArray {
+            r#type: ArrayType::new_static(DataType::F32, [2, 3]),
+            type_read_count: Rc::clone(&type_read_count),
+        };
+        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
+        type_read_count.set(0);
+
+        let operation = CustomCallOperation::new("ryft.test.dense", vec![vector_type()]);
+        let context = BatchingContext::<_, ArrayBatching>::new(TypeReadCountingContext, 2);
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.dense` has no batching rule for operand 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+        assert_eq!(type_read_count.get(), 0);
     }
 
     #[test]
@@ -3180,6 +3308,27 @@ mod tests {
             .trim_end(),
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_dense_custom_call_validates_extents_before_array_projection() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let operation =
+            CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]));
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let inputs = [
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32))),
+        ];
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &inputs),
+            Err(BatchingError::Type(TypeError::Invalid { message }))
+                if message == "expected dimension type but got array type",
+        ));
     }
 
     #[test]

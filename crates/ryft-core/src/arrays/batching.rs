@@ -1163,17 +1163,27 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
     fn mask_identity_input(
         _context: &BatchingContext<C, ArrayBatching<Self>>,
         input: &ArrayBatch<C::Value>,
-        _masked_axes: &[usize],
-        _identity: RaggedMaskIdentity,
+        masked_axes: &[usize],
+        identity: RaggedMaskIdentity,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
         // Writing an identity over padding needs the same comparison, constant, and selection machinery that the two
-        // hooks above do, and static array batching has neither the per-item extents nor a reason to (it never
-        // creates bounded ragged axes). A ragged carrier reaching this hook through the public
+        // hooks above do, and static array batching has neither the per-item extents nor a reason to (it never creates
+        // bounded ragged axes). A ragged carrier with a selected ragged axis reaching this hook through the public
         // `ArrayBatch::with_ragged_axes` is therefore rejected rather than passed through, because returning it
         // unchanged would leave padding that the consuming operation then accumulates into its live result.
-        if !input.ragged_axes().is_empty() {
+        // Ragged axes outside `masked_axes` remain untouched because this hook does not consume them.
+        let masked_dimensions = input
+            .ragged_axes()
+            .iter()
+            .filter(|ragged_axis| masked_axes.contains(&ragged_axis.axis()))
+            .map(|ragged_axis| format!("`{}` on axis {}", ragged_axis.dimension(), ragged_axis.axis()))
+            .collect::<Vec<_>>();
+        if !masked_dimensions.is_empty() {
             return Err(BatchingError::UnsupportedOperation {
-                message: "static array batching cannot identity-mask bounded ragged axes".to_string(),
+                message: format!(
+                    "static array batching cannot identity-mask bounded ragged dimension {} with `{identity:?}`",
+                    masked_dimensions.join(", "),
+                ),
             });
         }
         Ok(input.clone())
@@ -4165,7 +4175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_static_array_batching_rejects_ragged_carriers() {
+    fn test_static_array_batching_handles_defensive_ragged_carriers() {
         let packed_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let packed = Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
@@ -4199,9 +4209,19 @@ mod tests {
             assert!(matches!(
                 StaticArrayBatchingPolicy::mask_identity_input(&context, &ragged, &[1], identity),
                 Err(BatchingError::UnsupportedOperation { message })
-                    if message == "static array batching cannot identity-mask bounded ragged axes",
+                    if message
+                        == format!(
+                            "static array batching cannot identity-mask bounded ragged dimension `extent` on axis 1 \
+                             with `{identity:?}`",
+                        ),
             ));
         }
+
+        // Axes not selected for masking are left untouched by this hook, even on a defensive ragged carrier.
+        assert_eq!(
+            StaticArrayBatchingPolicy::mask_identity_input(&context, &ragged, &[0], RaggedMaskIdentity::Zero,).unwrap(),
+            ragged,
+        );
 
         // A ragged carrier cannot leave the transform either, matching the composite policy's boundary guard.
         assert_eq!(

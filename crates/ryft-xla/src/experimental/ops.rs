@@ -546,7 +546,6 @@ impl_composite_operation_conversion!(
     ZeroLikeOperation<ArrayIrType>,
     ZeroOperation<ArrayType>,
     OneOperation<ArrayType>,
-    OneOperation<ArrayIrType>,
     IotaOperation<ArrayType>,
     ConcatenateOperation<ArrayType>,
     CustomCallOperation<ArrayType>,

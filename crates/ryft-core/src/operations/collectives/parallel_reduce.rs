@@ -89,8 +89,11 @@ impl Display for ParallelReductionKind {
 /// reduction identity before the participant reduction, and each surviving ragged extent is the elementwise maximum
 /// across the participating mapped items. Participants whose local extents exclude a position contribute the identity;
 /// with multiple ragged axes, a position inside the coordinatewise-maximum output bounds that no participant covers
-/// is therefore the identity. `parallel_mean` rejects ragged operands because its denominator has no single implied
-/// meaning: participant count, present-value count, and logical-element count define different operations.
+/// is therefore the identity. For `parallel_sum`, that hole is zero. For `parallel_max`, it is the element type's
+/// maximum identity: the lowest value, which is zero or false for unsigned integers and Booleans rather than an
+/// unconditionally chosen numeric zero. Signed or floating-point negative live values therefore still win correctly.
+/// `parallel_mean` rejects ragged operands because its denominator has no single implied meaning: participant count,
+/// present-value count, and logical-element count define different operations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ParallelReduceOperation {
     /// Axis name referenced by this collective. Matches the `axis_name` argument of an enclosing
