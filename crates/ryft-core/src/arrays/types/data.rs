@@ -20,7 +20,6 @@ pub enum DataTypeError {
     InvalidPromotion { message: String, backtrace: String },
 }
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
 /// Represents a primitive data type that can be stored in arrays, tensors, matrices, vectors, scalars, etc., which
 /// range from standard numeric types including booleans, integers, floating-point numbers, and complex numbers of
 /// various precisions to advanced data types that mirror [LLVM/MLIR types](https://mlir.llvm.org/docs/Dialects/Builtin)
@@ -690,6 +689,7 @@ pub enum DataTypeError {
 /// Ordinary scalar types may also support explicit element-type conversion between pairs that do not promote. Such
 /// conversions remain explicit because they may lose precision. [`DataType::Token`] and [`DataType::Zero`] are not
 /// ordinary scalar representations and cannot be converted to or from other types.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum DataType {
     /// [`DataType`] that represents token values that are threaded between side-effecting operations.
