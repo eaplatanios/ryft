@@ -16,6 +16,7 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
+// TODO(eaplatanios): Figure out what to do about the large enum warning here and if I should be worried about it.
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
 /// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the concrete array
 /// representation selected by the owning backend. Dimensions use the common [`DimensionValue`] which is a checked

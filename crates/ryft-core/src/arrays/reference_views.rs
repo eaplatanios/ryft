@@ -29,8 +29,8 @@ pub enum ArrayReferenceViewError {
     CannotFreezeView,
 
     /// A derived view was read through the bound-free root-only accessor.
-    #[error("cannot read a reference view directly; use array reference operations instead")]
-    CannotReadViewDirectly,
+    #[error("cannot read a reference view through the root-only snapshot accessor")]
+    CannotReadRootThroughView,
 
     /// A derived or identity-renamed handle was used as a backend root-state transaction boundary.
     #[error("reference runtime transactions require an unrenamed root handle")]
@@ -343,6 +343,13 @@ impl ArrayReferenceView {
         intermediates: &[C::Value],
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
+        if intermediates.len() < self.transforms.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference view reconstruction requires {} parent snapshots but received {}",
+                self.transforms.len(),
+                intermediates.len(),
+            )));
+        }
         let mut reconstructed = replacement;
         for transform_index in (0..self.transforms.len()).rev() {
             reconstructed = self.transforms[transform_index].replace_in(
@@ -511,28 +518,28 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
 
     /// Returns a derived handle after appending `transform` without creating a resource.
     pub fn with_transform(&self, transform: ArrayReferenceViewTransform) -> Result<Self, ProgramError> {
-        self.root.validate_live().map_err(ProgramError::custom)?;
         // The cached handle type already reflects every earlier transform, so composition validates and derives
-        // incrementally instead of re-folding the complete chain from the root type.
+        // incrementally instead of re-folding the complete chain from the root type. Derivation is purely structural:
+        // holder liveness is checked only when the resulting handle accesses state.
         let referent = transform.output_type(self.r#type.referent())?;
         let view = self.view.with_transform_unchecked(transform);
         Ok(Self { root: self.root.clone(), view, r#type: ReferenceType::new(referent) })
     }
 
-    /// Returns an immutable root snapshot without requiring array-manipulation capabilities.
-    pub fn read(&self) -> Result<A, ProgramError> {
-        if !self.view.is_root() {
-            return Err(ProgramError::custom(ArrayReferenceViewError::CannotReadViewDirectly));
-        }
-        self.root.read().map_err(ProgramError::custom)
-    }
-
     /// Returns an immutable snapshot of this handle's selected coordinates.
-    pub(crate) fn read_view(&self) -> Result<A, ProgramError>
+    pub fn read(&self) -> Result<A, ProgramError>
     where
         A: Reshape + Slice,
     {
         self.view.apply(&self.root.read().map_err(ProgramError::custom)?)
+    }
+
+    /// Returns an immutable root snapshot without requiring array-manipulation capabilities.
+    pub fn read_root(&self) -> Result<A, ProgramError> {
+        if !self.view.is_root() {
+            return Err(ProgramError::custom(ArrayReferenceViewError::CannotReadRootThroughView));
+        }
+        self.root.read().map_err(ProgramError::custom)
     }
 
     /// Validates that `value` exactly matches this handle's derived referent type. The root paths inherit this rule
@@ -778,23 +785,25 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_read_requires_the_root_handle() {
+    fn test_array_reference_reads_root_and_derived_handles() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let derived = root
             .with_transform(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
             .unwrap();
 
-        // The bound-free accessor returns the complete root snapshot and rejects every derived handle, because
-        // selecting a view requires the array-manipulation capabilities that this accessor deliberately does not bind.
+        // The ordinary accessor applies the handle's complete view, while the bound-free root-only accessor remains
+        // available to generic code that has no array manipulation capabilities.
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
+        assert_eq!(derived.read(), Ok(Array::vector(vec![2.0_f32, 3.0])));
+        assert_eq!(root.read_root(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
 
         assert_eq!(
-            derived.read().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
-            Some(&ArrayReferenceViewError::CannotReadViewDirectly),
+            derived.read_root().unwrap_err().downcast_custom::<ArrayReferenceViewError>(),
+            Some(&ArrayReferenceViewError::CannotReadRootThroughView),
         );
         assert_eq!(
-            derived.read().unwrap_err().to_string(),
-            "cannot read a reference view directly; use array reference operations instead",
+            derived.read_root().unwrap_err().to_string(),
+            "cannot read a reference view through the root-only snapshot accessor",
         );
     }
 
@@ -880,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_view_derivation_never_resolves_holder_state() {
+    fn test_array_reference_view_derivation_is_pure_structural_composition() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let mut guard = root.lock_root().unwrap();
         let generation = guard.next_generation().unwrap();
@@ -895,19 +904,33 @@ mod tests {
         let derived = root.with_transform(transform).unwrap();
         assert_eq!(derived.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
-        // Failing the reservation is terminal for the alias family, so the next read reports that failure instead of
-        // the stale value, and further view derivation is rejected with the same reason.
+        // Failing the reservation is terminal for the alias family, but further derivation remains pure structural
+        // composition. The resulting handle reports the holder failure only when it attempts to access state.
         let mut guard = root.lock_root().unwrap();
         assert!(guard.poison_pending(generation, "submission failed"));
         drop(guard);
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
+        let composed = derived.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }).unwrap();
+        assert_eq!(composed.r#type().as_ref(), &ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        assert_eq!(composed.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
+
+        let frozen = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(frozen.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        let frozen_view = frozen.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }).unwrap();
+        assert_eq!(frozen_view.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_array_reference_view_reconstruction_validates_parent_count() {
+        let view = ArrayReferenceView::root()
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 });
+        let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         assert_eq!(
-            derived
-                .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 })
-                .unwrap_err()
-                .downcast_custom::<ReferenceError>(),
-            Some(&poisoned),
+            view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32)),
+            Err(ProgramError::MalformedProgram(
+                "reference view reconstruction requires 1 parent snapshots but received 0".to_string(),
+            )),
         );
     }
 

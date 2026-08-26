@@ -3,8 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::num::FpCategory;
 
 // The external element types are re-exported so that element vocabulary (including the
-// `dispatch_on_array_element_type!` macro in the sibling `macros` module) can name every array element type through
-// one `$crate`-addressable path.
+// `dispatch_on_array_element_type!` macro in the sibling `macros` module) can name every
+// array element type through one `$crate`-addressable path.
 pub use half::{bf16, f16};
 pub use num_complex::Complex;
 
