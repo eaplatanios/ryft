@@ -10,6 +10,8 @@ use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceAccessMode {
@@ -19,20 +21,20 @@ pub enum ReferenceAccessMode {
     /// Replaces the selected referenced value without observing its previous contents.
     Write,
 
-    /// Observes the selected referenced value and replaces it with a successor in program order. A swap remains
-    /// `ReadWrite` even when a caller leaves its old-value result dead: liveness is a use-site fact, not operation
-    /// semantics.
+    /// Observes the selected referenced value and replaces it with a successor in program order. A reference swap
+    /// operation remains [`ReferenceAccessMode::ReadWrite`] even when a caller leaves its old-value result dead:
+    /// liveness is a use-site fact, not operation semantics.
     ReadWrite,
 
-    /// Combines an update with the current state as an *ordered* additive accumulation. Accumulation stays distinct
-    /// from [`Write`](ReferenceAccessMode::Write) because it is linear in the update operand and therefore
-    /// transposable, unlike a replacement. It carries no commutativity or atomicity promise: same-root accumulations
-    /// execute in program order (floating-point addition cannot generally be reordered while preserving results),
-    /// and atomic/commutative accumulation is a separate future semantics.
+    /// Combines an update with the current state as an _ordered_ additive accumulation. Accumulation stays distinct
+    /// from [`ReferenceAccessMode::Write`] because it is linear in the update operand and therefore transposable,
+    /// unlike a replacement. It carries no commutativity or atomicity promise: same-root accumulations execute in
+    /// program order (floating-point addition cannot generally be reordered while preserving results), and
+    /// atomic/commutative accumulation is not supported by this mode.
     Accumulate,
 
-    /// Consumes the root: after this access the root and its entire alias family are invalid. Consumption is a
-    /// lifetime event, not a memory-access flavor — `freeze` is the consuming access that also returns the final
+    /// Consumes the root. After such an access the root and its entire alias family are rendered invalid. Consumption
+    /// is a lifetime event, not a memory-access flavor: `freeze` is the consuming access that also returns the final
     /// value, and a future `free_reference` would consume without producing a result.
     Consume,
 }
