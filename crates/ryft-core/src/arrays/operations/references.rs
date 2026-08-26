@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(
             program.interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))]),
             Err(ProgramError::UnsupportedOperation {
-                message: "program replay cannot bind external reference `public input 0`; use a stateful \
+                message: "program replay cannot bind external reference `input 0`; use a stateful \
                           compilation domain"
                     .to_string(),
             }),

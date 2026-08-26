@@ -56,22 +56,24 @@
 //! ([`reference_freeze`](ReferenceFreezeOperation)) is a whole-root lifetime event that invalidates the complete
 //! family, which is why consuming through a narrowing view is rejected. Roots also split by provenance: a *local*
 //! root is allocated inside the program and disappears entirely after discharge, while an *external* root denotes
-//! caller-owned state entering through a public input or capture ([`ReferenceSource`]) and is what a
+//! caller-owned state entering through an input or capture ([`ReferenceSource`]) and is what a
 //! [`ReferenceStateBinding`] describes to the backend.
 //!
 //! # Module Structure
 //!
 //! The implementation is split by responsibility:
 //!
-//! - `semantics.rs` defines [`ReferenceType`], the operation-local [`ReferenceOperationSemantics`] descriptor,
-//!   access modes, root/alias classifications, and entry-boundary sources.
+//! - `types.rs` defines the structural [`ReferenceType`] and its cross-occurrence refinements.
+//! - `values.rs` defines the eager [`Reference`] value and its holder-facing operations.
+//! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
+//!   root/alias classifications.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
 //!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
 //!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
 //!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
-//! - `runtime.rs` implements [`Reference`] and its synchronized holder state machine. The hidden backend interface
-//!   uses generations, completion dependencies, read leases, reservations, pending installation, and terminal
-//!   poisoning to coordinate external state across synchronous and asynchronous execution.
+//! - `runtime.rs` implements the synchronized holder state machine and hidden backend interface. It uses generations,
+//!   completion dependencies, read leases, reservations, pending installation, and terminal poisoning to coordinate
+//!   external state across synchronous and asynchronous execution.
 //! - `discharge.rs` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
 //!   roots with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep
 //!   the transform open to non-array value families and to third-party operations.
@@ -114,6 +116,8 @@ mod discharge;
 mod operations;
 mod runtime;
 mod semantics;
+mod types;
+mod values;
 
 pub use discharge::{
     PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver, ReferenceAccumulationPolicy,
@@ -121,7 +125,7 @@ pub use discharge::{
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState,
+    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource,
     ReferenceStateBinding, discharge_positional_region_operation, discharge_preserved_access,
     discharge_reference_free_operation,
 };
@@ -133,11 +137,12 @@ pub use operations::{
     ReferenceWriteOperation,
 };
 pub use runtime::{
-    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, Reference, ReferenceCompletion,
+    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError,
     ReferenceGeneration, ReferenceGuard, ReferenceId,
 };
 pub use semantics::{
     ReferenceAccessMode, ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
-    ReferenceSource, ReferenceType, ReferenceTypeRefinements,
 };
+pub use types::{ReferenceType, ReferenceTypeRefinements};
+pub use values::Reference;

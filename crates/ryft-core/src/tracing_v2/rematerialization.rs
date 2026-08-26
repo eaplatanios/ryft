@@ -4312,7 +4312,7 @@ mod tests {
             external.rematerialize_with_local_references::<ReferenceTestContext>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "rematerialization supports only local references, but the program uses external \
-                    `public input 0`",
+                    `input 0`",
         ));
     }
 

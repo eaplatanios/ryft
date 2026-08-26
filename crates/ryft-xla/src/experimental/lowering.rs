@@ -10452,8 +10452,8 @@ mod tests {
         ];
         let result_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let states = [
-            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 1 }, 1, Some(0)),
-            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 2 }, 2, None),
+            ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, 1, Some(0)),
+            ReferenceStateBinding::new(ReferenceSource::Input { index: 2 }, 2, None),
         ];
 
         let lowered = lower_mlir_module_for_program_with_reference_state(
@@ -10493,7 +10493,7 @@ mod tests {
             .replace("@SIGNATURE@", expected_signature),
         );
 
-        let invalid_state = ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None);
+        let invalid_state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None);
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
                 &program,
@@ -10564,7 +10564,7 @@ mod tests {
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
         let program: FlatXlaProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
-        let reference_state = ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(0));
+        let reference_state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(0));
 
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(

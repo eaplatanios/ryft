@@ -2096,9 +2096,7 @@ fn persistent_reference_states(
         .map(|state| {
             let source = match state.source() {
                 ReferenceSource::Capture { index } => PersistentReferenceSourceV6::Capture { index: index as u64 },
-                ReferenceSource::PublicInput { index } => {
-                    PersistentReferenceSourceV6::PublicInput { index: index as u64 }
-                }
+                ReferenceSource::Input { index } => PersistentReferenceSourceV6::PublicInput { index: index as u64 },
             };
             Ok(PersistentReferenceStateV6 {
                 source,
@@ -2121,7 +2119,7 @@ fn decode_persistent_reference_states(
                     ReferenceSource::Capture { index: checked_usize(index)? }
                 }
                 PersistentReferenceSourceV6::PublicInput { index } => {
-                    ReferenceSource::PublicInput { index: checked_usize(index)? }
+                    ReferenceSource::Input { index: checked_usize(index)? }
                 }
             };
             Ok(ReferenceStateBinding::new(
@@ -3296,7 +3294,7 @@ impl<'c> XlaDomain<'c> {
         for state in &reference_states {
             let expected_input_index = match state.source() {
                 ReferenceSource::Capture { index } => index,
-                ReferenceSource::PublicInput { index } => capture_count.checked_add(index).ok_or_else(|| {
+                ReferenceSource::Input { index } => capture_count.checked_add(index).ok_or_else(|| {
                     ProgramError::MalformedProgram("external reference input index overflows usize".to_string())
                 })?,
             };
@@ -3734,7 +3732,7 @@ impl<'c> XlaDomain<'c> {
         for state in &reference_states {
             let expected_input_index = match state.source() {
                 ReferenceSource::Capture { index } => index,
-                ReferenceSource::PublicInput { index } => capture_count
+                ReferenceSource::Input { index } => capture_count
                     .checked_add(index)
                     .ok_or_else(|| persistent_error("persistent reference input index overflows usize"))?,
             };
@@ -5825,7 +5823,7 @@ mod tests {
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible public output count",
         ));
-        let state = ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None);
+        let state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None);
         let replacement = XlaInvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
@@ -10276,7 +10274,7 @@ mod tests {
         assert_eq!(compiled.reference_states[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(compiled.reference_states[0].discharged_input_index(), 0);
         assert_eq!(compiled.reference_states[0].final_state_output_index(), Some(1));
-        assert_eq!(compiled.reference_states[1].source(), ReferenceSource::PublicInput { index: 0 });
+        assert_eq!(compiled.reference_states[1].source(), ReferenceSource::Input { index: 0 });
         assert_eq!(compiled.reference_states[1].discharged_input_index(), 1);
         assert_eq!(compiled.reference_states[1].final_state_output_index(), None);
         assert_eq!(restored.public_output_count, compiled.public_output_count);
@@ -10496,7 +10494,7 @@ mod tests {
         assert_eq!(restored.public_output_count, 1);
         assert_eq!(
             restored.reference_states.as_ref(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
         );
     }
 
@@ -10530,7 +10528,7 @@ mod tests {
         assert_eq!(compiled.mesh, mesh);
         assert_eq!(
             compiled.reference_states.as_ref(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(1))],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
         );
         match domain.serialize_xla_program(&compiled).unwrap() {
             Some(bytes) => {

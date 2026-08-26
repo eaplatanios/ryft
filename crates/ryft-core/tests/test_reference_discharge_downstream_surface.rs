@@ -545,7 +545,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
         discharged.external_states(),
         &[
             ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(2)),
-            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 1, None),
+            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 1, None),
         ],
     );
     assert_eq!(
@@ -566,7 +566,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     assert_eq!(
         source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap_err(),
         ProgramError::MalformedProgram(
-            "reference discharge consumed external public input 0, whose holder belongs to the caller".to_string(),
+            "reference discharge consumed external input 0, whose holder belongs to the caller".to_string(),
         ),
     );
 }
@@ -631,8 +631,8 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
     assert_eq!(
         sites,
         vec![
-            ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 0 }),
-            ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 1 }),
+            ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
+            ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 }),
         ],
     );
     let discharged = source
@@ -644,7 +644,7 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
     assert_eq!(discharged.public_output_count(), 1);
     assert_eq!(
         discharged.external_states(),
-        &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(1))],
+        &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
     );
     assert_eq!(
         discharged.program().to_string(),

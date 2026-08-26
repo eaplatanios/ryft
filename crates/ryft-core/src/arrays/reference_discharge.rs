@@ -269,7 +269,7 @@ where
 {
     /// Lifts this closed program's captures and discharges every reachable array reference.
     ///
-    /// The returned logical metadata continues to identify capture slots separately from public inputs. Concrete
+    /// The returned logical metadata continues to identify capture slots separately from inputs. Concrete
     /// capture values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the
     /// derived program.
     pub fn discharge_references(
@@ -575,7 +575,7 @@ mod tests {
             discharged.external_states(),
             &[
                 ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 1, None),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 1, None),
             ],
         );
         assert_eq!(
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
         );
 
         // A reference-free program is its own discharge and is returned untouched.
@@ -760,7 +760,7 @@ mod tests {
         assert_eq!(
             source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge consumed external public input 0, whose holder belongs to the caller".to_string(),
+                "reference discharge consumed external input 0, whose holder belongs to the caller".to_string(),
             ),
         );
 
@@ -1304,24 +1304,24 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 1 }, 1, None),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(2)),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, 1, None),
             ],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
             concat!(
-                r#"[{"source":{"public_input":{"index":0}},"discharged_input_index":0,"#,
-                r#""final_state_output_index":2},{"source":{"public_input":{"index":1}},"#,
+                r#"[{"source":{"input":{"index":0}},"discharged_input_index":0,"#,
+                r#""final_state_output_index":2},{"source":{"input":{"index":1}},"#,
                 r#""discharged_input_index":1,"final_state_output_index":null}]"#,
             ),
         );
         assert_eq!(
             format!("{:?}", discharged.external_states()),
             concat!(
-                "[ReferenceStateBinding { source: PublicInput { index: 0 }, ",
+                "[ReferenceStateBinding { source: Input { index: 0 }, ",
                 "discharged_input_index: 0, final_state_output_index: Some(2) }, ",
-                "ReferenceStateBinding { source: PublicInput { index: 1 }, ",
+                "ReferenceStateBinding { source: Input { index: 1 }, ",
                 "discharged_input_index: 1, final_state_output_index: None }]",
             ),
         );
@@ -1965,7 +1965,7 @@ mod tests {
             external.clone().discharge_local_references(0, "differentiation"),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "differentiation supports only local references, but the program uses external \
-                    `public input 0`",
+                    `input 0`",
         ));
         assert!(matches!(
             external.discharge_local_references(1, "batching"),
@@ -2139,9 +2139,9 @@ mod tests {
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.public_output_count(), 2);
         assert_eq!(discharged.external_states().len(), 2);
-        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::PublicInput { index: 1 });
+        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 1 });
         assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
-        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::PublicInput { index: 2 });
+        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 2 });
         assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(3));
 
         // The true branch swaps only the second root, leaving the first root's final state at its entering value.
@@ -2596,7 +2596,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
         );
         assert_eq!(discharged.program().interpret(vec![scalar(3.0), scalar(0.0)]), Ok(vec![scalar(3.0)]));
     }

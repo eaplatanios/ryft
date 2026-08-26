@@ -118,7 +118,8 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 
-use super::semantics::{ReferenceAccessMode, ReferenceOutput, ReferenceSource, ReferenceType};
+use super::semantics::{ReferenceAccessMode, ReferenceOutput};
+use super::types::ReferenceType;
 
 /// Shared payload and logical external-state metadata of a reference discharge result.
 #[derive(Debug)]
@@ -496,10 +497,54 @@ pub trait ReferenceDischarge: Sized {
     }
 }
 
+/// Invocation source of one external reference root.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSource {
+    /// Capture lifted into the entry boundary before input arguments.
+    Capture {
+        /// Zero-based capture position in the lifted capture prefix.
+        index: usize,
+    },
+
+    /// Reference input argument after the lifted capture prefix.
+    Input {
+        /// Zero-based input position, excluding lifted captures.
+        index: usize,
+    },
+}
+
+impl ReferenceSource {
+    /// Returns the entry-boundary source of one flat input position, splitting the boundary at the lifted capture
+    /// prefix.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_index`: Flat entry input position.
+    ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table.
+    #[inline]
+    pub const fn from_input_index(input_index: usize, capture_count: usize) -> Self {
+        if input_index < capture_count {
+            Self::Capture { index: input_index }
+        } else {
+            Self::Input { index: input_index - capture_count }
+        }
+    }
+}
+
+impl Display for ReferenceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture { index } => write!(formatter, "capture {index}"),
+            Self::Input { index } => write!(formatter, "input {index}"),
+        }
+    }
+}
+
 /// Logical binding recipe for one external reference root in a discharged program.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ReferenceStateBinding {
-    /// Capture or public argument supplying the runtime holder.
+    /// Capture or input argument supplying the runtime holder.
     source: ReferenceSource,
 
     /// Flat input position receiving the entering immutable value.
@@ -514,7 +559,7 @@ impl ReferenceStateBinding {
     ///
     /// # Parameters
     ///
-    ///   - `source`: Capture or public input supplying the runtime holder.
+    ///   - `source`: Capture or input supplying the runtime holder.
     ///   - `discharged_input_index`: Flat discharged input receiving the holder's entering immutable value.
     ///   - `final_state_output_index`: Hidden output containing the final state, or [`None`] for a read-only root.
     pub const fn new(
@@ -525,7 +570,7 @@ impl ReferenceStateBinding {
         Self { source, discharged_input_index, final_state_output_index }
     }
 
-    /// Returns the capture or public argument supplying the runtime holder.
+    /// Returns the capture or input argument supplying the runtime holder.
     pub const fn source(&self) -> ReferenceSource {
         self.source
     }
@@ -645,7 +690,7 @@ where
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table, used to
-    ///     split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::PublicInput`]
+    ///     split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
     ///     positions.
     ///
     /// # Errors
@@ -744,7 +789,7 @@ where
                             )));
                         }
                         ReferenceSource::Capture { index } => *index,
-                        ReferenceSource::PublicInput { index } => capture_count + index,
+                        ReferenceSource::Input { index } => capture_count + index,
                     };
                     let Some(input) = input_ids.get(input_index) else {
                         return Err(ProgramError::MalformedProgram(format!(
@@ -821,7 +866,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table, used
-    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::PublicInput`]
+    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
     ///     positions.
     ///
     /// # Errors
@@ -882,7 +927,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table, used
-    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::PublicInput`]
+    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
     ///     positions.
     ///   - `sites`: Reference sites to discharge, enumerated from this same program through
     ///     [`reference_discharge_sites`](Self::reference_discharge_sites). Every other root is preserved.
@@ -933,7 +978,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Parameters
     ///
     ///   - `capture_count`: Length of the lifted capture prefix, which is both the split between
-    ///     [`ReferenceSource::Capture`] and [`ReferenceSource::PublicInput`] positions and the capture scope's own
+    ///     [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions and the capture scope's own
     ///     length.
     ///
     /// # Errors
@@ -5125,7 +5170,7 @@ mod tests {
                     1,
                     0,
                     0,
-                    vec![ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None)],
+                    vec![ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
                 ),
                 TestDischargeMode::Malformed => ReferenceDischargeResult::from_provider_payload(7, 0, 1, 0, Vec::new()),
             }
@@ -5146,7 +5191,7 @@ mod tests {
     fn test_reference_discharge_result_validates_boundaries() {
         let bindings = vec![
             ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(1)),
-            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 1, Some(2)),
+            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 1, Some(2)),
         ];
         let result = ReferenceDischargeResult::from_provider_payload("program", 2, 3, 1, bindings.clone()).unwrap();
         assert_eq!(result.program(), &"program");
@@ -5165,12 +5210,11 @@ mod tests {
                 0,
                 0,
                 0,
-                vec![ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, None)],
+                vec![ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge state for `public input 0` names input 0 but discharged input count is 0"
-                    .to_string(),
+                "reference discharge state for `input 0` names input 0 but discharged input count is 0".to_string(),
             ),
         );
         assert_eq!(
@@ -5184,7 +5228,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(source_index, input_index)| {
-                    ReferenceStateBinding::new(ReferenceSource::PublicInput { index: source_index }, input_index, None)
+                    ReferenceStateBinding::new(ReferenceSource::Input { index: source_index }, input_index, None)
                 })
                 .collect();
             assert_eq!(
@@ -5197,7 +5241,7 @@ mod tests {
         }
         for sources in [
             [ReferenceSource::Capture { index: 0 }, ReferenceSource::Capture { index: 0 }],
-            [ReferenceSource::PublicInput { index: 0 }, ReferenceSource::Capture { index: 0 }],
+            [ReferenceSource::Input { index: 0 }, ReferenceSource::Capture { index: 0 }],
         ] {
             let bindings = sources
                 .into_iter()
@@ -5226,7 +5270,7 @@ mod tests {
             external.discharge_local_references(0, "test transform"),
             Err(ProgramError::UnsupportedOperation {
                 message: "test transform supports only local references, but the program uses external \
-                          `public input 0`"
+                          `input 0`"
                     .to_string(),
             }),
         );
@@ -5248,7 +5292,7 @@ mod tests {
         // the discharged bindings and the public-output prefix that precedes their hidden final-state suffix.
         let bindings = vec![
             ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(1)),
-            ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 1, None),
+            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 1, None),
         ];
         let result = PartialReferenceDischargeResult::new("program", 2, 2, 1, bindings.clone()).unwrap();
         assert_eq!(result.program(), &"program");
@@ -5415,7 +5459,7 @@ mod tests {
             program.reference_discharge_sites(1),
             Ok(vec![
                 ReferenceDischargeSite::External(ReferenceSource::Capture { index: 0 }),
-                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 0 }),
+                ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
                 ReferenceDischargeSite::Allocation { instruction: InstructionId::new(callee, 0), output_index: 0 },
                 ReferenceDischargeSite::Allocation {
                     instruction: InstructionId::new(program.entry(), 0),
@@ -5428,8 +5472,8 @@ mod tests {
         assert_eq!(
             program.reference_discharge_sites(0).unwrap()[..2],
             [
-                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 0 }),
-                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 1 }),
+                ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
+                ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 }),
             ],
         );
         assert_eq!(
@@ -5482,12 +5526,12 @@ mod tests {
             "reference discharge selection names external capture 0 but the program has 0 captures",
         );
         assert_eq!(
-            reject(&[ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 2 })]),
-            "reference discharge selection names external public input 2 but the program has 2 inputs",
+            reject(&[ReferenceDischargeSite::External(ReferenceSource::Input { index: 2 })]),
+            "reference discharge selection names external input 2 but the program has 2 inputs",
         );
         assert_eq!(
-            reject(&[ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 1 })]),
-            "reference discharge selection names external public input 1 but input 1 is not reference-typed",
+            reject(&[ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 })]),
+            "reference discharge selection names external input 1 but input 1 is not reference-typed",
         );
 
         // Allocation sites are checked against the arena, against the operation's allocation semantics, and against
@@ -6796,8 +6840,8 @@ mod tests {
         assert_eq!(
             sites,
             vec![
-                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 0 }),
-                ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 1 }),
+                ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
+                ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 }),
             ],
         );
         let discharged = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &sites[..1]);
@@ -6808,7 +6852,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(1))],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -6912,7 +6956,7 @@ mod tests {
         assert_eq!(
             source.discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge consumed external public input 0, whose holder belongs to the caller".to_string(),
+                "reference discharge consumed external input 0, whose holder belongs to the caller".to_string(),
             ),
         );
 
@@ -6976,7 +7020,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::PublicInput { index: 0 }, 0, Some(1))],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -7011,11 +7055,11 @@ mod tests {
             source
                 .partially_discharge_references_with_policy::<ListReferenceDischarge>(
                     0,
-                    &[ReferenceDischargeSite::External(ReferenceSource::PublicInput { index: 3 })],
+                    &[ReferenceDischargeSite::External(ReferenceSource::Input { index: 3 })],
                 )
                 .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge selection names external public input 3 but the program has 1 inputs".to_string(),
+                "reference discharge selection names external input 3 but the program has 1 inputs".to_string(),
             ),
         );
     }

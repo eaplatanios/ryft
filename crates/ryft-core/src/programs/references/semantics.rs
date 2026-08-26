@@ -1,14 +1,6 @@
-use std::borrow::Borrow;
 use std::fmt::Display;
 
-use serde::Serialize;
-
-use ryft_macros::Parameter;
-
-use crate::parameters::Parameter;
 use crate::programs::ProgramError;
-use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
-use crate::programs::types::{Type, TypeError, TypeRefinements};
 
 /// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -265,10 +257,8 @@ impl ReferenceOperationSemantics {
         self.outputs.as_slice()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the output positions at which this operation allocates a fresh reference root, in deterministic
-    /// operation-defined order.
+    /// Returns the output positions at which the corresponding [`Operation`](crate::Operation) allocates a fresh
+    /// [`ReferenceOutput::Root`], in deterministic operation-defined order.
     #[inline]
     pub fn root_output_indices(&self) -> impl Iterator<Item = usize> {
         self.outputs.iter().filter_map(|output| match output {
@@ -277,14 +267,15 @@ impl ReferenceOperationSemantics {
         })
     }
 
-    /// Validates that every position named by this descriptor exists in an operation application with the provided
+    /// Validates that every position named by this [`ReferenceOperationSemantics`] exists in an
+    /// [`Operation`](crate::Operation) application (i.e., an [`Instruction`](crate::Instruction)) with the provided
     /// input and output arity.
     ///
     /// # Parameters
     ///
-    ///   - `operation_name`: Name of the operation whose descriptor is being validated.
-    ///   - `input_count`: Number of operands in the application.
-    ///   - `output_count`: Number of results inferred for the application.
+    ///   - `operation_name`: Name of the operation whose descriptor is being validated, used for diagnostic purposes.
+    ///   - `input_count`: Number of inputs/operands in the application.
+    ///   - `output_count`: Number of outputs/results inferred for the application.
     pub(crate) fn validate_arity(
         &self,
         operation_name: &str,
@@ -300,6 +291,7 @@ impl ReferenceOperationSemantics {
                  {input_count}",
             )))
         };
+
         let validate_output = |output_index: usize| {
             if output_index < output_count {
                 return Ok(());
@@ -309,378 +301,35 @@ impl ReferenceOperationSemantics {
                  {output_count}",
             )))
         };
+
         for access in &self.inputs {
             validate_input(access.input_index(), "an accessed")?;
         }
+
         for output in &self.outputs {
             validate_output(output.output_index())?;
             if let ReferenceOutput::Alias { input_index, .. } = output {
                 validate_input(*input_index, "an aliased")?;
             }
         }
+
         Ok(())
-    }
-}
-
-/// Invocation source of one external reference root.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReferenceSource {
-    /// Capture lifted into the entry boundary before public arguments.
-    Capture {
-        /// Zero-based capture position in the lifted capture prefix.
-        index: usize,
-    },
-
-    /// Public reference argument after the lifted capture prefix.
-    PublicInput {
-        /// Zero-based public input position, excluding lifted captures.
-        index: usize,
-    },
-}
-
-impl ReferenceSource {
-    /// Returns the entry-boundary source of one flat input position, splitting the boundary at the lifted capture
-    /// prefix.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_index`: Flat entry input position.
-    ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table.
-    #[inline]
-    pub const fn from_input_index(input_index: usize, capture_count: usize) -> Self {
-        if input_index < capture_count {
-            Self::Capture { index: input_index }
-        } else {
-            Self::PublicInput { index: input_index - capture_count }
-        }
-    }
-}
-
-impl Display for ReferenceSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Capture { index } => write!(formatter, "capture {index}"),
-            Self::PublicInput { index } => write!(formatter, "public input {index}"),
-        }
-    }
-}
-
-/// Structural [`Type`] of a reference to a value whose type is `T`.
-///
-/// A reference type contains only referent metadata. Runtime resource identity belongs to
-/// [`Reference`](crate::programs::Reference) and therefore does not affect structural equality, hashing, or
-/// retained-program specialization. Reference compatibility is exact: a reference cannot implicitly broadcast or
-/// promote its storage, while refinement and identity handling delegate to the referent type. Exactness deliberately
-/// spans the referent's optional layout, sharding, and memory metadata as well: the external-state mutation ABI
-/// requires exact physical referent compatibility, so a metadata-tolerant relation would overpromise. Revisit this if
-/// a compatibility consumer ever needs the tolerant reading.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct ReferenceType<T: Type> {
-    /// Structural type of the referenced value.
-    referent: T,
-}
-
-impl<T: Type> ReferenceType<T> {
-    /// Creates a reference type for `referent`.
-    #[inline]
-    pub fn new(referent: T) -> Self {
-        Self { referent }
-    }
-
-    /// Returns the structural type of the referenced value.
-    #[inline]
-    pub fn referent(&self) -> &T {
-        &self.referent
-    }
-}
-
-impl<T: Type> Display for ReferenceType<T> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "ref<{}>", self.referent)
-    }
-}
-
-impl<T: Type> Type for ReferenceType<T> {
-    type Identity = T::Identity;
-    type Refinements = ReferenceTypeRefinements<T>;
-
-    #[inline]
-    fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-        self.referent.identities()
-    }
-
-    fn derive_identity_renaming(
-        declared: &[Self],
-        actual: &[Self],
-    ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-        let declared = declared.iter().map(|r#type| r#type.referent.clone()).collect::<Vec<_>>();
-        let actual = actual.iter().map(|r#type| r#type.referent.clone()).collect::<Vec<_>>();
-        T::derive_identity_renaming(&declared, &actual)
-    }
-
-    #[inline]
-    fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-        Ok(Self::new(self.referent.rename_identities(renaming)?))
-    }
-
-    #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
-        self == other
-    }
-
-    #[inline]
-    fn is_refined_by(&self, other: &Self) -> bool {
-        self.referent.is_refined_by(&other.referent)
-    }
-
-    #[inline]
-    fn is_scalar(&self) -> bool {
-        false
-    }
-
-    #[inline]
-    fn is_complex(&self) -> bool {
-        false
-    }
-
-    #[inline]
-    fn is_reference(&self) -> bool {
-        true
-    }
-}
-
-/// Cross-occurrence refinements established for a complete [`ReferenceType`] signature.
-#[derive(Clone, Debug)]
-pub struct ReferenceTypeRefinements<T: Type> {
-    /// Referent refinement state shared across every reference in the signature.
-    referents: T::Refinements,
-}
-
-impl<T: Type> Default for ReferenceTypeRefinements<T> {
-    #[inline]
-    fn default() -> Self {
-        Self { referents: T::Refinements::default() }
-    }
-}
-
-impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> {
-    fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
-    where
-        D::IntoIter: ExactSizeIterator,
-        A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ReferenceType<T>>,
-        A::Item: Borrow<ReferenceType<T>>,
-    {
-        // Collecting the items is a shallow move; the referents themselves are delegated by borrow (`&T` satisfies
-        // the `Borrow<T>` item bound) so no referent is ever cloned on this type-inference path.
-        let declared = declared.into_iter().collect::<Vec<_>>();
-        let actual = actual.into_iter().collect::<Vec<_>>();
-        let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
-        let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
-        Ok(Self { referents: T::Refinements::establish(declared, actual)? })
-    }
-
-    fn validate<D: IntoIterator, A: IntoIterator>(
-        &self,
-        declared: D,
-        actual: A,
-        closed_identities: &[T::Identity],
-    ) -> Result<(), TypeError>
-    where
-        D::IntoIter: ExactSizeIterator,
-        A::IntoIter: ExactSizeIterator,
-        D::Item: Borrow<ReferenceType<T>>,
-        A::Item: Borrow<ReferenceType<T>>,
-    {
-        // Refer to the borrow-based delegation note in `establish` above.
-        let declared = declared.into_iter().collect::<Vec<_>>();
-        let actual = actual.into_iter().collect::<Vec<_>>();
-        let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
-        let actual = actual.iter().map(|r#type| &r#type.borrow().referent);
-        self.referents.validate(declared, actual, closed_identities)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::{Borrow, Cow};
-    use std::fmt::Display;
+    use std::borrow::Cow;
 
     use pretty_assertions::assert_eq;
 
-    use crate::parameters::Parameter;
-    use crate::programs::identities::TypeIdentity;
     use crate::programs::operations::Operation;
+    use crate::programs::references::types::ReferenceType;
+    use crate::programs::references::types::tests::TestType;
     use crate::programs::regions::RegionInterface;
+    use crate::programs::types::TypeError;
 
     use super::*;
-
-    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    struct TestIdentity(u8);
-
-    impl Display for TestIdentity {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "identity<{}>", self.0)
-        }
-    }
-
-    impl TypeIdentity for TestIdentity {
-        fn fresh(&self) -> Self {
-            Self(self.0.wrapping_add(128))
-        }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    enum TestType {
-        Dynamic(TestIdentity),
-        Static(u8),
-    }
-
-    impl Display for TestType {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Self::Dynamic(identity) => write!(formatter, "dynamic<{identity}>"),
-                Self::Static(value) => write!(formatter, "static<{value}>"),
-            }
-        }
-    }
-
-    impl Parameter for TestType {}
-
-    #[derive(Clone, Debug, Default)]
-    struct TestTypeRefinements {
-        values: Vec<(TestIdentity, u8)>,
-    }
-
-    impl TestTypeRefinements {
-        fn observe(&mut self, declared: &TestType, actual: &TestType) -> Result<(), TypeError> {
-            match (declared, actual) {
-                (TestType::Dynamic(identity), TestType::Static(value)) => {
-                    if let Some((_, established)) = self.values.iter().find(|(candidate, _)| candidate == identity) {
-                        if established != value {
-                            return Err(TypeError::invalid(format!(
-                                "identity `{identity}` was refined to both {established} and {value}",
-                            )));
-                        }
-                    } else {
-                        self.values.push((*identity, *value));
-                    }
-                    Ok(())
-                }
-                (TestType::Dynamic(_), TestType::Dynamic(_)) | (TestType::Static(_), TestType::Static(_))
-                    if declared.is_refined_by(actual) =>
-                {
-                    Ok(())
-                }
-                _ => Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}"))),
-            }
-        }
-    }
-
-    impl TypeRefinements<TestType> for TestTypeRefinements {
-        fn establish<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
-        where
-            D::IntoIter: ExactSizeIterator,
-            A::IntoIter: ExactSizeIterator,
-            D::Item: Borrow<TestType>,
-            A::Item: Borrow<TestType>,
-        {
-            let declared = declared.into_iter();
-            let actual = actual.into_iter();
-            if declared.len() != actual.len() {
-                return Err(TypeError::invalid(format!(
-                    "declared type count {} does not match actual type count {}",
-                    declared.len(),
-                    actual.len(),
-                )));
-            }
-            let mut refinements = Self::default();
-            for (declared, actual) in declared.zip(actual) {
-                refinements.observe(declared.borrow(), actual.borrow())?;
-            }
-            Ok(refinements)
-        }
-
-        fn validate<D: IntoIterator, A: IntoIterator>(
-            &self,
-            declared: D,
-            actual: A,
-            _closed_identities: &[TestIdentity],
-        ) -> Result<(), TypeError>
-        where
-            D::IntoIter: ExactSizeIterator,
-            A::IntoIter: ExactSizeIterator,
-            D::Item: Borrow<TestType>,
-            A::Item: Borrow<TestType>,
-        {
-            let declared = declared.into_iter();
-            let actual = actual.into_iter();
-            if declared.len() != actual.len() {
-                return Err(TypeError::invalid(format!(
-                    "declared type count {} does not match actual type count {}",
-                    declared.len(),
-                    actual.len(),
-                )));
-            }
-            let mut refinements = self.clone();
-            for (declared, actual) in declared.zip(actual) {
-                refinements.observe(declared.borrow(), actual.borrow())?;
-            }
-            Ok(())
-        }
-    }
-
-    impl Type for TestType {
-        type Identity = TestIdentity;
-        type Refinements = TestTypeRefinements;
-
-        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-            match self {
-                Self::Dynamic(identity) => Some((TypeIdentityPosition::Definition, identity)),
-                Self::Static(_) => None,
-            }
-            .into_iter()
-        }
-
-        fn derive_identity_renaming(
-            declared: &[Self],
-            actual: &[Self],
-        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-            Self::Refinements::establish(declared, actual)?;
-            let mut renaming = TypeIdentityRenaming::new();
-            for (declared, actual) in declared.iter().zip(actual) {
-                if let (Self::Dynamic(declared), Self::Dynamic(actual)) = (declared, actual) {
-                    renaming.insert(*declared, *actual)?;
-                }
-            }
-            Ok(renaming)
-        }
-
-        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-            Ok(match self {
-                Self::Dynamic(identity) => Self::Dynamic(renaming.rename(identity)),
-                Self::Static(value) => Self::Static(*value),
-            })
-        }
-
-        fn is_compatible_with(&self, other: &Self) -> bool {
-            self == other
-        }
-
-        fn is_refined_by(&self, other: &Self) -> bool {
-            matches!(self, Self::Dynamic(_)) || self == other
-        }
-
-        fn is_scalar(&self) -> bool {
-            false
-        }
-
-        fn is_complex(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn test_reference_access_mode() {
@@ -695,43 +344,6 @@ mod tests {
             assert_eq!(mode.to_string(), display);
             assert_eq!(mode.is_consuming(), is_consuming);
         }
-    }
-
-    #[test]
-    fn test_reference_type_delegates_identity_and_refinement_without_implicit_compatibility() {
-        let declared = TestIdentity(0);
-        let actual = TestIdentity(1);
-        let declared_type = ReferenceType::new(TestType::Dynamic(declared));
-        let actual_type = ReferenceType::new(TestType::Dynamic(actual));
-        let renaming = ReferenceType::derive_identity_renaming(
-            std::slice::from_ref(&declared_type),
-            std::slice::from_ref(&actual_type),
-        )
-        .unwrap();
-        assert_eq!(renaming.rename(&declared), actual);
-
-        let static_two = ReferenceType::new(TestType::Static(2));
-        let static_three = ReferenceType::new(TestType::Static(3));
-        assert!(declared_type.is_refined_by(&static_two));
-        assert!(!declared_type.is_compatible_with(&static_two));
-        assert!(!static_two.is_compatible_with(&static_three));
-        assert!(static_two.is_reference());
-        assert!(!static_two.is_scalar());
-        assert!(!static_two.is_complex());
-        assert_eq!(static_two.to_string(), "ref<static<2>>");
-        assert_eq!(format!("{static_two:?}"), format!("ReferenceType {{ referent: {:?} }}", static_two.referent()));
-        let refinements = ReferenceTypeRefinements::establish(
-            [declared_type.clone(), declared_type.clone()],
-            [static_two.clone(), static_two.clone()],
-        )
-        .unwrap();
-        assert_eq!(refinements.validate([declared_type.clone()], [static_two.clone()], &[]), Ok(()));
-        let error = ReferenceTypeRefinements::establish(
-            [ReferenceType::new(TestType::Dynamic(declared)), ReferenceType::new(TestType::Dynamic(declared))],
-            [static_two, static_three],
-        )
-        .unwrap_err();
-        assert_eq!(error, TypeError::invalid("identity `identity<0>` was refined to both 2 and 3"));
     }
 
     #[test]

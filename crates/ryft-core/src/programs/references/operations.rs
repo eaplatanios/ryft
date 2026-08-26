@@ -36,9 +36,8 @@ use super::discharge::{
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, discharge_preserved_access,
 };
-use super::semantics::{
-    ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceType,
-};
+use super::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput};
+use super::types::ReferenceType;
 
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
