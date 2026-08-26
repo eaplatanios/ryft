@@ -16,7 +16,6 @@ use crate::programs::{
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
-// TODO(eaplatanios): Figure out what to do about the large enum warning here and if I should be worried about it.
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
 /// [`ArrayType`]-typed [`Value`]s, [`DimensionValue`]s, and [`ArrayReference`]s. `A` is the concrete array
 /// representation selected by the owning backend. Dimensions use the common [`DimensionValue`] which is a checked
@@ -464,7 +463,7 @@ mod tests {
             renamed.r#type().referent(),
             &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())])),
         );
-        assert_eq!(renamed.read().unwrap().r#type().into_owned(), renamed.r#type().referent().clone());
+        assert_eq!(renamed.read_root().unwrap().r#type().into_owned(), renamed.r#type().referent().clone());
         assert_eq!(
             <ArrayIrValue<CaptureReference<ArrayType>> as ValueProjection<ReferenceType<ArrayType>>>::projected(&value),
             Ok(&reference),
@@ -484,7 +483,7 @@ mod tests {
             two_axis_reference.rename_type_identities(&non_bijective),
             Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
         );
-        assert_eq!(two_axis_reference.read(), Ok(CaptureReference::new(1, two_axis_type)));
+        assert_eq!(two_axis_reference.read_root(), Ok(CaptureReference::new(1, two_axis_type)));
 
         // The collision is reported in the caller's direction, so a handle that already carries a bijective
         // handle-local mapping names its own identities rather than the root identities behind them. Deriving the

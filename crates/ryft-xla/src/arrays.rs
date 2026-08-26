@@ -1208,8 +1208,8 @@ mod tests {
 
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension, DimensionBounds, DimensionVariable, Error as CoreError,
-        Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StaticShape,
-        TiledLayout, Typed,
+        Layout, LogicalMesh, MeshAxis, MeshAxisType, Reference, Shape, Sharding, ShardingDimension, ShardingError,
+        StaticShape, TiledLayout, Typed,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
@@ -1223,6 +1223,13 @@ mod tests {
     #[test]
     fn test_array_is_send_and_sync() {
         assert_send_sync::<Array<'static>>();
+    }
+
+    #[test]
+    fn test_array_reference_is_send_and_sync() {
+        // Reference handles share their handle vocabulary between exact clones, so the XLA reference family relies
+        // on the array value and type metadata being safe for concurrent access.
+        assert_send_sync::<Reference<Array<'static>>>();
     }
 
     // TODO(eaplatanios): Review this test.
