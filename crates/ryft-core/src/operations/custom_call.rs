@@ -316,6 +316,7 @@ impl Display for CustomCallRaggedOutputBinding {
 /// declaration supplies no differentiation semantics: ragged custom calls continue to follow the ordinary custom-call
 /// differentiation contract. Padding remains unspecified downstream; the result [`RaggedAxis`] metadata is what lets
 /// extent-aware operations avoid observing it.
+///
 /// Runtime extent values must lie within the declared [`DimensionVariable`] bounds and must not exceed their packed
 /// physical axis. Eager foreign-kernel implementations are responsible for checking that precondition when decoding
 /// their ordinary extent operands and outputs.

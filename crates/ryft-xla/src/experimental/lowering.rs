@@ -8564,7 +8564,8 @@ fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
 }
 
-/// Lowers a scalar `u64` constant used by the [`AxisIndexOperation`] coordinate arithmetic below.
+/// Lowers a scalar `u64` constant. Shared by the ragged-dot group-interval arithmetic, the physical
+/// `ragged_all_to_all` lane arithmetic, and the [`AxisIndexOperation`] coordinate arithmetic.
 fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     value: u64,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -12067,10 +12068,14 @@ mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
+        // The physical buffers deliberately carry garbage (not zeros) in every slot beyond the live prefix of the
+        // bounded-dynamic batch axis. Each batch position computes independently, so the asserted live prefix can
+        // only stay correct if the lowering itself confines the padded positions, rather than relying on the caller
+        // zeroing them.
         let inputs = [
             client
                 .buffer(
-                    values_to_bytes(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0]).as_slice(),
+                    values_to_bytes(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).as_slice(),
                     BufferType::F32,
                     &[3, 3, 1],
                     None,
@@ -12080,7 +12085,7 @@ mod tests {
                 .unwrap(),
             client
                 .buffer(
-                    values_to_bytes(&[10.0_f32, 2.0, 0.0, 20.0, 3.0, 0.0]).as_slice(),
+                    values_to_bytes(&[10.0_f32, 2.0, -9.0, 20.0, 3.0, -11.0]).as_slice(),
                     BufferType::F32,
                     &[2, 3, 1, 1],
                     None,
@@ -12090,7 +12095,7 @@ mod tests {
                 .unwrap(),
             client
                 .buffer(
-                    values_to_bytes(&[1_i32, 2, 2, 1, 0, 0]).as_slice(),
+                    values_to_bytes(&[1_i32, 2, 2, 1, 5, 7]).as_slice(),
                     BufferType::I32,
                     &[3, 2],
                     None,

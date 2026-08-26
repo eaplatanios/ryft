@@ -84,9 +84,10 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
 
 // TODO(eaplatanios): Review from here onwards.
 
-// These residual-protocol algorithms are deliberately inherent methods duplicated by thin trait-impl delegations
-// below rather than living only on the trait: the `XlaOperation` provider reuses them across operation families,
-// which their `Self`-typed builder and context parameters cannot express. Do not fold them into the trait impl.
+// These residual-protocol algorithms are deliberately inherent methods duplicated by thin trait implementation
+// delegations below rather than living only on the trait: the `XlaOperation` provider reuses them across operation
+// families, which their `Self`-typed builder and context parameters cannot express. Do not fold them into the trait
+// implementation.
 impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
     /// Captures the runtime extents needed to materialize a disconnected cotangent zero from the primal `source`.
     pub fn capture_zero_residuals<
