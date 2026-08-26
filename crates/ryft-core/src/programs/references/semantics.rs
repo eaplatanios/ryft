@@ -149,19 +149,23 @@ impl ReferenceOutput {
     }
 }
 
+// Shared empty descriptor returned by `ReferenceOperationSemantics::empty` so that the `Operation` trait default can
+// hand out a borrow without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
+static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
+    ReferenceOperationSemantics { inputs: Vec::new(), outputs: Vec::new() };
+
 // TODO(eaplatanios): Review from here onwards.
 
-/// Operation-local reference semantics: input accesses plus output root/alias classifications, expressed in
-/// operand/result index space.
-///
-/// All indices are *operation-local operand and result positions*, never resource identifiers. Program-level
-/// analysis later resolves them to canonical roots (an entry input, a capture, or an allocation instruction), so the
-/// descriptor intentionally contains no runtime resource IDs. The empty default describes operations that neither
-/// create, alias, nor access references.
+/// [`Operation`](crate::Operation)-local reference semantics that describes the input [`Reference`](crate::Reference)
+/// accesses and the output root/alias [`Reference`](crate::Reference) classifications, expressed in operand/result
+/// index space. All indices are operation-local input/operand and output/result positions, never resource identifiers.
+/// [`Program`](crate::Program)-level analysis later resolves them to canonical roots (i.e., an entry input, a capture,
+/// or an allocation instruction), so the descriptor intentionally contains no runtime resource IDs. The empty default
+/// describes operations that neither create, alias, nor access references.
 ///
 /// # Examples
 ///
-/// The array-reference vocabulary declares the following semantics:
+/// The array reference vocabulary declares the following semantics:
 ///
 /// ```text
 /// new_reference(x) -> r
@@ -202,11 +206,6 @@ pub struct ReferenceOperationSemantics {
     /// Classifications for the operation results that denote references. Ordinary SSA results are omitted.
     outputs: Vec<ReferenceOutput>,
 }
-
-// Shared empty descriptor returned by `ReferenceOperationSemantics::empty` so that the `Operation` trait default can
-// hand out a borrow without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
-static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
-    ReferenceOperationSemantics { inputs: Vec::new(), outputs: Vec::new() };
 
 impl ReferenceOperationSemantics {
     /// Creates a reference semantics descriptor from its ordered components.
