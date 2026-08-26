@@ -20,16 +20,14 @@ pub struct ReferenceType<T: Type> {
     referent: T,
 }
 
-// TODO(eaplatanios): Review from here onward.
-
 impl<T: Type> ReferenceType<T> {
-    /// Creates a reference type for `referent`.
+    /// Creates a new [`ReferenceType`].
     #[inline]
     pub fn new(referent: T) -> Self {
         Self { referent }
     }
 
-    /// Returns the structural type of the referenced value.
+    /// Returns the [`Type`] of the referenced [`Value`](crate::Value).
     #[inline]
     pub fn referent(&self) -> &T {
         &self.referent
@@ -52,6 +50,7 @@ impl<T: Type> Type for ReferenceType<T> {
         self.referent.identities()
     }
 
+    #[inline]
     fn derive_identity_renaming(
         declared: &[Self],
         actual: &[Self],
@@ -92,7 +91,7 @@ impl<T: Type> Type for ReferenceType<T> {
     }
 }
 
-/// Cross-occurrence refinements established for a complete [`ReferenceType`] signature.
+/// Cross-occurrence [`TypeRefinements`] established for a complete [`ReferenceType`] signature.
 #[derive(Clone, Debug)]
 pub struct ReferenceTypeRefinements<T: Type> {
     /// Referent refinement state shared across every reference in the signature.
@@ -114,8 +113,8 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
         D::Item: Borrow<ReferenceType<T>>,
         A::Item: Borrow<ReferenceType<T>>,
     {
-        // Collecting the items is a shallow move; the referents themselves are delegated by borrow (`&T` satisfies
-        // the `Borrow<T>` item bound) so no referent is ever cloned on this type-inference path.
+        // Collecting the items is a shallow move as the referents themselves are delegated by borrow (i.e., `&T`
+        // satisfies the `Borrow<T>` item bound), and so no referent is ever cloned on this type inference path.
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
         let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
@@ -135,7 +134,8 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
         D::Item: Borrow<ReferenceType<T>>,
         A::Item: Borrow<ReferenceType<T>>,
     {
-        // Refer to the borrow-based delegation note in `establish` above.
+        // Collecting the items is a shallow move as the referents themselves are delegated by borrow (i.e., `&T`
+        // satisfies the `Borrow<T>` item bound), and so no referent is ever cloned on this type inference path.
         let declared = declared.into_iter().collect::<Vec<_>>();
         let actual = actual.into_iter().collect::<Vec<_>>();
         let declared = declared.iter().map(|r#type| &r#type.borrow().referent);
@@ -145,7 +145,7 @@ impl<T: Type> TypeRefinements<ReferenceType<T>> for ReferenceTypeRefinements<T> 
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use std::borrow::Borrow;
     use std::fmt::Display;
 
@@ -157,7 +157,7 @@ pub(super) mod tests {
     use super::*;
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-    pub(in crate::programs::references) struct TestIdentity(pub(in crate::programs::references) u8);
+    struct TestIdentity(u8);
 
     impl Display for TestIdentity {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -172,7 +172,7 @@ pub(super) mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-    pub(in crate::programs::references) enum TestType {
+    enum TestType {
         Dynamic(TestIdentity),
         Static(u8),
     }
@@ -188,8 +188,58 @@ pub(super) mod tests {
 
     impl Parameter for TestType {}
 
+    impl Type for TestType {
+        type Identity = TestIdentity;
+        type Refinements = TestTypeRefinements;
+
+        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+            match self {
+                Self::Dynamic(identity) => Some((TypeIdentityPosition::Definition, identity)),
+                Self::Static(_) => None,
+            }
+            .into_iter()
+        }
+
+        fn derive_identity_renaming(
+            declared: &[Self],
+            actual: &[Self],
+        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
+            Self::Refinements::establish(declared, actual)?;
+            let mut renaming = TypeIdentityRenaming::new();
+            for (declared, actual) in declared.iter().zip(actual) {
+                if let (Self::Dynamic(declared), Self::Dynamic(actual)) = (declared, actual) {
+                    renaming.insert(*declared, *actual)?;
+                }
+            }
+            Ok(renaming)
+        }
+
+        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+            Ok(match self {
+                Self::Dynamic(identity) => Self::Dynamic(renaming.rename(identity)),
+                Self::Static(value) => Self::Static(*value),
+            })
+        }
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            self == other
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            matches!(self, Self::Dynamic(_)) || self == other
+        }
+
+        fn is_scalar(&self) -> bool {
+            false
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+    }
+
     #[derive(Clone, Debug, Default)]
-    pub(in crate::programs::references) struct TestTypeRefinements {
+    struct TestTypeRefinements {
         values: Vec<(TestIdentity, u8)>,
     }
 
@@ -268,56 +318,6 @@ pub(super) mod tests {
                 refinements.observe(declared.borrow(), actual.borrow())?;
             }
             Ok(())
-        }
-    }
-
-    impl Type for TestType {
-        type Identity = TestIdentity;
-        type Refinements = TestTypeRefinements;
-
-        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-            match self {
-                Self::Dynamic(identity) => Some((TypeIdentityPosition::Definition, identity)),
-                Self::Static(_) => None,
-            }
-            .into_iter()
-        }
-
-        fn derive_identity_renaming(
-            declared: &[Self],
-            actual: &[Self],
-        ) -> Result<TypeIdentityRenaming<Self::Identity>, TypeError> {
-            Self::Refinements::establish(declared, actual)?;
-            let mut renaming = TypeIdentityRenaming::new();
-            for (declared, actual) in declared.iter().zip(actual) {
-                if let (Self::Dynamic(declared), Self::Dynamic(actual)) = (declared, actual) {
-                    renaming.insert(*declared, *actual)?;
-                }
-            }
-            Ok(renaming)
-        }
-
-        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-            Ok(match self {
-                Self::Dynamic(identity) => Self::Dynamic(renaming.rename(identity)),
-                Self::Static(value) => Self::Static(*value),
-            })
-        }
-
-        fn is_compatible_with(&self, other: &Self) -> bool {
-            self == other
-        }
-
-        fn is_refined_by(&self, other: &Self) -> bool {
-            matches!(self, Self::Dynamic(_)) || self == other
-        }
-
-        fn is_scalar(&self) -> bool {
-            false
-        }
-
-        fn is_complex(&self) -> bool {
-            false
         }
     }
 

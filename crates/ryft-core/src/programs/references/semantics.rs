@@ -323,9 +323,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::ArrayType;
     use crate::programs::operations::Operation;
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::references::types::tests::TestType;
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
 
@@ -352,7 +352,7 @@ mod tests {
         struct TestAliasingOperation;
 
         impl Operation for TestAliasingOperation {
-            type Type = ReferenceType<TestType>;
+            type Type = ReferenceType<ArrayType>;
 
             fn name(&self) -> &'static str {
                 "test_alias"
@@ -360,9 +360,9 @@ mod tests {
 
             fn infer_output_types(
                 &self,
-                input_types: &[ReferenceType<TestType>],
-                _region_interfaces: &[RegionInterface<ReferenceType<TestType>>],
-            ) -> Result<Vec<ReferenceType<TestType>>, TypeError> {
+                input_types: &[ReferenceType<ArrayType>],
+                _region_interfaces: &[RegionInterface<ReferenceType<ArrayType>>],
+            ) -> Result<Vec<ReferenceType<ArrayType>>, TypeError> {
                 Ok(input_types.to_vec())
             }
 
