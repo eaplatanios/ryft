@@ -251,7 +251,8 @@ The first portable family includes:
 - scalar constants, arithmetic, comparisons, selection, casts, and bounded control flow;
 - tile creation, reshape, transpose, broadcast, iota, slice, concatenate, and reductions;
 - reference load, store, swap, and ordered accumulation with views, masks, and optional `other` values;
-- sequentially consistent atomic read-modify-write operations over the portable scopes defined in §5.6;
+- sequentially consistent atomic read-modify-write operations over the portable scopes defined in §5.6, with
+  commutative atomic accumulation carried by the dedicated access mode defined there;
 - dot and block-scaled dot with explicit input, scale, accumulator, output, rounding, and saturation contracts;
 - asynchronous copy start/wait through linear completion tokens and target-neutral pipeline stages;
 - debug assertions and trace markers that can be compiled out by policy.
@@ -287,7 +288,18 @@ portable operations but cannot be labeled or tested as native NVFP4.
 
 ### 5.6 Synchronization and race freedom
 
-- Ordered reference effects define compiler ordering but do not imply atomicity between programs.
+- Ordered reference effects define compiler ordering but do not imply atomicity between programs. The converse also
+  holds: cross-program accumulation is never expressed by relaxing the ordered `Accumulate` access mode. Commutative
+  atomic accumulation is the semantics that the `Accumulate` documentation in
+  `crates/ryft-core/src/programs/references/semantics.rs` explicitly excludes from the ordered mode, and Phase 9
+  introduces it as the separate `AtomicAccumulate` mode: the program author promises order-independence, the
+  implementation promises tear-free exactly-once application, and results may differ bitwise across runs for
+  non-associative element types. Sequential
+  contexts admit both accumulation modes, because serializing atomic accumulations is an admitted execution; a
+  parallel grid region admits `AtomicAccumulate` and rejects ordered `Accumulate`, because an unspecified traversal
+  order cannot honor program-ordered accumulation. Non-commutative atomics such as exchange and compare-and-swap are
+  not accumulations and keep read/write-class reference semantics under the same sequentially consistent scope
+  contract.
 - Grid expansion creates independently scheduled program instances, each internally sequential; grid traversal order
   is not semantically observable. Tile lanes are values, not independently scheduled agents. Portable atomics are
   device-scoped and sequentially consistent: all admitted atomic operations participate in one total order consistent
@@ -762,6 +774,16 @@ kernel body executes.
 - [ ] Add masked load/store/swap, ordered accumulation, device-scoped sequentially consistent atomics, and async-copy
       tokens/waits with exact operation-local reference semantics. Define the typed extension contract used later by
       target barriers and semaphores without pretending they are portable operations.
+- [ ] Introduce the generic `ReferenceAccessMode::AtomicAccumulate` mode and `reference_atomic_add_update` operation
+      carrying the atomic/commutative semantics that the `Accumulate` documentation in
+      `crates/ryft-core/src/programs/references/semantics.rs` explicitly excludes from the ordered mode (§5.6). The
+      fixed exact-mode set forces every classifier, summary, display rendering,
+      and liveness action phrase to handle the variant at compile time. Region policies admit it wherever ordered
+      `Accumulate` is admitted and additionally through parallel grid inputs, where ordered `Accumulate` is rejected.
+      Discharge reuses `ReferenceAccumulationPolicy`, because sequential replay is an admitted execution of the
+      commutative contract. The update operand stays linear and therefore transposable. The first release keeps
+      `Effect::OrderedState` so that only the kernel boundary exploits same-root commutation; generic transforms gain
+      no reordering rights.
 - [ ] Define the portable sequentially consistent atomic model and device scope. Reject invalid combinations
       in core; defer otherwise valid but unavailable dtype/scope combinations to backend capability selection.
 - [ ] Add root/view overlap and race analysis for common affine block mappings.
@@ -773,7 +795,8 @@ kernel body executes.
 
 **Tests/docs:** all access modes; write-only full-output initialization and publication; ordered repeated stores;
 empty-grid/nonempty-output rejection; uninitialized reads; partial writes; escape/use-after-scope; sibling views;
-masked accesses; atomic contract tests; token linearity; statically provable async ordering/races; and liveness.
+masked accesses; atomic contract tests, including ordered-versus-atomic accumulation admission through sequential and
+parallel regions; token linearity; statically provable async ordering/races; and liveness.
 
 **Excludes:** unsafe arbitrary races and target encodings.
 
@@ -1175,8 +1198,11 @@ without any TPU dependency.
 
 - Kernel types/operations, grids, block mappings, references/scratch, effects, verifier, interpreter, builders, and
   transform rules.
+- The one deliberate core-vocabulary extension: `ReferenceAccessMode::AtomicAccumulate` and
+  `reference_atomic_add_update` in `programs::references` (Phase 9, §5.6), rippling through the exhaustive mode
+  classifiers, summaries, and region policies that the exact-mode set audits at compile time.
 - Existing reference, array, tracing, compilation, differentiation, batching, partial-evaluation, and program modules
-  only where the kernel operation participates in their established contracts.
+  otherwise change only where the kernel operation participates in their established contracts.
 
 ### `ryft-xla`
 

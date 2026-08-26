@@ -13,7 +13,7 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
-use crate::programs::references::{ReferenceAccessMode, ReferenceAliasKind, ReferenceOutputSemantics};
+use crate::programs::references::{ReferenceAccessMode, ReferenceAliasKind, ReferenceOutput};
 use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -564,7 +564,7 @@ impl ReferenceLifetimes {
         }
         let name = operation.name();
         let semantics = operation.reference_semantics();
-        for access in semantics.accesses() {
+        for access in semantics.inputs() {
             let Some(atom) = inputs.get(access.input_index()) else {
                 continue;
             };
@@ -597,7 +597,7 @@ impl ReferenceLifetimes {
     /// Records the consumptions and alias edges performed by one accepted application.
     fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
         let semantics = operation.reference_semantics();
-        for access in semantics.accesses() {
+        for access in semantics.inputs() {
             if access.mode().is_consuming()
                 && let Some(atom) = inputs.get(access.input_index())
             {
@@ -614,7 +614,7 @@ impl ReferenceLifetimes {
             }
         }
         for output in semantics.outputs() {
-            if let ReferenceOutputSemantics::Alias { output_index, input_index, kind } = *output
+            if let ReferenceOutput::Alias { output_index, input_index, kind } = *output
                 && let (Some(output_atom), Some(input_atom)) = (outputs.get(output_index), inputs.get(input_index))
             {
                 self.alias(*output_atom, *input_atom, kind == ReferenceAliasKind::View);
@@ -673,7 +673,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
-    use crate::programs::references::{ReferenceAccessMode, ReferenceInputAccess, ReferenceOperationSemantics};
+    use crate::programs::references::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
@@ -1436,8 +1436,8 @@ mod tests {
 
             fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
                 Cow::Owned(ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(1, ReferenceAccessMode::Read)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(1, ReferenceAccessMode::Read)],
                 ))
             }
         }
@@ -1495,23 +1495,20 @@ mod tests {
 
         let access = |name, mode| TestReferenceOperation {
             name,
-            semantics: ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, mode)]),
+            semantics: ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, mode)], Vec::new()),
             forwarded: None,
         };
         let alias = |name, kind| TestReferenceOperation {
             name,
             semantics: ReferenceOperationSemantics::new(
-                vec![ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind }],
                 Vec::new(),
+                vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind }],
             ),
             forwarded: None,
         };
         let allocation = TestReferenceOperation {
             name: "new_reference",
-            semantics: ReferenceOperationSemantics::new(
-                vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
-                Vec::new(),
-            ),
+            semantics: ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]),
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);

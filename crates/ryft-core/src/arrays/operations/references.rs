@@ -37,7 +37,7 @@ use crate::programs::{
     FreezeReference, FreezeReferenceOperation, NewReference, NewReferenceOperation, Operation, OperationFormatter,
     ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasKind,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
+    ReferenceDischargeableOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceWrite,
     ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
@@ -120,8 +120,8 @@ where
 // Both view operations preserve the canonical root without accessing its state.
 static REFERENCE_VIEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(
-        vec![ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
         Vec::new(),
+        vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
     )
 });
 
@@ -714,9 +714,9 @@ mod tests {
         assert!(index.effects().is_pure());
         assert_eq!(
             index.reference_semantics().outputs(),
-            &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
+            &[ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
         );
-        assert!(index.reference_semantics().accesses().is_empty());
+        assert!(index.reference_semantics().inputs().is_empty());
         assert_eq!(index.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
         assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
 

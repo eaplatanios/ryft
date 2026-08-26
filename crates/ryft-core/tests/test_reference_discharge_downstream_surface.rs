@@ -23,8 +23,8 @@ use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, InterpretableOperation, InterpretationDriver, NoIdentity,
     Operation, Parameter, Placeholder, Program, ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver,
     ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceInputAccess,
-    ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceSource, ReferenceStateBinding, ReferenceType,
+    ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceInput,
+    ReferenceOperationSemantics, ReferenceOutput, ReferenceSource, ReferenceStateBinding, ReferenceType,
     RegionInterface, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_preserved_access,
     discharge_reference_free_operation,
 };
@@ -311,24 +311,24 @@ impl Operation for RegisterOperation {
         match self {
             Self::Negate => Cow::Borrowed(ReferenceOperationSemantics::empty()),
             Self::NewReference => Cow::Owned(ReferenceOperationSemantics::new(
-                vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
                 Vec::new(),
+                vec![ReferenceOutput::Root { output_index: 0 }],
             )),
             Self::Read => Cow::Owned(ReferenceOperationSemantics::new(
+                vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
                 Vec::new(),
-                vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
             )),
             Self::Write => Cow::Owned(ReferenceOperationSemantics::new(
+                vec![ReferenceInput::new(0, ReferenceAccessMode::Write)],
                 Vec::new(),
-                vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
             )),
             Self::Swap => Cow::Owned(ReferenceOperationSemantics::new(
+                vec![ReferenceInput::new(0, ReferenceAccessMode::ReadWrite)],
                 Vec::new(),
-                vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
             )),
             Self::Freeze => Cow::Owned(ReferenceOperationSemantics::new(
+                vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)],
                 Vec::new(),
-                vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)],
             )),
         }
     }

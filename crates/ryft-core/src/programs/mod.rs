@@ -158,11 +158,11 @@ pub use references::{
     ReferenceDischargeDriver, ReferenceDischargePayload, ReferenceDischargePolicy, ReferenceDischargeReference,
     ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceError, ReferenceGeneration, ReferenceGuard,
-    ReferenceId, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceRead,
-    ReferenceReadOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource,
-    ReferenceStateBinding, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements,
-    ReferenceWrite, ReferenceWriteOperation, discharge_positional_region_operation, discharge_preserved_access,
+    ReferenceId, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionDischargeInput,
+    ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceSource, ReferenceStateBinding,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements, ReferenceWrite,
+    ReferenceWriteOperation, discharge_positional_region_operation, discharge_preserved_access,
     discharge_reference_free_operation,
 };
 pub use regions::{

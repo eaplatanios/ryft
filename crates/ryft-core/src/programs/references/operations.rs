@@ -6,6 +6,8 @@
 //! relationship between those types. Reference views remain value-family-owned because their coordinate
 //! transformations are not generic.
 
+// TODO(eaplatanios): Review from here onwards.
+
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -35,7 +37,7 @@ use super::discharge::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, discharge_preserved_access,
 };
 use super::semantics::{
-    ReferenceAccessMode, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics, ReferenceType,
+    ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceType,
 };
 
 /// Canonical operation name for [`NewReferenceOperation`].
@@ -126,28 +128,27 @@ pub trait FreezeReference<Output = Self>: Sized {
 
 // Reference semantics descriptors are constant per operation type. Sharing them through `LazyLock` statics lets the
 // per-instruction program analysis read them through `Cow::Borrowed` without allocating.
-static NEW_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }], Vec::new())
-});
+static NEW_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> =
+    LazyLock::new(|| ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]));
 
 static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)])
+    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Read)], Vec::new())
 });
 
 static REFERENCE_WRITE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)])
+    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Write)], Vec::new())
 });
 
 static REFERENCE_SWAP_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)])
+    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::ReadWrite)], Vec::new())
 });
 
 static REFERENCE_ADD_UPDATE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Accumulate)])
+    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Accumulate)], Vec::new())
 });
 
 static FREEZE_REFERENCE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)])
+    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)], Vec::new())
 });
 
 macro_rules! define_reference_primitive_payload {
@@ -1967,31 +1968,22 @@ mod tests {
         assert_eq!(AddUpdate::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Freeze::new().effects(), Effects::single(Effect::OrderedState));
 
-        assert_eq!(
-            New::new().reference_semantics().outputs(),
-            &[ReferenceOutputSemantics::NewRoot { output_index: 0 }],
-        );
-        assert_eq!(New::new().reference_semantics().accesses(), &[]);
+        assert_eq!(New::new().reference_semantics().outputs(), &[ReferenceOutput::Root { output_index: 0 }],);
+        assert_eq!(New::new().reference_semantics().inputs(), &[]);
         assert_eq!(Read::new().reference_semantics().outputs(), &[]);
+        assert_eq!(Read::new().reference_semantics().inputs(), &[ReferenceInput::new(0, ReferenceAccessMode::Read)],);
+        assert_eq!(Write::new().reference_semantics().inputs(), &[ReferenceInput::new(0, ReferenceAccessMode::Write)],);
         assert_eq!(
-            Read::new().reference_semantics().accesses(),
-            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
+            Swap::new().reference_semantics().inputs(),
+            &[ReferenceInput::new(0, ReferenceAccessMode::ReadWrite)],
         );
         assert_eq!(
-            Write::new().reference_semantics().accesses(),
-            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
+            AddUpdate::new().reference_semantics().inputs(),
+            &[ReferenceInput::new(0, ReferenceAccessMode::Accumulate)],
         );
         assert_eq!(
-            Swap::new().reference_semantics().accesses(),
-            &[ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
-        );
-        assert_eq!(
-            AddUpdate::new().reference_semantics().accesses(),
-            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Accumulate)],
-        );
-        assert_eq!(
-            Freeze::new().reference_semantics().accesses(),
-            &[ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)],
+            Freeze::new().reference_semantics().inputs(),
+            &[ReferenceInput::new(0, ReferenceAccessMode::Consume)],
         );
     }
 

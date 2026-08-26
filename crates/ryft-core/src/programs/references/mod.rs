@@ -25,6 +25,40 @@
 //! A reference family has one canonical root and any number of aliases. An alias preserves the root while possibly
 //! selecting a narrower view. Every access resolves through that root, and consumption invalidates the whole family.
 //!
+//! # Roots, Aliases, and Views
+//!
+//! The reference vocabulary used throughout this module and its consumers is defined relative to one concept:
+//!
+//! - A **root** is the canonical mutable storage cell that a reference family denotes. Only
+//!   [`new_reference`](NewReferenceOperation) mints one. Eagerly, the root is the shared synchronized holder behind
+//!   every [`Reference`] clone; in operation semantics, it is the identity that [`ReferenceOutput::Root`] introduces
+//!   and [`ReferenceOutput::Alias`] preserves; during discharge, it is the unit of state threading, named by a
+//!   [`ReferenceRootHandle`].
+//! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
+//!   The root has its own referent — the type of the complete stored value — and a view's handle-local referent may
+//!   be narrower.
+//! - A **handle** is one name for a root: a program value of reference type, or an eager [`Reference`] clone.
+//! - An **alias** is a handle derived from another handle. It always denotes the same root, either identically or
+//!   through operation-owned view metadata ([`ReferenceAliasKind`]).
+//! - A **view** is a narrowing alias, such as the result of
+//!   [`reference_slice`](crate::arrays::ReferenceSliceOperation) or
+//!   [`reference_index`](crate::arrays::ReferenceIndexOperation): it selects part of the root's value while every
+//!   access through it still resolves to the root.
+//! - The **alias family** is the complete set of handles denoting one root. Mutation through any member is visible
+//!   through every other member.
+//! - A **whole-root handle** exposes the root's complete stored value with no narrowing view. State that crosses a
+//!   structured-region or discharge boundary is always whole-root; views are re-derived from the root inside the
+//!   region that needs them.
+//!
+//! Every handle resolves to exactly one root: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
+//! are structurally unrepresentable rather than merely rejected, so analyses reason about state per root. Access-mode
+//! summaries, discharge state threading, and race validation are per-root facts, and consumption
+//! ([`freeze_reference`](FreezeReferenceOperation)) is a whole-root lifetime event that invalidates the complete
+//! family, which is why consuming through a narrowing view is rejected. Roots also split by provenance: a *local*
+//! root is allocated inside the program and disappears entirely after discharge, while an *external* root denotes
+//! caller-owned state entering through a public input or capture ([`ReferenceSource`]) and is what a
+//! [`ReferenceStateBinding`] describes to the backend.
+//!
 //! # Module Structure
 //!
 //! The implementation is split by responsibility:
@@ -74,6 +108,8 @@
 //! These checks are complementary. Construction sees the source call, the eager holder sees runtime aliases and
 //! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
 
+// TODO(eaplatanios): Review this module.
+
 mod discharge;
 mod operations;
 mod runtime;
@@ -102,6 +138,6 @@ pub use runtime::{
     ReferenceGeneration, ReferenceGuard, ReferenceId,
 };
 pub use semantics::{
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceInputAccess, ReferenceOperationSemantics,
-    ReferenceOutputSemantics, ReferenceSource, ReferenceType, ReferenceTypeRefinements,
+    ReferenceAccessMode, ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
+    ReferenceSource, ReferenceType, ReferenceTypeRefinements,
 };

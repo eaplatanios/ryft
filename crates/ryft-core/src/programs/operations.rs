@@ -1064,7 +1064,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::Effect;
-    use crate::programs::references::ReferenceOutputSemantics;
+    use crate::programs::references::ReferenceOutput;
 
     use super::*;
 
@@ -1130,10 +1130,7 @@ mod tests {
         }
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-            Cow::Owned(ReferenceOperationSemantics::new(
-                vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
-                Vec::new(),
-            ))
+            Cow::Owned(ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]))
         }
 
         fn effects(&self) -> Effects {
@@ -1289,7 +1286,7 @@ mod tests {
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
         let semantics = operation.reference_semantics();
-        assert_eq!(semantics.outputs(), &[ReferenceOutputSemantics::NewRoot { output_index: 0 }]);
+        assert_eq!(semantics.outputs(), &[ReferenceOutput::Root { output_index: 0 }]);
         assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),

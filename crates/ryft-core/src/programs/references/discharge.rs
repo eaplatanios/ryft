@@ -91,6 +91,8 @@
 //! it; loop-shaped operations retain the symmetry their fixed-point contracts require. Every rebuilt region is
 //! validated against the roots and mutations its summary predicted before the parent environment accepts its outputs.
 
+// TODO(eaplatanios): Review from here onwards.
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -116,7 +118,7 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Concretizable, Value};
 use crate::tracing::TracingContext;
 
-use super::semantics::{ReferenceAccessMode, ReferenceOutputSemantics, ReferenceSource, ReferenceType};
+use super::semantics::{ReferenceAccessMode, ReferenceOutput, ReferenceSource, ReferenceType};
 
 /// Shared payload and logical external-state metadata of a reference discharge result.
 #[derive(Debug)]
@@ -672,7 +674,7 @@ where
                 instruction
                     .operation()
                     .reference_semantics()
-                    .new_root_output_indices()
+                    .root_output_indices()
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(move |output_index| ReferenceDischargeSite::Allocation {
@@ -764,7 +766,7 @@ where
                         )));
                     };
                     let operation = instruction.operation();
-                    let output_indices = operation.reference_semantics().new_root_output_indices().collect::<Vec<_>>();
+                    let output_indices = operation.reference_semantics().root_output_indices().collect::<Vec<_>>();
                     if output_indices.is_empty() {
                         return Err(ProgramError::MalformedProgram(format!(
                             "reference discharge selection names {site} but operation `{}` allocates no reference \
@@ -3643,7 +3645,7 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     for instruction in region.instructions() {
         let operation = instruction.operation();
         let semantics = operation.reference_semantics();
-        for access in semantics.accesses() {
+        for access in semantics.inputs() {
             let accessed = operand(instruction, access.input_index(), "an accessed")?;
             if let Some(root) = resolve(&roots, accessed, operation.name())? {
                 summary.record(root, access.mode(), operation.name())?;
@@ -3659,8 +3661,8 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
                 ))
             })?;
             let root = match output {
-                ReferenceOutputSemantics::NewRoot { .. } => None,
-                ReferenceOutputSemantics::Alias { input_index, .. } => {
+                ReferenceOutput::Root { .. } => None,
+                ReferenceOutput::Alias { input_index, .. } => {
                     resolve(&roots, operand(instruction, *input_index, "an aliased")?, operation.name())?
                 }
             };
@@ -4273,9 +4275,7 @@ mod tests {
 
     use crate::captures::CaptureReference;
 
-    use super::super::semantics::{
-        ReferenceAliasKind, ReferenceInputAccess, ReferenceOperationSemantics, ReferenceOutputSemantics,
-    };
+    use super::super::semantics::{ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput};
     use super::*;
 
     /// Minimal generic type universe for the boundary tests below: opaque indexed values plus references over them.
@@ -4408,17 +4408,16 @@ mod tests {
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             let semantics = match self {
-                Self::NewRoot => ReferenceOperationSemantics::new(
-                    vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
-                    Vec::new(),
-                ),
+                Self::NewRoot => {
+                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }])
+                }
                 Self::Read => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
                 ),
                 Self::Consume => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)],
                 ),
                 Self::Call => ReferenceOperationSemantics::default(),
             };
@@ -4849,37 +4848,32 @@ mod tests {
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             let semantics = match self {
-                Self::NewReference => ReferenceOperationSemantics::new(
-                    vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }],
-                    Vec::new(),
-                ),
+                Self::NewReference => {
+                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }])
+                }
                 Self::Slice { .. } => ReferenceOperationSemantics::new(
-                    vec![ReferenceOutputSemantics::Alias {
-                        output_index: 0,
-                        input_index: 0,
-                        kind: ReferenceAliasKind::View,
-                    }],
                     Vec::new(),
+                    vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
                 ),
                 Self::Read => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
                 ),
                 Self::Write => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Write)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Write)],
                 ),
                 Self::Swap => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::ReadWrite)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::ReadWrite)],
                 ),
                 Self::AddUpdate => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Accumulate)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Accumulate)],
                 ),
                 Self::Freeze => ReferenceOperationSemantics::new(
+                    vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)],
                     Vec::new(),
-                    vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Consume)],
                 ),
                 Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Call => {
                     return Cow::Borrowed(ReferenceOperationSemantics::empty());
@@ -5316,8 +5310,8 @@ mod tests {
                 match self {
                     Self::OrderedIo => Cow::Borrowed(ReferenceOperationSemantics::empty()),
                     Self::RetainedReference => Cow::Owned(ReferenceOperationSemantics::new(
+                        vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
                         Vec::new(),
-                        vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
                     )),
                 }
             }

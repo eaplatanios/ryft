@@ -10,8 +10,6 @@ use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceAccessMode {
@@ -21,9 +19,9 @@ pub enum ReferenceAccessMode {
     /// Replaces the selected referenced value without observing its previous contents.
     Write,
 
-    /// Observes the selected referenced value and replaces it with a successor in program order. A reference swap
-    /// operation remains [`ReferenceAccessMode::ReadWrite`] even when a caller leaves its old-value result dead:
-    /// liveness is a use-site fact, not operation semantics.
+    /// Observes the selected referenced value and replaces it with a successor in program order.
+    /// [`ReferenceSwapOperation`](crate::ReferenceSwapOperation) remains [`ReferenceAccessMode::ReadWrite`] even
+    /// when a caller leaves its old-value result dead: liveness is a use-site fact, not operation semantics.
     ReadWrite,
 
     /// Combines an update with the current state as an _ordered_ additive accumulation. Accumulation stays distinct
@@ -34,13 +32,13 @@ pub enum ReferenceAccessMode {
     Accumulate,
 
     /// Consumes the root. After such an access the root and its entire alias family are rendered invalid. Consumption
-    /// is a lifetime event, not a memory-access flavor: `freeze` is the consuming access that also returns the final
-    /// value, and a future `free_reference` would consume without producing a result.
+    /// is a lifetime event, not a memory-access flavor: [`FreezeReferenceOperation`](crate::FreezeReferenceOperation)
+    /// is the consuming access that also returns the final value.
     Consume,
 }
 
 impl ReferenceAccessMode {
-    /// Returns whether this access consumes the complete reference root.
+    /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference root.
     #[inline]
     pub const fn is_consuming(self) -> bool {
         match self {
@@ -63,89 +61,97 @@ impl Display for ReferenceAccessMode {
     }
 }
 
-/// Kind of one root-preserving reference alias edge.
+/// Kind of a root-preserving [`ReferenceOutput::Alias`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum ReferenceAliasKind {
     /// The alias preserves the input handle's exact referent type and mapping.
     Identity,
 
-    /// The alias adds operation-owned view metadata validated by the value family's discharge policy.
+    /// The alias selects a view of the input handle's root, and the aliasing operation itself carries the metadata that
+    /// maps the new handle's coordinates onto that root. The generic program layer records only that the output aliases
+    /// the input's root; interpreting and validating the operation-owned metadata is the job of the value family's
+    /// reference discharge policy, which obtains it through the operation family's reference view operation contract.
+    ///
+    /// For example, [`ReferenceSliceOperation`](crate::ReferenceSliceOperation) declares `Alias { output_index: 0,
+    /// input_index: 0, kind: View }` specifying that its result is a handle onto the same root whose referent is the
+    /// sliced window, the slice axes live on the operation, and the array discharge policy reads those axes to
+    /// materialize or reconstruct the selected coordinates during discharge.
     View,
 }
 
-/// Reference classification of one operation output: either a fresh canonical root or an alias of one input's root.
-///
-/// The two cases are mutually exclusive by construction, so an output can never be declared as both a new root and
-/// an alias. [`Alias`](ReferenceOutputSemantics::Alias) carries exactly one `input_index` on purpose: every reference
-/// operand must resolve to exactly one canonical root, so multi-source aliases (e.g., a hypothetical
-/// `select_reference(a, b)`) are structurally unrepresentable rather than merely rejected. [`ReferenceAliasKind`]
-/// distinguishes an identity-preserving edge from an operation-owned view edge. Generic root analysis needs only that
-/// marker; the value family's discharge policy obtains and validates its exact metadata through the operation family's
-/// view-operation contract.
+/// Information about a [`Reference`](crate::Reference)-valued [`Operation`](crate::Operation) output.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ReferenceOutputSemantics {
-    /// The output allocates a fresh resource and defines a new canonical root.
-    NewRoot {
-        /// Operation output index defining the new root.
-        output_index: usize,
-    },
-
-    /// The output aliases the canonical root of one reference input.
-    Alias {
-        /// Operation output index producing the alias.
-        output_index: usize,
-
-        /// Operation input index whose canonical root is preserved.
-        input_index: usize,
-
-        /// Whether this edge preserves the exact handle or adds an operation-owned view mapping.
-        kind: ReferenceAliasKind,
-    },
-}
-
-impl ReferenceOutputSemantics {
-    /// Returns the operation output index this classification applies to.
-    #[inline]
-    pub const fn output_index(self) -> usize {
-        match self {
-            Self::NewRoot { output_index } | Self::Alias { output_index, .. } => output_index,
-        }
-    }
-}
-
-/// Reference access performed through one operation input.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ReferenceInputAccess {
-    /// Operation input index being accessed.
+pub struct ReferenceInput {
+    /// Index of the [`Operation`](crate::Operation) input being accessed.
     input_index: usize,
 
-    /// Semantic mode of the access.
+    /// [`ReferenceAccessMode`] of this [`ReferenceInput`].
     mode: ReferenceAccessMode,
 }
 
-impl ReferenceInputAccess {
-    /// Creates an access of `mode` through `input_index`.
+impl ReferenceInput {
+    /// Creates a new [`ReferenceInput`].
     #[inline]
     pub const fn new(input_index: usize, mode: ReferenceAccessMode) -> Self {
         Self { input_index, mode }
     }
 
-    /// Returns the operation input index being accessed.
+    /// Returns the index of the [`Operation`](crate::Operation) input being accessed.
     #[inline]
     pub const fn input_index(self) -> usize {
         self.input_index
     }
 
-    /// Returns the semantic mode of this access.
+    /// Returns the [`ReferenceAccessMode`] of this [`ReferenceInput`].
     #[inline]
     pub const fn mode(self) -> ReferenceAccessMode {
         self.mode
     }
 }
 
-/// Operation-local reference semantics: output root/alias classification plus input accesses, expressed in
+/// Reference classification of a [`Reference`](crate::Reference)-valued [`Operation`](crate::Operation) output that is
+/// either a fresh canonical root or an alias of one input's root.The two cases are mutually exclusive by construction,
+/// so an output can never be declared as both a new root and an alias. [`Self::Alias`] carries exactly one
+/// `input_index` on purpose as every reference operand must resolve to exactly one canonical root, so multi-source
+/// aliases (e.g., a hypothetical `select_reference(a, b)`) are structurally unrepresentable rather than merely
+/// rejected. [`ReferenceAliasKind`] distinguishes an identity-preserving edge from an operation-owned view edge.
+/// Generic root analysis needs only that marker; the value family's discharge policy obtains and validates its exact
+/// metadata through the operation family's view-operation contract.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceOutput {
+    /// The output allocates a fresh resource and defines a new canonical root.
+    Root {
+        /// Index of the [`Operation`](crate::Operation) output defining the new root.
+        output_index: usize,
+    },
+
+    /// The output aliases the canonical root of a [`Reference`](crate::Reference)-valued input.
+    Alias {
+        /// Index of the [`Operation`](crate::Operation) output producing the alias.
+        output_index: usize,
+
+        /// [`Operation`](crate::Operation) input index whose canonical root is preserved.
+        input_index: usize,
+
+        /// [`ReferenceAliasKind`] specifying whether this alias preserves the exact handle or adds an
+        /// [`Operation`](crate::Operation)-owned view mapping.
+        kind: ReferenceAliasKind,
+    },
+}
+
+impl ReferenceOutput {
+    /// Returns the index of the [`Operation`](crate::Operation) output this [`ReferenceOutput`] corresponds to.
+    #[inline]
+    pub const fn output_index(self) -> usize {
+        match self {
+            Self::Root { output_index } | Self::Alias { output_index, .. } => output_index,
+        }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+/// Operation-local reference semantics: input accesses plus output root/alias classifications, expressed in
 /// operand/result index space.
 ///
 /// All indices are *operation-local operand and result positions*, never resource identifiers. Program-level
@@ -159,60 +165,67 @@ impl ReferenceInputAccess {
 ///
 /// ```text
 /// new_reference(x) -> r
-///     outputs  = [NewRoot { output_index: 0 }]
-///     accesses = []
+///     inputs  = []
+///     outputs = [Root { output_index: 0 }]
 ///
 /// reference_read(r) -> x
-///     outputs  = []
-///     accesses = [ReferenceInputAccess { input_index: 0, mode: Read }]
+///     inputs  = [ReferenceInput { input_index: 0, mode: Read }]
+///     outputs = []
 ///
 /// reference_write(r, x) -> ()
-///     outputs  = []
-///     accesses = [ReferenceInputAccess { input_index: 0, mode: Write }]
+///     inputs  = [ReferenceInput { input_index: 0, mode: Write }]
+///     outputs = []
 ///
 /// reference_swap(r, x) -> old
-///     outputs  = []
-///     accesses = [ReferenceInputAccess { input_index: 0, mode: ReadWrite }]
+///     inputs  = [ReferenceInput { input_index: 0, mode: ReadWrite }]
+///     outputs = []
 ///
 /// reference_add_update(r, x) -> ()
-///     outputs  = []
-///     accesses = [ReferenceInputAccess { input_index: 0, mode: Accumulate }]
+///     inputs  = [ReferenceInput { input_index: 0, mode: Accumulate }]
+///     outputs = []
 ///
 /// freeze_reference(r) -> x
-///     outputs  = []
-///     accesses = [ReferenceInputAccess { input_index: 0, mode: Consume }]
+///     inputs  = [ReferenceInput { input_index: 0, mode: Consume }]
+///     outputs = []
 ///
 /// reference_index(r, axis, index) -> view
 /// reference_slice(r, axes) -> view
-///     outputs  = [Alias { output_index: 0, input_index: 0, kind: View }]
-///     accesses = []
+///     inputs  = []
+///     outputs = [Alias { output_index: 0, input_index: 0, kind: View }]
 /// ```
 ///
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOperationSemantics {
-    /// Classifications for the operation results that denote references. Ordinary SSA results are omitted.
-    outputs: Vec<ReferenceOutputSemantics>,
-
     /// State accesses through reference inputs.
-    accesses: Vec<ReferenceInputAccess>,
+    inputs: Vec<ReferenceInput>,
+
+    /// Classifications for the operation results that denote references. Ordinary SSA results are omitted.
+    outputs: Vec<ReferenceOutput>,
 }
 
 // Shared empty descriptor returned by `ReferenceOperationSemantics::empty` so that the `Operation` trait default can
 // hand out a borrow without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
 static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
-    ReferenceOperationSemantics { outputs: Vec::new(), accesses: Vec::new() };
+    ReferenceOperationSemantics { inputs: Vec::new(), outputs: Vec::new() };
 
 impl ReferenceOperationSemantics {
     /// Creates a reference semantics descriptor from its ordered components.
     ///
     /// # Panics
     ///
-    /// Panics when one output index receives two classifications or one input index receives two accesses. These are
-    /// operation-author contract violations: the documented mutual exclusivity of [`ReferenceOutputSemantics`] holds
+    /// Panics when one input index receives two accesses or one output index receives two classifications. These are
+    /// operation-author contract violations: the documented mutual exclusivity of [`ReferenceOutput`] holds
     /// only if each operand/result position appears at most once, and checked program construction trusts that
     /// invariant. Index ranges cannot be checked here because the descriptor carries no arity information; the
     /// builder validates them against each instruction's actual operand/result arity.
-    pub fn new(outputs: Vec<ReferenceOutputSemantics>, accesses: Vec<ReferenceInputAccess>) -> Self {
+    pub fn new(inputs: Vec<ReferenceInput>, outputs: Vec<ReferenceOutput>) -> Self {
+        for (index, access) in inputs.iter().enumerate() {
+            let input_index = access.input_index();
+            assert!(
+                inputs[..index].iter().all(|previous| previous.input_index() != input_index),
+                "input {input_index} received two reference accesses",
+            );
+        }
         for (index, output) in outputs.iter().enumerate() {
             let output_index = output.output_index();
             assert!(
@@ -220,14 +233,7 @@ impl ReferenceOperationSemantics {
                 "output {output_index} received two reference classifications",
             );
         }
-        for (index, access) in accesses.iter().enumerate() {
-            let input_index = access.input_index();
-            assert!(
-                accesses[..index].iter().all(|previous| previous.input_index() != input_index),
-                "input {input_index} received two reference accesses",
-            );
-        }
-        Self { outputs, accesses }
+        Self { inputs, outputs }
     }
 
     /// Validates that every position named by this descriptor exists in an operation application with the provided
@@ -262,12 +268,12 @@ impl ReferenceOperationSemantics {
                  {output_count}",
             )))
         };
-        for access in &self.accesses {
+        for access in &self.inputs {
             validate_input(access.input_index(), "an accessed")?;
         }
         for output in &self.outputs {
             validate_output(output.output_index())?;
-            if let ReferenceOutputSemantics::Alias { input_index, .. } = output {
+            if let ReferenceOutput::Alias { input_index, .. } = output {
                 validate_input(*input_index, "an aliased")?;
             }
         }
@@ -280,32 +286,32 @@ impl ReferenceOperationSemantics {
         &EMPTY_REFERENCE_OPERATION_SEMANTICS
     }
 
-    /// Returns whether this descriptor declares no reference outputs and no reference accesses.
+    /// Returns whether this descriptor declares no reference accesses and no reference outputs.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.outputs.is_empty() && self.accesses.is_empty()
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
+
+    /// Returns input reference accesses in deterministic operation-defined order.
+    #[inline]
+    pub fn inputs(&self) -> &[ReferenceInput] {
+        self.inputs.as_slice()
     }
 
     /// Returns output reference classifications in deterministic operation-defined order.
     #[inline]
-    pub fn outputs(&self) -> &[ReferenceOutputSemantics] {
+    pub fn outputs(&self) -> &[ReferenceOutput] {
         self.outputs.as_slice()
     }
 
     /// Returns the output positions at which this operation allocates a fresh reference root, in deterministic
     /// operation-defined order.
     #[inline]
-    pub fn new_root_output_indices(&self) -> impl Iterator<Item = usize> {
+    pub fn root_output_indices(&self) -> impl Iterator<Item = usize> {
         self.outputs.iter().filter_map(|output| match output {
-            ReferenceOutputSemantics::NewRoot { output_index } => Some(*output_index),
-            ReferenceOutputSemantics::Alias { .. } => None,
+            ReferenceOutput::Root { output_index } => Some(*output_index),
+            ReferenceOutput::Alias { .. } => None,
         })
-    }
-
-    /// Returns reference accesses in deterministic operation-defined order.
-    #[inline]
-    pub fn accesses(&self) -> &[ReferenceInputAccess] {
-        self.accesses.as_slice()
     }
 }
 
@@ -743,22 +749,22 @@ mod tests {
 
             fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
                 Cow::Owned(ReferenceOperationSemantics::new(
-                    vec![ReferenceOutputSemantics::Alias {
+                    Vec::new(),
+                    vec![ReferenceOutput::Alias {
                         output_index: 0,
                         input_index: 0,
                         kind: ReferenceAliasKind::Identity,
                     }],
-                    Vec::new(),
                 ))
             }
         }
 
         let semantics = TestAliasingOperation.reference_semantics();
-        assert!(semantics.accesses().is_empty());
+        assert!(semantics.inputs().is_empty());
         assert!(!semantics.is_empty());
         assert_eq!(
             semantics.outputs(),
-            &[ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::Identity }],
+            &[ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::Identity }],
         );
         assert_eq!(ReferenceOperationSemantics::empty(), &ReferenceOperationSemantics::default());
         assert!(ReferenceOperationSemantics::empty().is_empty());
@@ -770,17 +776,13 @@ mod tests {
     #[test]
     fn test_reference_semantics_validates_application_arity() {
         let semantics = ReferenceOperationSemantics::new(
-            vec![ReferenceOutputSemantics::Alias {
-                output_index: 0,
-                input_index: 1,
-                kind: ReferenceAliasKind::Identity,
-            }],
-            vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
+            vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
+            vec![ReferenceOutput::Alias { output_index: 0, input_index: 1, kind: ReferenceAliasKind::Identity }],
         );
         assert_eq!(semantics.validate_arity("test.alias", 2, 1), Ok(()));
 
         let invalid_access =
-            ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(2, ReferenceAccessMode::Read)]);
+            ReferenceOperationSemantics::new(vec![ReferenceInput::new(2, ReferenceAccessMode::Read)], Vec::new());
         assert_eq!(
             invalid_access.validate_arity("test.read", 2, 0),
             Err(ProgramError::MalformedProgram(
@@ -789,12 +791,8 @@ mod tests {
         );
 
         let invalid_alias_input = ReferenceOperationSemantics::new(
-            vec![ReferenceOutputSemantics::Alias {
-                output_index: 0,
-                input_index: 1,
-                kind: ReferenceAliasKind::Identity,
-            }],
             Vec::new(),
+            vec![ReferenceOutput::Alias { output_index: 0, input_index: 1, kind: ReferenceAliasKind::Identity }],
         );
         assert_eq!(
             invalid_alias_input.validate_arity("test.alias", 1, 1),
@@ -804,12 +802,8 @@ mod tests {
         );
 
         let invalid_alias_output = ReferenceOperationSemantics::new(
-            vec![ReferenceOutputSemantics::Alias {
-                output_index: 1,
-                input_index: 0,
-                kind: ReferenceAliasKind::Identity,
-            }],
             Vec::new(),
+            vec![ReferenceOutput::Alias { output_index: 1, input_index: 0, kind: ReferenceAliasKind::Identity }],
         );
         assert_eq!(
             invalid_alias_output.validate_arity("test.alias", 1, 1),
@@ -818,10 +812,10 @@ mod tests {
             )),
         );
 
-        let invalid_new_root =
-            ReferenceOperationSemantics::new(vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }], Vec::new());
+        let invalid_root =
+            ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]);
         assert_eq!(
-            invalid_new_root.validate_arity("test.new_reference", 1, 0),
+            invalid_root.validate_arity("test.new_reference", 1, 0),
             Err(ProgramError::MalformedProgram(
                 "operation `test.new_reference` classifies output 0 but the application output count is 0".to_string(),
             )),
@@ -832,11 +826,11 @@ mod tests {
     #[should_panic(expected = "output 0 received two reference classifications")]
     fn test_reference_semantics_rejects_two_classifications_for_one_output() {
         ReferenceOperationSemantics::new(
-            vec![
-                ReferenceOutputSemantics::NewRoot { output_index: 0 },
-                ReferenceOutputSemantics::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::Identity },
-            ],
             Vec::new(),
+            vec![
+                ReferenceOutput::Root { output_index: 0 },
+                ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::Identity },
+            ],
         );
     }
 
@@ -844,11 +838,8 @@ mod tests {
     #[should_panic(expected = "input 0 received two reference accesses")]
     fn test_reference_semantics_rejects_two_accesses_for_one_input() {
         ReferenceOperationSemantics::new(
+            vec![ReferenceInput::new(0, ReferenceAccessMode::Read), ReferenceInput::new(0, ReferenceAccessMode::Write)],
             Vec::new(),
-            vec![
-                ReferenceInputAccess::new(0, ReferenceAccessMode::Read),
-                ReferenceInputAccess::new(0, ReferenceAccessMode::Write),
-            ],
         );
     }
 }
