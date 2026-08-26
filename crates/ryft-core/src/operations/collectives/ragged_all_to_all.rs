@@ -36,6 +36,7 @@ use crate::operations::cumulative::cumulative_sum::{CumulativeSum, CumulativeSum
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::conversion::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
@@ -45,7 +46,6 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::math::add::{Add, AddOperation};
 use crate::operations::math::mul::{Mul, MulOperation};
 use crate::operations::math::neg::{Neg, NegOperation};
-use crate::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError,
