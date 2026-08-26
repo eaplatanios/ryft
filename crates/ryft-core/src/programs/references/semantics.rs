@@ -154,8 +154,6 @@ impl ReferenceOutput {
 static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
     ReferenceOperationSemantics { inputs: Vec::new(), outputs: Vec::new() };
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Operation`](crate::Operation)-local reference semantics that describes the input [`Reference`](crate::Reference)
 /// accesses and the output root/alias [`Reference`](crate::Reference) classifications, expressed in operand/result
 /// index space. All indices are operation-local input/operand and output/result positions, never resource identifiers.
@@ -193,17 +191,21 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 ///     outputs = []
 ///
 /// reference_index(r, axis, index) -> view
+///     inputs  = []
+///     outputs = [Alias { output_index: 0, input_index: 0, kind: View }]
+///
 /// reference_slice(r, axes) -> view
 ///     inputs  = []
 ///     outputs = [Alias { output_index: 0, input_index: 0, kind: View }]
 /// ```
-///
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOperationSemantics {
-    /// State accesses through reference inputs.
+    /// [`ReferenceInput`]s of the underlying [`Operation`](crate::Operation). Ordinary Single Static Assignment (SSA)
+    /// value (i.e., non-reference) inputs are omitted from this list.
     inputs: Vec<ReferenceInput>,
 
-    /// Classifications for the operation results that denote references. Ordinary SSA results are omitted.
+    /// [`ReferenceOutput`]s of the underlying [`Operation`](crate::Operation). Ordinary Single Static Assignment (SSA)
+    /// value (i.e., non-reference) outputs are omitted from this list.
     outputs: Vec<ReferenceOutput>,
 }
 
@@ -233,6 +235,46 @@ impl ReferenceOperationSemantics {
             );
         }
         Self { inputs, outputs }
+    }
+
+    /// Returns the shared empty [`ReferenceOperationSemantics`] used by [`Operation`](crate::Operation)s that neither
+    /// create, alias, nor access [`Reference`](crate::Reference)s.
+    #[inline]
+    pub fn empty() -> &'static Self {
+        &EMPTY_REFERENCE_OPERATION_SEMANTICS
+    }
+
+    /// Returns `true` if this [`ReferenceOperationSemantics`] declares no reference accesses and no reference outputs,
+    /// and `false` otherwise.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
+
+    /// Returns the [`ReferenceInput`]s of the underlying [`Operation`](crate::Operation) in operation-defined order.
+    /// Ordinary Single Static Assignment (SSA) value (i.e., non-reference) inputs are omitted from this list.
+    #[inline]
+    pub fn inputs(&self) -> &[ReferenceInput] {
+        self.inputs.as_slice()
+    }
+
+    /// Returns the [`ReferenceOutput`]s of the underlying [`Operation`](crate::Operation) in operation-defined order.
+    /// Ordinary Single Static Assignment (SSA) value (i.e., non-reference) outputs are omitted from this list.
+    #[inline]
+    pub fn outputs(&self) -> &[ReferenceOutput] {
+        self.outputs.as_slice()
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Returns the output positions at which this operation allocates a fresh reference root, in deterministic
+    /// operation-defined order.
+    #[inline]
+    pub fn root_output_indices(&self) -> impl Iterator<Item = usize> {
+        self.outputs.iter().filter_map(|output| match output {
+            ReferenceOutput::Root { output_index } => Some(*output_index),
+            ReferenceOutput::Alias { .. } => None,
+        })
     }
 
     /// Validates that every position named by this descriptor exists in an operation application with the provided
@@ -277,40 +319,6 @@ impl ReferenceOperationSemantics {
             }
         }
         Ok(())
-    }
-
-    /// Returns the shared empty descriptor used by operations that neither create, alias, nor access references.
-    #[inline]
-    pub fn empty() -> &'static Self {
-        &EMPTY_REFERENCE_OPERATION_SEMANTICS
-    }
-
-    /// Returns whether this descriptor declares no reference accesses and no reference outputs.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inputs.is_empty() && self.outputs.is_empty()
-    }
-
-    /// Returns input reference accesses in deterministic operation-defined order.
-    #[inline]
-    pub fn inputs(&self) -> &[ReferenceInput] {
-        self.inputs.as_slice()
-    }
-
-    /// Returns output reference classifications in deterministic operation-defined order.
-    #[inline]
-    pub fn outputs(&self) -> &[ReferenceOutput] {
-        self.outputs.as_slice()
-    }
-
-    /// Returns the output positions at which this operation allocates a fresh reference root, in deterministic
-    /// operation-defined order.
-    #[inline]
-    pub fn root_output_indices(&self) -> impl Iterator<Item = usize> {
-        self.outputs.iter().filter_map(|output| match output {
-            ReferenceOutput::Root { output_index } => Some(*output_index),
-            ReferenceOutput::Alias { .. } => None,
-        })
     }
 }
 
