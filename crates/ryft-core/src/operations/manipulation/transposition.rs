@@ -1,7 +1,10 @@
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
+use std::sync::Arc;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Shape, Sharding};
+use crate::arrays::{
+    Array, ArrayAddressing, ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Shape, Sharding,
+};
 use crate::axes::{Axes, Axis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -285,9 +288,23 @@ where
             None => (self.permutation().to_vec(), None),
         };
         let lifted_operation = TransposeOperation::new(lifted_permutation);
-        Ok(lifted_operation
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+        let mut outputs = lifted_operation.interpret_with_batch_axes(
+            context,
+            inputs,
+            &[BatchAxis::from_optional_position(output_axis)],
+        )?;
+        let output_axes = lifted_operation.permutation().inverse()?.iter().copied().map(Some).collect::<Vec<_>>();
+        let ragged_axes = inputs[0]
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| {
+                // `output_axes` is the total inverse of a validated permutation, so every stored input axis survives.
+                ragged_axis.relocated(output_axes.as_slice()).unwrap()
+            })
+            .collect();
+        let output = outputs.remove(0).with_ragged_axes(ragged_axes)?;
+        Ok(vec![output].into())
     }
 }
 
@@ -425,6 +442,36 @@ impl Transpose for ArrayType {
     }
 }
 
+impl Transpose for Array {
+    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
+        // Validate the permutation and compute the output type (including sharding) via the type-level rule,
+        // so that an out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
+        let permutation = permutation.into();
+        let output_type = self.r#type().transpose(permutation.clone())?;
+        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
+            return Ok(self.clone());
+        }
+        let rank = self.r#type().rank();
+        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
+        let output_addressing = ArrayAddressing::new(output_type.clone())?;
+        let mut bytes = vec![0; output_addressing.storage_byte_len()];
+        if output_addressing.element_count() == 0 {
+            return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
+        }
+        let mut output_index = vec![0usize; rank];
+        let mut input_index = vec![0usize; rank];
+        for output_flat in 0..output_addressing.element_count() {
+            for (position, &input_axis) in permutation.iter().enumerate() {
+                input_index[input_axis] = output_index[position];
+            }
+            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
+                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
+            output_addressing.advance_index(&mut output_index);
+        }
+        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
+    }
+}
+
 impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
     Transpose for V
 {
@@ -450,7 +497,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionVariable, Layout, LogicalMesh, Memory,
-        MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
+        MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiableOperation, TransposableOperation};
@@ -687,6 +734,43 @@ mod tests {
                     outputs = [(@mapped(axis = 3), trailing_axis_output)],
                 },
             ],
+        );
+
+        // Ragged metadata names physical packed axes, so the lifted transpose must apply its inverse axis map to the
+        // ragged dimension and every extent axis while preserving the mapped batch axis.
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let extents = Array::matrix(2, 2, vec![1_i32, 4, 2, 3]);
+        let packed =
+            Array::from_f64s(ArrayType::new_static(DataType::F64, [2, 2, 3, 4]), (0..48).map(f64::from).collect());
+        let expected_value = packed.transpose([3, 1, 0, 2]).unwrap();
+        let input = ArrayBatch::new(packed, BatchAxis::new(1))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(3, extents.clone(), length.clone(), vec![0, 1])])
+            .unwrap();
+        assert!(matches!(
+            TransposeOperation::new([0, 1]).batch(
+                &BatchingContext::new(EagerContext::<Array>::new(), 2),
+                &EmptyRegionDriver,
+                std::slice::from_ref(&input),
+            ),
+            Err(BatchingError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "`transpose` permutation has length 3 but input has rank 4",
+        ));
+        let output = TransposeOperation::new([2, 0, 1])
+            .batch(&BatchingContext::new(EagerContext::<Array>::new(), 2), &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts()
+            .0
+            .remove(0);
+        assert_eq!(output.value(), &expected_value);
+        assert_eq!(output.batch_axis(), BatchAxis::new(1));
+        assert_eq!(output.ragged_axes(), &[RaggedAxis::new(0, extents, length.clone(), vec![2, 1])]);
+        assert_eq!(
+            output.unbatched_type(),
+            ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Dynamic(length), Dimension::Static(2), Dimension::Static(3)]),
+            ),
         );
 
         // Transpose only reorders axes, so its batching rule also works when the mapped dimension is symbolic. It
@@ -961,6 +1045,15 @@ mod tests {
         let expected = [0, 3, 1, 4, 2, 5].map(|value| ComplexNumber::new(f64::from(value), -f64::from(value))).to_vec();
         assert_eq!(input.transpose([1, 0]), Ok(Array::matrix(3, 2, expected)));
 
+        // Transposition reads the input through its physical layout and produces the canonical layout-free output.
+        let input_type =
+            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
+        let input = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
+        let output = input.transpose([1, 0]).unwrap();
+        assert_eq!(output.r#type().into_owned(), ArrayType::new_static(DataType::U16, [3, 2]));
+        assert_eq!(output.elements::<u16>(), Ok(vec![1, 4, 2, 5, 3, 6]));
+        assert_eq!(output.storage_bytes(), [1, 0, 4, 0, 2, 0, 5, 0, 3, 0, 6, 0]);
+
         // Rank-3 permutation moving the last axis to the front.
         let input_type = ArrayType::new(
             DataType::F64,
@@ -994,6 +1087,13 @@ mod tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(0)]))
         );
         assert_eq!(output.to_f64s(), Vec::<f64>::new());
+
+        // Empty arrays do not calculate strides for irrelevant dimensions, whose products need not fit in `usize`.
+        let input = Array::new(ArrayType::new_static(DataType::F64, [0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
+        assert_eq!(
+            input.transpose([1, 2, 0]),
+            Ok(Array::new(ArrayType::new_static(DataType::F64, [usize::MAX, usize::MAX, 0]), Vec::new()).unwrap()),
+        );
 
         // An invalid permutation is a clean error rather than an out-of-bounds panic, since the value-level transpose
         // validates the permutation through the type-level rule before indexing.

@@ -2,6 +2,7 @@ pub mod broadcasting;
 pub mod concatenation;
 pub mod conversion;
 pub mod gathering;
+pub mod memory;
 pub mod padding;
 pub mod reshaping;
 pub mod scattering;
@@ -16,6 +17,7 @@ pub use conversion::{
     CONVERT_ELEMENT_TYPE_OPERATION_NAME, ConvertElementType, ConvertElementTypeOperation, ElementType,
 };
 pub use gathering::{GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode};
+pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use padding::{PAD_OPERATION_NAME, Pad, PadOperation};
 pub use reshaping::{
     DynamicReshape, DynamicReshapeOperation, RESHAPE_OPERATION_NAME, Reshape, ReshapeOperation, ReshapeParameters,

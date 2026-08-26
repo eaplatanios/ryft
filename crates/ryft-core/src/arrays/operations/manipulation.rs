@@ -115,36 +115,6 @@ impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape for ArrayIrValue<A> {
     }
 }
 
-impl Transpose for Array {
-    fn transpose<P: Into<Permutation>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        // Validate the permutation and compute the output type (including sharding) via the type-level rule, so an
-        // out-of-range or duplicated axis is a clean error rather than an out-of-bounds panic.
-        let permutation = permutation.into();
-        let output_type = self.r#type().transpose(permutation.clone())?;
-        if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
-            return Ok(self.clone());
-        }
-        let rank = self.r#type().rank();
-        let input_addressing = ArrayAddressing::new(self.r#type().into_owned())?;
-        let output_addressing = ArrayAddressing::new(output_type.clone())?;
-        let mut bytes = vec![0; output_addressing.storage_byte_len()];
-        if output_addressing.element_count() == 0 {
-            return Ok(Self::new_unchecked(output_type, Arc::new(bytes)));
-        }
-        let mut output_index = vec![0usize; rank];
-        let mut input_index = vec![0usize; rank];
-        for output_flat in 0..output_addressing.element_count() {
-            for (position, &input_axis) in permutation.iter().enumerate() {
-                input_index[input_axis] = output_index[position];
-            }
-            bytes[output_addressing.byte_range_for_flat_index(output_flat)]
-                .copy_from_slice(&self.storage_bytes()[input_addressing.byte_range_unchecked(&input_index)]);
-            output_addressing.advance_index(&mut output_index);
-        }
-        Ok(Self::new_unchecked(output_type, Arc::new(bytes)))
-    }
-}
-
 impl Reshape for Array {
     fn reshape<P: Into<ReshapeParameters>>(&self, parameters: P) -> Result<Self, ProgramError> {
         // Delegate to the type-level reshape so all element-count and sharding validation remains shared with staged
@@ -2995,31 +2965,6 @@ in (%4)
                     if message == "cannot materialize a value of dynamically sized type f64[dynamic, dynamic]",
             ));
         }
-    }
-
-    #[test]
-    fn test_array_transpose() {
-        let matrix = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let transposed = matrix.transpose([1, 0]).unwrap();
-        assert_eq!(transposed.r#type().into_owned(), ArrayType::new_static(DataType::F64, [3, 2]));
-        assert_eq!(transposed.to_f64s(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-        assert!(matrix.transpose([0, 0]).is_err());
-
-        // Transposition traverses the input's physical layout while producing the canonical layout-free output type.
-        let input_type =
-            ArrayType::new_static(DataType::U16, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 2])));
-        let matrix = Array::from_elements(input_type, &[1u16, 2, 3, 4, 5, 6]).unwrap();
-        let transposed = matrix.transpose([1, 0]).unwrap();
-        assert_eq!(transposed.r#type().into_owned(), ArrayType::new_static(DataType::U16, [3, 2]));
-        assert_eq!(transposed.elements::<u16>(), Ok(vec![1, 4, 2, 5, 3, 6]));
-        assert_eq!(transposed.storage_bytes(), [1, 0, 4, 0, 2, 0, 5, 0, 3, 0, 6, 0]);
-
-        // Empty arrays transpose without calculating strides that may overflow for otherwise irrelevant dimensions.
-        let empty = Array::new(ArrayType::new_static(DataType::F64, [0, usize::MAX, usize::MAX]), Vec::new()).unwrap();
-        assert_eq!(
-            empty.transpose([1, 2, 0]).unwrap(),
-            Array::new(ArrayType::new_static(DataType::F64, [usize::MAX, usize::MAX, 0]), Vec::new()).unwrap(),
-        );
     }
 
     #[test]
