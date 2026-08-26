@@ -959,7 +959,8 @@ where
         check_count!("input", body.input_ids(), inputs.len(), ProgramError);
         check_count!("output", body.output_ids(), inputs.len(), ProgramError);
         let condition_summary = context.region_summary(self, 0, condition, carries.as_slice())?;
-        let summary = condition_summary.merged(&context.region_summary(self, 1, body, carries.as_slice())?);
+        let body_summary = context.region_summary(self, 1, body, carries.as_slice())?;
+        let summary = body_summary.merged(&condition_summary);
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
@@ -4972,7 +4973,7 @@ mod tests {
         let context = ReferenceDischargeContext::<EagerContext<TestValue, TestOperation>, ArrayReferenceDischarge>::new(
             EagerContext::new(),
         );
-        let reference = context.allocate_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32)));
+        let reference = context.allocate_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32))).unwrap();
         let root = reference.expect_reference("the loop-carried root").unwrap().root();
         assert_eq!(
             context.region_summary(

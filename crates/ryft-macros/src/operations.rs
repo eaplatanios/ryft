@@ -1303,7 +1303,7 @@ impl OperationEnum {
     /// Generates the [`ReferenceDischargeableOperation`](ryft_core::ReferenceDischargeableOperation) dispatcher. The
     /// reference universe policy stays fully generic for every family, because a policy names the reference universe
     /// being threaded rather than the element universe the family's values belong to. Composite-native variants
-    /// delegate to their payload's own discharge rule, while member variants and bare generic extension variants
+    /// and bare generic extension variants delegate to their payload's own discharge rule, while member variants
     /// replay the complete enum through
     /// [`discharge_reference_free_operation`](ryft_core::discharge_reference_free_operation), which copies any
     /// attached regions across unchanged and rejects a reference operand or a region closure that reaches a
@@ -1330,14 +1330,14 @@ impl OperationEnum {
             __ReferenceDischargePolicy: #ryft::ReferenceDischargePolicy<__ParentContext>
         });
 
-        // Only composite-native payloads name a discharge rule of their own. The verbatim replay the remaining
-        // variants use needs no payload predicate: the impl already pins `__ParentContext::Operation` to this enum,
-        // `From<Self>` is reflexive, and `Clone` and `Operation<Type = T>` are already available on the enum.
+        // Composite-native and generic extension payloads name discharge rules of their own. Member payloads replay
+        // the enclosing enum instead because their operation type belongs to the projected member universe rather than
+        // the parent reference universe.
         discharge_where_clause.predicates.extend(
             variants
                 .iter()
                 .filter(|variant| {
-                    !variant.is_generic_extension && matches!(variant.class, OperationVariantClass::CompositeNative)
+                    variant.is_generic_extension || matches!(variant.class, OperationVariantClass::CompositeNative)
                 })
                 .map(|variant| {
                     let operation_type = &variant.program_payload_type;
@@ -1352,7 +1352,7 @@ impl OperationEnum {
         );
         let discharge_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            if variant.is_generic_extension || !matches!(variant.class, OperationVariantClass::CompositeNative) {
+            if !variant.is_generic_extension && !matches!(variant.class, OperationVariantClass::CompositeNative) {
                 // The payload is replayed as the enclosing enum rather than on its own, so the arm binds nothing.
                 quote! {
                     Self::#variant_ident(..) => {

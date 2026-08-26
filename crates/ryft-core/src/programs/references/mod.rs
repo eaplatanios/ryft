@@ -74,8 +74,6 @@
 //! These checks are complementary. Construction sees the source call, the eager holder sees runtime aliases and
 //! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
 
-// TODO(eaplatanios): Review this whole module, its submodules, and all of the documentation and tests.
-
 mod discharge;
 mod operations;
 mod runtime;
@@ -83,12 +81,13 @@ mod semantics;
 
 pub use discharge::{
     PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver, ReferenceAccumulationPolicy,
-    ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeReference, ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite,
-    ReferenceDischargeTracer, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionDischargeInput,
-    ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState, ReferenceStateBinding,
-    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePayload,
+    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
+    ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeTracer, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceRegionDischargeInput, ReferenceRegionSummary, ReferenceRootHandle, ReferenceRootState,
+    ReferenceStateBinding, discharge_positional_region_operation, discharge_preserved_access,
+    discharge_reference_free_operation,
 };
 pub use operations::{
     FREEZE_REFERENCE_OPERATION_NAME, FreezeReference, FreezeReferenceOperation, NEW_REFERENCE_OPERATION_NAME,
@@ -98,8 +97,9 @@ pub use operations::{
     ReferenceWriteOperation,
 };
 pub use runtime::{
-    PreparedReferenceValue, Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
-    ReferenceCompletionResult, ReferenceError, ReferenceGeneration, ReferenceGuard, ReferenceId,
+    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, Reference, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError,
+    ReferenceGeneration, ReferenceGuard, ReferenceId,
 };
 pub use semantics::{
     ReferenceAccessMode, ReferenceAliasKind, ReferenceInputAccess, ReferenceOperationSemantics,

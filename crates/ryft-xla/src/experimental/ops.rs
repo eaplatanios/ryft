@@ -16,16 +16,15 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
-    ArrayIrType, ArrayOperation, ArrayReferenceOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform,
-    ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram,
-    BatchingContext, BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant,
-    CaptureReference, CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable,
-    ConditionOperation, ConstantOperation, Context, ConvertElementTypeOperation, CosOperation,
-    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
-    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation,
-    DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation,
-    DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis,
+    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
+    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CompareOperation,
+    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
+    ConvertElementTypeOperation, CosOperation, CumulativeLogSumExpOperation, CumulativeMaxOperation,
+    CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
     DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
     DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
     DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
@@ -370,19 +369,6 @@ where
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<Constant>>),
-}
-
-impl<Constant> ArrayReferenceOperation for XlaOperation<Constant>
-where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-        match self {
-            Self::ReferenceIndex(operation) => Some(operation.transform()),
-            Self::ReferenceSlice(operation) => Some(operation.transform()),
-            _ => None,
-        }
-    }
 }
 
 impl<Constant> ArrayReferenceViewOperation for XlaOperation<Constant>
@@ -1360,19 +1346,17 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceOperation, ArrayReferenceViewTransform, ArraySliceAxis, ArrayType, CaptureReference,
-        CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
+        CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation,
+        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
         EmptyRegionDriver, FreezeReferenceOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
         NewReferenceOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder,
-        ProgramError, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceIndexOperation, ReferenceReadOperation,
-        ReferenceSliceOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
-        ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
-        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
-        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-        WhileOperation, ZeroOperation,
+        ProgramError, ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceReadOperation, ReferenceSource,
+        ReferenceStateBinding, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver,
+        RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
+        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -2532,26 +2516,6 @@ mod tests {
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::PublicInput { index: 0 });
         assert!(!discharged.external_states()[0].is_mutated());
         assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
-    }
-
-    #[test]
-    fn test_reference_view_transforms() {
-        // The only reference classification an operation family still declares is which of its members derive a
-        // root-preserving view, and with what coordinates. Everything else the kernel path needs is derived from
-        // `Operation::reference_semantics`, so a family has one declaration to keep honest rather than two.
-        let index = XlaOperation::<XlaConstant>::ReferenceIndex(ReferenceIndexOperation::new(0, 1));
-        assert_eq!(index.reference_view_transform(), Some(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }));
-        let axes = vec![ArraySliceAxis::new(1, 2, 1)];
-        let slice = XlaOperation::<XlaConstant>::ReferenceSlice(ReferenceSliceOperation::new(axes.clone()));
-        assert_eq!(slice.reference_view_transform(), Some(ArrayReferenceViewTransform::Slice { axes }));
-        assert_eq!(
-            XlaOperation::<XlaConstant>::ReferenceRead(ReferenceReadOperation::new()).reference_view_transform(),
-            None,
-        );
-        assert_eq!(
-            XlaOperation::<XlaConstant>::NewReference(NewReferenceOperation::new()).reference_view_transform(),
-            None,
-        );
     }
 
     #[test]

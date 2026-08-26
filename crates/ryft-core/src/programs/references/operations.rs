@@ -6,9 +6,6 @@
 //! relationship between those types. Reference views remain value-family-owned because their coordinate
 //! transformations are not generic.
 
-// TODO(eaplatanios): Review this module.
-// TODO(eaplatanios): Should this module be moved to `ryft_core::operations::reference`?
-
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -278,6 +275,12 @@ where
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let referent = <&T>::try_from(&input_types[0])?;
+        if referent.is_reference() {
+            return Err(TypeError::invalid(format!(
+                "`{NEW_REFERENCE_OPERATION_NAME}` cannot allocate a reference whose referent type `{referent}` is \
+                 itself a reference",
+            )));
+        }
         Ok(vec![ReferenceType::new(referent.clone()).into()])
     }
 
@@ -679,7 +682,7 @@ where
             ))
         })?;
         if context.selects_allocation(driver.instruction(), 0) {
-            return Ok(vec![context.allocate_discharged(r#type, initial)]);
+            return Ok(vec![context.allocate_discharged(r#type, initial)?]);
         }
 
         // An unselected allocation site survives, so the allocation is replayed and the root it binds is the
@@ -820,9 +823,9 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let reference = inputs[0].expect_reference("a reference to freeze")?;
         if reference.preserved().is_some() {
+            let outputs = discharge_preserved_access(self, context, inputs)?;
             // The replayed freeze produces the destination's own frozen value; all that remains is to stop the
             // environment from handing the consumed root out again.
-            let outputs = discharge_preserved_access(self, context, inputs)?;
             context.unbind_preserved(reference)?;
             return Ok(outputs);
         }
@@ -1131,6 +1134,90 @@ mod tests {
 
         fn is_reference(&self) -> bool {
             matches!(self, Self::Reference(_))
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum NestedTestType {
+        Reference(ReferenceType<TestReferent>),
+        Nested(ReferenceType<ReferenceType<TestReferent>>),
+    }
+
+    impl Display for NestedTestType {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Reference(r#type) => Display::fmt(r#type, formatter),
+                Self::Nested(r#type) => Display::fmt(r#type, formatter),
+            }
+        }
+    }
+
+    impl Parameter for NestedTestType {}
+
+    impl From<ReferenceType<ReferenceType<TestReferent>>> for NestedTestType {
+        fn from(r#type: ReferenceType<ReferenceType<TestReferent>>) -> Self {
+            Self::Nested(r#type)
+        }
+    }
+
+    impl<'t> TryFrom<&'t NestedTestType> for &'t ReferenceType<TestReferent> {
+        type Error = TypeError;
+
+        fn try_from(r#type: &'t NestedTestType) -> Result<Self, Self::Error> {
+            match r#type {
+                NestedTestType::Reference(r#type) => Ok(r#type),
+                NestedTestType::Nested(_) => {
+                    Err(TypeError::invalid("expected reference type but got nested reference type"))
+                }
+            }
+        }
+    }
+
+    impl Type for NestedTestType {
+        type Identity = TestIdentity;
+        type Refinements = ();
+
+        fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
+            match self {
+                Self::Reference(r#type) => r#type.identities().collect::<Vec<_>>(),
+                Self::Nested(r#type) => r#type.identities().collect::<Vec<_>>(),
+            }
+            .into_iter()
+        }
+
+        fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
+            Ok(match self {
+                Self::Reference(r#type) => Self::Reference(r#type.rename_identities(renaming)?),
+                Self::Nested(r#type) => Self::Nested(r#type.rename_identities(renaming)?),
+            })
+        }
+
+        fn is_compatible_with(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+                (Self::Nested(left), Self::Nested(right)) => left.is_compatible_with(right),
+                _ => false,
+            }
+        }
+
+        fn is_refined_by(&self, other: &Self) -> bool {
+            match (self, other) {
+                (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
+                (Self::Nested(left), Self::Nested(right)) => left.is_refined_by(right),
+                _ => false,
+            }
+        }
+
+        fn is_scalar(&self) -> bool {
+            false
+        }
+
+        fn is_complex(&self) -> bool {
+            false
+        }
+
+        fn is_reference(&self) -> bool {
+            true
         }
     }
 
@@ -1795,6 +1882,18 @@ mod tests {
     }
 
     #[test]
+    fn test_new_reference_rejects_nested_referent_types() {
+        let referent = ReferenceType::new(TestReferent::new(7, 16));
+        assert_eq!(
+            NewReferenceOperation::<ReferenceType<TestReferent>, NestedTestType>::new()
+                .infer_output_types(&[NestedTestType::Reference(referent.clone())], &[]),
+            Err(TypeError::invalid(format!(
+                "`new_reference` cannot allocate a reference whose referent type `{referent}` is itself a reference",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_generic_reference_primitive_arity_and_member_projection_errors() {
         let value = TestType::Value(TestReferent::new(7, 16));
         let reference = TestType::Reference(ReferenceType::new(TestReferent::new(7, 16)));
@@ -2011,7 +2110,7 @@ mod tests {
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);
-        let allocated = context.allocate_discharged(ReferenceType::new(REFERENT), initial);
+        let allocated = context.allocate_discharged(ReferenceType::new(REFERENT), initial).unwrap();
         let reference = allocated.expect_reference("the allocated root").unwrap().clone();
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),

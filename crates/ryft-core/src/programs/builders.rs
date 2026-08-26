@@ -197,6 +197,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 .collect()
         };
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
+        operation.reference_semantics().validate_arity(operation.name(), inputs.len(), output_types.len())?;
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(
             Instruction::new(operation, inputs, outputs, regions)
@@ -1411,6 +1412,49 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "region ^0 is not reachable from the program entry region",
         ));
+    }
+
+    #[test]
+    fn test_program_builder_rejects_invalid_reference_semantics_before_mutation() {
+        #[derive(Clone)]
+        struct InvalidReferenceOperation;
+
+        impl Operation for InvalidReferenceOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "test.invalid_reference"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+
+            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+                Cow::Owned(ReferenceOperationSemantics::new(
+                    Vec::new(),
+                    vec![ReferenceInputAccess::new(1, ReferenceAccessMode::Read)],
+                ))
+            }
+        }
+
+        let mut builder = ProgramBuilder::<Array, InvalidReferenceOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let atom_count = builder.atoms.len();
+        let instruction_count = builder.instructions.len();
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation, Vec::new(), vec![input], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(builder.atoms.len(), atom_count);
+        assert_eq!(builder.instructions.len(), instruction_count);
     }
 
     #[test]

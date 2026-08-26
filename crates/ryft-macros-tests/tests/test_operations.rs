@@ -2978,6 +2978,117 @@ fn test_operation_generates_reference_discharge_dispatch() {
     );
 }
 
+/// Generic extension operation with intrinsic reference behavior, used to prove that the enclosing derived family
+/// delegates discharge to the payload rule it advertises.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceAwareExtensionOperation;
+
+impl Operation for ReferenceAwareExtensionOperation {
+    type Type = ArrayType;
+
+    fn name(&self) -> &'static str {
+        "reference_aware_extension"
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+
+    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
+        std::borrow::Cow::Owned(ReferenceOperationSemantics::Read)
+    }
+}
+
+impl<C: Domain<Type = ArrayType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+    for ReferenceAwareExtensionOperation
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        _context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        _inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        Ok(vec![ReferenceDischargeValue::labeled("reference_aware_extension_rule")])
+    }
+}
+
+/// Generic extension operation with no reference behavior. Its explicit discharge rule is the compile-time proof that
+/// the payload is safe to replay; no runtime semantics test is needed in the generated dispatcher.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceFreeExtensionOperation;
+
+impl Operation for ReferenceFreeExtensionOperation {
+    type Type = ArrayType;
+
+    fn name(&self) -> &'static str {
+        "reference_free_extension"
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<C: Domain<Type = ArrayType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+    for ReferenceFreeExtensionOperation
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        _context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        _inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        Ok(vec![ReferenceDischargeValue::labeled("reference_free_extension_rule")])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(dispatch(discharge))]
+enum ExtensibleDischargeOperation<V: Value<Type = ArrayType>, Extension: Operation<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Constant(ConstantOperation<ArrayType, V>),
+    Extension(Extension),
+}
+
+#[test]
+fn test_operation_delegates_reference_discharge_to_generic_extensions() {
+    type ReferenceAwareOperation = ExtensibleDischargeOperation<Factor, ReferenceAwareExtensionOperation>;
+    type ReferenceFreeOperation = ExtensibleDischargeOperation<Factor, ReferenceFreeExtensionOperation>;
+
+    let reference_aware_context =
+        ReferenceDischargeContext::<TestContext<Factor, ReferenceAwareOperation>, TestReferenceDischargePolicy> {
+            parent: TestContext { marker: PhantomData },
+            policy: PhantomData,
+        };
+    assert_eq!(
+        ReferenceAwareOperation::Extension(ReferenceAwareExtensionOperation)
+            .discharge_references(&reference_aware_context, &EmptyRegionDriver, &[])
+            .unwrap(),
+        vec![ReferenceDischargeValue::labeled("reference_aware_extension_rule")],
+    );
+
+    let reference_free_context =
+        ReferenceDischargeContext::<TestContext<Factor, ReferenceFreeOperation>, TestReferenceDischargePolicy> {
+            parent: TestContext { marker: PhantomData },
+            policy: PhantomData,
+        };
+    assert_eq!(
+        ReferenceFreeOperation::Extension(ReferenceFreeExtensionOperation)
+            .discharge_references(&reference_free_context, &EmptyRegionDriver, &[])
+            .unwrap(),
+        vec![ReferenceDischargeValue::labeled("reference_free_extension_rule")],
+    );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
 #[ryft(dispatch(discharge, batching, differentiation, transposition))]

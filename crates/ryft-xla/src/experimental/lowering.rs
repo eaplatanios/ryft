@@ -4772,7 +4772,7 @@ pub(crate) fn to_mlir_module<
     // This module entry must enforce the same discharge preconditions as `lower_mlir_module_for_program`: these are
     // the only guards keeping unresolved state and references out of the shard-map token-threading machinery.
     if contains_unresolved_references(program) {
-        return Err(LoweringError::UnresolvedReference { construct: "program with unresolved references".to_string() });
+        return Err(LoweringError::UnresolvedReference { construct: "program".to_string() });
     }
     if contains_unresolved_state(program) {
         return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
@@ -4962,7 +4962,7 @@ where
     S: AsRef<str>,
 {
     if contains_unresolved_references(program) {
-        return Err(LoweringError::UnresolvedReference { construct: "program with unresolved references".to_string() });
+        return Err(LoweringError::UnresolvedReference { construct: "program".to_string() });
     }
     if contains_unresolved_state(program) {
         return Err(LoweringError::UnresolvedState { construct: "program".to_string() });
@@ -10427,8 +10427,7 @@ mod tests {
                 None,
                 None,
             ),
-            Err(LoweringError::UnresolvedReference { construct })
-                if construct == "program with unresolved references",
+            Err(LoweringError::UnresolvedReference { construct }) if construct == "program",
         ));
     }
 

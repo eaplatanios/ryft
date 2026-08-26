@@ -18,12 +18,12 @@ use ryft_core::{
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult,
-    ReferenceDischargeResult, ReferenceExecution, ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceSource,
-    ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
-    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
-    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    Operation, Parameterized, PendingReferenceReservations, Placeholder, ProgramError, Provenance, ProvenanceScope,
+    ReductionKind, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
+    ReferenceCompletionResult, ReferenceDischargeResult, ReferenceExecution, ReferenceGuard, ReferenceId,
+    ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest,
+    StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
+    TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -139,52 +139,6 @@ impl ReferenceCompletionBackend for XlaReferenceCompletion {
 /// Maps one backend-neutral completion failure back into the XLA domain's public error vocabulary.
 fn xla_reference_completion_error(reason: Arc<str>) -> XlaDomainError {
     XlaDomainError::AsynchronousReferenceExecution { reason: reason.to_string() }
-}
-
-/// Submitted mutation reservations that must be installed or generation-safely poisoned before leaving scope.
-struct PendingXlaReferenceReservations<'c> {
-    /// Identity-ordered holder generations reserved by one submitted execution.
-    reservations: Vec<(ArrayReference<Array<'c>>, ReferenceGeneration)>,
-
-    /// Whether drop still owns cleanup responsibility.
-    armed: bool,
-}
-
-impl<'c> PendingXlaReferenceReservations<'c> {
-    /// Creates an armed cleanup owner for `reservations`.
-    fn new(reservations: Vec<(ArrayReference<Array<'c>>, ReferenceGeneration)>) -> Self {
-        Self { reservations, armed: true }
-    }
-
-    /// Poisons every reservation with one shared failure and disarms drop cleanup.
-    ///
-    /// Poisoning must never panic: the armed [`Drop`] path runs during unwinding after an unexpected failure, where
-    /// a second panic would abort the process and leave the remaining holders reserved without notification. A
-    /// holder whose mutex is poisoned is skipped, because its own lock poisoning already fails every later access,
-    /// and a reservation whose generation has moved on was already resolved by its installer, so `poison_pending`
-    /// declining it needs no further action.
-    fn poison(&mut self, reason: impl Into<Arc<str>>) {
-        self.armed = false;
-        let reason = reason.into();
-        for (reference, generation) in &self.reservations {
-            if let Ok(mut guard) = reference.lock_root() {
-                guard.poison_pending(*generation, Arc::clone(&reason));
-            }
-        }
-    }
-
-    /// Disarms cleanup after every reservation has received its pending final value.
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for PendingXlaReferenceReservations<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.poison("submitted XLA reference execution ended before final state installation");
-        }
-    }
 }
 
 /// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
@@ -3056,7 +3010,7 @@ impl<'c> XlaDomain<'c> {
                 let (execution_arguments, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
                 let guard_storage = RefCell::new(Some(guards));
-                let publication: RefCell<Option<(ReferenceCompletion, PendingXlaReferenceReservations<'c>)>> =
+                let publication: RefCell<Option<(ReferenceCompletion, PendingReferenceReservations)>> =
                     RefCell::new(None);
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
@@ -3072,15 +3026,13 @@ impl<'c> XlaDomain<'c> {
                         for guard_index in &read_only_guard_indices {
                             guards[*guard_index].publish_read_lease_unchecked(completion.clone());
                         }
-                        for (guard_index, _, generation) in &mutated {
-                            guards[*guard_index].reserve_pending_unchecked(*generation, completion.clone());
-                        }
                         let reservations = mutated
                             .iter()
-                            .map(|(guard_index, _, generation)| (bindings[*guard_index].1.clone(), *generation))
+                            .map(|(guard_index, _, generation)| {
+                                guards[*guard_index].reserve_pending_unchecked(*generation, completion.clone())
+                            })
                             .collect();
-                        *publication.borrow_mut() =
-                            Some((completion, PendingXlaReferenceReservations::new(reservations)));
+                        *publication.borrow_mut() = Some((completion, PendingReferenceReservations::new(reservations)));
                         drop(stored_guards.take());
                     });
                 break 'snapshot (execution, input_refinements, mutated, publication.into_inner());

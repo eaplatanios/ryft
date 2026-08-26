@@ -3,6 +3,10 @@
 //! Indexing and slicing remain here because they require [`ArrayReferenceViewTransform`] geometry. The generic
 //! allocation, read, replacement, additive-update, and freeze payloads live in [`crate::programs::references`]; this
 //! module specializes them to [`ArrayIrType`] and implements their capabilities for array values and tracers.
+//!
+//! Staged and composite value calls validate the complete operand-type relationship before dispatching the operation.
+//! Their type diagnostics can therefore precede any eager holder-state error. Once an eager reference or derived view
+//! is reached, holder-state errors take precedence over replacement-type validation, as documented on that runtime API.
 
 // TODO(eaplatanios): Review this module.
 
@@ -63,13 +67,19 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceIndex<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+impl<V> ReferenceIndex<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<ReferenceIndexOperation>,
 {
-    fn reference_index(&self, axis: usize, index: usize) -> Result<V, ProgramError> {
-        self.value().reference_index(axis, index)
+    fn reference_index(
+        &self,
+        axis: usize,
+        index: usize,
+    ) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+        self.value().reference_index(axis, index)?.into_projected().map_err(Into::into)
     }
 }
 
@@ -92,13 +102,18 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceSlice<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+impl<V> ReferenceSlice<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<ReferenceSliceOperation>,
 {
-    fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<V, ProgramError> {
-        self.value().reference_slice(axes)
+    fn reference_slice(
+        &self,
+        axes: &[ArraySliceAxis],
+    ) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+        self.value().reference_slice(axes)?.into_projected().map_err(Into::into)
     }
 }
 
@@ -406,17 +421,19 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> NewReference<V> for ProjectedValue<ArrayType, V>
+impl<V> NewReference<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected> for ProjectedValue<ArrayType, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<NewReferenceOperation<ArrayType, ArrayIrType>>,
 {
-    fn new_reference(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
+    fn new_reference(&self) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+        self.value()
             .dispatch_domain()
             .bind(NewReferenceOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -433,17 +450,19 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceRead<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+impl<V> ReferenceRead<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
 {
-    fn read(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
+    fn read(&self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
+        self.value()
             .dispatch_domain()
             .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -491,18 +510,23 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> ReferenceSwap<ProjectedValue<ArrayType, V>, V>
+impl<V> ReferenceSwap<ProjectedValue<ArrayType, V>, <V as ValueProjection<ArrayType>>::Projected>
     for ProjectedValue<ReferenceType<ArrayType>, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<ReferenceSwapOperation<ArrayType, ArrayIrType>>,
 {
-    fn swap(&self, replacement: &ProjectedValue<ArrayType, V>) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
+    fn swap(
+        &self,
+        replacement: &ProjectedValue<ArrayType, V>,
+    ) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
+        self.value()
             .dispatch_domain()
             .bind(ReferenceSwapOperation::new(), Vec::new(), &[self.value().clone(), replacement.value().clone()])?
-            .remove(0))
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -545,16 +569,19 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType>> FreezeReference<V> for ProjectedValue<ReferenceType<ArrayType>, V>
+impl<V> FreezeReference<<V as ValueProjection<ArrayType>>::Projected> for ProjectedValue<ReferenceType<ArrayType>, V>
 where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
     <V::DispatchDomain as Domain>::Operation: From<FreezeReferenceOperation<ArrayType, ArrayIrType>>,
 {
-    fn freeze(self) -> Result<V, ProgramError> {
+    fn freeze(self) -> Result<<V as ValueProjection<ArrayType>>::Projected, ProgramError> {
         let domain = self.value().dispatch_domain();
-        Ok(domain
+        domain
             .bind(FreezeReferenceOperation::new(), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
+            .remove(0)
+            .into_projected()
+            .map_err(Into::into)
     }
 }
 
@@ -572,7 +599,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> ReferenceRead for ArrayIrValu
         ReferenceReadOperation::<ArrayType, ArrayIrType>::new()
             .infer_output_types(std::slice::from_ref(self.r#type().as_ref()), &[])?;
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        Ok(Self::Array(reference.read_view()?))
+        Ok(Self::Array(reference.read()?))
     }
 }
 
@@ -655,7 +682,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationContext;
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
+        Effect, Effects, EmptyRegionDriver, NEW_REFERENCE_OPERATION_NAME, ProgramBuilder, ProgramError,
+        REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -720,10 +748,12 @@ mod tests {
         // alias, and bind nothing: a view's coordinates are materialized at each access instead.
         let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
         let root_type = ArrayType::new_static(DataType::F32, [3, 3]);
-        let allocated = context.allocate_discharged(
-            ReferenceType::new(root_type.clone()),
-            TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
-        );
+        let allocated = context
+            .allocate_discharged(
+                ReferenceType::new(root_type.clone()),
+                TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
+            )
+            .unwrap();
         let root = allocated.expect_reference("the allocated root").unwrap().clone();
         let sliced = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)])
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&allocated))
@@ -1235,10 +1265,12 @@ mod tests {
                 let replacement = <TestTracer as ValueProjection<ArrayType>>::into_projected(replacement)?;
                 let update = <TestTracer as ValueProjection<ArrayType>>::into_projected(update)?;
                 let reference = initial.new_reference()?;
-                let reference = <TestTracer as ValueProjection<ReferenceType<ArrayType>>>::into_projected(reference)?;
+                let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &reference;
                 reference.write(&replacement)?;
                 reference.add_update(&update)?;
-                Ok(vec![reference.freeze()?])
+                let frozen = reference.freeze()?;
+                let _: &ProjectedValue<ArrayType, TestTracer> = &frozen;
+                Ok(vec![frozen.into_value()])
             },
             vec![array_type.clone(), array_type.clone(), array_type],
         )
@@ -1254,6 +1286,39 @@ mod tests {
                 in (%4)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_projected_reference_view_chains_preserve_projected_results() {
+        type TestContext = TracingContext<TestValue, TestOperation>;
+        type TestTracer = Tracer<TestContext>;
+
+        let (output_type, program) = TestContext::trace(
+            |input: TestTracer| {
+                let input = <TestTracer as ValueProjection<ArrayType>>::into_projected(input)?;
+                let reference = input.new_reference()?;
+                let sliced = reference.reference_slice(&[ArraySliceAxis::new(0, 2, 1)])?;
+                let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &sliced;
+                let indexed = sliced.reference_index(0, 1)?;
+                let _: &ProjectedValue<ReferenceType<ArrayType>, TestTracer> = &indexed;
+                let value = indexed.read()?;
+                let _: &ProjectedValue<ArrayType, TestTracer> = &value;
+                Ok(value.into_value())
+            },
+            ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+
+        assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec![
+                NEW_REFERENCE_OPERATION_NAME,
+                REFERENCE_SLICE_OPERATION_NAME,
+                REFERENCE_INDEX_OPERATION_NAME,
+                REFERENCE_READ_OPERATION_NAME,
+            ],
         );
     }
 

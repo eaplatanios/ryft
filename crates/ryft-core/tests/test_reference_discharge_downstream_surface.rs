@@ -379,7 +379,7 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].expect_ordinary("an initial state")?.clone();
                 if context.selects_allocation(driver.instruction(), 0) {
-                    return Ok(vec![context.allocate_discharged(ReferenceType::new(RegisterType), initial)]);
+                    return Ok(vec![context.allocate_discharged(ReferenceType::new(RegisterType), initial)?]);
                 }
                 let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -592,7 +592,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
         .unwrap();
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1));
+    let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
     let root = reference.expect_reference("a downstream root").unwrap().root();
     let summary = context
         .region_summary(&RegisterRegionOperation, 0, region.entry_region_ref(), &[Some(root), None])

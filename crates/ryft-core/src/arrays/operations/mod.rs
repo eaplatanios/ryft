@@ -13,7 +13,6 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::ArrayReferenceViewTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -240,7 +239,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 ///     [`Reshard`](crate::operations::sharding::Reshard),
 ///     [`ConstrainSharding`](crate::operations::sharding::ConstrainSharding),
 ///     [`ParallelReduce`](crate::operations::collectives::ParallelReduce), and
-///     [`TransferToMemory`](crate::operations::memory::TransferToMemory)), so that single-device generic code never
+///     [`TransferToMemory`](crate::operations::manipulation::memory::TransferToMemory)), so that single-device generic
+///     code never
 ///     carries sharded-programming obligations; and
 ///   - differentiation plumbing such as [`ReverseModeDifferentiate`](crate::differentiation::ReverseModeDifferentiate)
 ///     and the operation-family `From` bounds that transforms require of a domain.
@@ -543,19 +543,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
-/// Operation-family contract for array-reference analysis.
-///
-/// Generic [`Operation::reference_semantics`] identifies roots and aliases. This array-owned extension supplies the
-/// exact coordinate mapping for aliases classified as reference views, keeping array indexing metadata out of the
-/// generic program layer while giving every public analysis artifact a fully validated view mapping.
-pub trait ArrayReferenceOperation: Operation<Type = ArrayIrType> {
-    /// Returns the coordinate transform carried by a reference-view operation.
-    #[inline]
-    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-        None
-    }
-}
-
 /// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
 ///
 /// Mapping between a reference root and one derived handle's coordinates is a sequence of slices, reshapes, and
@@ -565,8 +552,6 @@ pub trait ArrayReferenceOperation: Operation<Type = ArrayIrType> {
 /// operations into a closed operation family it does not otherwise know the shape of, so core array IR and
 /// backend-owned supersets share one traversal without matching operation names.
 ///
-/// It is orthogonal to [`ArrayReferenceOperation`], which reports the view transform a member derives rather than
-/// constructing one: a consumer that only stages view accesses states this contract alone.
 pub trait ArrayReferenceViewOperation: Operation<Type = ArrayIrType> + Sized {
     /// Wraps a canonical homogeneous array reshape for reference-view staging.
     fn from_reference_reshape(operation: ReshapeOperation) -> Self;
@@ -576,16 +561,6 @@ pub trait ArrayReferenceViewOperation: Operation<Type = ArrayIrType> + Sized {
 
     /// Wraps a canonical homogeneous array update-slice for reference-view staging.
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
-}
-
-impl<A: Value<Type = ArrayType>> ArrayReferenceOperation for ArrayIrOperation<A> {
-    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-        match self {
-            Self::ReferenceIndex(operation) => Some(operation.transform()),
-            Self::ReferenceSlice(operation) => Some(operation.transform()),
-            _ => None,
-        }
-    }
 }
 
 impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperation<A> {

@@ -30,6 +30,10 @@
 //! because a consumed root has no successor state for a boundary to carry. Derived views do not cross any of these
 //! boundaries and must be recreated from the root inside the attached region.
 //!
+//! Mutation summaries are conservative: a write in either condition branch or in a loop/scan body publishes hidden
+//! final state and advances the external holder generation even when one execution takes the other branch, performs
+//! zero loop iterations, or scans a zero-length axis. In those executions the published state equals the input state.
+//!
 //! ```text
 //! local reference program
 //!     -> discharge to immutable array SSA, rejecting misuse against the root it reached
@@ -363,7 +367,7 @@ where
         let intermediates = alias.intermediates_in(&mut carrier, current.clone())?;
         let selected = intermediates.last().unwrap().clone();
         let accumulated = carrier.bind(C::Operation::from(AddOperation::new()), &[&selected, &update])?;
-        alias.reconstruct_in(&mut carrier, intermediates.as_slice(), accumulated)
+        alias.reconstruct_in(&mut carrier, &intermediates[..alias.transforms().len()], accumulated)
     }
 }
 
@@ -438,7 +442,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceOperation, ReferenceIndexOperation, ReferenceSliceOperation,
+        ArrayIrOperation, ArrayOperation, ReferenceIndexOperation, ReferenceSliceOperation,
     };
     use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform};
     use crate::arrays::types::data::DataType;
@@ -1402,8 +1406,7 @@ mod tests {
         assert_eq!(
             discharged.try_into_full().unwrap_err(),
             ProgramError::MalformedProgram(
-                "partial reference discharge result still contains a reference-typed value and cannot be converted \
-                 into a full discharge"
+                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
             ),
         );
@@ -2774,15 +2777,6 @@ mod tests {
                 match self {
                     Self::Native(operation) => operation.render(formatter, indentation),
                     Self::Call => formatter.write_str(self.name()),
-                }
-            }
-        }
-
-        impl ArrayReferenceOperation for CallingOperation {
-            fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-                match self {
-                    Self::Native(operation) => operation.reference_view_transform(),
-                    Self::Call => None,
                 }
             }
         }

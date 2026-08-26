@@ -31,8 +31,8 @@ pub use encoding::{
 pub use ir::ArrayIrValue;
 pub use macros::dispatch_on_array_element_type;
 pub use operations::{
-    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceOperation,
-    ArrayReferenceViewOperation, ArrayTracingContext, DimensionOperation, DimensionOperations, DimensionTracingContext,
+    ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceViewOperation,
+    ArrayTracingContext, DimensionOperation, DimensionOperations, DimensionTracingContext,
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
     ReferenceSlice, ReferenceSliceOperation,
 };

@@ -6,10 +6,9 @@ use serde::Serialize;
 use ryft_macros::Parameter;
 
 use crate::parameters::Parameter;
+use crate::programs::ProgramError;
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming};
 use crate::programs::types::{Type, TypeError, TypeRefinements};
-
-// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -69,7 +68,7 @@ pub enum ReferenceAliasKind {
     /// The alias preserves the input handle's exact referent type and mapping.
     Identity,
 
-    /// The alias adds operation-owned view metadata validated by the value family's owning analysis overlay.
+    /// The alias adds operation-owned view metadata validated by the value family's discharge policy.
     View,
 }
 
@@ -80,7 +79,8 @@ pub enum ReferenceAliasKind {
 /// operand must resolve to exactly one canonical root, so multi-source aliases (e.g., a hypothetical
 /// `select_reference(a, b)`) are structurally unrepresentable rather than merely rejected. [`ReferenceAliasKind`]
 /// distinguishes an identity-preserving edge from an operation-owned view edge. Generic root analysis needs only that
-/// marker; the value family's owning overlay obtains and validates its exact view metadata from the operation family.
+/// marker; the value family's discharge policy obtains and validates its exact metadata through the operation family's
+/// view-operation contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ReferenceOutputSemantics {
@@ -188,7 +188,7 @@ impl ReferenceInputAccess {
 ///
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOperationSemantics {
-    /// Reference classifications of operation outputs.
+    /// Classifications for the operation results that denote references. Ordinary SSA results are omitted.
     outputs: Vec<ReferenceOutputSemantics>,
 
     /// State accesses through reference inputs.
@@ -207,9 +207,9 @@ impl ReferenceOperationSemantics {
     ///
     /// Panics when one output index receives two classifications or one input index receives two accesses. These are
     /// operation-author contract violations: the documented mutual exclusivity of [`ReferenceOutputSemantics`] holds
-    /// only if each operand/result position appears at most once, and program-level analysis trusts that invariant.
-    /// Index ranges cannot be checked here because the descriptor carries no arity information; program-level
-    /// reference analysis validates them against each instruction's actual operand/result arity.
+    /// only if each operand/result position appears at most once, and checked program construction trusts that
+    /// invariant. Index ranges cannot be checked here because the descriptor carries no arity information; the
+    /// builder validates them against each instruction's actual operand/result arity.
     pub fn new(outputs: Vec<ReferenceOutputSemantics>, accesses: Vec<ReferenceInputAccess>) -> Self {
         for (index, output) in outputs.iter().enumerate() {
             let output_index = output.output_index();
@@ -226,6 +226,50 @@ impl ReferenceOperationSemantics {
             );
         }
         Self { outputs, accesses }
+    }
+
+    /// Validates that every position named by this descriptor exists in an operation application with the provided
+    /// input and output arity.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation_name`: Name of the operation whose descriptor is being validated.
+    ///   - `input_count`: Number of operands in the application.
+    ///   - `output_count`: Number of results inferred for the application.
+    pub(crate) fn validate_arity(
+        &self,
+        operation_name: &str,
+        input_count: usize,
+        output_count: usize,
+    ) -> Result<(), ProgramError> {
+        let validate_input = |input_index: usize, role: &str| {
+            if input_index < input_count {
+                return Ok(());
+            }
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{operation_name}` names {role} input {input_index} but the application input count is \
+                 {input_count}",
+            )))
+        };
+        let validate_output = |output_index: usize| {
+            if output_index < output_count {
+                return Ok(());
+            }
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `{operation_name}` classifies output {output_index} but the application output count is \
+                 {output_count}",
+            )))
+        };
+        for access in &self.accesses {
+            validate_input(access.input_index(), "an accessed")?;
+        }
+        for output in &self.outputs {
+            validate_output(output.output_index())?;
+            if let ReferenceOutputSemantics::Alias { input_index, .. } = output {
+                validate_input(*input_index, "an aliased")?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the shared empty descriptor used by operations that neither create, alias, nor access references.
@@ -719,6 +763,67 @@ mod tests {
 
         let boxed: Box<TestAliasingOperation> = Box::new(TestAliasingOperation);
         assert_eq!(boxed.reference_semantics(), TestAliasingOperation.reference_semantics());
+    }
+
+    #[test]
+    fn test_reference_semantics_validates_application_arity() {
+        let semantics = ReferenceOperationSemantics::new(
+            vec![ReferenceOutputSemantics::Alias {
+                output_index: 0,
+                input_index: 1,
+                kind: ReferenceAliasKind::Identity,
+            }],
+            vec![ReferenceInputAccess::new(0, ReferenceAccessMode::Read)],
+        );
+        assert_eq!(semantics.validate_arity("test.alias", 2, 1), Ok(()));
+
+        let invalid_access =
+            ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceInputAccess::new(2, ReferenceAccessMode::Read)]);
+        assert_eq!(
+            invalid_access.validate_arity("test.read", 2, 0),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.read` names an accessed input 2 but the application input count is 2".to_string(),
+            )),
+        );
+
+        let invalid_alias_input = ReferenceOperationSemantics::new(
+            vec![ReferenceOutputSemantics::Alias {
+                output_index: 0,
+                input_index: 1,
+                kind: ReferenceAliasKind::Identity,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            invalid_alias_input.validate_arity("test.alias", 1, 1),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.alias` names an aliased input 1 but the application input count is 1".to_string(),
+            )),
+        );
+
+        let invalid_alias_output = ReferenceOperationSemantics::new(
+            vec![ReferenceOutputSemantics::Alias {
+                output_index: 1,
+                input_index: 0,
+                kind: ReferenceAliasKind::Identity,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            invalid_alias_output.validate_arity("test.alias", 1, 1),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.alias` classifies output 1 but the application output count is 1".to_string(),
+            )),
+        );
+
+        let invalid_new_root =
+            ReferenceOperationSemantics::new(vec![ReferenceOutputSemantics::NewRoot { output_index: 0 }], Vec::new());
+        assert_eq!(
+            invalid_new_root.validate_arity("test.new_reference", 1, 0),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.new_reference` classifies output 0 but the application output count is 0".to_string(),
+            )),
+        );
     }
 
     #[test]

@@ -343,7 +343,7 @@ impl ArrayReferenceView {
         intermediates: &[C::Value],
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
-        if intermediates.len() < self.transforms.len() {
+        if intermediates.len() != self.transforms.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference view reconstruction requires {} parent snapshots but received {}",
                 self.transforms.len(),
@@ -374,7 +374,7 @@ impl ArrayReferenceView {
         // The traversal always pushes the root itself first, so the chain is never empty and its last snapshot is
         // the value this view selects.
         let previous = intermediates.last().unwrap().clone();
-        let reconstructed = self.reconstruct_in(carrier, intermediates.as_slice(), replacement)?;
+        let reconstructed = self.reconstruct_in(carrier, &intermediates[..self.transforms.len()], replacement)?;
         Ok((previous, reconstructed))
     }
 
@@ -464,6 +464,9 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrie
 }
 
 /// Eager array-reference handle pairing one shared root holder with handle-local view metadata.
+///
+/// Equality and hashing identify the mutable location and structural view, not the handle-local type vocabulary.
+/// Renaming type identities therefore preserves equality with the original handle when its view is unchanged.
 pub struct ArrayReference<A: Value<Type = ArrayType>> {
     /// Shared root holder.
     root: Reference<A>,
@@ -480,7 +483,9 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     /// Creates a new root reference initialized with `value`.
     #[inline]
     pub fn new(value: A) -> Self {
-        let root = Reference::new(value);
+        // `A::Type` is exactly `ArrayType`, whose type family cannot denote a reference, so the generic nested-
+        // referent rejection is unreachable for this specialized constructor.
+        let root = Reference::new(value).unwrap();
         let r#type = root.r#type().into_owned();
         Self { root, view: ArrayReferenceView::root(), r#type }
     }
@@ -558,6 +563,9 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     }
 
     /// Replaces this handle's selected coordinates and returns their previous snapshot.
+    ///
+    /// Holder-state errors take precedence over a replacement-type error, consistently with mutation through the
+    /// root handle.
     pub fn swap(&self, replacement: A) -> Result<A, ProgramError>
     where
         A: Reshape + Slice + UpdateSlice,
@@ -567,13 +575,16 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         }
         // Validating inside the update keeps holder-state errors (frozen, poisoned, mid-transaction) ahead of the
         // replacement-type diagnostic, matching the root path.
-        self.root.update_with_result(|current| {
+        self.root.update_locked_with_result(|current| {
             self.validate_view_referent_type(&replacement)?;
             self.view.swap(current, &replacement)
         })
     }
 
     /// Replaces this handle's selected coordinates without returning their previous snapshot.
+    ///
+    /// Holder-state errors take precedence over a replacement-type error, consistently with mutation through the
+    /// root handle.
     pub fn write(&self, replacement: A) -> Result<(), ProgramError>
     where
         A: Reshape + Slice + UpdateSlice,
@@ -602,7 +613,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             let intermediates = self.view.intermediates_in(&mut carrier, current.clone())?;
             let updated_view = intermediates.last().unwrap().add(update)?;
             self.validate_view_referent_type(&updated_view)?;
-            self.view.reconstruct_in(&mut carrier, intermediates.as_slice(), updated_view)
+            self.view.reconstruct_in(&mut carrier, &intermediates[..self.view.transforms().len()], updated_view)
         })
     }
 
@@ -893,7 +904,7 @@ mod tests {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let mut guard = root.lock_root().unwrap();
         let generation = guard.next_generation().unwrap();
-        guard.reserve_pending_unchecked(generation, ReferenceCompletion::ready(Ok(())));
+        let reservation = guard.reserve_pending_unchecked(generation, ReferenceCompletion::ready(Ok(())));
         drop(guard);
 
         // A derived handle is pure structural metadata over a live holder, so composing one must never resolve the
@@ -909,6 +920,7 @@ mod tests {
         let mut guard = root.lock_root().unwrap();
         assert!(guard.poison_pending(generation, "submission failed"));
         drop(guard);
+        drop(reservation);
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
         let composed = derived.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }).unwrap();
@@ -930,6 +942,16 @@ mod tests {
             view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32)),
             Err(ProgramError::MalformedProgram(
                 "reference view reconstruction requires 1 parent snapshots but received 0".to_string(),
+            )),
+        );
+        assert_eq!(
+            view.reconstruct_in(
+                &mut carrier,
+                &[Array::vector(vec![1.0_f32]), Array::scalar(1.0_f32)],
+                Array::scalar(1.0_f32),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "reference view reconstruction requires 1 parent snapshots but received 2".to_string(),
             )),
         );
     }

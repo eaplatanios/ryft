@@ -1,23 +1,11 @@
-error[E0451]: fields `root`, `alias`, `type` and `preserved` of struct `ReferenceDischargeReference` are private
-  --> tests/reference_discharge/error_reference_handle_fabrication.rs:16:35
+error: cannot construct `ReferenceDischargeReference<_, _>` with struct literal syntax due to private fields
+  --> tests/reference_discharge/error_reference_handle_fabrication.rs:16:5
    |
 16 |     ReferenceDischargeReference { root, alias, r#type, preserved: None }
-   |                                   ^^^^  ^^^^^  ^^^^^^  ^^^^^^^^^ private field
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^   ----  -----  ------  --------------- private field
    |                                   |     |      |
    |                                   |     |      private field
    |                                   |     private field
    |                                   private field
-
-error[E0451]: fields `index` and `environment` of struct `ReferenceRootHandle` are private
-  --> tests/reference_discharge/error_reference_handle_fabrication.rs:23:27
    |
-23 |     ReferenceRootHandle { index: 0, environment: unreachable!() }
-   |                           ^^^^^     ^^^^^^^^^^^ private field
-   |                           |
-   |                           private field
-
-error: type `references::discharge::ReferenceDischargeEnvironmentId` is private
-  --> tests/reference_discharge/error_reference_handle_fabrication.rs:23:50
-   |
-23 |     ReferenceRootHandle { index: 0, environment: unreachable!() }
-   |                                                  ^^^^^^^^^^^^^^ private type
+   = note: ...and other private field `denotes_whole_root` that was not provided
