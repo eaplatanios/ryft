@@ -1856,9 +1856,9 @@ mod tests {
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
         LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
         ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend,
-        ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError, ReferenceFreeze, ReferenceNew,
-        ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
-        StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ReferenceCompletionCallback, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceType,
+        Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh,
+        Typed, Value, ValueProjection, WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1883,7 +1883,7 @@ mod tests {
     /// Mutable state of one [`ControlledReferenceCompletion`].
     struct ControlledReferenceCompletionState {
         /// Terminal result, absent while the completion is pending.
-        result: Option<ReferenceCompletionResult>,
+        result: Option<Result<(), Arc<str>>>,
 
         /// Callbacks waiting for the terminal result.
         callbacks: Vec<ReferenceCompletionCallback>,
@@ -1923,7 +1923,7 @@ mod tests {
         }
 
         /// Completes this gate exactly once and invokes deferred callbacks outside its mutex.
-        fn complete(&self, result: ReferenceCompletionResult) {
+        fn complete(&self, result: Result<(), Arc<str>>) {
             let callbacks = {
                 let (state, ready) = &*self.state;
                 let mut state = state.lock().unwrap();
@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     impl ReferenceCompletionBackend for ControlledReferenceCompletion {
-        fn r#await(&self) -> ReferenceCompletionResult {
+        fn r#await(&self) -> Result<(), Arc<str>> {
             let (state, ready) = &*self.state;
             let mut state = state.lock().unwrap();
             if let Some((label, await_started)) = state.await_started.take() {

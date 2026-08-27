@@ -64,16 +64,15 @@
 //! The implementation is split by responsibility:
 //!
 //! - `types.rs` defines the structural [`ReferenceType`] and its cross-occurrence refinements.
-//! - `values.rs` defines the eager [`Reference`] value and its holder-facing operations.
+//! - `values.rs` defines the eager [`Reference`] value, backend-neutral completion dependencies, and synchronized
+//!   holder state machine, including identity, generations, guards, read leases, reservations, pending publication,
+//!   and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
 //!   root/alias classifications.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
 //!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
 //!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
 //!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
-//! - `runtime.rs` implements the synchronized holder state machine and hidden backend interface. It uses generations,
-//!   completion dependencies, read leases, reservations, pending installation, and terminal poisoning to coordinate
-//!   external state across synchronous and asynchronous execution.
 //! - `discharge.rs` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
 //!   roots with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep
 //!   the transform open to non-array value families and to third-party operations.
@@ -112,9 +111,69 @@
 
 // TODO(eaplatanios): Review this module.
 
+use thiserror::Error;
+
+/// Error produced while accessing a [`Reference`]'s eager holder.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
+pub enum ReferenceError {
+    /// A reference allocation attempted to store another reference as its immediate referent.
+    #[error("reference referent type `{referent_type}` must not itself be a reference")]
+    NestedReferent {
+        /// Rejected immediate referent type.
+        referent_type: String,
+    },
+
+    /// A replacement or update result did not preserve the holder's exact declared referent type.
+    #[error("reference value type `{actual}` must exactly match declared referent type `{expected}`")]
+    ReferentTypeMismatch {
+        /// Exact declared referent type.
+        expected: String,
+
+        /// Actual replacement or update-result type.
+        actual: String,
+    },
+
+    /// A handle-local metadata mapping could not reconstruct a value crossing the shared-holder boundary.
+    #[error("reference value reconstruction failed: {message}")]
+    ValueReconstruction {
+        /// Underlying value-family reconstruction diagnostic.
+        message: String,
+    },
+
+    /// The reference and its complete alias family were invalidated by a consuming freeze.
+    #[error("reference is frozen")]
+    Frozen,
+
+    /// A guarded transaction attempted an operation incompatible with an extraction, reservation, or active lease.
+    #[error("reference holder has a conflicting transaction or execution lease")]
+    TransactionInProgress,
+
+    /// A prepared replacement belongs to a different holder transaction.
+    #[error("prepared reference value belongs to a different holder")]
+    TransactionHolderMismatch,
+
+    /// A pending value or completion targeted an older holder generation.
+    #[error("reference completion targets a stale holder generation")]
+    StaleGeneration,
+
+    /// The holder exhausted its monotonically increasing mutation generation space.
+    #[error("reference holder mutation generation is exhausted")]
+    GenerationExhausted,
+
+    /// The holder's synchronization primitive was poisoned by a panic during an earlier access.
+    #[error("reference holder is poisoned")]
+    Poisoned,
+
+    /// The holder was invalidated after a stateful backend invocation crossed its irreversible execution boundary.
+    #[error("reference state is poisoned: {reason}")]
+    ExecutionPoisoned {
+        /// Backend-owned reason the state can no longer be used safely.
+        reason: String,
+    },
+}
+
 mod discharge;
 mod operations;
-mod runtime;
 mod semantics;
 mod types;
 mod values;
@@ -136,13 +195,53 @@ pub use operations::{
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };
-pub use runtime::{
-    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceCompletionResult, ReferenceError,
-    ReferenceGeneration, ReferenceGuard, ReferenceId,
-};
 pub use semantics::{
     ReferenceAccessMode, ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
-pub use values::Reference;
+pub use values::{
+    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, Reference, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceGeneration, ReferenceGuard, ReferenceId,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reference_error() {
+        let cases = [
+            (
+                ReferenceError::NestedReferent { referent_type: "ref<f32[2]>".to_string() },
+                "reference referent type `ref<f32[2]>` must not itself be a reference",
+            ),
+            (
+                ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() },
+                "reference value type `f32[3]` must exactly match declared referent type `f32[2]`",
+            ),
+            (
+                ReferenceError::ValueReconstruction { message: "unbound identity".to_string() },
+                "reference value reconstruction failed: unbound identity",
+            ),
+            (ReferenceError::Frozen, "reference is frozen"),
+            (
+                ReferenceError::TransactionInProgress,
+                "reference holder has a conflicting transaction or execution lease",
+            ),
+            (ReferenceError::TransactionHolderMismatch, "prepared reference value belongs to a different holder"),
+            (ReferenceError::StaleGeneration, "reference completion targets a stale holder generation"),
+            (ReferenceError::GenerationExhausted, "reference holder mutation generation is exhausted"),
+            (ReferenceError::Poisoned, "reference holder is poisoned"),
+            (
+                ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() },
+                "reference state is poisoned: submission failed",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.to_string(), expected);
+        }
+        let error = ReferenceError::Frozen;
+        assert_eq!(format!("{error:?}"), "Frozen");
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}

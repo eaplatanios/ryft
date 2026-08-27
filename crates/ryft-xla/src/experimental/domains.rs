@@ -20,10 +20,10 @@ use ryft_core::{
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
     Operation, Parameterized, PendingReferenceReservations, Placeholder, ProgramError, Provenance, ProvenanceScope,
     ReductionKind, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
-    ReferenceCompletionResult, ReferenceDischargeResult, ReferenceExecution, ReferenceGuard, ReferenceId,
-    ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest,
-    StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
-    TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    ReferenceDischargeResult, ReferenceExecution, ReferenceGuard, ReferenceId, ReferenceSource, ReferenceStateBinding,
+    ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
+    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
+    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -123,7 +123,7 @@ struct XlaReferenceCompletion {
 }
 
 impl ReferenceCompletionBackend for XlaReferenceCompletion {
-    fn r#await(&self) -> ReferenceCompletionResult {
+    fn r#await(&self) -> Result<(), Arc<str>> {
         self.fence.block_until_ready().map_err(|error| Arc::from(error.to_string()))
     }
 
