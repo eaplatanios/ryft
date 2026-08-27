@@ -2490,8 +2490,8 @@ where
     /// the first reference operation the transform reaches. Discharge local reference state first through
     /// [`ReferenceDischarge::discharge_local_references`](crate::ReferenceDischarge::discharge_local_references) with
     /// the `"batching"` consumer label, which also rejects external or captured reference roots (batching one shared
-    /// mutable holder across batch items has no defined semantics). Ordinary non-reference captures remain valid and
-    /// keep their boundary positions.
+    /// mutable reference across batch items has no defined semantics). Ordinary non-reference captures remain valid
+    /// and keep their boundary positions.
     ///
     /// # Parameters
     ///

@@ -72,7 +72,7 @@ pub enum XlaDomainError {
     #[error("{0}")]
     Tracing(#[from] ProgramError),
 
-    /// Error surfaced while acquiring or updating an eager reference holder.
+    /// Error surfaced while acquiring or updating eager reference state.
     #[error("{0}")]
     Reference(#[from] ryft_core::ReferenceError),
 
@@ -132,7 +132,7 @@ impl ReferenceCompletionBackend for XlaReferenceCompletion {
     }
 }
 
-/// Maps one backend-neutral completion failure back into the XLA domain's public error vocabulary.
+/// Maps one backend-neutral completion failure into the XLA domain's public error type.
 fn xla_reference_completion_error(reason: Arc<str>) -> XlaDomainError {
     XlaDomainError::AsynchronousReferenceExecution { reason: reason.to_string() }
 }
@@ -1646,7 +1646,7 @@ struct XlaPersistentExecutableMetadataV6 {
     compilation_duration_nanoseconds: Option<u64>,
 }
 
-/// Persisted holder-free source of one logical external reference state.
+/// Persisted source descriptor for one logical external reference state. It contains no runtime reference handle.
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum PersistentReferenceSourceV6 {
@@ -2091,7 +2091,7 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Xla
         .collect()
 }
 
-/// Encodes holder-free logical reference-state slots in the stable V6 shape.
+/// Encodes logical reference-state slots in the stable V6 shape without runtime reference handles.
 ///
 /// V6 redundantly stores each flat logical input position. Deriving that coordinate from the canonical source keeps
 /// valid serialized bytes unchanged without reintroducing the redundant field into [`ReferenceStateBinding`].
@@ -2116,7 +2116,8 @@ fn persistent_reference_states(
         .collect()
 }
 
-/// Decodes holder-free logical reference-state slots and validates the redundant V6 flat input coordinate.
+/// Decodes logical reference-state slots without runtime reference handles and validates the redundant V6 flat input
+/// coordinate.
 fn decode_persistent_reference_states(
     states: Vec<PersistentReferenceStateV6>,
     capture_count: usize,
@@ -2400,7 +2401,7 @@ impl<'c> XlaCompiledProgram<'c> {
         &self.output_types[..self.public_output_count]
     }
 
-    /// Returns whether this executable requires a stateful holder invocation boundary.
+    /// Returns whether this executable requires a stateful reference invocation boundary.
     #[inline]
     pub(crate) fn requires_stateful_call(&self) -> bool {
         !self.reference_states.is_empty()
@@ -2452,7 +2453,7 @@ impl<'c> XlaDomain<'c> {
 
     /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with a
     /// whole-execution fence. Programs with external reference state must flow through the stateful call surface
-    /// instead, which owns the holder transaction and the hidden final-state outputs.
+    /// instead, which owns the reference transaction and the hidden final-state outputs.
     ///
     /// For programs without bounded-dynamic boundaries, this call only enqueues device work: the returned arrays and
     /// fence resolve asynchronously. Bounded-dynamic boundaries weaken that guarantee in two ways: below-bound inputs
@@ -2873,7 +2874,7 @@ impl<'c> XlaDomain<'c> {
                 if !effective_type.is_refined_by(actual_type.referent()) {
                     return Err(XlaDomainError::UnsupportedReferenceAbi {
                         reason: format!(
-                            "external state input {logical_input_index} holder type `{}` does not refine effective \
+                            "external state input {logical_input_index} reference type `{}` does not refine effective \
                              compiled state type `{effective_type}`",
                             actual_type.referent(),
                         ),
@@ -2886,10 +2887,7 @@ impl<'c> XlaDomain<'c> {
                 }
                 if !seen.insert(reference.id()) {
                     return Err(XlaDomainError::UnsupportedReferenceAbi {
-                        reason: format!(
-                            "reference holder `{:?}` is bound more than once in one invocation",
-                            reference.id(),
-                        ),
+                        reason: format!("reference `{:?}` is bound more than once in one invocation", reference.id(),),
                     });
                 }
                 bindings.push((reference.id(), reference.clone()));
@@ -2955,7 +2953,7 @@ impl<'c> XlaDomain<'c> {
                     if snapshot.mesh() != program.mesh {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
                             reason: format!(
-                                "external state input {logical_input_index} holder mesh does not match the compiled \
+                                "external state input {logical_input_index} reference mesh does not match the compiled \
                                  device mesh",
                             ),
                         });

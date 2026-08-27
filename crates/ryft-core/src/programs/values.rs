@@ -138,7 +138,7 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// Validates that this value can be used as a program constant (i.e., [`Atom::Constant`](crate::Atom::Constant)).
     /// Such values must satisfy the following rendering contract: their [`Display`] output must be deterministic and
     /// semantically complete, because program renderings double as structural fingerprints. Values that cannot satisfy
-    /// it (most notably mutable reference holders, whose runtime identity is process-local and deliberately absent from
+    /// it (most notably mutable references, whose runtime identity is process-local and deliberately absent from
     /// their deterministic rendering) must reject constant storage here and enter programs through inputs or captures
     /// instead. [`Region`](crate::Region) sealing enforces this for every stored constant in every region, so all
     /// construction paths (i.e., program builders, [`Program::new`](crate::Program::new), and region imports alike)
@@ -447,7 +447,7 @@ impl<T: Type, C, V: Concretizable<C>> Concretizable<C> for ProjectedValue<T, V> 
 /// Renames a value's type-identity metadata by _rejection_ meaning that identity renamings and renamings that leave
 /// the value's [`Type`] unchanged clone the value, while identity-changing renamings fail because the value has no
 /// value-specific reconstruction. This one helper backs the [`Value::rename_type_identities`] default implementation
-/// and composite member arms that deliberately keep the same semantics (e.g., eager reference holders, whose shared
+/// and composite member arms that deliberately keep the same semantics (e.g., eager references, whose shared
 /// state must not be renamed through one alias), so the rejection policy and diagnostic have exactly one home.
 pub(crate) fn rename_type_identities_by_rejection<V: Typed + Clone>(
     value: &V,

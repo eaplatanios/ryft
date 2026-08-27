@@ -147,7 +147,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// that accesses a reference whose alias family an earlier instruction consumed, or that consumes a derived view
     /// rather than a whole root, is rejected at the "append" that performs it. Construction is the earliest point at
     /// which such a misuse can be reported against the call that caused it (the eager runtime invalidates a frozen
-    /// holder's complete alias family and discharge reports what its own environment observes, but a program under
+    /// reference's complete alias family and discharge reports what its own environment observes, but a program under
     /// construction could otherwise record the misuse and surface it only much later). Replay and rebuild paths that
     /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
     /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation

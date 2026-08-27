@@ -31,7 +31,7 @@
 //! boundaries and must be recreated from the root inside the attached region.
 //!
 //! Mutation summaries are conservative: a write in either condition branch or in a loop/scan body publishes hidden
-//! final state and advances the external holder generation even when one execution takes the other branch, performs
+//! final state and advances the external reference generation even when one execution takes the other branch, performs
 //! zero loop iterations, or scans a zero-length axis. In those executions the published state equals the input state.
 //!
 //! ```text
@@ -212,8 +212,8 @@ where
     /// A preserved root crosses a condition, loop, scan, or call boundary as the reference it already is, at its own
     /// declared operand position, so the rewritten operation threads discharged state and surviving references side by
     /// side; only the discharged half widens. A preserved root may also be consumed, which full discharge rejects for
-    /// a caller-owned root: the payload keeps the `reference_freeze`, so the caller hands its holder to that operation
-    /// instead of to a state binding. A capture-lifted program has no partial form, and keeps using
+    /// a caller-owned root: the payload keeps the `reference_freeze`, so the caller passes its reference to that
+    /// operation instead of to a state binding. A capture-lifted program has no partial form, and keeps using
     /// [`Program::discharge_references_with_lifted_captures`].
     ///
     /// # Parameters
@@ -757,7 +757,8 @@ mod tests {
         assert_eq!(
             source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge consumed external input 0, whose holder belongs to the caller".to_string(),
+                "reference discharge consumed external input 0, whose state must remain owned by the caller"
+                    .to_string(),
             ),
         );
 

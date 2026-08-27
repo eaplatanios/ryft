@@ -296,7 +296,7 @@ pub trait Context: Domain + Clone {
 
 /// Zero-sized [`Context`] used for a concrete `(type, value, operation)` universe whose operations can be interpreted
 /// directly without backend-owned context state. Values may themselves carry explicit resources, such as reference
-/// holders, but all state needed to interpret an operation arrives through those values and the attached regions.
+/// allocations, but all state needed to interpret an operation arrives through those values and the attached regions.
 /// [`EagerContext`] makes this direct interpretation mode explicit in generic code that otherwise has no backend-owned
 /// eager context value to pass around.
 ///

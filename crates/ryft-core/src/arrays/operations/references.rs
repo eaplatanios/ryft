@@ -5,8 +5,9 @@
 //! module specializes them to [`ArrayIrType`] and implements their capabilities for array values and tracers.
 //!
 //! Staged and composite value calls validate the complete operand-type relationship before dispatching the operation.
-//! Their type diagnostics can therefore precede any eager holder-state error. Once an eager reference or derived view
-//! is reached, holder-state errors take precedence over replacement-type validation, as documented on that runtime API.
+//! Their type diagnostics can therefore precede any eager reference-state error. Once an eager reference or derived
+//! view is reached, reference-state errors take precedence over replacement-type validation, as documented on that
+//! runtime API.
 
 // TODO(eaplatanios): Review this module.
 

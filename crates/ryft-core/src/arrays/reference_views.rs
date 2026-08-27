@@ -540,10 +540,10 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         self.root.read().map_err(ProgramError::custom)
     }
 
-    /// Validates that `value` exactly matches this handle's derived referent type. The root paths inherit this rule
-    /// from the shared holder, but derived-view mutations must enforce it themselves: the update-slice reconstruction
-    /// only requires the written value to fit inside the selected coordinates, so a smaller replacement would
-    /// otherwise silently write a partial update.
+    /// Validates that `value` exactly matches this handle's derived referent type. Root-handle mutations inherit this
+    /// rule from the shared reference state, but derived-view mutations must enforce it themselves: update-slice
+    /// reconstruction only requires the written value to fit inside the selected coordinates, so a smaller replacement
+    /// would otherwise silently write a partial update.
     fn validate_view_referent_type(&self, value: &A) -> Result<(), ProgramError> {
         let actual = value.r#type();
         if actual.as_ref() == self.r#type.referent() {

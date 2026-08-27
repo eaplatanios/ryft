@@ -207,10 +207,10 @@ pub struct CompilationCall<D: CompilationDomain, Input: Parameterized<D::Type>, 
 ///
 /// The public result may be reconstructed immediately from pending backend values, but [`Self::await`] always observes
 /// the whole invocation completion before exposing that result. Completion includes every predecessor dependency of
-/// the holders used by the invocation, not only the most recently submitted backend event. Dropping this wrapper never
-/// cancels submitted work or rolls holder state back; callers that need to observe asynchronous failure must await it.
-/// A backend may also record a post-submission failure on the affected mutated holders so subsequent accesses report
-/// the same poisoned-state cause.
+/// the references used by the invocation, not only the most recently submitted backend event. Dropping this wrapper
+/// never cancels submitted work or rolls reference state back; callers that need to observe asynchronous failure must
+/// await it. A backend may also record a post-submission failure on the affected mutated references so later accesses
+/// report the same poisoned-state cause.
 #[must_use = "stateful execution errors are observed by awaiting this completion"]
 pub struct ReferenceExecution<Output, Error> {
     /// Public output or reconstruction failure prepared after submission.
@@ -234,7 +234,7 @@ impl<Output, Error> ReferenceExecution<Output, Error> {
     /// # Parameters
     ///
     ///   - `result`: Public output or reconstruction failure prepared right after submission.
-    ///   - `completion`: Whole-invocation completion, including every cumulative holder predecessor dependency.
+    ///   - `completion`: Whole-invocation completion, including every cumulative reference predecessor dependency.
     ///   - `completion_error`: Converts a backend completion failure message into the domain error type. It is applied
     ///     only when the completion itself fails, and its result then replaces `result`.
     #[doc(hidden)]
@@ -1389,7 +1389,7 @@ where
 
     /// Calls this dispatcher through its domain's completion-bearing stateful execution capability.
     ///
-    /// Submission publishes the domain's holder dependencies before this function returns. The returned completion
+    /// Submission publishes the domain's reference dependencies before this function returns. The returned completion
     /// must be awaited to observe asynchronous failure; dropping it does not cancel the invocation.
     pub fn call_statefully_async(
         &self,
@@ -1423,7 +1423,7 @@ where
     /// Calls this dispatcher statefully and waits for whole-invocation completion.
     ///
     /// This routes through [`StatefulCompilationDomain::call_statefully`], so it reports asynchronous execution errors
-    /// before returning and does not weaken the domain's holder sequencing contract.
+    /// before returning and does not weaken the domain's reference sequencing contract.
     pub fn call_statefully(
         &self,
         static_parameters: Static,
@@ -1595,8 +1595,8 @@ where
 
 /// Executes a completion-bearing structured runtime call through a stateful domain.
 ///
-/// The returned completion owns error observation, not cancellation. Submission and holder publication semantics are
-/// defined by [`StatefulCompilationDomain::call_statefully_async`].
+/// The returned completion owns error observation, not cancellation. Submission and reference-state publication
+/// semantics are defined by [`StatefulCompilationDomain::call_statefully_async`].
 pub fn call_function_statefully_async<D, Input, Output>(
     domain: &D,
     executable: &ExecutableFunction<D, Input, Output>,

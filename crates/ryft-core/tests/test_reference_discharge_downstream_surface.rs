@@ -14,18 +14,21 @@
 //! fail to discharge for it, and it would fail at compile time, scoped to exactly that operation.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use indoc::indoc;
 use pretty_assertions::assert_eq;
+
 use ryft_core::macros::check_count;
 use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, InterpretableOperation, InterpretationDriver, NoIdentity,
-    Operation, Parameter, Placeholder, Program, ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver,
-    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceInput,
-    ReferenceOperationSemantics, ReferenceOutput, ReferenceSource, ReferenceStateBinding, ReferenceType,
-    RegionInterface, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
+    Operation, OutputRegionProvenance, Parameter, Placeholder, Program, ProgramBuilder, ProgramError,
+    RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionDischargeBoundary,
+    ReferenceRegionStateInsertion, ReferenceSource, ReferenceStateBinding, ReferenceType, RegionInterface, RegionSlot,
+    Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -209,38 +212,6 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
     }
 }
 
-/// Structured-operation stand-in that permits every non-consuming reference mode through its only region.
-#[derive(Copy, Clone, Debug)]
-struct RegisterRegionOperation;
-
-impl Display for RegisterRegionOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl Parameter for RegisterRegionOperation {}
-
-impl Operation for RegisterRegionOperation {
-    type Type = RegisterIrType;
-
-    fn name(&self) -> &'static str {
-        "register.region"
-    }
-
-    fn infer_output_types(
-        &self,
-        _input_types: &[RegisterIrType],
-        _region_interfaces: &[RegionInterface<RegisterIrType>],
-    ) -> Result<Vec<RegisterIrType>, TypeError> {
-        Ok(Vec::new())
-    }
-
-    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
-        region_index == 0 && !mode.is_consuming()
-    }
-}
-
 /// Operation family of the downstream universe.
 #[derive(Copy, Clone, Debug)]
 enum RegisterOperation {
@@ -250,6 +221,7 @@ enum RegisterOperation {
     Write,
     Swap,
     Freeze,
+    Call,
 }
 
 impl Display for RegisterOperation {
@@ -269,13 +241,32 @@ impl Operation for RegisterOperation {
             Self::Write => "register.write",
             Self::Swap => "register.swap",
             Self::Freeze => "register.freeze",
+            Self::Call => "register.call",
         }
+    }
+
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        match self {
+            Self::Call => const { &[RegionSlot::computation("callee")] },
+            _ => &[],
+        }
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        match self {
+            Self::Call => vec![OutputRegionProvenance { region_index: 0, output_index }],
+            _ => Vec::new(),
+        }
+    }
+
+    fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+        matches!(self, Self::Call) && region_index == 0 && !mode.is_consuming()
     }
 
     fn infer_output_types(
         &self,
         input_types: &[RegisterIrType],
-        _region_interfaces: &[RegionInterface<RegisterIrType>],
+        region_interfaces: &[RegionInterface<RegisterIrType>],
     ) -> Result<Vec<RegisterIrType>, TypeError> {
         let referent = || match input_types.first() {
             Some(RegisterIrType::Reference(reference)) => Ok(reference.referent().clone()),
@@ -303,6 +294,10 @@ impl Operation for RegisterOperation {
                 check_count!("input", input_types, 2, TypeError);
                 Ok(vec![RegisterIrType::Register(referent()?)])
             }
+            Self::Call => match region_interfaces.first() {
+                Some(interface) => Ok(interface.output_types().to_vec()),
+                None => Err(TypeError::invalid("`register.call` expects one callee region")),
+            },
         }
     }
 
@@ -329,6 +324,9 @@ impl Operation for RegisterOperation {
                 vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)],
                 Vec::new(),
             )),
+            // A structured operation declares no operation-local reference semantics: its accesses are summarized
+            // transitively from the region closure it attaches.
+            Self::Call => Cow::Borrowed(ReferenceOperationSemantics::empty()),
         }
     }
 
@@ -369,9 +367,8 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, RegisterReferenceDischarge>],
     ) -> Result<Vec<ReferenceDischargeValue<C, RegisterReferenceDischarge>>, ProgramError> {
-        // Each access serves both kinds of root: a selected one threads as immutable state, while a root partial
-        // discharge preserved survives in the destination and its access replays verbatim over the reference the
-        // handle denotes.
+        // Access arms see only discharged roots: the dispatch path replays accesses to preserved roots verbatim
+        // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
         match self {
             Self::Negate => discharge_reference_free_operation(self, context, driver, inputs),
             Self::ReferenceNew => {
@@ -406,6 +403,64 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to freeze")?;
                 Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
+            }
+            // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
+            // widen the boundary with the reached state, rebuild the region in an isolated fork, validate the fork
+            // against the summary's predictions, and merge every published successor state back. This is the same
+            // shape a future kernel-call rule needs, expressed purely through the public discharge surface.
+            Self::Call => {
+                let region = driver.region(0)?;
+                check_count!("input", region.input_ids(), inputs.len(), ProgramError);
+                let mut declared = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    declared.push(context.operand_root(input, self.name())?);
+                }
+                let summary = context.region_summary(self, 0, region, declared.as_slice())?;
+                if summary.output_roots().iter().any(Option::is_some) {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{}` does not return references from its callee",
+                        self.name(),
+                    )));
+                }
+                let operand_roots = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
+                let widening = context.state_widening(&summary, &operand_roots, self.name())?;
+                let entering = widening.entering().to_vec();
+                let source_output_count = region.output_ids().len();
+
+                let fork = driver.discharge_region_program(
+                    context,
+                    0,
+                    &ReferenceRegionDischargeBoundary::new(
+                        self,
+                        0,
+                        declared,
+                        ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
+                        ReferenceRegionStateInsertion::new(widening.published().to_vec(), source_output_count),
+                    ),
+                )?;
+                fork.validate_predicted_mutations(widening.published(), self.name())?;
+                fork.validate_predicted_output_roots(summary.output_roots(), self.name())?;
+
+                let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+                for input in inputs {
+                    operands.push(context.operand_value(input)?);
+                }
+                for root in &entering {
+                    operands.push(context.discharged_state(*root)?);
+                }
+                let outputs = context.parent().bind(*self, vec![fork.into_program()], operands.as_slice())?;
+                check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
+
+                let mut results = Vec::with_capacity(source_output_count);
+                for (position, output) in outputs.into_iter().enumerate() {
+                    if position < source_output_count {
+                        results.push(ReferenceDischargeValue::Ordinary(output));
+                    } else {
+                        let root = widening.published()[position - source_output_count];
+                        context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                    }
+                }
+                Ok(results)
             }
         }
     }
@@ -580,7 +635,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
     let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
     let root = reference.expect_reference("a downstream root").unwrap().root();
     let summary = context
-        .region_summary(&RegisterRegionOperation, 0, region.entry_region_ref(), &[Some(root), None])
+        .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(root), None])
         .unwrap();
 
     assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![root]);
@@ -638,6 +693,118 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
             let %3:register = register.read %1
                 register.write %1 %2
             in (%0, %3)"},
+    );
+}
+
+#[test]
+fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() {
+    // The hand-rolled `register.call` rule exercises the complete structured surface from a third-party position:
+    // region summaries, state widening, boundary construction, isolated region rebuilding, prediction validation,
+    // and successor-state merging. The same caller root enters at two declared positions, so the rebuilt region must
+    // preserve the aliasing: the write through position 0 is observed by the read through position 1.
+    let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let first = callee.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let second = callee.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let replacement = callee.add_input(RegisterIrType::Register(RegisterType));
+    callee
+        .add_instruction(RegisterOperation::Write, Vec::new(), vec![first, replacement], None)
+        .unwrap();
+    let observed = callee.add_instruction(RegisterOperation::Read, Vec::new(), vec![second], None).unwrap()[0];
+    let callee = callee
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
+        .unwrap();
+
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let update = builder.add_input(RegisterIrType::Register(RegisterType));
+    let region = builder.import_program(callee);
+    let result = builder
+        .add_instruction(RegisterOperation::Call, vec![region], vec![reference, reference, update], None)
+        .unwrap()[0];
+    let source = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
+        .unwrap();
+
+    let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap();
+    assert_eq!(discharged.public_output_count(), 1);
+    assert_eq!(
+        discharged.external_states(),
+        &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+    );
+    assert_eq!(
+        discharged.program().to_string(),
+        indoc! {"
+            lambda %0:register, %1:register .
+            let %2:register, %3:register = register.call %0 %0 %1 [
+                callee={
+                    lambda %0:register, %1:register, %2:register .
+                    in (%2, %2)
+                },
+            ]
+            in (%2, %3)"},
+    );
+}
+
+#[test]
+fn test_downstream_partial_selection_reaches_an_allocation_inside_a_structured_region() {
+    // The allocation site sits inside the callee region, so whether it discharges is decided by the replay coordinate
+    // the downstream rule's driver hands to `selects_allocation` inside the fork. An empty selection must preserve
+    // the allocation inside the rebuilt region, and selecting the enumerated site must discharge it completely —
+    // which is exactly the behavior a driver without a real `instruction()` coordinate would silently break.
+    let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let initial = callee.add_input(RegisterIrType::Register(RegisterType));
+    let local = callee.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+    let frozen = callee.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![local], None).unwrap()[0];
+    let callee = callee
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+        .unwrap();
+
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let input = builder.add_input(RegisterIrType::Register(RegisterType));
+    let region = builder.import_program(callee);
+    let result = builder.add_instruction(RegisterOperation::Call, vec![region], vec![input], None).unwrap()[0];
+    let source = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![result], vec![Placeholder], vec![Placeholder])
+        .unwrap();
+
+    let preserved = source
+        .clone()
+        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &[])
+        .unwrap();
+    assert_eq!(preserved.external_states(), &[]);
+    assert_eq!(
+        preserved.program().to_string(),
+        indoc! {"
+            lambda %0:register .
+            let %1:register = register.call %0 [
+                callee={
+                    lambda %0:register .
+                    let %1:ref<register> = register.reference_new %0
+                        %2:register = register.freeze %1
+                    in (%2)
+                },
+            ]
+            in (%1)"},
+    );
+
+    let sites = source.reference_discharge_sites(0).unwrap();
+    assert_eq!(sites.len(), 1);
+    let full = source
+        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, sites.as_slice())
+        .unwrap()
+        .try_into_full()
+        .unwrap();
+    assert_eq!(
+        full.program().to_string(),
+        indoc! {"
+            lambda %0:register .
+            let %1:register = register.call %0 [
+                callee={
+                    lambda %0:register .
+                    in (%0)
+                },
+            ]
+            in (%1)"},
     );
 }
 

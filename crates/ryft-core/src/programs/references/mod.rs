@@ -27,7 +27,7 @@
 //!
 //! # Roots, Aliases, and Views
 //!
-//! The reference vocabulary used throughout this module and its consumers is defined relative to one concept:
+//! The reference terms used throughout this module and its consumers are defined relative to one concept:
 //!
 //! - A **root** is the canonical mutable storage cell that a reference family denotes. Only
 //!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the root is the reference allocation whose
@@ -73,13 +73,15 @@
 //!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
 //!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
 //!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
-//! - `discharge.rs` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
+//! - `discharge/` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
 //!   roots with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep
 //!   the transform open to non-array value families and to third-party operations.
 //!
 //! Structured operations own their reference boundary rewrites. For example, condition, while, and scan operations
 //! decide how immutable state is added to their branch or loop boundaries; the discharge driver supplies isolated
-//! region rebuilding, root summaries, and validation rather than choosing the rewrite for them.
+//! region rebuilding, root summaries, and validation rather than choosing the rewrite for them. The one rewrite the
+//! replay path owns itself is the preserved-access replay: a region-free, access-only application over exclusively
+//! preserved roots is replayed verbatim before any rule runs.
 //!
 //! # Eager and Staged State
 //!
@@ -145,23 +147,23 @@ pub enum ReferenceError {
     Frozen,
 
     /// A guarded transaction attempted an operation incompatible with an extraction or active execution lease.
-    #[error("reference holder has a conflicting transaction or execution lease")]
+    #[error("reference has a conflicting transaction or execution lease")]
     TransactionInProgress,
 
     /// A reference replacement was prepared for a different reference allocation.
-    #[error("reference replacement belongs to a different holder")]
+    #[error("reference replacement belongs to a different reference allocation")]
     ReplacementHolderMismatch,
 
     /// A pending value or completion targeted an older generation of the shared reference state.
-    #[error("reference completion targets a stale holder generation")]
+    #[error("reference completion targets a stale reference generation")]
     StaleGeneration,
 
     /// The shared reference state exhausted its monotonically increasing mutation generation space.
-    #[error("reference holder mutation generation is exhausted")]
+    #[error("reference mutation generation is exhausted")]
     GenerationExhausted,
 
     /// The reference allocation's synchronization primitive was poisoned by a panic during an earlier access.
-    #[error("reference holder is poisoned")]
+    #[error("reference state mutex is poisoned")]
     Poisoned,
 
     /// The shared reference state was invalidated after a stateful backend invocation crossed its irreversible
@@ -224,14 +226,14 @@ mod tests {
                 "reference value reconstruction failed: unbound identity",
             ),
             (ReferenceError::Frozen, "reference is frozen"),
+            (ReferenceError::TransactionInProgress, "reference has a conflicting transaction or execution lease"),
             (
-                ReferenceError::TransactionInProgress,
-                "reference holder has a conflicting transaction or execution lease",
+                ReferenceError::ReplacementHolderMismatch,
+                "reference replacement belongs to a different reference allocation",
             ),
-            (ReferenceError::ReplacementHolderMismatch, "reference replacement belongs to a different holder"),
-            (ReferenceError::StaleGeneration, "reference completion targets a stale holder generation"),
-            (ReferenceError::GenerationExhausted, "reference holder mutation generation is exhausted"),
-            (ReferenceError::Poisoned, "reference holder is poisoned"),
+            (ReferenceError::StaleGeneration, "reference completion targets a stale reference generation"),
+            (ReferenceError::GenerationExhausted, "reference mutation generation is exhausted"),
+            (ReferenceError::Poisoned, "reference state mutex is poisoned"),
             (
                 ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() },
                 "reference state is poisoned: submission failed",

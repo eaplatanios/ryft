@@ -9,8 +9,8 @@
 //! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
 //! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 //!
-//! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array-reference
-//! holders. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
+//! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
+//! references. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
 //! after submission, install hidden final states without holding host mutexes through device execution, and return a
 //! [`ReferenceExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
 //! protocol.
@@ -21,12 +21,13 @@
 //! automatic differentiation and preserved-kernel semantics remain under development. Ordinary array-only staging,
 //! compilation, and execution are unaffected.
 //!
-//! Reference lowering opens each external holder as an ordinary array input. A read-only holder has no hidden result.
-//! A mutated holder gains one hidden final-state output after the public output prefix, and the runtime installs that
-//! value atomically into the same holder after execution. The entry argument also receives a `tf.aliasing_output`
+//! Reference lowering opens each external reference as an ordinary array input. A read-only reference has no hidden
+//! result. A mutated reference gains one hidden final-state output after the public output prefix, and the runtime
+//! installs that value atomically into the same reference after execution. The entry argument also receives a
+//! `tf.aliasing_output`
 //! relation to the hidden result. That relation is a non-semantic may-alias hint: it permits, but never requires,
 //! backend buffer reuse, and it never promises physical in-place mutation. Reference-state inputs are themselves never
-//! donated, so their holders keep the snapshot they passed in, and correctness always comes from installing the
+//! donated, so each reference retains the snapshot it passed in, and correctness always comes from installing the
 //! returned final value. Read snapshots and retained initializers consequently remain immutable even when a backend
 //! chooses to reuse storage.
 //!
@@ -45,29 +46,29 @@
 //!     return old                       // public result
 //! })
 //!
-//! call_statefully((holder, update))
-//!     -> execute(array(holder), update)
+//! call_statefully((reference, update))
+//!     -> execute(array(reference), update)
 //!     -> receive(old, hidden_final_state)
-//!     -> install hidden_final_state into holder
+//!     -> install hidden_final_state into reference
 //!     -> return old
 //!
 //! compile_statefully_with_captures(
 //!     |captures, input| captures[0].add_update(input),
-//!     captures = [holder],
+//!     captures = [reference],
 //! )
 //! call_statefully(input)
-//!     -> lift holder as the leading executable input
+//!     -> lift reference as the leading executable input
 //!     -> install its hidden final state through the same transaction
 //! ```
 //!
-//! Captured holders use the same protocol after capture lifting and cannot also appear as public arguments. Calls
-//! that use the same mutable holder dependency-chain their generations; read-only calls publish leases and may
+//! Captured references use the same protocol after capture lifting and cannot also appear as public arguments. Calls
+//! that use the same mutable reference dependency-chain their generations; read-only calls publish leases and may
 //! overlap. Dropping [`ReferenceExecution`] does not cancel work. Awaiting it reports whole-invocation failure. A
 //! failure between submission handoff and hidden-state installation poisons the complete affected mutation group so
-//! later holder access cannot silently observe stale state; poisoning is terminal there because no buffer can be
-//! proven current after that boundary, and recovery requires constructing a new holder from independently trusted
+//! later reference access cannot silently observe stale state; poisoning is terminal there because no buffer can be
+//! proven current after that boundary, and recovery requires constructing a new reference from independently trusted
 //! state. Once the hidden final states are installed the pending generations are disarmed, so a later failure—such as
-//! public-output reconstruction—surfaces as an ordinary error while the installed holder state stays valid.
+//! public-output reconstruction—surfaces as an ordinary error while the installed reference state stays valid.
 //!
 //! Local references—including local views and references inside supported conditions, bounded loops, scans, and
 //! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
@@ -392,14 +393,14 @@ where
     jitted_with_options(function, domain, XlaOptions::new(mesh))
 }
 
-/// Retained heterogeneous XLA JIT dispatcher whose calls may bind external reference holders.
+/// Retained heterogeneous XLA JIT dispatcher whose calls may bind external references.
 ///
 /// The dispatcher retains one compiled specialization per static-parameter and input-type combination, exactly like
 /// the array-only JIT surface, but its boundary is the heterogeneous [`XlaStatefulValue`] family: reference-typed
-/// leaves bind live [`ryft_core::ArrayReference`] holders at call time instead of immutable arrays. Every reference
+/// leaves bind live [`ryft_core::ArrayReference`] values at call time instead of immutable arrays. Every reference
 /// leaf must be an unrenamed root handle whose type refines the effective compiled boundary, including its declared
-/// sharding and memory. A read-only bounded-dynamic holder may refine its finite replicated declaration. The runtime
-/// snapshots every holder, releases the holder locks at the backend submission handoff, and publishes
+/// sharding and memory. A read-only bounded-dynamic reference may refine its finite replicated declaration. The runtime
+/// snapshots every reference, releases its state locks at the backend submission handoff, and publishes
 /// completion-bearing read leases or hidden final states before public outputs are exposed.
 ///
 /// # Stability
@@ -462,11 +463,11 @@ where
 {
     /// Executes one specialization statefully, compiling it on the first call and reusing it on warm calls.
     ///
-    /// The call snapshots every bound holder in ascending identity order, completes fallible preparation without
-    /// retaining holder locks, and revalidates holder generations before submission. It waits for the asynchronous
+    /// The call snapshots every bound reference in ascending identity order, completes fallible preparation without
+    /// retaining reference state locks, and revalidates reference generations before submission. It waits for the
     /// completion returned by [`Self::call_statefully_async`], so completion errors are reported and read-only leases
-    /// have completed before it returns. Mutated holders reconcile their ready or poisoned state lazily on their next
-    /// access.
+    /// have completed before it returns. Mutated references reconcile their ready or poisoned state lazily on their
+    /// next access.
     pub fn call_statefully(
         &self,
         static_parameters: Static,
@@ -486,7 +487,8 @@ where
     ///
     /// The returned [`ReferenceExecution`] may already carry reconstructed public outputs backed by pending device
     /// values; awaiting it observes whole-invocation completion, including asynchronous execution errors that would
-    /// otherwise surface only through holder poisoning. Dropping the result never cancels submitted work.
+    /// otherwise surface only when the affected reference is next accessed. Dropping the result never cancels
+    /// submitted work.
     pub fn call_statefully_async(
         &self,
         static_parameters: Static,
@@ -607,11 +609,11 @@ where
     jitted_statefully_with_options(function, domain, XlaOptions::new(mesh))
 }
 
-/// Compiled heterogeneous XLA function whose invocation may bind external reference holders.
+/// Compiled heterogeneous XLA function whose invocation may bind external references.
 ///
 /// This is the ahead-of-time counterpart of [`StatefulJittedXlaFunction`] for one fixed signature: reference-typed
 /// input leaves bind unrenamed root [`ryft_core::ArrayReference`] handles whose types refine the effective compiled
-/// boundary, including its declared sharding and memory. Read-only bounded-dynamic holders may refine finite
+/// boundary, including its declared sharding and memory. Read-only bounded-dynamic references may refine finite
 /// replicated declarations. Each invocation uses the same snapshot, generation-revalidation, asynchronous
 /// publication, and completion protocol as the retained dispatcher.
 ///
@@ -644,10 +646,10 @@ where
         self.function.executable_function()
     }
 
-    /// Executes synchronously and returns public outputs after holder completion.
+    /// Executes synchronously and returns public outputs after the reference transaction completes.
     ///
-    /// The call waits for the completion-bearing protocol after pending holder state and read leases are published.
-    /// A failed completion therefore cannot leave silently stale holder state behind. Refer to the documentation of
+    /// The call waits for the completion-bearing protocol after pending reference state and read leases are published.
+    /// A failed completion therefore cannot leave silently stale reference state behind. Refer to the documentation of
     /// [`StatefulJittedXlaFunction::call_statefully`] for the complete transaction contract.
     pub fn call_statefully(
         &self,
@@ -670,7 +672,7 @@ where
     }
 
     /// Returns the public flat output types, excluding the hidden final-state output suffix that reference
-    /// discharge appends for mutated external holders.
+    /// discharge appends for mutated external references.
     #[inline]
     pub fn output_types(&self) -> &[ArrayIrType] {
         self.function.executable_function().output_types()
@@ -705,8 +707,8 @@ where
 ///
 /// # Stability
 ///
-/// This external-state entry point is experimental. A captured reference participates in the same holder transaction
-/// as a public reference input and cannot alias any other capture or public argument in the invocation.
+/// This external-state entry point is experimental. A captured reference participates in the same reference
+/// transaction as a public reference input and cannot alias any other capture or public argument in the invocation.
 pub fn compile_statefully_with_captures<'domain, 'c: 'domain, F, In, Out>(
     function: F,
     captures: Vec<XlaStatefulValue<'c>>,
@@ -2615,7 +2617,7 @@ mod tests {
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == format!(
-                    "external state input 0 holder type `{alternate_type}` does not refine effective compiled state \
+                    "external state input 0 reference type `{alternate_type}` does not refine effective compiled state \
                      type `{replicated_type}`",
                 ),
         ));
@@ -2693,7 +2695,7 @@ mod tests {
                 (ArrayIrValue::Reference(reversed_reference.clone()), ArrayIrValue::Array(update)),
             ),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == "external state input 0 holder mesh does not match the compiled device mesh",
+                if reason == "external state input 0 reference mesh does not match the compiled device mesh",
         ));
         assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
     }
@@ -2848,7 +2850,7 @@ mod tests {
             compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
                 if reason == format!(
-                    "reference holder `{:?}` is bound more than once in one invocation",
+                    "reference `{:?}` is bound more than once in one invocation",
                     reference.id(),
                 ),
         ));

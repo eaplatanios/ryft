@@ -109,9 +109,9 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
         Request: CallRequest<Self>;
 }
 
-/// Optional execution capability for compiled functions that bind external mutable reference holders.
+/// Optional execution capability for compiled functions that bind external mutable references.
 ///
-/// Implementations must keep hidden state results out of [`CallRequest::RuntimeOutput`] and preserve their holder
+/// Implementations must keep hidden state results out of [`CallRequest::RuntimeOutput`] and preserve their reference
 /// transaction guarantees even when the public output has no leaves or fails reconstruction.
 pub trait StatefulCompilationDomain: CompilationDomain {
     /// Performs a completion-bearing stateful structured execution transition.

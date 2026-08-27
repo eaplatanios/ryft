@@ -58,7 +58,7 @@ pub type XlaArrayConstant = CaptureReference<ArrayType>;
 /// Staged XLA programs keep two kinds of constants apart, and this sum is the staged counterpart of the eager
 /// [`ArrayIrValue`](ryft_core::ArrayIrValue) universe:
 ///
-///   - **Captured runtime values:** array buffers and external reference holders stay in the surrounding
+///   - **Captured runtime values:** array buffers and external references stay in the surrounding
 ///     compiled function's capture table, while the program stores only a lifetime-free [`CaptureReference`] carrying
 ///     its index and structural [`ArrayIrType`]. This keeps runtime storage out of literal IR payloads. A captured
 ///     reference remains metadata only and must be validated and discharged before ordinary XLA lowering.
