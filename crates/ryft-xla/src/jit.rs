@@ -1840,7 +1840,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
     use pretty_assertions::assert_eq;
@@ -1855,10 +1855,10 @@ mod tests {
         DimensionBounds, DimensionVariable, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
         DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
         LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
-        ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend,
-        ReferenceCompletionCallback, ReferenceError, ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceType,
-        Reshape, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh,
-        Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError,
+        ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding,
+        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection,
+        WhileOperation, ZeroLike,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1876,7 +1876,7 @@ mod tests {
     /// Deterministic completion gate used by stateful asynchronous integration tests.
     #[derive(Clone)]
     struct ControlledReferenceCompletion {
-        /// Shared terminal result, wait notification, and deferred callbacks.
+        /// Shared terminal result and wait notification.
         state: Arc<(Mutex<ControlledReferenceCompletionState>, Condvar)>,
     }
 
@@ -1884,9 +1884,6 @@ mod tests {
     struct ControlledReferenceCompletionState {
         /// Terminal result, absent while the completion is pending.
         result: Option<Result<(), Arc<str>>>,
-
-        /// Callbacks waiting for the terminal result.
-        callbacks: Vec<ReferenceCompletionCallback>,
 
         /// Optional one-shot notification emitted when a caller starts waiting, carrying this gate's label so that
         /// tests sharing one channel across several gates can pin which gate was awaited first.
@@ -1898,11 +1895,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 state: Arc::new((
-                    Mutex::new(ControlledReferenceCompletionState {
-                        result: None,
-                        callbacks: Vec::new(),
-                        await_started: None,
-                    }),
+                    Mutex::new(ControlledReferenceCompletionState { result: None, await_started: None }),
                     Condvar::new(),
                 )),
             }
@@ -1914,7 +1907,6 @@ mod tests {
                 state: Arc::new((
                     Mutex::new(ControlledReferenceCompletionState {
                         result: None,
-                        callbacks: Vec::new(),
                         await_started: Some((label, await_started)),
                     }),
                     Condvar::new(),
@@ -1922,19 +1914,13 @@ mod tests {
             }
         }
 
-        /// Completes this gate exactly once and invokes deferred callbacks outside its mutex.
+        /// Completes this gate exactly once and wakes blocking waiters.
         fn complete(&self, result: Result<(), Arc<str>>) {
-            let callbacks = {
-                let (state, ready) = &*self.state;
-                let mut state = state.lock().unwrap();
-                assert!(state.result.is_none());
-                state.result = Some(result.clone());
-                ready.notify_all();
-                std::mem::take(&mut state.callbacks)
-            };
-            for callback in callbacks {
-                callback(result.clone());
-            }
+            let (state, ready) = &*self.state;
+            let mut state = state.lock().unwrap();
+            assert!(state.result.is_none());
+            state.result = Some(result);
+            ready.notify_all();
         }
     }
 
@@ -1954,21 +1940,6 @@ mod tests {
         fn is_ready(&self) -> Result<bool, Arc<str>> {
             let state = self.state.0.lock().unwrap();
             state.result.clone().map_or(Ok(false), |result| result.map(|_| true))
-        }
-
-        fn on_ready(&self, callback: ReferenceCompletionCallback) {
-            let callback = {
-                let mut state = self.state.0.lock().unwrap();
-                if let Some(result) = &state.result {
-                    Some((callback, result.clone()))
-                } else {
-                    state.callbacks.push(callback);
-                    None
-                }
-            };
-            if let Some((callback, result)) = callback {
-                callback(result);
-            }
         }
     }
 
@@ -2940,6 +2911,79 @@ mod tests {
     }
 
     #[test]
+    fn test_overlapping_stateful_calls_lock_shared_holders_in_identity_order() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ()>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update).map_err(Into::into)
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let second = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let (lower_reference, higher_reference) =
+            if first.id() < second.id() { (first, second) } else { (second, first) };
+        let higher_first_update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        let lower_first_update =
+            Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        // The two calls present the same holders in opposite argument order and start together. Both must finish:
+        // internal identity ordering serializes their retained-guard windows without creating a lock cycle.
+        std::thread::scope(|scope| {
+            let start = Arc::new(Barrier::new(3));
+            let (finished, results) = mpsc::channel();
+            for (first, second, update) in [
+                (higher_reference.clone(), lower_reference.clone(), higher_first_update),
+                (lower_reference.clone(), higher_reference.clone(), lower_first_update),
+            ] {
+                let start = Arc::clone(&start);
+                let finished = finished.clone();
+                let compiled = &compiled;
+                let domain = &domain;
+                scope.spawn(move || {
+                    start.wait();
+                    finished
+                        .send(compiled.call_statefully(
+                            domain,
+                            (
+                                ArrayIrValue::Reference(first),
+                                ArrayIrValue::Reference(second),
+                                ArrayIrValue::Array(update),
+                            ),
+                        ))
+                        .unwrap();
+                });
+            }
+            drop(finished);
+            start.wait();
+            for _ in 0..2 {
+                results.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            }
+        });
+        assert_eq!(read_f32_array(&client, &lower_reference.read().unwrap()), vec![5.0]);
+        assert_eq!(read_f32_array(&client, &higher_reference.read().unwrap()), vec![5.0]);
+    }
+
+    #[test]
     fn test_stateful_failure_boundaries_restore_poison_or_install_holder_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2998,7 +3042,7 @@ mod tests {
         assert_eq!(read_f32_array(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
         assert_eq!(read_f32_array(&client, &pre_handoff_read_only.read().unwrap()), vec![20.0]);
 
-        // A fully prepared call that fails before PJRT submission publishes no lease or mutation reservation.
+        // A fully prepared call that fails before PJRT submission publishes no lease or pending mutation.
         let pre_submission_first = reference_new(1.0);
         let pre_submission_second = reference_new(10.0);
         let pre_submission_read_only = reference_new(20.0);
@@ -3055,6 +3099,41 @@ mod tests {
             );
         }
         assert_eq!(read_f32_array(&client, &post_handoff_read_only.read().unwrap()), vec![20.0]);
+
+        // Every ordinary error after publication but before the validate-all/install-all commit poisons the complete
+        // mutated batch with that exact error. The published read lease on a read-only peer remains valid and releases
+        // normally when the submitted execution completes.
+        let pre_installation_first = reference_new(1.0);
+        let pre_installation_second = reference_new(10.0);
+        let pre_installation_read_only = reference_new(20.0);
+        let update =
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenInstallation);
+        assert!(matches!(
+            compiled.call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(pre_installation_first.clone()),
+                    ArrayIrValue::Reference(pre_installation_second.clone()),
+                    ArrayIrValue::Reference(pre_installation_read_only.clone()),
+                    ArrayIrValue::Array(update),
+                ),
+            ),
+            Err(XlaDomainError::InvalidCompilationOptions { reason })
+                if reason == "injected failure before hidden state installation",
+        ));
+        for reference in [&pre_installation_first, &pre_installation_second] {
+            let Err(error) = reference.read() else { panic!("mutated holder must be poisoned before installation") };
+            assert_eq!(
+                error.downcast_custom::<ReferenceError>(),
+                Some(&ReferenceError::ExecutionPoisoned {
+                    reason: "invalid compilation options: injected failure before hidden state installation"
+                        .to_string(),
+                }),
+            );
+        }
+        assert_eq!(read_f32_array(&client, &pre_installation_read_only.read().unwrap()), vec![20.0]);
 
         // A failure confined to public reconstruction occurs only after every hidden final state is installed.
         let installed_first = reference_new(1.0);

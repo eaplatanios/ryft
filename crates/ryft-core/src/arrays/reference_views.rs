@@ -252,10 +252,11 @@ impl ArrayReferenceViewTransform {
 /// another mutable resource.
 ///
 /// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
-/// or synchronization state. [`ArrayReference`] pairs it with the shared holder. The view determines
-/// that handle's referent type and selected coordinates; mutations reconstruct the root by applying the inverse update
-/// of each transform in reverse order. Consequently, overlapping handles may select the same root coordinates and
-/// observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
+/// or synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation. The view
+/// determines that handle's referent type and selected coordinates; mutations reconstruct the root by applying the
+/// inverse update of each transform in reverse order. Consequently, overlapping handles may select the same root
+/// coordinates and observe one another's ordered mutations, while equality and hashing distinguish different
+/// transform sequences.
 ///
 /// Views currently support composed static indexing and static unit-stride slicing. Derived views cannot themselves
 /// cross attached-region or external runtime state boundaries: pass the root handle across the boundary and recreate
@@ -463,12 +464,12 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrie
     }
 }
 
-/// Eager array-reference handle pairing one shared root holder with handle-local view metadata.
+/// Eager array-reference handle pairing one shared root allocation with handle-local view metadata.
 ///
 /// Equality and hashing identify the mutable location and structural view, not the handle-local type vocabulary.
 /// Renaming type identities therefore preserves equality with the original handle when its view is unchanged.
 pub struct ArrayReference<A: Value<Type = ArrayType>> {
-    /// Shared root holder.
+    /// Handle to the shared root allocation.
     root: Reference<A>,
 
     /// Ordered mapping from the shared root to this handle's referent.
@@ -490,7 +491,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         Self { root, view: ArrayReferenceView::root(), r#type }
     }
 
-    /// Returns this shared holder's process-local identity.
+    /// Returns this shared reference allocation's process-local identity.
     #[inline]
     pub fn id(&self) -> ReferenceId {
         self.root.id()
@@ -510,15 +511,6 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
             return Err(ProgramError::custom(ArrayReferenceViewError::InvalidRuntimeRoot));
         }
         self.root.lock().map_err(ProgramError::custom)
-    }
-
-    /// Waits until an unrenamed root has left its short submitted-before-install reservation window.
-    #[doc(hidden)]
-    pub fn wait_until_runtime_accessible(&self) -> Result<(), ProgramError> {
-        if !self.is_runtime_root_handle() {
-            return Err(ProgramError::custom(ArrayReferenceViewError::InvalidRuntimeRoot));
-        }
-        self.root.wait_until_accessible().map_err(ProgramError::custom)
     }
 
     /// Returns a derived handle after appending `transform` without creating a resource.
@@ -564,8 +556,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
 
     /// Replaces this handle's selected coordinates and returns their previous snapshot.
     ///
-    /// Holder-state errors take precedence over a replacement-type error, consistently with mutation through the
-    /// root handle.
+    /// Errors from the shared reference state take precedence over a replacement-type error, consistently with
+    /// mutation through the root handle.
     pub fn swap(&self, replacement: A) -> Result<A, ProgramError>
     where
         A: Reshape + Slice + UpdateSlice,
@@ -583,8 +575,8 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
 
     /// Replaces this handle's selected coordinates without returning their previous snapshot.
     ///
-    /// Holder-state errors take precedence over a replacement-type error, consistently with mutation through the
-    /// root handle.
+    /// Errors from the shared reference state take precedence over a replacement-type error, consistently with
+    /// mutation through the root handle.
     pub fn write(&self, replacement: A) -> Result<(), ProgramError>
     where
         A: Reshape + Slice + UpdateSlice,
@@ -699,7 +691,6 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::types::data::DataType;
-    use crate::programs::ReferenceCompletion;
 
     use super::*;
 
@@ -904,23 +895,20 @@ mod tests {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let mut guard = root.lock_root().unwrap();
         let generation = guard.next_generation().unwrap();
-        let reservation = guard.reserve_pending_unchecked(generation, ReferenceCompletion::ready(Ok(())));
-        drop(guard);
+        guard.begin_submitted_mutation(generation);
 
         // A derived handle is pure structural metadata over a live holder, so composing one must never resolve the
-        // holder's submitted work. The holder is parked in its submitted-before-install reservation window, where
-        // every value access blocks until an installation that this test never performs, and the derivation still
-        // completes and derives its exact referent type.
+        // holder's submitted work. The holder is parked in its submitted-before-install hidden state, where every
+        // value access is unavailable behind this retained guard until installation, and derivation still completes
+        // and computes its exact referent type.
         let transform = ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
         let derived = root.with_transform(transform).unwrap();
         assert_eq!(derived.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
-        // Failing the reservation is terminal for the alias family, but further derivation remains pure structural
+        // Poisoning the submitted mutation is terminal for the alias family, but further derivation remains structural
         // composition. The resulting handle reports the holder failure only when it attempts to access state.
-        let mut guard = root.lock_root().unwrap();
-        assert!(guard.poison_pending(generation, "submission failed"));
+        guard.poison("submission failed");
         drop(guard);
-        drop(reservation);
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
         let composed = derived.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }).unwrap();

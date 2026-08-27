@@ -49,18 +49,20 @@
 //! # Transactional External State
 //!
 //! [`StatefulCompilationDomain`] is an opt-in execution capability, not a relaxation of the ordinary pure call
-//! contract. A stateful backend snapshots each external holder, chains that holder's cumulative predecessor dependency
-//! into the new invocation's joined completion instead of blocking on it, publishes read leases and mutation
-//! reservations atomically after successful submission, and installs hidden final state without exposing it as a
-//! public function result. Calls involving the same mutated holder therefore serialize by generation without any host
-//! wait, read-only calls may overlap, and calls involving independent holders do not acquire a global lock.
+//! contract. A stateful backend snapshots each external reference, chains that reference's cumulative predecessor
+//! dependency into the new invocation's joined completion instead of blocking on it, publishes read leases and
+//! submitted mutations atomically after successful submission, and installs hidden final state without exposing it as
+//! a public function result. Calls involving the same mutated reference allocation therefore serialize by generation
+//! without any host wait, read-only calls may overlap, and calls involving independent allocations do not acquire a
+//! global lock.
 //!
 //! [`ReferenceExecution`] owns whole-invocation completion. Its blocking `r#await` observes execution failure before
 //! returning the reconstructed public output, while dropping it never cancels submitted work. A failure before
-//! submission leaves every holder unchanged. After submission, a failure that makes the final state ambiguous
-//! poisons the complete affected mutation group; later holder access reports that stored cause. Read-only holders are
-//! leased rather than donated and remain usable after a failed reader. Concrete backends may support only a subset of
-//! shapes, memory placements, shardings, and process topologies and must reject the rest before launch.
+//! submission leaves every reference unchanged. After submission, a failure that makes the final state ambiguous
+//! poisons the complete affected mutation group; later reference access reports that stored cause. Read-only
+//! references are leased rather than donated and remain usable after a failed reader. Concrete backends may support
+//! only a subset of shapes, memory placements, shardings, and process topologies and must reject the rest before
+//! launch.
 //!
 //! # Lifecycle Handles
 //!

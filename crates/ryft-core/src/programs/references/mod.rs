@@ -1,4 +1,4 @@
-//! Generic reference types, operations, eager holders, and staged discharge.
+//! Generic reference types, operations, eager runtime state, and staged discharge.
 //!
 //! References are Ryft's second-class mutable-state values. A reference may be created, aliased, read, replaced,
 //! updated, and consumed inside a program, but it is not ordinary immutable data: numeric operations cannot consume
@@ -15,10 +15,10 @@
 //! Three similarly named types serve different stages of the system:
 //!
 //! - [`ReferenceType<T>`](ReferenceType) is structural program metadata. It says that a value refers to a `T`, but
-//!   contains no eager holder and no process-local resource identity.
-//! - [`Reference<V>`] is the eager runtime handle. Its clones share one synchronized holder, so mutation through one
-//!   handle is visible through every alias. A read returns an immutable snapshot, and a consuming
-//!   [`freeze`](Reference::freeze) invalidates the complete alias family.
+//!   contains no eager state and no process-local resource identity.
+//! - [`Reference<V>`] is the eager runtime handle. Its clones share the synchronized state of one reference
+//!   allocation, so mutation through one handle is visible through every alias. A read returns an immutable snapshot,
+//!   and a consuming [`freeze`](Reference::freeze) invalidates the complete alias family.
 //! - [`ReferenceDischargeReference`] is a temporary handle used only while a program is being discharged. It names a
 //!   root in the transform's environment and carries the policy-owned alias metadata for that particular handle.
 //!
@@ -30,10 +30,10 @@
 //! The reference vocabulary used throughout this module and its consumers is defined relative to one concept:
 //!
 //! - A **root** is the canonical mutable storage cell that a reference family denotes. Only
-//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the root is the shared synchronized holder behind
-//!   every [`Reference`] clone; in operation semantics, it is the identity that [`ReferenceOutput::Root`] introduces
-//!   and [`ReferenceOutput::Alias`] preserves; during discharge, it is the unit of state threading, named by a
-//!   [`ReferenceRootHandle`].
+//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the root is the reference allocation whose
+//!   synchronized state every [`Reference`] clone shares; in operation semantics, it is the identity that
+//!   [`ReferenceOutput::Root`] introduces and [`ReferenceOutput::Alias`] preserves; during discharge, it is the unit
+//!   of state threading, named by a [`ReferenceRootHandle`].
 //! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
 //!   The root has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
@@ -65,8 +65,8 @@
 //!
 //! - `types.rs` defines the structural [`ReferenceType`] and its cross-occurrence refinements.
 //! - `values.rs` defines the eager [`Reference`] value, backend-neutral completion dependencies, and synchronized
-//!   holder state machine, including identity, generations, guards, read leases, reservations, pending publication,
-//!   and terminal poisoning.
+//!   state machine for each reference allocation, including identity, generations, guards, read leases, pending
+//!   completion, and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
 //!   root/alias classifications.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
@@ -83,12 +83,12 @@
 //!
 //! # Eager and Staged State
 //!
-//! Eager code acts directly on a [`Reference`] holder. Staged programs instead use the six reference operations.
+//! Eager code acts directly through a [`Reference`] handle. Staged programs instead use the six reference operations.
 //! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
 //! operations into explicit state dataflow. A local root disappears entirely after that rewrite. An external root
 //! becomes an ordinary state input and, when mutated, a hidden final-state output described by a
 //! [`ReferenceStateBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
-//! the caller's holder. Refer to the `discharge.rs` module documentation for a concrete before-and-after example.
+//! the caller's reference. Refer to the `discharge.rs` module documentation for a concrete before-and-after example.
 //!
 //! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned roots
 //! become immutable state while other references deliberately remain in the program. A full
@@ -101,19 +101,19 @@
 //!
 //! 1. [`ProgramBuilder::add_instruction`](crate::ProgramBuilder::add_instruction) tracks aliases within the region
 //!    under construction and rejects an access after consumption or consumption through a narrowing view.
-//! 2. The eager [`Reference`] holder rejects frozen, poisoned, conflicting, and stale-generation accesses while
-//!    preserving atomic replacement semantics.
+//! 2. The eager [`Reference`] rejects frozen, poisoned, conflicting, and stale-generation accesses while preserving
+//!    atomic replacement semantics across its alias family.
 //! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound roots, invalid
 //!    structured-region threading, escaping local allocations, and surviving references in a claimed full result.
 //!
-//! These checks are complementary. Construction sees the source call, the eager holder sees runtime aliases and
+//! These checks are complementary. Construction sees the source call, the eager reference sees runtime aliases and
 //! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
 
 // TODO(eaplatanios): Review this module.
 
 use thiserror::Error;
 
-/// Error produced while accessing a [`Reference`]'s eager holder.
+/// Error produced while accessing the shared state of an eager [`Reference`] allocation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceError {
     /// A reference allocation attempted to store another reference as its immediate referent.
@@ -123,7 +123,7 @@ pub enum ReferenceError {
         referent_type: String,
     },
 
-    /// A replacement or update result did not preserve the holder's exact declared referent type.
+    /// A replacement or update result did not preserve the root's exact declared referent type.
     #[error("reference value type `{actual}` must exactly match declared referent type `{expected}`")]
     ReferentTypeMismatch {
         /// Exact declared referent type.
@@ -133,7 +133,7 @@ pub enum ReferenceError {
         actual: String,
     },
 
-    /// A handle-local metadata mapping could not reconstruct a value crossing the shared-holder boundary.
+    /// A handle-local metadata mapping could not reconstruct a value crossing the shared-state boundary.
     #[error("reference value reconstruction failed: {message}")]
     ValueReconstruction {
         /// Underlying value-family reconstruction diagnostic.
@@ -144,27 +144,28 @@ pub enum ReferenceError {
     #[error("reference is frozen")]
     Frozen,
 
-    /// A guarded transaction attempted an operation incompatible with an extraction, reservation, or active lease.
+    /// A guarded transaction attempted an operation incompatible with an extraction or active execution lease.
     #[error("reference holder has a conflicting transaction or execution lease")]
     TransactionInProgress,
 
-    /// A reference replacement was prepared for a different holder.
+    /// A reference replacement was prepared for a different reference allocation.
     #[error("reference replacement belongs to a different holder")]
     ReplacementHolderMismatch,
 
-    /// A pending value or completion targeted an older holder generation.
+    /// A pending value or completion targeted an older generation of the shared reference state.
     #[error("reference completion targets a stale holder generation")]
     StaleGeneration,
 
-    /// The holder exhausted its monotonically increasing mutation generation space.
+    /// The shared reference state exhausted its monotonically increasing mutation generation space.
     #[error("reference holder mutation generation is exhausted")]
     GenerationExhausted,
 
-    /// The holder's synchronization primitive was poisoned by a panic during an earlier access.
+    /// The reference allocation's synchronization primitive was poisoned by a panic during an earlier access.
     #[error("reference holder is poisoned")]
     Poisoned,
 
-    /// The holder was invalidated after a stateful backend invocation crossed its irreversible execution boundary.
+    /// The shared reference state was invalidated after a stateful backend invocation crossed its irreversible
+    /// execution boundary.
     #[error("reference state is poisoned: {reason}")]
     ExecutionPoisoned {
         /// Backend-owned reason the state can no longer be used safely.
@@ -200,8 +201,8 @@ pub use semantics::{
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
-    Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceGeneration,
-    ReferenceGuard, ReferenceId, ReferenceReplacement, ReferenceReservationToken, ReferenceReservationTokenBatch,
+    Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceGuard, ReferenceId,
+    ReferenceReplacement,
 };
 
 #[cfg(test)]

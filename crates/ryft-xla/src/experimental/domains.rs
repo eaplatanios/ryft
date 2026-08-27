@@ -19,11 +19,11 @@ use ryft_core::{
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
     Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceDischargeResult,
-    ReferenceExecution, ReferenceGuard, ReferenceId, ReferenceReservationTokenBatch, ReferenceSource,
-    ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
-    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
-    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceGuard,
+    ReferenceId, ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension,
+    StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension,
+    TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
+    ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -130,10 +130,6 @@ impl ReferenceCompletionBackend for XlaReferenceCompletion {
     fn is_ready(&self) -> Result<bool, Arc<str>> {
         self.fence.is_ready().map_err(|error| Arc::from(error.to_string()))
     }
-
-    fn on_ready(&self, callback: ReferenceCompletionCallback) {
-        self.fence.on_ready(move |result| callback(result.map_err(|error| Arc::from(error.to_string()))));
-    }
 }
 
 /// Maps one backend-neutral completion failure back into the XLA domain's public error vocabulary.
@@ -220,6 +216,9 @@ pub(crate) enum StatefulFailureInjection {
 
     /// Fails after mutable inputs cross the execution handoff boundary.
     AfterHandoff,
+
+    /// Fails after state publication but before hidden final states are reconstructed and installed.
+    BeforeHiddenInstallation,
 
     /// Fails after hidden final states are installed but before public outputs are reconstructed.
     BeforePublicReconstruction,
@@ -2878,6 +2877,9 @@ impl<'c> XlaDomain<'c> {
                 }
                 bindings.push((reference.id(), reference.clone()));
             }
+            // Every in-repo multi-holder path acquires guards in ascending identity order. This ordering is the
+            // deadlock-prevention invariant for overlapping stateful calls and must be preserved while guards remain
+            // held from submission through hidden-state installation below.
             bindings.sort_by_key(|(id, _)| *id);
             let guard_indices =
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
@@ -2904,16 +2906,11 @@ impl<'c> XlaDomain<'c> {
                 .iter()
                 .map(|state| (state.discharged_input_index(), false))
                 .collect::<Vec<_>>();
-            let (execution, input_refinements, mutated, publication) = 'snapshot: loop {
+            let (execution, input_refinements, mutated, publication, mut guards) = 'snapshot: loop {
                 let mut guards = bindings
                     .iter()
                     .map(|(_, reference)| reference.lock_root())
                     .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
-                if let Some(guard_index) = guards.iter().position(ReferenceGuard::reservation_pending) {
-                    drop(guards);
-                    bindings[guard_index].1.wait_until_runtime_accessible()?;
-                    continue;
-                }
                 let read_leases = mutated_slots
                     .iter()
                     .flat_map(|(guard_index, _)| guards[*guard_index].active_read_leases())
@@ -2963,11 +2960,6 @@ impl<'c> XlaDomain<'c> {
                     .iter()
                     .map(|(_, reference)| reference.lock_root())
                     .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
-                if let Some(guard_index) = guards.iter().position(ReferenceGuard::reservation_pending) {
-                    drop(guards);
-                    bindings[guard_index].1.wait_until_runtime_accessible()?;
-                    continue;
-                }
                 let current_generations =
                     guards.iter().map(ReferenceGuard::current_generation).collect::<Result<Vec<_>, _>>()?;
                 if current_generations != observed_generations {
@@ -3004,12 +2996,11 @@ impl<'c> XlaDomain<'c> {
                 // Generation validation under the ordered guards commits this attempt. Dropping the original logical
                 // arguments here releases only retry ownership, allowing ordinary inputs to remain donatable.
                 drop(arguments.take());
-                // Nothing has been reserved or published yet, so a failed projection simply releases the guards.
+                // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
                 let (execution_arguments, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
-                let guard_storage = RefCell::new(Some(guards));
-                let publication: RefCell<Option<(ReferenceCompletion, ReferenceReservationTokenBatch)>> =
-                    RefCell::new(None);
+                let guard_storage = RefCell::new(guards);
+                let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
                         let mut completions = dependencies.clone();
@@ -3019,23 +3010,25 @@ impl<'c> XlaDomain<'c> {
                             completions.push(injected);
                         }
                         let completion = ReferenceCompletion::join(completions);
-                        let mut stored_guards = guard_storage.borrow_mut();
-                        let guards = stored_guards.as_mut().unwrap();
+                        let mut guards = guard_storage.borrow_mut();
                         for guard_index in &read_only_guard_indices {
                             guards[*guard_index].publish_read_lease_unchecked(completion.clone());
                         }
-                        let tokens = mutated
-                            .iter()
-                            .map(|(guard_index, _, generation)| {
-                                guards[*guard_index].reserve_pending_unchecked(*generation, completion.clone())
-                            })
-                            .collect();
-                        *publication.borrow_mut() = Some((completion, ReferenceReservationTokenBatch::new(tokens)));
-                        drop(stored_guards.take());
+                        for (guard_index, _, generation) in &mutated {
+                            guards[*guard_index].begin_submitted_mutation(*generation);
+                        }
+                        *publication.borrow_mut() = Some(completion);
                     });
-                break 'snapshot (execution, input_refinements, mutated, publication.into_inner());
+                break 'snapshot (
+                    execution,
+                    input_refinements,
+                    mutated,
+                    publication.into_inner(),
+                    guard_storage.into_inner(),
+                );
             };
-            let Some((completion, mut token_batch)) = publication else {
+            let Some(completion) = publication else {
+                drop(guards);
                 return match execution {
                     Err(error) => Ok(ReferenceExecution::ready(Err(error))),
                     Ok(_) => unreachable!("successful PJRT submission must publish reference state"),
@@ -3044,13 +3037,23 @@ impl<'c> XlaDomain<'c> {
             let execution = match execution {
                 Ok(execution) => execution,
                 Err(error) => {
-                    token_batch.poison(error.to_string());
+                    let reason = error.to_string();
+                    for (guard_index, _, _) in &mutated {
+                        guards[*guard_index].poison(reason.clone());
+                    }
+                    drop(guards);
                     return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
             };
             let (physical_outputs, fence) = execution.into_parts();
             let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
             let installation = (|| -> Result<(), XlaDomainError> {
+                #[cfg(test)]
+                if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenInstallation) {
+                    return Err(XlaDomainError::InvalidCompilationOptions {
+                        reason: "injected failure before hidden state installation".to_string(),
+                    });
+                }
                 let hidden_outputs = reconstruct_compiled_outputs(
                     self.client()?,
                     program,
@@ -3061,18 +3064,13 @@ impl<'c> XlaDomain<'c> {
                 let mut hidden_outputs = (program.public_output_count..program.output_types.len())
                     .zip(hidden_outputs)
                     .collect::<BTreeMap<_, _>>();
-                let mut mutation_guards = mutated
-                    .iter()
-                    .map(|(guard_index, _, _)| bindings[*guard_index].1.lock_root())
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
                 let replacements = mutated
                     .iter()
-                    .zip(mutation_guards.iter())
-                    .map(|((_, logical_output_index, _), guard)| {
+                    .map(|(guard_index, logical_output_index, _)| {
                         let value = hidden_outputs.remove(logical_output_index).ok_or_else(|| {
                             ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
                         })?;
-                        guard.prepare_replacement(value).map_err(ProgramError::custom)
+                        guards[*guard_index].prepare_replacement(value).map_err(ProgramError::custom)
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 if !hidden_outputs.is_empty() {
@@ -3081,23 +3079,26 @@ impl<'c> XlaDomain<'c> {
                     )
                     .into());
                 }
-                for (((_, _, generation), guard), value) in
-                    mutated.iter().zip(mutation_guards.iter()).zip(&replacements)
-                {
-                    guard.validate_pending_install(*generation, value)?;
+                for ((guard_index, _, generation), replacement) in mutated.iter().zip(&replacements) {
+                    guards[*guard_index].validate_pending_install(*generation, replacement)?;
                 }
-                for (((_, _, generation), guard), value) in
-                    mutated.iter().zip(mutation_guards.iter_mut()).zip(replacements)
-                {
-                    guard.install_pending_unchecked(*generation, value);
+                for ((guard_index, _, generation), replacement) in mutated.iter().zip(replacements) {
+                    guards[*guard_index].install_pending_unchecked(*generation, completion.clone(), replacement);
                 }
                 Ok(())
             })();
             if let Err(error) = installation {
-                token_batch.poison(error.to_string());
+                let reason = error.to_string();
+                for (guard_index, _, _) in &mutated {
+                    guards[*guard_index].poison(reason.clone());
+                }
+                drop(guards);
                 return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
             }
-            token_batch.disarm();
+            // Mutated hidden outputs are statically shaped under the current ABI, so neither buffer logical-shape
+            // queries nor runtime-extent materialization can wait for device execution during installation. Release
+            // every holder before public reconstruction, where dynamic outputs may require either wait.
+            drop(guards);
 
             let public_result = (|| -> Result<_, XlaDomainError> {
                 #[cfg(test)]
@@ -5118,11 +5119,21 @@ fn reconstruct_compiled_outputs<'c>(
         .iter()
         .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
     {
+        let physical_output_index = output_dimension.physical_output_index();
+        let physical_output =
+            physical_outputs.get_mut(physical_output_index).and_then(Option::take).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "physical output {physical_output_index} for runtime extent of output {} axis {} is missing or was \
+                     claimed twice",
+                    output_dimension.logical_output_index(),
+                    output_dimension.axis(),
+                ))
+            })?;
         let scalar = Array::from_canonical_addressable_buffers(
             client,
             scalar_type.clone(),
             program.mesh.clone(),
-            physical_outputs[output_dimension.physical_output_index()].take().unwrap(),
+            physical_output,
         )?
         .with_execution_fence(fence.clone());
         let bytes = materialize_dense_array_bytes(&scalar)?;
@@ -5174,7 +5185,12 @@ fn reconstruct_compiled_outputs<'c>(
                         client,
                         output_type,
                         program.mesh.clone(),
-                        physical_outputs[physical_index].take().unwrap(),
+                        physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "physical output {physical_index} for logical output {logical_index} is missing or was \
+                                 claimed twice",
+                            ))
+                        })?,
                     )?
                     .with_execution_fence(fence.clone()))
                 }

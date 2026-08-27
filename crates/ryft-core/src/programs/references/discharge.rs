@@ -38,10 +38,11 @@
 //! input becomes an ordinary input carrying the entering referent. If the program mutates the root, its final state is
 //! appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
 //! argument owns that state, which discharged input receives the snapshot, and which hidden output must be installed
-//! back into the holder. A read-only external root has no hidden output.
+//! back into the caller's reference. A read-only external root has no hidden output.
 //!
-//! Discharge rewrites a program; it does not itself lock eager holders or execute a backend. The stateful compilation
-//! surface uses the result's binding metadata together with the runtime holder protocol after compilation.
+//! Discharge rewrites a program; it does not itself lock eager reference state or execute a backend. The stateful
+//! compilation surface uses the result's binding metadata together with the runtime reference protocol after
+//! compilation.
 //!
 //! # Full and Partial Discharge
 //!
@@ -243,7 +244,7 @@ impl<P> ReferenceDischargeResult<P> {
 /// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
 /// external roots are reported as [`ReferenceStateBinding`]s in canonical entry-boundary order, and the mutated
 /// subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
-/// allocations leave no binding, because no caller owns their holders. Preserved roots contribute neither bindings
+/// allocations leave no binding, because no caller owns their state. Preserved roots contribute neither bindings
 /// nor hidden outputs; they simply remain reference-typed values inside the payload, and their accesses replay
 /// verbatim.
 ///
@@ -544,7 +545,7 @@ impl Display for ReferenceSource {
 /// Logical binding recipe for one external reference root in a discharged program.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ReferenceStateBinding {
-    /// Capture or input argument supplying the runtime holder.
+    /// Capture or input argument supplying the eager reference handle.
     source: ReferenceSource,
 
     /// Flat input position receiving the entering immutable value.
@@ -559,8 +560,8 @@ impl ReferenceStateBinding {
     ///
     /// # Parameters
     ///
-    ///   - `source`: Capture or input supplying the runtime holder.
-    ///   - `discharged_input_index`: Flat discharged input receiving the holder's entering immutable value.
+    ///   - `source`: Capture or input supplying the eager reference handle.
+    ///   - `discharged_input_index`: Flat discharged input receiving the reference's entering immutable value.
     ///   - `final_state_output_index`: Hidden output containing the final state, or [`None`] for a read-only root.
     pub const fn new(
         source: ReferenceSource,
@@ -570,7 +571,7 @@ impl ReferenceStateBinding {
         Self { source, discharged_input_index, final_state_output_index }
     }
 
-    /// Returns the capture or input argument supplying the runtime holder.
+    /// Returns the capture or input argument supplying the eager reference handle.
     pub const fn source(&self) -> ReferenceSource {
         self.source
     }
@@ -872,7 +873,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `capture_count` exceeds the program's input count, when an
-    /// output still denotes a reference, when the program consumes an external root, whose holder belongs to the
+    /// output still denotes a reference, when the program consumes an external root, whose state belongs to the
     /// caller, or when the rewritten payload fails the reference-freedom proof. Rule-level failures, including a
     /// use-after-consume and an access to an unbound root, propagate from the replay itself.
     pub fn discharge_references_with_policy<P>(
@@ -939,9 +940,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// preserved root onto a rebuilt region's added state positions, and otherwise for every reason
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) documents — with one deliberate
     /// exception. Consuming a *discharged* external root is still rejected, because a
-    /// [`ReferenceStateBinding`] cannot express a holder that no longer exists; consuming a *preserved* one is
-    /// accepted, because the payload retains the consuming operation and the caller hands its holder to that
-    /// operation directly.
+    /// [`ReferenceStateBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
+    /// a *preserved* one is accepted, because the payload retains the consuming operation and the caller passes its
+    /// reference handle to that operation directly.
     pub fn partially_discharge_references_with_policy<P>(
         self,
         capture_count: usize,
@@ -2124,8 +2125,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// A loop-shaped boundary is symmetric: it returns a successor state for every root it carries, including roots
     /// its closure only read. The value that comes back for such a root equals the one that entered, so re-threading
     /// it keeps the destination consistent — but recording it as a write would not, because the mutation flag is what
-    /// decides whether an external root publishes a hidden final-state output and therefore whether its caller writes
-    /// its holder back. A read-only loop must leave its caller's holder alone.
+    /// decides whether an external root publishes a hidden final-state output and therefore whether its caller updates
+    /// the shared reference state. A read-only loop must leave its caller's reference state unchanged.
     ///
     /// # Parameters
     ///

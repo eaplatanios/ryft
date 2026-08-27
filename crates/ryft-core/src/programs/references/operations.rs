@@ -95,7 +95,7 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// Passing it by value makes the common single-handle misuse — freezing and then reading through the same
     /// binding — a compile error rather than a runtime one. Aliases obtained by cloning the handle are a different
     /// case and remain a dynamic failure, because the type system cannot see them: an eager alias fails at its next
-    /// access against the shared holder, and a staged alias fails while tracing, because every clone of one
+    /// access against the shared reference state, and a staged alias fails while tracing, because every clone of one
     /// [`Tracer`](crate::Tracer) names the same staged atom. Freezing through a shared borrow is therefore an
     /// explicit clone-then-freeze, which reads as the deliberate act it is.
     ///
@@ -112,7 +112,7 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// ```
     /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
     ///
-    /// // A clone is a separate handle onto one holder, so the misuse it enables is caught dynamically instead.
+    /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
     /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
     /// let alias = root.clone();
     /// assert_eq!(root.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32)));
