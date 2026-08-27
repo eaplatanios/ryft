@@ -52,24 +52,19 @@ impl ReferenceGeneration {
     }
 }
 
-// TODO(eaplatanios): Review from here onward.
-
-/// Cloneable handle for a referenced [`Value`].
+/// Cloneable handle for a referenced [`Value`]. Cloning a [`Reference`] creates an alias that shares the same
+/// mutable state. Reading clones the current value. Writes and swaps validate the exact declared referent type before
+/// atomically replacing the shared snapshot, and a consuming freeze invalidates the complete alias family. Reference
+/// referents are expected to have immutable value clone semantics so that later replacements and updates cannot change
+/// any initializers, read results, or swap results retained by the caller.
 ///
-/// Cloning a reference creates an alias that shares the same mutable state. Reading clones the current value. Writes and
-/// swaps validate the exact declared referent type before atomically replacing the shared snapshot, and a consuming
-/// freeze invalidates the complete alias family. Reference referents are expected to have immutable-value clone
-/// semantics so that later replacement or update cannot change an initializer, read result, or swap result retained by
-/// the caller. Array IR admits only array referents, whose SSA/copy-on-write semantics satisfy this requirement;
-/// resource handles such as references are not valid referents there.
-///
-/// A directly created eager handle has no program-owned scope: it remains valid until an explicit freeze or until the
-/// last handle in its alias family is dropped. Statically validated local program roots that are never frozen are
-/// implicitly discarded when their nonescaping interpretation environment is released.
+/// A directly created eager handle has no [`Program`](crate::Program)-owned scope. It remains valid until an explicit
+/// freeze or until the last handle in its alias family is dropped. Statically validated local program roots that are
+/// never frozen are implicitly discarded when their non-escaping interpretation environment is released.
 ///
 /// # Reference State Machine
 ///
-/// Each alias family has one synchronized state. Its lifecycle is:
+/// Each reference alias family has one synchronized state. The following diagram illustrates its lifecycle:
 ///
 /// ```mermaid
 /// stateDiagram-v2
@@ -79,76 +74,76 @@ impl ReferenceGeneration {
 ///   Pending --> Taken: chained asynchronous submission (generation + 1)
 ///   Taken --> Ready: install synchronous replacement
 ///   Taken --> Pending: install asynchronous replacement
-///   Taken --> ExecutionPoisoned: guard drop or backend failure
+///   Taken --> Poisoned: guard drop or backend failure
 ///   Pending --> Ready: backend completion succeeds
-///   Pending --> ExecutionPoisoned: backend completion fails
+///   Pending --> Poisoned: backend completion fails
 ///   Ready --> Frozen: freeze
 /// ```
 ///
-/// `Ready` exposes a completed immutable snapshot. `Taken` is an exclusive transaction whose [`ReferenceGuard`]
-/// retains exclusive access to the shared state while a synchronous backend prepares a replacement or an asynchronous
-/// backend reconstructs submitted hidden state. Dropping that guard before installation poisons the reference
-/// defensively. An asynchronous installation changes the state to `Pending`, where the new value remains inaccessible
-/// until its cumulative [`ReferenceCompletion`] succeeds. Generations ensure that completion of an older execution
-/// cannot affect a newer mutation. `Frozen` and `ExecutionPoisoned` are terminal states.
+/// `Ready` exposes a completed immutable snapshot. `Taken` is an exclusive transaction whose [`ReferenceGuard`] retains
+/// exclusive access to the shared state while a synchronous backend prepares a replacement or an asynchronous backend
+/// reconstructs submitted hidden state. Dropping that guard before installation poisons the reference defensively. An
+/// asynchronous installation changes the state to `Pending`, where the new value remains inaccessible until its
+/// cumulative [`ReferenceCompletion`] succeeds. Generations ensure that completion of an older execution cannot
+/// affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
 ///
 /// Read-only asynchronous executions do not enter a separate state. They publish completion leases on `Ready` or
-/// `Pending`; a mutating transaction waits for those leases before it may take the reference, preventing donated
+/// `Pending`. Mutating transactions wait for those leases before they may take the reference, preventing donated
 /// storage from racing a reader that still observes the current snapshot.
 ///
 /// Equality and hashing identify the mutable storage location, not this handle's structural type. Clones and
 /// identity-renamed handles into the same alias family therefore compare equal and hash identically even when their
 /// handle-local referent types use different identity vocabularies.
 ///
-/// Handles are pointer-sized: cloning one is a single reference-count increment, because exact clones share one
-/// immutable handle vocabulary. Identity renaming allocates a new vocabulary sharing the same reference allocation and
-/// maps values bidirectionally at the shared-state boundary. Because that vocabulary is shared across clones,
-/// `Reference<V>` is `Send` and `Sync` only when the referent value and its type and identity metadata are all safe to
-/// share across threads (`Send + Sync`). Array indexing and slicing are provided by the array-owned
-/// [`ArrayReference`](crate::arrays::ArrayReference) wrapper.
+/// Handles are pointer-sized. Cloning a handle is a single reference-count increment because exact clones share one
+/// immutable handle vocabulary. Identity renaming allocates a new vocabulary sharing the same reference allocation
+/// and maps values bidirectionally at the shared-state boundary. Because that vocabulary is shared across clones,
+/// `Reference<V>` is [`Send`] and [`Sync`] only when the referent value and its type and identity metadata are
+/// all safe to share across threads (i.e., they are all `Send + Sync`).
 #[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
-    /// Immutable handle vocabulary shared by exact clones, including the shared mutable holder. All runtime
+    /// Immutable [`ReferenceHandle`] shared by exact clones, including the shared mutable holder. All runtime
     /// mutability lives behind the holder's state lock.
-    inner: Arc<ReferenceHandle<V>>,
+    handle: Arc<ReferenceHandle<V>>,
 }
 
 impl<V: Value> Reference<V> {
-    /// Creates a new independent reference initialized with `value`.
+    /// Creates a new independent [`Reference`] whose underlying storage is initialized with `value`.
     pub fn new(value: V) -> Result<Self, ReferenceError> {
         let root_type = value.r#type().into_owned();
         if root_type.is_reference() {
             return Err(ReferenceError::NestedReferent { referent_type: root_type.to_string() });
         }
-        let r#type = ReferenceType::new(root_type.clone());
         Ok(Self {
-            inner: Arc::new(ReferenceHandle {
+            handle: Arc::new(ReferenceHandle {
                 holder: Arc::new(ReferenceHolder {
-                    root_type,
+                    root_type: root_type.clone(),
                     state: Mutex::new(ReferenceState::Ready {
                         value,
                         generation: ReferenceGeneration::initial(),
                         read_leases: Vec::new(),
                     }),
                 }),
-                r#type,
+                r#type: ReferenceType::new(root_type),
                 root_to_handle: TypeIdentityRenaming::new(),
                 handle_to_root: TypeIdentityRenaming::new(),
             }),
         })
     }
 
+    // TODO(eaplatanios): Review from here onward.
+
     /// Returns this alias family's process-local identity, which remains stable while any alias is alive.
     #[inline]
     pub fn id(&self) -> ReferenceId {
-        ReferenceId::from_address(Arc::as_ptr(&self.inner.holder) as usize)
+        ReferenceId::from_address(Arc::as_ptr(&self.handle.holder) as usize)
     }
 
     /// Returns whether this handle exposes the shared state's root type without a handle-local identity mapping.
     #[doc(hidden)]
     pub fn is_root_handle(&self) -> bool {
-        self.inner.root_to_handle.is_identity() && self.inner.handle_to_root.is_identity()
+        self.handle.root_to_handle.is_identity() && self.handle.handle_to_root.is_identity()
     }
 
     /// Locks this reference for one stateful backend transaction.
@@ -242,7 +237,7 @@ impl<V: Value> Reference<V> {
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
-        let current_type = self.inner.r#type.referent();
+        let current_type = self.handle.r#type.referent();
         let renamed_type = current_type.rename_identities(renaming)?;
         // A renaming that merges two of the referent's identities cannot be inverted for value reconstruction.
         // Detect the collision here and report it in the caller's direction; deriving the inverse below would
@@ -262,15 +257,15 @@ impl<V: Value> Reference<V> {
         }
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
-        let root_type = &self.inner.holder.root_type;
+        let root_type = &self.handle.holder.root_type;
         let root_to_handle = Self::compose_renamings(
-            &self.inner.root_to_handle,
+            &self.handle.root_to_handle,
             renaming,
             root_type.identities().map(|(_, identity)| identity),
         )?;
         let handle_to_root = Self::compose_renamings(
             &inverse_step,
-            &self.inner.handle_to_root,
+            &self.handle.handle_to_root,
             renamed_type.identities().map(|(_, identity)| identity),
         )?;
         if root_type.rename_identities(&root_to_handle)? != renamed_type
@@ -281,8 +276,8 @@ impl<V: Value> Reference<V> {
             ));
         }
         Ok(Self {
-            inner: Arc::new(ReferenceHandle {
-                holder: Arc::clone(&self.inner.holder),
+            handle: Arc::new(ReferenceHandle {
+                holder: Arc::clone(&self.handle.holder),
                 r#type: ReferenceType::new(renamed_type),
                 root_to_handle,
                 handle_to_root,
@@ -304,7 +299,7 @@ impl<V: Value> Reference<V> {
                     Some((Some((*generation, completion.clone())), Vec::new()))
                 }
                 ReferenceState::Frozen => return Err(ReferenceError::Frozen),
-                ReferenceState::ExecutionPoisoned(reason) => {
+                ReferenceState::Poisoned(reason) => {
                     return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
                 }
                 // `Taken` is unobservable during a valid transaction because its guard retains this mutex: competing
@@ -334,12 +329,12 @@ impl<V: Value> Reference<V> {
     /// Locks the holder, recovering mutex poisoning only when [`ReferenceGuard::drop`] already replaced the state
     /// with the explicit terminal execution failure before unwinding released the mutex.
     fn lock_state(&self) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
-        match self.inner.holder.state.lock() {
+        match self.handle.holder.state.lock() {
             Ok(state) => Ok(state),
             Err(poisoned) => {
                 let state = poisoned.into_inner();
-                if matches!(*state, ReferenceState::ExecutionPoisoned(_)) {
-                    self.inner.holder.state.clear_poison();
+                if matches!(*state, ReferenceState::Poisoned(_)) {
+                    self.handle.holder.state.clear_poison();
                     Ok(state)
                 } else {
                     Err(ReferenceError::Poisoned)
@@ -367,7 +362,7 @@ impl<V: Value> Reference<V> {
                 };
                 *state = ReferenceState::Ready { value, generation, read_leases };
             }
-            Err(reason) => *state = ReferenceState::ExecutionPoisoned(reason),
+            Err(reason) => *state = ReferenceState::Poisoned(reason),
         }
         true
     }
@@ -391,7 +386,7 @@ impl<V: Value> Reference<V> {
     /// Reconstructs one root-stored value in this handle's type-identity vocabulary.
     fn reconstruct_local(&self, value: &V) -> Result<V, ReferenceError> {
         value
-            .rename_type_identities(&self.inner.root_to_handle)
+            .rename_type_identities(&self.handle.root_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
     }
 
@@ -399,7 +394,7 @@ impl<V: Value> Reference<V> {
     fn prepare_stored(&self, value: V) -> Result<V, ReferenceError> {
         self.validate_referent_type(&value)?;
         let stored = value
-            .rename_type_identities(&self.inner.handle_to_root)
+            .rename_type_identities(&self.handle.handle_to_root)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
         self.validate_root_type(&stored)?;
         Ok(stored)
@@ -420,11 +415,11 @@ impl<V: Value> Reference<V> {
     /// Validates that `value` preserves this holder's exact declared referent type.
     fn validate_referent_type(&self, value: &V) -> Result<(), ReferenceError> {
         let actual = value.r#type();
-        if actual.as_ref() == self.inner.r#type.referent() {
+        if actual.as_ref() == self.handle.r#type.referent() {
             return Ok(());
         }
         Err(ReferenceError::ReferentTypeMismatch {
-            expected: self.inner.r#type.referent().to_string(),
+            expected: self.handle.r#type.referent().to_string(),
             actual: actual.to_string(),
         })
     }
@@ -432,7 +427,7 @@ impl<V: Value> Reference<V> {
     /// Validates the exact value type stored behind every handle-local mapping.
     fn validate_root_type(&self, value: &V) -> Result<(), ReferenceError> {
         let actual = value.r#type();
-        let root_type = &self.inner.holder.root_type;
+        let root_type = &self.handle.holder.root_type;
         if actual.as_ref() == root_type {
             return Ok(());
         }
@@ -444,7 +439,7 @@ impl<V: Value> Reference<V> {
 impl<V: Value> Clone for Reference<V> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self { handle: Arc::clone(&self.handle) }
     }
 }
 
@@ -454,7 +449,7 @@ impl<V: Value> Debug for Reference<V> {
         formatter
             .debug_struct("Reference")
             .field("id", &self.id())
-            .field("type", &self.inner.r#type)
+            .field("type", &self.handle.r#type)
             .finish()
     }
 }
@@ -465,14 +460,14 @@ impl<V: Value> Debug for Reference<V> {
 impl<V: Value> Display for Reference<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(&self.inner.r#type, formatter)
+        Display::fmt(&self.handle.r#type, formatter)
     }
 }
 
 impl<V: Value> PartialEq for Reference<V> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner.holder, &other.inner.holder)
+        Arc::ptr_eq(&self.handle.holder, &other.handle.holder)
     }
 }
 
@@ -481,7 +476,7 @@ impl<V: Value> Eq for Reference<V> {}
 impl<V: Value> Hash for Reference<V> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.inner.holder).hash(state);
+        Arc::as_ptr(&self.handle.holder).hash(state);
     }
 }
 
@@ -490,7 +485,7 @@ impl<V: Value> Typed for Reference<V> {
 
     #[inline]
     fn r#type(&self) -> Cow<'_, Self::Type> {
-        Cow::Borrowed(&self.inner.r#type)
+        Cow::Borrowed(&self.handle.r#type)
     }
 }
 
@@ -562,7 +557,7 @@ enum ReferenceState<V: Value> {
     },
 
     /// Value that may have been consumed by an irreversible failed backend invocation.
-    ExecutionPoisoned(Arc<str>),
+    Poisoned(Arc<str>),
 
     /// Consumed reference whose value was returned by `freeze`.
     Frozen,
@@ -601,9 +596,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
             ReferenceState::Ready { generation, .. } => Ok(*generation),
             ReferenceState::Pending { generation, .. } => Ok(*generation),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
-            }
+            ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
             ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
         }
     }
@@ -615,9 +608,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
                 self.reference.reconstruct_local(value)
             }
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
-            }
+            ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
             ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
         }
     }
@@ -645,9 +636,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
         match &*self.state {
             ReferenceState::Ready { .. } | ReferenceState::Pending { .. } => Ok(()),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
-                Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() })
-            }
+            ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
             ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
         }
     }
@@ -712,7 +701,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
                 generation.next().ok_or(ReferenceError::GenerationExhausted)?
             }
             ReferenceState::Frozen => return Err(ReferenceError::Frozen),
-            ReferenceState::ExecutionPoisoned(reason) => {
+            ReferenceState::Poisoned(reason) => {
                 return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
             }
             ReferenceState::Taken { .. } => return Err(ReferenceError::TransactionInProgress),
@@ -796,12 +785,12 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// Converts and validates a prospective replacement without changing the shared reference state.
     pub fn prepare_replacement(&self, value: V) -> Result<ReferenceReplacement<V>, ReferenceError> {
         let stored = self.reference.prepare_stored(value)?;
-        Ok(ReferenceReplacement { holder: Arc::downgrade(&self.reference.inner.holder), value: stored })
+        Ok(ReferenceReplacement { holder: Arc::downgrade(&self.reference.handle.holder), value: stored })
     }
 
     /// Validates that `replacement` was prepared against this exact holder.
     pub(crate) fn accepts(&self, replacement: &ReferenceReplacement<V>) -> Result<(), ReferenceError> {
-        if std::ptr::eq(replacement.holder.as_ptr(), Arc::as_ptr(&self.reference.inner.holder)) {
+        if std::ptr::eq(replacement.holder.as_ptr(), Arc::as_ptr(&self.reference.handle.holder)) {
             Ok(())
         } else {
             Err(ReferenceError::ReplacementHolderMismatch)
@@ -828,7 +817,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// error for a guard-state error; a guard that does not own a `Taken` transaction is deliberately left untouched.
     pub fn poison(&mut self, reason: impl Into<Arc<str>>) {
         if matches!(*self.state, ReferenceState::Taken { .. }) {
-            *self.state = ReferenceState::ExecutionPoisoned(reason.into());
+            *self.state = ReferenceState::Poisoned(reason.into());
         }
     }
 }
@@ -836,8 +825,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
 impl<V: Value> Drop for ReferenceGuard<'_, V> {
     fn drop(&mut self) {
         if matches!(*self.state, ReferenceState::Taken { .. }) {
-            *self.state =
-                ReferenceState::ExecutionPoisoned("stateful transaction ended without restoring state".into());
+            *self.state = ReferenceState::Poisoned("stateful transaction ended without restoring state".into());
         }
     }
 }
@@ -1205,7 +1193,7 @@ mod tests {
     fn test_reference_write_preserves_state_when_the_generation_is_exhausted() {
         let reference = reference_new(Array::scalar(1.0_f32));
         {
-            let mut state = reference.inner.holder.state.lock().unwrap();
+            let mut state = reference.handle.holder.state.lock().unwrap();
             let ReferenceState::Ready { generation, .. } = &mut *state else {
                 unreachable!("a newly allocated reference is ready")
             };
@@ -1237,7 +1225,7 @@ mod tests {
     #[test]
     fn test_reference_read_reports_a_poisoned_holder() {
         let reference = reference_new(Array::scalar(1.0_f32));
-        let holder = Arc::clone(&reference.inner.holder);
+        let holder = Arc::clone(&reference.handle.holder);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let _guard = holder.state.lock().unwrap();
@@ -1677,7 +1665,7 @@ mod tests {
 
         let reference = reference_new(Array::scalar(1.0_f32));
         let clone = reference.clone();
-        assert!(Arc::ptr_eq(&clone.inner, &reference.inner));
+        assert!(Arc::ptr_eq(&clone.handle, &reference.handle));
     }
 
     #[test]
@@ -1781,8 +1769,8 @@ mod tests {
 
         // Renaming allocates a distinct handle vocabulary over the same shared holder, which is exactly the
         // handle-vocabulary/storage split: equality and hashing follow the holder, not the vocabulary.
-        assert!(!Arc::ptr_eq(&renamed.inner, &reference.inner));
-        assert!(Arc::ptr_eq(&renamed.inner.holder, &reference.inner.holder));
+        assert!(!Arc::ptr_eq(&renamed.handle, &reference.handle));
+        assert!(Arc::ptr_eq(&renamed.handle.holder, &reference.handle.holder));
         assert_eq!(renamed, reference);
         assert_ne!(renamed.r#type(), reference.r#type());
         let mut reference_hasher = DefaultHasher::new();
