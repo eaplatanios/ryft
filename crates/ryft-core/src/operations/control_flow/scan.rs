@@ -44,8 +44,8 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
     Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeInput, RegionInterface, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    ReferenceRegionDischargeBoundary, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
+    TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1755,11 +1755,7 @@ where
         let boundary = ReferenceRegionDischargeBoundary::new(
             self,
             0,
-            carry_operands
-                .iter()
-                .map(ReferenceRegionDischargeInput::from_operand)
-                .chain(body_input_types[carry_count..].iter().cloned().map(ReferenceRegionDischargeInput::Value))
-                .collect(),
+            body_roots,
             entering.clone(),
             carry_count,
             entering.clone(),

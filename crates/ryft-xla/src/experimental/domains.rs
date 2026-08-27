@@ -1410,7 +1410,9 @@ pub struct XlaLoweredProgram {
     /// Number of leading logical outputs exposed through the structured public function result.
     public_output_count: usize,
 
-    /// Logical external reference-state binding recipes in canonical boundary order.
+    /// Logical external reference-state binding recipes in canonical source order.
+    ///
+    /// Flat input positions are derived from each binding's source and [`Self::capture_count`].
     reference_states: Arc<[ReferenceStateBinding]>,
 
     /// Effective logical input types, including captures first.
@@ -1659,7 +1661,10 @@ enum PersistentReferenceSourceV6 {
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct PersistentReferenceStateV6 {
     source: PersistentReferenceSourceV6,
+
+    /// Redundant flat position retained solely for V6 wire compatibility and corruption detection.
     logical_input_index: u64,
+
     logical_output_index: Option<u64>,
 }
 
@@ -2086,29 +2091,35 @@ fn persistent_mapping(mapping: &[Option<usize>]) -> Result<Vec<Option<u64>>, Xla
         .collect()
 }
 
-/// Encodes holder-free logical reference-state slots.
+/// Encodes holder-free logical reference-state slots in the stable V6 shape.
+///
+/// V6 redundantly stores each flat logical input position. Deriving that coordinate from the canonical source keeps
+/// valid serialized bytes unchanged without reintroducing the redundant field into [`ReferenceStateBinding`].
 fn persistent_reference_states(
     states: &[ReferenceStateBinding],
+    capture_count: usize,
 ) -> Result<Vec<PersistentReferenceStateV6>, XlaDomainError> {
     states
         .iter()
         .map(|state| {
+            let logical_input_index = state.source().flat_input_index(capture_count)?;
             let source = match state.source() {
                 ReferenceSource::Capture { index } => PersistentReferenceSourceV6::Capture { index: index as u64 },
                 ReferenceSource::Input { index } => PersistentReferenceSourceV6::PublicInput { index: index as u64 },
             };
             Ok(PersistentReferenceStateV6 {
                 source,
-                logical_input_index: state.discharged_input_index() as u64,
+                logical_input_index: logical_input_index as u64,
                 logical_output_index: state.final_state_output_index().map(|index| index as u64),
             })
         })
         .collect()
 }
 
-/// Decodes holder-free logical reference-state slots.
+/// Decodes holder-free logical reference-state slots and validates the redundant V6 flat input coordinate.
 fn decode_persistent_reference_states(
     states: Vec<PersistentReferenceStateV6>,
+    capture_count: usize,
 ) -> Result<Vec<ReferenceStateBinding>, XlaDomainError> {
     states
         .into_iter()
@@ -2121,11 +2132,13 @@ fn decode_persistent_reference_states(
                     ReferenceSource::Input { index: checked_usize(index)? }
                 }
             };
-            Ok(ReferenceStateBinding::new(
-                source,
-                checked_usize(state.logical_input_index)?,
-                state.logical_output_index.map(checked_usize).transpose()?,
-            ))
+            let logical_input_index = checked_usize(state.logical_input_index)?;
+            if source.flat_input_index(capture_count).map_err(|error| persistent_error(error.to_string()))?
+                != logical_input_index
+            {
+                return Err(persistent_error("reference-state source does not match its logical input"));
+            }
+            Ok(ReferenceStateBinding::new(source, state.logical_output_index.map(checked_usize).transpose()?))
         })
         .collect()
 }
@@ -2821,11 +2834,15 @@ impl<'c> XlaDomain<'c> {
             }
 
             let arguments = request.into_arguments();
+            let reference_state_input_indices = program
+                .reference_states
+                .iter()
+                .map(|state| state.source().flat_input_index(program.capture_count))
+                .collect::<Result<Vec<_>, _>>()?;
             let mut bindings =
                 Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
             let mut seen = HashSet::with_capacity(program.reference_states.len());
-            for state in program.reference_states.iter() {
-                let logical_input_index = state.discharged_input_index();
+            for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                 let reference = match arguments.get(logical_input_index) {
                     Some(ArrayIrValue::Reference(reference)) => reference,
                     Some(value) => {
@@ -2886,8 +2903,7 @@ impl<'c> XlaDomain<'c> {
 
             let mut mutated_slots = Vec::new();
             let mut read_only_guard_indices = Vec::new();
-            for state in program.reference_states.iter() {
-                let logical_input_index = state.discharged_input_index();
+            for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                 let ArrayIrValue::Reference(reference) = &arguments[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
                 };
@@ -2904,7 +2920,8 @@ impl<'c> XlaDomain<'c> {
             let donation_overrides = program
                 .reference_states
                 .iter()
-                .map(|state| (state.discharged_input_index(), false))
+                .zip(&reference_state_input_indices)
+                .map(|(_, &logical_input_index)| (logical_input_index, false))
                 .collect::<Vec<_>>();
             let (execution, input_refinements, mutated, publication, mut guards) = 'snapshot: loop {
                 let mut guards = bindings
@@ -2930,8 +2947,7 @@ impl<'c> XlaDomain<'c> {
                     guards.iter().map(ReferenceGuard::current_generation).collect::<Result<Vec<_>, _>>()?;
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
-                for state in program.reference_states.iter() {
-                    let logical_input_index = state.discharged_input_index();
+                for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                     let ArrayIrValue::Reference(reference) = &logical_arguments[logical_input_index] else {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
@@ -3180,14 +3196,13 @@ impl<'c> XlaDomain<'c> {
         // capture prefixes used during staging. Programs that actually contain references are cloned because
         // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
         let discharged = program.clone().discharge_references_with_lifted_captures(capture_count)?;
-        self.lower_discharged_xla_program(&discharged, capture_count, options)
+        self.lower_discharged_xla_program(&discharged, options)
     }
 
     /// Lowers one validated reference-discharge artifact through the ordinary array-only XLA path.
     fn lower_discharged_xla_program(
         &self,
         discharged: &ReferenceDischargeResult<FlatXlaProgram>,
-        capture_count: usize,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
@@ -3201,7 +3216,7 @@ impl<'c> XlaDomain<'c> {
         }
         self.lower_verified_reference_free_xla_program(
             discharged.program(),
-            capture_count,
+            discharged.capture_count(),
             discharged.public_output_count(),
             discharged.external_states(),
             options,
@@ -3273,10 +3288,11 @@ impl<'c> XlaDomain<'c> {
             .chain(effective_public_input_types.iter().cloned())
             .collect::<Vec<_>>();
         let reference_states = reference_states.to_vec();
-        if reference_states
-            .windows(2)
-            .any(|states| states[0].discharged_input_index() >= states[1].discharged_input_index())
-        {
+        let reference_state_input_indices = reference_states
+            .iter()
+            .map(|state| state.source().flat_input_index(capture_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        if reference_state_input_indices.windows(2).any(|indices| indices[0] >= indices[1]) {
             return Err(ProgramError::MalformedProgram(
                 "external reference states must follow strictly increasing logical input order".to_string(),
             )
@@ -3292,50 +3308,32 @@ impl<'c> XlaDomain<'c> {
             )
             .into());
         }
-        for state in &reference_states {
-            let expected_input_index = match state.source() {
-                ReferenceSource::Capture { index } => index,
-                ReferenceSource::Input { index } => capture_count.checked_add(index).ok_or_else(|| {
-                    ProgramError::MalformedProgram("external reference input index overflows usize".to_string())
-                })?,
-            };
-            if state.discharged_input_index() != expected_input_index {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "external state from {} maps to logical input {} instead of {expected_input_index}",
-                    state.source(),
-                    state.discharged_input_index(),
-                ))
-                .into());
-            }
-            let input_type = effective_input_types.get(state.discharged_input_index()).ok_or_else(|| {
+        for (_, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+            let input_type = effective_input_types.get(logical_input_index).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "external state logical input {} is out of range",
-                    state.discharged_input_index(),
+                    "external state logical input {logical_input_index} is out of range",
                 ))
             })?;
             if input_type.sharding().is_some_and(|sharding| sharding.mesh() != options.mesh.logical_mesh()) {
                 return Err(XlaDomainError::UnsupportedReferenceAbi {
                     reason: format!(
-                        "external reference state at logical input {} uses a sharding mesh that does not match the \
-                         compilation mesh",
-                        state.discharged_input_index(),
+                        "external reference state at logical input {logical_input_index} uses a sharding mesh that \
+                         does not match the compilation mesh",
                     ),
                 });
             }
             if input_type.data_type().is_zero() {
                 return Err(XlaDomainError::UnsupportedReferenceAbi {
                     reason: format!(
-                        "external reference state at logical input {} cannot use a zero-space type because it has no \
-                         executable buffer",
-                        state.discharged_input_index(),
+                        "external reference state at logical input {logical_input_index} cannot use a zero-space type \
+                         because it has no executable buffer",
                     ),
                 });
             }
             if input_type.memory() != Memory::Device {
                 return Err(XlaDomainError::UnsupportedReferenceAbi {
                     reason: format!(
-                        "external reference state at logical input {} must use device memory",
-                        state.discharged_input_index(),
+                        "external reference state at logical input {logical_input_index} must use device memory"
                     ),
                 });
             }
@@ -3347,8 +3345,8 @@ impl<'c> XlaDomain<'c> {
             {
                 return Err(XlaDomainError::UnsupportedReferenceAbi {
                     reason: format!(
-                        "external reference state at logical input {} has an unbounded dynamic dimension",
-                        state.discharged_input_index(),
+                        "external reference state at logical input {logical_input_index} has an unbounded dynamic \
+                         dimension",
                     ),
                 });
             }
@@ -3367,8 +3365,7 @@ impl<'c> XlaDomain<'c> {
                 })
             })
             .collect::<Vec<_>>();
-        for state in &reference_states {
-            let logical_input_index = state.discharged_input_index();
+        for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             if effective_input_types[logical_input_index].static_shape().is_none() {
                 if state.final_state_output_index().is_some() {
                     return Err(XlaDomainError::UnsupportedReferenceAbi {
@@ -3393,11 +3390,12 @@ impl<'c> XlaDomain<'c> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
         for logical_output_index in public_output_count..program.output_count() {
-            let state = reference_states
+            let (_, &logical_input_index) = reference_states
                 .iter()
-                .find(|state| state.final_state_output_index() == Some(logical_output_index))
+                .zip(&reference_state_input_indices)
+                .find(|(state, _)| state.final_state_output_index() == Some(logical_output_index))
                 .unwrap();
-            output_types.push(effective_input_types[state.discharged_input_index()].clone());
+            output_types.push(effective_input_types[logical_input_index].clone());
         }
         let result_shardings = if reference_states.is_empty() {
             output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>()
@@ -3412,11 +3410,12 @@ impl<'c> XlaDomain<'c> {
                                 Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
                             })
                         } else {
-                            let state = reference_states
+                            let (_, &logical_input_index) = reference_states
                                 .iter()
-                                .find(|state| state.final_state_output_index() == Some(logical_output_index))
+                                .zip(&reference_state_input_indices)
+                                .find(|(state, _)| state.final_state_output_index() == Some(logical_output_index))
                                 .unwrap();
-                            logical_argument_shardings[state.discharged_input_index()].clone()
+                            logical_argument_shardings[logical_input_index].clone()
                         }
                     })
                     .collect(),
@@ -3519,7 +3518,7 @@ impl<'c> XlaDomain<'c> {
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
             public_output_count: program.public_output_count as u64,
-            reference_states: persistent_reference_states(&program.reference_states)?,
+            reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: &program.donation_flags,
             capture_count: program.capture_count as u64,
@@ -3627,7 +3626,7 @@ impl<'c> XlaDomain<'c> {
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
             public_output_count: program.public_output_count as u64,
-            reference_states: persistent_reference_states(&program.reference_states)?,
+            reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: program.donation_flags.to_vec(),
             capture_count: program.capture_count as u64,
@@ -3698,7 +3697,7 @@ impl<'c> XlaDomain<'c> {
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
         let capture_count = checked_usize(metadata.capture_count)?;
         let public_output_count = checked_usize(metadata.public_output_count)?;
-        let reference_states = decode_persistent_reference_states(metadata.reference_states)?;
+        let reference_states = decode_persistent_reference_states(metadata.reference_states, capture_count)?;
         if !reference_states.is_empty() && !is_fully_addressable_single_process_mesh(self.client()?, &mesh)? {
             return Err(persistent_error("reference-state mesh is not fully addressable by this process"));
         }
@@ -3717,10 +3716,13 @@ impl<'c> XlaDomain<'c> {
         if capture_count > input_types.len() || metadata.donation_flags.len() != input_types.len() - capture_count {
             return Err(persistent_error("capture or donation metadata has an invalid arity"));
         }
-        if reference_states
-            .windows(2)
-            .any(|states| states[0].discharged_input_index() >= states[1].discharged_input_index())
-        {
+        let reference_state_input_indices = reference_states
+            .iter()
+            .map(|state| {
+                state.source().flat_input_index(capture_count).map_err(|error| persistent_error(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if reference_state_input_indices.windows(2).any(|indices| indices[0] >= indices[1]) {
             return Err(persistent_error("reference states are not in canonical logical input order"));
         }
         let hidden_output_indices = reference_states
@@ -3730,14 +3732,8 @@ impl<'c> XlaDomain<'c> {
         if hidden_output_indices != (public_output_count..output_types.len()).collect::<Vec<_>>() {
             return Err(persistent_error("reference-state metadata does not cover the hidden output suffix"));
         }
-        for state in &reference_states {
-            let expected_input_index = match state.source() {
-                ReferenceSource::Capture { index } => index,
-                ReferenceSource::Input { index } => capture_count
-                    .checked_add(index)
-                    .ok_or_else(|| persistent_error("persistent reference input index overflows usize"))?,
-            };
-            if state.discharged_input_index() != expected_input_index || expected_input_index >= input_types.len() {
+        for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+            if expected_input_index >= input_types.len() {
                 return Err(persistent_error("reference-state source does not match its logical input"));
             }
             let input_type = &input_types[expected_input_index];
@@ -3797,8 +3793,7 @@ impl<'c> XlaDomain<'c> {
         if expected_argument_shardings.len() != physical_input_count {
             return Err(persistent_error("expected argument shardings do not match the physical input count"));
         }
-        for state in &reference_states {
-            let expected_input_index = state.discharged_input_index();
+        for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
             let physical_input = signature.input_mapping()[expected_input_index]
                 .ok_or_else(|| persistent_error("reference-state input is erased from the executable boundary"))?;
             let input_type = &input_types[expected_input_index];
@@ -5839,7 +5834,7 @@ mod tests {
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible public output count",
         ));
-        let state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None);
+        let state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None);
         let replacement = XlaInvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
@@ -10252,7 +10247,7 @@ mod tests {
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)).unwrap();
         assert_eq!(lowered.public_output_count, 1);
         assert_eq!(lowered.reference_states.len(), 1);
-        assert_eq!(lowered.reference_states[0].discharged_input_index(), 0);
+        assert_eq!(lowered.reference_states[0].source().flat_input_index(lowered.capture_count).unwrap(), 0);
         assert_eq!(lowered.reference_states[0].final_state_output_index(), None);
         assert!(!lowered.stable_hlo.contains("reference"));
     }
@@ -10288,10 +10283,10 @@ mod tests {
         assert_eq!(compiled.public_output_count, 1);
         assert_eq!(compiled.reference_states.len(), 2);
         assert_eq!(compiled.reference_states[0].source(), ReferenceSource::Capture { index: 0 });
-        assert_eq!(compiled.reference_states[0].discharged_input_index(), 0);
+        assert_eq!(compiled.reference_states[0].source().flat_input_index(compiled.capture_count).unwrap(), 0);
         assert_eq!(compiled.reference_states[0].final_state_output_index(), Some(1));
         assert_eq!(compiled.reference_states[1].source(), ReferenceSource::Input { index: 0 });
-        assert_eq!(compiled.reference_states[1].discharged_input_index(), 1);
+        assert_eq!(compiled.reference_states[1].source().flat_input_index(compiled.capture_count).unwrap(), 1);
         assert_eq!(compiled.reference_states[1].final_state_output_index(), None);
         assert_eq!(restored.public_output_count, compiled.public_output_count);
         assert_eq!(restored.reference_states, compiled.reference_states);
@@ -10313,6 +10308,20 @@ mod tests {
             corrupted.extend_from_slice(&bytes[metadata_end..]);
             corrupted
         };
+        let mut metadata: XlaPersistentExecutableMetadataV6 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        assert_eq!(metadata.reference_states[0].source, PersistentReferenceSourceV6::Capture { index: 0 });
+        assert_eq!(metadata.reference_states[0].logical_input_index, 0);
+        assert_eq!(metadata.reference_states[1].source, PersistentReferenceSourceV6::PublicInput { index: 0 });
+        assert_eq!(metadata.reference_states[1].logical_input_index, 1);
+        metadata.reference_states[0].logical_input_index = 1;
+        let corrupted = corrupt(metadata);
+        assert!(matches!(
+            domain.deserialize_xla_program(corrupted.as_slice()),
+            Err(XlaDomainError::InvalidPersistentExecutable { reason })
+                if reason == "reference-state source does not match its logical input",
+        ));
+
         let mut metadata: XlaPersistentExecutableMetadataV6 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
         metadata.reference_states[0].source = PersistentReferenceSourceV6::PublicInput { index: 1 };
@@ -10510,7 +10519,7 @@ mod tests {
         assert_eq!(restored.public_output_count, 1);
         assert_eq!(
             restored.reference_states.as_ref(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
     }
 
@@ -10544,7 +10553,7 @@ mod tests {
         assert_eq!(compiled.mesh, mesh);
         assert_eq!(
             compiled.reference_states.as_ref(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         match domain.serialize_xla_program(&compiled).unwrap() {
             Some(bytes) => {

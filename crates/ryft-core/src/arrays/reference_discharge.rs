@@ -161,9 +161,6 @@
 //! semantics cannot drift apart, because both reach their coordinates through the one [`ArrayReferenceView`]
 //! traversal — the eager handles through a value carrier, the policy through a destination-context carrier.
 
-// TODO(eaplatanios): Review this module.
-//  Also, is all of this specific to "array IR" or can some of it be moved to core?
-
 use std::borrow::Cow;
 
 use crate::arrays::operations::ArrayReferenceViewOperation;
@@ -574,8 +571,8 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 1, None),
+                ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None),
             ],
         );
         assert_eq!(
@@ -595,7 +592,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
 
         // A reference-free program is its own discharge and is returned untouched.
@@ -1304,25 +1301,22 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, 1, None),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
+                ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, None),
             ],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
             concat!(
-                r#"[{"source":{"input":{"index":0}},"discharged_input_index":0,"#,
-                r#""final_state_output_index":2},{"source":{"input":{"index":1}},"#,
-                r#""discharged_input_index":1,"final_state_output_index":null}]"#,
+                r#"[{"source":{"input":{"index":0}},"final_state_output_index":2},"#,
+                r#"{"source":{"input":{"index":1}},"final_state_output_index":null}]"#,
             ),
         );
         assert_eq!(
             format!("{:?}", discharged.external_states()),
             concat!(
-                "[ReferenceStateBinding { source: Input { index: 0 }, ",
-                "discharged_input_index: 0, final_state_output_index: Some(2) }, ",
-                "ReferenceStateBinding { source: Input { index: 1 }, ",
-                "discharged_input_index: 1, final_state_output_index: None }]",
+                "[ReferenceStateBinding { source: Input { index: 0 }, final_state_output_index: Some(2) }, ",
+                "ReferenceStateBinding { source: Input { index: 1 }, final_state_output_index: None }]",
             ),
         );
         assert_eq!(
@@ -2412,6 +2406,69 @@ mod tests {
     }
 
     #[test]
+    fn test_while_discharge_accepts_the_same_root_at_repeated_carry_positions() {
+        let reference_type = ReferenceType::new(scalar_type());
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first_reference = condition_builder.add_input(reference_type.clone().into());
+        let second_reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first_reference], None)
+            .unwrap();
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second_reference], None)
+            .unwrap();
+        let condition = condition_builder.add_constant(boolean(true));
+        let condition = condition_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first_reference = body_builder.add_input(reference_type.clone().into());
+        let second_reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(scalar(1.0));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![second_reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![first_reference, second_reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(Some(1)).unwrap();
+        let outputs =
+            builder.add_instruction(operation, vec![condition, body], vec![reference, reference], None).unwrap();
+        let first_reference = outputs[0];
+        let second_reference = outputs[1];
+        let first_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first_reference], None)
+            .unwrap()[0];
+        let second_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second_reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![first_value, second_value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Each declared carry position still exists in the rebuilt loop even though both source operands name one
+        // root. The root has one canonical state, so either carry observes the same update and only one hidden final
+        // state is published.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_states().len(), 1);
+        assert_eq!(discharged.program().interpret(vec![scalar(2.0)]), Ok(vec![scalar(3.0), scalar(3.0), scalar(3.0)]),);
+    }
+
+    #[test]
     fn test_scan_discharge_keeps_state_carries_separate_from_stacked_outputs() {
         let reference_type = ReferenceType::new(scalar_type());
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -2534,7 +2591,7 @@ mod tests {
         );
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
-        assert_eq!(discharged.external_states()[0].discharged_input_index(), 0);
+        assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));
         assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
         let CaptureOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected discharged scan operation");
@@ -2596,7 +2653,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
         assert_eq!(discharged.program().interpret(vec![scalar(3.0), scalar(0.0)]), Ok(vec![scalar(3.0)]));
     }
@@ -2959,14 +3016,11 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, 0, None)],
+            &[ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, None)],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
-            concat!(
-                r#"[{"source":{"capture":{"index":0}},"discharged_input_index":0,"#,
-                r#""final_state_output_index":null}]"#,
-            ),
+            r#"[{"source":{"capture":{"index":0}},"final_state_output_index":null}]"#,
         );
         assert_eq!(
             discharged.program().input_types(),
@@ -3134,7 +3188,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
-        assert_eq!(discharged.external_states()[0].discharged_input_index(), 0);
+        assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));
         assert!(discharged.external_states()[0].is_mutated());
         assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
         assert_eq!(

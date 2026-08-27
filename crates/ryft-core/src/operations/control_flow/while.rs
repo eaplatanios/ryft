@@ -55,8 +55,8 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeInput, RegionInterface, RegionRef, RegionSlot, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceRegionDischargeBoundary, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -971,14 +971,13 @@ where
         let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
         let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
 
-        let region_inputs = inputs.iter().map(ReferenceRegionDischargeInput::from_operand).collect::<Vec<_>>();
         let condition_fork = driver.discharge_region_program(
             context,
             0,
             &ReferenceRegionDischargeBoundary::new(
                 self,
                 0,
-                region_inputs.clone(),
+                carries.clone(),
                 entering.clone(),
                 inputs.len(),
                 Vec::new(),
@@ -992,7 +991,7 @@ where
             &ReferenceRegionDischargeBoundary::new(
                 self,
                 1,
-                region_inputs,
+                carries.clone(),
                 entering.clone(),
                 inputs.len(),
                 entering.clone(),

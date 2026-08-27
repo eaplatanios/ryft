@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, 0, Some(1))],
+            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),

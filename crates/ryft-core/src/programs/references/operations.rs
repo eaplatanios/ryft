@@ -943,9 +943,7 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
     use crate::programs::programs::Program;
-    use crate::programs::references::discharge::{
-        ReferenceDischargeReference, ReferenceRootState, discharge_reference_free_operation,
-    };
+    use crate::programs::references::discharge::{ReferenceDischargeReference, discharge_reference_free_operation};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Type;
     use crate::programs::values::Value;
@@ -2045,10 +2043,8 @@ mod tests {
         assert_eq!(reference.r#type(), &ReferenceType::new(REFERENT));
         assert_eq!(reference.alias(), &TestAlias);
         assert_eq!(reference.preserved(), None);
-        assert_eq!(
-            context.root_state(reference.root()),
-            Ok(ReferenceRootState::Discharged { current: TestValue::new(REFERENT, 4), mutated: false }),
-        );
+        assert_eq!(context.discharged_state(reference.root()), Ok(TestValue::new(REFERENT, 4)));
+        assert_eq!(context.is_mutated(reference.root()), Ok(false));
 
         // A reference operand is not an initial state, and the diagnostic says which operand the rule expected.
         let context = TestDischargeContext::new(TestDestination::new());
