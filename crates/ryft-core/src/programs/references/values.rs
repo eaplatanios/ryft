@@ -104,8 +104,7 @@ impl ReferenceGeneration {
 #[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
-    /// Immutable [`ReferenceHandle`] shared by exact clones, including the shared mutable holder. All runtime
-    /// mutability lives behind the holder's state lock.
+    /// Immutable [`ReferenceHandle`] shared by exact clones. All runtime mutability lives behind its shared state lock.
     handle: Arc<ReferenceHandle<V>>,
 }
 
@@ -139,32 +138,139 @@ impl<V: Value> Reference<V> {
         ReferenceId::from_address(Arc::as_ptr(&self.handle.holder) as usize)
     }
 
-    /// Returns `true` if this handle uses the shared holder's original type identities, and `false` otherwise. When
-    /// this function returns `true`, values cross between the handle and holder without type-identity renaming. A
-    /// handle produced by [`Self::rename_type_identities`] still refers to the same holder but returns `false` when
-    /// that operation results in changing any identity.
+    /// Returns `true` if this handle uses the reference allocation's original type identities, and `false` otherwise.
+    /// When this function returns `true`, values cross between the handle-local representation and shared reference
+    /// state without type-identity renaming. A handle produced by [`Self::rename_type_identities`] still refers to the
+    /// same reference allocation but returns `false` when that operation changes any identity.
     #[inline]
     pub fn uses_root_type_identities(&self) -> bool {
         self.handle.root_to_handle.is_identity() && self.handle.handle_to_root.is_identity()
     }
 
-    // TODO(eaplatanios): Review from here onward.
-
-    /// Locks this reference for one stateful backend transaction.
+    /// Acquires this [`Reference`]'s shared lifecycle state for one backend-managed transaction. This is the
+    /// backend-facing wrapper around the private raw state lock. It returns as soon as the state mutex is acquired and
+    /// deliberately does not await a `Pending` value or active read leases. The returned [`ReferenceGuard`] exposes the
+    /// pending dependency and the validated transitions a backend needs to compose, submit, and install stateful work
+    /// while retaining exclusive access.
     ///
-    /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain that order
-    /// until every submitted hidden replacement has been validated and installed. A submitted mutation remains
-    /// represented by `Taken` while this guard is held, so dropping the guard before installation poisons the reference.
+    /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap), or
+    /// [`freeze`](Self::freeze), which reconcile pending work before accessing the value. Backends that lock multiple
+    /// references must acquire them in ascending [`ReferenceId`] order and retain that order until every submitted
+    /// hidden replacement has been validated and installed. A submitted mutation remains represented by `Taken` while
+    /// this guard is held, so dropping the guard before installation poisons the reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::Poisoned`] when the state mutex was poisoned without the explicit terminal `Poisoned`
+    /// lifecycle state that [`ReferenceGuard`] installs defensively during an unwind.
     #[inline]
     pub fn lock(&self) -> Result<ReferenceGuard<'_, V>, ReferenceError> {
-        let state = self.lock_state()?;
+        let state = self.lock_holder_state()?;
         Ok(ReferenceGuard { reference: self, state })
     }
 
+    /// Acquires the [`Reference`] in `Ready` state after reconciling work that prevents the requested value access.
+    /// Each iteration acquires the raw mutex through [`Self::lock_holder_state`]. A `Pending` value causes this method
+    /// to release the mutex, await its cumulative completion, reacquire the mutex, and apply the result only if that
+    /// generation is still current. When read leases must also finish, the method prunes completed leases, releases the
+    /// mutex while awaiting the remaining leases, and retries. It never awaits backend work while holding the mutex.
+    ///
+    /// Unlike [`lock`](Self::lock), this method is the private ordinary-access path: it hides pending-state
+    /// reconciliation and returns a raw guard proven to contain `Ready`. It does not return [`ReferenceGuard`] because
+    /// ordinary reads and mutations do not participate in the backend transaction protocol or its `Taken`-on-drop
+    /// poisoning rule.
+    ///
+    /// # Parameters
+    ///
+    ///   - `wait_for_read_leases`: Whether the returned state must also have no active readers. Reads pass `false`
+    ///     because they may share the current immutable snapshot while writes, swaps, updates, and freezing pass `true`
+    ///     because they may replace or consume storage still observed by a submitted reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lifecycle error represented by `Frozen`, `Poisoned`, or `Taken`, propagates unexpected mutex
+    /// poisoning from [`Self::lock_holder_state`], and reports a failed pending completion as
+    /// [`ReferenceError::ExecutionPoisoned`].
+    fn lock_ready_state(
+        &self,
+        wait_for_read_leases: bool,
+    ) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
+        loop {
+            let mut state = self.lock_holder_state()?;
+            let wait = match &mut *state {
+                ReferenceState::Ready { read_leases, .. } if wait_for_read_leases => {
+                    read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
+                    (!read_leases.is_empty()).then(|| (None, read_leases.clone()))
+                }
+                ReferenceState::Ready { .. } => return Ok(state),
+                ReferenceState::Pending { generation, completion, .. } => {
+                    Some((Some((*generation, completion.clone())), Vec::new()))
+                }
+                ReferenceState::Frozen => return Err(ReferenceError::Frozen),
+                ReferenceState::Poisoned(reason) => {
+                    return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
+                }
+                ReferenceState::Taken { .. } => {
+                    // `Taken` is unobservable during a valid transaction because its guard retains this mutex.
+                    // Competing accesses block before reading the state. Keep the arm as a defensive contract
+                    // check for misuse.
+                    return Err(ReferenceError::TransactionInProgress);
+                }
+            };
+            let Some((pending, read_leases)) = wait else {
+                return Ok(state);
+            };
+            drop(state);
+            if let Some((generation, completion)) = pending {
+                let result = completion.r#await();
+                let mut state = self.lock_holder_state()?;
+                Self::apply_completion(&mut state, generation, result);
+            } else {
+                for lease in read_leases {
+                    match lease.r#await() {
+                        Ok(()) | Err(_) => {
+                            // A completed read lease is safe to release regardless of its owning execution result.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Acquires the raw lifecycle-state mutex without interpreting the current [`ReferenceState`]. This is the common
+    /// lowest-level locking primitive for [`lock`](Self::lock) and [`Self::lock_ready_state`]. It neither resolves a
+    /// `Pending` completion nor waits for read leases. It recovers standard-library mutex poisoning only when
+    /// [`ReferenceGuard::drop`] already replaced the lifecycle state with the explicit terminal `Poisoned` state before
+    /// an unwind released the mutex. Any other mutex poisoning represents an unexpected panic while the reference was
+    /// in a usable state and is reported rather than cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::Poisoned`] when the mutex was poisoned while the lifecycle state was not explicitly
+    /// `Poisoned`.
+    fn lock_holder_state(&self) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
+        match self.handle.holder.state.lock() {
+            Ok(state) => Ok(state),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                if matches!(*state, ReferenceState::Poisoned(_)) {
+                    self.handle.holder.state.clear_poison();
+                    Ok(state)
+                } else {
+                    Err(ReferenceError::Poisoned)
+                }
+            }
+        }
+    }
+
+    // TODO(eaplatanios): Review from here onward.
+
     /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
     pub fn read(&self) -> Result<V, ReferenceError> {
-        let state = self.lock_ready(false)?;
-        let ReferenceState::Ready { value, .. } = &*state else { unreachable!("lock_ready yields only ready states") };
+        let state = self.lock_ready_state(false)?;
+        let ReferenceState::Ready { value, .. } = &*state else {
+            unreachable!("`lock_ready_state` yields only ready states")
+        };
         self.reconstruct_local(value)
     }
 
@@ -174,9 +280,9 @@ impl<V: Value> Reference<V> {
     /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
     /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
     pub fn write(&self, replacement: V) -> Result<(), ReferenceError> {
-        let mut state = self.lock_ready(true)?;
+        let mut state = self.lock_ready_state(true)?;
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready yields only ready states")
+            unreachable!("lock_ready_state yields only ready states")
         };
         let stored_replacement = self.prepare_stored(replacement)?;
         Self::commit_ready(current, generation, stored_replacement)
@@ -188,9 +294,9 @@ impl<V: Value> Reference<V> {
     /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
     /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
     pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
-        let mut state = self.lock_ready(true)?;
+        let mut state = self.lock_ready_state(true)?;
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready yields only ready states")
+            unreachable!("lock_ready_state yields only ready states")
         };
         let stored_replacement = self.prepare_stored(replacement)?;
         let old = self.reconstruct_local(current)?;
@@ -198,11 +304,22 @@ impl<V: Value> Reference<V> {
         Ok(old)
     }
 
+    /// Consumes this reference's current value and invalidates every handle in its alias family.
+    pub fn freeze(&self) -> Result<V, ReferenceError> {
+        let mut state = self.lock_ready_state(true)?;
+        let ReferenceState::Ready { value, .. } = &*state else {
+            unreachable!("lock_ready_state yields only ready states")
+        };
+        let value = self.reconstruct_local(value)?;
+        *state = ReferenceState::Frozen;
+        Ok(value)
+    }
+
     /// Atomically computes and installs an updated value while retaining the old value on every failure.
     ///
     /// This crate-visible primitive keeps value-family-specific update logic (such as array addition) outside the
-    /// generic holder while ensuring no other access can interleave between reading the old state and installing the
-    /// new one.
+    /// generic reference state while ensuring no other access can interleave between reading the old state and
+    /// installing the new one.
     pub(crate) fn update_with(&self, update: impl FnOnce(&V) -> Result<V, ProgramError>) -> Result<(), ProgramError> {
         self.update_locked_with_result(|current| Ok((update(current)?, ())))
     }
@@ -210,15 +327,15 @@ impl<V: Value> Reference<V> {
     /// Atomically maps this handle's current value to a replacement and an operation result.
     ///
     /// Both handle-local reconstruction directions complete before the shared state is committed, so every failure
-    /// leaves the live holder unchanged. `update` runs while this holder's non-reentrant mutex is locked and therefore
-    /// must not access this reference or any other handle in the same alias family.
+    /// leaves the live reference unchanged. `update` runs while this reference's non-reentrant state mutex is locked
+    /// and therefore must not access this reference or any other handle in the same alias family.
     pub(crate) fn update_locked_with_result<R>(
         &self,
         update: impl FnOnce(&V) -> Result<(V, R), ProgramError>,
     ) -> Result<R, ProgramError> {
-        let mut state = self.lock_ready(true).map_err(ProgramError::custom)?;
+        let mut state = self.lock_ready_state(true).map_err(ProgramError::custom)?;
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready yields only ready states")
+            unreachable!("lock_ready_state yields only ready states")
         };
         let local = self.reconstruct_local(current).map_err(ProgramError::custom)?;
         let (updated, result) = update(&local)?;
@@ -227,16 +344,7 @@ impl<V: Value> Reference<V> {
         Ok(result)
     }
 
-    /// Consumes this reference's current value and invalidates every handle in its alias family.
-    pub fn freeze(&self) -> Result<V, ReferenceError> {
-        let mut state = self.lock_ready(true)?;
-        let ReferenceState::Ready { value, .. } = &*state else { unreachable!("lock_ready yields only ready states") };
-        let value = self.reconstruct_local(value)?;
-        *state = ReferenceState::Frozen;
-        Ok(value)
-    }
-
-    /// Returns a handle-local identity-renamed view of this same shared holder.
+    /// Returns a handle-local identity-renamed view of this same reference allocation.
     pub(crate) fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
@@ -289,65 +397,7 @@ impl<V: Value> Reference<V> {
         })
     }
 
-    /// Locks this holder after resolving a pending mutation and, when requested, every active read lease.
-    fn lock_ready(&self, wait_for_read_leases: bool) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
-        loop {
-            let mut state = self.lock_state()?;
-            let wait = match &mut *state {
-                ReferenceState::Ready { read_leases, .. } if wait_for_read_leases => {
-                    read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
-                    (!read_leases.is_empty()).then(|| (None, read_leases.clone()))
-                }
-                ReferenceState::Ready { .. } => return Ok(state),
-                ReferenceState::Pending { generation, completion, .. } => {
-                    Some((Some((*generation, completion.clone())), Vec::new()))
-                }
-                ReferenceState::Frozen => return Err(ReferenceError::Frozen),
-                ReferenceState::Poisoned(reason) => {
-                    return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
-                }
-                // `Taken` is unobservable during a valid transaction because its guard retains this mutex: competing
-                // accesses block before reading the state. Keep the arm as a defensive contract check for misuse.
-                ReferenceState::Taken { .. } => return Err(ReferenceError::TransactionInProgress),
-            };
-            let Some((pending, read_leases)) = wait else {
-                return Ok(state);
-            };
-            drop(state);
-            if let Some((generation, completion)) = pending {
-                let result = completion.r#await();
-                let mut state = self.lock_state()?;
-                Self::apply_completion(&mut state, generation, result);
-            } else {
-                for lease in read_leases {
-                    match lease.r#await() {
-                        Ok(()) | Err(_) => {
-                            // A completed read lease is safe to release regardless of its owning execution result.
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Locks the holder, recovering mutex poisoning only when [`ReferenceGuard::drop`] already replaced the state
-    /// with the explicit terminal execution failure before unwinding released the mutex.
-    fn lock_state(&self) -> Result<MutexGuard<'_, ReferenceState<V>>, ReferenceError> {
-        match self.handle.holder.state.lock() {
-            Ok(state) => Ok(state),
-            Err(poisoned) => {
-                let state = poisoned.into_inner();
-                if matches!(*state, ReferenceState::Poisoned(_)) {
-                    self.handle.holder.state.clear_poison();
-                    Ok(state)
-                } else {
-                    Err(ReferenceError::Poisoned)
-                }
-            }
-        }
-    }
-
-    /// Applies `result` only when `generation` remains the holder's current generation.
+    /// Applies `result` only when `generation` remains the shared state's current generation.
     fn apply_completion(
         state: &mut ReferenceState<V>,
         generation: ReferenceGeneration,
@@ -394,7 +444,7 @@ impl<V: Value> Reference<V> {
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
     }
 
-    /// Validates and reconstructs one handle-local value for storage in the shared root holder.
+    /// Validates and reconstructs one handle-local value for storage in the shared root representation.
     fn prepare_stored(&self, value: V) -> Result<V, ReferenceError> {
         self.validate_referent_type(&value)?;
         let stored = value
@@ -404,7 +454,7 @@ impl<V: Value> Reference<V> {
         Ok(stored)
     }
 
-    /// Commits one prepared replacement and advances the ready holder's generation.
+    /// Commits one prepared replacement and advances the ready reference generation.
     fn commit_ready(
         current: &mut V,
         generation: &mut ReferenceGeneration,
@@ -416,7 +466,7 @@ impl<V: Value> Reference<V> {
         Ok(())
     }
 
-    /// Validates that `value` preserves this holder's exact declared referent type.
+    /// Validates that `value` preserves this reference's exact declared referent type.
     fn validate_referent_type(&self, value: &V) -> Result<(), ReferenceError> {
         let actual = value.r#type();
         if actual.as_ref() == self.handle.r#type.referent() {
@@ -498,11 +548,12 @@ impl<V: Value> Typed for Reference<V> {
 ///
 /// Every binding is fixed at construction and never reassigned: the `Reference` API exposes no way to mutate handle
 /// metadata, derivation ([`Reference::rename_type_identities`]) constructs a new handle rather than modifying an
-/// existing one, and all runtime mutability lives behind the holder's state mutex. Private code must preserve that
-/// invariant — `Arc` alone does not prevent mutation through `Arc::get_mut`, and sharing this metadata between exact
-/// clones relies on Ryft's semantic contract that structural [`Type`] metadata remains stable for a value's lifetime.
+/// existing one, and all runtime mutability lives behind the [`ReferenceHolder`]'s state mutex. Private code must
+/// preserve that invariant — `Arc` alone does not prevent mutation through `Arc::get_mut`, and sharing this metadata
+/// between exact clones relies on Ryft's semantic contract that structural [`Type`] metadata remains stable for a
+/// value's lifetime.
 struct ReferenceHandle<V: Value> {
-    /// Shared mutable holder whose allocation defines this reference's runtime identity.
+    /// Shared [`ReferenceHolder`] whose allocation defines this reference's runtime identity.
     holder: Arc<ReferenceHolder<V>>,
 
     /// Handle-local structural referent type.
@@ -511,18 +562,18 @@ struct ReferenceHandle<V: Value> {
     /// Identity mapping applied when a stored value crosses into this handle.
     root_to_handle: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 
-    /// Inverse identity mapping applied before a handle-local value enters the shared holder.
+    /// Inverse identity mapping applied before a handle-local value enters the shared [`ReferenceHolder`].
     handle_to_root: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 }
 
 /// Storage shared by one reference alias family.
 struct ReferenceHolder<V: Value> {
-    /// Structural referent type of values stored in this holder. Every alias agrees on it, it is immutable for the
-    /// holder's lifetime, and it is deliberately readable without the state lock so validation paths never have to
-    /// acquire or order against the lifecycle mutex.
+    /// Structural referent type of values stored in this [`ReferenceHolder`]. Every alias agrees on it, it is
+    /// immutable for the holder's lifetime, and it is deliberately readable without the state lock so validation
+    /// paths never have to acquire or order against the lifecycle mutex.
     root_type: V::Type,
 
-    /// Holder lifecycle state.
+    /// Lifecycle state owned by this [`ReferenceHolder`].
     state: Mutex<ReferenceState<V>>,
 }
 
@@ -555,7 +606,7 @@ enum ReferenceState<V: Value> {
         read_leases: Vec<ReferenceCompletion>,
     },
 
-    /// Value temporarily unavailable while a backend transaction holds this holder's mutex.
+    /// Value temporarily unavailable while a backend transaction holds the shared state mutex.
     Taken {
         /// Generation claimed by the transaction.
         generation: ReferenceGeneration,
@@ -587,10 +638,10 @@ enum ReferenceState<V: Value> {
 /// protocol.
 #[doc(hidden)]
 pub struct ReferenceGuard<'a, V: Value> {
-    /// Reference handle whose holder and handle-local type mapping this guard protects.
+    /// Reference handle whose shared state and handle-local type mapping this guard protects.
     reference: &'a Reference<V>,
 
-    /// Locked holder lifecycle state.
+    /// Locked reference lifecycle state.
     state: MutexGuard<'a, ReferenceState<V>>,
 }
 
@@ -763,7 +814,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     }
 
     /// Applies a completion result only if `generation` is still current. Test-only entry into the lazy completion
-    /// reconciliation that value accesses perform through `lock_ready`.
+    /// reconciliation that value accesses perform through `lock_ready_state`.
     #[cfg(test)]
     fn complete(&mut self, generation: ReferenceGeneration, result: Result<(), Arc<str>>) -> bool {
         Reference::<V>::apply_completion(&mut self.state, generation, result)
@@ -793,7 +844,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(ReferenceReplacement { holder: Arc::downgrade(&self.reference.handle.holder), value: stored })
     }
 
-    /// Validates that `replacement` was prepared against this exact holder.
+    /// Validates that `replacement` was prepared for this exact reference allocation.
     pub(crate) fn accepts(&self, replacement: &ReferenceReplacement<V>) -> Result<(), ReferenceError> {
         if std::ptr::eq(replacement.holder.as_ptr(), Arc::as_ptr(&self.reference.handle.holder)) {
             Ok(())
@@ -843,13 +894,13 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
 /// references from being exchanged during a multi-reference transaction.
 #[doc(hidden)]
 pub struct ReferenceReplacement<V: Value> {
-    /// Weak identity of the holder allocation for which this replacement was prepared.
+    /// Weak identity of the reference allocation for which this replacement was prepared.
     ///
     /// Retaining the allocation's weak control block prevents its address from being recycled while this replacement
-    /// can still present it as holder-ownership proof.
+    /// can still present it as allocation-identity proof.
     holder: Weak<ReferenceHolder<V>>,
 
-    /// Value represented in the shared root holder's type identity space.
+    /// Value represented in the reference allocation's root type-identity space.
     value: V,
 }
 

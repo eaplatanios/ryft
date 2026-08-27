@@ -155,7 +155,7 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 ///
 /// # Examples
 ///
-/// The array reference vocabulary declares the following semantics:
+/// Array reference operations declare the following semantics:
 ///
 /// ```text
 /// reference_new(x) -> r
