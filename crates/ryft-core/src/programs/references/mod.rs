@@ -148,9 +148,9 @@ pub enum ReferenceError {
     #[error("reference holder has a conflicting transaction or execution lease")]
     TransactionInProgress,
 
-    /// A prepared replacement belongs to a different holder transaction.
-    #[error("prepared reference value belongs to a different holder")]
-    TransactionHolderMismatch,
+    /// A reference replacement was prepared for a different holder.
+    #[error("reference replacement belongs to a different holder")]
+    ReplacementHolderMismatch,
 
     /// A pending value or completion targeted an older holder generation.
     #[error("reference completion targets a stale holder generation")]
@@ -200,8 +200,8 @@ pub use semantics::{
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
-    PendingReferenceReservation, PendingReferenceReservations, PreparedReferenceValue, Reference, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceGeneration, ReferenceGuard, ReferenceId,
+    Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceGeneration,
+    ReferenceGuard, ReferenceId, ReferenceReplacement, ReferenceReservationToken, ReferenceReservationTokenBatch,
 };
 
 #[cfg(test)]
@@ -228,7 +228,7 @@ mod tests {
                 ReferenceError::TransactionInProgress,
                 "reference holder has a conflicting transaction or execution lease",
             ),
-            (ReferenceError::TransactionHolderMismatch, "prepared reference value belongs to a different holder"),
+            (ReferenceError::ReplacementHolderMismatch, "reference replacement belongs to a different holder"),
             (ReferenceError::StaleGeneration, "reference completion targets a stale holder generation"),
             (ReferenceError::GenerationExhausted, "reference holder mutation generation is exhausted"),
             (ReferenceError::Poisoned, "reference holder is poisoned"),

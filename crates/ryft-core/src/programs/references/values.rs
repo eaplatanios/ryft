@@ -15,8 +15,8 @@ use crate::programs::values::Value;
 
 /// Process-local identity that remains stable for the lifetime of one eager [`ReferenceHolder`]. The identity supports
 /// alias identity checks and diagnostics inside one process. It carries no structural type information, is never
-/// serialized into a program or compilation key, and may be reused after the last handle and every prepared transaction
-/// value retaining the original holder allocation are dropped.
+/// serialized into a program or compilation key, and may be reused after the last handle and every reference
+/// replacement retaining the original holder allocation are dropped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceId(usize);
 
@@ -69,6 +69,44 @@ impl ReferenceGeneration {
 /// last handle in its alias family is dropped. Statically validated local program roots that are never frozen are
 /// implicitly discarded when their nonescaping interpretation environment is released.
 ///
+/// # Holder State Machine
+///
+/// Each alias family has one synchronized holder. Its lifecycle is:
+///
+/// ```mermaid
+/// stateDiagram-v2
+///   [*] --> Ready: new at generation 0
+///   Ready --> Ready: write, swap, or update (generation + 1)
+///   Ready --> Taken: synchronous take (generation + 1)
+///   Taken --> Ready: install replacement
+///   Taken --> ExecutionPoisoned: guard drop or backend failure
+///   Ready --> Reserved: publish submitted mutation (generation + 1)
+///   Pending --> Reserved: publish chained mutation (generation + 1)
+///   Reserved --> Pending: install hidden replacement
+///   Reserved --> ExecutionPoisoned: token abandonment or installation failure
+///   Pending --> Ready: backend completion succeeds
+///   Pending --> ExecutionPoisoned: completion fails or token is abandoned
+///   Ready --> Frozen: freeze
+/// ```
+///
+/// `Ready` exposes a completed immutable snapshot. `Taken` is a synchronous transaction whose [`ReferenceGuard`]
+/// retains the holder mutex while a backend may donate or replace that snapshot. `Reserved` is the short
+/// post-submission write-intent state: an already-submitted asynchronous execution owns the next generation, but its
+/// hidden replacement has not yet been reconstructed. The mutex is not retained in this state; other accesses wait
+/// on a separate reservation signal. Installing the replacement changes the holder to `Pending`, where the new value
+/// remains inaccessible until its cumulative [`ReferenceCompletion`] succeeds. `Frozen` and `ExecutionPoisoned` are
+/// terminal states.
+///
+/// A [`ReferenceReservationToken`] owns cleanup for one `Reserved` or `Pending` transition. Dropping an armed token
+/// marks that transition abandoned and wakes waiters, which prevents a failed or unwound backend path from leaving
+/// the holder permanently inaccessible. Stateful executions that mutate several holders retain their tokens in one
+/// [`ReferenceReservationTokenBatch`] until every replacement has been installed. Generations ensure that a delayed
+/// installation, completion, or abandonment can affect only the transition that created it.
+///
+/// Read-only asynchronous executions do not enter a separate holder state. They publish completion leases on `Ready`
+/// or `Pending`; a mutating transaction waits for those leases before it may take or reserve the holder, preventing
+/// donated storage from racing a reader that still observes the current snapshot.
+///
 /// Equality and hashing identify the mutable storage location, not this handle's structural type. Clones and
 /// identity-renamed handles into the same alias family therefore compare equal and hash identically even when their
 /// handle-local referent types use different identity vocabularies.
@@ -79,6 +117,7 @@ impl ReferenceGeneration {
 /// `Send` and `Sync` only when the referent value and its type and identity metadata are all safe to share across
 /// threads (`Send + Sync`). Array indexing and slicing are provided by the array-owned
 /// [`ArrayReference`](crate::arrays::ArrayReference) wrapper.
+#[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
     /// Immutable handle vocabulary shared by exact clones, including the shared mutable holder. All runtime
@@ -131,10 +170,12 @@ impl<V: Value> Reference<V> {
         Ok(ReferenceGuard { reference: self, state })
     }
 
-    /// Waits until the short post-submission reservation window has installed a pending value.
+    /// Waits until a post-submission mutation reservation installs its replacement or is abandoned.
     ///
+    /// A reserved holder does not retain its state mutex. This method releases that mutex and waits on the
+    /// reservation's independent signal, allowing the installer to reacquire the holder and publish the replacement.
     /// Multi-holder runtimes call this before taking any ordered guards so they never wait while retaining another
-    /// holder lock needed by the installer.
+    /// holder lock needed by that installer.
     #[doc(hidden)]
     pub fn wait_until_accessible(&self) -> Result<(), ReferenceError> {
         loop {
@@ -726,7 +767,7 @@ pub struct ReferenceGuard<'a, V: Value> {
 }
 
 impl<V: Value> ReferenceGuard<'_, V> {
-    /// Returns whether this guard observes the short submitted-before-install reservation state.
+    /// Returns whether a submitted mutation owns the holder's next generation but has not installed its replacement.
     #[inline]
     pub fn reservation_pending(&self) -> bool {
         matches!(*self.state, ReferenceState::Reserved { .. })
@@ -820,13 +861,17 @@ impl<V: Value> ReferenceGuard<'_, V> {
     fn reserve_pending(
         &mut self,
         completion: ReferenceCompletion,
-    ) -> Result<(ReferenceGeneration, PendingReferenceReservation), ReferenceError> {
+    ) -> Result<(ReferenceGeneration, ReferenceReservationToken), ReferenceError> {
         let generation = self.next_generation()?;
-        let reservation = self.reserve_pending_unchecked(generation, completion);
-        Ok((generation, reservation))
+        let token = self.reserve_pending_unchecked(generation, completion);
+        Ok((generation, token))
     }
 
     /// Validates a mutation reservation and returns its next generation without changing holder state.
+    ///
+    /// Validation computes the generation that a successfully submitted execution will claim. The caller must retain
+    /// this same guard through submission and pass the returned generation to [`Self::reserve_pending_unchecked`] from
+    /// the backend's successful-submission publication callback.
     ///
     /// Any published lease still recorded on the holder rejects the reservation, including one whose execution has
     /// already completed: this borrows the holder immutably and therefore cannot prune. Backends must drain
@@ -858,43 +903,54 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(generation)
     }
 
-    /// Commits a reservation after [`Self::next_generation`] succeeded under this same guard.
+    /// Publishes a submitted mutation's write-intent claim after [`Self::next_generation`] succeeded under this guard.
+    ///
+    /// This moves a `Ready` or `Pending` holder to `Reserved`: `generation` is now owned by the submitted execution,
+    /// but its hidden replacement has not yet been reconstructed. The caller may then release the holder mutex;
+    /// competing accesses wait for installation or abandonment through the reservation's independent signal.
     ///
     /// `completion` must cumulatively include both this holder's prior pending dependency and the newly submitted
     /// execution. The predecessor must be part of the submission-time dependency: joining it afterwards cannot
     /// prevent the backend from reading or replacing pending storage before that predecessor finishes.
+    ///
+    /// The returned [`ReferenceReservationToken`] must remain owned until every replacement produced by the submitted
+    /// execution has been installed. Dropping it earlier abandons this reservation and wakes waiters.
     #[must_use = "the returned reservation token must be retained until complete batch installation"]
     pub fn reserve_pending_unchecked(
         &mut self,
         generation: ReferenceGeneration,
         completion: ReferenceCompletion,
-    ) -> PendingReferenceReservation {
+    ) -> ReferenceReservationToken {
         debug_assert_eq!(self.next_generation(), Ok(generation));
-        let reservation = Arc::new(ReferenceReservationSignal::new());
-        *self.state = ReferenceState::Reserved { generation, completion, reservation: Arc::clone(&reservation) };
-        PendingReferenceReservation { reservation, armed: true }
+        let signal = Arc::new(ReferenceReservationSignal::new());
+        *self.state = ReferenceState::Reserved { generation, completion, reservation: Arc::clone(&signal) };
+        ReferenceReservationToken { signal, armed: true }
     }
 
-    /// Installs a prepared final value for `generation` while leaving it pending on its cumulative completion.
+    /// Installs a validated replacement for `generation` while leaving it pending on its cumulative completion.
     /// Test-only convenience combinator for the production validate-then-commit protocol.
     #[cfg(test)]
     fn install_pending(
         &mut self,
         generation: ReferenceGeneration,
-        value: PreparedReferenceValue<V>,
+        replacement: ReferenceReplacement<V>,
     ) -> Result<(), ReferenceError> {
-        self.validate_pending_install(generation, &value)?;
-        self.install_pending_unchecked(generation, value);
+        self.validate_pending_install(generation, &replacement)?;
+        self.install_pending_unchecked(generation, replacement);
         Ok(())
     }
 
-    /// Validates one prepared pending-value installation without changing holder state.
+    /// Validates one pending replacement installation without changing holder state.
+    ///
+    /// The replacement must belong to this exact holder, and `generation` must identify its current `Reserved`
+    /// transition. This method is the fallible first phase used to validate every member of a multi-holder batch before
+    /// any member is committed through [`Self::install_pending_unchecked`].
     pub fn validate_pending_install(
         &self,
         generation: ReferenceGeneration,
-        value: &PreparedReferenceValue<V>,
+        replacement: &ReferenceReplacement<V>,
     ) -> Result<(), ReferenceError> {
-        self.accepts(value)?;
+        self.accepts(replacement)?;
         let ReferenceState::Reserved { generation: current, .. } = &*self.state else {
             return Err(ReferenceError::TransactionInProgress);
         };
@@ -904,16 +960,20 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(())
     }
 
-    /// Commits a prepared value after [`Self::validate_pending_install`] succeeded under this same guard.
-    pub fn install_pending_unchecked(&mut self, generation: ReferenceGeneration, value: PreparedReferenceValue<V>) {
-        debug_assert!(self.validate_pending_install(generation, &value).is_ok());
+    /// Commits a replacement after [`Self::validate_pending_install`] succeeded under this same guard.
+    ///
+    /// This moves the holder from `Reserved` to `Pending`, publishes installation to reservation waiters, and attaches
+    /// the cumulative completion that will eventually make the replacement `Ready` or poison the holder. Cleanup
+    /// ownership remains armed until the complete [`ReferenceReservationTokenBatch`] is disarmed.
+    pub fn install_pending_unchecked(&mut self, generation: ReferenceGeneration, replacement: ReferenceReplacement<V>) {
+        debug_assert!(self.validate_pending_install(generation, &replacement).is_ok());
         let ReferenceState::Reserved { completion, reservation, .. } = &*self.state else {
             unreachable!("pending installation was validated under the same holder guard")
         };
         let completion = completion.clone();
         let reservation = Arc::clone(reservation);
         *self.state = ReferenceState::Pending {
-            value: value.value,
+            value: replacement.value,
             generation,
             completion: completion.clone(),
             reservation: Arc::clone(&reservation),
@@ -972,30 +1032,30 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(local)
     }
 
-    /// Validates a prospective restored or installed value without changing holder state.
-    pub fn prepare(&self, value: V) -> Result<PreparedReferenceValue<V>, ReferenceError> {
+    /// Converts and validates a prospective holder replacement without changing holder state.
+    pub fn prepare_replacement(&self, value: V) -> Result<ReferenceReplacement<V>, ReferenceError> {
         let stored = self.reference.prepare_stored(value)?;
-        Ok(PreparedReferenceValue { holder: Arc::downgrade(&self.reference.inner.holder), value: stored })
+        Ok(ReferenceReplacement { holder: Arc::downgrade(&self.reference.inner.holder), value: stored })
     }
 
-    /// Validates that `value` was prepared against this exact holder.
-    pub(crate) fn accepts(&self, value: &PreparedReferenceValue<V>) -> Result<(), ReferenceError> {
-        if std::ptr::eq(value.holder.as_ptr(), Arc::as_ptr(&self.reference.inner.holder)) {
+    /// Validates that `replacement` was prepared against this exact holder.
+    pub(crate) fn accepts(&self, replacement: &ReferenceReplacement<V>) -> Result<(), ReferenceError> {
+        if std::ptr::eq(replacement.holder.as_ptr(), Arc::as_ptr(&self.reference.inner.holder)) {
             Ok(())
         } else {
-            Err(ReferenceError::TransactionHolderMismatch)
+            Err(ReferenceError::ReplacementHolderMismatch)
         }
     }
 
-    /// Installs a value whose reconstruction and type checks completed through [`Self::prepare`].
+    /// Installs a value whose reconstruction and type checks completed through [`Self::prepare_replacement`].
     ///
-    /// Installation fails when `value` was prepared for another holder or this guard does not own an extracted value.
-    pub fn install(&mut self, value: PreparedReferenceValue<V>) -> Result<(), ReferenceError> {
-        self.accepts(&value)?;
+    /// Installation fails when `replacement` belongs to another holder or this guard does not own an extracted value.
+    pub fn install(&mut self, replacement: ReferenceReplacement<V>) -> Result<(), ReferenceError> {
+        self.accepts(&replacement)?;
         let ReferenceState::Taken { generation } = *self.state else {
             return Err(ReferenceError::TransactionInProgress);
         };
-        *self.state = ReferenceState::Ready { value: value.value, generation, read_leases: Vec::new() };
+        *self.state = ReferenceState::Ready { value: replacement.value, generation, read_leases: Vec::new() };
         Ok(())
     }
 
@@ -1024,54 +1084,65 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
     }
 }
 
-/// Root-normalized holder value whose fallible reconstruction and type validation have completed.
+/// Validated replacement bound to one reference holder.
+///
+/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value into the holder's root identity vocabulary,
+/// validates its exact referent type, and records the holder allocation for which it was prepared. Installation
+/// consumes the replacement only after verifying that allocation, preventing replacements prepared for different
+/// holders from being exchanged during a multi-holder transaction.
 #[doc(hidden)]
-pub struct PreparedReferenceValue<V: Value> {
-    /// Weak identity of the holder allocation against which this value was prepared.
+pub struct ReferenceReplacement<V: Value> {
+    /// Weak identity of the holder allocation for which this replacement was prepared.
     ///
-    /// Retaining the allocation's weak control block prevents its address from being recycled while this prepared
-    /// value can still present it as transaction-ownership proof.
+    /// Retaining the allocation's weak control block prevents its address from being recycled while this replacement
+    /// can still present it as holder-ownership proof.
     holder: Weak<ReferenceHolder<V>>,
 
     /// Value represented in the shared root holder's type identity space.
     value: V,
 }
 
-/// RAII ownership token returned by publishing one reference mutation reservation.
+/// RAII cleanup token for one published reference mutation reservation.
 ///
-/// Dropping an armed token never acquires the holder mutex. It marks the reservation abandoned and wakes waiters; the
-/// next holder access then converts the matching current reservation into a terminal execution failure under the
-/// holder's ordinary lock. A stale token retains only its retired abandonment state and cannot affect a later
-/// generation.
+/// A reservation is a post-submission write-intent claim on one holder's next generation. It prevents another access
+/// from observing the old value or starting a competing mutation while the submitted execution's hidden replacement
+/// is being reconstructed. The reservation does not retain the holder mutex; its independently synchronized signal
+/// lets accessors wait for installation or abandonment without blocking the installer from reacquiring that mutex.
+///
+/// An armed token owns responsibility for resolving that write-intent claim. Dropping it marks the reservation
+/// abandoned and wakes waiters without acquiring the holder mutex. The next holder access converts a matching current
+/// abandonment into [`ReferenceError::ExecutionPoisoned`]. Generation checks make a stale token harmless after a newer
+/// mutation has superseded its reservation. A token must remain armed until its replacement is installed, after which
+/// [`ReferenceReservationTokenBatch::disarm`] releases cleanup ownership for the complete submitted mutation batch.
 #[doc(hidden)]
 #[must_use = "a published reference reservation must remain owned until its complete mutation batch is installed"]
-pub struct PendingReferenceReservation {
+pub struct ReferenceReservationToken {
     /// Signal stored in the matching reserved or pending generation.
-    reservation: Arc<ReferenceReservationSignal>,
+    signal: Arc<ReferenceReservationSignal>,
 
     /// Whether drop still owns cleanup responsibility.
     armed: bool,
 }
 
-impl PendingReferenceReservation {
-    /// Marks this reservation abandoned, optionally retaining an explicit backend failure.
+impl ReferenceReservationToken {
+    /// Marks this token's mutation reservation abandoned, optionally retaining an explicit backend failure.
     fn abandon(&mut self, reason: Option<Arc<str>>) {
         if !self.armed {
             return;
         }
-        self.reservation.abandon(reason);
+        self.signal.abandon(reason);
         self.armed = false;
     }
 
-    /// Disarms cleanup after the complete mutation batch has installed every pending final value.
+    /// Disarms drop cleanup after this token's replacement has been installed.
     fn disarm(&mut self) {
-        if self.reservation.is_installed() {
+        if self.signal.is_installed() {
             self.armed = false;
         }
     }
 }
 
-impl Drop for PendingReferenceReservation {
+impl Drop for ReferenceReservationToken {
     fn drop(&mut self) {
         if self.armed {
             self.abandon(None);
@@ -1079,33 +1150,47 @@ impl Drop for PendingReferenceReservation {
     }
 }
 
-/// RAII cleanup owner for one submitted batch of reference mutation reservations.
+/// RAII cleanup owner for all reference mutation reservations published by one submitted execution.
+///
+/// A stateful execution may mutate several holders. Their replacements are reconstructed and validated together, so
+/// cleanup ownership must cover the entire installation window: any failure abandons every still-owned reservation,
+/// and successful cleanup is disarmed only after every replacement is installed. Keeping this invariant in one batch
+/// prevents a partially installed execution from silently leaving another holder reserved.
 #[doc(hidden)]
 #[must_use = "submitted reference reservations must remain owned until the complete mutation batch is installed"]
-pub struct PendingReferenceReservations {
+pub struct ReferenceReservationTokenBatch {
     /// Per-holder ownership tokens returned by reservation publication.
-    reservations: Vec<PendingReferenceReservation>,
+    tokens: Vec<ReferenceReservationToken>,
 }
 
-impl PendingReferenceReservations {
-    /// Collects the ownership tokens returned while publishing one complete mutation batch.
-    pub fn new(reservations: Vec<PendingReferenceReservation>) -> Self {
-        Self { reservations }
+impl ReferenceReservationTokenBatch {
+    /// Collects every token published for one submitted execution.
+    ///
+    /// The returned batch must remain alive until all corresponding replacements have been installed. Dropping it
+    /// earlier abandons every still-armed reservation through the individual tokens' [`Drop`] implementations.
+    pub fn new(tokens: Vec<ReferenceReservationToken>) -> Self {
+        Self { tokens }
     }
 
-    /// Marks every still-owned reservation abandoned with the same backend failure.
+    /// Abandons every still-owned mutation reservation with the same backend failure.
+    ///
+    /// This is used when a post-submission failure prevents complete replacement installation. Abandonment is
+    /// non-locking and wakes waiters for both already-installed and not-yet-installed members of the batch.
     pub fn poison(&mut self, reason: impl Into<Arc<str>>) {
         let reason = reason.into();
-        for reservation in &mut self.reservations {
-            reservation.abandon(Some(Arc::clone(&reason)));
+        for token in &mut self.tokens {
+            token.abandon(Some(Arc::clone(&reason)));
         }
     }
 
-    /// Disarms cleanup only after every reservation has installed its pending final value.
+    /// Disarms cleanup after every reservation in this batch has installed its replacement.
+    ///
+    /// Callers invoke this only after validating and committing the complete multi-holder installation. Until then,
+    /// retaining armed tokens ensures that an error or unwind abandons every unfinished transition.
     pub fn disarm(&mut self) {
-        debug_assert!(self.reservations.iter().all(|reservation| reservation.reservation.is_installed()));
-        for reservation in &mut self.reservations {
-            reservation.disarm();
+        debug_assert!(self.tokens.iter().all(|token| token.signal.is_installed()));
+        for token in &mut self.tokens {
+            token.disarm();
         }
     }
 }
@@ -1532,15 +1617,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_prepares_transaction_values_for_the_exact_holder() {
+    fn test_reference_guard_prepares_replacement_for_the_exact_holder() {
         let first = reference_new(Array::scalar(1.0_f32));
         let second = reference_new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         assert_eq!(first_guard.take(), Ok(Array::scalar(1.0_f32)));
-        let prepared = first_guard.prepare(Array::scalar(3.0_f32)).unwrap();
-        assert_eq!(second_guard.accepts(&prepared), Err(ReferenceError::TransactionHolderMismatch));
-        first_guard.install(prepared).unwrap();
+        let replacement = first_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+        assert_eq!(second_guard.accepts(&replacement), Err(ReferenceError::ReplacementHolderMismatch));
+        first_guard.install(replacement).unwrap();
         drop(first_guard);
         drop(second_guard);
         assert_eq!(first.read(), Ok(Array::scalar(3.0_f32)));
@@ -1548,34 +1633,34 @@ mod tests {
     }
 
     #[test]
-    fn test_prepared_reference_value_pins_holder_allocation_identity_after_last_handle_is_dropped() {
+    fn test_reference_replacement_pins_holder_allocation_identity_after_last_handle_is_dropped() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let original_id = reference.id();
-        let prepared = reference.lock().unwrap().prepare(Array::scalar(2.0_f32)).unwrap();
-        let original_holder = prepared.holder.clone();
+        let replacement = reference.lock().unwrap().prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        let original_holder = replacement.holder.clone();
         drop(reference);
         assert!(original_holder.upgrade().is_none());
 
         // The surviving weak control block keeps the retired allocation address unavailable to a new holder. This
         // makes pointer equality a stable ownership proof even after every strong handle to the original is gone.
-        let replacement = reference_new(Array::scalar(3.0_f32));
-        assert_ne!(replacement.id(), original_id);
-        assert_eq!(replacement.lock().unwrap().accepts(&prepared), Err(ReferenceError::TransactionHolderMismatch),);
+        let new_reference = reference_new(Array::scalar(3.0_f32));
+        assert_ne!(new_reference.id(), original_id);
+        assert_eq!(new_reference.lock().unwrap().accepts(&replacement), Err(ReferenceError::ReplacementHolderMismatch),);
     }
 
     #[test]
     fn test_reference_pending_generations_ignore_stale_completion() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
-        let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let (first, mut first_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(first, first_value).unwrap();
-        first_reservation.disarm();
+        first_token.disarm();
 
-        let (second, mut second_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let second_value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        let (second, mut second_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let second_value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
         guard.install_pending(second, second_value).unwrap();
-        second_reservation.disarm();
+        second_token.disarm();
         assert!(!guard.complete(first, Err("stale failure".into())));
         assert!(guard.complete(second, Ok(())));
         drop(guard);
@@ -1586,17 +1671,17 @@ mod tests {
     fn test_reference_pending_poison_is_generation_safe() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
-        let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let (first, mut first_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(first, first_value).unwrap();
-        first_reservation.disarm();
-        let (second, second_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let second_value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        first_token.disarm();
+        let (second, second_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let second_value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
         guard.install_pending(second, second_value).unwrap();
         assert!(!guard.poison_pending(first, "stale failure"));
         assert!(guard.poison_pending(second, "current failure"));
         drop(guard);
-        drop(second_reservation);
+        drop(second_token);
         assert_eq!(reference.read(), Err(ReferenceError::ExecutionPoisoned { reason: "current failure".to_string() }));
     }
 
@@ -1614,7 +1699,7 @@ mod tests {
         });
         barrier.wait();
         let mut guard = reference.lock().unwrap();
-        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(generation, value).unwrap();
         reservation.disarm();
         drop(guard);
@@ -1642,9 +1727,9 @@ mod tests {
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
-        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(generation, value).unwrap();
-        let reservation_signal = Arc::clone(&reservation.reservation);
+        let reservation_signal = Arc::clone(&reservation.signal);
         reservation.disarm();
         drop(guard);
 
@@ -1674,9 +1759,9 @@ mod tests {
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
-        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(generation, value).unwrap();
-        let reservation_signal = Arc::clone(&reservation.reservation);
+        let reservation_signal = Arc::clone(&reservation.signal);
         reservation.disarm();
         drop(guard);
 
@@ -1701,7 +1786,7 @@ mod tests {
         let backend = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
         let (generation, mut reservation) = guard.reserve_pending(ReferenceCompletion::new(backend.clone())).unwrap();
-        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(generation, value).unwrap();
         reservation.disarm();
         drop(guard);
@@ -1817,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dropping_reservation_ownership_while_holder_guard_is_locked_does_not_relock() {
+    fn test_dropping_reservation_token_while_holder_guard_is_locked_does_not_relock() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
         let (_, reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
@@ -1835,10 +1920,10 @@ mod tests {
     }
 
     #[test]
-    fn test_dropping_reservation_batch_wakes_waiter_with_abandonment_failure() {
+    fn test_dropping_reservation_token_batch_wakes_waiter_with_abandonment_failure() {
         let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let reservations = PendingReferenceReservations::new(vec![reservation]);
+        let token_batch = ReferenceReservationTokenBatch::new(vec![reservation]);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let waiting_reference = Arc::clone(&reference);
         let waiting_barrier = Arc::clone(&barrier);
@@ -1847,7 +1932,7 @@ mod tests {
             waiting_reference.wait_until_accessible()
         });
         barrier.wait();
-        drop(reservations);
+        drop(token_batch);
         assert_eq!(
             waiter.join().unwrap(),
             Err(ReferenceError::ExecutionPoisoned {
@@ -1863,10 +1948,10 @@ mod tests {
         let mut guard = reference.lock().unwrap();
         let (generation, reservation) =
             guard.reserve_pending(ReferenceCompletion::new(pending_backend.clone())).unwrap();
-        let reservation_signal = Arc::clone(&reservation.reservation);
-        let value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let reservation_signal = Arc::clone(&reservation.signal);
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(generation, value).unwrap();
-        let reservations = PendingReferenceReservations::new(vec![reservation]);
+        let token_batch = ReferenceReservationTokenBatch::new(vec![reservation]);
         drop(guard);
 
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1876,7 +1961,7 @@ mod tests {
 
         // Installation alone does not disarm batch cleanup. Abandoning that ownership must preempt a backend
         // completion that may never arrive and wake a reader already blocked on the pending generation.
-        drop(reservations);
+        drop(token_batch);
         let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
         if result.is_err() {
             pending_backend.complete(Ok(()));
@@ -1896,16 +1981,15 @@ mod tests {
         let second = reference_new(Array::scalar(2.0_f32));
         let mut first_guard = first.lock().unwrap();
         let mut second_guard = second.lock().unwrap();
-        let (first_generation, first_reservation) =
-            first_guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let (_, second_reservation) = second_guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let first_value = first_guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        let (first_generation, first_token) = first_guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let (_, second_token) = second_guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = first_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
         first_guard.install_pending(first_generation, first_value).unwrap();
-        let mut reservations = PendingReferenceReservations::new(vec![first_reservation, second_reservation]);
+        let mut token_batch = ReferenceReservationTokenBatch::new(vec![first_token, second_token]);
 
         // Explicit cleanup is also non-locking, so a partial batch can be invalidated while every publication guard
         // remains held. The installed Pending member and the uninstalled Reserved member fail atomically on access.
-        reservations.poison("batch installation failed");
+        token_batch.poison("batch installation failed");
         drop(first_guard);
         drop(second_guard);
         let expected = Err(ReferenceError::ExecutionPoisoned { reason: "batch installation failed".to_string() });
@@ -1917,27 +2001,26 @@ mod tests {
     fn test_stale_reservation_abandonment_cannot_poison_a_newer_generation() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
-        let (first_generation, first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let (first_generation, first_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(first_generation, first_value).unwrap();
-        let (second_generation, mut second_reservation) =
-            guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let (second_generation, mut second_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
 
-        drop(first_reservation);
-        let second_value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        drop(first_token);
+        let second_value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
         guard.install_pending(second_generation, second_value).unwrap();
-        second_reservation.disarm();
+        second_token.disarm();
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
 
     #[test]
-    fn test_unwinding_drops_reservation_owner_and_poisons_the_holder() {
+    fn test_unwinding_drops_reservation_token_and_poisons_the_holder() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                let _reservations = PendingReferenceReservations::new(vec![reservation]);
+                let _token_batch = ReferenceReservationTokenBatch::new(vec![reservation]);
                 panic!("injected backend unwind");
             }))
             .is_err(),
@@ -1951,11 +2034,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reservation_owner_drop_does_not_double_panic_after_holder_mutex_poisoning() {
+    fn test_reservation_token_drop_does_not_double_panic_after_holder_mutex_poisoning() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let holder = Arc::clone(&reference.inner.holder);
         let (_, reservation) = reference.lock().unwrap().reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let reservations = PendingReferenceReservations::new(vec![reservation]);
+        let token_batch = ReferenceReservationTokenBatch::new(vec![reservation]);
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let _guard = holder.state.lock().unwrap();
@@ -1963,7 +2046,7 @@ mod tests {
             }))
             .is_err(),
         );
-        assert!(catch_unwind(AssertUnwindSafe(|| drop(reservations))).is_ok());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(token_batch))).is_ok());
         assert_eq!(reference.read(), Err(ReferenceError::Poisoned));
     }
 
@@ -1980,12 +2063,12 @@ mod tests {
             ReferenceCompletion::ready(Err("completed execution failure".into())),
             ReferenceCompletion::new(pending_backend),
         ];
-        let reservations = references
+        let tokens = references
             .iter()
             .zip(completions)
             .map(|(reference, completion)| reference.lock().unwrap().reserve_pending(completion).unwrap().1)
             .collect();
-        drop(PendingReferenceReservations::new(reservations));
+        drop(ReferenceReservationTokenBatch::new(tokens));
 
         let expected = Err(ReferenceError::ExecutionPoisoned {
             reason: "submitted reference execution ended before final state installation".to_string(),
@@ -1999,18 +2082,18 @@ mod tests {
     fn test_reference_pending_install_rejects_a_stale_generation() {
         let reference = reference_new(Array::scalar(1.0_f32));
         let mut guard = reference.lock().unwrap();
-        let (first, mut first_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
-        let first_value = guard.prepare(Array::scalar(2.0_f32)).unwrap();
+        let (first, mut first_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         guard.install_pending(first, first_value).unwrap();
-        first_reservation.disarm();
-        let (second, mut second_reservation) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
+        first_token.disarm();
+        let (second, mut second_token) = guard.reserve_pending(ReferenceCompletion::ready(Ok(()))).unwrap();
 
         // A late installation for the superseded generation is rejected without changing holder state, so the current
         // reservation still installs its own value.
-        let value = guard.prepare(Array::scalar(3.0_f32)).unwrap();
+        let value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
         assert_eq!(guard.validate_pending_install(first, &value), Err(ReferenceError::StaleGeneration));
         guard.install_pending(second, value).unwrap();
-        second_reservation.disarm();
+        second_token.disarm();
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
@@ -2028,7 +2111,7 @@ mod tests {
         assert_eq!(guard.take(), Err(ReferenceError::TransactionInProgress));
         lease.complete(Ok(()));
         assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
-        let restored = guard.prepare(Array::scalar(4.0_f32)).unwrap();
+        let restored = guard.prepare_replacement(Array::scalar(4.0_f32)).unwrap();
         guard.install(restored).unwrap();
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
@@ -2255,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn test_identity_renamed_reference_preserves_location_equality_hashing_and_prepared_ownership() {
+    fn test_identity_renamed_reference_preserves_location_equality_hashing_and_replacement_ownership() {
         let bounds = DimensionBounds::positive(Some(9)).unwrap();
         let source = DimensionVariable::new("source", bounds);
         let target = DimensionVariable::new("target", bounds);
@@ -2281,8 +2364,8 @@ mod tests {
 
         let mut guard = renamed.lock().unwrap();
         assert_eq!(guard.take(), Ok(CaptureReference::new(0, target_type.clone())));
-        let prepared = guard.prepare(CaptureReference::new(1, target_type)).unwrap();
-        guard.install(prepared).unwrap();
+        let replacement = guard.prepare_replacement(CaptureReference::new(1, target_type)).unwrap();
+        guard.install(replacement).unwrap();
         drop(guard);
         assert_eq!(reference.read(), Ok(CaptureReference::new(1, source_type)));
     }

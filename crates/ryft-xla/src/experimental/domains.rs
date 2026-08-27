@@ -18,12 +18,12 @@ use ryft_core::{
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, Parameterized, PendingReferenceReservations, Placeholder, ProgramError, Provenance, ProvenanceScope,
-    ReductionKind, ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback,
-    ReferenceDischargeResult, ReferenceExecution, ReferenceGuard, ReferenceId, ReferenceSource, ReferenceStateBinding,
-    ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
-    StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceCompletionCallback, ReferenceDischargeResult,
+    ReferenceExecution, ReferenceGuard, ReferenceId, ReferenceReservationTokenBatch, ReferenceSource,
+    ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction,
+    StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
+    TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -3008,7 +3008,7 @@ impl<'c> XlaDomain<'c> {
                 let (execution_arguments, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
                 let guard_storage = RefCell::new(Some(guards));
-                let publication: RefCell<Option<(ReferenceCompletion, PendingReferenceReservations)>> =
+                let publication: RefCell<Option<(ReferenceCompletion, ReferenceReservationTokenBatch)>> =
                     RefCell::new(None);
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
@@ -3024,18 +3024,18 @@ impl<'c> XlaDomain<'c> {
                         for guard_index in &read_only_guard_indices {
                             guards[*guard_index].publish_read_lease_unchecked(completion.clone());
                         }
-                        let reservations = mutated
+                        let tokens = mutated
                             .iter()
                             .map(|(guard_index, _, generation)| {
                                 guards[*guard_index].reserve_pending_unchecked(*generation, completion.clone())
                             })
                             .collect();
-                        *publication.borrow_mut() = Some((completion, PendingReferenceReservations::new(reservations)));
+                        *publication.borrow_mut() = Some((completion, ReferenceReservationTokenBatch::new(tokens)));
                         drop(stored_guards.take());
                     });
                 break 'snapshot (execution, input_refinements, mutated, publication.into_inner());
             };
-            let Some((completion, mut reservations)) = publication else {
+            let Some((completion, mut token_batch)) = publication else {
                 return match execution {
                     Err(error) => Ok(ReferenceExecution::ready(Err(error))),
                     Ok(_) => unreachable!("successful PJRT submission must publish reference state"),
@@ -3044,7 +3044,7 @@ impl<'c> XlaDomain<'c> {
             let execution = match execution {
                 Ok(execution) => execution,
                 Err(error) => {
-                    reservations.poison(error.to_string());
+                    token_batch.poison(error.to_string());
                     return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
             };
@@ -3065,14 +3065,14 @@ impl<'c> XlaDomain<'c> {
                     .iter()
                     .map(|(guard_index, _, _)| bindings[*guard_index].1.lock_root())
                     .collect::<Result<Vec<_>, ProgramError>>()?;
-                let prepared_values = mutated
+                let replacements = mutated
                     .iter()
                     .zip(mutation_guards.iter())
                     .map(|((_, logical_output_index, _), guard)| {
                         let value = hidden_outputs.remove(logical_output_index).ok_or_else(|| {
                             ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
                         })?;
-                        guard.prepare(value).map_err(ProgramError::custom)
+                        guard.prepare_replacement(value).map_err(ProgramError::custom)
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 if !hidden_outputs.is_empty() {
@@ -3082,22 +3082,22 @@ impl<'c> XlaDomain<'c> {
                     .into());
                 }
                 for (((_, _, generation), guard), value) in
-                    mutated.iter().zip(mutation_guards.iter()).zip(&prepared_values)
+                    mutated.iter().zip(mutation_guards.iter()).zip(&replacements)
                 {
                     guard.validate_pending_install(*generation, value)?;
                 }
                 for (((_, _, generation), guard), value) in
-                    mutated.iter().zip(mutation_guards.iter_mut()).zip(prepared_values)
+                    mutated.iter().zip(mutation_guards.iter_mut()).zip(replacements)
                 {
                     guard.install_pending_unchecked(*generation, value);
                 }
                 Ok(())
             })();
             if let Err(error) = installation {
-                reservations.poison(error.to_string());
+                token_batch.poison(error.to_string());
                 return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
             }
-            reservations.disarm();
+            token_batch.disarm();
 
             let public_result = (|| -> Result<_, XlaDomainError> {
                 #[cfg(test)]
