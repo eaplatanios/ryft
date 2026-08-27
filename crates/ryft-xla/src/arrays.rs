@@ -1227,8 +1227,8 @@ mod tests {
 
     #[test]
     fn test_array_reference_is_send_and_sync() {
-        // Reference handles share their handle vocabulary between exact clones, so the XLA reference family relies
-        // on the array value and type metadata being safe for concurrent access.
+        // Exact reference clones share immutable handle-local type and identity metadata, so the XLA reference family
+        // relies on the array value and that metadata being safe for concurrent access.
         assert_send_sync::<Reference<Array<'static>>>();
     }
 

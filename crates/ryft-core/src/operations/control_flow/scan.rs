@@ -44,8 +44,8 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
     Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
+    TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1745,24 +1745,20 @@ where
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. This is the same threaded set the shared positional rewrite builds, and it excludes the carries
-        // that survive as references: those occupy their declared carry positions as the references they already are.
-        let threaded = context.threaded_state_roots(&summary, name)?;
+        // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
+        // positions as the references they already are.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
-        let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
+        let widening = context.state_widening(&summary, &carried, name)?;
+        let entering = widening.entering().to_vec();
 
-        let boundary = ReferenceRegionDischargeBoundary::new(
+        let boundary = ReferenceRegionDischargeBoundary::symmetric(
             self,
             0,
             body_roots,
-            entering.clone(),
-            carry_count,
-            entering.clone(),
-            carry_count,
+            ReferenceRegionStateInsertion::new(entering.clone(), carry_count),
         );
         let fork = driver.discharge_region_program(context, 0, &boundary)?;
-        fork.validate_predicted_mutations(published.as_slice(), name)?;
+        fork.validate_predicted_mutations(widening.published(), name)?;
         fork.validate_predicted_output_roots(summary.output_roots(), name)?;
 
         // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
@@ -1808,18 +1804,14 @@ where
             if position < carry_count {
                 match carries[position] {
                     Some(root) => {
-                        // A carry that survives as a reference came back out as the same reference, so there is no
-                        // successor state to merge for it.
-                        if threaded.contains(&root) {
-                            context.merge_discharged_state(root, output, summary.is_mutated(root))?;
-                        }
+                        context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
                         results.push(carry_operands[position].clone());
                     }
                     None => results.push(ReferenceDischargeValue::Ordinary(output)),
                 }
             } else if position < carry_count + entering.len() {
                 let root = entering[position - carry_count];
-                context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
             } else {
                 results.push(ReferenceDischargeValue::Ordinary(output));
             }

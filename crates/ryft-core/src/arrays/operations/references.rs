@@ -323,15 +323,11 @@ where
     let reference = inputs[0].expect_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
     let alias = reference.alias().with_transform_unchecked(transform);
-    let preserved = match reference.preserved() {
-        None => None,
-        Some(value) => {
-            let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
-            check_count!("output", outputs, 1, ProgramError);
-            Some(outputs.remove(0))
-        }
-    };
-    Ok(vec![context.derive(reference, alias, ReferenceType::new(referent), preserved)?])
+    Ok(vec![context.derive(reference, alias, ReferenceType::new(referent), |value| {
+        let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    })?])
 }
 
 impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation

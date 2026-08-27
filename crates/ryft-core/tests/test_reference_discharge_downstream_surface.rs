@@ -25,8 +25,7 @@ use ryft_core::{
     ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceInput,
     ReferenceOperationSemantics, ReferenceOutput, ReferenceSource, ReferenceStateBinding, ReferenceType,
-    RegionInterface, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_preserved_access,
-    discharge_reference_free_operation,
+    RegionInterface, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -388,18 +387,12 @@ where
             Self::Read => {
                 check_count!("input", inputs, 1, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to read")?;
-                if reference.preserved().is_some() {
-                    return discharge_preserved_access(self, context, inputs);
-                }
                 Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
             }
             Self::Write => {
                 check_count!("input", inputs, 2, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to write")?;
                 let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                if reference.preserved().is_some() {
-                    return discharge_preserved_access(self, context, inputs);
-                }
                 context.write(reference, replacement)?;
                 Ok(Vec::new())
             }
@@ -407,19 +400,11 @@ where
                 check_count!("input", inputs, 2, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to replace")?;
                 let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                if reference.preserved().is_some() {
-                    return discharge_preserved_access(self, context, inputs);
-                }
                 Ok(vec![ReferenceDischargeValue::Ordinary(context.replace(reference, replacement)?)])
             }
             Self::Freeze => {
                 check_count!("input", inputs, 1, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to freeze")?;
-                if reference.preserved().is_some() {
-                    let outputs = discharge_preserved_access(self, context, inputs)?;
-                    context.unbind_preserved(reference)?;
-                    return Ok(outputs);
-                }
                 Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
             }
         }

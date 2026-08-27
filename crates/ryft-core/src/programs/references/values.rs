@@ -93,13 +93,14 @@ impl ReferenceGeneration {
 ///
 /// Equality and hashing identify the mutable storage location, not this handle's structural type. Clones and
 /// identity-renamed handles into the same alias family therefore compare equal and hash identically even when their
-/// handle-local referent types use different identity vocabularies.
+/// handle-local referent types use different type-identity namespaces.
 ///
 /// Handles are pointer-sized. Cloning a handle is a single reference-count increment because exact clones share one
-/// immutable handle vocabulary. Identity renaming allocates a new vocabulary sharing the same reference allocation
-/// and maps values bidirectionally at the shared-state boundary. Because that vocabulary is shared across clones,
-/// `Reference<V>` is [`Send`] and [`Sync`] only when the referent value and its type and identity metadata are
-/// all safe to share across threads (i.e., they are all `Send + Sync`).
+/// immutable handle containing the same local referent type and identity mappings. Identity renaming allocates a new
+/// handle with a different type-identity namespace, shares the same reference allocation, and maps values
+/// bidirectionally at the shared-state boundary. Because exact clones share that metadata, `Reference<V>` is [`Send`]
+/// and [`Sync`] only when the referent value and its type and identity metadata are all safe to share across threads
+/// (i.e., they are all `Send + Sync`).
 #[cfg_attr(doc, aquamarine::aquamarine)]
 #[derive(Parameter)]
 pub struct Reference<V: Value> {
@@ -132,26 +133,29 @@ impl<V: Value> Reference<V> {
         })
     }
 
-    // TODO(eaplatanios): Review from here onward.
-
-    /// Returns this alias family's process-local identity, which remains stable while any alias is alive.
+    /// Returns the process-local [`ReferenceId`] of this [`Reference`], which remains stable while any alias is alive.
     #[inline]
     pub fn id(&self) -> ReferenceId {
         ReferenceId::from_address(Arc::as_ptr(&self.handle.holder) as usize)
     }
 
-    /// Returns whether this handle exposes the shared state's root type without a handle-local identity mapping.
-    #[doc(hidden)]
-    pub fn is_root_handle(&self) -> bool {
+    /// Returns `true` if this handle uses the shared holder's original type identities, and `false` otherwise. When
+    /// this function returns `true`, values cross between the handle and holder without type-identity renaming. A
+    /// handle produced by [`Self::rename_type_identities`] still refers to the same holder but returns `false` when
+    /// that operation results in changing any identity.
+    #[inline]
+    pub fn uses_root_type_identities(&self) -> bool {
         self.handle.root_to_handle.is_identity() && self.handle.handle_to_root.is_identity()
     }
+
+    // TODO(eaplatanios): Review from here onward.
 
     /// Locks this reference for one stateful backend transaction.
     ///
     /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain that order
     /// until every submitted hidden replacement has been validated and installed. A submitted mutation remains
     /// represented by `Taken` while this guard is held, so dropping the guard before installation poisons the reference.
-    #[doc(hidden)]
+    #[inline]
     pub fn lock(&self) -> Result<ReferenceGuard<'_, V>, ReferenceError> {
         let state = self.lock_state()?;
         Ok(ReferenceGuard { reference: self, state })
@@ -383,7 +387,7 @@ impl<V: Value> Reference<V> {
         Ok(result)
     }
 
-    /// Reconstructs one root-stored value in this handle's type-identity vocabulary.
+    /// Reconstructs one root-stored value in this handle's type-identity namespace.
     fn reconstruct_local(&self, value: &V) -> Result<V, ReferenceError> {
         value
             .rename_type_identities(&self.handle.root_to_handle)
@@ -435,7 +439,8 @@ impl<V: Value> Reference<V> {
     }
 }
 
-// Exact clones share one immutable handle vocabulary, so cloning is a single reference-count increment.
+// Exact clones share one immutable handle and its type-identity mappings, so cloning is a single reference-count
+// increment.
 impl<V: Value> Clone for Reference<V> {
     #[inline]
     fn clone(&self) -> Self {
@@ -489,10 +494,10 @@ impl<V: Value> Typed for Reference<V> {
     }
 }
 
-/// Handle-local vocabulary shared by exact clones of one [`Reference`].
+/// Immutable handle-local type and identity mappings shared by exact clones of one [`Reference`].
 ///
 /// Every binding is fixed at construction and never reassigned: the `Reference` API exposes no way to mutate handle
-/// vocabulary, derivation ([`Reference::rename_type_identities`]) constructs a new handle rather than modifying an
+/// metadata, derivation ([`Reference::rename_type_identities`]) constructs a new handle rather than modifying an
 /// existing one, and all runtime mutability lives behind the holder's state mutex. Private code must preserve that
 /// invariant — `Arc` alone does not prevent mutation through `Arc::get_mut`, and sharing this metadata between exact
 /// clones relies on Ryft's semantic contract that structural [`Type`] metadata remains stable for a value's lifetime.
@@ -832,10 +837,10 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
 
 /// Validated replacement bound to one reference allocation.
 ///
-/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value into the root identity vocabulary, validates
-/// its exact referent type, and records the reference allocation for which it was prepared. Installation consumes the
-/// replacement only after verifying that allocation, preventing replacements prepared for different references from
-/// being exchanged during a multi-reference transaction.
+/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value into the root's type-identity namespace,
+/// validates its exact referent type, and records the reference allocation for which it was prepared. Installation
+/// consumes the replacement only after verifying that allocation, preventing replacements prepared for different
+/// references from being exchanged during a multi-reference transaction.
 #[doc(hidden)]
 pub struct ReferenceReplacement<V: Value> {
     /// Weak identity of the holder allocation for which this replacement was prepared.
@@ -1651,16 +1656,16 @@ mod tests {
 
     #[test]
     fn test_reference_is_send_and_sync() {
-        // Sharing the handle vocabulary between exact clones requires it to be safe for concurrent access, so the
-        // production array reference family must remain `Send + Sync`.
+        // Exact clones share immutable handle-local type and identity metadata, so the production array reference
+        // family requires that metadata to remain `Send + Sync`.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Reference<Array>>();
     }
 
     #[test]
     fn test_reference_handle_layout_and_clone_sharing() {
-        // Handles are pointer-sized and exact clones share one immutable handle vocabulary, so cloning is a single
-        // reference-count increment.
+        // Handles are pointer-sized and exact clones share one immutable handle with its type-identity mappings, so
+        // cloning is a single reference-count increment.
         assert_eq!(size_of::<Reference<Array>>(), size_of::<usize>());
 
         let reference = reference_new(Array::scalar(1.0_f32));
@@ -1767,8 +1772,8 @@ mod tests {
         renaming.insert(source, target).unwrap();
         let renamed = reference.rename_type_identities(&renaming).unwrap();
 
-        // Renaming allocates a distinct handle vocabulary over the same shared holder, which is exactly the
-        // handle-vocabulary/storage split: equality and hashing follow the holder, not the vocabulary.
+        // Renaming allocates distinct handle-local type and identity metadata over the same shared holder. Equality and
+        // hashing follow the holder rather than that metadata.
         assert!(!Arc::ptr_eq(&renamed.handle, &reference.handle));
         assert!(Arc::ptr_eq(&renamed.handle.holder, &reference.handle.holder));
         assert_eq!(renamed, reference);

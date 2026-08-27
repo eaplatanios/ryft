@@ -13,7 +13,7 @@ fn construct_handle<C: Domain, P: ReferenceDischargePolicy<C>>(
     alias: P::Alias,
     r#type: ReferenceType<P::Referent>,
 ) -> ReferenceDischargeReference<C, P> {
-    ReferenceDischargeReference { root, alias, r#type, preserved: None }
+    ReferenceDischargeReference { root, alias, r#type }
 }
 
 // The diverging field initializer keeps the snapshot to the privacy rejections themselves: the environment identity

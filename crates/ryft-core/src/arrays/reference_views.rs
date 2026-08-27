@@ -466,7 +466,8 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrie
 
 /// Eager array-reference handle pairing one shared root allocation with handle-local view metadata.
 ///
-/// Equality and hashing identify the mutable location and structural view, not the handle-local type vocabulary.
+/// Equality and hashing identify the mutable location and structural view, not the handle-local type-identity
+/// namespace.
 /// Renaming type identities therefore preserves equality with the original handle when its view is unchanged.
 pub struct ArrayReference<A: Value<Type = ArrayType>> {
     /// Handle to the shared root allocation.
@@ -501,7 +502,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     #[doc(hidden)]
     #[inline]
     pub fn is_runtime_root_handle(&self) -> bool {
-        self.view.is_root() && self.root.is_root_handle()
+        self.view.is_root() && self.root.uses_root_type_identities()
     }
 
     /// Locks an unrenamed root for one backend-owned state transaction.

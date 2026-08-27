@@ -55,8 +55,8 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection,
+    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
+    TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -964,13 +964,15 @@ where
 
         // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. This is the same threaded set the shared positional rewrite builds, and it excludes the carries
-        // that survive as references: those occupy their declared carry positions as the references they already are.
-        let threaded = context.threaded_state_roots(&summary, name)?;
+        // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
+        // positions as the references they already are.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let entering = threaded.difference(&carried).copied().collect::<Vec<_>>();
-        let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
+        let widening = context.state_widening(&summary, &carried, name)?;
+        let entering = widening.entering().to_vec();
 
+        // The condition publishes nothing — it returns only its predicate — so its declared output roots need no
+        // `validate_predicted_output_roots` pass; the body's fixed-point carry check below is the stronger version of
+        // that agreement for the one region that does return references.
         let condition_fork = driver.discharge_region_program(
             context,
             0,
@@ -978,27 +980,22 @@ where
                 self,
                 0,
                 carries.clone(),
-                entering.clone(),
-                inputs.len(),
-                Vec::new(),
-                condition.output_ids().len(),
+                ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
+                ReferenceRegionStateInsertion::new(Vec::new(), condition.output_ids().len()),
             ),
         )?;
         condition_fork.validate_predicted_mutations(&[], name)?;
         let body_fork = driver.discharge_region_program(
             context,
             1,
-            &ReferenceRegionDischargeBoundary::new(
+            &ReferenceRegionDischargeBoundary::symmetric(
                 self,
                 1,
                 carries.clone(),
-                entering.clone(),
-                inputs.len(),
-                entering.clone(),
-                inputs.len(),
+                ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
             ),
         )?;
-        body_fork.validate_predicted_mutations(published.as_slice(), name)?;
+        body_fork.validate_predicted_mutations(widening.published(), name)?;
 
         // Every carry must leave the body as the reference it entered with, or the loop's state has no fixed point and
         // its zero-iteration result would not be its entering state.
@@ -1033,15 +1030,13 @@ where
         for (position, output) in outputs.into_iter().enumerate() {
             match carries.get(position).copied().flatten() {
                 Some(root) => {
-                    if threaded.contains(&root) {
-                        context.merge_discharged_state(root, output, summary.is_mutated(root))?;
-                    }
+                    context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
                     results.push(inputs[position].clone());
                 }
                 None if position < inputs.len() => results.push(ReferenceDischargeValue::Ordinary(output)),
                 None => {
                     let root = entering[position - inputs.len()];
-                    context.merge_discharged_state(root, output, summary.is_mutated(root))?;
+                    context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
                 }
             }
         }

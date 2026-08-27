@@ -34,7 +34,7 @@ use crate::programs::types::{Type, TypeError, Typed};
 
 use super::discharge::{
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, discharge_preserved_access,
+    ReferenceDischargeValue, ReferenceDischargeableOperation,
 };
 use super::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput};
 use super::types::ReferenceType;
@@ -622,10 +622,10 @@ where
 /// on operands the operation itself accepts.
 ///
 /// A [`Program`](crate::Program) built through a [`ProgramBuilder`](crate::ProgramBuilder) already ran this inference
-/// when the instruction was added, but a direct [`Context::bind`](crate::Context::bind) into a discharge context does
-/// not, and the rules that relate two operands to each other cannot recover that relationship from the carriers
-/// alone. Only those rules call this: an allocation derives its own output type instead, and a read or a freeze
-/// relates no operands, so re-deriving would restate the projection the rule already performs.
+/// when the instruction was added, but a rule invoked outside a checked program replay has no such guarantee, and the
+/// rules that relate two operands to each other cannot recover that relationship from the carriers alone. Only those
+/// rules call this: an allocation derives its own output type instead, and a read or a freeze relates no operands, so
+/// re-deriving would restate the projection the rule already performs.
 ///
 /// # Parameters
 ///
@@ -650,10 +650,11 @@ where
 // of them names the referent type parameter `T`: an allocation reads its fresh root's reference type back out of its
 // own inferred output type through the policy's projection, and every access reads the type off the flowing handle.
 //
-// Each rule additionally serves the roots partial discharge *preserves*. A preserved root survives in the destination
-// as an ordinary reference, so the honest rewrite of an access to it is the access itself, replayed verbatim through
-// `discharge_preserved_access`. That is the whole reason these rules bind their destination by `Context` rather than
-// by `Domain`: replaying a primitive requires the conversion seam into the destination's own operation family.
+// Accesses to the roots partial discharge *preserves* never reach these rules: the dispatch path replays them
+// verbatim through `discharge_preserved_access` before rule dispatch, so each access rule below rewrites only
+// discharged roots. The rules still bind their destination by `Context` rather than by `Domain` because the
+// allocation rule and the shared replay path require the conversion seam into the destination's own operation
+// family.
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
 where
     T: Type,
@@ -709,9 +710,6 @@ where
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let reference = inputs[0].expect_reference("a reference to read")?;
-        if reference.preserved().is_some() {
-            return discharge_preserved_access(self, context, inputs);
-        }
         Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
     }
 }
@@ -734,9 +732,6 @@ where
         let reference = inputs[0].expect_reference("a reference to write")?;
         let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
         validate_operand_types(self, inputs)?;
-        if reference.preserved().is_some() {
-            return discharge_preserved_access(self, context, inputs);
-        }
         context.write(reference, replacement)?;
         Ok(Vec::new())
     }
@@ -762,12 +757,8 @@ where
 
         // The replacement must carry exactly the handle's referent. A universe whose write mechanics only require the
         // replacement to fit inside the selected coordinates would otherwise perform a silent partial write, so the
-        // rule re-derives the operand relationship its own inference already states. It is checked for a preserved
-        // root too, because the destination re-runs the same inference and a mismatch reads better here.
+        // rule re-derives the operand relationship its own inference already states.
         validate_operand_types(self, inputs)?;
-        if reference.preserved().is_some() {
-            return discharge_preserved_access(self, context, inputs);
-        }
         Ok(vec![ReferenceDischargeValue::Ordinary(context.replace(reference, replacement)?)])
     }
 }
@@ -798,9 +789,6 @@ where
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
         // this operation's own inference states and what a universe's addition alone does not guarantee.
         validate_operand_types(self, inputs)?;
-        if reference.preserved().is_some() {
-            return discharge_preserved_access(self, context, inputs);
-        }
         context.accumulate(reference, update)?;
         Ok(Vec::new())
     }
@@ -822,13 +810,6 @@ where
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let reference = inputs[0].expect_reference("a reference to freeze")?;
-        if reference.preserved().is_some() {
-            let outputs = discharge_preserved_access(self, context, inputs)?;
-            // The replayed freeze produces the destination's own frozen value; all that remains is to stop the
-            // environment from handing the consumed root out again.
-            context.unbind_preserved(reference)?;
-            return Ok(outputs);
-        }
         Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
     }
 }
@@ -942,12 +923,10 @@ mod tests {
     use crate::parameters::{Parameter, Parameterized, Placeholder};
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
-    use crate::programs::programs::Program;
     use crate::programs::references::discharge::{ReferenceDischargeReference, discharge_reference_free_operation};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Type;
     use crate::programs::values::Value;
-    use crate::tracing::{Trace, Tracer, TracingContext};
 
     use super::*;
 
@@ -1428,15 +1407,6 @@ mod tests {
 
     /// Carrier flowing through the discharge-rule tests.
     type TestDischargeValue = ReferenceDischargeValue<TestDestination, TestReferenceDischarge>;
-
-    /// Staging destination of the discharge-rule tests, whose values can carry a reference type.
-    type TestStagingDestination = TracingContext<TestValue, TestOperation>;
-
-    /// Discharge context over the staging discharge-rule destination.
-    type TestStagingDischargeContext = ReferenceDischargeContext<TestStagingDestination, TestReferenceDischarge>;
-
-    /// Carrier flowing through the staging discharge-rule tests.
-    type TestStagingDischargeValue = ReferenceDischargeValue<TestStagingDestination, TestReferenceDischarge>;
 
     /// Operation family of the discharge-rule test destinations.
     ///
@@ -2200,58 +2170,41 @@ mod tests {
 
     #[test]
     fn test_reference_primitive_discharge_replays_accesses_to_a_preserved_root() {
-        // A root that partial discharge preserved survives in the destination as an ordinary reference, so every
-        // access rule replays its own operation verbatim over the handle's destination value instead of acting on
-        // threaded state. The rewritten program therefore performs the same reference operations the source did, in
-        // the same order.
-        let discharge = |inputs: Vec<Tracer<TestStagingDestination>>| {
-            let context = TestStagingDischargeContext::new(inputs[0].context().clone());
-            let preserved = context.bind_preserved(ReferenceType::new(REFERENT), inputs[0].clone())?;
-            let reference = preserved.expect_reference("the preserved root")?.clone();
-            let update: TestStagingDischargeValue = ReferenceDischargeValue::Ordinary(inputs[1].clone());
-            let observed =
-                Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))?;
-            assert_eq!(
-                Write::new().discharge_references(
-                    &context,
-                    &EmptyRegionDriver,
-                    &[preserved.clone(), update.clone()]
-                )?,
-                Vec::new(),
-            );
-            let previous =
-                Swap::new().discharge_references(&context, &EmptyRegionDriver, &[preserved.clone(), update.clone()])?;
-            assert_eq!(
-                AddUpdate::new().discharge_references(&context, &EmptyRegionDriver, &[preserved.clone(), update])?,
-                Vec::new(),
-            );
-            let frozen =
-                Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))?;
-
-            // Consuming a preserved root unbinds it, so a later access is a use-after-consume exactly as it is for a
-            // discharged root, even though discharge never held the root's state.
-            assert_eq!(context.live_roots(), Vec::new());
-            assert_eq!(
-                Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved)),
-                Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge accessed consumed {}",
-                    reference.root(),
-                ))),
-            );
-            [observed, previous, frozen]
-                .iter()
-                .flatten()
-                .map(|output| output.expect_ordinary("a replayed access result").cloned())
-                .collect::<Result<Vec<_>, _>>()
-        };
-        let (_, program): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
-            TestDestination::trace(
-                discharge,
-                vec![TestType::Reference(ReferenceType::new(REFERENT)), TestType::Value(REFERENT)],
+        // A root that partial discharge preserved survives in the destination as an ordinary reference, so the
+        // dispatch path replays every access verbatim over the handle's destination value instead of acting on
+        // threaded state, and the access rules themselves never run. The rewritten program therefore performs the
+        // same reference operations the source did, in the same order, and the consumed root contributes no binding.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(TestType::Reference(ReferenceType::new(REFERENT)));
+        let update = builder.add_input(TestType::Value(REFERENT));
+        let observed = builder
+            .add_instruction(TestOperation::Read(Read::new()), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(TestOperation::Write(Write::new()), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let previous = builder
+            .add_instruction(TestOperation::Swap(Swap::new()), Vec::new(), vec![reference, update], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let frozen = builder
+            .add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![observed, previous, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
             )
             .unwrap();
+
+        let preserved = source.partially_discharge_references_with_policy::<TestReferenceDischarge>(0, &[]).unwrap();
+        assert_eq!(preserved.public_output_count(), 3);
+        assert_eq!(preserved.external_states(), &[]);
         assert_eq!(
-            program.to_string(),
+            preserved.program().to_string(),
             indoc! {"
                 lambda %0:ref<value<i7,p16>>, %1:value<i7,p16> .
                 let %2:value<i7,p16> = reference_read %0

@@ -184,9 +184,9 @@ pub use discharge::{
     ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePayload,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionSummary, ReferenceRootHandle,
-    ReferenceSource, ReferenceStateBinding, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionStateInsertion,
+    ReferenceRegionSummary, ReferenceRootHandle, ReferenceSource, ReferenceStateBinding, ReferenceStateWidening,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
