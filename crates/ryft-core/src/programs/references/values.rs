@@ -1122,8 +1122,10 @@ impl ReferenceCompletion {
         }
     }
 
-    // TODO(eaplatanios): Why is the "terminal failure" an `Arc<str>`?
-    /// Returns `Ok(false)` while any underlying work is pending, `Ok(true)` after success, or the terminal failure.
+    /// Checks whether all underlying work has completed without blocking. Returns `Ok(false)` while any work is
+    /// pending, `Ok(true)` after success, or the backend's terminal failure reason. Failures use `Arc<str>` so cloned
+    /// completions and joined dependencies can cheaply retain and propagate the same immutable diagnostic across
+    /// threads without tying it to a backend object's lifetime.
     #[inline]
     pub fn is_ready(&self) -> Result<bool, Arc<str>> {
         match &self.storage {
@@ -1132,7 +1134,10 @@ impl ReferenceCompletion {
         }
     }
 
-    /// Blocks until all underlying work completes and returns its terminal result.
+    /// Blocks until all underlying work completes and returns its terminal result. A joined completion waits for every
+    /// dependency even after observing a failure and returns the first failure in input order. The shared `Arc<str>`
+    /// failure reason can be retained by poisoned reference state and propagated through backend execution results
+    /// without copying its contents.
     #[inline]
     pub fn r#await(&self) -> Result<(), Arc<str>> {
         match &self.storage {
@@ -1240,25 +1245,22 @@ pub struct ReferenceReplacement<V: Value> {
     value: V,
 }
 
-// TODO(eaplatanios): Review this block.
-/// A submitted asynchronous mutation awaiting its reconstructed replacement value.
-///
+/// A submitted asynchronous [`Reference`] mutation awaiting its reconstructed replacement value.
 /// [`ReferenceGuard::begin_replacement`] creates this transaction only after backend submission succeeds and moves the
-/// reference to `Taken`. The transaction binds the reference allocation, its newly claimed generation, and the
+/// reference state to `Taken`. The transaction binds the reference allocation, its newly claimed generation, and the
 /// cumulative backend completion. Calling [`Self::validate`] with a prepared [`ReferenceReplacement`] checks the
-/// allocation and state before returning a [`ValidatedPendingReplacement`].
-///
-/// A backend that mutates multiple references should validate every transaction before committing any returned token.
-/// Dropping this transaction does not restore the reference; the guard must instead be poisoned after any failure.
+/// allocation and state before returning a [`ValidatedPendingReplacement`]. A backend that mutates multiple references
+/// should validate every transaction before committing any returned token. Dropping this transaction does not restore
+/// the reference; the guard must instead be poisoned after any failure.
 #[must_use = "a submitted reference replacement must be committed or its reference must be poisoned"]
 pub struct ReferenceReplacementTransaction<V: Value> {
-    /// Weak pointer identifying the reference allocation whose value is being replaced.
+    /// Weak pointer identifying the [`Reference`] allocation whose value is being replaced.
     holder: Weak<ReferenceHolder<V>>,
 
-    /// Generation claimed for the submitted mutation.
+    /// [`ReferenceGeneration`] claimed for the submitted mutation.
     generation: ReferenceGeneration,
 
-    /// Cumulative completion of the submitted mutation and its predecessor dependencies.
+    /// Cumulative [`ReferenceCompletion`] of the submitted mutation and its predecessor dependencies.
     completion: ReferenceCompletion,
 }
 
