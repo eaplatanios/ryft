@@ -865,10 +865,7 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
         Ok(ReferenceReplacementPreparation::Prepared(PreparedReferenceReplacement { guard: self, generation }))
     }
 
-    // Synchronous extraction.
-
     /// Waits until this reference is `Ready` with no active read leases and returns the corresponding typestate guard.
-    ///
     /// This function releases the current mutex guard before awaiting pending mutation completion or read leases. The
     /// returned guard therefore protects the newest value at the time the wait completes, which may differ from an
     /// earlier [`ReferenceObservation`].
@@ -876,9 +873,14 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
     /// # Errors
     ///
     /// Returns the applicable terminal lifecycle error, unexpected mutex poisoning, or a failed pending completion.
+    #[inline]
     pub fn wait_until_ready(self) -> Result<ReadyReferenceGuard<'g, V>, ReferenceError> {
         let reference = self.guard.reference;
+
+        // Release the current state mutex before `lock_ready_state` reacquires it to reconcile pending work and read
+        // leases. The borrowed reference remains valid for the guard lifetime after this guard is dropped.
         drop(self);
+
         let state = reference.lock_ready_state(true)?;
         Ok(ReadyReferenceGuard { guard: ReferenceGuard { reference, state } })
     }
