@@ -9,10 +9,9 @@ use crate::programs::programs::Program;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-use super::interpreter::region_closure_touches_references;
 use super::interpreter::{
     RecursiveReferenceDischargeDriver, ReferenceCaptureScope, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, region_closure_touches_references,
 };
 use super::policies::ReferenceDischargePolicy;
 use super::results::{

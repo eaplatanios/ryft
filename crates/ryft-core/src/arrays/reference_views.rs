@@ -696,6 +696,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::types::data::DataType;
+    use crate::programs::ReferenceCompletion;
 
     use super::*;
 
@@ -900,18 +901,17 @@ mod tests {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let mut guard = root.lock_root().unwrap();
         let generation = guard.next_generation().unwrap();
-        guard.begin_submitted_mutation(generation);
+        let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
 
-        // A derived handle is pure structural metadata over a live holder, so composing one must never resolve the
-        // holder's submitted work. The holder is parked in its submitted-before-install hidden state, where every
-        // value access is unavailable behind this retained guard until installation, and derivation still completes
-        // and computes its exact referent type.
+        // A derived handle is pure structural metadata over a live reference, so composing one must never resolve its
+        // submitted work. The reference is parked in its `Taken` state, where every value access is unavailable behind
+        // this retained guard until replacement commit, and derivation still computes its exact referent type.
         let transform = ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] };
         let derived = root.with_transform(transform).unwrap();
         assert_eq!(derived.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
         // Poisoning the submitted mutation is terminal for the alias family, but further derivation remains structural
-        // composition. The resulting handle reports the holder failure only when it attempts to access state.
+        // composition. The resulting handle reports the reference failure only when it attempts to access state.
         guard.poison("submission failed");
         drop(guard);
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };

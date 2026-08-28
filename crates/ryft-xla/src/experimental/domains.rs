@@ -217,10 +217,10 @@ pub(crate) enum StatefulFailureInjection {
     /// Fails after mutable inputs cross the execution handoff boundary.
     AfterHandoff,
 
-    /// Fails after state publication but before hidden final states are reconstructed and installed.
-    BeforeHiddenInstallation,
+    /// Fails after state publication but before hidden final-state replacements are reconstructed and committed.
+    BeforeHiddenReplacementCommit,
 
-    /// Fails after hidden final states are installed but before public outputs are reconstructed.
+    /// Fails after hidden final-state replacements are committed but before public outputs are reconstructed.
     BeforePublicReconstruction,
 }
 
@@ -2786,7 +2786,7 @@ impl<'c> XlaDomain<'c> {
         Ok((output, fence))
     }
 
-    /// Submits one stateful request, publishes its dependencies, and installs hidden final states without waiting for
+    /// Submits one stateful request, publishes its dependencies, and commits hidden final states without waiting for
     /// device completion when the logical boundary is static.
     fn execute_stateful_request_async<Request>(
         &self,
@@ -2894,7 +2894,7 @@ impl<'c> XlaDomain<'c> {
             }
             // Every in-repo multi-holder path acquires guards in ascending identity order. This ordering is the
             // deadlock-prevention invariant for overlapping stateful calls and must be preserved while guards remain
-            // held from submission through hidden-state installation below.
+            // held from submission through hidden-state replacement commit below.
             bindings.sort_by_key(|(id, _)| *id);
             let guard_indices =
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
@@ -2921,7 +2921,7 @@ impl<'c> XlaDomain<'c> {
                 .zip(&reference_state_input_indices)
                 .map(|(_, &logical_input_index)| (logical_input_index, false))
                 .collect::<Vec<_>>();
-            let (execution, input_refinements, mutated, publication, mut guards) = 'snapshot: loop {
+            let (execution, input_refinements, mutated, publication, replacement_transactions, mut guards) = 'snapshot: loop {
                 let mut guards = bindings
                     .iter()
                     .map(|(_, reference)| reference.lock_root())
@@ -3023,6 +3023,7 @@ impl<'c> XlaDomain<'c> {
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
                 let guard_storage = RefCell::new(guards);
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
+                let replacement_transactions = RefCell::new(Vec::with_capacity(mutated.len()));
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
                         let mut completions = dependencies.clone();
@@ -3031,13 +3032,14 @@ impl<'c> XlaDomain<'c> {
                         if let Some(injected) = take_stateful_completion_injection() {
                             completions.push(injected);
                         }
-                        let completion = ReferenceCompletion::join(completions);
+                        let completion = ReferenceCompletion::joined(completions);
                         let mut guards = guard_storage.borrow_mut();
                         for guard_index in &read_only_guard_indices {
                             guards[*guard_index].publish_read_lease_unchecked(completion.clone());
                         }
+                        let mut transactions = replacement_transactions.borrow_mut();
                         for (guard_index, _, generation) in &mutated {
-                            guards[*guard_index].begin_submitted_mutation(*generation);
+                            transactions.push(guards[*guard_index].begin_replacement(*generation, completion.clone()));
                         }
                         *publication.borrow_mut() = Some(completion);
                     });
@@ -3046,6 +3048,7 @@ impl<'c> XlaDomain<'c> {
                     input_refinements,
                     mutated,
                     publication.into_inner(),
+                    replacement_transactions.into_inner(),
                     guard_storage.into_inner(),
                 );
             };
@@ -3069,11 +3072,11 @@ impl<'c> XlaDomain<'c> {
             };
             let (physical_outputs, fence) = execution.into_parts();
             let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
-            let installation = (|| -> Result<(), XlaDomainError> {
+            let replacement_commit = (|| -> Result<(), XlaDomainError> {
                 #[cfg(test)]
-                if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenInstallation) {
+                if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenReplacementCommit) {
                     return Err(XlaDomainError::InvalidCompilationOptions {
-                        reason: "injected failure before hidden state installation".to_string(),
+                        reason: "injected failure before hidden state replacement commit".to_string(),
                     });
                 }
                 let hidden_outputs = reconstruct_compiled_outputs(
@@ -3101,15 +3104,43 @@ impl<'c> XlaDomain<'c> {
                     )
                     .into());
                 }
-                for ((guard_index, _, generation), replacement) in mutated.iter().zip(&replacements) {
-                    guards[*guard_index].validate_pending_install(*generation, replacement)?;
+                if replacement_transactions.len() != mutated.len() {
+                    return Err(ProgramError::MalformedProgram(
+                        "submitted reference replacement count does not match mutated reference count".to_string(),
+                    )
+                    .into());
                 }
-                for ((guard_index, _, generation), replacement) in mutated.iter().zip(replacements) {
-                    guards[*guard_index].install_pending_unchecked(*generation, completion.clone(), replacement);
+                let mut replacements_by_guard_index = BTreeMap::new();
+                for ((guard_index, _, _), (transaction, replacement)) in
+                    mutated.iter().zip(replacement_transactions.into_iter().zip(replacements))
+                {
+                    let previous = replacements_by_guard_index.insert(*guard_index, (transaction, replacement));
+                    if previous.is_some() {
+                        return Err(ProgramError::MalformedProgram(
+                            "mutated reference guard was claimed twice".to_string(),
+                        )
+                        .into());
+                    }
+                }
+                if replacements_by_guard_index.keys().any(|guard_index| *guard_index >= guards.len()) {
+                    return Err(ProgramError::MalformedProgram(
+                        "mutated reference guard index is out of range".to_string(),
+                    )
+                    .into());
+                }
+                let mut validated_replacements = Vec::with_capacity(mutated.len());
+                for (guard_index, guard) in guards.iter_mut().enumerate() {
+                    if let Some((transaction, replacement)) = replacements_by_guard_index.remove(&guard_index) {
+                        validated_replacements.push(transaction.validate(guard, replacement)?);
+                    }
+                }
+                debug_assert!(replacements_by_guard_index.is_empty());
+                for replacement in validated_replacements {
+                    replacement.commit();
                 }
                 Ok(())
             })();
-            if let Err(error) = installation {
+            if let Err(error) = replacement_commit {
                 let reason = error.to_string();
                 for (guard_index, _, _) in &mutated {
                     guards[*guard_index].poison(reason.clone());
@@ -3118,8 +3149,9 @@ impl<'c> XlaDomain<'c> {
                 return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
             }
             // Mutated hidden outputs are statically shaped under the current ABI, so neither buffer logical-shape
-            // queries nor runtime-extent materialization can wait for device execution during installation. Release
-            // every holder before public reconstruction, where dynamic outputs may require either wait.
+            // queries nor runtime-extent materialization can wait for device execution during replacement commit.
+            // Release every reference guard before public reconstruction, where dynamic outputs may require either
+            // wait.
             drop(guards);
 
             let public_result = (|| -> Result<_, XlaDomainError> {

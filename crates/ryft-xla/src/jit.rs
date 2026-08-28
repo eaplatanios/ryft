@@ -11,7 +11,7 @@
 //!
 //! [`jitted_statefully`] and [`compile_statefully`] expose the heterogeneous boundary used by external array
 //! references. Asynchronous stateful calls atomically publish read leases and pending mutation generations immediately
-//! after submission, install hidden final states without holding host mutexes through device execution, and return a
+//! after submission, commit hidden final states without holding host mutexes through device execution, and return a
 //! [`ReferenceExecution`] that reports completion failures. The blocking stateful surface is a thin await of that
 //! protocol.
 //!
@@ -23,11 +23,11 @@
 //!
 //! Reference lowering opens each external reference as an ordinary array input. A read-only reference has no hidden
 //! result. A mutated reference gains one hidden final-state output after the public output prefix, and the runtime
-//! installs that value atomically into the same reference after execution. The entry argument also receives a
+//! commits that value atomically into the same reference after execution. The entry argument also receives a
 //! `tf.aliasing_output`
 //! relation to the hidden result. That relation is a non-semantic may-alias hint: it permits, but never requires,
 //! backend buffer reuse, and it never promises physical in-place mutation. Reference-state inputs are themselves never
-//! donated, so each reference retains the snapshot it passed in, and correctness always comes from installing the
+//! donated, so each reference retains the snapshot it passed in, and correctness always comes from committing the
 //! returned final value. Read snapshots and retained initializers consequently remain immutable even when a backend
 //! chooses to reuse storage.
 //!
@@ -49,7 +49,7 @@
 //! call_statefully((reference, update))
 //!     -> execute(array(reference), update)
 //!     -> receive(old, hidden_final_state)
-//!     -> install hidden_final_state into reference
+//!     -> commit hidden_final_state into reference
 //!     -> return old
 //!
 //! compile_statefully_with_captures(
@@ -58,17 +58,18 @@
 //! )
 //! call_statefully(input)
 //!     -> lift reference as the leading executable input
-//!     -> install its hidden final state through the same transaction
+//!     -> commit its hidden final state through the same transaction
 //! ```
 //!
 //! Captured references use the same protocol after capture lifting and cannot also appear as public arguments. Calls
 //! that use the same mutable reference dependency-chain their generations; read-only calls publish leases and may
 //! overlap. Dropping [`ReferenceExecution`] does not cancel work. Awaiting it reports whole-invocation failure. A
-//! failure between submission handoff and hidden-state installation poisons the complete affected mutation group so
-//! later reference access cannot silently observe stale state; poisoning is terminal there because no buffer can be
-//! proven current after that boundary, and recovery requires constructing a new reference from independently trusted
-//! state. Once the hidden final states are installed the pending generations are disarmed, so a later failure—such as
-//! public-output reconstruction—surfaces as an ordinary error while the installed reference state stays valid.
+//! failure between submission handoff and hidden-state replacement commit poisons the complete affected mutation
+//! group, so later reference access cannot silently observe stale state. Poisoning is terminal there because no buffer
+//! can be proven current after that boundary, and recovery requires constructing a new reference from independently
+//! trusted state. Once the hidden final-state replacements are committed, the pending generations are disarmed, so a
+//! later failure—such as public-output reconstruction—surfaces as an ordinary error while the committed reference
+//! state stays valid.
 //!
 //! Local references—including local views and references inside supported conditions, bounded loops, scans, and
 //! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
@@ -2411,7 +2412,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_zero_public_output_waits_for_holder_installation() {
+    fn test_stateful_zero_public_output_waits_for_reference_replacement_commit() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2858,7 +2859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_call_installs_two_mutated_holders_bound_in_reverse_identity_order() {
+    fn test_stateful_call_commits_two_mutated_references_bound_in_reverse_identity_order() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2986,7 +2987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_failure_boundaries_restore_poison_or_install_holder_state() {
+    fn test_stateful_failure_boundaries_restore_poison_or_commit_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -3102,63 +3103,63 @@ mod tests {
         }
         assert_eq!(read_f32_array(&client, &post_handoff_read_only.read().unwrap()), vec![20.0]);
 
-        // Every ordinary error after publication but before the validate-all/install-all commit poisons the complete
+        // Every ordinary error after publication but before the validate-all/commit-all boundary poisons the complete
         // mutated batch with that exact error. The published read lease on a read-only peer remains valid and releases
         // normally when the submitted execution completes.
-        let pre_installation_first = reference_new(1.0);
-        let pre_installation_second = reference_new(10.0);
-        let pre_installation_read_only = reference_new(20.0);
+        let pre_commit_first = reference_new(1.0);
+        let pre_commit_second = reference_new(10.0);
+        let pre_commit_read_only = reference_new(20.0);
         let update =
             Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
                 .unwrap();
-        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenInstallation);
+        XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforeHiddenReplacementCommit);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(pre_installation_first.clone()),
-                    ArrayIrValue::Reference(pre_installation_second.clone()),
-                    ArrayIrValue::Reference(pre_installation_read_only.clone()),
+                    ArrayIrValue::Reference(pre_commit_first.clone()),
+                    ArrayIrValue::Reference(pre_commit_second.clone()),
+                    ArrayIrValue::Reference(pre_commit_read_only.clone()),
                     ArrayIrValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
-                if reason == "injected failure before hidden state installation",
+                if reason == "injected failure before hidden state replacement commit",
         ));
-        for reference in [&pre_installation_first, &pre_installation_second] {
-            let Err(error) = reference.read() else { panic!("mutated holder must be poisoned before installation") };
+        for reference in [&pre_commit_first, &pre_commit_second] {
+            let Err(error) = reference.read() else { panic!("mutated reference must be poisoned before commit") };
             assert_eq!(
                 error.downcast_custom::<ReferenceError>(),
                 Some(&ReferenceError::ExecutionPoisoned {
-                    reason: "invalid compilation options: injected failure before hidden state installation"
+                    reason: "invalid compilation options: injected failure before hidden state replacement commit"
                         .to_string(),
                 }),
             );
         }
-        assert_eq!(read_f32_array(&client, &pre_installation_read_only.read().unwrap()), vec![20.0]);
+        assert_eq!(read_f32_array(&client, &pre_commit_read_only.read().unwrap()), vec![20.0]);
 
-        // A failure confined to public reconstruction occurs only after every hidden final state is installed.
-        let installed_first = reference_new(1.0);
-        let installed_second = reference_new(10.0);
-        let installed_read_only = reference_new(20.0);
+        // A failure confined to public reconstruction occurs only after every hidden final-state replacement commits.
+        let committed_first = reference_new(1.0);
+        let committed_second = reference_new(10.0);
+        let committed_read_only = reference_new(20.0);
         let update = Array::from_host_buffer(&client, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
         XlaDomain::inject_stateful_failure_for_test(StatefulFailureInjection::BeforePublicReconstruction);
         assert!(matches!(
             compiled.call_statefully(
                 &domain,
                 (
-                    ArrayIrValue::Reference(installed_first.clone()),
-                    ArrayIrValue::Reference(installed_second.clone()),
-                    ArrayIrValue::Reference(installed_read_only.clone()),
+                    ArrayIrValue::Reference(committed_first.clone()),
+                    ArrayIrValue::Reference(committed_second.clone()),
+                    ArrayIrValue::Reference(committed_read_only.clone()),
                     ArrayIrValue::Array(update),
                 ),
             ),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "injected failure before public output reconstruction",
         ));
-        assert_eq!(read_f32_array(&client, &installed_first.read().unwrap()), vec![3.0]);
-        assert_eq!(read_f32_array(&client, &installed_second.read().unwrap()), vec![12.0]);
-        assert_eq!(read_f32_array(&client, &installed_read_only.read().unwrap()), vec![20.0]);
+        assert_eq!(read_f32_array(&client, &committed_first.read().unwrap()), vec![3.0]);
+        assert_eq!(read_f32_array(&client, &committed_second.read().unwrap()), vec![12.0]);
+        assert_eq!(read_f32_array(&client, &committed_read_only.read().unwrap()), vec![20.0]);
     }
 
     #[test]

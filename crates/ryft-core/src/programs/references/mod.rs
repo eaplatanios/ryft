@@ -151,13 +151,13 @@ pub enum ReferenceError {
     #[error("reference has a conflicting transaction or execution lease")]
     TransactionInProgress,
 
+    /// A replacement transaction was applied to another allocation or no longer matches the claimed generation.
+    #[error("reference replacement transaction does not match the current reference transaction")]
+    ReplacementTransactionMismatch,
+
     /// A reference replacement was prepared for a different reference allocation.
     #[error("reference replacement belongs to a different reference allocation")]
     ReplacementHolderMismatch,
-
-    /// A pending value or completion targeted an older generation of the shared reference state.
-    #[error("reference completion targets a stale reference generation")]
-    StaleGeneration,
 
     /// The shared reference state exhausted its monotonically increasing mutation generation space.
     #[error("reference mutation generation is exhausted")]
@@ -204,7 +204,8 @@ pub use semantics::{
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
     Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceGuard, ReferenceId,
-    ReferenceObservation, ReferenceReplacement,
+    ReferenceObservation, ReferenceReplacement, ReferenceReplacementTransaction,
+    ValidatedPendingReplacementTransaction,
 };
 
 #[cfg(test)]
@@ -229,10 +230,13 @@ mod tests {
             (ReferenceError::Frozen, "reference is frozen"),
             (ReferenceError::TransactionInProgress, "reference has a conflicting transaction or execution lease"),
             (
+                ReferenceError::ReplacementTransactionMismatch,
+                "reference replacement transaction does not match the current reference transaction",
+            ),
+            (
                 ReferenceError::ReplacementHolderMismatch,
                 "reference replacement belongs to a different reference allocation",
             ),
-            (ReferenceError::StaleGeneration, "reference completion targets a stale reference generation"),
             (ReferenceError::GenerationExhausted, "reference mutation generation is exhausted"),
             (ReferenceError::Poisoned, "reference state mutex is poisoned"),
             (

@@ -717,10 +717,10 @@ enum ReferenceState<V: Value> {
 /// [`Self::next_generation`] validates the mutation before submission, while [`Self::begin_replacement`] marks the
 /// value unavailable only after submission succeeds and returns a [`ReferenceReplacementTransaction`]. The backend
 /// then prepares every [`ReferenceReplacement`] and validates every transaction. Each successful validation returns a
-/// [`ValidatedPendingReplacement`] that exclusively borrows its guard. Only after every replacement validates does the
-/// backend commit those tokens. This validate-all/commit-all split prevents a malformed multi-reference result from
-/// being committed partially. Guards for multiple references must be acquired and retained in ascending
-/// [`ReferenceId`] order throughout the commit phase.
+/// [`ValidatedPendingReplacementTransaction`] that exclusively borrows its guard. Only after every replacement
+/// validates does the backend commit those transactions. This validate-all/commit-all split prevents a malformed
+/// multi-reference result from being committed partially. Guards for multiple references must be acquired and retained
+/// in ascending [`ReferenceId`] order throughout the commit phase.
 ///
 /// A synchronous or potentially donating backend follows the shorter extraction protocol:
 ///
@@ -1022,47 +1022,42 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
     }
 }
 
-// TODO(eaplatanios): Review this block.
 /// Represents a coherent observation of a [`Reference`] value and the work that must precede its use.
 /// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
 /// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
 /// the same reference allocation, and use [`ReferenceGuard::is_current`] to verify that the observation is still valid.
 /// When [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
 pub struct ReferenceObservation<V: Value> {
-    /// Allocation from which this observation was created.
-    ///
-    /// Keeping its weak control block alive prevents a later allocation from reusing the same address while this
-    /// observation exists.
+    /// [`Reference`] allocation from which this observation was created. Keeping its weak control block alive prevents
+    /// a later allocation from reusing the same address while this observation exists.
     holder: Weak<ReferenceHolder<V>>,
 
-    /// Generation of the observed value.
+    /// [`ReferenceGeneration`] of the observed value.
     generation: ReferenceGeneration,
 
-    /// Observed value using the originating handle's type identities.
+    /// Observed [`Value`] using the originating handle's type identities.
     snapshot: V,
 
-    /// Cumulative work that must complete before the snapshot may be used.
+    /// Cumulative [`ReferenceCompletion`] that must complete before the snapshot may be used.
     dependency: Option<ReferenceCompletion>,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<V: Value> ReferenceObservation<V> {
-    /// Returns the generation of the observed value.
+    /// Returns the [`ReferenceGeneration`] of the observed value.
     #[inline]
     pub fn generation(&self) -> ReferenceGeneration {
         self.generation
     }
 
-    /// Returns the observed value using the originating reference handle's type identities.
+    /// Returns the observed [`Value`] using the originating [`Reference`] handle's type identities.
     #[inline]
     pub fn snapshot(&self) -> &V {
         &self.snapshot
     }
 
-    /// Returns the cumulative work that must complete before the observed value may be used.
-    ///
-    /// `None` means the value was already `Ready` when observed. The returned completion may already have resolved
-    /// because pending reference state is reconciled lazily.
+    /// Returns the cumulative work that must complete before the observed value may be used. [`None`] means that the
+    /// value was already `Ready` when observed. The returned completion may already have resolved because pending
+    /// reference state is reconciled lazily.
     #[inline]
     pub fn dependency(&self) -> Option<&ReferenceCompletion> {
         self.dependency.as_ref()
@@ -1249,9 +1244,9 @@ pub struct ReferenceReplacement<V: Value> {
 /// [`ReferenceGuard::begin_replacement`] creates this transaction only after backend submission succeeds and moves the
 /// reference state to `Taken`. The transaction binds the reference allocation, its newly claimed generation, and the
 /// cumulative backend completion. Calling [`Self::validate`] with a prepared [`ReferenceReplacement`] checks the
-/// allocation and state before returning a [`ValidatedPendingReplacement`]. A backend that mutates multiple references
-/// should validate every transaction before committing any returned token. Dropping this transaction does not restore
-/// the reference; the guard must instead be poisoned after any failure.
+/// allocation and state before returning a [`ValidatedPendingReplacementTransaction`]. A backend that mutates multiple
+/// references should validate every transaction before committing any returned transaction. Dropping this transaction
+/// does not restore the reference; the guard must instead be poisoned after any failure.
 #[must_use = "a submitted reference replacement must be committed or its reference must be poisoned"]
 pub struct ReferenceReplacementTransaction<V: Value> {
     /// Weak pointer identifying the [`Reference`] allocation whose value is being replaced.
@@ -1264,19 +1259,17 @@ pub struct ReferenceReplacementTransaction<V: Value> {
     completion: ReferenceCompletion,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<V: Value> ReferenceReplacementTransaction<V> {
-    /// Validates a prepared replacement against this transaction and exclusively borrows its guard for commit.
-    ///
-    /// Validation does not change the reference state. The returned [`ValidatedPendingReplacement`] owns all data
-    /// needed for an infallible commit and keeps `guard` exclusively borrowed, preventing the reference from changing
-    /// between validation and commit. Multi-reference backends can therefore collect all validation tokens before
-    /// committing any of them.
+    /// Validates a prepared [`ReferenceReplacement`] against this [`ReferenceReplacementTransaction`] and exclusively
+    /// borrows its [`ReferenceGuard`] for commit. Validation does not change the reference state. The returned
+    /// [`ValidatedPendingReplacementTransaction`] owns all data needed for an infallible commit and keeps `guard`
+    /// exclusively borrowed, preventing the reference from changing between validation and commit. Multi-reference
+    /// backends can therefore collect all validated transactions before committing any of them.
     ///
     /// # Parameters
     ///
-    ///   - `guard`: Guard for the reference allocation being replaced.
-    ///   - `replacement`: Type-checked replacement prepared through that allocation's guard.
+    ///   - `guard`: [`ReferenceGuard`] for the reference allocation being replaced.
+    ///   - `replacement`: Type-checked [`ReferenceReplacement`] prepared through that allocation's guard.
     ///
     /// # Errors
     ///
@@ -1287,7 +1280,7 @@ impl<V: Value> ReferenceReplacementTransaction<V> {
         self,
         guard: &'g mut ReferenceGuard<'r, V>,
         replacement: ReferenceReplacement<V>,
-    ) -> Result<ValidatedPendingReplacement<'g, 'r, V>, ReferenceError> {
+    ) -> Result<ValidatedPendingReplacementTransaction<'g, 'r, V>, ReferenceError> {
         if !std::ptr::eq(self.holder.as_ptr(), Arc::as_ptr(&guard.reference.handle.holder)) {
             return Err(ReferenceError::ReplacementTransactionMismatch);
         }
@@ -1303,7 +1296,7 @@ impl<V: Value> ReferenceReplacementTransaction<V> {
                 return Err(ReferenceError::TransactionInProgress);
             }
         }
-        Ok(ValidatedPendingReplacement {
+        Ok(ValidatedPendingReplacementTransaction {
             guard,
             generation: self.generation,
             value: replacement.value,
@@ -1312,35 +1305,33 @@ impl<V: Value> ReferenceReplacementTransaction<V> {
     }
 }
 
-// TODO(eaplatanios): Review this block.
-/// A fully validated pending replacement that can be committed without failure.
-///
-/// [`ReferenceReplacementTransaction::validate`] creates this token after confirming that the transaction,
-/// replacement, and exclusively borrowed guard all belong to the same allocation and claimed generation. Holding the
-/// borrow prevents that state from changing before [`Self::commit`]. A multi-reference backend can hold one token per
-/// disjoint guard, then commit them only after every validation succeeds.
+/// A fully validated [`ReferenceReplacementTransaction`] that can be committed without failure.
+/// [`ReferenceReplacementTransaction::validate`] creates [`ValidatedPendingReplacementTransaction`]s after confirming
+/// that the corresponding transactions, replacements, and exclusively borrowed guards all belong to the same allocation
+/// and claimed [`ReferenceGeneration`]. Holding the borrow prevents that state from changing before [`Self::commit`].
+/// A multi-reference backend can hold one token per disjoint guard, then commit them only after every validation
+/// succeeds.
 #[must_use = "a validated reference replacement must be committed or its reference must be poisoned"]
-pub struct ValidatedPendingReplacement<'g, 'r, V: Value> {
-    /// Exclusively borrowed guard whose `Taken` state was validated.
+pub struct ValidatedPendingReplacementTransaction<'g, 'r, V: Value> {
+    /// Exclusively borrowed [`ReferenceGuard`] whose `Taken` state was validated.
     guard: &'g mut ReferenceGuard<'r, V>,
 
-    /// Generation claimed for the submitted mutation.
+    /// [`ReferenceGeneration`] claimed for the submitted mutation.
     generation: ReferenceGeneration,
 
-    /// Replacement value using the allocation's canonical type identities.
+    /// Replacement [`Value`] using the allocation's canonical type identities.
     value: V,
 
-    /// Cumulative completion of the submitted mutation and its predecessor dependencies.
+    /// Cumulative [`ReferenceCompletion`] of the submitted mutation and its predecessor dependencies.
     completion: ReferenceCompletion,
 }
 
-// TODO(eaplatanios): Review this block.
-impl<V: Value> ValidatedPendingReplacement<'_, '_, V> {
-    /// Commits the validated replacement and moves its reference from `Taken` to `Pending`.
-    ///
-    /// This function is infallible because validation already established every precondition while acquiring the
-    /// exclusive guard borrow. The pending completion eventually makes the replacement `Ready` or poisons the
+impl<V: Value> ValidatedPendingReplacementTransaction<'_, '_, V> {
+    /// Commits this [`ValidatedPendingReplacementTransaction`] and moves its [`Reference`]'s state from `Taken` to
+    /// `Pending`. This function is infallible because validation already established every precondition while acquiring
+    /// the exclusive guard borrow. The pending completion eventually makes the replacement `Ready` or poisons the
     /// reference if backend execution fails.
+    #[inline]
     pub fn commit(self) {
         let Self { guard, generation, value, completion } = self;
         *guard.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
