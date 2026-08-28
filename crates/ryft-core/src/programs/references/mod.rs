@@ -193,9 +193,10 @@ pub use semantics::{
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
-    PreparedReferenceReplacement, ReadyReferenceGuard, Reference, ReferenceCompletion, ReferenceCompletionBackend,
-    ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceObservation, ReferenceReplacementPreparation,
-    ReferenceReplacementTransaction, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
+    PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceCompletion,
+    ReferenceCompletionBackend, ReferenceGeneration, ReferenceId, ReferenceObservation,
+    ReferenceReplacementPreparation, ReferenceReplacementTransaction, TakenReferenceGuard,
+    ValidatedPendingReplacementTransaction,
 };
 
 #[cfg(test)]

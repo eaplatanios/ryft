@@ -16,7 +16,7 @@ use crate::arrays::types::dimensions::{Dimension, Shape};
 use crate::operations::{Add, Reshape, Slice, UpdateSlice};
 use crate::parameters::Parameter;
 use crate::programs::{
-    ProgramError, Reference, ReferenceError, ReferenceGuard, ReferenceId, ReferenceType, Type, TypeError,
+    ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceError, ReferenceId, ReferenceType, Type, TypeError,
     TypeIdentityRenaming, Typed, Value,
 };
 
@@ -507,7 +507,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
 
     /// Locks an unrenamed root for one backend-owned state transaction.
     #[doc(hidden)]
-    pub fn lock_root(&self) -> Result<ReferenceGuard<'_, A>, ProgramError> {
+    pub fn lock_root(&self) -> Result<ReadyOrPendingReferenceGuard<'_, A>, ProgramError> {
         if !self.is_runtime_root_handle() {
             return Err(ProgramError::custom(ArrayReferenceViewError::InvalidRuntimeRoot));
         }

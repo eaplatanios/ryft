@@ -18,8 +18,8 @@ use ryft_core::{
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
     DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, InterpretableOperation,
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
-    Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceGuard,
+    Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReadyOrPendingReferenceGuard,
+    ReductionKind, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution,
     ReferenceId, ReferenceReplacementPreparation, ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape,
     Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
     Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
@@ -2789,7 +2789,7 @@ impl<'c> XlaDomain<'c> {
     /// Locks one stateful reference while preserving reference lifecycle errors as [`XlaDomainError::Reference`].
     fn lock_stateful_reference<'g>(
         reference: &'g ArrayReference<Array<'c>>,
-    ) -> Result<ReferenceGuard<'g, Array<'c>>, XlaDomainError> {
+    ) -> Result<ReadyOrPendingReferenceGuard<'g, Array<'c>>, XlaDomainError> {
         reference.lock_root().map_err(|error| {
             if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
                 XlaDomainError::Reference(reference_error)
@@ -2943,8 +2943,9 @@ impl<'c> XlaDomain<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
-                let observations = guards.iter().map(ReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
+                let observations =
+                    guards.iter().map(ReadyOrPendingReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
                 for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
@@ -2975,7 +2976,7 @@ impl<'c> XlaDomain<'c> {
                 let guards = bindings
                     .iter()
                     .map(|(_, reference)| Self::lock_stateful_reference(reference))
-                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
+                    .collect::<Result<Vec<ReadyOrPendingReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
                 if !guards.iter().zip(&observations).all(|(guard, observation)| observation.is_current(guard)) {
                     continue;
                 }

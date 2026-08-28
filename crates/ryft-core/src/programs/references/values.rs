@@ -279,8 +279,8 @@ impl<V: Value> Reference<V> {
 
     /// Acquires this [`Reference`]'s observable lifecycle state for backend-managed access. This function returns as
     /// soon as the state mutex is acquired and deliberately does not await a `Pending` value or active read leases.
-    /// The returned [`ReferenceGuard`] always protects `Ready` or `Pending` state and can observe the current snapshot,
-    /// publish a submitted read, or begin one of the typed replacement protocols.
+    /// The returned [`ReadyOrPendingReferenceGuard`] always protects `Ready` or `Pending` state and can observe the
+    /// current snapshot, publish a submitted read, or begin one of the typed replacement protocols.
     ///
     /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
     /// [`update`](Self::update), or [`freeze`](Self::freeze), which reconcile pending work before accessing the value.
@@ -295,11 +295,11 @@ impl<V: Value> Reference<V> {
     /// after a replacement obligation or backend execution fails, or [`ReferenceError::Poisoned`] after unexpected
     /// mutex poisoning.
     #[inline]
-    pub fn lock(&self) -> Result<ReferenceGuard<'_, V>, ReferenceError> {
+    pub fn lock(&self) -> Result<ReadyOrPendingReferenceGuard<'_, V>, ReferenceError> {
         let state = self.lock_holder_state()?;
         match &*state {
             ReferenceState::Ready { .. } | ReferenceState::Pending { .. } => {
-                Ok(ReferenceGuard { core: ReferenceGuardCore { reference: self, state } })
+                Ok(ReadyOrPendingReferenceGuard { guard: ReferenceGuard { reference: self, state } })
             }
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
@@ -317,9 +317,9 @@ impl<V: Value> Reference<V> {
     /// the mutex.
     ///
     /// Unlike [`lock`](Self::lock), this function is the private ordinary-access path: it hides pending-state
-    /// reconciliation and returns a raw guard proven to contain `Ready`. It does not return [`ReferenceGuard`] because
-    /// ordinary reads and mutations do not expose `Pending` state or use the `Taken` state and its guard-drop poisoning
-    /// rule.
+    /// reconciliation and returns a raw guard proven to contain `Ready`. It does not return
+    /// [`ReadyOrPendingReferenceGuard`] because ordinary reads and mutations do not expose `Pending` state or use the
+    /// `Taken` state and its guard-drop poisoning rule.
     ///
     /// # Parameters
     ///
@@ -724,7 +724,7 @@ enum ReferenceState<V: Value> {
 ///   preparation -->|no| prepared["PreparedReferenceReplacement"]
 ///   prepared -->|submission succeeds; begin| transaction["ReferenceReplacementTransaction (Taken)"]
 ///   transaction -->|validate| validated["ValidatedPendingReplacementTransaction"]
-///   validated -->|commit| pending["ReferenceGuard (Pending)"]
+///   validated -->|commit| pending["ReadyOrPendingReferenceGuard (Pending)"]
 ///   pending -->|completion succeeds| ready["Ready"]
 ///   pending -->|completion fails| poisoned["Poisoned"]
 ///   transaction -->|poison or drop| poisoned
@@ -742,7 +742,7 @@ enum ReferenceState<V: Value> {
 ///
 /// ```mermaid
 /// flowchart LR
-///   observable["ReferenceGuard"] -->|wait_until_ready| ready["ReadyReferenceGuard (Ready)"]
+///   observable["ReadyOrPendingReferenceGuard"] -->|wait_until_ready| ready["ReadyReferenceGuard (Ready)"]
 ///   ready -->|take| taken["TakenReferenceGuard (Taken)"]
 ///   taken -->|replace| ready
 ///   taken -->|poison or drop| poisoned["Poisoned"]
@@ -753,13 +753,13 @@ enum ReferenceState<V: Value> {
 /// resolve the resulting `Taken` state. Dropping that [`TakenReferenceGuard`] poisons the reference because the previous
 /// value is no longer available and may already have been consumed by backend work.
 #[cfg_attr(doc, aquamarine::aquamarine)]
-pub struct ReferenceGuard<'g, V: Value> {
+pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
     /// Locked observable reference state.
-    core: ReferenceGuardCore<'g, V>,
+    guard: ReferenceGuard<'g, V>,
 }
 
 // TODO(eaplatanios): Review this block.
-impl<'g, V: Value> ReferenceGuard<'g, V> {
+impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
     // Observation and retry coordination.
 
     /// Observes the reference's value, generation, and pending dependency without waiting for backend work.
@@ -774,20 +774,20 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
     ///
     /// Returns [`ReferenceError::ValueReconstruction`] if identity conversion fails.
     pub fn observe(&self) -> Result<ReferenceObservation<V>, ReferenceError> {
-        let (value, generation, dependency) = match &*self.core.state {
+        let (value, generation, dependency) = match &*self.guard.state {
             ReferenceState::Ready { value, generation, .. } => (value, *generation, None),
             ReferenceState::Pending { value, generation, completion, .. } => {
                 (value, *generation, Some(completion.clone()))
             }
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReferenceGuard` protects only observable reference state")
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         };
         let snapshot = value
-            .rename_type_identities(&self.core.reference.handle.storage_to_handle)
+            .rename_type_identities(&self.guard.reference.handle.storage_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
         Ok(ReferenceObservation {
-            holder: Arc::downgrade(&self.core.reference.handle.holder),
+            holder: Arc::downgrade(&self.guard.reference.handle.holder),
             generation,
             snapshot,
             dependency,
@@ -799,10 +799,10 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
     /// Both successful and failed completed leases are removed because neither can still access the value. The returned
     /// tokens can be awaited before restarting an asynchronous mutation attempt.
     fn active_read_leases(&mut self) -> Vec<ReferenceCompletion> {
-        let read_leases = match &mut *self.core.state {
+        let read_leases = match &mut *self.guard.state {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => read_leases,
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReferenceGuard` protects only observable reference state")
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         };
         // A terminal failure matters to the invocation that submitted the lease, but it no longer pins this reference's
@@ -825,7 +825,7 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
     ///
     ///   - `lease`: Completion token for the submitted read-only execution.
     pub fn publish_read_lease(&mut self, lease: ReferenceCompletion) {
-        match &mut *self.core.state {
+        match &mut *self.guard.state {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => {
                 // Publication is the only lifecycle update guaranteed for a read-only reference. Pruning here keeps
                 // completed executions from accumulating when no mutation path runs.
@@ -833,7 +833,7 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
                 read_leases.push(lease);
             }
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReferenceGuard` protects only observable reference state")
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         }
     }
@@ -856,12 +856,12 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
         if !read_leases.is_empty() {
             return Ok(ReferenceReplacementPreparation::Waiting(read_leases));
         }
-        let generation = match &*self.core.state {
+        let generation = match &*self.guard.state {
             ReferenceState::Ready { generation, .. } | ReferenceState::Pending { generation, .. } => {
                 generation.next().ok_or(ReferenceError::GenerationExhausted)?
             }
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReferenceGuard` protects only observable reference state")
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         };
         Ok(ReferenceReplacementPreparation::Prepared(PreparedReferenceReplacement { guard: self, generation }))
@@ -879,32 +879,22 @@ impl<'g, V: Value> ReferenceGuard<'g, V> {
     ///
     /// Returns the applicable terminal lifecycle error, unexpected mutex poisoning, or a failed pending completion.
     pub fn wait_until_ready(self) -> Result<ReadyReferenceGuard<'g, V>, ReferenceError> {
-        let reference = self.core.reference;
+        let reference = self.guard.reference;
         drop(self);
         let state = reference.lock_ready_state(true)?;
-        Ok(ReadyReferenceGuard { core: ReferenceGuardCore { reference, state } })
+        Ok(ReadyReferenceGuard { guard: ReferenceGuard { reference, state } })
     }
-}
-
-// TODO(eaplatanios): Review this block.
-/// Common locked storage owned by each reference-guard typestate.
-struct ReferenceGuardCore<'g, V: Value> {
-    /// Handle that supplies this guard's alias-local type conversions.
-    reference: &'g Reference<V>,
-
-    /// Locked state of the shared reference allocation.
-    state: MutexGuard<'g, ReferenceState<V>>,
 }
 
 // TODO(eaplatanios): Review this block.
 /// Exclusive access to a [`Reference`] whose value is `Ready` and has no active read leases.
 ///
-/// [`ReferenceGuard::wait_until_ready`] creates this guard after awaiting all work that could prevent safe synchronous
-/// extraction. Its only state-changing function is [`Self::take`], which removes the value and returns the owning
-/// [`TakenReferenceGuard`] that must replace or poison it.
+/// [`ReadyOrPendingReferenceGuard::wait_until_ready`] creates this guard after awaiting all work that could prevent safe
+/// synchronous extraction. Its only state-changing function is [`Self::take`], which removes the value and returns the
+/// owning [`TakenReferenceGuard`] that must replace or poison it.
 pub struct ReadyReferenceGuard<'g, V: Value> {
     /// Locked ready reference state.
-    core: ReferenceGuardCore<'g, V>,
+    guard: ReferenceGuard<'g, V>,
 }
 
 // TODO(eaplatanios): Review this block.
@@ -920,10 +910,10 @@ impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
     /// Returns [`ReferenceError::ValueReconstruction`] if identity conversion fails or
     /// [`ReferenceError::GenerationExhausted`] when the current generation has no successor.
     pub fn take(mut self) -> Result<(V, TakenReferenceGuard<'g, V>), ReferenceError> {
-        let (value, generation) = match &*self.core.state {
+        let (value, generation) = match &*self.guard.state {
             ReferenceState::Ready { value, generation, .. } => {
                 let value = value
-                    .rename_type_identities(&self.core.reference.handle.storage_to_handle)
+                    .rename_type_identities(&self.guard.reference.handle.storage_to_handle)
                     .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
                 let generation = generation.next().ok_or(ReferenceError::GenerationExhausted)?;
                 (value, generation)
@@ -933,8 +923,8 @@ impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
             | ReferenceState::Poisoned(_)
             | ReferenceState::Frozen => unreachable!("`ReadyReferenceGuard` protects only ready reference state"),
         };
-        *self.core.state = ReferenceState::Taken { generation };
-        Ok((value, TakenReferenceGuard { core: Some(self.core) }))
+        *self.guard.state = ReferenceState::Taken { generation };
+        Ok((value, TakenReferenceGuard { guard: Some(self.guard) }))
     }
 }
 
@@ -948,7 +938,7 @@ impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
 #[must_use = "a taken reference must be replaced or poisoned"]
 pub struct TakenReferenceGuard<'g, V: Value> {
     /// Locked taken reference state. [`None`] only while an owning transition consumes this guard.
-    core: Option<ReferenceGuardCore<'g, V>>,
+    guard: Option<ReferenceGuard<'g, V>>,
 }
 
 // TODO(eaplatanios): Review this block.
@@ -968,23 +958,23 @@ impl<'g, V: Value> TakenReferenceGuard<'g, V> {
     /// Returns [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type or
     /// [`ReferenceError::ValueReconstruction`] if identity conversion fails.
     pub fn replace(mut self, replacement: V) -> Result<ReadyReferenceGuard<'g, V>, ReferenceError> {
-        let core = self.core.as_mut().unwrap();
-        let replacement = match core.reference.prepare_replacement(replacement) {
+        let guard = self.guard.as_mut().unwrap();
+        let replacement = match guard.reference.prepare_replacement(replacement) {
             Ok(replacement) => replacement,
             Err(error) => {
-                *core.state = ReferenceState::Poisoned(error.to_string().into());
+                *guard.state = ReferenceState::Poisoned(error.to_string().into());
                 return Err(error);
             }
         };
-        let generation = match *core.state {
+        let generation = match *guard.state {
             ReferenceState::Taken { generation } => generation,
             ReferenceState::Ready { .. }
             | ReferenceState::Pending { .. }
             | ReferenceState::Poisoned(_)
             | ReferenceState::Frozen => unreachable!("`TakenReferenceGuard` protects only taken reference state"),
         };
-        *core.state = ReferenceState::Ready { value: replacement, generation, read_leases: Vec::new() };
-        Ok(ReadyReferenceGuard { core: self.core.take().unwrap() })
+        *guard.state = ReferenceState::Ready { value: replacement, generation, read_leases: Vec::new() };
+        Ok(ReadyReferenceGuard { guard: self.guard.take().unwrap() })
     }
 
     /// Permanently poisons the taken reference because no valid replacement can be provided.
@@ -994,24 +984,24 @@ impl<'g, V: Value> TakenReferenceGuard<'g, V> {
     ///   - `reason`: Failure description reported by later attempts to access the reference.
     #[inline]
     pub fn poison<R: Into<Arc<str>>>(mut self, reason: R) {
-        let core = self.core.as_mut().unwrap();
-        debug_assert!(matches!(*core.state, ReferenceState::Taken { .. }));
-        *core.state = ReferenceState::Poisoned(reason.into());
+        let guard = self.guard.as_mut().unwrap();
+        debug_assert!(matches!(*guard.state, ReferenceState::Taken { .. }));
+        *guard.state = ReferenceState::Poisoned(reason.into());
     }
 
     /// Stores an asynchronous replacement and changes the reference from `Taken` to `Pending`.
     #[inline]
-    fn commit_pending(mut self, value: V, completion: ReferenceCompletion) -> ReferenceGuard<'g, V> {
-        let core = self.core.as_mut().unwrap();
-        let generation = match *core.state {
+    fn commit_pending(mut self, value: V, completion: ReferenceCompletion) -> ReadyOrPendingReferenceGuard<'g, V> {
+        let guard = self.guard.as_mut().unwrap();
+        let generation = match *guard.state {
             ReferenceState::Taken { generation } => generation,
             ReferenceState::Ready { .. }
             | ReferenceState::Pending { .. }
             | ReferenceState::Poisoned(_)
             | ReferenceState::Frozen => unreachable!("`TakenReferenceGuard` protects only taken reference state"),
         };
-        *core.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
-        ReferenceGuard { core: self.core.take().unwrap() }
+        *guard.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
+        ReadyOrPendingReferenceGuard { guard: self.guard.take().unwrap() }
     }
 }
 
@@ -1019,26 +1009,36 @@ impl<'g, V: Value> TakenReferenceGuard<'g, V> {
 impl<V: Value> Drop for TakenReferenceGuard<'_, V> {
     #[inline]
     fn drop(&mut self) {
-        let Some(core) = &mut self.core else {
+        let Some(guard) = &mut self.guard else {
             return;
         };
-        if matches!(*core.state, ReferenceState::Taken { .. }) {
+        if matches!(*guard.state, ReferenceState::Taken { .. }) {
             // No value remains in `Taken`, and the previous value may already have been consumed by irreversible
             // backend work. Make an abandoned replacement obligation a permanent, explicit failure.
-            *core.state = ReferenceState::Poisoned("stateful transaction ended without restoring state".into());
+            *guard.state = ReferenceState::Poisoned("stateful transaction ended without restoring state".into());
         }
     }
 }
 
 // TODO(eaplatanios): Review this block.
+/// Common locked storage owned by each reference-guard typestate.
+struct ReferenceGuard<'g, V: Value> {
+    /// Handle that supplies this guard's alias-local type conversions.
+    reference: &'g Reference<V>,
+
+    /// Locked state of the shared reference allocation.
+    state: MutexGuard<'g, ReferenceState<V>>,
+}
+
+// TODO(eaplatanios): Review this block.
 /// Outcome of preparing an observable [`Reference`] for asynchronous replacement.
 ///
-/// Preparation consumes the original [`ReferenceGuard`]. It either returns a locked
+/// Preparation consumes the original [`ReadyOrPendingReferenceGuard`]. It either returns a locked
 /// [`PreparedReferenceReplacement`] or releases the lock and returns the read completions that must be awaited before
 /// restarting the complete observation-and-preparation attempt.
-pub enum ReferenceReplacementPreparation<'a, V: Value> {
+pub enum ReferenceReplacementPreparation<'g, V: Value> {
     /// Every prerequisite is satisfied and the guard may remain locked through backend submission.
-    Prepared(PreparedReferenceReplacement<'a, V>),
+    Prepared(PreparedReferenceReplacement<'g, V>),
 
     /// Submitted reads may still be using the observed value. The guard has been released, and the caller should wait
     /// for these completions before reacquiring the reference and retrying the complete observation attempt.
@@ -1052,16 +1052,16 @@ pub enum ReferenceReplacementPreparation<'a, V: Value> {
 /// Dropping it simply releases the unchanged observable state. After backend submission succeeds, call [`Self::begin`]
 /// to make the value unavailable and create the owning [`ReferenceReplacementTransaction`].
 #[must_use = "a prepared reference replacement must be submitted or released"]
-pub struct PreparedReferenceReplacement<'a, V: Value> {
+pub struct PreparedReferenceReplacement<'g, V: Value> {
     /// Guard retained across the backend submission boundary.
-    guard: ReferenceGuard<'a, V>,
+    guard: ReadyOrPendingReferenceGuard<'g, V>,
 
     /// Generation assigned if submission succeeds.
     generation: ReferenceGeneration,
 }
 
 // TODO(eaplatanios): Review this block.
-impl<'a, V: Value> PreparedReferenceReplacement<'a, V> {
+impl<'g, V: Value> PreparedReferenceReplacement<'g, V> {
     /// Records successful backend submission, changes the reference to `Taken`, and returns the transaction that must
     /// provide its replacement.
     ///
@@ -1072,17 +1072,17 @@ impl<'a, V: Value> PreparedReferenceReplacement<'a, V> {
     /// # Parameters
     ///
     ///   - `completion`: Cumulative completion of the submitted mutation and all predecessor dependencies.
-    pub fn begin(mut self, completion: ReferenceCompletion) -> ReferenceReplacementTransaction<'a, V> {
-        *self.guard.core.state = ReferenceState::Taken { generation: self.generation };
-        ReferenceReplacementTransaction { taken: TakenReferenceGuard { core: Some(self.guard.core) }, completion }
+    pub fn begin(mut self, completion: ReferenceCompletion) -> ReferenceReplacementTransaction<'g, V> {
+        *self.guard.guard.state = ReferenceState::Taken { generation: self.generation };
+        ReferenceReplacementTransaction { taken: TakenReferenceGuard { guard: Some(self.guard.guard) }, completion }
     }
 }
 
 /// Represents a coherent observation of a [`Reference`] value and the work that must precede its use.
-/// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
-/// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
-/// the same reference allocation, and use [`Self::is_current`] to verify that the observation is still valid. When
-/// [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
+/// [`ReadyOrPendingReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its
+/// optional [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any
+/// handle for the same reference allocation, and use [`Self::is_current`] to verify that the observation is still
+/// valid. When [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
 pub struct ReferenceObservation<V: Value> {
     /// [`Reference`] allocation from which this observation was created. Keeping its weak control block alive prevents
     /// a later allocation from reusing the same address while this observation exists.
@@ -1130,14 +1130,14 @@ impl<V: Value> ReferenceObservation<V> {
     ///
     ///   - `guard`: Guard protecting the reference state against which this observation is checked.
     #[inline]
-    pub fn is_current(&self, guard: &ReferenceGuard<'_, V>) -> bool {
-        match &*guard.core.state {
+    pub fn is_current(&self, guard: &ReadyOrPendingReferenceGuard<'_, V>) -> bool {
+        match &*guard.guard.state {
             ReferenceState::Ready { generation, .. } | ReferenceState::Pending { generation, .. } => {
-                std::ptr::eq(self.holder.as_ptr(), Arc::as_ptr(&guard.core.reference.handle.holder))
+                std::ptr::eq(self.holder.as_ptr(), Arc::as_ptr(&guard.guard.reference.handle.holder))
                     && *generation == self.generation
             }
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReferenceGuard` protects only observable reference state")
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         }
     }
@@ -1311,15 +1311,15 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
 /// generation. It must be validated and committed or explicitly poisoned; dropping it poisons the reference through
 /// its owned [`TakenReferenceGuard`].
 #[must_use = "a submitted reference replacement must be committed or its reference must be poisoned"]
-pub struct ReferenceReplacementTransaction<'a, V: Value> {
+pub struct ReferenceReplacementTransaction<'g, V: Value> {
     /// Exclusive ownership of the reference's `Taken` state.
-    taken: TakenReferenceGuard<'a, V>,
+    taken: TakenReferenceGuard<'g, V>,
 
     /// Cumulative [`ReferenceCompletion`] of the submitted mutation and its predecessor dependencies.
     completion: ReferenceCompletion,
 }
 
-impl<'a, V: Value> ReferenceReplacementTransaction<'a, V> {
+impl<'g, V: Value> ReferenceReplacementTransaction<'g, V> {
     /// Validates and converts the reconstructed replacement without changing the reference's `Taken` state.
     ///
     /// This function consumes the submitted transaction. Success returns an owning
@@ -1335,8 +1335,8 @@ impl<'a, V: Value> ReferenceReplacementTransaction<'a, V> {
     ///
     /// Returns [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type or
     /// [`ReferenceError::ValueReconstruction`] if identity conversion fails.
-    pub fn validate(self, replacement: V) -> Result<ValidatedPendingReplacementTransaction<'a, V>, ReferenceError> {
-        let replacement = match self.taken.core.as_ref().unwrap().reference.prepare_replacement(replacement) {
+    pub fn validate(self, replacement: V) -> Result<ValidatedPendingReplacementTransaction<'g, V>, ReferenceError> {
+        let replacement = match self.taken.guard.as_ref().unwrap().reference.prepare_replacement(replacement) {
             Ok(replacement) => replacement,
             Err(error) => {
                 self.taken.poison(error.to_string());
@@ -1366,9 +1366,9 @@ impl<'a, V: Value> ReferenceReplacementTransaction<'a, V> {
 /// replacement while retaining exclusive ownership of its `Taken` reference guard. A multi-reference backend can keep
 /// one validated transaction per reference, then commit them only after every replacement validates successfully.
 #[must_use = "a validated reference replacement must be committed or its reference must be poisoned"]
-pub struct ValidatedPendingReplacementTransaction<'a, V: Value> {
+pub struct ValidatedPendingReplacementTransaction<'g, V: Value> {
     /// Exclusive ownership of the reference's validated `Taken` state.
-    taken: TakenReferenceGuard<'a, V>,
+    taken: TakenReferenceGuard<'g, V>,
 
     /// Replacement [`Value`] using the allocation's canonical type identities.
     value: V,
@@ -1377,13 +1377,13 @@ pub struct ValidatedPendingReplacementTransaction<'a, V: Value> {
     completion: ReferenceCompletion,
 }
 
-impl<'a, V: Value> ValidatedPendingReplacementTransaction<'a, V> {
+impl<'g, V: Value> ValidatedPendingReplacementTransaction<'g, V> {
     /// Stores the validated replacement and changes its [`Reference`] state from `Taken` to `Pending`. This function is
     /// infallible because validation established every precondition while retaining the exact taken guard.
     /// After the stored completion resolves, ordinary reference access reconciles `Pending` to `Ready` on success or
     /// `Poisoned` on backend failure.
     #[inline]
-    pub fn commit(self) -> ReferenceGuard<'a, V> {
+    pub fn commit(self) -> ReadyOrPendingReferenceGuard<'g, V> {
         let Self { taken, value, completion } = self;
         taken.commit_pending(value, completion)
     }
@@ -1424,11 +1424,11 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     // Simulates the successful-submission and replacement-commit phases used by asynchronous backend tests.
-    fn transition_to_pending<'a, V: Value>(
-        guard: ReferenceGuard<'a, V>,
+    fn transition_to_pending<'g, V: Value>(
+        guard: ReadyOrPendingReferenceGuard<'g, V>,
         completion: ReferenceCompletion,
         replacement: V,
-    ) -> Result<(ReferenceGuard<'a, V>, ReferenceGeneration), ReferenceError> {
+    ) -> Result<(ReadyOrPendingReferenceGuard<'g, V>, ReferenceGeneration), ReferenceError> {
         let prepared = match guard.prepare_replacement()? {
             ReferenceReplacementPreparation::Prepared(prepared) => prepared,
             ReferenceReplacementPreparation::Waiting(_) => {
@@ -1963,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_drop_during_submitted_mutation_unwind_poisons_reference() {
+    fn test_reference_replacement_transaction_drop_during_unwind_poisons_reference() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -1985,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_prepare_replacement_prunes_terminal_read_leases() {
+    fn test_ready_or_pending_reference_guard_prepare_replacement_prunes_terminal_read_leases() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
         guard.publish_read_lease(ReferenceCompletion::ready(Ok(())));
@@ -2164,7 +2164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_prepare_replacement_returns_active_read_leases() {
+    fn test_ready_or_pending_reference_guard_prepare_replacement_returns_active_read_leases() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
@@ -2188,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_poison_affects_only_the_taken_reference() {
+    fn test_taken_reference_guard_poison_affects_only_the_taken_reference() {
         let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
         let first_guard = first.lock().unwrap().wait_until_ready().unwrap();
@@ -2204,7 +2204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_read_lease_publication_releases_terminal_leases() {
+    fn test_ready_or_pending_reference_guard_read_lease_publication_releases_terminal_leases() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
@@ -2241,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_drop_after_take_poisons_reference() {
+    fn test_taken_reference_guard_drop_poisons_reference() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (value, taken) = ready.take().unwrap();
