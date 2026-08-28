@@ -53,7 +53,7 @@ pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
     type Alias: Clone + Debug + Parameter;
 
     /// Returns the identity alias of an unviewed root with the provided referent type, which is the alias that
-    /// allocation and entry-boundary binding install on a fresh root handle.
+    /// allocation and entry-boundary binding assign to a fresh root handle.
     ///
     /// This is infallible by design. Validating a referent type is type inference's job, and deriving the identity
     /// alias of an already-valid referent is total.

@@ -626,7 +626,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Errors
     ///
-    /// Propagates the underlying state installation's liveness and type failures.
+    /// Propagates the underlying state replacement's liveness and type failures.
     pub fn merge_boundary_state(
         &self,
         summary: &ReferenceRegionSummary,

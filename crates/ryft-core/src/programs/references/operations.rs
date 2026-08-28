@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn test_reference_write_operation_reference_discharge() {
-        // A policy with no accumulation capability installs successor state through `write`, produces no old-value
+        // A policy with no accumulation capability replaces state through `write`, produces no old-value
         // result, and marks the root mutated. Its `replace` path is an error, making accidental swap dispatch visible.
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
@@ -2095,7 +2095,7 @@ mod tests {
 
     #[test]
     fn test_reference_swap_operation_reference_discharge() {
-        // A replacement returns the previous state and installs the successor, which marks the root mutated.
+        // A replacement returns the previous state and commits the successor, which marks the root mutated.
         let (context, reference) = allocated_root(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
@@ -2122,7 +2122,7 @@ mod tests {
 
     #[test]
     fn test_reference_add_update_operation_reference_discharge() {
-        // An accumulation produces no result and installs the sum of the current state and the update.
+        // An accumulation produces no result and replaces the current state with its sum with the update.
         let (context, reference) = allocated_root(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),

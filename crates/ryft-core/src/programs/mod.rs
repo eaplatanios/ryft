@@ -159,11 +159,10 @@ pub use references::{
     ReferenceGuard, ReferenceId, ReferenceInput, ReferenceNew, ReferenceNewOperation, ReferenceObservation,
     ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
     ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionStateInsertion,
-    ReferenceRegionSummary, ReferenceReplacement, ReferenceReplacementTransaction, ReferenceRootHandle,
-    ReferenceSource, ReferenceStateBinding, ReferenceStateWidening, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceType, ReferenceTypeRefinements, ReferenceWrite, ReferenceWriteOperation,
-    ValidatedPendingReplacementTransaction, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation,
+    ReferenceRegionSummary, ReferenceReplacementTransaction, ReferenceRootHandle, ReferenceSource,
+    ReferenceStateBinding, ReferenceStateWidening, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
+    ReferenceTypeRefinements, ReferenceWrite, ReferenceWriteOperation, ValidatedPendingReplacementTransaction,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,

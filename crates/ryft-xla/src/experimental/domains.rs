@@ -3091,11 +3091,10 @@ impl<'c> XlaDomain<'c> {
                     .collect::<BTreeMap<_, _>>();
                 let replacements = mutated
                     .iter()
-                    .map(|(guard_index, logical_output_index, _)| {
-                        let value = hidden_outputs.remove(logical_output_index).ok_or_else(|| {
+                    .map(|(_, logical_output_index, _)| {
+                        hidden_outputs.remove(logical_output_index).ok_or_else(|| {
                             ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
-                        })?;
-                        guards[*guard_index].prepare_replacement(value).map_err(ProgramError::custom)
+                        })
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 if !hidden_outputs.is_empty() {

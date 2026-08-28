@@ -155,10 +155,6 @@ pub enum ReferenceError {
     #[error("reference replacement transaction does not match the current reference transaction")]
     ReplacementTransactionMismatch,
 
-    /// A reference replacement was prepared for a different reference allocation.
-    #[error("reference replacement belongs to a different reference allocation")]
-    ReplacementHolderMismatch,
-
     /// The shared reference state exhausted its monotonically increasing mutation generation space.
     #[error("reference mutation generation is exhausted")]
     GenerationExhausted,
@@ -204,8 +200,7 @@ pub use semantics::{
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
     Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceGuard, ReferenceId,
-    ReferenceObservation, ReferenceReplacement, ReferenceReplacementTransaction,
-    ValidatedPendingReplacementTransaction,
+    ReferenceObservation, ReferenceReplacementTransaction, ValidatedPendingReplacementTransaction,
 };
 
 #[cfg(test)]
@@ -232,10 +227,6 @@ mod tests {
             (
                 ReferenceError::ReplacementTransactionMismatch,
                 "reference replacement transaction does not match the current reference transaction",
-            ),
-            (
-                ReferenceError::ReplacementHolderMismatch,
-                "reference replacement belongs to a different reference allocation",
             ),
             (ReferenceError::GenerationExhausted, "reference mutation generation is exhausted"),
             (ReferenceError::Poisoned, "reference state mutex is poisoned"),

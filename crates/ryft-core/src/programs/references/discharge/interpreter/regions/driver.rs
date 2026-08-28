@@ -334,7 +334,7 @@ where
         // threaded declared inputs, and every other region inherits the caller's scope mapped onto the fork roots
         // standing for its caller roots. A caller root the boundary did not thread binds nothing. Discharged capture
         // accesses and outputs enter as state, while a preserved capture-scoped output enters as its destination
-        // reference, so both states mint fork roots before the inherited scope is installed.
+        // reference, so both states mint fork roots before the inherited scope is established.
         let inherited = context.captures().with_roots(
             context
                 .captures()

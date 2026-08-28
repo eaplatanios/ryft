@@ -675,7 +675,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         })?
     }
 
-    /// Installs the immutable state of one discharged root and records that the root was mutated.
+    /// Replaces the immutable state of one discharged root and records that the root was mutated.
     ///
     /// The context's own write, replace, and accumulate services use this for the successor they just computed, and
     /// the positional rewrite uses it for the appended final-state outputs it publishes. A structured rule merges a
@@ -686,18 +686,18 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Parameters
     ///
-    ///   - `root`: Discharged root whose state is being installed.
+    ///   - `root`: Discharged root whose state is being replaced.
     ///   - `current`: Successor immutable state of the whole root.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the root is not live or was preserved rather than discharged.
     fn set_discharged_state(&self, root: ReferenceRootHandle, current: C::Value) -> Result<(), ProgramError> {
-        self.install_discharged_state(root, current, true)
+        self.replace_discharged_state(root, current, true)
     }
 
-    /// Installs the state one boundary carried back out for a discharged root, recording a mutation only when that
-    /// boundary's closure actually wrote it.
+    /// Replaces the state of one discharged root with the state carried back out of a boundary, recording a mutation
+    /// only when that boundary's closure actually wrote it.
     ///
     /// A loop-shaped boundary is symmetric: it returns a successor state for every root it carries, including roots
     /// its closure only read. The value that comes back for such a root equals the one that entered, so re-threading
@@ -720,7 +720,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         current: C::Value,
         mutated: bool,
     ) -> Result<(), ProgramError> {
-        self.install_discharged_state(root, current, mutated)
+        self.replace_discharged_state(root, current, mutated)
     }
 
     /// Returns whether any ordered write or accumulation has been applied to one discharged root.
@@ -989,8 +989,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         })
     }
 
-    /// Installs one live discharged root's successor state and merges its mutation fact.
-    fn install_discharged_state(
+    /// Replaces one live discharged root's state with its successor and merges the mutation fact.
+    fn replace_discharged_state(
         &self,
         root: ReferenceRootHandle,
         current: C::Value,
@@ -1006,7 +1006,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 Ok(())
             }
             Some(ReferenceRootState::Preserved { .. }) => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge installed state into preserved {root}",
+                "reference discharge replaced the state of preserved {root}",
             ))),
             None => Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {root}"))),
         }
@@ -1212,7 +1212,7 @@ mod tests {
         let reference = allocated.expect_reference("the allocated root").unwrap();
         let root = reference.root();
 
-        // Both state-installation paths validate before taking the mutable environment borrow, so failure preserves
+        // Both state-replacement paths validate before taking the mutable environment borrow, so failure preserves
         // the prior state and mutation bit.
         assert_eq!(context.set_discharged_state(root, wrong_state.clone()), Err(error.clone()));
         assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![1, 2])));
@@ -1271,7 +1271,7 @@ mod tests {
         );
         assert_eq!(
             context.set_discharged_state(root, ListIrValue::List(vec![0, 0])),
-            Err(ProgramError::MalformedProgram(format!("reference discharge installed state into preserved {root}"))),
+            Err(ProgramError::MalformedProgram(format!("reference discharge replaced the state of preserved {root}",))),
         );
 
         // Deriving on a preserved root hands the closure the parent handle's exact destination value, so the derived

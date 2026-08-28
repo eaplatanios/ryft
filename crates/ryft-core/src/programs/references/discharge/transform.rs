@@ -321,7 +321,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 inputs.push(carrier);
             }
 
-            // The capture scope can only be installed once the prefix has minted its roots, and it is what lets a
+            // The capture scope can only be established once the prefix has minted its roots, and it is what lets a
             // nested region resolve the caller references it names through capture constants rather than through its
             // own boundary.
             let context = context.with_captures(ReferenceCaptureScope::new(capture_index, capture_roots));

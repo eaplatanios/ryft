@@ -178,7 +178,7 @@ pub use programs::{
     ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration, ReferenceGuard, ReferenceId,
     ReferenceInput, ReferenceNew, ReferenceNewOperation, ReferenceObservation, ReferenceOperationSemantics,
     ReferenceOutput, ReferenceRead, ReferenceReadOperation, ReferenceRegionDischargeBoundary,
-    ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceReplacement,
+    ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary,
     ReferenceReplacementTransaction, ReferenceRootHandle, ReferenceSource, ReferenceStateBinding,
     ReferenceStateWidening, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements,
     ReferenceWrite, ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,

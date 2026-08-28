@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0])));
 
         // A write-only replacement of exactly the derived type preserves unaffected coordinates without returning the
-        // selected snapshot. A following swap observes that installed value and replaces it again.
+        // selected snapshot. A following swap observes that replacement value and replaces it again.
         assert_eq!(view.write(Array::vector(vec![10.0_f32, 20.0, 30.0])), Ok(()));
         assert_eq!(root.read(), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0, 4.0])));
         assert_eq!(view.swap(Array::vector(vec![40.0_f32, 50.0, 60.0])), Ok(Array::vector(vec![10.0_f32, 20.0, 30.0])));
