@@ -754,7 +754,7 @@ enum ReferenceState<V: Value> {
 /// value is no longer available and may already have been consumed by backend work.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
-    /// Locked observable reference state.
+    /// Underlying [`ReferenceGuard`].
     guard: ReferenceGuard<'g, V>,
 }
 
@@ -893,7 +893,7 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
 /// synchronous extraction. Its only state-changing function is [`Self::take`], which removes the value and returns the
 /// owning [`TakenReferenceGuard`] that must replace or poison it.
 pub struct ReadyReferenceGuard<'g, V: Value> {
-    /// Locked ready reference state.
+    /// Underlying [`ReferenceGuard`].
     guard: ReferenceGuard<'g, V>,
 }
 
@@ -937,7 +937,7 @@ impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
 /// abandonment reason so a missing replacement can never become observable as usable state.
 #[must_use = "a taken reference must be replaced or poisoned"]
 pub struct TakenReferenceGuard<'g, V: Value> {
-    /// Locked taken reference state. [`None`] only while an owning transition consumes this guard.
+    /// Underlying [`ReferenceGuard`] or [`None`] when an owning transition consumes this guard.
     guard: Option<ReferenceGuard<'g, V>>,
 }
 
@@ -1020,22 +1020,20 @@ impl<V: Value> Drop for TakenReferenceGuard<'_, V> {
     }
 }
 
-// TODO(eaplatanios): Review this block.
-/// Common locked storage owned by each reference-guard typestate.
+/// Storage owned by each reference guard typestate (i.e., [`ReadyOrPendingReferenceGuard`],
+/// [`ReadyReferenceGuard`], or [`TakenReferenceGuard`]).
 struct ReferenceGuard<'g, V: Value> {
     /// Handle that supplies this guard's alias-local type conversions.
     reference: &'g Reference<V>,
 
-    /// Locked state of the shared reference allocation.
+    /// Locked [`ReferenceState`] of the shared [`Reference`] allocation.
     state: MutexGuard<'g, ReferenceState<V>>,
 }
 
-// TODO(eaplatanios): Review this block.
-/// Outcome of preparing an observable [`Reference`] for asynchronous replacement.
-///
-/// Preparation consumes the original [`ReadyOrPendingReferenceGuard`]. It either returns a locked
-/// [`PreparedReferenceReplacement`] or releases the lock and returns the read completions that must be awaited before
-/// restarting the complete observation-and-preparation attempt.
+/// Outcome of preparing an observable [`Reference`] for asynchronous replacement. Preparation consumes the original
+/// [`ReadyOrPendingReferenceGuard`]. It either returns a locked [`PreparedReferenceReplacement`] or releases the lock
+/// and returns the read completions that must be awaited before restarting the complete observation-and-preparation
+/// attempt.
 pub enum ReferenceReplacementPreparation<'g, V: Value> {
     /// Every prerequisite is satisfied and the guard may remain locked through backend submission.
     Prepared(PreparedReferenceReplacement<'g, V>),
@@ -1045,33 +1043,29 @@ pub enum ReferenceReplacementPreparation<'g, V: Value> {
     Waiting(Vec<ReferenceCompletion>),
 }
 
-// TODO(eaplatanios): Review this block.
-/// A locked [`Reference`] that is ready to cross an asynchronous replacement's submission boundary.
-///
-/// This type proves that no active read lease can still access the current value and that a next generation exists.
-/// Dropping it simply releases the unchanged observable state. After backend submission succeeds, call [`Self::begin`]
-/// to make the value unavailable and create the owning [`ReferenceReplacementTransaction`].
+/// Locked [`Reference`] that is ready to cross an asynchronous replacement's submission boundary. This type proves that
+/// no active read lease can still access the current value and that a next [`ReferenceGeneration`] exists. Dropping it
+/// simply releases the unchanged observable state. After backend submission succeeds, call [`Self::begin`] to make the
+/// value unavailable and create the owning [`ReferenceReplacementTransaction`].
 #[must_use = "a prepared reference replacement must be submitted or released"]
 pub struct PreparedReferenceReplacement<'g, V: Value> {
-    /// Guard retained across the backend submission boundary.
+    /// [`ReadyOrPendingReferenceGuard`] retained across the backend submission boundary.
     guard: ReadyOrPendingReferenceGuard<'g, V>,
 
-    /// Generation assigned if submission succeeds.
+    /// [`ReferenceGeneration`] assigned if submission succeeds.
     generation: ReferenceGeneration,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<'g, V: Value> PreparedReferenceReplacement<'g, V> {
-    /// Records successful backend submission, changes the reference to `Taken`, and returns the transaction that must
-    /// provide its replacement.
-    ///
-    /// `completion` must include the submitted mutation and the dependency captured by the observation used to prepare
-    /// that mutation. After this function returns, dropping the transaction without committing or explicitly poisoning
-    /// it poisons the reference automatically.
+    /// Records successful backend submission, changes the underlying [`Reference`] state to `Taken`, and returns
+    /// the transaction that must provide its replacement. `completion` must include the submitted mutation and the
+    /// dependency captured by the observation used to prepare that mutation. After this function returns, dropping the
+    /// transaction without committing or explicitly poisoning it poisons the underlying reference automatically.
     ///
     /// # Parameters
     ///
-    ///   - `completion`: Cumulative completion of the submitted mutation and all predecessor dependencies.
+    ///   - `completion`: Cumulative [`ReferenceCompletion`] of the submitted mutation and all predecessor dependencies.
+    #[inline]
     pub fn begin(mut self, completion: ReferenceCompletion) -> ReferenceReplacementTransaction<'g, V> {
         *self.guard.guard.state = ReferenceState::Taken { generation: self.generation };
         ReferenceReplacementTransaction { taken: TakenReferenceGuard { guard: Some(self.guard.guard) }, completion }
