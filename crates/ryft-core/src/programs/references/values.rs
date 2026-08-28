@@ -687,14 +687,12 @@ enum ReferenceState<V: Value> {
     Frozen,
 }
 
-// TODO(eaplatanios): Review this block.
-/// Backend-facing exclusive access to a [`Reference`] in observable `Ready` or `Pending` state.
-///
-/// This guard acquires the reference mutex without waiting for pending backend work. It can capture a coherent
-/// [`ReferenceObservation`], publish a read lease, prepare an asynchronous replacement, or wait for the stricter
-/// [`ReadyReferenceGuard`] needed by synchronous extraction. Each function that creates a mandatory replacement
-/// obligation consumes this guard and returns a more specific owning type. The guard holds the mutex for its entire
-/// lifetime and cannot move to another thread.
+/// Backend-facing exclusive access to a [`Reference`] in observable `Ready` or `Pending` state. This guard acquires
+/// the reference mutex without waiting for pending backend work. It can capture a coherent [`ReferenceObservation`],
+/// publish a read lease, prepare an asynchronous replacement, or wait for the stricter [`ReadyReferenceGuard`] needed
+/// by synchronous extraction. Each function that creates a mandatory replacement obligation consumes this guard and
+/// returns a more specific owning type. The guard holds the mutex for its entire lifetime and cannot move to another
+/// thread.
 ///
 /// An asynchronous read keeps the state `Ready` or `Pending` and publishes its completion as a read lease:
 ///
@@ -731,14 +729,14 @@ enum ReferenceState<V: Value> {
 /// ```
 ///
 /// Preparation checks active readers and computes the next generation before submission, while leaving the state
-/// unchanged. [`PreparedReferenceReplacement::begin`] is called only after submission succeeds; it changes the state
+/// unchanged. [`PreparedReferenceReplacement::begin`] is called only after submission succeeds. It changes the state
 /// to `Taken` and returns a [`ReferenceReplacementTransaction`] that owns both the exact guard and the submitted
 /// completion. Successful validation returns a [`ValidatedPendingReplacementTransaction`] whose commit cannot fail. A
 /// multi-reference backend validates every replacement before committing any of them, then retains every guard returned
 /// by commit until all commits finish. This prevents another thread from observing a partially published state update.
 /// Guards for multiple references must be acquired and retained in ascending [`ReferenceId`] order.
 ///
-/// A synchronous or potentially donating backend follows the shorter extraction protocol:
+/// A synchronous or potentially donating backend follows the following shorter extraction protocol:
 ///
 /// ```mermaid
 /// flowchart LR
@@ -749,9 +747,9 @@ enum ReferenceState<V: Value> {
 /// ```
 ///
 /// [`Self::wait_until_ready`] releases this guard while waiting for a pending mutation or read leases, then returns a
-/// guard proven to protect `Ready`. [`ReadyReferenceGuard::take`] returns the value and the only typestate that can
-/// resolve the resulting `Taken` state. Dropping that [`TakenReferenceGuard`] poisons the reference because the previous
-/// value is no longer available and may already have been consumed by backend work.
+/// guard proven to protect the `Ready` state. [`ReadyReferenceGuard::take`] returns the value and the only typestate
+/// that can resolve the resulting `Taken` state. Dropping that [`TakenReferenceGuard`] poisons the reference because
+/// the previous value is no longer available and may already have been consumed by backend work.
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
     /// Underlying [`ReferenceGuard`].
