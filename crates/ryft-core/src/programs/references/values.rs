@@ -80,16 +80,16 @@ impl ReferenceGeneration {
 ///   Ready --> Frozen: freeze
 /// ```
 ///
-/// `Ready` exposes a completed immutable snapshot. `Taken` is an exclusive transaction whose [`ReferenceGuard`] retains
-/// exclusive access to the shared state while a synchronous backend prepares a replacement or an asynchronous backend
-/// reconstructs submitted hidden state. Dropping that guard before restoring or committing the replacement poisons the
-/// reference defensively. Committing an asynchronous replacement changes the state to `Pending`, where the new value
-/// remains inaccessible until its cumulative [`ReferenceCompletion`] succeeds. Generations ensure that completion of
-/// an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
+/// `Ready` exposes a completed immutable snapshot. `Taken` contains no accessible value: the value was either returned
+/// by [`ReferenceGuard::take`] or removed after an asynchronous mutation was submitted. The [`ReferenceGuard`] that
+/// made this transition keeps the shared state locked and must replace the missing value or mark the reference
+/// `Poisoned` before it is released. Committing an asynchronous replacement changes the state to `Pending`, where
+/// the new value remains inaccessible until its cumulative [`ReferenceCompletion`] succeeds. Generations ensure that
+/// completion of an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
 ///
 /// Read-only asynchronous executions do not enter a separate state. They publish completion leases on `Ready` or
-/// `Pending`. Mutating transactions wait for those leases before they may take the reference, preventing donated
-/// storage from racing a reader that still observes the current snapshot.
+/// `Pending`. A mutation waits for those leases before it may remove the value, preventing donated storage from racing
+/// a reader that still observes the current snapshot.
 ///
 /// Equality and hashing identify the mutable storage location, not this handle's structural type. Clones and
 /// identity-renamed handles into the same alias family therefore compare equal and hash identically even when their
@@ -273,18 +273,18 @@ impl<V: Value> Reference<V> {
         Ok(value)
     }
 
-    /// Acquires this [`Reference`]'s shared lifecycle state for one backend-managed transaction. This is the
-    /// backend-facing wrapper around the private raw state lock. It returns as soon as the state mutex is acquired and
-    /// deliberately does not await a `Pending` value or active read leases. The returned [`ReferenceGuard`] produces a
-    /// coherent [`ReferenceObservation`] and exposes the validated transitions a backend needs to compose, submit, and
-    /// commit stateful work while retaining exclusive access.
+    /// Acquires this [`Reference`]'s shared lifecycle state for backend-managed access. This is the backend-facing
+    /// wrapper around the private raw state lock. It returns as soon as the state mutex is acquired and deliberately
+    /// does not await a `Pending` value or active read leases. The returned [`ReferenceGuard`] can observe unresolved
+    /// state, record read-only executions, or replace the value while keeping every state transition under the same
+    /// exclusive lock.
     ///
     /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
     /// [`update`](Self::update), or [`freeze`](Self::freeze), which reconcile pending work before accessing the value.
     /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain that
-    /// order until every submitted hidden replacement has been validated and committed. A submitted mutation remains
-    /// represented by `Taken` while this guard is held, so dropping the guard before replacement commit poisons the
-    /// reference.
+    /// order until every submitted hidden replacement has been validated and committed. After a guard changes the state
+    /// to `Taken`, no value is accessible; the guard must replace that value or mark the reference `Poisoned` before it
+    /// is released.
     ///
     /// # Errors
     ///
@@ -305,8 +305,8 @@ impl<V: Value> Reference<V> {
     ///
     /// Unlike [`lock`](Self::lock), this function is the private ordinary-access path: it hides pending-state
     /// reconciliation and returns a raw guard proven to contain `Ready`. It does not return [`ReferenceGuard`] because
-    /// ordinary reads and mutations do not participate in the backend transaction protocol or its `Taken`-on-drop
-    /// poisoning rule.
+    /// ordinary reads and mutations do not expose `Pending` state or use the `Taken` state and its guard-drop poisoning
+    /// rule.
     ///
     /// # Parameters
     ///
@@ -339,9 +339,9 @@ impl<V: Value> Reference<V> {
                     return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
                 }
                 ReferenceState::Taken { .. } => {
-                    // `Taken` is unobservable during a valid transaction because its guard retains this mutex.
-                    // Competing accesses block before reading the state. Keep the arm as a defensive contract
-                    // check for misuse.
+                    // The guard that changed the state to `Taken` retains this mutex until it either stores a
+                    // replacement or poisons the reference. Competing accesses therefore block before reading this
+                    // state. Keep the arm as a defensive contract check for misuse.
                     return Err(ReferenceError::TransactionInProgress);
                 }
             };
@@ -653,7 +653,7 @@ enum ReferenceState<V: Value> {
         /// Pending replacement in the allocation's canonical identity space.
         value: V,
 
-        /// [`ReferenceGeneration`] that owns `value`.
+        /// [`ReferenceGeneration`] assigned to `value`.
         generation: ReferenceGeneration,
 
         /// Completion of this [`ReferenceGeneration`] and every predecessor on which it depends.
@@ -663,13 +663,14 @@ enum ReferenceState<V: Value> {
         read_leases: Vec<ReferenceCompletion>,
     },
 
-    /// A backend transaction has claimed the next [`ReferenceGeneration`] but has not committed its replacement.
+    /// No value is accessible while a backend finishes replacing it at the next [`ReferenceGeneration`].
     Taken {
-        /// [`ReferenceGeneration`] claimed by the transaction.
+        /// [`ReferenceGeneration`] assigned to the missing replacement.
         generation: ReferenceGeneration,
     },
 
-    /// No trustworthy value remains after a submitted mutation failed or a transaction ended without a replacement.
+    /// No trustworthy value remains after a submitted mutation failed or a `Taken` guard was released
+    /// without replacing the missing value.
     Poisoned(Arc<str>),
 
     /// Value was consumed by [`Reference::freeze`].
@@ -679,9 +680,9 @@ enum ReferenceState<V: Value> {
 // TODO(eaplatanios): Review this block.
 /// Backend-facing exclusive access to one [`Reference`] allocation.
 ///
-/// Unlike ordinary [`Reference`] access, this guard exposes unresolved `Pending` state without waiting. Backends use
-/// it to observe a value, publish read-only work that retains that value, or perform one synchronous or asynchronous
-/// mutation. The guard holds the reference mutex throughout each commit phase and cannot move to another thread.
+/// Unlike ordinary [`Reference`] access, this guard exposes unresolved `Pending` state without waiting. A backend uses
+/// it either to observe and retain a value for read-only work or to replace a value synchronously or asynchronously.
+/// The guard holds the reference mutex for its entire lifetime and cannot move to another thread.
 ///
 /// An asynchronous read keeps the state `Ready` or `Pending` and publishes its completion as a read lease:
 ///
@@ -693,18 +694,18 @@ enum ReferenceState<V: Value> {
 ///   submission -->|publish completion as read lease| state
 /// ```
 ///
-/// A later mutation prunes completed leases and waits for every lease still using the snapshot. Publication is split
-/// into [`Self::validate_read_lease_publication`] and [`Self::publish_read_lease_unchecked`] so a multi-reference
-/// backend can validate every reference before crossing the irreversible submission boundary, then publish every
-/// lease infallibly from the successful-submission callback.
+/// Before removing the value, a later mutation prunes completed leases and waits for every lease still using the
+/// snapshot. Publication is split into [`Self::validate_read_lease_publication`] and
+/// [`Self::publish_read_lease_unchecked`] so a multi-reference backend can validate every reference before crossing the
+/// irreversible submission boundary, then publish every lease infallibly after submission succeeds.
 ///
-/// An asynchronous mutation observes and prepares work before reacquiring the guards and validating that the
-/// observations remain current:
+/// An asynchronous mutation first observes the value and prepares backend work. It then reacquires the guard and
+/// verifies that the observed generation is still current before submitting that work:
 ///
 /// ```mermaid
 /// flowchart LR
 ///   state["Ready or Pending"] -->|observe| prepare["Prepare execution"]
-///   prepare --> validate["Reacquire guard and check is_current"]
+///   prepare --> validate["Reacquire guard and check observation"]
 ///   validate -->|stale| state
 ///   validate -->|submission succeeds; begin_replacement| taken["Taken"]
 ///   taken -->|transaction.validate| validated["Validated replacement"]
@@ -714,13 +715,13 @@ enum ReferenceState<V: Value> {
 ///   taken -->|poison or guard drop| poisoned
 /// ```
 ///
-/// [`Self::next_replacement_generation`] validates the mutation before submission, while [`Self::begin_replacement`]
-/// marks the value unavailable only after submission succeeds and returns a [`ReferenceReplacementTransaction`]. The
-/// backend then validates every transaction with its replacement value. Each successful validation returns a
-/// [`ValidatedPendingReplacementTransaction`] that exclusively borrows its guard. Only after every replacement
-/// validates does the backend commit those transactions. This validate-all/commit-all split prevents a malformed
-/// multi-reference result from being committed partially. Guards for multiple references must be acquired and retained
-/// in ascending [`ReferenceId`] order throughout the commit phase.
+/// [`Self::next_replacement_generation`] checks before submission that the value may be replaced.
+/// [`Self::begin_replacement`] is called only after submission succeeds; it changes the state to `Taken`, in which no
+/// value is accessible, and returns a [`ReferenceReplacementTransaction`]. The backend validates each reconstructed
+/// replacement with its transaction. Successful validation returns a [`ValidatedPendingReplacementTransaction`] that
+/// keeps its guard exclusively borrowed. A multi-reference backend validates every replacement before committing any
+/// of them, preventing malformed results from being committed partially. Guards for multiple references must be
+/// acquired and retained in ascending [`ReferenceId`] order throughout this process.
 ///
 /// A synchronous or potentially donating backend follows the shorter extraction protocol:
 ///
@@ -731,10 +732,11 @@ enum ReferenceState<V: Value> {
 ///   taken -->|poison or guard drop| poisoned["Poisoned"]
 /// ```
 ///
-/// After [`Self::take`] succeeds, the backend must call [`Self::replace`] or [`Self::poison`] before releasing the
-/// guard. More generally, dropping any guard in `Taken` state marks the reference `Poisoned`, because submitted work
-/// may already have consumed the previous value. A panic while the guard instead protects `Ready` or `Pending` poisons
-/// the mutex and later access reports [`ReferenceError::Poisoned`].
+/// [`Self::take`] returns the stored value and changes the state to `Taken`. Before releasing the guard, the backend
+/// must call [`Self::replace`] to store its replacement or [`Self::poison`] to record that no valid replacement can be
+/// provided. Dropping a guard while the state is `Taken` automatically marks the reference `Poisoned`, because the
+/// previous value is no longer available and may already have been consumed by submitted work. A panic while the guard
+/// instead protects `Ready` or `Pending` poisons the mutex, and later access reports [`ReferenceError::Poisoned`].
 #[cfg_attr(doc, aquamarine::aquamarine)]
 pub struct ReferenceGuard<'a, V: Value> {
     /// Handle that supplies this guard's alias-local type conversions.
@@ -748,12 +750,13 @@ pub struct ReferenceGuard<'a, V: Value> {
 impl<V: Value> ReferenceGuard<'_, V> {
     // Observation and retry coordination.
 
-    /// Captures the current value, generation, and pending dependency as one coherent [`ReferenceObservation`].
+    /// Observes the reference's value, generation, and pending dependency without waiting for backend work.
     ///
-    /// The value is converted to this handle's type identities. A `Pending` value is returned immediately together with
-    /// the cumulative dependency that must precede backend use of that value; this function never waits for backend
-    /// work. Use [`ReferenceObservation::is_current`] after reacquiring the reference to determine whether work
-    /// prepared from the observation may still be submitted.
+    /// In `Ready` or `Pending` state, this function converts the stored value to this handle's type identities and
+    /// returns all three fields as one coherent [`ReferenceObservation`]. A `Pending` value is returned immediately
+    /// together with the cumulative dependency that backend work must wait for before using it. After preparing work
+    /// and reacquiring the guard, use [`ReferenceObservation::is_current`] to determine whether the observed value is
+    /// still the one stored by this reference.
     ///
     /// # Errors
     ///
@@ -781,10 +784,11 @@ impl<V: Value> ReferenceGuard<'_, V> {
         })
     }
 
-    /// Prunes completed read leases and returns clones of those that remain pending.
+    /// Removes completed read leases and returns the leases for executions that may still be reading the value.
     ///
-    /// Both successful and failed terminal leases are removed because neither can still access the value. Returns an
-    /// empty vector unless the reference is `Ready` or `Pending`.
+    /// Both successful and failed completed leases are removed because neither can still access the value. In `Ready`
+    /// or `Pending` state, the returned tokens can be awaited before retrying a mutation. This function returns an empty
+    /// vector in every other state.
     pub fn active_read_leases(&mut self) -> Vec<ReferenceCompletion> {
         let read_leases = match &mut *self.state {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => read_leases,
@@ -798,7 +802,11 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     // Asynchronous read publication.
 
-    /// Verifies that the reference can accept a read lease without changing its state.
+    /// Verifies that a read lease may be recorded while this guard remains locked.
+    ///
+    /// This succeeds only in `Ready` or `Pending` state and does not change the state. A backend that submits reads of
+    /// multiple references can call this function for every guard before submission, then call
+    /// [`Self::publish_read_lease_unchecked`] for each guard after submission succeeds.
     ///
     /// # Errors
     ///
@@ -813,11 +821,12 @@ impl<V: Value> ReferenceGuard<'_, V> {
         }
     }
 
-    /// Publishes a read lease after [`Self::validate_read_lease_publication`] succeeded under this same guard.
+    /// Records a submitted read-only execution after [`Self::validate_read_lease_publication`] succeeds.
     ///
-    /// `lease` must cover the submitted read and, when its snapshot came from `Pending` state, that snapshot's prior
-    /// dependency. It must remain pending for as long as the execution may access the snapshot. Completed leases are
-    /// pruned during publication so a reference used only for reads does not retain backend resources indefinitely.
+    /// The same guard must remain locked between validation and this function. `lease` must cover the submitted read
+    /// and, when its snapshot came from `Pending` state, that snapshot's prior dependency. It must remain pending for
+    /// as long as the execution may access the snapshot. Completed leases are removed before the new lease is recorded
+    /// so a reference used only for reads does not retain backend resources indefinitely.
     ///
     /// # Parameters
     ///
@@ -836,14 +845,15 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     // Asynchronous replacement transactions.
 
-    /// Returns the generation that a new mutation would claim without changing the reference state.
+    /// Checks whether the value can be replaced asynchronously and returns the replacement's generation.
     ///
-    /// The caller must retain this guard through submission and pass the returned generation to
-    /// [`Self::begin_replacement`] from the backend's successful-submission callback.
+    /// This function succeeds only when the state is `Ready` or `Pending`, the current generation has a successor, and
+    /// no read lease is recorded. It does not change the reference state. The caller must retain this guard through
+    /// submission and pass the returned generation to [`Self::begin_replacement`] after submission succeeds.
     ///
     /// Any recorded read lease rejects the mutation, even if that lease has already completed, because this function
     /// borrows the state immutably and cannot prune it. Call [`Self::active_read_leases`] first; if pending leases are
-    /// returned, release the guard, await them, and retry the transaction.
+    /// returned, release the guard, await them, and retry the replacement.
     ///
     /// # Errors
     ///
@@ -873,14 +883,15 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(generation)
     }
 
-    /// Starts the replacement transaction for a successfully submitted asynchronous mutation.
+    /// Records a successfully submitted asynchronous replacement and makes the previous value inaccessible.
     ///
     /// The caller must first obtain `generation` from [`Self::next_replacement_generation`] under this same guard. This
-    /// transition makes the previous value unavailable while the backend reconstructs its replacement. The returned
-    /// [`ReferenceReplacementTransaction`] binds this allocation and generation to `completion`, so later code cannot
-    /// accidentally commit the replacement with a different dependency. The caller must retain the guard on the
-    /// submitting thread until the transaction commits a replacement or [`Self::poison`] records a failure; dropping
-    /// it first poisons the reference automatically.
+    /// function changes `Ready` or `Pending` state to `Taken`, which retains the replacement generation but exposes no
+    /// value. The returned [`ReferenceReplacementTransaction`] binds this reference allocation and generation to
+    /// `completion`, preventing the reconstructed replacement from being paired with a different execution. The caller
+    /// must keep the guard on the submitting thread until the replacement has been validated and committed, or call
+    /// [`Self::poison`] if no valid replacement can be provided. Dropping the guard while the state remains `Taken`
+    /// poisons the reference automatically.
     ///
     /// # Parameters
     ///
@@ -904,11 +915,13 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     /// Extracts the current `Ready` value for a synchronous or potentially donating backend invocation.
     ///
-    /// This converts the value to the handle's type identities, advances its generation, and transitions the reference
-    /// to `Taken`. It prunes completed read leases first. Any remaining lease rejects extraction because a donating
-    /// execution could otherwise mutate storage that a submitted reader still uses. A `Pending` value must be chained
-    /// through the asynchronous submission protocol instead of being extracted here. Before releasing the guard, the
-    /// caller must restore the extracted value with [`Self::replace`] or invalidate it with [`Self::poison`].
+    /// In `Ready` state, this function converts the stored value to the handle's type identities, advances its
+    /// generation, returns the value, and changes the state to `Taken`. The `Taken` state retains only the new
+    /// generation; it does not retain a copy of the returned value. Completed read leases are removed first. Any lease
+    /// that remains pending rejects extraction because a donating execution could otherwise mutate storage that a
+    /// submitted reader still uses. A `Pending` value must instead use the asynchronous replacement protocol. Before
+    /// releasing the guard, the caller must store a replacement with [`Self::replace`] or record the failure with
+    /// [`Self::poison`].
     ///
     /// # Errors
     ///
@@ -928,12 +941,13 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(local)
     }
 
-    /// Replaces the value owned by the current `Taken` transaction and returns the reference to `Ready`.
+    /// Stores a synchronous replacement after [`Self::take`] and changes the state from `Taken` to `Ready`.
     ///
-    /// This is the synchronous counterpart to [`Self::take`]. It validates the replacement's referent type, converts
-    /// its type identities for shared storage, and preserves the generation claimed by `take`. A submitted asynchronous
-    /// mutation must instead use [`Self::begin_replacement`], validate the returned transaction with its replacement,
-    /// and commit the resulting token so its completion remains attached to the replacement.
+    /// The reference must still be `Taken` by this guard. This function validates the replacement's referent type,
+    /// converts its type identities for shared storage, and stores it at the generation assigned by [`Self::take`]. A
+    /// submitted asynchronous mutation must instead use [`Self::begin_replacement`], validate the returned
+    /// [`ReferenceReplacementTransaction`] with its replacement, and commit the resulting token so the backend
+    /// completion remains attached to the replacement.
     ///
     /// If replacement validation fails, the reference remains `Taken`; the caller may retry with a valid value or call
     /// [`Self::poison`] before releasing the guard.
@@ -944,7 +958,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     ///
     /// # Errors
     ///
-    /// Returns [`ReferenceError::TransactionInProgress`] unless this guard owns a `Taken` value,
+    /// Returns [`ReferenceError::TransactionInProgress`] unless the reference state is `Taken`,
     /// [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type, or
     /// [`ReferenceError::ValueReconstruction`] if identity conversion fails.
     pub fn replace(&mut self, replacement: V) -> Result<(), ReferenceError> {
@@ -958,11 +972,12 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     // Failure handling.
 
-    /// Marks the current `Taken` transaction as terminally failed.
+    /// Changes `Taken` state to terminal `Poisoned` state when no valid replacement can be provided.
     ///
-    /// Later access reports `reason` through [`ReferenceError::ExecutionPoisoned`]. This function is infallible so a
-    /// cleanup path cannot replace the original error with another failure. It does nothing unless the guard currently
-    /// owns a `Taken` transaction.
+    /// Call this after [`Self::take`] or [`Self::begin_replacement`] if the backend cannot produce or validate a
+    /// replacement. Later access reports `reason` through [`ReferenceError::ExecutionPoisoned`]. This function is
+    /// infallible so cleanup cannot replace the original failure with another error. It has no effect unless the
+    /// reference state is `Taken`.
     pub fn poison(&mut self, reason: impl Into<Arc<str>>) {
         if matches!(*self.state, ReferenceState::Taken { .. }) {
             *self.state = ReferenceState::Poisoned(reason.into());
@@ -974,8 +989,8 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
     #[inline]
     fn drop(&mut self) {
         if matches!(*self.state, ReferenceState::Taken { .. }) {
-            // The extracted value may already have been donated to irreversible backend work, so restoring it would
-            // be unsound. Make the missing replacement a permanent, explicit failure instead.
+            // `Taken` contains no value, and the previous value may already have been donated to irreversible backend
+            // work. Make the missing replacement a permanent, explicit failure instead of fabricating a value.
             *self.state = ReferenceState::Poisoned("stateful transaction ended without restoring state".into());
         }
     }
@@ -1213,19 +1228,19 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
     }
 }
 
-/// A submitted asynchronous [`Reference`] mutation awaiting its reconstructed replacement value.
-/// [`ReferenceGuard::begin_replacement`] creates this transaction only after backend submission succeeds and moves the
-/// reference state to `Taken`. The transaction binds the reference allocation, its newly claimed generation, and the
-/// cumulative backend completion. Calling [`Self::validate`] checks the transaction, reference state, and raw
-/// replacement value before returning a [`ValidatedPendingReplacementTransaction`]. A backend that mutates multiple
-/// references should validate every transaction before committing any returned transaction. Dropping this transaction
-/// does not restore the reference; the guard must instead be poisoned after any failure.
+/// Proof that an asynchronous [`Reference`] replacement was submitted successfully and is awaiting its reconstructed
+/// value. [`ReferenceGuard::begin_replacement`] creates this transaction while changing the reference state to `Taken`.
+/// It binds the reference allocation, the generation assigned to its missing replacement, and the cumulative backend
+/// completion. Calling [`Self::validate`] checks those bindings and prepares the replacement value before returning a
+/// [`ValidatedPendingReplacementTransaction`]. A backend that replaces multiple references should validate every
+/// replacement before committing any of them. Dropping this transaction does not change the `Taken` reference state.
+/// After any failure, the backend must call [`ReferenceGuard::poison`] before releasing the guard.
 #[must_use = "a submitted reference replacement must be committed or its reference must be poisoned"]
 pub struct ReferenceReplacementTransaction<V: Value> {
     /// Weak pointer identifying the [`Reference`] allocation whose value is being replaced.
     holder: Weak<ReferenceHolder<V>>,
 
-    /// [`ReferenceGeneration`] claimed for the submitted mutation.
+    /// [`ReferenceGeneration`] assigned to the submitted replacement.
     generation: ReferenceGeneration,
 
     /// Cumulative [`ReferenceCompletion`] of the submitted mutation and its predecessor dependencies.
@@ -1233,12 +1248,12 @@ pub struct ReferenceReplacementTransaction<V: Value> {
 }
 
 impl<V: Value> ReferenceReplacementTransaction<V> {
-    /// Validates a replacement value against this [`ReferenceReplacementTransaction`] and exclusively borrows its
-    /// [`ReferenceGuard`] for commit. Validation confirms the allocation and generation, validates the replacement's
-    /// referent type, and converts its type identities for shared storage without changing the reference state. The
-    /// returned [`ValidatedPendingReplacementTransaction`] owns all data needed for an infallible commit and keeps
-    /// `guard` exclusively borrowed, preventing the reference from changing between validation and commit.
-    /// Multi-reference backends can therefore collect all validated transactions before committing any of them.
+    /// Validates a replacement value and keeps its [`ReferenceGuard`] exclusively borrowed until commit. This function
+    /// verifies that the transaction and guard refer to the same allocation and replacement generation, checks the
+    /// replacement's referent type, and converts its type identities for shared storage without changing the `Taken`
+    /// state. The returned [`ValidatedPendingReplacementTransaction`] contains everything needed to commit without
+    /// failure. Keeping `guard` borrowed prevents the reference state from changing between validation and commit.
+    /// A multi-reference backend can therefore validate every replacement before committing any of them.
     ///
     /// # Parameters
     ///
@@ -1248,8 +1263,8 @@ impl<V: Value> ReferenceReplacementTransaction<V> {
     /// # Errors
     ///
     /// Returns [`ReferenceError::ReplacementTransactionMismatch`] if this transaction belongs to another allocation or
-    /// no longer matches the allocation's claimed generation, the applicable state error unless the guard is `Taken`,
-    /// [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type, or
+    /// does not match the generation stored in `Taken` state, the applicable state error unless the guard protects
+    /// `Taken` state, [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type, or
     /// [`ReferenceError::ValueReconstruction`] if identity conversion fails.
     pub fn validate<'g, 'r>(
         self,
@@ -1280,18 +1295,17 @@ impl<V: Value> ReferenceReplacementTransaction<V> {
     }
 }
 
-/// A fully validated [`ReferenceReplacementTransaction`] that can be committed without failure.
-/// [`ReferenceReplacementTransaction::validate`] creates [`ValidatedPendingReplacementTransaction`]s after confirming
-/// that the corresponding transactions, replacements, and exclusively borrowed guards all belong to the same allocation
-/// and claimed [`ReferenceGeneration`]. Holding the borrow prevents that state from changing before [`Self::commit`].
-/// A multi-reference backend can hold one token per disjoint guard, then commit them only after every validation
-/// succeeds.
+/// A replacement prepared to change its [`Reference`] from `Taken` to `Pending` without failure.
+/// [`ReferenceReplacementTransaction::validate`] creates this transaction after confirming that its source transaction,
+/// replacement value, and exclusively borrowed guard all refer to the same allocation and generation. Holding the guard
+/// borrow prevents the `Taken` state from changing before [`Self::commit`]. A multi-reference backend can keep one
+/// validated transaction per disjoint guard, then commit them only after every replacement validates successfully.
 #[must_use = "a validated reference replacement must be committed or its reference must be poisoned"]
 pub struct ValidatedPendingReplacementTransaction<'g, 'r, V: Value> {
-    /// Exclusively borrowed [`ReferenceGuard`] whose `Taken` state was validated.
+    /// Exclusively borrowed [`ReferenceGuard`] protecting the validated `Taken` state.
     guard: &'g mut ReferenceGuard<'r, V>,
 
-    /// [`ReferenceGeneration`] claimed for the submitted mutation.
+    /// [`ReferenceGeneration`] assigned to the submitted replacement.
     generation: ReferenceGeneration,
 
     /// Replacement [`Value`] using the allocation's canonical type identities.
@@ -1302,10 +1316,10 @@ pub struct ValidatedPendingReplacementTransaction<'g, 'r, V: Value> {
 }
 
 impl<V: Value> ValidatedPendingReplacementTransaction<'_, '_, V> {
-    /// Commits this [`ValidatedPendingReplacementTransaction`] and moves its [`Reference`]'s state from `Taken` to
-    /// `Pending`. This function is infallible because validation already established every precondition while acquiring
-    /// the exclusive guard borrow. The pending completion eventually makes the replacement `Ready` or poisons the
-    /// reference if backend execution fails.
+    /// Stores the validated replacement and changes its [`Reference`] from `Taken` to `Pending`. This function is
+    /// infallible because validation established every precondition while exclusively borrowing the guard. The stored
+    /// completion eventually changes the replacement to `Ready` or marks the reference `Poisoned` if backend execution
+    /// fails.
     #[inline]
     pub fn commit(self) {
         let Self { guard, generation, value, completion } = self;
