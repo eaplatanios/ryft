@@ -675,19 +675,14 @@ enum ReferenceState<V: Value> {
     Frozen,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Backend-facing exclusive access to one reference allocation.
-///
-/// Unlike ordinary [`Reference`] access, this guard exposes `Pending` state without waiting so an asynchronous backend
-/// can add [`Self::dependency`] to its next submission. A mutation uses a validate-then-commit protocol: obtain a
-/// generation with [`Self::next_generation`], retain the same guard while submitting work, call
-/// [`Self::begin_submitted_mutation`] after submission succeeds, prepare and validate every replacement in the batch,
-/// and then call [`Self::install_pending_unchecked`]. Multi-reference backends must hold guards in ascending
-/// [`ReferenceId`] order throughout this protocol.
-///
-/// A synchronous backend instead calls [`Self::take`] followed by [`Self::install`] on success or [`Self::poison`] if
-/// the extracted value cannot be restored safely.
+/// Backend-facing exclusive access to one [`Reference`] allocation. Unlike ordinary [`Reference`] access, this guard
+/// exposes a `Pending` state without waiting so an asynchronous backend can add [`Self::dependency`] to its next
+/// submission. A mutation uses a validate-then-commit protocol: obtain a generation with [`Self::next_generation`],
+/// retain the same guard while submitting work, call [`Self::begin_submitted_mutation`] after submission succeeds,
+/// prepare and validate every replacement in the batch, and then call [`Self::install_pending_unchecked`].
+/// Multi-reference backends must hold guards in ascending [`ReferenceId`] order throughout this protocol. A synchronous
+/// backend instead calls [`Self::take`] followed by [`Self::install`] on success or [`Self::poison`] if the extracted
+/// value cannot be restored safely.
 ///
 /// Dropping a guard in `Taken` state marks the reference `Poisoned`, because an extracted value may already have been
 /// consumed. A panic while the guard instead protects `Ready` or `Pending` state poisons the mutex and later access
@@ -700,6 +695,8 @@ pub struct ReferenceGuard<'a, V: Value> {
     /// Locked state of the shared reference allocation.
     state: MutexGuard<'a, ReferenceState<V>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value> ReferenceGuard<'_, V> {
     /// Returns the current `Ready` or `Pending` generation without resolving pending work.
