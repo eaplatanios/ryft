@@ -30,10 +30,10 @@ impl ReferenceId {
 
 /// Monotonically increasing version of one [`Reference`]'s mutable state. A newly allocated reference starts at
 /// generation zero. Each committed synchronous mutation or submitted asynchronous mutation advances the generation,
-/// and every asynchronous installation and completion path retains the generation it belongs to. The reference applies
-/// a delayed completion only while that generation remains current, preventing an older execution from completing or
-/// poisoning state installed by a newer mutation. Generations are local to one reference allocation and do not
-/// identify references across allocations or processes.
+/// and every asynchronous replacement transaction and completion path retains the generation it belongs to. The
+/// reference applies a delayed completion only while that generation remains current, preventing an older execution
+/// from completing or poisoning state committed by a newer mutation. Generations are local to one reference allocation
+/// and do not identify references across allocations or processes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceGeneration(u64);
 
@@ -73,7 +73,7 @@ impl ReferenceGeneration {
 ///   Ready --> Taken: synchronous take or asynchronous submission (generation + 1)
 ///   Pending --> Taken: chained asynchronous submission (generation + 1)
 ///   Taken --> Ready: install synchronous replacement
-///   Taken --> Pending: install asynchronous replacement
+///   Taken --> Pending: commit asynchronous replacement
 ///   Taken --> Poisoned: guard drop or backend failure
 ///   Pending --> Ready: backend completion succeeds
 ///   Pending --> Poisoned: backend completion fails
@@ -82,10 +82,10 @@ impl ReferenceGeneration {
 ///
 /// `Ready` exposes a completed immutable snapshot. `Taken` is an exclusive transaction whose [`ReferenceGuard`] retains
 /// exclusive access to the shared state while a synchronous backend prepares a replacement or an asynchronous backend
-/// reconstructs submitted hidden state. Dropping that guard before installation poisons the reference defensively. An
-/// asynchronous installation changes the state to `Pending`, where the new value remains inaccessible until its
-/// cumulative [`ReferenceCompletion`] succeeds. Generations ensure that completion of an older execution cannot
-/// affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
+/// reconstructs submitted hidden state. Dropping that guard before restoring or committing the replacement poisons the
+/// reference defensively. Committing an asynchronous replacement changes the state to `Pending`, where the new value
+/// remains inaccessible until its cumulative [`ReferenceCompletion`] succeeds. Generations ensure that completion of
+/// an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
 ///
 /// Read-only asynchronous executions do not enter a separate state. They publish completion leases on `Ready` or
 /// `Pending`. Mutating transactions wait for those leases before they may take the reference, preventing donated
@@ -148,7 +148,7 @@ impl<V: Value> Reference<V> {
     }
 
     /// Returns an immutable snapshot of this [`Reference`]'s current value. If a submitted mutation is still pending,
-    /// this function waits for its completion without holding the state mutex and then reads the installed value. It
+    /// this function waits for its completion without holding the state mutex and then reads the committed value. It
     /// does not wait for active read-only executions because they may safely share the same immutable snapshot. For an
     /// identity-renamed alias, the returned value uses that alias's referent type identities.
     ///
@@ -277,13 +277,13 @@ impl<V: Value> Reference<V> {
     /// backend-facing wrapper around the private raw state lock. It returns as soon as the state mutex is acquired and
     /// deliberately does not await a `Pending` value or active read leases. The returned [`ReferenceGuard`] produces a
     /// coherent [`ReferenceObservation`] and exposes the validated transitions a backend needs to compose, submit, and
-    /// install stateful work while retaining exclusive access.
+    /// commit stateful work while retaining exclusive access.
     ///
     /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
     /// [`update`](Self::update), or [`freeze`](Self::freeze), which reconcile pending work before accessing the value.
     /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain that
-    /// order until every submitted hidden replacement has been validated and installed. A submitted mutation remains
-    /// represented by `Taken` while this guard is held, so dropping the guard before installation poisons the
+    /// order until every submitted hidden replacement has been validated and committed. A submitted mutation remains
+    /// represented by `Taken` while this guard is held, so dropping the guard before replacement commit poisons the
     /// reference.
     ///
     /// # Errors
@@ -648,12 +648,12 @@ enum ReferenceState<V: Value> {
         read_leases: Vec<ReferenceCompletion>,
     },
 
-    /// Current replacement is installed, but the execution producing it has not completed.
+    /// Current replacement is committed, but the execution producing it has not completed.
     Pending {
         /// Pending replacement in the allocation's canonical identity space.
         value: V,
 
-        /// [`ReferenceGeneration`] that installed `value`.
+        /// [`ReferenceGeneration`] that owns `value`.
         generation: ReferenceGeneration,
 
         /// Completion of this [`ReferenceGeneration`] and every predecessor on which it depends.
@@ -663,7 +663,7 @@ enum ReferenceState<V: Value> {
         read_leases: Vec<ReferenceCompletion>,
     },
 
-    /// A backend transaction has claimed the next [`ReferenceGeneration`] but has not installed its replacement.
+    /// A backend transaction has claimed the next [`ReferenceGeneration`] but has not committed its replacement.
     Taken {
         /// [`ReferenceGeneration`] claimed by the transaction.
         generation: ReferenceGeneration,
@@ -706,19 +706,21 @@ enum ReferenceState<V: Value> {
 ///   state["Ready or Pending"] -->|observe| prepare["Prepare execution"]
 ///   prepare --> validate["Reacquire guard and check is_current"]
 ///   validate -->|stale| state
-///   validate -->|submission succeeds; begin_submitted_mutation| taken["Taken"]
-///   taken -->|install_pending_unchecked| pending["Pending"]
+///   validate -->|submission succeeds; begin_replacement| taken["Taken"]
+///   taken -->|transaction.validate| validated["Validated replacement"]
+///   validated -->|commit| pending["Pending"]
 ///   pending -->|completion succeeds| ready["Ready"]
 ///   pending -->|completion fails| poisoned["Poisoned"]
 ///   taken -->|poison or guard drop| poisoned
 /// ```
 ///
-/// [`Self::next_generation`] validates the mutation before submission, while [`Self::begin_submitted_mutation`] marks
-/// the value unavailable only after submission succeeds. The backend then prepares every [`ReferenceReplacement`],
-/// validates every installation with [`Self::validate_pending_install`], and only then calls
-/// [`Self::install_pending_unchecked`] for each reference. This validate-all/install-all split prevents a malformed
-/// multi-reference result from being installed partially. Guards for multiple references must be acquired and retained
-/// in ascending [`ReferenceId`] order throughout the commit phase.
+/// [`Self::next_generation`] validates the mutation before submission, while [`Self::begin_replacement`] marks the
+/// value unavailable only after submission succeeds and returns a [`ReferenceReplacementTransaction`]. The backend
+/// then prepares every [`ReferenceReplacement`] and validates every transaction. Each successful validation returns a
+/// [`ValidatedPendingReplacement`] that exclusively borrows its guard. Only after every replacement validates does the
+/// backend commit those tokens. This validate-all/commit-all split prevents a malformed multi-reference result from
+/// being committed partially. Guards for multiple references must be acquired and retained in ascending
+/// [`ReferenceId`] order throughout the commit phase.
 ///
 /// A synchronous or potentially donating backend follows the shorter extraction protocol:
 ///
@@ -822,7 +824,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     /// Validates `value`, converts it to the allocation's type identities, and binds it to this allocation.
     ///
-    /// This function does not change the reference state. The returned [`ReferenceReplacement`] can be installed only
+    /// This function does not change the reference state. The returned [`ReferenceReplacement`] can be committed only
     /// through a guard for this same allocation.
     ///
     /// # Errors
@@ -881,12 +883,12 @@ impl<V: Value> ReferenceGuard<'_, V> {
         }
     }
 
-    // Asynchronous mutation.
+    // Asynchronous replacement transactions.
 
     /// Returns the generation that a new mutation would claim without changing the reference state.
     ///
     /// The caller must retain this guard through submission and pass the returned generation to
-    /// [`Self::begin_submitted_mutation`] from the backend's successful-submission callback.
+    /// [`Self::begin_replacement`] from the backend's successful-submission callback.
     ///
     /// Any recorded read lease rejects the mutation, even if that lease has already completed, because this function
     /// borrows the state immutably and cannot prune it. Call [`Self::active_read_leases`] first; if pending leases are
@@ -920,63 +922,31 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(generation)
     }
 
-    /// Marks a successfully submitted mutation as `Taken`.
+    /// Starts the replacement transaction for a successfully submitted asynchronous mutation.
     ///
     /// The caller must first obtain `generation` from [`Self::next_generation`] under this same guard. This transition
-    /// makes the previous value unavailable while the backend reconstructs its replacement. The caller must retain the
-    /// guard on the submitting thread until [`Self::install_pending_unchecked`] installs that replacement or
-    /// [`Self::poison`] records a failure; dropping it first poisons the reference automatically.
+    /// makes the previous value unavailable while the backend reconstructs its replacement. The returned
+    /// [`ReferenceReplacementTransaction`] binds this allocation and generation to `completion`, so later code cannot
+    /// accidentally commit the replacement with a different dependency. The caller must retain the guard on the
+    /// submitting thread until the transaction commits a replacement or [`Self::poison`] records a failure; dropping
+    /// it first poisons the reference automatically.
     ///
     /// # Parameters
     ///
     ///   - `generation`: Generation returned by the immediately preceding [`Self::next_generation`] call.
-    pub fn begin_submitted_mutation(&mut self, generation: ReferenceGeneration) {
-        debug_assert_eq!(self.next_generation(), Ok(generation));
-        *self.state = ReferenceState::Taken { generation };
-    }
-
-    /// Validates a pending replacement without changing the reference state.
-    ///
-    /// The replacement must have been prepared for this allocation, and `generation` must match its current `Taken`
-    /// state. Multi-reference backends use this fallible phase for every replacement before committing any replacement
-    /// with [`Self::install_pending_unchecked`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReferenceError::ReplacementHolderMismatch`] for another allocation,
-    /// [`ReferenceError::TransactionInProgress`] unless the reference is `Taken`, or
-    /// [`ReferenceError::StaleGeneration`] when `generation` does not match the claimed generation.
-    pub fn validate_pending_install(
-        &self,
-        generation: ReferenceGeneration,
-        replacement: &ReferenceReplacement<V>,
-    ) -> Result<(), ReferenceError> {
-        self.accepts(replacement)?;
-        let ReferenceState::Taken { generation: current } = &*self.state else {
-            return Err(ReferenceError::TransactionInProgress);
-        };
-        if *current != generation {
-            return Err(ReferenceError::StaleGeneration);
-        }
-        Ok(())
-    }
-
-    /// Installs a pending replacement after [`Self::validate_pending_install`] succeeded under this same guard.
-    ///
-    /// This moves the reference from `Taken` to `Pending`. `completion` must cover both the submitted execution and its
-    /// predecessor dependency; it will eventually make the replacement `Ready` or poison the reference. Every
-    /// replacement in a multi-reference mutation must be validated before the first replacement is installed. This
-    /// function then performs only moves and state assignment. It must run through the same guard, on the same thread,
-    /// as [`Self::begin_submitted_mutation`].
-    pub fn install_pending_unchecked(
+    ///   - `completion`: Cumulative completion of the submitted mutation and all of its predecessor dependencies.
+    pub fn begin_replacement(
         &mut self,
         generation: ReferenceGeneration,
         completion: ReferenceCompletion,
-        replacement: ReferenceReplacement<V>,
-    ) {
-        debug_assert!(self.validate_pending_install(generation, &replacement).is_ok());
-        *self.state =
-            ReferenceState::Pending { value: replacement.value, generation, completion, read_leases: Vec::new() };
+    ) -> ReferenceReplacementTransaction<V> {
+        debug_assert_eq!(self.next_generation(), Ok(generation));
+        *self.state = ReferenceState::Taken { generation };
+        ReferenceReplacementTransaction {
+            holder: Arc::downgrade(&self.reference.handle.holder),
+            generation,
+            completion,
+        }
     }
 
     // Synchronous extraction.
@@ -1010,8 +980,9 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// Installs a prepared replacement into the current `Taken` transaction and returns the reference to `Ready`.
     ///
     /// This is the synchronous counterpart to [`Self::take`], and the replacement inherits the generation claimed by
-    /// the transaction. A submitted asynchronous mutation must instead use [`Self::validate_pending_install`] followed
-    /// by [`Self::install_pending_unchecked`] so its completion remains attached to the replacement.
+    /// the transaction. A submitted asynchronous mutation must instead use [`Self::begin_replacement`], validate the
+    /// returned transaction with its prepared replacement, and commit the resulting token so its completion remains
+    /// attached to the replacement.
     ///
     /// # Errors
     ///
@@ -1051,6 +1022,7 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
     }
 }
 
+// TODO(eaplatanios): Review this block.
 /// Represents a coherent observation of a [`Reference`] value and the work that must precede its use.
 /// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
 /// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
@@ -1073,6 +1045,7 @@ pub struct ReferenceObservation<V: Value> {
     dependency: Option<ReferenceCompletion>,
 }
 
+// TODO(eaplatanios): Review this block.
 impl<V: Value> ReferenceObservation<V> {
     /// Returns the generation of the observed value.
     #[inline]
@@ -1257,8 +1230,8 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
 
 /// Type-checked value replacement prepared for one [`Reference`] allocation. [`ReferenceGuard::prepare_replacement`]
 /// converts a handle-local value to the allocation's canonical type identities and records which allocation it belongs
-/// to. Installation verifies that identity before moving the value into shared state, preventing a multi-reference
-/// transaction from exchanging two otherwise type-compatible replacements.
+/// to. Transaction validation verifies that identity before moving the value into shared state, preventing a
+/// multi-reference transaction from exchanging two otherwise type-compatible replacements.
 pub struct ReferenceReplacement<V: Value> {
     /// Weak pointer identifying the allocation for which this [`ReferenceReplacement`] was prepared. Keeping the weak
     /// control block alive prevents its address from being reused while this replacement exists, so pointer equality
@@ -1267,6 +1240,111 @@ pub struct ReferenceReplacement<V: Value> {
 
     /// Value using the reference allocation's canonical type identities.
     value: V,
+}
+
+// TODO(eaplatanios): Review this block.
+/// A submitted asynchronous mutation awaiting its reconstructed replacement value.
+///
+/// [`ReferenceGuard::begin_replacement`] creates this transaction only after backend submission succeeds and moves the
+/// reference to `Taken`. The transaction binds the reference allocation, its newly claimed generation, and the
+/// cumulative backend completion. Calling [`Self::validate`] with a prepared [`ReferenceReplacement`] checks the
+/// allocation and state before returning a [`ValidatedPendingReplacement`].
+///
+/// A backend that mutates multiple references should validate every transaction before committing any returned token.
+/// Dropping this transaction does not restore the reference; the guard must instead be poisoned after any failure.
+#[must_use = "a submitted reference replacement must be committed or its reference must be poisoned"]
+pub struct ReferenceReplacementTransaction<V: Value> {
+    /// Weak pointer identifying the reference allocation whose value is being replaced.
+    holder: Weak<ReferenceHolder<V>>,
+
+    /// Generation claimed for the submitted mutation.
+    generation: ReferenceGeneration,
+
+    /// Cumulative completion of the submitted mutation and its predecessor dependencies.
+    completion: ReferenceCompletion,
+}
+
+// TODO(eaplatanios): Review this block.
+impl<V: Value> ReferenceReplacementTransaction<V> {
+    /// Validates a prepared replacement against this transaction and exclusively borrows its guard for commit.
+    ///
+    /// Validation does not change the reference state. The returned [`ValidatedPendingReplacement`] owns all data
+    /// needed for an infallible commit and keeps `guard` exclusively borrowed, preventing the reference from changing
+    /// between validation and commit. Multi-reference backends can therefore collect all validation tokens before
+    /// committing any of them.
+    ///
+    /// # Parameters
+    ///
+    ///   - `guard`: Guard for the reference allocation being replaced.
+    ///   - `replacement`: Type-checked replacement prepared through that allocation's guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::ReplacementTransactionMismatch`] if this transaction belongs to another allocation or
+    /// no longer matches the allocation's claimed generation, [`ReferenceError::ReplacementHolderMismatch`] if
+    /// `replacement` was prepared for another allocation, or the applicable state error unless the guard is `Taken`.
+    pub fn validate<'g, 'r>(
+        self,
+        guard: &'g mut ReferenceGuard<'r, V>,
+        replacement: ReferenceReplacement<V>,
+    ) -> Result<ValidatedPendingReplacement<'g, 'r, V>, ReferenceError> {
+        if !std::ptr::eq(self.holder.as_ptr(), Arc::as_ptr(&guard.reference.handle.holder)) {
+            return Err(ReferenceError::ReplacementTransactionMismatch);
+        }
+        guard.accepts(&replacement)?;
+        match &*guard.state {
+            ReferenceState::Taken { generation } if *generation == self.generation => {}
+            ReferenceState::Taken { .. } => return Err(ReferenceError::ReplacementTransactionMismatch),
+            ReferenceState::Frozen => return Err(ReferenceError::Frozen),
+            ReferenceState::Poisoned(reason) => {
+                return Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() });
+            }
+            ReferenceState::Ready { .. } | ReferenceState::Pending { .. } => {
+                return Err(ReferenceError::TransactionInProgress);
+            }
+        }
+        Ok(ValidatedPendingReplacement {
+            guard,
+            generation: self.generation,
+            value: replacement.value,
+            completion: self.completion,
+        })
+    }
+}
+
+// TODO(eaplatanios): Review this block.
+/// A fully validated pending replacement that can be committed without failure.
+///
+/// [`ReferenceReplacementTransaction::validate`] creates this token after confirming that the transaction,
+/// replacement, and exclusively borrowed guard all belong to the same allocation and claimed generation. Holding the
+/// borrow prevents that state from changing before [`Self::commit`]. A multi-reference backend can hold one token per
+/// disjoint guard, then commit them only after every validation succeeds.
+#[must_use = "a validated reference replacement must be committed or its reference must be poisoned"]
+pub struct ValidatedPendingReplacement<'g, 'r, V: Value> {
+    /// Exclusively borrowed guard whose `Taken` state was validated.
+    guard: &'g mut ReferenceGuard<'r, V>,
+
+    /// Generation claimed for the submitted mutation.
+    generation: ReferenceGeneration,
+
+    /// Replacement value using the allocation's canonical type identities.
+    value: V,
+
+    /// Cumulative completion of the submitted mutation and its predecessor dependencies.
+    completion: ReferenceCompletion,
+}
+
+// TODO(eaplatanios): Review this block.
+impl<V: Value> ValidatedPendingReplacement<'_, '_, V> {
+    /// Commits the validated replacement and moves its reference from `Taken` to `Pending`.
+    ///
+    /// This function is infallible because validation already established every precondition while acquiring the
+    /// exclusive guard borrow. The pending completion eventually makes the replacement `Ready` or poisons the
+    /// reference if backend execution fails.
+    pub fn commit(self) {
+        let Self { guard, generation, value, completion } = self;
+        *guard.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
+    }
 }
 
 #[cfg(test)]
@@ -1293,16 +1371,15 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    // Simulates the successful-submission and pending-installation phases used by asynchronous backend tests.
+    // Simulates the successful-submission and replacement-commit phases used by asynchronous backend tests.
     fn transition_to_pending<V: Value>(
         guard: &mut ReferenceGuard<'_, V>,
         completion: ReferenceCompletion,
         replacement: ReferenceReplacement<V>,
     ) -> Result<ReferenceGeneration, ReferenceError> {
         let generation = guard.next_generation()?;
-        guard.begin_submitted_mutation(generation);
-        guard.validate_pending_install(generation, &replacement)?;
-        guard.install_pending_unchecked(generation, completion, replacement);
+        let transaction = guard.begin_replacement(generation, completion);
+        transaction.validate(guard, replacement)?.commit();
         Ok(generation)
     }
 
@@ -1689,10 +1766,6 @@ mod tests {
                 if expected == "f32[]" && actual == "f32[1]"
         ));
         let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        assert_eq!(
-            guard.validate_pending_install(ReferenceGeneration(1), &replacement),
-            Err(ReferenceError::TransactionInProgress),
-        );
         assert_eq!(guard.install(replacement), Err(ReferenceError::TransactionInProgress));
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
@@ -1716,21 +1789,56 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_validate_pending_install_rejects_a_replacement_from_another_allocation() {
+    fn test_reference_replacement_transaction_rejects_a_replacement_from_another_allocation() {
         let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
         let mut first_guard = first.lock().unwrap();
         let second_guard = second.lock().unwrap();
         let generation = first_guard.next_generation().unwrap();
-        first_guard.begin_submitted_mutation(generation);
+        let transaction = first_guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
         let foreign_replacement = second_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
 
-        assert_eq!(
-            first_guard.validate_pending_install(generation, &foreign_replacement),
+        assert!(matches!(
+            transaction.validate(&mut first_guard, foreign_replacement),
             Err(ReferenceError::ReplacementHolderMismatch),
-        );
+        ));
         first_guard.poison("test cleanup");
         drop(second_guard);
+    }
+
+    #[test]
+    fn test_reference_replacement_transaction_rejects_another_reference_allocation() {
+        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let mut first_guard = first.lock().unwrap();
+        let mut second_guard = second.lock().unwrap();
+        let generation = first_guard.next_generation().unwrap();
+        let transaction = first_guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
+        let replacement = second_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+
+        assert!(matches!(
+            transaction.validate(&mut second_guard, replacement),
+            Err(ReferenceError::ReplacementTransactionMismatch),
+        ));
+        first_guard.poison("test cleanup");
+        drop(first_guard);
+        drop(second_guard);
+        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_replacement_transaction_reports_terminal_state_during_validation() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+        let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        let generation = guard.next_generation().unwrap();
+        let transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
+        guard.poison("injected failure");
+
+        assert!(matches!(
+            transaction.validate(&mut guard, replacement),
+            Err(ReferenceError::ExecutionPoisoned { reason }) if reason == "injected failure",
+        ));
     }
 
     #[test]
@@ -1770,7 +1878,7 @@ mod tests {
         let reader = thread::spawn(move || sender.send(reader_reference.read()).unwrap());
         first_backend.wait_until_awaited();
 
-        // Install generation two while the reader is waiting. Its completion includes generation one's dependency,
+        // Commit generation two while the reader is waiting. Its completion includes generation one's dependency,
         // matching the cumulative dependency contract required of chained submissions.
         let second_generation = {
             let mut guard = reference.lock().unwrap();
@@ -1812,7 +1920,7 @@ mod tests {
             catch_unwind(AssertUnwindSafe(|| {
                 let mut guard = reference.lock().unwrap();
                 let generation = guard.next_generation().unwrap();
-                guard.begin_submitted_mutation(generation);
+                let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
                 panic!("injected backend unwind");
             }))
             .is_err(),
@@ -1834,7 +1942,7 @@ mod tests {
         assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
         assert!(guard.active_read_leases().is_empty());
         let generation = guard.next_generation().unwrap();
-        guard.begin_submitted_mutation(generation);
+        let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
         guard.poison("test cleanup");
     }
 
@@ -1952,7 +2060,7 @@ mod tests {
         guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
         drop(guard);
 
-        // A leased snapshot pins the current value, so the replacement cannot be installed until the lease completes.
+        // A leased snapshot pins the current value, so the replacement cannot be committed until the lease completes.
         let (sender, receiver) = channel();
         let swapping_reference = Arc::clone(&reference);
         let swapper = thread::spawn(move || sender.send(swapping_reference.swap(Array::scalar(2.0_f32))).unwrap());
@@ -1996,19 +2104,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_validate_pending_install_rejects_a_stale_generation() {
+    fn test_reference_replacement_transaction_commits_its_claimed_generation() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
         let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
         let first = transition_to_pending(&mut guard, ReferenceCompletion::ready(Ok(())), first_value).unwrap();
         let second = guard.next_generation().unwrap();
-        guard.begin_submitted_mutation(second);
-
-        // Rejecting a late installation leaves the newer `Taken` transition intact, allowing that transaction to
-        // install its own replacement.
+        let transaction = guard.begin_replacement(second, ReferenceCompletion::ready(Ok(())));
         let value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
-        assert_eq!(guard.validate_pending_install(first, &value), Err(ReferenceError::StaleGeneration));
-        guard.install_pending_unchecked(second, ReferenceCompletion::ready(Ok(())), value);
+        transaction.validate(&mut guard, value).unwrap().commit();
+        assert_eq!(first.next(), Some(second));
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
@@ -2076,7 +2181,7 @@ mod tests {
         let generation =
             transition_to_pending(&mut guard, ReferenceCompletion::new(completion.clone()), replacement).unwrap();
 
-        // Explicit poisoning applies only to an uninstalled `Taken` transaction. Once a replacement is installed,
+        // Explicit poisoning applies only to an uncommitted `Taken` transaction. Once a replacement is committed,
         // its cumulative completion remains the sole authority for promoting or poisoning that pending generation.
         guard.poison("unrelated backend failure");
         let observation = guard.observe().unwrap();
