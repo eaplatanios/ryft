@@ -194,6 +194,42 @@ impl<V: Value> Reference<V> {
     }
 
     // TODO(eaplatanios): Review this function.
+    /// Atomically transforms the stored value and returns a result derived from its previous snapshot.
+    ///
+    /// This method waits until the reference can be mutated, converts the current value into this reference's type
+    /// identity space, and passes that immutable snapshot to `update`. The closure returns both the replacement value
+    /// and the result returned to the caller. The replacement is validated and converted back to the shared storage
+    /// representation before either the value or its generation is changed, so every error leaves the reference
+    /// unchanged.
+    ///
+    /// `update` runs while this reference's non-reentrant state mutex is locked. It must not access this reference or
+    /// another alias of the same reference, because doing so would attempt to acquire that mutex recursively.
+    ///
+    /// # Parameters
+    ///
+    ///   - `update`: Computes a replacement and an accompanying result from the current immutable value snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from acquiring or reconstructing the current reference state, propagates errors returned by
+    /// `update`, rejects a replacement whose type does not exactly match the reference's referent type, and returns a
+    /// generation-exhaustion error before modifying the reference.
+    pub fn update<R, F: FnOnce(&V) -> Result<(V, R), ProgramError>>(&self, update: F) -> Result<R, ProgramError> {
+        let mut state = self.lock_ready_state(true).map_err(ProgramError::custom)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("`lock_ready_state` yields only ready states")
+        };
+        let local = current
+            .rename_type_identities(&self.handle.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
+            .map_err(ProgramError::custom)?;
+        let (updated, result) = update(&local)?;
+        let stored = self.prepare_replacement(updated).map_err(ProgramError::custom)?;
+        Self::commit_replacement(current, generation, stored).map_err(ProgramError::custom)?;
+        Ok(result)
+    }
+
+    // TODO(eaplatanios): Review this function.
     /// Consumes this reference's current value and invalidates every handle in its alias family.
     pub fn freeze(&self) -> Result<V, ReferenceError> {
         let mut state = self.lock_ready_state(true)?;
@@ -213,11 +249,12 @@ impl<V: Value> Reference<V> {
     /// pending dependency and the validated transitions a backend needs to compose, submit, and install stateful work
     /// while retaining exclusive access.
     ///
-    /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap), or
-    /// [`freeze`](Self::freeze), which reconcile pending work before accessing the value. Backends that lock multiple
-    /// references must acquire them in ascending [`ReferenceId`] order and retain that order until every submitted
-    /// hidden replacement has been validated and installed. A submitted mutation remains represented by `Taken` while
-    /// this guard is held, so dropping the guard before installation poisons the reference.
+    /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
+    /// [`update`](Self::update), or [`freeze`](Self::freeze), which reconcile pending work before accessing the value.
+    /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain that
+    /// order until every submitted hidden replacement has been validated and installed. A submitted mutation remains
+    /// represented by `Taken` while this guard is held, so dropping the guard before installation poisons the
+    /// reference.
     ///
     /// # Errors
     ///
@@ -329,51 +366,21 @@ impl<V: Value> Reference<V> {
         }
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Atomically computes and installs an updated value while retaining the old value on every failure.
-    ///
-    /// This crate-visible primitive keeps value-family-specific update logic (such as array addition) outside the
-    /// generic reference state while ensuring no other access can interleave between reading the old state and
-    /// installing the new one.
-    pub(crate) fn update_with(&self, update: impl FnOnce(&V) -> Result<V, ProgramError>) -> Result<(), ProgramError> {
-        self.update_locked_with_result(|current| Ok((update(current)?, ())))
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Atomically maps this handle's current value to a replacement and an operation result.
-    ///
-    /// Both handle-local reconstruction directions complete before the shared state is committed, so every failure
-    /// leaves the live reference unchanged. `update` runs while this reference's non-reentrant state mutex is locked
-    /// and therefore must not access this reference or any other handle in the same alias family.
-    pub(crate) fn update_locked_with_result<R>(
-        &self,
-        update: impl FnOnce(&V) -> Result<(V, R), ProgramError>,
-    ) -> Result<R, ProgramError> {
-        let mut state = self.lock_ready_state(true).map_err(ProgramError::custom)?;
-        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready_state yields only ready states")
-        };
-        let local = current
-            .rename_type_identities(&self.handle.root_to_handle)
-            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
-            .map_err(ProgramError::custom)?;
-        let (updated, result) = update(&local)?;
-        let stored = self.prepare_replacement(updated).map_err(ProgramError::custom)?;
-        Self::commit_replacement(current, generation, stored).map_err(ProgramError::custom)?;
-        Ok(result)
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Returns a handle-local identity-renamed view of this same reference allocation.
+    /// Creates an alias of this [`Reference`] whose referent type uses the provided [`TypeIdentityRenaming`]. The
+    /// returned reference shares the same stored value and mutation state as `self`. Reading through the alias renames
+    /// the stored value's type identities, and writing through it translates those identities back before validating
+    /// the replacement. Because values must be translated in both directions, `renaming` must map every identity used
+    /// by the referent type uniquely and reversibly.
     pub(crate) fn rename_type_identities(
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
         let current_type = self.handle.r#type.referent();
         let renamed_type = current_type.rename_identities(renaming)?;
-        // A renaming that merges two of the referent's identities cannot be inverted for value reconstruction.
-        // Detect the collision here and report it in the caller's direction; deriving the inverse below would
-        // otherwise surface it backwards, as a target renamed to two sources.
+
+        // A renaming that merges two of the referent's identities cannot be inverted for value reconstruction. Detect
+        // the collision here and report it in the caller's direction. Deriving the inverse below would otherwise
+        // surface it backwards, as a target renamed to two sources.
         let mut renamed_identities: Vec<(<V::Type as Type>::Identity, <V::Type as Type>::Identity)> = Vec::new();
         for (_, identity) in current_type.identities() {
             let renamed = renaming.rename(identity);
@@ -387,8 +394,10 @@ impl<V: Value> Reference<V> {
                 None => renamed_identities.push((renamed, identity.clone())),
             }
         }
+
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
+
         let root_type = &self.handle.holder.root_type;
         let mut root_to_handle = TypeIdentityRenaming::new();
         for (_, identity) in root_type.identities() {
@@ -406,6 +415,7 @@ impl<V: Value> Reference<V> {
                 "reference identity renaming must admit an exact bidirectional value reconstruction",
             ));
         }
+
         Ok(Self {
             handle: Arc::new(ReferenceHandle {
                 holder: Arc::clone(&self.handle.holder),
@@ -1243,10 +1253,10 @@ mod tests {
         assert!(written_generation > swapped_generation);
 
         let rejected = ProgramError::InvalidArgument { message: "rejected update".to_string() };
-        assert_eq!(reference.update_with(|_| Err(rejected.clone())), Err(rejected));
+        assert_eq!(reference.update::<(), _>(|_| Err(rejected.clone())), Err(rejected));
         assert_eq!(reference.lock().unwrap().current_generation(), Ok(written_generation));
 
-        reference.update_with(|_| Ok(Array::scalar(4.0_f32))).unwrap();
+        assert_eq!(reference.update(|_| Ok((Array::scalar(4.0_f32), "updated"))), Ok("updated"));
         let updated_generation = reference.lock().unwrap().current_generation().unwrap();
         assert!(updated_generation > written_generation);
     }
@@ -1753,9 +1763,9 @@ mod tests {
         // A rejected update must not invoke value-family code after the shared holder has been consumed.
         let update_executed = Cell::new(false);
         let error = alias
-            .update_with(|_| {
+            .update(|_| {
                 update_executed.set(true);
-                Ok(Array::vector(vec![3.0_f32, 4.0]))
+                Ok((Array::vector(vec![3.0_f32, 4.0]), ()))
             })
             .unwrap_err();
         assert!(!update_executed.get());
@@ -1780,10 +1790,10 @@ mod tests {
         assert_eq!(reference.read(), Ok(initial.clone()));
 
         let update_error = ProgramError::InvalidArgument { message: "test update failed".to_string() };
-        assert_eq!(reference.update_with(|_| Err(update_error.clone())), Err(update_error));
+        assert_eq!(reference.update::<(), _>(|_| Err(update_error.clone())), Err(update_error));
         assert_eq!(reference.read(), Ok(initial.clone()));
 
-        let error = reference.update_with(|_| Ok(Array::vector(vec![3.0_f32, 4.0, 5.0]))).unwrap_err();
+        let error = reference.update(|_| Ok((Array::vector(vec![3.0_f32, 4.0, 5.0]), ()))).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ReferenceError>(),
             Some(&ReferenceError::ReferentTypeMismatch {
@@ -1805,7 +1815,9 @@ mod tests {
 
         first.write(replacement).unwrap();
         let swapped_snapshot = first.swap(Array::vector(vec![7.0_f32, 8.0])).unwrap();
-        first.update_with(|current| current.add(&Array::vector(vec![10.0_f32, 20.0]))).unwrap();
+        first
+            .update(|current| current.add(&Array::vector(vec![10.0_f32, 20.0])).map(|updated| (updated, ())))
+            .unwrap();
         assert_eq!(second.read(), Ok(initializer.clone()));
         assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer.clone()));
 

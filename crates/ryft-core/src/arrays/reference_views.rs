@@ -568,7 +568,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         }
         // Validating inside the update keeps holder-state errors (frozen, poisoned, mid-transaction) ahead of the
         // replacement-type diagnostic, matching the root path.
-        self.root.update_locked_with_result(|current| {
+        self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
             self.view.swap(current, &replacement)
         })
@@ -587,9 +587,11 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         }
         // Validation remains inside the holder transaction so frozen, poisoned, and leased-state diagnostics retain
         // precedence over replacement-type errors, matching the root write and swap paths.
-        self.root.update_with(|current| {
+        self.root.update(|current| {
             self.validate_view_referent_type(&replacement)?;
-            self.view.write_in(&mut EagerViewCarrier(PhantomData), current.clone(), replacement)
+            self.view
+                .write_in(&mut EagerViewCarrier(PhantomData), current.clone(), replacement)
+                .map(|updated| (updated, ()))
         })
     }
 
@@ -599,14 +601,16 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
         A: Add + Reshape + Slice + UpdateSlice,
     {
         if self.view.is_root() {
-            return self.root.update_with(|current| current.add(update));
+            return self.root.update(|current| current.add(update).map(|updated| (updated, ())));
         }
-        self.root.update_with(|current| {
+        self.root.update(|current| {
             let mut carrier = EagerViewCarrier(PhantomData);
             let intermediates = self.view.intermediates_in(&mut carrier, current.clone())?;
             let updated_view = intermediates.last().unwrap().add(update)?;
             self.validate_view_referent_type(&updated_view)?;
-            self.view.reconstruct_in(&mut carrier, &intermediates[..self.view.transforms().len()], updated_view)
+            self.view
+                .reconstruct_in(&mut carrier, &intermediates[..self.view.transforms().len()], updated_view)
+                .map(|updated| (updated, ()))
         })
     }
 
