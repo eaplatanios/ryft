@@ -678,53 +678,6 @@ enum ReferenceState<V: Value> {
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// One coherent observation of a [`Reference`] value and the work that must precede its use.
-///
-/// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
-/// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
-/// the same reference allocation, and use [`ReferenceGuard::is_current`] to verify that the observation is still valid.
-/// When
-/// [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
-pub struct ReferenceObservation<V: Value> {
-    /// Allocation from which this observation was created.
-    ///
-    /// Keeping its weak control block alive prevents a later allocation from reusing the same address while this
-    /// observation exists.
-    holder: Weak<ReferenceHolder<V>>,
-
-    /// Generation of the observed value.
-    generation: ReferenceGeneration,
-
-    /// Observed value using the originating handle's type identities.
-    snapshot: V,
-
-    /// Cumulative work that must complete before the snapshot may be used.
-    dependency: Option<ReferenceCompletion>,
-}
-
-impl<V: Value> ReferenceObservation<V> {
-    /// Returns the generation of the observed value.
-    #[inline]
-    pub fn generation(&self) -> ReferenceGeneration {
-        self.generation
-    }
-
-    /// Returns the observed value using the originating reference handle's type identities.
-    #[inline]
-    pub fn snapshot(&self) -> &V {
-        &self.snapshot
-    }
-
-    /// Returns the cumulative work that must complete before the observed value may be used.
-    ///
-    /// `None` means the value was already `Ready` when observed. The returned completion may already have resolved
-    /// because pending reference state is reconciled lazily.
-    #[inline]
-    pub fn dependency(&self) -> Option<&ReferenceCompletion> {
-        self.dependency.as_ref()
-    }
-}
-
 /// Backend-facing exclusive access to one [`Reference`] allocation.
 ///
 /// Unlike ordinary [`Reference`] access, this guard exposes unresolved `Pending` state without waiting. Backends use
@@ -1097,20 +1050,49 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
     }
 }
 
-/// Type-checked replacement prepared for one reference allocation.
-///
-/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value to the allocation's canonical type identities
-/// and records which allocation it belongs to. Installation verifies that identity before moving the value into shared
-/// state, preventing a multi-reference transaction from exchanging two otherwise type-compatible replacements.
-pub struct ReferenceReplacement<V: Value> {
-    /// Weak pointer identifying the allocation for which this replacement was prepared.
+/// Represents a coherent observation of a [`Reference`] value and the work that must precede its use.
+/// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
+/// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
+/// the same reference allocation, and use [`ReferenceGuard::is_current`] to verify that the observation is still valid.
+/// When [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
+pub struct ReferenceObservation<V: Value> {
+    /// Allocation from which this observation was created.
     ///
-    /// Keeping the weak control block alive prevents its address from being reused while this replacement exists, so
-    /// pointer equality remains a stable allocation-identity check even after the last strong handle is dropped.
+    /// Keeping its weak control block alive prevents a later allocation from reusing the same address while this
+    /// observation exists.
     holder: Weak<ReferenceHolder<V>>,
 
-    /// Value using the reference allocation's canonical type identities.
-    value: V,
+    /// Generation of the observed value.
+    generation: ReferenceGeneration,
+
+    /// Observed value using the originating handle's type identities.
+    snapshot: V,
+
+    /// Cumulative work that must complete before the snapshot may be used.
+    dependency: Option<ReferenceCompletion>,
+}
+
+impl<V: Value> ReferenceObservation<V> {
+    /// Returns the generation of the observed value.
+    #[inline]
+    pub fn generation(&self) -> ReferenceGeneration {
+        self.generation
+    }
+
+    /// Returns the observed value using the originating reference handle's type identities.
+    #[inline]
+    pub fn snapshot(&self) -> &V {
+        &self.snapshot
+    }
+
+    /// Returns the cumulative work that must complete before the observed value may be used.
+    ///
+    /// `None` means the value was already `Ready` when observed. The returned completion may already have resolved
+    /// because pending reference state is reconciled lazily.
+    #[inline]
+    pub fn dependency(&self) -> Option<&ReferenceCompletion> {
+        self.dependency.as_ref()
+    }
 }
 
 /// Cloneable backend-neutral token for work that reads or replaces a reference value.
@@ -1264,6 +1246,22 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
         }
         result
     }
+}
+
+/// Type-checked replacement prepared for one reference allocation.
+///
+/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value to the allocation's canonical type identities
+/// and records which allocation it belongs to. Installation verifies that identity before moving the value into shared
+/// state, preventing a multi-reference transaction from exchanging two otherwise type-compatible replacements.
+pub struct ReferenceReplacement<V: Value> {
+    /// Weak pointer identifying the allocation for which this replacement was prepared.
+    ///
+    /// Keeping the weak control block alive prevents its address from being reused while this replacement exists, so
+    /// pointer equality remains a stable allocation-identity check even after the last strong handle is dropped.
+    holder: Weak<ReferenceHolder<V>>,
+
+    /// Value using the reference allocation's canonical type identities.
+    value: V,
 }
 
 #[cfg(test)]
